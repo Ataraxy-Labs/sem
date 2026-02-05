@@ -173,7 +173,6 @@
       transition: width 0.8s ease-out;
     }
     .bench-bar.sem-bar { background: var(--green); }
-    .bench-bar.lix-bar { background: var(--orange); }
     .bench-bar.git-bar { background: var(--blue); }
     .bench-multiplier {
       font-size: 12px; color: var(--green); font-weight: 600; margin-top: 4px;
@@ -342,106 +341,14 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
     <section id="benchmarks">
       <h2>Benchmarks</h2>
       <p class="section-desc">
-        Real measurements. Native C bindings vs WASM. Profiled with node --cpu-prof and --prof.
+        Real measurements. Profiled with node --cpu-prof and --prof. 20 runs each, median reported.
       </p>
 
       <div class="bench-group">
-        <h3>SQLite: Insert 1,000 entities</h3>
+        <h3>sem diff vs git diff (2 files changed)</h3>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem (better-sqlite3, native C)</span>
-            <span class="value">2.0ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 30%">2.0ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Lix (sql.js, WASM)</span>
-            <span class="value">5.9ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar lix-bar" style="width: 90%">5.9ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">sem is 3.0x faster</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>SQLite: Insert + 3 queries</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem (better-sqlite3)</span>
-            <span class="value">2.8ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 35%">2.8ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Lix (sql.js WASM)</span>
-            <span class="value">7.3ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar lix-bar" style="width: 92%">7.3ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">sem is 2.6x faster</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>Parse 50-function TypeScript file</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem (tree-sitter, native)</span>
-            <span class="value">0.65ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 12%">0.65ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name" style="color: var(--dim)">Lix</span>
-            <span class="value" style="color: var(--red)">not supported</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar" style="width: 100%; background: #2a1515">cannot parse code</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">sem only — Lix has no code parsing</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>Full pipeline: parse + insert + detect changes (2 files)</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem (better-sqlite3)</span>
-            <span class="value">0.6ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 12%">0.6ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Lix (sql.js WASM)</span>
-            <span class="value">2.8ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar lix-bar" style="width: 55%">2.8ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">sem is 4.7x faster (same data, same queries)</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>End-to-end wall clock (2 files changed)</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">git diff</span>
+            <span class="name">git diff (line-level)</span>
             <span class="value">15ms</span>
           </div>
           <div class="bench-bar-track">
@@ -450,14 +357,78 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem diff</span>
+            <span class="name">sem diff (entity-level)</span>
             <span class="value">260ms</span>
           </div>
           <div class="bench-bar-track">
             <div class="bench-bar sem-bar" style="width: 52%">260ms</div>
           </div>
         </div>
-        <div class="bench-multiplier">sem: Node startup 150ms + git subprocesses 100ms + compute 0.6ms</div>
+        <div class="bench-multiplier">260ms for semantic understanding that git can't do</div>
+      </div>
+
+      <div class="bench-group">
+        <h3>Where the 260ms goes</h3>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Node.js startup</span>
+            <span class="value">150ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar" style="width: 58%; background: var(--purple)">150ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Git subprocesses (4 parallel calls)</span>
+            <span class="value">100ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar" style="width: 38%; background: var(--orange)">100ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Parse + diff + entity matching</span>
+            <span class="value">0.6ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" style="width: 2%">0.6ms</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">Actual semantic work: 0.6ms. 99.8% overhead is runtime + I/O.</div>
+      </div>
+
+      <div class="bench-group">
+        <h3>Parsing speed</h3>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Parse 50-function TypeScript file (tree-sitter)</span>
+            <span class="value">0.65ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" style="width: 8%">0.65ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Store 1,000 entities in SQLite</span>
+            <span class="value">2.0ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" style="width: 24%">2.0ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Store + query 1,000 entities</span>
+            <span class="value">2.8ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" style="width: 34%">2.8ms</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">Native tree-sitter + better-sqlite3. No WASM, no overhead.</div>
       </div>
 
       <!-- Profiler breakdown -->
@@ -539,9 +510,9 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
 
     <!-- ═══ Comparison ═══ -->
     <section id="comparison">
-      <h2>sem vs git vs Lix</h2>
+      <h2>sem vs git</h2>
       <p class="section-desc">
-        git gives you lines. Lix gives you change graphs in the browser. sem gives you semantic entities in the terminal.
+        git gives you lines. sem gives you entities — functions, properties, rows, sections.
       </p>
       <div class="comparison-table">
         <table>
@@ -549,124 +520,84 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
             <tr>
               <th>Feature</th>
               <th>git diff</th>
-              <th>sem</th>
-              <th>Lix</th>
+              <th>sem diff</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>Diff granularity</td>
               <td class="lose">lines</td>
-              <td class="win">entities</td>
-              <td>cells / fields</td>
+              <td class="win">entities (functions, classes, properties)</td>
             </tr>
             <tr>
               <td>Code parsing</td>
               <td class="lose">no</td>
-              <td class="win">tree-sitter (native)</td>
-              <td class="na">no</td>
+              <td class="win">tree-sitter (TS, Python, Go, Rust, JS)</td>
             </tr>
             <tr>
               <td>JSON / YAML / TOML</td>
               <td class="lose">lines</td>
               <td class="win">key-path entities</td>
-              <td>fields</td>
             </tr>
             <tr>
               <td>CSV</td>
               <td class="lose">lines</td>
               <td class="win">row + cell identity</td>
-              <td>cell identity</td>
             </tr>
             <tr>
               <td>Rename detection</td>
-              <td class="lose">heuristic</td>
+              <td class="lose">heuristic (file-level)</td>
               <td class="win">3-phase (ID + hash + fuzzy)</td>
-              <td>change graph</td>
             </tr>
             <tr>
               <td>SQL queries</td>
               <td class="na">no</td>
               <td class="win">full SQLite</td>
-              <td>via SDK</td>
             </tr>
             <tr>
               <td>Machine-readable output</td>
               <td class="lose">patch format</td>
               <td class="win">JSON + SQL</td>
-              <td>SDK only</td>
-            </tr>
-            <tr>
-              <td>Works with existing Git</td>
-              <td>-</td>
-              <td class="win">yes, zero config</td>
-              <td class="lose">replaces Git</td>
-            </tr>
-            <tr>
-              <td>CLI-first</td>
-              <td class="win">yes</td>
-              <td class="win">yes</td>
-              <td class="lose">browser-only</td>
             </tr>
             <tr>
               <td>Entity blame</td>
               <td class="lose">line-level only</td>
               <td class="win">entity-level</td>
-              <td class="na">no</td>
             </tr>
             <tr>
               <td>Entity history</td>
               <td class="lose">file-level only</td>
               <td class="win">per-entity timeline</td>
-              <td class="na">no</td>
             </tr>
             <tr>
               <td>PR review</td>
               <td class="lose">manual</td>
               <td class="win">semantic + risk signals</td>
-              <td class="na">no</td>
             </tr>
             <tr>
               <td>Validation rules</td>
               <td class="na">no</td>
               <td class="win">.semrc.json</td>
-              <td>lint rules</td>
             </tr>
             <tr>
               <td>Labels / Comments</td>
               <td class="na">no</td>
               <td class="win">on entities</td>
-              <td>discussions</td>
             </tr>
             <tr>
               <td>File watcher</td>
               <td class="na">no</td>
               <td class="win">sem watch</td>
-              <td class="na">no</td>
             </tr>
             <tr>
-              <td>SQLite engine</td>
-              <td class="na">-</td>
-              <td class="win">better-sqlite3 (native C)</td>
-              <td class="lose">sql.js (WASM)</td>
+              <td>Speed</td>
+              <td class="win">15ms</td>
+              <td>260ms (semantic understanding included)</td>
             </tr>
             <tr>
-              <td>Speed (1K entity insert)</td>
-              <td class="na">-</td>
-              <td class="win">2.0ms</td>
-              <td class="lose">5.9ms</td>
-            </tr>
-            <tr>
-              <td>Collaboration</td>
-              <td>remotes</td>
-              <td class="lose">local-only (v0.1)</td>
-              <td class="win">built-in sync</td>
-            </tr>
-            <tr>
-              <td>Adoption barrier</td>
+              <td>Adoption</td>
               <td>-</td>
-              <td class="win">npm install, done</td>
-              <td class="lose">replace your VCS</td>
+              <td class="win">npm install, drop into any Git repo</td>
             </tr>
           </tbody>
         </table>
