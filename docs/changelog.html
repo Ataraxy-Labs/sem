@@ -14,13 +14,13 @@
       --dim2: #444;
       --border: #222;
       --accent: #fff;
-      --green: #4ade80;
-      --yellow: #facc15;
-      --red: #f87171;
-      --blue: #60a5fa;
-      --cyan: #22d3ee;
-      --purple: #a78bfa;
-      --orange: #fb923c;
+      --green: #e0e0e0;
+      --yellow: #999;
+      --red: #888;
+      --blue: #ccc;
+      --cyan: #bbb;
+      --purple: #aaa;
+      --orange: #999;
       --surface: #111;
       --surface2: #141414;
       --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
@@ -75,19 +75,19 @@
     .changelog-tag {
       font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-right: 6px;
     }
-    .changelog-tag.feat { background: #1a2e1a; color: var(--green); }
-    .changelog-tag.perf { background: #2e2a1a; color: var(--yellow); }
-    .changelog-tag.fix { background: #2e1a1a; color: var(--red); }
-    .changelog-tag.rewrite { background: #1a1a2e; color: var(--blue); }
-    .changelog-tag.docs { background: #1e1a2e; color: var(--purple); }
+    .changelog-tag.feat { background: #1a1a1a; color: var(--fg); }
+    .changelog-tag.perf { background: #1a1a1a; color: var(--fg); }
+    .changelog-tag.fix { background: #1a1a1a; color: var(--fg); }
+    .changelog-tag.rewrite { background: #1a1a1a; color: var(--fg); }
+    .changelog-tag.docs { background: #1a1a1a; color: var(--fg); }
     .changelog-title { font-size: 14px; color: var(--accent); font-weight: 600; margin-bottom: 6px; }
     .changelog-body { font-size: 12px; color: var(--dim); line-height: 1.7; }
     .changelog-stats { font-size: 11px; color: var(--dim2); margin-top: 8px; }
     .changelog-mistake {
-      margin-top: 10px; padding: 10px 14px; border-left: 2px solid var(--yellow);
-      background: #1a1a0f; font-size: 12px; color: var(--dim); line-height: 1.6;
+      margin-top: 10px; padding: 10px 14px; border-left: 2px solid #555;
+      background: #141414; font-size: 12px; color: var(--dim); line-height: 1.6;
     }
-    .changelog-mistake strong { color: var(--yellow); font-weight: 600; }
+    .changelog-mistake strong { color: var(--accent); font-weight: 600; }
 
     /* Footer */
     footer {
@@ -124,7 +124,7 @@
           Initial release
         </div>
         <p class="changelog-body">
-          First working version. <code style="color:var(--cyan)">sem diff</code> with tree-sitter parsing for TypeScript, JavaScript, Python, Go, Rust.
+          First working version. <code style="color:var(--fg)">sem diff</code> with tree-sitter parsing for TypeScript, JavaScript, Python, Go, Rust.
           JSON/YAML/TOML/CSV/Markdown support via custom parsers. Three-phase entity matching (exact ID, content hash, fuzzy similarity).
         </p>
         <p class="changelog-stats">Node.js + TypeScript &bull; tsup build &bull; better-sqlite3 for storage &bull; ~290ms cold start</p>
@@ -140,7 +140,7 @@
           7 new commands
         </div>
         <p class="changelog-body">
-          Added <code style="color:var(--cyan)">blame</code>, <code style="color:var(--cyan)">status</code>, <code style="color:var(--cyan)">watch</code>, <code style="color:var(--cyan)">review</code>, <code style="color:var(--cyan)">history</code>, <code style="color:var(--cyan)">label</code>, <code style="color:var(--cyan)">comment</code>.
+          Added <code style="color:var(--fg)">blame</code>, <code style="color:var(--fg)">status</code>, <code style="color:var(--fg)">watch</code>, <code style="color:var(--fg)">review</code>, <code style="color:var(--fg)">history</code>, <code style="color:var(--fg)">label</code>, <code style="color:var(--fg)">comment</code>.
           Entity-level blame (who last touched each function), semantic PR review with risk signals, real-time file watching, threaded comments on entities.
         </p>
         <p class="changelog-stats">+1,191 lines &bull; 12 files &bull; 15 functions, 12 interfaces, 3 variables, 1 class added</p>
@@ -153,7 +153,7 @@
           591ms &rarr; 260ms (56% faster)
         </div>
         <p class="changelog-body">
-          Parallelized git operations. Replaced sequential <code style="color:var(--cyan)">simple-git</code> calls with batched <code style="color:var(--cyan)">diff --name-status</code> + <code style="color:var(--cyan)">show</code>. Lazy-loaded parsers instead of importing all grammars upfront. Added internal benchmarking harness.
+          Parallelized git operations. Replaced sequential <code style="color:var(--fg)">simple-git</code> calls with batched <code style="color:var(--fg)">diff --name-status</code> + <code style="color:var(--fg)">show</code>. Lazy-loaded parsers instead of importing all grammars upfront. Added internal benchmarking harness.
         </p>
         <p class="changelog-stats">+705 lines &bull; 32 added, 10 modified, 3 deleted entities across 5 types</p>
         <div class="changelog-mistake">
@@ -168,8 +168,8 @@
           Rust rewrite: 30ms (10x faster)
         </div>
         <p class="changelog-body">
-          Rewrote <code style="color:var(--cyan)">sem diff</code> as a compiled Rust binary. git2 for in-process git operations (no subprocess spawning), tree-sitter grammars compiled directly into the binary (no WASM, no dynamic loading).
-          Cargo workspace: <code style="color:var(--cyan)">sem-core</code> (library) + <code style="color:var(--cyan)">sem-cli</code> (binary). All 7 parser plugins ported.
+          Rewrote <code style="color:var(--fg)">sem diff</code> as a compiled Rust binary. git2 for in-process git operations (no subprocess spawning), tree-sitter grammars compiled directly into the binary (no WASM, no dynamic loading).
+          Cargo workspace: <code style="color:var(--fg)">sem-core</code> (library) + <code style="color:var(--fg)">sem-cli</code> (binary). All 7 parser plugins ported.
         </p>
         <p class="changelog-stats">+3,905 lines &bull; 278 entities &bull; 11 entity types including Rust-specific (struct, impl, trait)</p>
         <div class="changelog-mistake">
@@ -186,7 +186,7 @@
           Agent accuracy benchmark
         </div>
         <p class="changelog-body">
-          Proved that AI agents are 2.3x more accurate at answering questions about code changes when given <code style="color:var(--green)">sem diff</code> JSON vs raw <code style="color:var(--blue)">git diff</code> output.
+          Proved that AI agents are 2.3x more accurate at answering questions about code changes when given <code style="color:var(--fg)">sem diff</code> JSON vs raw <code style="color:var(--fg)">git diff</code> output.
           Tested with Claude Sonnet 4.5 across 4 question types and 3 commits of varying size.
           Core finding: line diffs cause systematic failures &mdash; the model confuses lines with entities, can't distinguish adds from modifications, and has no entity type vocabulary.
         </p>
@@ -200,7 +200,7 @@
           Homebrew distribution
         </div>
         <p class="changelog-body">
-          <code style="color:var(--cyan)">brew install sem-diff</code> &mdash; single command install via Homebrew tap.
+          <code style="color:var(--fg)">brew install sem-diff</code> &mdash; single command install via Homebrew tap.
           Formula builds from source using Cargo, compiles all tree-sitter grammars in, links against system libgit2.
           Includes a test that verifies entity extraction on a Python function.
         </p>
