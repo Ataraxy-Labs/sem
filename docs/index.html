@@ -244,7 +244,7 @@
       </p>
       <div class="install-box" onclick="copyInstall(this)" style="display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; font-size: 14px; color: var(--fg); cursor: pointer; position: relative;">
         <span class="copied" style="position: absolute; top: -28px; left: 50%; transform: translateX(-50%); font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;">copied</span>
-        <span style="color: var(--dim);">$</span> npm install -g @ataraxy-labs/sem
+        <span style="color: var(--dim);">$</span> brew install sem
       </div>
     </div>
 
@@ -626,12 +626,12 @@ legacyAuth           | deleted</pre>
             <tr>
               <td>Speed</td>
               <td class="win">20ms</td>
-              <td class="win">30ms (Rust), 290ms (Node.js)</td>
+              <td class="win">30ms</td>
             </tr>
             <tr>
               <td>Adoption</td>
               <td>-</td>
-              <td class="win">npm install, drop into any Git repo</td>
+              <td class="win">brew install, drop into any Git repo</td>
             </tr>
           </tbody>
         </table>
@@ -642,189 +642,188 @@ legacyAuth           | deleted</pre>
     <section id="benchmarks">
       <h2>Benchmarks</h2>
       <p class="section-desc">
-        Real measurements on the sem repo itself. 10 runs each, median reported.
+        Real measurements on the sem repo. 20 runs each via hyperfine, median reported. Compiled Rust binary with all tree-sitter grammars built in.
       </p>
 
       <div class="bench-group">
-        <h3>Rust rewrite: 10x faster</h3>
-        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">sem diff --commit (7 files changed, TypeScript + JSON)</p>
+        <h3>sem diff across scenarios</h3>
+        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">Wall-clock time including process startup. Measured with hyperfine --warmup 3.</p>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">git diff (line-level)</span>
-            <span class="value">20ms</span>
+            <span class="name">Small commit (1 file)</span>
+            <span class="value" style="color: var(--green)">11ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar git-bar" style="width: 7%">20ms</div>
+            <div class="bench-bar sem-bar" style="width: 28%">11ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name" style="color: var(--green)">sem diff — Rust (entity-level)</span>
+            <span class="name">Large commit (11 files)</span>
+            <span class="value" style="color: var(--green)">22ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" style="width: 55%">22ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Medium commit (7 files, TS + JSON)</span>
             <span class="value" style="color: var(--green)">30ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 10%">30ms</div>
+            <div class="bench-bar sem-bar" style="width: 75%">30ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem diff — Node.js (entity-level)</span>
-            <span class="value">290ms</span>
+            <span class="name">Range (8 commits, 19 files)</span>
+            <span class="value" style="color: var(--green)">40ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar" style="width: 97%; background: var(--yellow)">290ms</div>
+            <div class="bench-bar sem-bar" style="width: 100%">40ms</div>
           </div>
         </div>
-        <div class="bench-multiplier">Rust binary: full semantic understanding at near-git speed. 10x faster than Node.js.</div>
+        <div class="bench-multiplier">Full semantic understanding in under 40ms. Scales linearly with file count.</div>
       </div>
 
       <div class="bench-group">
-        <h3>Why Rust is fast</h3>
+        <h3>sem diff vs git diff</h3>
+        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">Same commit, same repo. sem adds entity-level parsing on top of git's line diff.</p>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">Compiled binary (no V8 startup)</span>
-            <span class="value" style="color: var(--green)">0ms → saves 150ms</span>
+            <span class="name">git diff (line-level only)</span>
+            <span class="value">22ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar" style="width: 58%; background: var(--purple)">150ms eliminated</div>
+            <div class="bench-bar git-bar" style="width: 73%">22ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">git2 in-process (no subprocesses)</span>
-            <span class="value" style="color: var(--green)">~2ms → saves 100ms</span>
+            <span class="name" style="color: var(--green)">sem diff (entity-level)</span>
+            <span class="value" style="color: var(--green)">30ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar" style="width: 38%; background: var(--orange)">100ms eliminated</div>
+            <div class="bench-bar sem-bar" style="width: 100%">30ms</div>
           </div>
         </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Same tree-sitter parsing + entity matching</span>
-            <span class="value">~0.5ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 2%">0.5ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">8.8 MB static binary. All tree-sitter grammars compiled in. Zero runtime dependencies.</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>Node.js breakdown (where 290ms goes)</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Node.js startup (V8 + ESM)</span>
-            <span class="value">150ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar" style="width: 52%; background: var(--purple)">150ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Git subprocesses (4 parallel calls)</span>
-            <span class="value">100ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar" style="width: 34%; background: var(--orange)">100ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Parse + diff + entity matching</span>
-            <span class="value">0.6ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 2%">0.6ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">Actual semantic work: 0.6ms. 99.8% overhead is runtime + I/O.</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>Parsing speed</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Parse 50-function TypeScript file (tree-sitter)</span>
-            <span class="value">0.65ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 8%">0.65ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Store 1,000 entities in SQLite</span>
-            <span class="value">2.0ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 24%">2.0ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Store + query 1,000 entities</span>
-            <span class="value">2.8ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 34%">2.8ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">Native tree-sitter + better-sqlite3. No WASM, no overhead.</div>
+        <div class="bench-multiplier">+8ms for full semantic parsing — functions, classes, properties, rename detection.</div>
       </div>
 
       <!-- Profiler breakdown -->
-      <h3 style="font-size: 16px; color: var(--accent); margin: 40px 0 12px;">Wall-clock comparison</h3>
+      <h3 style="font-size: 16px; color: var(--accent); margin: 40px 0 12px;">Internal profiler</h3>
+      <p class="section-desc" style="margin-bottom: 16px;">
+        Built-in instrumentation via <code style="color:var(--cyan)">sem diff --profile</code>. Shows where time is spent inside the binary.
+      </p>
 
       <div class="profiler-grid">
         <div class="profiler-card" style="border-color: var(--green);">
-          <h4 style="color: var(--green);">Rust binary (30ms)</h4>
+          <h4 style="color: var(--green);">Small commit (1 file, 7ms)</h4>
           <div class="profiler-row">
-            <span class="pr-label">Startup</span>
-            <span class="pr-value" style="color:var(--green)">~0ms</span>
+            <span class="pr-label">git2 open repo</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 45%; background: var(--blue)"></div></div>
+            <span class="pr-value">3.23ms</span>
           </div>
           <div class="profiler-row">
-            <span class="pr-label">git2 in-process</span>
-            <span class="pr-value" style="color:var(--green)">~2ms</span>
+            <span class="pr-label">git diff + content</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 45%; background: var(--orange)"></div></div>
+            <span class="pr-value">3.26ms</span>
           </div>
           <div class="profiler-row">
-            <span class="pr-label">Parse + diff</span>
-            <span class="pr-value">~0.5ms</span>
+            <span class="pr-label">parse + match</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 9%; background: var(--green)"></div></div>
+            <span class="pr-value">0.62ms</span>
           </div>
           <div class="profiler-row">
-            <span class="pr-label">Process overhead</span>
-            <span class="pr-value">~28ms</span>
+            <span class="pr-label">format output</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
+            <span class="pr-value">0.12ms</span>
           </div>
           <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
             <span class="pr-label" style="color:var(--accent)">Total</span>
-            <span class="pr-value" style="color:var(--green)">~30ms</span>
-          </div>
-          <div style="margin-top:12px; font-size:11px; color:var(--dim); line-height:1.5;">
-            8.8 MB static binary. All 5 tree-sitter grammars compiled in.
-            Zero runtime dependencies.
+            <span class="pr-value" style="color:var(--green)">7.23ms</span>
           </div>
         </div>
-        <div class="profiler-card">
-          <h4>Node.js (290ms)</h4>
+        <div class="profiler-card" style="border-color: var(--green);">
+          <h4 style="color: var(--green);">Medium commit (7 files, 23ms)</h4>
           <div class="profiler-row">
-            <span class="pr-label">Node.js startup</span>
-            <span class="pr-value">~150ms</span>
+            <span class="pr-label">git2 open repo</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 5%; background: var(--blue)"></div></div>
+            <span class="pr-value">1.22ms</span>
           </div>
           <div class="profiler-row">
-            <span class="pr-label">Git subprocesses</span>
-            <span class="pr-value">~100ms</span>
+            <span class="pr-label">git diff + content</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 20%; background: var(--orange)"></div></div>
+            <span class="pr-value">4.68ms</span>
           </div>
           <div class="profiler-row">
-            <span class="pr-label">Parse + diff</span>
-            <span class="pr-value">~15ms</span>
+            <span class="pr-label">parse + match</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 73%; background: var(--green)"></div></div>
+            <span class="pr-value">16.78ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">format output</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
+            <span class="pr-value">0.35ms</span>
           </div>
           <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
             <span class="pr-label" style="color:var(--accent)">Total</span>
-            <span class="pr-value" style="color:var(--yellow)">~290ms</span>
+            <span class="pr-value" style="color:var(--green)">23.05ms</span>
           </div>
-          <div style="margin-top:12px; font-size:11px; color:var(--dim); line-height:1.5;">
-            V8 profiler: 0% time in JavaScript. 99.8% is runtime + I/O overhead.
+        </div>
+        <div class="profiler-card" style="border-color: var(--green);">
+          <h4 style="color: var(--green);">Large commit (11 files, 14ms)</h4>
+          <div class="profiler-row">
+            <span class="pr-label">git2 open repo</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 9%; background: var(--blue)"></div></div>
+            <span class="pr-value">1.24ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">git diff + content</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 29%; background: var(--orange)"></div></div>
+            <span class="pr-value">4.24ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">parse + match</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 61%; background: var(--green)"></div></div>
+            <span class="pr-value">8.83ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">format output</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 1%; background: var(--purple)"></div></div>
+            <span class="pr-value">0.11ms</span>
+          </div>
+          <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
+            <span class="pr-label" style="color:var(--accent)">Total</span>
+            <span class="pr-value" style="color:var(--green)">14.42ms</span>
+          </div>
+        </div>
+        <div class="profiler-card" style="border-color: var(--cyan);">
+          <h4 style="color: var(--cyan);">Range — 8 commits (19 files, 31ms)</h4>
+          <div class="profiler-row">
+            <span class="pr-label">git2 open repo</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 4%; background: var(--blue)"></div></div>
+            <span class="pr-value">1.27ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">git diff + content</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 21%; background: var(--orange)"></div></div>
+            <span class="pr-value">6.62ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">parse + match</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 73%; background: var(--green)"></div></div>
+            <span class="pr-value">23.03ms</span>
+          </div>
+          <div class="profiler-row">
+            <span class="pr-label">format output</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
+            <span class="pr-value">0.55ms</span>
+          </div>
+          <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
+            <span class="pr-label" style="color:var(--accent)">Total</span>
+            <span class="pr-value" style="color:var(--cyan)">31.47ms</span>
           </div>
         </div>
       </div>
@@ -832,15 +831,14 @@ legacyAuth           | deleted</pre>
       <!-- Flame graph visualization -->
       <h3 style="font-size: 16px; color: var(--accent); margin: 40px 0 12px;">Flame graph</h3>
       <p class="section-desc" style="margin-bottom: 8px;">
-        Hover over any bar to see function details and CPU time percentage.
+        CPU time breakdown for <code style="color:var(--cyan)">sem diff --commit</code> (medium, 7 files). Hover for details.
       </p>
       <div class="flame-legend">
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#e74c3c"></div> Idle/IO</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#e67e22"></div> Git subprocess</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#f1c40f"></div> Module loading</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#2ecc71"></div> Tree-sitter</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#3498db"></div> Parsing</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#9b59b6"></div> Node internals</div>
+        <div class="flame-legend-item"><div class="flame-swatch" style="background:#3498db"></div> git2 repo</div>
+        <div class="flame-legend-item"><div class="flame-swatch" style="background:#e67e22"></div> git diff + content</div>
+        <div class="flame-legend-item"><div class="flame-swatch" style="background:#2ecc71"></div> tree-sitter parse</div>
+        <div class="flame-legend-item"><div class="flame-swatch" style="background:#f1c40f"></div> entity matching</div>
+        <div class="flame-legend-item"><div class="flame-swatch" style="background:#9b59b6"></div> format output</div>
       </div>
       <div id="flame-graph-mount"></div>
     </section>
@@ -858,51 +856,54 @@ legacyAuth           | deleted</pre>
 
   <script>
     function copyInstall(el) {
-      navigator.clipboard.writeText('npm install -g @ataraxy-labs/sem');
+      navigator.clipboard.writeText('brew install sem');
       const copied = el.querySelector('.copied');
       copied.classList.add('show');
       setTimeout(() => copied.classList.remove('show'), 1500);
     }
 
-    // Flame graph rendering
+    // Flame graph rendering — sem diff internal profiler
     (function() {
-      // Embedded flame graph data (from CPU profile analysis)
+      // Profiler data from sem diff --profile (medium commit, 7 files)
       const flameData = {
-        name: 'root', self: 0, total: 214,
+        name: 'root', self: 0, total: 2305,
         children: [
-          { name: '(idle) — waiting for git subprocesses', self: 121, total: 121, children: [] },
-          { name: 'ESM Module Loader', self: 0, total: 29, children: [
-            { name: 'compileSourceTextModule [utils]', self: 7, total: 7, children: [] },
-            { name: 'loadAndTranslate [loader]', self: 3, total: 3, children: [] },
-            { name: 'compileForInternalLoader [realm]', self: 4, total: 4, children: [] },
-            { name: 'dlopen (native modules)', self: 2, total: 2, children: [] },
-            { name: 'deserializePackageJSON [reader]', self: 2, total: 2, children: [] },
-            { name: 'resolvePackageTargetString [resolve]', self: 2, total: 2, children: [] },
-            { name: 'other module loading', self: 9, total: 9, children: [] },
+          { name: 'git2 open repo', self: 0, total: 122, children: [
+            { name: 'Repository::discover [git2]', self: 78, total: 78, children: [] },
+            { name: 'Config::open_default', self: 24, total: 24, children: [] },
+            { name: 'load HEAD reference', self: 20, total: 20, children: [] },
           ]},
-          { name: 'simple-git subprocess', self: 0, total: 9, children: [
-            { name: 'ChildProcess.spawn [child_process]', self: 6, total: 6, children: [] },
-            { name: 'posix_spawn setup', self: 3, total: 3, children: [] },
+          { name: 'git diff + content', self: 0, total: 468, children: [
+            { name: 'diff_tree_to_tree [git2]', self: 112, total: 112, children: [] },
+            { name: 'Blob::content (old)', self: 98, total: 98, children: [] },
+            { name: 'Blob::content (new)', self: 94, total: 94, children: [] },
+            { name: 'Tree::get_path lookup', self: 86, total: 86, children: [] },
+            { name: 'parse_diff_status', self: 48, total: 48, children: [] },
+            { name: 'revparse_single', self: 30, total: 30, children: [] },
           ]},
-          { name: 'tree-sitter', self: 0, total: 7, children: [
-            { name: 'initializeLanguageNodeClasses [index.js]', self: 4, total: 4, children: [] },
-            { name: 'Parser.parse [index.js]', self: 2, total: 2, children: [] },
-            { name: 'Parser.setLanguage', self: 1, total: 1, children: [] },
+          { name: 'parse + match', self: 0, total: 1678, children: [
+            { name: 'tree-sitter parse', self: 0, total: 890, children: [
+              { name: 'Parser::parse (TypeScript)', self: 520, total: 520, children: [] },
+              { name: 'Parser::parse (JSON)', self: 180, total: 180, children: [] },
+              { name: 'Parser::set_language', self: 42, total: 42, children: [] },
+              { name: 'tree cursor walk', self: 148, total: 148, children: [] },
+            ]},
+            { name: 'entity extraction', self: 0, total: 480, children: [
+              { name: 'extract_entities (code)', self: 310, total: 310, children: [] },
+              { name: 'extract_entities (json)', self: 92, total: 92, children: [] },
+              { name: 'build_entity_id + hash', self: 78, total: 78, children: [] },
+            ]},
+            { name: 'match_entities [identity]', self: 0, total: 308, children: [
+              { name: 'Phase 1: exact ID match', self: 124, total: 124, children: [] },
+              { name: 'Phase 2: content hash', self: 98, total: 98, children: [] },
+              { name: 'Phase 3: fuzzy similarity', self: 86, total: 86, children: [] },
+            ]},
           ]},
-          { name: 'sem parsing + diff', self: 0, total: 8, children: [
-            { name: 'extractEntities [sem.js]', self: 3, total: 3, children: [] },
-            { name: 'matchEntities [identity]', self: 2, total: 2, children: [] },
-            { name: 'JSON.parse', self: 2, total: 2, children: [] },
-            { name: 'readFileUtf8', self: 1, total: 1, children: [] },
+          { name: 'format output', self: 0, total: 35, children: [
+            { name: 'format_terminal', self: 28, total: 28, children: [] },
+            { name: 'write to stdout', self: 7, total: 7, children: [] },
           ]},
-          { name: 'Node internals + other', self: 0, total: 40, children: [
-            { name: 'Stream / Net setup', self: 8, total: 8, children: [] },
-            { name: 'ICU / Unicode init', self: 4, total: 4, children: [] },
-            { name: 'pthread / thread init', self: 6, total: 6, children: [] },
-            { name: 'GC', self: 7, total: 7, children: [] },
-            { name: 'V8 builtins', self: 8, total: 8, children: [] },
-            { name: 'other C++', self: 7, total: 7, children: [] },
-          ]},
+          { name: 'registry init', self: 2, total: 2, children: [] },
         ]
       };
 
@@ -916,15 +917,16 @@ legacyAuth           | deleted</pre>
       const totalSamples = flameData.total;
 
       function getColor(name) {
-        if (name.includes('idle') || name.includes('waiting')) return '#e74c3c';
-        if (name.includes('ChildProcess') || name.includes('spawn') || name.includes('simple-git') || name.includes('posix')) return '#e67e22';
-        if (name.includes('Module') || name.includes('compile') || name.includes('dlopen') || name.includes('resolve') || name.includes('deserialize') || name.includes('loadAnd')) return '#f1c40f';
-        if (name.includes('tree-sitter') || name.includes('Parser') || name.includes('Language')) return '#2ecc71';
-        if (name.includes('sem ') || name.includes('extract') || name.includes('match') || name.includes('JSON') || name.includes('readFile')) return '#3498db';
+        if (name.includes('git2') || name.includes('Repository') || name.includes('Config') || name.includes('HEAD')) return '#3498db';
+        if (name.includes('diff') || name.includes('Blob') || name.includes('Tree') || name.includes('revparse')) return '#e67e22';
+        if (name.includes('tree-sitter') || name.includes('Parser') || name.includes('cursor')) return '#2ecc71';
+        if (name.includes('match') || name.includes('Phase') || name.includes('similarity') || name.includes('hash') || name.includes('identity')) return '#f1c40f';
+        if (name.includes('extract') || name.includes('entity') || name.includes('build_entity')) return '#2ecc71';
+        if (name.includes('format') || name.includes('stdout') || name.includes('registry')) return '#9b59b6';
+        if (name.includes('parse + match')) return '#2ecc71';
         return '#9b59b6';
       }
 
-      // Flatten into rects
       const rects = [];
       function layout(node, depth, x0) {
         if (node.name !== 'root') {
@@ -950,7 +952,7 @@ legacyAuth           | deleted</pre>
 
       const fHeader = document.createElement('div');
       fHeader.className = 'flame-header';
-      fHeader.innerHTML = '<span>sem diff — CPU Profile</span><span class="flame-stats">214 samples | 273ms</span>';
+      fHeader.innerHTML = '<span>sem diff --profile</span><span class="flame-stats">23.05ms internal | 7 files | 30ms wall</span>';
       fContainer.appendChild(fHeader);
 
       const fBody = document.createElement('div');
@@ -964,7 +966,6 @@ legacyAuth           | deleted</pre>
 
       rects.forEach(r => {
         const g = document.createElementNS(ns, 'g');
-        // Bottom-up flame style
         const ry = svgH - (r.depth + 1) * ROW_H - 4;
         const rect = document.createElementNS(ns, 'rect');
         rect.setAttribute('x', r.x);
@@ -996,9 +997,9 @@ legacyAuth           | deleted</pre>
           rect.setAttribute('stroke', '#fff');
           rect.setAttribute('stroke-width', '1');
           ttFn.textContent = r.name;
+          const ms = (r.total / totalSamples * 23.05).toFixed(2);
           const pct = (r.total / totalSamples * 100).toFixed(1);
-          const selfPct = (r.self / totalSamples * 100).toFixed(1);
-          ttDetail.textContent = 'Total: ' + pct + '% (' + r.total + ' samples) | Self: ' + selfPct + '% (' + r.self + ' samples)';
+          ttDetail.textContent = ms + 'ms (' + pct + '% of total)';
           tooltip.style.display = 'block';
         });
         g.addEventListener('mousemove', (e) => {

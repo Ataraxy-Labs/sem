@@ -34,6 +34,10 @@ enum Commands {
         /// Output format: terminal or json
         #[arg(long, default_value = "terminal")]
         format: String,
+
+        /// Show internal timing profile
+        #[arg(long, hide = true)]
+        profile: bool,
     },
 }
 
@@ -47,6 +51,7 @@ fn main() {
             from,
             to,
             format,
+            profile,
         }) => {
             let output_format = match format.as_str() {
                 "json" => OutputFormat::Json,
@@ -63,6 +68,7 @@ fn main() {
                 commit,
                 from,
                 to,
+                profile,
             });
         }
         None => {
@@ -77,6 +83,7 @@ fn main() {
                 commit: None,
                 from: None,
                 to: None,
+                profile: false,
             });
         }
     }
