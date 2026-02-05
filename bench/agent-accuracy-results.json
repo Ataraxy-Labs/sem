@@ -1,0 +1,794 @@
+{
+  "model": "claude-sonnet-4-5-20250929",
+  "temperature": 0,
+  "timestamp": "2026-02-05T22:45:49Z",
+  "commits": [
+    {
+      "sha": "9f7f1c7",
+      "label": "7 new commands (11 files)"
+    },
+    {
+      "sha": "fffb38f",
+      "label": "Speed optimization (mixed ops)"
+    },
+    {
+      "sha": "ae576ab",
+      "label": "Rust rewrite (large)"
+    }
+  ],
+  "summary": {
+    "q1_added_functions": {
+      "sem_avg": 0.9273,
+      "git_avg": 0.7526,
+      "delta": 0.1747,
+      "sem_scores": [
+        1.0,
+        1.0,
+        0.7818
+      ],
+      "git_scores": [
+        1.0,
+        0.7143,
+        0.5435
+      ]
+    },
+    "q2_files_with_modified": {
+      "sem_avg": 1.0,
+      "git_avg": 0.5524,
+      "delta": 0.4476,
+      "sem_scores": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "git_scores": [
+        0.8571,
+        0.8,
+        0.0
+      ]
+    },
+    "q3_entity_type_counts": {
+      "sem_avg": 0.9084,
+      "git_avg": 0.1347,
+      "delta": 0.7738,
+      "sem_scores": [
+        0.9635,
+        0.873,
+        0.8888
+      ],
+      "git_scores": [
+        0.0,
+        0.2571,
+        0.1469
+      ]
+    },
+    "q4_change_type_counts": {
+      "sem_avg": 1.0,
+      "git_avg": 0.2222,
+      "delta": 0.7778,
+      "sem_scores": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "git_scores": [
+        0.3333,
+        0.3333,
+        0.0
+      ]
+    },
+    "overall": {
+      "sem_avg": 0.9589,
+      "git_avg": 0.4155,
+      "delta": 0.5435
+    }
+  },
+  "results": [
+    {
+      "commit": "9f7f1c7",
+      "commit_label": "7 new commands (11 files)",
+      "question_id": "q1_added_functions",
+      "question_text": "List all functions that were ADDED (not modified) in this diff. Return a JSON object: {\"functions\": [\"name1\", \"name2\", ...]}. Only include function names, not methods or other entity types. Return ONLY the JSON, no explanation.",
+      "question_type": "set_f1",
+      "ground_truth": [
+        "blameCommand",
+        "commentCommand",
+        "evaluateCondition",
+        "formatValidationResults",
+        "getGitAuthor",
+        "historyCommand",
+        "interpolateMessage",
+        "labelCommand",
+        "loadConfig",
+        "matchesRule",
+        "reviewCommand",
+        "statusCommand",
+        "validateChanges",
+        "watchCommand"
+      ],
+      "sem": {
+        "raw_response": "```json\n{\"functions\": [\"blameCommand\", \"commentCommand\", \"getGitAuthor\", \"historyCommand\", \"labelCommand\", \"reviewCommand\", \"statusCommand\", \"loadConfig\", \"validateChanges\", \"matchesRule\", \"evaluateCondition\", \"interpolateMessage\", \"formatValidationResults\", \"watchCommand\"]}\n```",
+        "parsed": [
+          "blameCommand",
+          "commentCommand",
+          "getGitAuthor",
+          "historyCommand",
+          "labelCommand",
+          "reviewCommand",
+          "statusCommand",
+          "loadConfig",
+          "validateChanges",
+          "matchesRule",
+          "evaluateCondition",
+          "interpolateMessage",
+          "formatValidationResults",
+          "watchCommand"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\n  \"functions\": [\n    \"blameCommand\",\n    \"commentCommand\",\n    \"getGitAuthor\",\n    \"historyCommand\",\n    \"labelCommand\",\n    \"reviewCommand\",\n    \"statusCommand\",\n    \"loadConfig\",\n    \"validateChanges\",\n    \"matchesRule\",\n    \"evaluateCondition\",\n    \"interpolateMessage\",\n    \"formatValidationResults\",\n    \"watchCommand\"\n  ]\n}\n```",
+        "parsed": [
+          "blameCommand",
+          "commentCommand",
+          "getGitAuthor",
+          "historyCommand",
+          "labelCommand",
+          "reviewCommand",
+          "statusCommand",
+          "loadConfig",
+          "validateChanges",
+          "matchesRule",
+          "evaluateCondition",
+          "interpolateMessage",
+          "formatValidationResults",
+          "watchCommand"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      }
+    },
+    {
+      "commit": "9f7f1c7",
+      "commit_label": "7 new commands (11 files)",
+      "question_id": "q2_files_with_modified",
+      "question_text": "List all files that contain at least one MODIFIED (not added or deleted) entity. Return a JSON object: {\"files\": [\"path/to/file1\", ...]}. Return ONLY the JSON, no explanation.",
+      "question_type": "set_f1",
+      "ground_truth": [
+        "src/cli/commands/diff.ts",
+        "src/storage/database.ts",
+        "src/storage/schema.ts"
+      ],
+      "sem": {
+        "raw_response": "```json\n{\"files\": [\"src/cli/commands/diff.ts\", \"src/storage/database.ts\", \"src/storage/schema.ts\"]}\n```",
+        "parsed": [
+          "src/cli/commands/diff.ts",
+          "src/storage/database.ts",
+          "src/storage/schema.ts"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\n  \"files\": [\n    \"bin/sem.ts\",\n    \"src/cli/commands/diff.ts\",\n    \"src/storage/database.ts\",\n    \"src/storage/schema.ts\"\n  ]\n}\n```",
+        "parsed": [
+          "bin/sem.ts",
+          "src/cli/commands/diff.ts",
+          "src/storage/database.ts",
+          "src/storage/schema.ts"
+        ],
+        "score": {
+          "precision": 0.75,
+          "recall": 1.0,
+          "f1": 0.8571
+        }
+      }
+    },
+    {
+      "commit": "9f7f1c7",
+      "commit_label": "7 new commands (11 files)",
+      "question_id": "q3_entity_type_counts",
+      "question_text": "Count the number of changed entities grouped by entity type (e.g. function, class, interface, etc). Return a JSON object: {\"counts\": {\"function\": 5, \"class\": 2, ...}}. Return ONLY the JSON, no explanation.",
+      "question_type": "dict_accuracy",
+      "ground_truth": {
+        "interface": 12,
+        "function": 15,
+        "variable": 3,
+        "class": 1
+      },
+      "sem": {
+        "raw_response": "```json\n{\"counts\": {\"interface\": 11, \"function\": 16, \"variable\": 3, \"class\": 1}}\n```",
+        "parsed": {
+          "interface": 11,
+          "function": 16,
+          "variable": 3,
+          "class": 1
+        },
+        "score": {
+          "accuracy": 0.9635,
+          "per_type": {
+            "variable": 1.0,
+            "interface": 0.9167,
+            "function": 0.9375,
+            "class": 1.0
+          }
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"counts\": {\"file\": 11}}\n```",
+        "parsed": {
+          "file": 11
+        },
+        "score": {
+          "accuracy": 0.0,
+          "per_type": {
+            "variable": 0.0,
+            "class": 0.0,
+            "file": 0.0,
+            "interface": 0.0,
+            "function": 0.0
+          }
+        }
+      }
+    },
+    {
+      "commit": "9f7f1c7",
+      "commit_label": "7 new commands (11 files)",
+      "question_id": "q4_change_type_counts",
+      "question_text": "Count the total number of added, modified, and deleted entities in this diff. Return a JSON object: {\"added\": N, \"modified\": N, \"deleted\": N}. Return ONLY the JSON, no explanation.",
+      "question_type": "exact_match",
+      "ground_truth": {
+        "added": 27,
+        "modified": 4,
+        "deleted": 0
+      },
+      "sem": {
+        "raw_response": "{\"added\": 27, \"modified\": 4, \"deleted\": 0}",
+        "parsed": {
+          "added": 27,
+          "modified": 4,
+          "deleted": 0
+        },
+        "score": {
+          "score": 1.0,
+          "fields": {
+            "added": true,
+            "modified": true,
+            "deleted": true
+          },
+          "predicted": {
+            "added": 27,
+            "modified": 4,
+            "deleted": 0
+          },
+          "truth": {
+            "added": 27,
+            "modified": 4,
+            "deleted": 0
+          }
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"added\": 8, \"modified\": 3, \"deleted\": 0}\n```",
+        "parsed": {
+          "added": 8,
+          "modified": 3,
+          "deleted": 0
+        },
+        "score": {
+          "score": 0.3333,
+          "fields": {
+            "added": false,
+            "modified": false,
+            "deleted": true
+          },
+          "predicted": {
+            "added": 8,
+            "modified": 3,
+            "deleted": 0
+          },
+          "truth": {
+            "added": 27,
+            "modified": 4,
+            "deleted": 0
+          }
+        }
+      }
+    },
+    {
+      "commit": "fffb38f",
+      "commit_label": "Speed optimization (mixed ops)",
+      "question_id": "q1_added_functions",
+      "question_text": "List all functions that were ADDED (not modified) in this diff. Return a JSON object: {\"functions\": [\"name1\", \"name2\", ...]}. Only include function names, not methods or other entity types. Return ONLY the JSON, no explanation.",
+      "question_type": "set_f1",
+      "ground_truth": [
+        "getRegistry",
+        "main",
+        "median",
+        "runN",
+        "runNAsync"
+      ],
+      "sem": {
+        "raw_response": "```json\n{\n  \"functions\": [\"median\", \"runN\", \"runNAsync\", \"main\", \"getRegistry\"]\n}\n```",
+        "parsed": [
+          "median",
+          "runN",
+          "runNAsync",
+          "main",
+          "getRegistry"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\n  \"functions\": [\n    \"median\",\n    \"runN\",\n    \"runNAsync\",\n    \"main\",\n    \"detectJsonChanges\",\n    \"getRegistry\",\n    \"parseDiffNameStatus\",\n    \"detectAndGetFiles\",\n    \"populateContent\"\n  ]\n}\n```",
+        "parsed": [
+          "median",
+          "runN",
+          "runNAsync",
+          "main",
+          "detectJsonChanges",
+          "getRegistry",
+          "parseDiffNameStatus",
+          "detectAndGetFiles",
+          "populateContent"
+        ],
+        "score": {
+          "precision": 0.5556,
+          "recall": 1.0,
+          "f1": 0.7143
+        }
+      }
+    },
+    {
+      "commit": "fffb38f",
+      "commit_label": "Speed optimization (mixed ops)",
+      "question_id": "q2_files_with_modified",
+      "question_text": "List all files that contain at least one MODIFIED (not added or deleted) entity. Return a JSON object: {\"files\": [\"path/to/file1\", ...]}. Return ONLY the JSON, no explanation.",
+      "question_type": "set_f1",
+      "ground_truth": [
+        "package-lock.json",
+        "package.json",
+        "src/cli/commands/diff.ts",
+        "src/git/bridge.ts",
+        "src/git/diff-reader.ts",
+        "src/parser/differ.ts"
+      ],
+      "sem": {
+        "raw_response": "```json\n{\"files\": [\"package-lock.json\", \"package.json\", \"src/cli/commands/diff.ts\", \"src/git/bridge.ts\", \"src/git/diff-reader.ts\", \"src/parser/differ.ts\"]}\n```",
+        "parsed": [
+          "package-lock.json",
+          "package.json",
+          "src/cli/commands/diff.ts",
+          "src/git/bridge.ts",
+          "src/git/diff-reader.ts",
+          "src/parser/differ.ts"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"files\": [\"src/cli/commands/diff.ts\", \"src/git/bridge.ts\", \"src/git/diff-reader.ts\", \"src/parser/differ.ts\"]}\n```",
+        "parsed": [
+          "src/cli/commands/diff.ts",
+          "src/git/bridge.ts",
+          "src/git/diff-reader.ts",
+          "src/parser/differ.ts"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 0.6667,
+          "f1": 0.8
+        }
+      }
+    },
+    {
+      "commit": "fffb38f",
+      "commit_label": "Speed optimization (mixed ops)",
+      "question_id": "q3_entity_type_counts",
+      "question_text": "Count the number of changed entities grouped by entity type (e.g. function, class, interface, etc). Return a JSON object: {\"counts\": {\"function\": 5, \"class\": 2, ...}}. Return ONLY the JSON, no explanation.",
+      "question_type": "dict_accuracy",
+      "ground_truth": {
+        "variable": 15,
+        "function": 9,
+        "object": 6,
+        "property": 14,
+        "class": 1
+      },
+      "sem": {
+        "raw_response": "```json\n{\n  \"counts\": {\n    \"variable\": 18,\n    \"function\": 8,\n    \"object\": 7,\n    \"property\": 11,\n    \"class\": 1\n  }\n}\n```",
+        "parsed": {
+          "variable": 18,
+          "function": 8,
+          "object": 7,
+          "property": 11,
+          "class": 1
+        },
+        "score": {
+          "accuracy": 0.873,
+          "per_type": {
+            "class": 1.0,
+            "variable": 0.8333,
+            "property": 0.7857,
+            "function": 0.8889,
+            "object": 0.8571
+          }
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\n  \"counts\": {\n    \"function\": 15,\n    \"class\": 1,\n    \"interface\": 1,\n    \"method\": 8,\n    \"variable\": 3\n  }\n}\n```",
+        "parsed": {
+          "function": 15,
+          "class": 1,
+          "interface": 1,
+          "method": 8,
+          "variable": 3
+        },
+        "score": {
+          "accuracy": 0.2571,
+          "per_type": {
+            "variable": 0.2,
+            "class": 1.0,
+            "method": 0.0,
+            "property": 0.0,
+            "interface": 0.0,
+            "function": 0.6,
+            "object": 0.0
+          }
+        }
+      }
+    },
+    {
+      "commit": "fffb38f",
+      "commit_label": "Speed optimization (mixed ops)",
+      "question_id": "q4_change_type_counts",
+      "question_text": "Count the total number of added, modified, and deleted entities in this diff. Return a JSON object: {\"added\": N, \"modified\": N, \"deleted\": N}. Return ONLY the JSON, no explanation.",
+      "question_type": "exact_match",
+      "ground_truth": {
+        "added": 32,
+        "modified": 10,
+        "deleted": 3
+      },
+      "sem": {
+        "raw_response": "```json\n{\"added\": 32, \"modified\": 10, \"deleted\": 3}\n```",
+        "parsed": {
+          "added": 32,
+          "modified": 10,
+          "deleted": 3
+        },
+        "score": {
+          "score": 1.0,
+          "fields": {
+            "added": true,
+            "modified": true,
+            "deleted": true
+          },
+          "predicted": {
+            "added": 32,
+            "modified": 10,
+            "deleted": 3
+          },
+          "truth": {
+            "added": 32,
+            "modified": 10,
+            "deleted": 3
+          }
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"added\": 238, \"modified\": 10, \"deleted\": 0}\n```",
+        "parsed": {
+          "added": 238,
+          "modified": 10,
+          "deleted": 0
+        },
+        "score": {
+          "score": 0.3333,
+          "fields": {
+            "added": false,
+            "modified": true,
+            "deleted": false
+          },
+          "predicted": {
+            "added": 238,
+            "modified": 10,
+            "deleted": 0
+          },
+          "truth": {
+            "added": 32,
+            "modified": 10,
+            "deleted": 3
+          }
+        }
+      }
+    },
+    {
+      "commit": "ae576ab",
+      "commit_label": "Rust rewrite (large)",
+      "question_id": "q1_added_functions",
+      "question_text": "List all functions that were ADDED (not modified) in this diff. Return a JSON object: {\"functions\": [\"name1\", \"name2\", ...]}. Only include function names, not methods or other entity types. Return ONLY the JSON, no explanation.",
+      "question_type": "set_f1",
+      "ground_truth": "[67 items]",
+      "sem": {
+        "raw_response": "```json\n{\n  \"functions\": [\n    \"diff_command\",\n    \"format_json\",\n    \"format_terminal\",\n    \"main\",\n    \"build_entity_id\",\n    \"match_entities\",\n    \"default_similarity\",\n    \"make_entity\",\n    \"test_exact_match_modified\",\n    \"test_exact_match_unchanged\",\n    \"test_added_deleted\",\n    \"test_content_hash_rename\",\n    \"test_default_similarity\",\n    \"test_build_entity_id_no_parent\",\n    \"test_build_entity_id_with_parent\",\n    \"compute_semantic_diff\",\n    \"extract_entities\",\n    \"visit_node\",\n    \"extract_name\",\n    \"node_text\",\n    \"map_node_type\",\n    \"get_typescript\",\n    \"get_tsx\",\n    \"get_javascript\",\n    \"get_python\",\n    \"get_go\",\n    \"get_rust\",\n    \"get_language_config\",\n    \"get_all_code_extensions\",\n    \"parse_csv_line\",\n    \"walk\",\n    \"walk_toml\",\n    \"toml_value_to_string\",\n    \"find_key_line\",\n    \"walk_yaml\",\n    \"yaml_value_to_string\",\n    \"get_extension\",\n    \"create_default_registry\",\n    \"content_hash\",\n    \"short_hash\",\n    \"test_content_hash_deterministic\",\n    \"test_content_hash_hex_format\",\n    \"test_short_hash\"\n  ]\n}\n```",
+        "parsed": [
+          "diff_command",
+          "format_json",
+          "format_terminal",
+          "main",
+          "build_entity_id",
+          "match_entities",
+          "default_similarity",
+          "make_entity",
+          "test_exact_match_modified",
+          "test_exact_match_unchanged",
+          "test_added_deleted",
+          "test_content_hash_rename",
+          "test_default_similarity",
+          "test_build_entity_id_no_parent",
+          "test_build_entity_id_with_parent",
+          "compute_semantic_diff",
+          "extract_entities",
+          "visit_node",
+          "extract_name",
+          "node_text",
+          "map_node_type",
+          "get_typescript",
+          "get_tsx",
+          "get_javascript",
+          "get_python",
+          "get_go",
+          "get_rust",
+          "get_language_config",
+          "get_all_code_extensions",
+          "parse_csv_line",
+          "walk",
+          "walk_toml",
+          "toml_value_to_string",
+          "find_key_line",
+          "walk_yaml",
+          "yaml_value_to_string",
+          "get_extension",
+          "create_default_registry",
+          "content_hash",
+          "short_hash",
+          "test_content_hash_deterministic",
+          "test_content_hash_hex_format",
+          "test_short_hash"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 0.6418,
+          "f1": 0.7818
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\n  \"functions\": [\n    \"diff_command\",\n    \"format_json\",\n    \"format_terminal\",\n    \"main\",\n    \"extract_entities\",\n    \"visit_node\",\n    \"extract_name\",\n    \"node_text\",\n    \"map_node_type\",\n    \"get_typescript\",\n    \"get_tsx\",\n    \"get_javascript\",\n    \"get_python\",\n    \"get_go\",\n    \"get_rust\",\n    \"get_language_config\",\n    \"get_all_code_extensions\",\n    \"parse_csv_line\",\n    \"walk\",\n    \"compute_semantic_diff\",\n    \"match_entities\",\n    \"default_similarity\",\n    \"build_entity_id\",\n    \"make_entity\",\n    \"content_hash\"\n  ]\n}\n```",
+        "parsed": [
+          "diff_command",
+          "format_json",
+          "format_terminal",
+          "main",
+          "extract_entities",
+          "visit_node",
+          "extract_name",
+          "node_text",
+          "map_node_type",
+          "get_typescript",
+          "get_tsx",
+          "get_javascript",
+          "get_python",
+          "get_go",
+          "get_rust",
+          "get_language_config",
+          "get_all_code_extensions",
+          "parse_csv_line",
+          "walk",
+          "compute_semantic_diff",
+          "match_entities",
+          "default_similarity",
+          "build_entity_id",
+          "make_entity",
+          "content_hash"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 0.3731,
+          "f1": 0.5435
+        }
+      }
+    },
+    {
+      "commit": "ae576ab",
+      "commit_label": "Rust rewrite (large)",
+      "question_id": "q2_files_with_modified",
+      "question_text": "List all files that contain at least one MODIFIED (not added or deleted) entity. Return a JSON object: {\"files\": [\"path/to/file1\", ...]}. Return ONLY the JSON, no explanation.",
+      "question_type": "set_f1",
+      "ground_truth": [
+        "docs/index.html"
+      ],
+      "sem": {
+        "raw_response": "```json\n{\"files\": [\"docs/index.html\"]}\n```",
+        "parsed": [
+          "docs/index.html"
+        ],
+        "score": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"files\": []}\n```",
+        "parsed": [],
+        "score": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0
+        }
+      }
+    },
+    {
+      "commit": "ae576ab",
+      "commit_label": "Rust rewrite (large)",
+      "question_id": "q3_entity_type_counts",
+      "question_text": "Count the number of changed entities grouped by entity type (e.g. function, class, interface, etc). Return a JSON object: {\"counts\": {\"function\": 5, \"class\": 2, ...}}. Return ONLY the JSON, no explanation.",
+      "question_type": "dict_accuracy",
+      "ground_truth": {
+        "chunk": 80,
+        "section": 8,
+        "property": 29,
+        "struct": 18,
+        "enum": 6,
+        "function": 87,
+        "module": 31,
+        "impl": 10,
+        "trait": 1,
+        "static": 7,
+        "constant": 1
+      },
+      "sem": {
+        "raw_response": "```json\n{\n  \"counts\": {\n    \"chunk\": 78,\n    \"section\": 5,\n    \"property\": 28,\n    \"struct\": 17,\n    \"enum\": 5,\n    \"function\": 82,\n    \"module\": 28,\n    \"impl\": 17,\n    \"trait\": 1,\n    \"static\": 7,\n    \"constant\": 1\n  }\n}\n```",
+        "parsed": {
+          "chunk": 78,
+          "section": 5,
+          "property": 28,
+          "struct": 17,
+          "enum": 5,
+          "function": 82,
+          "module": 28,
+          "impl": 17,
+          "trait": 1,
+          "static": 7,
+          "constant": 1
+        },
+        "score": {
+          "accuracy": 0.8888,
+          "per_type": {
+            "enum": 0.8333,
+            "trait": 1.0,
+            "chunk": 0.975,
+            "struct": 0.9444,
+            "module": 0.9032,
+            "static": 1.0,
+            "constant": 1.0,
+            "property": 0.9655,
+            "section": 0.625,
+            "function": 0.9425,
+            "impl": 0.5882
+          }
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"counts\": {\"package\": 2, \"module\": 7, \"function\": 16, \"struct\": 3, \"enum\": 2, \"constant\": 1, \"type\": 1}}\n```",
+        "parsed": {
+          "package": 2,
+          "module": 7,
+          "function": 16,
+          "struct": 3,
+          "enum": 2,
+          "constant": 1,
+          "type": 1
+        },
+        "score": {
+          "accuracy": 0.1469,
+          "per_type": {
+            "enum": 0.3333,
+            "trait": 0.0,
+            "chunk": 0.0,
+            "struct": 0.1667,
+            "module": 0.2258,
+            "package": 0.0,
+            "type": 0.0,
+            "static": 0.0,
+            "constant": 1.0,
+            "property": 0.0,
+            "section": 0.0,
+            "function": 0.1839,
+            "impl": 0.0
+          }
+        }
+      }
+    },
+    {
+      "commit": "ae576ab",
+      "commit_label": "Rust rewrite (large)",
+      "question_id": "q4_change_type_counts",
+      "question_text": "Count the total number of added, modified, and deleted entities in this diff. Return a JSON object: {\"added\": N, \"modified\": N, \"deleted\": N}. Return ONLY the JSON, no explanation.",
+      "question_type": "exact_match",
+      "ground_truth": {
+        "added": 259,
+        "modified": 18,
+        "deleted": 1
+      },
+      "sem": {
+        "raw_response": "```json\n{\"added\": 259, \"modified\": 18, \"deleted\": 1}\n```",
+        "parsed": {
+          "added": 259,
+          "modified": 18,
+          "deleted": 1
+        },
+        "score": {
+          "score": 1.0,
+          "fields": {
+            "added": true,
+            "modified": true,
+            "deleted": true
+          },
+          "predicted": {
+            "added": 259,
+            "modified": 18,
+            "deleted": 1
+          },
+          "truth": {
+            "added": 259,
+            "modified": 18,
+            "deleted": 1
+          }
+        }
+      },
+      "git": {
+        "raw_response": "```json\n{\"added\": 1122, \"modified\": 0, \"deleted\": 0}\n```",
+        "parsed": {
+          "added": 1122,
+          "modified": 0,
+          "deleted": 0
+        },
+        "score": {
+          "score": 0.0,
+          "fields": {
+            "added": false,
+            "modified": false,
+            "deleted": false
+          },
+          "predicted": {
+            "added": 1122,
+            "modified": 0,
+            "deleted": 0
+          },
+          "truth": {
+            "added": 259,
+            "modified": 18,
+            "deleted": 1
+          }
+        }
+      }
+    }
+  ]
+}
