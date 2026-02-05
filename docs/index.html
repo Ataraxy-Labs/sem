@@ -415,7 +415,30 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
       </div>
 
       <div class="bench-group">
-        <h3>End-to-end: sem diff (2 files changed)</h3>
+        <h3>Full pipeline: parse + insert + detect changes (2 files)</h3>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem (better-sqlite3)</span>
+            <span class="value">0.6ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" style="width: 12%">0.6ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Lix (sql.js WASM)</span>
+            <span class="value">2.8ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar lix-bar" style="width: 55%">2.8ms</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">sem is 4.7x faster (same data, same queries)</div>
+      </div>
+
+      <div class="bench-group">
+        <h3>End-to-end wall clock (2 files changed)</h3>
         <div class="bench-row">
           <div class="bench-label">
             <span class="name">git diff</span>
@@ -434,16 +457,7 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
             <div class="bench-bar sem-bar" style="width: 52%">260ms</div>
           </div>
         </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Lix (estimated)</span>
-            <span class="value">~500ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar lix-bar" style="width: 100%">~500ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">sem is ~2x faster than Lix end-to-end</div>
+        <div class="bench-multiplier">sem: Node startup 150ms + git subprocesses 100ms + compute 0.6ms</div>
       </div>
 
       <!-- Profiler breakdown -->
