@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>sem &mdash; Changelog</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0a0a0a;
+      --fg: #e0e0e0;
+      --dim: #666;
+      --dim2: #444;
+      --border: #222;
+      --accent: #fff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --blue: #60a5fa;
+      --cyan: #22d3ee;
+      --purple: #a78bfa;
+      --orange: #fb923c;
+      --surface: #111;
+      --surface2: #141414;
+      --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    }
+
+    body {
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--fg); text-decoration-color: var(--dim); text-underline-offset: 3px; }
+    a:hover { color: var(--accent); text-decoration-color: var(--accent); }
+
+    .container { max-width: 800px; margin: 0 auto; padding: 0 24px; }
+
+    /* Nav */
+    nav {
+      padding: 20px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 50;
+    }
+    nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); text-decoration: none; }
+    nav .logo:hover { color: var(--accent); }
+    nav .links { display: flex; gap: 20px; font-size: 13px; color: var(--dim); }
+
+    /* Sections */
+    section { padding: 60px 0; }
+    section h2 {
+      font-size: 22px; font-weight: 600; color: var(--accent);
+      margin-bottom: 12px; letter-spacing: -0.5px;
+    }
+    section .section-desc {
+      font-size: 14px; color: var(--dim); margin-bottom: 32px; line-height: 1.7;
+    }
+
+    /* Changelog */
+    .changelog-entry { padding: 20px 0; border-bottom: 1px solid #181818; }
+    .changelog-entry:last-child { border-bottom: none; }
+    .changelog-sha {
+      font-size: 12px; color: var(--cyan); background: var(--surface);
+      padding: 2px 8px; border-radius: 4px; margin-right: 8px;
+    }
+    .changelog-tag {
+      font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-right: 6px;
+    }
+    .changelog-tag.feat { background: #1a2e1a; color: var(--green); }
+    .changelog-tag.perf { background: #2e2a1a; color: var(--yellow); }
+    .changelog-tag.fix { background: #2e1a1a; color: var(--red); }
+    .changelog-tag.rewrite { background: #1a1a2e; color: var(--blue); }
+    .changelog-tag.docs { background: #1e1a2e; color: var(--purple); }
+    .changelog-title { font-size: 14px; color: var(--accent); font-weight: 600; margin-bottom: 6px; }
+    .changelog-body { font-size: 12px; color: var(--dim); line-height: 1.7; }
+    .changelog-stats { font-size: 11px; color: var(--dim2); margin-top: 8px; }
+    .changelog-mistake {
+      margin-top: 10px; padding: 10px 14px; border-left: 2px solid var(--yellow);
+      background: #1a1a0f; font-size: 12px; color: var(--dim); line-height: 1.6;
+    }
+    .changelog-mistake strong { color: var(--yellow); font-weight: 600; }
+
+    /* Footer */
+    footer {
+      padding: 40px 0; border-top: 1px solid var(--border);
+      text-align: center; font-size: 12px; color: var(--dim);
+    }
+
+    @media (max-width: 640px) {
+      nav .links { gap: 12px; font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <nav>
+      <a href="index.html" class="logo">sem</a>
+      <div class="links">
+        <a href="/">Home</a>
+        <a href="/agents.html">Agents</a>
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+      </div>
+    </nav>
+
+    <section>
+      <h2>Changelog</h2>
+      <p class="section-desc">
+        How sem evolved &mdash; including the mistakes.
+      </p>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">01edf1f</span>
+          <span class="changelog-tag feat">feat</span>
+          Initial release
+        </div>
+        <p class="changelog-body">
+          First working version. <code style="color:var(--cyan)">sem diff</code> with tree-sitter parsing for TypeScript, JavaScript, Python, Go, Rust.
+          JSON/YAML/TOML/CSV/Markdown support via custom parsers. Three-phase entity matching (exact ID, content hash, fuzzy similarity).
+        </p>
+        <p class="changelog-stats">Node.js + TypeScript &bull; tsup build &bull; better-sqlite3 for storage &bull; ~290ms cold start</p>
+        <div class="changelog-mistake">
+          <strong>Mistake: Node.js startup overhead.</strong> The entire runtime &mdash; V8 init, module resolution, dynamic imports of tree-sitter WASM binaries &mdash; took ~120ms before any real work began. For a CLI tool that should feel instant, this was a problem we didn't think about until we started measuring.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">9f7f1c7</span>
+          <span class="changelog-tag feat">feat</span>
+          7 new commands
+        </div>
+        <p class="changelog-body">
+          Added <code style="color:var(--cyan)">blame</code>, <code style="color:var(--cyan)">status</code>, <code style="color:var(--cyan)">watch</code>, <code style="color:var(--cyan)">review</code>, <code style="color:var(--cyan)">history</code>, <code style="color:var(--cyan)">label</code>, <code style="color:var(--cyan)">comment</code>.
+          Entity-level blame (who last touched each function), semantic PR review with risk signals, real-time file watching, threaded comments on entities.
+        </p>
+        <p class="changelog-stats">+1,191 lines &bull; 12 files &bull; 15 functions, 12 interfaces, 3 variables, 1 class added</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">fffb38f</span>
+          <span class="changelog-tag perf">perf</span>
+          591ms &rarr; 260ms (56% faster)
+        </div>
+        <p class="changelog-body">
+          Parallelized git operations. Replaced sequential <code style="color:var(--cyan)">simple-git</code> calls with batched <code style="color:var(--cyan)">diff --name-status</code> + <code style="color:var(--cyan)">show</code>. Lazy-loaded parsers instead of importing all grammars upfront. Added internal benchmarking harness.
+        </p>
+        <p class="changelog-stats">+705 lines &bull; 32 added, 10 modified, 3 deleted entities across 5 types</p>
+        <div class="changelog-mistake">
+          <strong>Mistake: optimizing the wrong layer.</strong> We spent a week shaving milliseconds off the Node.js implementation &mdash; lazy imports, worker threads, caching git objects. Got from 591ms to 260ms, which felt like a win. But 120ms of that was still V8 startup that no amount of application-level optimization could touch. The real fix was switching runtimes entirely.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">ae576ab</span>
+          <span class="changelog-tag rewrite">rewrite</span>
+          Rust rewrite: 30ms (10x faster)
+        </div>
+        <p class="changelog-body">
+          Rewrote <code style="color:var(--cyan)">sem diff</code> as a compiled Rust binary. git2 for in-process git operations (no subprocess spawning), tree-sitter grammars compiled directly into the binary (no WASM, no dynamic loading).
+          Cargo workspace: <code style="color:var(--cyan)">sem-core</code> (library) + <code style="color:var(--cyan)">sem-cli</code> (binary). All 7 parser plugins ported.
+        </p>
+        <p class="changelog-stats">+3,905 lines &bull; 278 entities &bull; 11 entity types including Rust-specific (struct, impl, trait)</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: where the time actually goes.</strong> Node.js breakdown: ~120ms V8 startup, ~80ms module resolution, ~50ms WASM grammar load, ~40ms git subprocess spawn.
+          Rust breakdown: ~3ms binary load, ~5ms git2 repo open, ~17ms parse + match. The entire Rust binary finishes before Node even loads its first module.
+          We should have started in Rust &mdash; but building in Node first let us iterate on the algorithm fast, and the Rust port was straightforward because the architecture was already proven.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">bench</span>
+          <span class="changelog-tag docs">bench</span>
+          Agent accuracy benchmark
+        </div>
+        <p class="changelog-body">
+          Proved that AI agents are 2.3x more accurate at answering questions about code changes when given <code style="color:var(--green)">sem diff</code> JSON vs raw <code style="color:var(--blue)">git diff</code> output.
+          Tested with Claude Sonnet 4.5 across 4 question types and 3 commits of varying size.
+          Core finding: line diffs cause systematic failures &mdash; the model confuses lines with entities, can't distinguish adds from modifications, and has no entity type vocabulary.
+        </p>
+        <p class="changelog-stats">24 API calls &bull; sem 95.9% avg accuracy vs git 41.5% &bull; +54.4% delta</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">next</span>
+          <span class="changelog-tag feat">feat</span>
+          Homebrew distribution
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--cyan)">brew install sem-diff</code> &mdash; single command install via Homebrew tap.
+          Formula builds from source using Cargo, compiles all tree-sitter grammars in, links against system libgit2.
+          Includes a test that verifies entity extraction on a Python function.
+        </p>
+        <p class="changelog-stats">3 install methods: Homebrew (recommended) &bull; curl installer &bull; cargo install from source</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: distribution matters as much as the tool.</strong> A fast binary that's hard to install doesn't get adopted.
+          We started with <code style="color:var(--dim)">npm install -g</code>, then a curl script, and finally Homebrew.
+          Each step removed friction &mdash; Homebrew handles updates, dependencies, and uninstall for free.
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <p>Built by <a href="https://github.com/Ataraxy-Labs">Ataraxy Labs</a></p>
+    </footer>
+  </div>
+</body>
+</html>

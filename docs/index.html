@@ -215,41 +215,6 @@
       text-align: center; font-size: 12px; color: var(--dim);
     }
 
-    /* Changelog */
-    .changelog-entry { padding: 20px 0; border-bottom: 1px solid #181818; }
-    .changelog-entry:last-child { border-bottom: none; }
-    .changelog-sha {
-      font-size: 12px; color: var(--cyan); background: var(--surface);
-      padding: 2px 8px; border-radius: 4px; margin-right: 8px;
-    }
-    .changelog-tag {
-      font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-right: 6px;
-    }
-    .changelog-tag.feat { background: #1a2e1a; color: var(--green); }
-    .changelog-tag.perf { background: #2e2a1a; color: var(--yellow); }
-    .changelog-tag.fix { background: #2e1a1a; color: var(--red); }
-    .changelog-tag.rewrite { background: #1a1a2e; color: var(--blue); }
-    .changelog-tag.docs { background: #1e1a2e; color: var(--purple); }
-    .changelog-title { font-size: 14px; color: var(--accent); font-weight: 600; margin-bottom: 6px; }
-    .changelog-body { font-size: 12px; color: var(--dim); line-height: 1.7; }
-    .changelog-stats { font-size: 11px; color: var(--dim2); margin-top: 8px; }
-    .changelog-mistake {
-      margin-top: 10px; padding: 10px 14px; border-left: 2px solid var(--yellow);
-      background: #1a1a0f; font-size: 12px; color: var(--dim); line-height: 1.6;
-    }
-    .changelog-mistake strong { color: var(--yellow); font-weight: 600; }
-
-    /* Findings */
-    .finding-card {
-      padding: 16px; border: 1px solid var(--border); border-radius: 8px;
-      margin-bottom: 12px;
-    }
-    .finding-card h4 { font-size: 13px; color: var(--accent); margin-bottom: 8px; }
-    .finding-example {
-      font-size: 12px; line-height: 1.6; padding: 10px 14px;
-      background: var(--surface); border-radius: 6px; margin-top: 8px;
-    }
-
     @media (max-width: 640px) {
       .profiler-grid { grid-template-columns: 1fr; }
       .cmd-row { flex-direction: column; gap: 4px; }
@@ -267,8 +232,8 @@
         <a href="#formats">Formats</a>
         <a href="#output">Output</a>
         <a href="#benchmarks">Benchmarks</a>
-        <a href="#agent-accuracy">Agents</a>
-        <a href="#changelog">Changelog</a>
+        <a href="agents.html">Agents</a>
+        <a href="changelog.html">Changelog</a>
         <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
       </div>
     </nav>
@@ -324,18 +289,8 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
     <section id="commands">
       <h2>Commands</h2>
       <p class="section-desc">
-        11 commands. Every command supports <code style="color:var(--cyan)">--format json</code> for machine-readable output.
+        <code style="color:var(--cyan)">--format json</code> for machine-readable output. More commands coming soon.
       </p>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem init</span>
-          <span class="cmd-doc-desc">Initialize sem in the current repo</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><span>Creates .sem/ directory and SQLite database for queries, labels, and comments.</span></div>
-        </div>
-      </div>
 
       <div class="cmd-doc">
         <div class="cmd-doc-header">
@@ -347,108 +302,6 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
           <div class="flag"><code>-c, --commit &lt;sha&gt;</code> <span>Diff a specific commit</span></div>
           <div class="flag"><code>--from &lt;ref&gt; --to &lt;ref&gt;</code> <span>Diff a commit range</span></div>
           <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
-          <div class="flag"><code>--store</code> <span>Save changes to the database</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem status</span>
-          <span class="cmd-doc-desc">Semantic status with entity counts</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem log</span>
-          <span class="cmd-doc-desc">Semantic commit history</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-n, --count &lt;n&gt;</code> <span>Number of commits (default: 5)</span></div>
-          <div class="flag"><code>--store</code> <span>Save changes to the database</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem blame &lt;file&gt;</span>
-          <span class="cmd-doc-desc">Entity-level blame — who last touched each function</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-d, --depth &lt;n&gt;</code> <span>Commits to search (default: 50)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem history &lt;entity&gt;</span>
-          <span class="cmd-doc-desc">Full timeline of a single entity across commits</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>entity</code> <span>"auth.ts::function::login" or "auth.ts::login" or just "login"</span></div>
-          <div class="flag"><code>-d, --depth &lt;n&gt;</code> <span>Commits to search (default: 50)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem review &lt;branch|PR#&gt;</span>
-          <span class="cmd-doc-desc">Semantic PR review with risk signals</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-b, --base &lt;ref&gt;</code> <span>Base branch (default: main)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-          <div class="flag"><span>Flags: deleted functions, modified configs, large changesets</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem watch</span>
-          <span class="cmd-doc-desc">Real-time semantic diff on file changes</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>--debounce &lt;ms&gt;</code> <span>Debounce interval (default: 500ms)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem query &lt;sql&gt;</span>
-          <span class="cmd-doc-desc">Run SQL against stored changes</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>sql</code> <span>Any SQL query against the .sem/sem.db database</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem label &lt;entity&gt; [label]</span>
-          <span class="cmd-doc-desc">Add, remove, or list labels on entities</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-r, --remove</code> <span>Remove the label</span></div>
-          <div class="flag"><code>-l, --list</code> <span>List all labels for the entity</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem comment &lt;entity&gt; [body]</span>
-          <span class="cmd-doc-desc">Threaded comments on entities</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-a, --author &lt;name&gt;</code> <span>Comment author (defaults to git user.name)</span></div>
-          <div class="flag"><code>--reply &lt;id&gt;</code> <span>Reply to an existing comment</span></div>
         </div>
       </div>
     </section>
@@ -497,9 +350,9 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
 
     <!-- ═══ Output formats ═══ -->
     <section id="output">
-      <h2>Output formats</h2>
+      <h2>Output</h2>
       <p class="section-desc">
-        Every command outputs structured JSON. Pipe sem into your AI agent, CI pipeline, or automation.
+        Structured JSON. Pipe sem into your AI agent, CI pipeline, or automation.
       </p>
       <div class="terminal">
         <div class="terminal-bar">
@@ -524,59 +377,6 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
       <span class="b">"entityType"</span>: <span class="d">"function"</span>,
       <span class="b">"entityName"</span>: <span class="w">"validateToken"</span>,
       <span class="b">"filePath"</span>: <span class="d">"src/auth.ts"</span>
-    <span class="d">}</span>
-  <span class="d">]</span>
-<span class="d">}</span></pre>
-        </div>
-      </div>
-
-      <div class="terminal" style="margin-top: 16px;">
-        <div class="terminal-bar">
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-title">SQL queries</div>
-        </div>
-        <div class="terminal-body">
-<pre><span class="cmd">$ sem query "SELECT entity_name, change_type FROM changes WHERE entity_type = 'function'"</span>
-
-entity_name          | change_type
---------------------------------------
-validateToken        | added
-authenticateUser     | modified
-legacyAuth           | deleted</pre>
-        </div>
-      </div>
-    </section>
-
-    <!-- ═══ Validation ═══ -->
-    <section>
-      <h2>Validation rules</h2>
-      <p class="section-desc">
-        Define rules in <code style="color:var(--cyan)">.semrc.json</code>. sem diff auto-checks them.
-      </p>
-      <div class="terminal">
-        <div class="terminal-bar">
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-title">.semrc.json</div>
-        </div>
-        <div class="terminal-body">
-<pre><span class="d">{</span>
-  <span class="b">"rules"</span>: <span class="d">[</span>
-    <span class="d">{</span>
-      <span class="b">"name"</span>: <span class="c">"no-delete-public-api"</span>,
-      <span class="b">"match"</span>: <span class="d">{</span> <span class="b">"changeType"</span>: <span class="r">"deleted"</span>, <span class="b">"entityType"</span>: <span class="d">"function"</span> <span class="d">}</span>,
-      <span class="b">"severity"</span>: <span class="r">"error"</span>,
-      <span class="b">"message"</span>: <span class="c">"Public function deleted — this is a breaking change"</span>
-    <span class="d">}</span>,
-    <span class="d">{</span>
-      <span class="b">"name"</span>: <span class="c">"pool-size-limit"</span>,
-      <span class="b">"match"</span>: <span class="d">{</span> <span class="b">"entityType"</span>: <span class="d">"property"</span>, <span class="b">"filePath"</span>: <span class="d">"**/database.*"</span> <span class="d">}</span>,
-      <span class="b">"condition"</span>: <span class="d">{</span> <span class="b">"operator"</span>: <span class="d">"value >"</span>, <span class="b">"value"</span>: <span class="y">50</span> <span class="d">}</span>,
-      <span class="b">"severity"</span>: <span class="y">"warning"</span>,
-      <span class="b">"message"</span>: <span class="c">"Database pool size exceeds 50"</span>
     <span class="d">}</span>
   <span class="d">]</span>
 <span class="d">}</span></pre>
@@ -626,49 +426,14 @@ legacyAuth           | deleted</pre>
               <td class="win">3-phase (ID + hash + fuzzy)</td>
             </tr>
             <tr>
-              <td>SQL queries</td>
-              <td class="na">no</td>
-              <td class="win">full SQLite</td>
-            </tr>
-            <tr>
               <td>Machine-readable output</td>
               <td class="lose">patch format</td>
-              <td class="win">JSON + SQL</td>
-            </tr>
-            <tr>
-              <td>Entity blame</td>
-              <td class="lose">line-level only</td>
-              <td class="win">entity-level</td>
-            </tr>
-            <tr>
-              <td>Entity history</td>
-              <td class="lose">file-level only</td>
-              <td class="win">per-entity timeline</td>
-            </tr>
-            <tr>
-              <td>PR review</td>
-              <td class="lose">manual</td>
-              <td class="win">semantic + risk signals</td>
-            </tr>
-            <tr>
-              <td>Validation rules</td>
-              <td class="na">no</td>
-              <td class="win">.semrc.json</td>
-            </tr>
-            <tr>
-              <td>Labels / Comments</td>
-              <td class="na">no</td>
-              <td class="win">on entities</td>
-            </tr>
-            <tr>
-              <td>File watcher</td>
-              <td class="na">no</td>
-              <td class="win">sem watch</td>
+              <td class="win">JSON</td>
             </tr>
             <tr>
               <td>Agent accuracy</td>
               <td class="lose">41.5% avg</td>
-              <td class="win">95.9% avg (<a href="#agent-accuracy" style="color:var(--green)">benchmark</a>)</td>
+              <td class="win">95.9% avg (<a href="agents.html" style="color:var(--green)">benchmark</a>)</td>
             </tr>
             <tr>
               <td>Speed</td>
@@ -890,264 +655,6 @@ legacyAuth           | deleted</pre>
       <div id="flame-graph-mount"></div>
     </section>
 
-    <!-- ═══ Agent Accuracy ═══ -->
-    <section id="agent-accuracy">
-      <h2>Agent accuracy</h2>
-      <p class="section-desc">
-        Same questions about code changes, answered by Claude Sonnet 4.5. One gets <code style="color:var(--green)">sem diff</code> JSON, the other gets raw <code style="color:var(--blue)">git diff</code>. Scored against ground truth across 3 commits (small, medium, large).
-      </p>
-
-      <div style="display: flex; gap: 14px; margin-bottom: 24px; font-size: 12px;">
-        <div style="display: flex; align-items: center; gap: 6px;">
-          <div style="width: 12px; height: 12px; border-radius: 2px; background: var(--green);"></div>
-          <span style="color: var(--dim);">sem diff</span>
-        </div>
-        <div style="display: flex; align-items: center; gap: 6px;">
-          <div style="width: 12px; height: 12px; border-radius: 2px; background: var(--blue);"></div>
-          <span style="color: var(--dim);">git diff</span>
-        </div>
-      </div>
-
-      <div class="bench-group" id="agent-bench-mount">
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Q1: List added functions (F1)</span>
-            <span class="value" id="q1-values"></span>
-          </div>
-          <div style="display: flex; gap: 4px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar sem-bar" id="q1-sem-bar" style="width: 0%"></div>
-            </div>
-          </div>
-          <div style="display: flex; gap: 4px; margin-top: 2px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar git-bar" id="q1-git-bar" style="width: 0%"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="bench-row" style="margin-top: 16px;">
-          <div class="bench-label">
-            <span class="name">Q2: Files with modified entities (F1)</span>
-            <span class="value" id="q2-values"></span>
-          </div>
-          <div style="display: flex; gap: 4px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar sem-bar" id="q2-sem-bar" style="width: 0%"></div>
-            </div>
-          </div>
-          <div style="display: flex; gap: 4px; margin-top: 2px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar git-bar" id="q2-git-bar" style="width: 0%"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="bench-row" style="margin-top: 16px;">
-          <div class="bench-label">
-            <span class="name">Q3: Entity type counts (accuracy)</span>
-            <span class="value" id="q3-values"></span>
-          </div>
-          <div style="display: flex; gap: 4px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar sem-bar" id="q3-sem-bar" style="width: 0%"></div>
-            </div>
-          </div>
-          <div style="display: flex; gap: 4px; margin-top: 2px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar git-bar" id="q3-git-bar" style="width: 0%"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="bench-row" style="margin-top: 16px;">
-          <div class="bench-label">
-            <span class="name">Q4: Added/modified/deleted counts (exact)</span>
-            <span class="value" id="q4-values"></span>
-          </div>
-          <div style="display: flex; gap: 4px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar sem-bar" id="q4-sem-bar" style="width: 0%"></div>
-            </div>
-          </div>
-          <div style="display: flex; gap: 4px; margin-top: 2px;">
-            <div class="bench-bar-track" style="flex:1">
-              <div class="bench-bar git-bar" id="q4-git-bar" style="width: 0%"></div>
-            </div>
-          </div>
-        </div>
-
-        <div id="agent-bench-overall" style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
-          <span style="font-size: 14px; color: var(--accent); font-weight: 600;">Overall average</span>
-          <span id="overall-values" style="font-size: 13px;"></span>
-        </div>
-        <div id="agent-bench-delta" class="bench-multiplier" style="margin-top: 8px;"></div>
-      </div>
-
-      <!-- Detailed findings -->
-      <h3 style="font-size: 16px; color: var(--accent); margin: 40px 0 12px;">Why git diff fails agents</h3>
-      <p class="section-desc" style="margin-bottom: 16px;">
-        Tested on 3 commits from this repo. Each exposes a different failure mode when agents reason about raw line diffs.
-      </p>
-
-      <div class="finding-card">
-        <h4>Line/entity confusion <span style="color: var(--dim); font-weight: 400;">— Q4 on all commits</span></h4>
-        <p style="font-size: 12px; color: var(--dim); line-height: 1.6;">
-          git diff has no concept of "entity." When asked to count added entities, the model counts <code style="color:var(--cyan)">+</code> lines instead.
-          On the speed optimization commit (<code style="color:var(--cyan)">fffb38f</code>), git-based Claude reported <span style="color:var(--red)">238 added</span> — the number of <code style="color:var(--cyan)">+</code> lines in the diff.
-          The actual count is <span style="color:var(--green)">32 added entities</span>. On the Rust rewrite, it said <span style="color:var(--red)">1,122</span> vs truth of <span style="color:var(--green)">259</span>.
-        </p>
-        <div class="finding-example">
-          <span class="d">git-based:</span> <span class="r">{"added": 238, "modified": 10, "deleted": 0}</span><br>
-          <span class="d">sem-based:</span> <span class="g">{"added": 32, "modified": 10, "deleted": 3}</span> <span class="d">// exact match</span>
-        </div>
-      </div>
-
-      <div class="finding-card">
-        <h4>No entity type ontology <span style="color: var(--dim); font-weight: 400;">— Q3 on all commits</span></h4>
-        <p style="font-size: 12px; color: var(--dim); line-height: 1.6;">
-          Line diffs have no AST. On commit <code style="color:var(--cyan)">9f7f1c7</code> (7 new commands), git-based Claude returned <code style="color:var(--red)">{"file": 11}</code> — it counted files, not entities.
-          Truth: <code style="color:var(--green)">{"interface": 12, "function": 15, "variable": 3, "class": 1}</code>.
-          On the Rust rewrite, it found 16 functions when there are 87, and completely missed <code style="color:var(--cyan)">chunk</code> (80), <code style="color:var(--cyan)">property</code> (29), <code style="color:var(--cyan)">impl</code> (10).
-        </p>
-      </div>
-
-      <div class="finding-card">
-        <h4>Can't distinguish add vs modify <span style="color: var(--dim); font-weight: 400;">— Q1, Q2</span></h4>
-        <p style="font-size: 12px; color: var(--dim); line-height: 1.6;">
-          Modified functions show <code style="color:var(--cyan)">+</code> and <code style="color:var(--cyan)">-</code> hunks, same as new functions in changed files. On <code style="color:var(--cyan)">fffb38f</code>,
-          git-based Claude listed 9 "added" functions — 4 were actually modified (<code style="color:var(--dim)">detectJsonChanges</code>, <code style="color:var(--dim)">parseDiffNameStatus</code>, <code style="color:var(--dim)">detectAndGetFiles</code>, <code style="color:var(--dim)">populateContent</code>).
-          Precision dropped to 55.6%. sem tags each entity with <code style="color:var(--green)">changeType: "added"</code> vs <code style="color:var(--yellow)">changeType: "modified"</code>.
-        </p>
-      </div>
-
-      <div class="finding-card">
-        <h4>Config file blindness <span style="color: var(--dim); font-weight: 400;">— Q2, Q3</span></h4>
-        <p style="font-size: 12px; color: var(--dim); line-height: 1.6;">
-          JSON/YAML/TOML changes appear as raw <code style="color:var(--cyan)">+</code>/<code style="color:var(--cyan)">-</code> key-value lines. The model doesn't classify these as "entities."
-          On <code style="color:var(--cyan)">fffb38f</code>, git-based Claude missed <code style="color:var(--dim)">package.json</code> and <code style="color:var(--dim)">package-lock.json</code> as containing modified entities (recall dropped to 66.7%).
-          sem reports <code style="color:var(--green)">entityType: "property"</code> for each changed key.
-        </p>
-      </div>
-
-      <div class="finding-card">
-        <h4>Context window pressure <span style="color: var(--dim); font-weight: 400;">— Q1 on large diffs</span></h4>
-        <p style="font-size: 12px; color: var(--dim); line-height: 1.6;">
-          Both tools degrade on the 3,905-line Rust rewrite (<code style="color:var(--cyan)">ae576ab</code>). git diff was truncated at 100KB — the model found 25/67 added functions (37% recall).
-          sem's stripped JSON is much more compact (no source code), so the model saw all 278 entities but still only extracted 43/67 (64% recall).
-          sem wins, but large diffs are where attention limits hurt regardless of format.
-        </p>
-      </div>
-
-      <p style="font-size: 11px; color: var(--dim2); margin-top: 20px;">
-        3 commits &times; 4 questions &times; 2 tools = 24 API calls. Claude Sonnet 4.5, temperature 0. Content fields stripped from sem JSON for fair comparison.
-        <a href="https://github.com/Ataraxy-Labs/sem/blob/main/bench/agent-accuracy.py" style="color: var(--dim);">Reproduce &rarr;</a>
-      </p>
-    </section>
-
-    <!-- ═══ Changelog ═══ -->
-    <section id="changelog">
-      <h2>Changelog</h2>
-      <p class="section-desc">
-        How sem evolved — including the mistakes.
-      </p>
-
-      <div class="changelog-entry">
-        <div class="changelog-title">
-          <span class="changelog-sha">01edf1f</span>
-          <span class="changelog-tag feat">feat</span>
-          Initial release
-        </div>
-        <p class="changelog-body">
-          First working version. <code style="color:var(--cyan)">sem diff</code> with tree-sitter parsing for TypeScript, JavaScript, Python, Go, Rust.
-          JSON/YAML/TOML/CSV/Markdown support via custom parsers. Three-phase entity matching (exact ID, content hash, fuzzy similarity).
-        </p>
-        <p class="changelog-stats">Node.js + TypeScript &bull; tsup build &bull; better-sqlite3 for storage &bull; ~290ms cold start</p>
-        <div class="changelog-mistake">
-          <strong>Mistake: Node.js startup overhead.</strong> The entire runtime — V8 init, module resolution, dynamic imports of tree-sitter WASM binaries — took ~120ms before any real work began. For a CLI tool that should feel instant, this was a problem we didn't think about until we started measuring.
-        </div>
-      </div>
-
-      <div class="changelog-entry">
-        <div class="changelog-title">
-          <span class="changelog-sha">9f7f1c7</span>
-          <span class="changelog-tag feat">feat</span>
-          7 new commands
-        </div>
-        <p class="changelog-body">
-          Added <code style="color:var(--cyan)">blame</code>, <code style="color:var(--cyan)">status</code>, <code style="color:var(--cyan)">watch</code>, <code style="color:var(--cyan)">review</code>, <code style="color:var(--cyan)">history</code>, <code style="color:var(--cyan)">label</code>, <code style="color:var(--cyan)">comment</code>.
-          Entity-level blame (who last touched each function), semantic PR review with risk signals, real-time file watching, threaded comments on entities.
-        </p>
-        <p class="changelog-stats">+1,191 lines &bull; 12 files &bull; 15 functions, 12 interfaces, 3 variables, 1 class added</p>
-      </div>
-
-      <div class="changelog-entry">
-        <div class="changelog-title">
-          <span class="changelog-sha">fffb38f</span>
-          <span class="changelog-tag perf">perf</span>
-          591ms &rarr; 260ms (56% faster)
-        </div>
-        <p class="changelog-body">
-          Parallelized git operations. Replaced sequential <code style="color:var(--cyan)">simple-git</code> calls with batched <code style="color:var(--cyan)">diff --name-status</code> + <code style="color:var(--cyan)">show</code>. Lazy-loaded parsers instead of importing all grammars upfront. Added internal benchmarking harness.
-        </p>
-        <p class="changelog-stats">+705 lines &bull; 32 added, 10 modified, 3 deleted entities across 5 types</p>
-        <div class="changelog-mistake">
-          <strong>Mistake: optimizing the wrong layer.</strong> We spent a week shaving milliseconds off the Node.js implementation — lazy imports, worker threads, caching git objects. Got from 591ms to 260ms, which felt like a win. But 120ms of that was still V8 startup that no amount of application-level optimization could touch. The real fix was switching runtimes entirely.
-        </div>
-      </div>
-
-      <div class="changelog-entry">
-        <div class="changelog-title">
-          <span class="changelog-sha">ae576ab</span>
-          <span class="changelog-tag rewrite">rewrite</span>
-          Rust rewrite: 30ms (10x faster)
-        </div>
-        <p class="changelog-body">
-          Rewrote <code style="color:var(--cyan)">sem diff</code> as a compiled Rust binary. git2 for in-process git operations (no subprocess spawning), tree-sitter grammars compiled directly into the binary (no WASM, no dynamic loading).
-          Cargo workspace: <code style="color:var(--cyan)">sem-core</code> (library) + <code style="color:var(--cyan)">sem-cli</code> (binary). All 7 parser plugins ported.
-        </p>
-        <p class="changelog-stats">+3,905 lines &bull; 278 entities &bull; 11 entity types including Rust-specific (struct, impl, trait)</p>
-        <div class="changelog-mistake">
-          <strong>Lesson: where the time actually goes.</strong> Node.js breakdown: ~120ms V8 startup, ~80ms module resolution, ~50ms WASM grammar load, ~40ms git subprocess spawn.
-          Rust breakdown: ~3ms binary load, ~5ms git2 repo open, ~17ms parse + match. The entire Rust binary finishes before Node even loads its first module.
-          We should have started in Rust — but building in Node first let us iterate on the algorithm fast, and the Rust port was straightforward because the architecture was already proven.
-        </div>
-      </div>
-
-      <div class="changelog-entry">
-        <div class="changelog-title">
-          <span class="changelog-sha">bench</span>
-          <span class="changelog-tag docs">bench</span>
-          Agent accuracy benchmark
-        </div>
-        <p class="changelog-body">
-          Proved that AI agents are 2.3x more accurate at answering questions about code changes when given <code style="color:var(--green)">sem diff</code> JSON vs raw <code style="color:var(--blue)">git diff</code> output.
-          Tested with Claude Sonnet 4.5 across 4 question types and 3 commits of varying size.
-          Core finding: line diffs cause systematic failures — the model confuses lines with entities, can't distinguish adds from modifications, and has no entity type vocabulary.
-        </p>
-        <p class="changelog-stats">24 API calls &bull; sem 95.9% avg accuracy vs git 41.5% &bull; +54.4% delta</p>
-      </div>
-
-      <div class="changelog-entry">
-        <div class="changelog-title">
-          <span class="changelog-sha">next</span>
-          <span class="changelog-tag feat">feat</span>
-          Homebrew distribution
-        </div>
-        <p class="changelog-body">
-          <code style="color:var(--cyan)">brew install sem-diff</code> — single command install via Homebrew tap.
-          Formula builds from source using Cargo, compiles all tree-sitter grammars in, links against system libgit2.
-          Includes a test that verifies entity extraction on a Python function.
-        </p>
-        <p class="changelog-stats">3 install methods: Homebrew (recommended) &bull; curl installer &bull; cargo install from source</p>
-        <div class="changelog-mistake">
-          <strong>Lesson: distribution matters as much as the tool.</strong> A fast binary that's hard to install doesn't get adopted.
-          We started with <code style="color:var(--dim)">npm install -g</code>, then a curl script, and finally Homebrew.
-          Each step removed friction — Homebrew handles updates, dependencies, and uninstall for free.
-        </div>
-      </div>
-    </section>
-
     <footer>
       <p>Built by <a href="https://github.com/Ataraxy-Labs">Ataraxy Labs</a></p>
     </footer>
@@ -1330,45 +837,6 @@ legacyAuth           | deleted</pre>
       mount.appendChild(fContainer);
     })();
 
-    // Agent accuracy benchmark results
-    // Updated by bench/agent-accuracy.py — replace this block with real data after running
-    (function() {
-      const data = {
-        q1_added_functions:{ sem: 0.9274, git: 0.7526 },
-        q2_files_with_modified:{ sem: 1.0000, git: 0.5519 },
-        q3_entity_type_counts:{ sem: 0.9083, git: 0.1346 },
-        q4_change_type_counts:{ sem: 1.0000, git: 0.2222 },
-      };
-
-      const qs = ['q1', 'q2', 'q3', 'q4'];
-      const keys = ['q1_added_functions', 'q2_files_with_modified', 'q3_entity_type_counts', 'q4_change_type_counts'];
-
-      keys.forEach((key, i) => {
-        const q = qs[i];
-        const sem = data[key].sem;
-        const git = data[key].git;
-        const semBar = document.getElementById(q + '-sem-bar');
-        const gitBar = document.getElementById(q + '-git-bar');
-        const values = document.getElementById(q + '-values');
-        if (semBar) semBar.style.width = (sem * 100) + '%';
-        if (gitBar) gitBar.style.width = (git * 100) + '%';
-        if (semBar) semBar.textContent = sem > 0.08 ? (sem * 100).toFixed(0) + '%' : '';
-        if (gitBar) gitBar.textContent = git > 0.08 ? (git * 100).toFixed(0) + '%' : '';
-        if (values) values.innerHTML = '<span style="color:var(--green)">' + (sem * 100).toFixed(0) + '%</span> vs <span style="color:var(--blue)">' + (git * 100).toFixed(0) + '%</span>';
-      });
-
-      const allSem = keys.map(k => data[k].sem);
-      const allGit = keys.map(k => data[k].git);
-      const semAvg = allSem.reduce((a,b) => a+b, 0) / allSem.length;
-      const gitAvg = allGit.reduce((a,b) => a+b, 0) / allGit.length;
-      const overall = document.getElementById('overall-values');
-      if (overall) overall.innerHTML = '<span style="color:var(--green)">' + (semAvg * 100).toFixed(0) + '%</span> vs <span style="color:var(--blue)">' + (gitAvg * 100).toFixed(0) + '%</span>';
-      const delta = document.getElementById('agent-bench-delta');
-      if (delta && semAvg > gitAvg) {
-        const pct = ((semAvg - gitAvg) / gitAvg * 100).toFixed(0);
-        delta.textContent = 'Structured sem diff improves agent accuracy by +' + pct + '% over raw line diffs.';
-      }
-    })();
   </script>
 </body>
 </html>
