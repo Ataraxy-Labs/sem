@@ -1,0 +1,3 @@
+[workspace]
+members = ["sem-core", "sem-cli"]
+resolver = "2"
