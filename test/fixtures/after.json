@@ -1,0 +1,9 @@
+{
+  "name": "my-app",
+  "version": "2.0.0",
+  "settings": {
+    "debug": true,
+    "timeout": 30,
+    "logLevel": "info"
+  }
+}

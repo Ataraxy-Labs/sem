@@ -1,0 +1,8 @@
+server:
+  host: localhost
+  port: 3000
+
+database:
+  host: localhost
+  port: 5432
+  name: mydb

@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>sem — Semantic Version Control</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0a0a0a;
+      --fg: #e0e0e0;
+      --dim: #666;
+      --border: #222;
+      --accent: #fff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --blue: #60a5fa;
+      --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    }
+
+    body {
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--fg); text-decoration-color: var(--dim); text-underline-offset: 3px; }
+    a:hover { color: var(--accent); text-decoration-color: var(--accent); }
+
+    .container { max-width: 720px; margin: 0 auto; padding: 0 24px; }
+
+    /* Nav */
+    nav {
+      padding: 24px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); }
+    nav .links { display: flex; gap: 24px; font-size: 13px; color: var(--dim); }
+
+    /* Hero */
+    .hero {
+      padding: 80px 0 60px;
+      text-align: center;
+    }
+    .hero h1 {
+      font-size: 48px;
+      font-weight: 700;
+      letter-spacing: -2px;
+      color: var(--accent);
+      margin-bottom: 16px;
+    }
+    .hero p {
+      font-size: 16px;
+      color: var(--dim);
+      max-width: 480px;
+      margin: 0 auto 40px;
+      line-height: 1.7;
+    }
+    .hero .install-box {
+      display: inline-block;
+      background: #111;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 28px;
+      font-size: 15px;
+      color: var(--fg);
+      cursor: pointer;
+      transition: border-color 0.2s;
+      position: relative;
+    }
+    .hero .install-box:hover { border-color: #444; }
+    .hero .install-box .prompt { color: var(--dim); }
+    .hero .install-box .copied {
+      position: absolute;
+      top: -32px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 12px;
+      color: var(--green);
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    .hero .install-box .copied.show { opacity: 1; }
+
+    /* Terminal */
+    .terminal {
+      background: #0d0d0d;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin: 40px 0;
+      overflow: hidden;
+    }
+    .terminal-bar {
+      background: #141414;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .terminal-dot { width: 10px; height: 10px; border-radius: 50%; background: #333; }
+    .terminal-title { font-size: 12px; color: var(--dim); margin-left: 8px; }
+    .terminal-body {
+      padding: 20px 24px;
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+    .terminal-body .cmd { color: var(--accent); }
+    .terminal-body .g { color: var(--green); }
+    .terminal-body .y { color: var(--yellow); }
+    .terminal-body .r { color: var(--red); }
+    .terminal-body .d { color: #444; }
+    .terminal-body .b { color: var(--blue); }
+    .terminal-body .w { color: var(--accent); font-weight: 600; }
+
+    /* Sections */
+    section {
+      padding: 60px 0;
+      border-top: 1px solid var(--border);
+    }
+    section h2 {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 32px;
+      letter-spacing: -0.5px;
+    }
+
+    /* Feature grid */
+    .features {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+    .feature {
+      padding: 20px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .feature h3 {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .feature p { font-size: 13px; color: var(--dim); line-height: 1.6; }
+
+    /* Format table */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th {
+      text-align: left;
+      padding: 10px 16px;
+      color: var(--dim);
+      font-weight: 400;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 10px 16px;
+      border-bottom: 1px solid #181818;
+      color: var(--fg);
+    }
+    tr:last-child td { border-bottom: none; }
+
+    /* Commands */
+    .commands { display: flex; flex-direction: column; gap: 16px; }
+    .cmd-row { display: flex; gap: 16px; align-items: baseline; }
+    .cmd-row code {
+      background: #111;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--fg);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .cmd-row span { font-size: 13px; color: var(--dim); }
+
+    /* Footer */
+    footer {
+      padding: 40px 0;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      font-size: 12px;
+      color: var(--dim);
+    }
+
+    @media (max-width: 600px) {
+      .hero h1 { font-size: 32px; }
+      .features { grid-template-columns: 1fr; }
+      .cmd-row { flex-direction: column; gap: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <nav>
+      <div class="logo">sem</div>
+      <div class="links">
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+        <a href="#docs">Docs</a>
+      </div>
+    </nav>
+
+    <div class="hero">
+      <h1>Know what changed.</h1>
+      <p>Entity-level diffs on top of Git. Functions, classes, properties — not lines.</p>
+      <div class="install-box" onclick="copyInstall(this)">
+        <span class="copied">copied</span>
+        <span class="prompt">$</span> npm install -g @ataraxy-labs/sem
+      </div>
+    </div>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <div class="terminal-dot"></div>
+        <div class="terminal-dot"></div>
+        <div class="terminal-dot"></div>
+        <div class="terminal-title">~/project</div>
+      </div>
+      <div class="terminal-body">
+<pre><span class="cmd">$ sem diff</span>
+
+<span class="d">┌─ src/auth/login.ts ──────────────────────────────────</span>
+<span class="d">│</span>
+<span class="d">│</span>  <span class="g">⊕</span> <span class="d">function </span> <span class="w">validateToken</span>          <span class="g">[added]</span>
+<span class="d">│</span>  <span class="y">∆</span> <span class="d">function </span> <span class="w">authenticateUser</span>       <span class="y">[modified]</span>
+<span class="d">│</span>  <span class="r">⊖</span> <span class="d">function </span> <span class="w">legacyAuth</span>             <span class="r">[deleted]</span>
+<span class="d">│</span>
+<span class="d">└──────────────────────────────────────────────────────</span>
+
+<span class="d">┌─ config/database.yml ─────────────────────────────────</span>
+<span class="d">│</span>
+<span class="d">│</span>  <span class="y">∆</span> <span class="d">property </span> <span class="w">production.pool_size</span>   <span class="y">[modified]</span>
+<span class="d">│</span>    <span class="r">- 5</span>
+<span class="d">│</span>    <span class="g">+ 20</span>
+<span class="d">│</span>
+<span class="d">└──────────────────────────────────────────────────────</span>
+
+Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
+      </div>
+    </div>
+
+    <section>
+      <h2>Why sem</h2>
+      <div class="features">
+        <div class="feature">
+          <h3>Works with Git</h3>
+          <p>No migration. No new VCS. Drop into any existing repo and run sem diff.</p>
+        </div>
+        <div class="feature">
+          <h3>Understands code</h3>
+          <p>Native tree-sitter parsing for TypeScript, Python, Go, Rust, JavaScript.</p>
+        </div>
+        <div class="feature">
+          <h3>Understands config</h3>
+          <p>JSON, YAML, TOML, CSV, Markdown — all parsed into semantic entities.</p>
+        </div>
+        <div class="feature">
+          <h3>Detects renames</h3>
+          <p>Three-phase matching: exact ID, content hash, fuzzy similarity.</p>
+        </div>
+        <div class="feature">
+          <h3>Machine-readable</h3>
+          <p>JSON output for CI pipelines, AI agents, and automation.</p>
+        </div>
+        <div class="feature">
+          <h3>Queryable</h3>
+          <p>SQLite storage. Run SQL against your change history.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="docs">
+      <h2>Get started</h2>
+      <div class="commands">
+        <div class="cmd-row">
+          <code>sem diff</code>
+          <span>Semantic diff of working changes</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem diff --staged</code>
+          <span>Show only staged changes</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem diff --commit abc1234</code>
+          <span>Diff a specific commit</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem diff --from HEAD~5 --to HEAD</code>
+          <span>Diff a commit range</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem diff --format json</code>
+          <span>Machine-readable JSON output</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem log -n 10</code>
+          <span>Semantic history of last 10 commits</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem init</code>
+          <span>Initialize database for queries</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem diff --store</code>
+          <span>Store changes in the database</span>
+        </div>
+        <div class="cmd-row">
+          <code>sem query "SELECT * FROM changes"</code>
+          <span>Run SQL against stored changes</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Supported formats</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Format</th>
+            <th>Extensions</th>
+            <th>Entities</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>TypeScript</td>
+            <td>.ts .tsx</td>
+            <td>functions, classes, interfaces, types, enums</td>
+          </tr>
+          <tr>
+            <td>JavaScript</td>
+            <td>.js .jsx .mjs .cjs</td>
+            <td>functions, classes, variables</td>
+          </tr>
+          <tr>
+            <td>Python</td>
+            <td>.py</td>
+            <td>functions, classes, decorators</td>
+          </tr>
+          <tr>
+            <td>Go</td>
+            <td>.go</td>
+            <td>functions, methods, types</td>
+          </tr>
+          <tr>
+            <td>Rust</td>
+            <td>.rs</td>
+            <td>functions, structs, enums, impls, traits</td>
+          </tr>
+          <tr>
+            <td>JSON</td>
+            <td>.json</td>
+            <td>properties, objects (RFC 6901 paths)</td>
+          </tr>
+          <tr>
+            <td>YAML</td>
+            <td>.yml .yaml</td>
+            <td>sections, properties (dot paths)</td>
+          </tr>
+          <tr>
+            <td>TOML</td>
+            <td>.toml</td>
+            <td>sections, properties</td>
+          </tr>
+          <tr>
+            <td>CSV</td>
+            <td>.csv .tsv</td>
+            <td>rows (first column as ID)</td>
+          </tr>
+          <tr>
+            <td>Markdown</td>
+            <td>.md .mdx</td>
+            <td>heading-based sections</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>How matching works</h2>
+      <div class="commands">
+        <div class="cmd-row">
+          <code>Phase 1</code>
+          <span>Exact ID match — same entity in before/after → modified or unchanged</span>
+        </div>
+        <div class="cmd-row">
+          <code>Phase 2</code>
+          <span>Content hash — same content, different name → renamed or moved</span>
+        </div>
+        <div class="cmd-row">
+          <code>Phase 3</code>
+          <span>Fuzzy similarity — >80% token overlap → probable rename</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>JSON output</h2>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-title">sem diff --format json</div>
+        </div>
+        <div class="terminal-body">
+<pre>{
+  "summary": {
+    "fileCount": 2,
+    "added": 1,
+    "modified": 1,
+    "deleted": 1,
+    "total": 3
+  },
+  "changes": [
+    {
+      "entityId": "src/auth.ts::function::validateToken",
+      "changeType": "added",
+      "entityType": "function",
+      "entityName": "validateToken",
+      "filePath": "src/auth.ts"
+    }
+  ]
+}</pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>SQL queries</h2>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-title">~/project</div>
+        </div>
+        <div class="terminal-body">
+<pre><span class="cmd">$ sem query "SELECT change_type, count(*) as n FROM changes GROUP BY change_type"</span>
+
+change_type          │ n
+─────────────────────────────────
+added                │ 29
+deleted              │ 2
+modified             │ 7
+
+<span class="cmd">$ sem query "SELECT * FROM changes WHERE entity_type = 'function'"</span>
+
+entity_name          │ change_type          │ file_path
+──────────────────────────────────────────────────────────────
+validateToken        │ added                │ src/auth.ts
+authenticateUser     │ modified             │ src/auth.ts
+legacyAuth           │ deleted              │ src/auth.ts</pre>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <p>Built by <a href="https://github.com/Ataraxy-Labs">Ataraxy Labs</a></p>
+    </footer>
+  </div>
+
+  <script>
+    function copyInstall(el) {
+      navigator.clipboard.writeText('npm install -g @ataraxy-labs/sem');
+      const copied = el.querySelector('.copied');
+      copied.classList.add('show');
+      setTimeout(() => copied.classList.remove('show'), 1500);
+    }
+  </script>
+</body>
+</html>
