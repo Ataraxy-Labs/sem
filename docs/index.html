@@ -279,9 +279,9 @@
       <p style="font-size: 14px; color: var(--dim); margin-bottom: 24px; line-height: 1.7; max-width: 520px; margin-left: auto; margin-right: auto;">
         Entity-level diffs on top of Git. Structured output for AI agents, CI pipelines, and humans who want more than line numbers.
       </p>
-      <div class="install-box" onclick="copyCmd(this, 'brew install ataraxy-labs/tap/sem')" style="display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; font-size: 14px; color: var(--fg); cursor: pointer; position: relative;">
+      <div class="install-box" onclick="copyCmd(this, 'brew install sem-diff')" style="display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; font-size: 14px; color: var(--fg); cursor: pointer; position: relative;">
         <span class="copied" style="position: absolute; top: -28px; left: 50%; transform: translateX(-50%); font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;">copied</span>
-        <span style="color: var(--dim);">$</span> brew install ataraxy-labs/tap/sem
+        <span style="color: var(--dim);">$</span> brew install sem-diff
       </div>
       <div style="margin-top: 12px; font-size: 12px; color: var(--dim2);">
         or: <span onclick="copyCmd(this, 'curl -fsSL https://sem.sh/install | sh')" style="color: var(--dim); cursor: pointer; border-bottom: 1px dashed var(--dim2);">curl -fsSL https://sem.sh/install | sh</span>
@@ -1135,7 +1135,7 @@ legacyAuth           | deleted</pre>
           Homebrew distribution
         </div>
         <p class="changelog-body">
-          <code style="color:var(--cyan)">brew install ataraxy-labs/tap/sem</code> — single command install via Homebrew tap.
+          <code style="color:var(--cyan)">brew install sem-diff</code> — single command install via Homebrew tap.
           Formula builds from source using Cargo, compiles all tree-sitter grammars in, links against system libgit2.
           Includes a test that verifies entity extraction on a Python function.
         </p>
@@ -1170,7 +1170,7 @@ legacyAuth           | deleted</pre>
       }
     }
     // Legacy compat
-    function copyInstall(el) { copyCmd(el, 'brew install ataraxy-labs/tap/sem'); }
+    function copyInstall(el) { copyCmd(el, 'brew install sem-diff'); }
 
     // Flame graph rendering — sem diff internal profiler
     (function() {
