@@ -42,4 +42,27 @@ CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS labels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_id TEXT NOT NULL,
+  label TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(entity_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_labels_entity ON labels(entity_id);
+CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
+
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_id TEXT NOT NULL,
+  author TEXT,
+  body TEXT NOT NULL,
+  parent_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (parent_id) REFERENCES comments(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_entity ON comments(entity_id);
 `;

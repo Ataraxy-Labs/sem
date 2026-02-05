@@ -9,6 +9,7 @@ import { SemDatabase } from '../../storage/database.js';
 import { formatTerminal } from '../formatters/terminal.js';
 import { formatJson } from '../formatters/json.js';
 import { createDefaultRegistry } from '../../parser/plugins/index.js';
+import { loadConfig, validateChanges, formatValidationResults } from './validate.js';
 
 export interface DiffOptions {
   cwd?: string;
@@ -73,5 +74,20 @@ export async function diffCommand(opts: DiffOptions = {}): Promise<void> {
     console.log(formatJson(result));
   } else {
     console.log(formatTerminal(result));
+  }
+
+  // Run validation rules if .semrc exists
+  try {
+    const repoRoot = await git.getRepoRoot();
+    const config = await loadConfig(repoRoot);
+    if (config.rules && config.rules.length > 0) {
+      const violations = validateChanges(result, config);
+      if (violations.length > 0) {
+        console.log('');
+        console.log(formatValidationResults(violations));
+      }
+    }
+  } catch {
+    // No config or invalid config — skip validation
   }
 }

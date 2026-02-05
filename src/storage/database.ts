@@ -130,6 +130,55 @@ export class SemDatabase {
     }));
   }
 
+  // Labels
+  addLabel(entityId: string, label: string): void {
+    this.db.prepare(
+      'INSERT OR IGNORE INTO labels (entity_id, label) VALUES (?, ?)'
+    ).run(entityId, label);
+  }
+
+  removeLabel(entityId: string, label: string): void {
+    this.db.prepare(
+      'DELETE FROM labels WHERE entity_id = ? AND label = ?'
+    ).run(entityId, label);
+  }
+
+  getLabels(entityId: string): string[] {
+    const rows = this.db.prepare(
+      'SELECT label FROM labels WHERE entity_id = ?'
+    ).all(entityId) as Array<{ label: string }>;
+    return rows.map(r => r.label);
+  }
+
+  getEntitiesByLabel(label: string): string[] {
+    const rows = this.db.prepare(
+      'SELECT entity_id FROM labels WHERE label = ?'
+    ).all(label) as Array<{ entity_id: string }>;
+    return rows.map(r => r.entity_id);
+  }
+
+  // Comments
+  addComment(entityId: string, body: string, author?: string, parentId?: number): number {
+    const result = this.db.prepare(
+      'INSERT INTO comments (entity_id, body, author, parent_id) VALUES (?, ?, ?, ?)'
+    ).run(entityId, body, author ?? null, parentId ?? null);
+    return Number(result.lastInsertRowid);
+  }
+
+  getComments(entityId: string): Array<{ id: number; entityId: string; author: string | null; body: string; parentId: number | null; createdAt: string }> {
+    const rows = this.db.prepare(
+      'SELECT * FROM comments WHERE entity_id = ? ORDER BY created_at ASC'
+    ).all(entityId) as Array<Record<string, unknown>>;
+    return rows.map(r => ({
+      id: r.id as number,
+      entityId: r.entity_id as string,
+      author: r.author as string | null,
+      body: r.body as string,
+      parentId: r.parent_id as number | null,
+      createdAt: r.created_at as string,
+    }));
+  }
+
   query(sql: string): unknown[] {
     return this.db.prepare(sql).all();
   }
