@@ -54,28 +54,9 @@
     nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); }
     nav .links { display: flex; gap: 20px; font-size: 13px; color: var(--dim); }
 
-    /* Hero */
-    .hero { padding: 80px 0 60px; text-align: center; }
-    .hero h1 {
-      font-size: 48px; font-weight: 700; letter-spacing: -2px;
-      color: var(--accent); margin-bottom: 16px;
-    }
-    .hero p {
-      font-size: 15px; color: var(--dim); max-width: 500px;
-      margin: 0 auto 40px; line-height: 1.7;
-    }
-    .hero .install-box {
-      display: inline-block; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 8px; padding: 14px 28px; font-size: 15px; color: var(--fg);
-      cursor: pointer; transition: border-color 0.2s; position: relative;
-    }
-    .hero .install-box:hover { border-color: #444; }
-    .hero .install-box .prompt { color: var(--dim); }
-    .hero .install-box .copied {
-      position: absolute; top: -32px; left: 50%; transform: translateX(-50%);
-      font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;
-    }
-    .hero .install-box .copied.show { opacity: 1; }
+    /* Install box */
+    .install-box:hover { border-color: #444 !important; }
+    .install-box .copied.show { opacity: 1 !important; }
 
     /* Terminal */
     .terminal {
@@ -112,16 +93,6 @@
     section .section-desc {
       font-size: 14px; color: var(--dim); margin-bottom: 32px; line-height: 1.7;
     }
-
-    /* Feature grid */
-    .features { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .feature {
-      padding: 20px; border: 1px solid var(--border); border-radius: 8px;
-      transition: border-color 0.2s;
-    }
-    .feature:hover { border-color: #333; }
-    .feature h3 { font-size: 14px; font-weight: 600; color: var(--accent); margin-bottom: 8px; }
-    .feature p { font-size: 12px; color: var(--dim); line-height: 1.6; }
 
     /* Tables */
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -245,8 +216,6 @@
     }
 
     @media (max-width: 640px) {
-      .hero h1 { font-size: 32px; }
-      .features { grid-template-columns: 1fr; }
       .profiler-grid { grid-template-columns: 1fr; }
       .cmd-row { flex-direction: column; gap: 4px; }
       .cmd-row code { min-width: auto; }
@@ -259,20 +228,23 @@
     <nav>
       <div class="logo">sem</div>
       <div class="links">
+        <a href="#commands">Commands</a>
+        <a href="#formats">Formats</a>
+        <a href="#output">Output</a>
         <a href="#benchmarks">Benchmarks</a>
-        <a href="#comparison">Compare</a>
-        <a href="#docs">Docs</a>
         <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
       </div>
     </nav>
 
-    <!-- ═══ Hero ═══ -->
-    <div class="hero">
-      <h1>Know what changed.</h1>
-      <p>Entity-level diffs on top of Git. See functions, classes, and properties — not lines.</p>
-      <div class="install-box" onclick="copyInstall(this)">
-        <span class="copied">copied</span>
-        <span class="prompt">$</span> npm install -g @ataraxy-labs/sem
+    <!-- ═══ Header ═══ -->
+    <div style="padding: 40px 0 32px;">
+      <h1 style="font-size: 28px; font-weight: 700; color: var(--accent); letter-spacing: -1px; margin-bottom: 8px;">sem</h1>
+      <p style="font-size: 14px; color: var(--dim); margin-bottom: 20px; line-height: 1.7;">
+        Semantic version control on top of Git. Entity-level diffs for functions, classes, properties — not lines.
+      </p>
+      <div class="install-box" onclick="copyInstall(this)" style="display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; font-size: 14px; color: var(--fg); cursor: pointer; position: relative;">
+        <span class="copied" style="position: absolute; top: -28px; left: 50%; transform: translateX(-50%); font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;">copied</span>
+        <span style="color: var(--dim);">$</span> npm install -g @ataraxy-labs/sem
       </div>
     </div>
 
@@ -306,34 +278,363 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
       </div>
     </div>
 
-    <!-- ═══ Why sem ═══ -->
+    <!-- ═══ Commands ═══ -->
+    <section id="commands">
+      <h2>Commands</h2>
+      <p class="section-desc">
+        11 commands. Every command supports <code style="color:var(--cyan)">--format json</code> for machine-readable output.
+      </p>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem init</span>
+          <span class="cmd-doc-desc">Initialize sem in the current repo</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><span>Creates .sem/ directory and SQLite database for queries, labels, and comments.</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem diff</span>
+          <span class="cmd-doc-desc">Semantic diff of changes</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-s, --staged</code> <span>Show staged changes only</span></div>
+          <div class="flag"><code>-c, --commit &lt;sha&gt;</code> <span>Diff a specific commit</span></div>
+          <div class="flag"><code>--from &lt;ref&gt; --to &lt;ref&gt;</code> <span>Diff a commit range</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
+          <div class="flag"><code>--store</code> <span>Save changes to the database</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem status</span>
+          <span class="cmd-doc-desc">Semantic status with entity counts</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem log</span>
+          <span class="cmd-doc-desc">Semantic commit history</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-n, --count &lt;n&gt;</code> <span>Number of commits (default: 5)</span></div>
+          <div class="flag"><code>--store</code> <span>Save changes to the database</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem blame &lt;file&gt;</span>
+          <span class="cmd-doc-desc">Entity-level blame — who last touched each function</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-d, --depth &lt;n&gt;</code> <span>Commits to search (default: 50)</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem history &lt;entity&gt;</span>
+          <span class="cmd-doc-desc">Full timeline of a single entity across commits</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>entity</code> <span>"auth.ts::function::login" or "auth.ts::login" or just "login"</span></div>
+          <div class="flag"><code>-d, --depth &lt;n&gt;</code> <span>Commits to search (default: 50)</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem review &lt;branch|PR#&gt;</span>
+          <span class="cmd-doc-desc">Semantic PR review with risk signals</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-b, --base &lt;ref&gt;</code> <span>Base branch (default: main)</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+          <div class="flag"><span>Flags: deleted functions, modified configs, large changesets</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem watch</span>
+          <span class="cmd-doc-desc">Real-time semantic diff on file changes</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>--debounce &lt;ms&gt;</code> <span>Debounce interval (default: 500ms)</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem query &lt;sql&gt;</span>
+          <span class="cmd-doc-desc">Run SQL against stored changes</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>sql</code> <span>Any SQL query against the .sem/sem.db database</span></div>
+          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem label &lt;entity&gt; [label]</span>
+          <span class="cmd-doc-desc">Add, remove, or list labels on entities</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-r, --remove</code> <span>Remove the label</span></div>
+          <div class="flag"><code>-l, --list</code> <span>List all labels for the entity</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem comment &lt;entity&gt; [body]</span>
+          <span class="cmd-doc-desc">Threaded comments on entities</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>-a, --author &lt;name&gt;</code> <span>Comment author (defaults to git user.name)</span></div>
+          <div class="flag"><code>--reply &lt;id&gt;</code> <span>Reply to an existing comment</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Supported formats ═══ -->
+    <section id="formats">
+      <h2>Supported formats</h2>
+      <table>
+        <thead>
+          <tr><th>Format</th><th>Extensions</th><th>Entities</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>TypeScript</td><td>.ts .tsx</td><td>functions, classes, interfaces, types, enums</td></tr>
+          <tr><td>JavaScript</td><td>.js .jsx .mjs .cjs</td><td>functions, classes, variables</td></tr>
+          <tr><td>Python</td><td>.py</td><td>functions, classes, decorators</td></tr>
+          <tr><td>Go</td><td>.go</td><td>functions, methods, types</td></tr>
+          <tr><td>Rust</td><td>.rs</td><td>functions, structs, enums, impls, traits</td></tr>
+          <tr><td>JSON</td><td>.json</td><td>properties, objects (RFC 6901 paths)</td></tr>
+          <tr><td>YAML</td><td>.yml .yaml</td><td>sections, properties (dot paths)</td></tr>
+          <tr><td>TOML</td><td>.toml</td><td>sections, properties</td></tr>
+          <tr><td>CSV</td><td>.csv .tsv</td><td>rows (first column as ID)</td></tr>
+          <tr><td>Markdown</td><td>.md .mdx</td><td>heading-based sections</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ═══ How matching works ═══ -->
     <section>
-      <h2>Why sem</h2>
-      <div class="features">
-        <div class="feature">
-          <h3>Works with Git</h3>
-          <p>No migration. No new VCS. Drop into any repo and run sem diff.</p>
+      <h2>Entity matching</h2>
+      <p class="section-desc">Three-phase algorithm that detects additions, modifications, deletions, renames, and moves.</p>
+      <div class="commands">
+        <div class="cmd-row">
+          <code>Phase 1 — Exact ID</code>
+          <span>Same entity ID in before/after? Modified or unchanged.</span>
         </div>
-        <div class="feature">
-          <h3>Understands code</h3>
-          <p>Native tree-sitter parsing. TypeScript, Python, Go, Rust, JavaScript.</p>
+        <div class="cmd-row">
+          <code>Phase 2 — Content hash</code>
+          <span>Same SHA-256, different name? Renamed or moved.</span>
         </div>
-        <div class="feature">
-          <h3>Understands config</h3>
-          <p>JSON, YAML, TOML, CSV, Markdown — parsed into semantic entities.</p>
+        <div class="cmd-row">
+          <code>Phase 3 — Fuzzy similarity</code>
+          <span>>80% Jaccard token overlap? Probable rename.</span>
         </div>
-        <div class="feature">
-          <h3>Detects renames</h3>
-          <p>3-phase matching: exact ID, content hash, fuzzy similarity.</p>
+      </div>
+    </section>
+
+    <!-- ═══ Output formats ═══ -->
+    <section id="output">
+      <h2>Output formats</h2>
+      <p class="section-desc">
+        Every command outputs structured JSON. Pipe sem into your AI agent, CI pipeline, or automation.
+      </p>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-title">sem diff --format json | jq</div>
         </div>
-        <div class="feature">
-          <h3>Agent-native</h3>
-          <p>JSON output + SQL queries. Built for CI pipelines and AI agents.</p>
+        <div class="terminal-body">
+<pre><span class="d">{</span>
+  <span class="b">"summary"</span>: <span class="d">{</span>
+    <span class="b">"fileCount"</span>: <span class="y">2</span>,
+    <span class="b">"added"</span>: <span class="g">1</span>,
+    <span class="b">"modified"</span>: <span class="y">1</span>,
+    <span class="b">"deleted"</span>: <span class="r">1</span>,
+    <span class="b">"total"</span>: <span class="w">3</span>
+  <span class="d">}</span>,
+  <span class="b">"changes"</span>: <span class="d">[</span>
+    <span class="d">{</span>
+      <span class="b">"entityId"</span>: <span class="c">"src/auth.ts::function::validateToken"</span>,
+      <span class="b">"changeType"</span>: <span class="g">"added"</span>,
+      <span class="b">"entityType"</span>: <span class="d">"function"</span>,
+      <span class="b">"entityName"</span>: <span class="w">"validateToken"</span>,
+      <span class="b">"filePath"</span>: <span class="d">"src/auth.ts"</span>
+    <span class="d">}</span>
+  <span class="d">]</span>
+<span class="d">}</span></pre>
         </div>
-        <div class="feature">
-          <h3>Entity-level blame</h3>
-          <p>Know who last touched each function, not just each line.</p>
+      </div>
+
+      <div class="terminal" style="margin-top: 16px;">
+        <div class="terminal-bar">
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-title">SQL queries</div>
         </div>
+        <div class="terminal-body">
+<pre><span class="cmd">$ sem query "SELECT entity_name, change_type FROM changes WHERE entity_type = 'function'"</span>
+
+entity_name          | change_type
+--------------------------------------
+validateToken        | added
+authenticateUser     | modified
+legacyAuth           | deleted</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Validation ═══ -->
+    <section>
+      <h2>Validation rules</h2>
+      <p class="section-desc">
+        Define rules in <code style="color:var(--cyan)">.semrc.json</code>. sem diff auto-checks them.
+      </p>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-dot"></div>
+          <div class="terminal-title">.semrc.json</div>
+        </div>
+        <div class="terminal-body">
+<pre><span class="d">{</span>
+  <span class="b">"rules"</span>: <span class="d">[</span>
+    <span class="d">{</span>
+      <span class="b">"name"</span>: <span class="c">"no-delete-public-api"</span>,
+      <span class="b">"match"</span>: <span class="d">{</span> <span class="b">"changeType"</span>: <span class="r">"deleted"</span>, <span class="b">"entityType"</span>: <span class="d">"function"</span> <span class="d">}</span>,
+      <span class="b">"severity"</span>: <span class="r">"error"</span>,
+      <span class="b">"message"</span>: <span class="c">"Public function deleted — this is a breaking change"</span>
+    <span class="d">}</span>,
+    <span class="d">{</span>
+      <span class="b">"name"</span>: <span class="c">"pool-size-limit"</span>,
+      <span class="b">"match"</span>: <span class="d">{</span> <span class="b">"entityType"</span>: <span class="d">"property"</span>, <span class="b">"filePath"</span>: <span class="d">"**/database.*"</span> <span class="d">}</span>,
+      <span class="b">"condition"</span>: <span class="d">{</span> <span class="b">"operator"</span>: <span class="d">"value >"</span>, <span class="b">"value"</span>: <span class="y">50</span> <span class="d">}</span>,
+      <span class="b">"severity"</span>: <span class="y">"warning"</span>,
+      <span class="b">"message"</span>: <span class="c">"Database pool size exceeds 50"</span>
+    <span class="d">}</span>
+  <span class="d">]</span>
+<span class="d">}</span></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ sem vs git ═══ -->
+    <section>
+      <h2>sem vs git</h2>
+      <p class="section-desc">
+        git gives you lines. sem gives you entities — functions, properties, rows, sections.
+      </p>
+      <div class="comparison-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>git diff</th>
+              <th>sem diff</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Diff granularity</td>
+              <td class="lose">lines</td>
+              <td class="win">entities (functions, classes, properties)</td>
+            </tr>
+            <tr>
+              <td>Code parsing</td>
+              <td class="lose">no</td>
+              <td class="win">tree-sitter (TS, Python, Go, Rust, JS)</td>
+            </tr>
+            <tr>
+              <td>JSON / YAML / TOML</td>
+              <td class="lose">lines</td>
+              <td class="win">key-path entities</td>
+            </tr>
+            <tr>
+              <td>CSV</td>
+              <td class="lose">lines</td>
+              <td class="win">row + cell identity</td>
+            </tr>
+            <tr>
+              <td>Rename detection</td>
+              <td class="lose">heuristic (file-level)</td>
+              <td class="win">3-phase (ID + hash + fuzzy)</td>
+            </tr>
+            <tr>
+              <td>SQL queries</td>
+              <td class="na">no</td>
+              <td class="win">full SQLite</td>
+            </tr>
+            <tr>
+              <td>Machine-readable output</td>
+              <td class="lose">patch format</td>
+              <td class="win">JSON + SQL</td>
+            </tr>
+            <tr>
+              <td>Entity blame</td>
+              <td class="lose">line-level only</td>
+              <td class="win">entity-level</td>
+            </tr>
+            <tr>
+              <td>Entity history</td>
+              <td class="lose">file-level only</td>
+              <td class="win">per-entity timeline</td>
+            </tr>
+            <tr>
+              <td>PR review</td>
+              <td class="lose">manual</td>
+              <td class="win">semantic + risk signals</td>
+            </tr>
+            <tr>
+              <td>Validation rules</td>
+              <td class="na">no</td>
+              <td class="win">.semrc.json</td>
+            </tr>
+            <tr>
+              <td>Labels / Comments</td>
+              <td class="na">no</td>
+              <td class="win">on entities</td>
+            </tr>
+            <tr>
+              <td>File watcher</td>
+              <td class="na">no</td>
+              <td class="win">sem watch</td>
+            </tr>
+            <tr>
+              <td>Speed</td>
+              <td class="win">15ms</td>
+              <td>260ms (semantic understanding included)</td>
+            </tr>
+            <tr>
+              <td>Adoption</td>
+              <td>-</td>
+              <td class="win">npm install, drop into any Git repo</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -506,366 +807,6 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
         <div class="flame-legend-item"><div class="flame-swatch" style="background:#9b59b6"></div> Node internals</div>
       </div>
       <div id="flame-graph-mount"></div>
-    </section>
-
-    <!-- ═══ Comparison ═══ -->
-    <section id="comparison">
-      <h2>sem vs git</h2>
-      <p class="section-desc">
-        git gives you lines. sem gives you entities — functions, properties, rows, sections.
-      </p>
-      <div class="comparison-table">
-        <table>
-          <thead>
-            <tr>
-              <th>Feature</th>
-              <th>git diff</th>
-              <th>sem diff</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Diff granularity</td>
-              <td class="lose">lines</td>
-              <td class="win">entities (functions, classes, properties)</td>
-            </tr>
-            <tr>
-              <td>Code parsing</td>
-              <td class="lose">no</td>
-              <td class="win">tree-sitter (TS, Python, Go, Rust, JS)</td>
-            </tr>
-            <tr>
-              <td>JSON / YAML / TOML</td>
-              <td class="lose">lines</td>
-              <td class="win">key-path entities</td>
-            </tr>
-            <tr>
-              <td>CSV</td>
-              <td class="lose">lines</td>
-              <td class="win">row + cell identity</td>
-            </tr>
-            <tr>
-              <td>Rename detection</td>
-              <td class="lose">heuristic (file-level)</td>
-              <td class="win">3-phase (ID + hash + fuzzy)</td>
-            </tr>
-            <tr>
-              <td>SQL queries</td>
-              <td class="na">no</td>
-              <td class="win">full SQLite</td>
-            </tr>
-            <tr>
-              <td>Machine-readable output</td>
-              <td class="lose">patch format</td>
-              <td class="win">JSON + SQL</td>
-            </tr>
-            <tr>
-              <td>Entity blame</td>
-              <td class="lose">line-level only</td>
-              <td class="win">entity-level</td>
-            </tr>
-            <tr>
-              <td>Entity history</td>
-              <td class="lose">file-level only</td>
-              <td class="win">per-entity timeline</td>
-            </tr>
-            <tr>
-              <td>PR review</td>
-              <td class="lose">manual</td>
-              <td class="win">semantic + risk signals</td>
-            </tr>
-            <tr>
-              <td>Validation rules</td>
-              <td class="na">no</td>
-              <td class="win">.semrc.json</td>
-            </tr>
-            <tr>
-              <td>Labels / Comments</td>
-              <td class="na">no</td>
-              <td class="win">on entities</td>
-            </tr>
-            <tr>
-              <td>File watcher</td>
-              <td class="na">no</td>
-              <td class="win">sem watch</td>
-            </tr>
-            <tr>
-              <td>Speed</td>
-              <td class="win">15ms</td>
-              <td>260ms (semantic understanding included)</td>
-            </tr>
-            <tr>
-              <td>Adoption</td>
-              <td>-</td>
-              <td class="win">npm install, drop into any Git repo</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- ═══ Docs ═══ -->
-    <section id="docs">
-      <h2>Documentation</h2>
-      <p class="section-desc">
-        11 commands. Every command supports <code style="color:var(--cyan)">--format json</code> for machine-readable output.
-      </p>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem init</span>
-          <span class="cmd-doc-desc">Initialize sem in the current repo</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><span>Creates .sem/ directory and SQLite database for queries, labels, and comments.</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem diff</span>
-          <span class="cmd-doc-desc">Semantic diff of changes</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-s, --staged</code> <span>Show staged changes only</span></div>
-          <div class="flag"><code>-c, --commit &lt;sha&gt;</code> <span>Diff a specific commit</span></div>
-          <div class="flag"><code>--from &lt;ref&gt; --to &lt;ref&gt;</code> <span>Diff a commit range</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
-          <div class="flag"><code>--store</code> <span>Save changes to the database</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem status</span>
-          <span class="cmd-doc-desc">Semantic status with entity counts</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem log</span>
-          <span class="cmd-doc-desc">Semantic commit history</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-n, --count &lt;n&gt;</code> <span>Number of commits (default: 5)</span></div>
-          <div class="flag"><code>--store</code> <span>Save changes to the database</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem blame &lt;file&gt;</span>
-          <span class="cmd-doc-desc">Entity-level blame — who last touched each function</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-d, --depth &lt;n&gt;</code> <span>Commits to search (default: 50)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem history &lt;entity&gt;</span>
-          <span class="cmd-doc-desc">Full timeline of a single entity across commits</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>entity</code> <span>"auth.ts::function::login" or "auth.ts::login" or just "login"</span></div>
-          <div class="flag"><code>-d, --depth &lt;n&gt;</code> <span>Commits to search (default: 50)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem review &lt;branch|PR#&gt;</span>
-          <span class="cmd-doc-desc">Semantic PR review with risk signals</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-b, --base &lt;ref&gt;</code> <span>Base branch (default: main)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-          <div class="flag"><span>Flags: deleted functions, modified configs, large changesets</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem watch</span>
-          <span class="cmd-doc-desc">Real-time semantic diff on file changes</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>--debounce &lt;ms&gt;</code> <span>Debounce interval (default: 500ms)</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem query &lt;sql&gt;</span>
-          <span class="cmd-doc-desc">Run SQL against stored changes</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>sql</code> <span>Any SQL query against the .sem/sem.db database</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal or json</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem label &lt;entity&gt; [label]</span>
-          <span class="cmd-doc-desc">Add, remove, or list labels on entities</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-r, --remove</code> <span>Remove the label</span></div>
-          <div class="flag"><code>-l, --list</code> <span>List all labels for the entity</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem comment &lt;entity&gt; [body]</span>
-          <span class="cmd-doc-desc">Threaded comments on entities</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-a, --author &lt;name&gt;</code> <span>Comment author (defaults to git user.name)</span></div>
-          <div class="flag"><code>--reply &lt;id&gt;</code> <span>Reply to an existing comment</span></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ═══ Supported formats ═══ -->
-    <section>
-      <h2>Supported formats</h2>
-      <table>
-        <thead>
-          <tr><th>Format</th><th>Extensions</th><th>Entities</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>TypeScript</td><td>.ts .tsx</td><td>functions, classes, interfaces, types, enums</td></tr>
-          <tr><td>JavaScript</td><td>.js .jsx .mjs .cjs</td><td>functions, classes, variables</td></tr>
-          <tr><td>Python</td><td>.py</td><td>functions, classes, decorators</td></tr>
-          <tr><td>Go</td><td>.go</td><td>functions, methods, types</td></tr>
-          <tr><td>Rust</td><td>.rs</td><td>functions, structs, enums, impls, traits</td></tr>
-          <tr><td>JSON</td><td>.json</td><td>properties, objects (RFC 6901 paths)</td></tr>
-          <tr><td>YAML</td><td>.yml .yaml</td><td>sections, properties (dot paths)</td></tr>
-          <tr><td>TOML</td><td>.toml</td><td>sections, properties</td></tr>
-          <tr><td>CSV</td><td>.csv .tsv</td><td>rows (first column as ID)</td></tr>
-          <tr><td>Markdown</td><td>.md .mdx</td><td>heading-based sections</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <!-- ═══ How matching works ═══ -->
-    <section>
-      <h2>Entity matching</h2>
-      <p class="section-desc">Three-phase algorithm that detects additions, modifications, deletions, renames, and moves.</p>
-      <div class="commands">
-        <div class="cmd-row">
-          <code>Phase 1 — Exact ID</code>
-          <span>Same entity ID in before/after? Modified or unchanged.</span>
-        </div>
-        <div class="cmd-row">
-          <code>Phase 2 — Content hash</code>
-          <span>Same SHA-256, different name? Renamed or moved.</span>
-        </div>
-        <div class="cmd-row">
-          <code>Phase 3 — Fuzzy similarity</code>
-          <span>>80% Jaccard token overlap? Probable rename.</span>
-        </div>
-      </div>
-    </section>
-
-    <!-- ═══ Agent-native ═══ -->
-    <section>
-      <h2>Built for agents</h2>
-      <p class="section-desc">
-        Every command outputs structured JSON. Pipe sem into your AI agent, CI pipeline, or automation.
-      </p>
-      <div class="terminal">
-        <div class="terminal-bar">
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-title">sem diff --format json | jq</div>
-        </div>
-        <div class="terminal-body">
-<pre><span class="d">{</span>
-  <span class="b">"summary"</span>: <span class="d">{</span>
-    <span class="b">"fileCount"</span>: <span class="y">2</span>,
-    <span class="b">"added"</span>: <span class="g">1</span>,
-    <span class="b">"modified"</span>: <span class="y">1</span>,
-    <span class="b">"deleted"</span>: <span class="r">1</span>,
-    <span class="b">"total"</span>: <span class="w">3</span>
-  <span class="d">}</span>,
-  <span class="b">"changes"</span>: <span class="d">[</span>
-    <span class="d">{</span>
-      <span class="b">"entityId"</span>: <span class="c">"src/auth.ts::function::validateToken"</span>,
-      <span class="b">"changeType"</span>: <span class="g">"added"</span>,
-      <span class="b">"entityType"</span>: <span class="d">"function"</span>,
-      <span class="b">"entityName"</span>: <span class="w">"validateToken"</span>,
-      <span class="b">"filePath"</span>: <span class="d">"src/auth.ts"</span>
-    <span class="d">}</span>
-  <span class="d">]</span>
-<span class="d">}</span></pre>
-        </div>
-      </div>
-
-      <div class="terminal" style="margin-top: 16px;">
-        <div class="terminal-bar">
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-title">SQL queries</div>
-        </div>
-        <div class="terminal-body">
-<pre><span class="cmd">$ sem query "SELECT entity_name, change_type FROM changes WHERE entity_type = 'function'"</span>
-
-entity_name          | change_type
---------------------------------------
-validateToken        | added
-authenticateUser     | modified
-legacyAuth           | deleted</pre>
-        </div>
-      </div>
-    </section>
-
-    <!-- ═══ Validation ═══ -->
-    <section>
-      <h2>Validation rules</h2>
-      <p class="section-desc">
-        Define rules in <code style="color:var(--cyan)">.semrc.json</code>. sem diff auto-checks them.
-      </p>
-      <div class="terminal">
-        <div class="terminal-bar">
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-title">.semrc.json</div>
-        </div>
-        <div class="terminal-body">
-<pre><span class="d">{</span>
-  <span class="b">"rules"</span>: <span class="d">[</span>
-    <span class="d">{</span>
-      <span class="b">"name"</span>: <span class="c">"no-delete-public-api"</span>,
-      <span class="b">"match"</span>: <span class="d">{</span> <span class="b">"changeType"</span>: <span class="r">"deleted"</span>, <span class="b">"entityType"</span>: <span class="d">"function"</span> <span class="d">}</span>,
-      <span class="b">"severity"</span>: <span class="r">"error"</span>,
-      <span class="b">"message"</span>: <span class="c">"Public function deleted — this is a breaking change"</span>
-    <span class="d">}</span>,
-    <span class="d">{</span>
-      <span class="b">"name"</span>: <span class="c">"pool-size-limit"</span>,
-      <span class="b">"match"</span>: <span class="d">{</span> <span class="b">"entityType"</span>: <span class="d">"property"</span>, <span class="b">"filePath"</span>: <span class="d">"**/database.*"</span> <span class="d">}</span>,
-      <span class="b">"condition"</span>: <span class="d">{</span> <span class="b">"operator"</span>: <span class="d">"value >"</span>, <span class="b">"value"</span>: <span class="y">50</span> <span class="d">}</span>,
-      <span class="b">"severity"</span>: <span class="y">"warning"</span>,
-      <span class="b">"message"</span>: <span class="c">"Database pool size exceeds 50"</span>
-    <span class="d">}</span>
-  <span class="d">]</span>
-<span class="d">}</span></pre>
-        </div>
-      </div>
     </section>
 
     <footer>
