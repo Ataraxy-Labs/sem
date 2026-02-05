@@ -1,15 +1,19 @@
 import type { SimpleGit } from 'simple-git';
 import type { FileChange, DiffScope } from './types.js';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 
 export async function readChangedFiles(git: SimpleGit, scope: DiffScope): Promise<FileChange[]> {
   const files: FileChange[] = [];
 
   switch (scope.type) {
     case 'working': {
-      const diff = await git.diff(['--name-status']);
-      const untrackedRaw = await git.raw(['ls-files', '--others', '--exclude-standard']);
+      // Parallel: fetch tracked changes + untracked files simultaneously
+      const [diff, untrackedRaw] = await Promise.all([
+        git.diff(['--name-status']),
+        git.raw(['ls-files', '--others', '--exclude-standard']),
+      ]);
       files.push(...parseDiffNameStatus(diff));
-      // Add untracked files as 'added'
       for (const line of untrackedRaw.split('\n').filter(Boolean)) {
         files.push({ filePath: line.trim(), status: 'added' });
       }
@@ -41,7 +45,7 @@ function shouldIgnore(filePath: string): boolean {
   return IGNORED_PREFIXES.some(p => filePath.startsWith(p));
 }
 
-function parseDiffNameStatus(output: string): FileChange[] {
+export function parseDiffNameStatus(output: string): FileChange[] {
   const files: FileChange[] = [];
   for (const line of output.split('\n').filter(Boolean)) {
     const parts = line.split('\t');
@@ -60,16 +64,14 @@ function parseDiffNameStatus(output: string): FileChange[] {
   return files;
 }
 
-export async function getFileContent(git: SimpleGit, filePath: string, ref?: string): Promise<string | undefined> {
+export async function getFileContent(git: SimpleGit, filePath: string, ref?: string, repoRoot?: string): Promise<string | undefined> {
   try {
     if (ref) {
       return await git.show([`${ref}:${filePath}`]);
     }
-    // Current working copy
-    const { readFile } = await import('node:fs/promises');
-    const { resolve } = await import('node:path');
-    const root = await git.revparse(['--show-toplevel']);
-    return await readFile(resolve(root.trim(), filePath), 'utf-8');
+    // Current working copy — use cached repoRoot if available
+    const root = repoRoot ?? (await git.revparse(['--show-toplevel'])).trim();
+    return await readFile(resolve(root, filePath), 'utf-8');
   } catch {
     return undefined;
   }

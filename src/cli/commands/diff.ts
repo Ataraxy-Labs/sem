@@ -21,45 +21,60 @@ export interface DiffOptions {
   store?: boolean;
 }
 
+// Singleton registry — no need to recreate on every call
+let _registry: ParserRegistry | undefined;
+function getRegistry(): ParserRegistry {
+  return (_registry ??= createDefaultRegistry());
+}
+
 export async function diffCommand(opts: DiffOptions = {}): Promise<void> {
   const cwd = opts.cwd ?? process.cwd();
   const git = new GitBridge(cwd);
 
-  if (!(await git.isRepo())) {
-    console.error(chalk.red('Error: Not inside a Git repository.'));
-    process.exit(1);
-  }
-
-  // Determine scope
   let scope: DiffScope;
-  if (opts.commit) {
-    scope = { type: 'commit', sha: opts.commit };
-  } else if (opts.from && opts.to) {
-    scope = { type: 'range', from: opts.from, to: opts.to };
-  } else if (opts.staged) {
-    scope = { type: 'staged' };
-  } else {
-    scope = await git.detectScope();
-  }
+  let fileChanges;
 
-  // Get changed files with content
-  const fileChanges = await git.getChangedFiles(scope);
+  // Fast path: auto-detect uses combined detectAndGetFiles (1 round of git calls)
+  // Explicit scope falls back to separate calls
+  if (opts.commit) {
+    if (!(await git.isRepo())) { console.error(chalk.red('Error: Not inside a Git repository.')); process.exit(1); }
+    scope = { type: 'commit', sha: opts.commit };
+    fileChanges = await git.getChangedFiles(scope);
+  } else if (opts.from && opts.to) {
+    if (!(await git.isRepo())) { console.error(chalk.red('Error: Not inside a Git repository.')); process.exit(1); }
+    scope = { type: 'range', from: opts.from, to: opts.to };
+    fileChanges = await git.getChangedFiles(scope);
+  } else if (opts.staged) {
+    if (!(await git.isRepo())) { console.error(chalk.red('Error: Not inside a Git repository.')); process.exit(1); }
+    scope = { type: 'staged' };
+    fileChanges = await git.getChangedFiles(scope);
+  } else {
+    // Combined: isRepo + detectScope + getChangedFiles in one batch
+    try {
+      const result = await git.detectAndGetFiles();
+      scope = result.scope;
+      fileChanges = result.files;
+    } catch {
+      console.error(chalk.red('Error: Not inside a Git repository.'));
+      process.exit(1);
+    }
+  }
 
   if (fileChanges.length === 0) {
     console.log(chalk.dim('No changes detected.'));
     return;
   }
 
-  // Set up parser registry
-  const registry = createDefaultRegistry();
-
   // Compute semantic diff
+  const registry = getRegistry();
   const commitSha = scope.type === 'commit' ? scope.sha : undefined;
   const result = computeSemanticDiff(fileChanges, registry, commitSha);
 
+  // Get repoRoot once for both store + validation
+  const repoRoot = await git.getRepoRoot();
+
   // Optionally store changes
   if (opts.store) {
-    const repoRoot = await git.getRepoRoot();
     const dbPath = resolve(repoRoot, '.sem', 'sem.db');
     if (existsSync(dbPath)) {
       const db = new SemDatabase(dbPath);
@@ -78,7 +93,6 @@ export async function diffCommand(opts: DiffOptions = {}): Promise<void> {
 
   // Run validation rules if .semrc exists
   try {
-    const repoRoot = await git.getRepoRoot();
     const config = await loadConfig(repoRoot);
     if (config.rules && config.rules.length > 0) {
       const violations = validateChanges(result, config);

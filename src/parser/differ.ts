@@ -65,13 +65,25 @@ export function computeSemanticDiff(
     }
   }
 
+  // Single-pass counting
+  let addedCount = 0, modifiedCount = 0, deletedCount = 0, movedCount = 0, renamedCount = 0;
+  for (const c of allChanges) {
+    switch (c.changeType) {
+      case 'added': addedCount++; break;
+      case 'modified': modifiedCount++; break;
+      case 'deleted': deletedCount++; break;
+      case 'moved': movedCount++; break;
+      case 'renamed': renamedCount++; break;
+    }
+  }
+
   return {
     changes: allChanges,
     fileCount: filesWithChanges.size,
-    addedCount: allChanges.filter(c => c.changeType === 'added').length,
-    modifiedCount: allChanges.filter(c => c.changeType === 'modified').length,
-    deletedCount: allChanges.filter(c => c.changeType === 'deleted').length,
-    movedCount: allChanges.filter(c => c.changeType === 'moved').length,
-    renamedCount: allChanges.filter(c => c.changeType === 'renamed').length,
+    addedCount,
+    modifiedCount,
+    deletedCount,
+    movedCount,
+    renamedCount,
   };
 }
