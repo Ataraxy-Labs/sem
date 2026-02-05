@@ -244,7 +244,7 @@
       </p>
       <div class="install-box" onclick="copyInstall(this)" style="display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; font-size: 14px; color: var(--fg); cursor: pointer; position: relative;">
         <span class="copied" style="position: absolute; top: -28px; left: 50%; transform: translateX(-50%); font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;">copied</span>
-        <span style="color: var(--dim);">$</span> brew install sem
+        <span style="color: var(--dim);">$</span> curl -fsSL https://sem.sh/install | sh
       </div>
     </div>
 
@@ -631,7 +631,7 @@ legacyAuth           | deleted</pre>
             <tr>
               <td>Adoption</td>
               <td>-</td>
-              <td class="win">brew install, drop into any Git repo</td>
+              <td class="win">single binary, drop into any Git repo</td>
             </tr>
           </tbody>
         </table>
@@ -856,7 +856,7 @@ legacyAuth           | deleted</pre>
 
   <script>
     function copyInstall(el) {
-      navigator.clipboard.writeText('brew install sem');
+      navigator.clipboard.writeText('curl -fsSL https://sem.sh/install | sh');
       const copied = el.querySelector('.copied');
       copied.classList.add('show');
       setTimeout(() => copied.classList.remove('show'), 1500);
