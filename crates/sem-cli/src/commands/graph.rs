@@ -227,6 +227,11 @@ fn ref_symbol(ref_type: &RefType) -> colored::ColoredString {
     }
 }
 
+/// Find all supported files in the repo (public for use by other commands).
+pub fn find_supported_files_public(root: &Path, registry: &sem_core::parser::registry::ParserRegistry) -> Vec<String> {
+    find_supported_files(root, registry)
+}
+
 fn find_supported_files(root: &Path, registry: &sem_core::parser::registry::ParserRegistry) -> Vec<String> {
     let mut files = Vec::new();
     walk_dir(root, root, registry, &mut files);

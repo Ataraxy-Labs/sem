@@ -4,6 +4,7 @@ mod formatters;
 use clap::{Parser, Subcommand};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::graph::{graph_command, GraphFormat, GraphOptions};
+use commands::impact::{impact_command, ImpactOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = "0.2.0", about = "Semantic version control")]
@@ -39,6 +40,20 @@ enum Commands {
         /// Show internal timing profile
         #[arg(long, hide = true)]
         profile: bool,
+    },
+    /// Show impact of changing an entity (what else would break?)
+    Impact {
+        /// Name of the entity to analyze
+        #[arg()]
+        entity: String,
+
+        /// Specific files to analyze (default: all supported files)
+        #[arg(long)]
+        files: Vec<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show entity dependency graph
     Graph {
@@ -84,6 +99,21 @@ fn main() {
                 from,
                 to,
                 profile,
+            });
+        }
+        Some(Commands::Impact {
+            entity,
+            files,
+            json,
+        }) => {
+            impact_command(ImpactOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                entity_name: entity,
+                file_paths: files,
+                json,
             });
         }
         Some(Commands::Graph {
