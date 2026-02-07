@@ -12,6 +12,11 @@ pub struct SemanticEntity {
     pub parent_id: Option<String>,
     pub content: String,
     pub content_hash: String,
+    /// AST-based hash that strips comments and normalizes whitespace.
+    /// Two entities with the same structural_hash are logically identical
+    /// even if formatting/comments differ. Inspired by Unison's content-addressed model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structural_hash: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

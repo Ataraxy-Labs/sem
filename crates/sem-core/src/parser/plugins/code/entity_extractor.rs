@@ -1,7 +1,7 @@
 use tree_sitter::{Node, Tree};
 
 use crate::model::entity::{build_entity_id, SemanticEntity};
-use crate::utils::hash::content_hash;
+use crate::utils::hash::{content_hash, structural_hash};
 use super::languages::LanguageConfig;
 
 pub fn extract_entities(
@@ -37,6 +37,7 @@ fn visit_node(
             let entity_type = map_node_type(node_type);
             let content = node_text(node, source);
 
+            let struct_hash = structural_hash(node, source);
             let entity = SemanticEntity {
                 id: build_entity_id(file_path, &entity_type, &name, parent_id),
                 file_path: file_path.to_string(),
@@ -44,6 +45,7 @@ fn visit_node(
                 name: name.clone(),
                 parent_id: parent_id.map(String::from),
                 content_hash: content_hash(&content),
+                structural_hash: Some(struct_hash),
                 content,
                 start_line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,

@@ -35,6 +35,7 @@ impl SemanticParserPlugin for FallbackParserPlugin {
                 name,
                 parent_id: None,
                 content_hash: content_hash(&chunk_content),
+                structural_hash: None,
                 content: chunk_content,
                 start_line,
                 end_line,

@@ -3,6 +3,7 @@ mod formatters;
 
 use clap::{Parser, Subcommand};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
+use commands::graph::{graph_command, GraphFormat, GraphOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = "0.2.0", about = "Semantic version control")]
@@ -39,6 +40,20 @@ enum Commands {
         #[arg(long, hide = true)]
         profile: bool,
     },
+    /// Show entity dependency graph
+    Graph {
+        /// Specific files to analyze (default: all supported files)
+        #[arg()]
+        files: Vec<String>,
+
+        /// Show dependencies/dependents for a specific entity
+        #[arg(long)]
+        entity: Option<String>,
+
+        /// Output format: terminal or json
+        #[arg(long, default_value = "terminal")]
+        format: String,
+    },
 }
 
 fn main() {
@@ -69,6 +84,26 @@ fn main() {
                 from,
                 to,
                 profile,
+            });
+        }
+        Some(Commands::Graph {
+            files,
+            entity,
+            format,
+        }) => {
+            let graph_format = match format.as_str() {
+                "json" => GraphFormat::Json,
+                _ => GraphFormat::Terminal,
+            };
+
+            graph_command(GraphOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                file_paths: files,
+                entity,
+                format: graph_format,
             });
         }
         None => {

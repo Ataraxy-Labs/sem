@@ -71,6 +71,7 @@ fn walk_toml(
             name: dot_path.clone(),
             parent_id,
             content_hash: content_hash(&value_str),
+            structural_hash: None,
             content: value_str,
             start_line: line_match,
             end_line: line_match,

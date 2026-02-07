@@ -104,6 +104,7 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
                 name: section.name.clone(),
                 parent_id: section.parent_id.clone(),
                 content_hash: content_hash(&section_content),
+                structural_hash: None,
                 content: section_content,
                 start_line: section.start_line,
                 end_line: section.start_line + section.lines.len() - 1,

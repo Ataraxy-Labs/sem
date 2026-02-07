@@ -64,50 +64,72 @@ pub fn match_entities(
         .collect();
 
     // Phase 2: Content hash match (rename/move detection)
+    // Also uses structural_hash — if formatting/comments changed but logic is same,
+    // structural_hash still matches (inspired by Unison content-addressed model).
     let mut before_by_hash: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    let mut before_by_structural: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
     for entity in &unmatched_before {
         before_by_hash
             .entry(entity.content_hash.as_str())
             .or_default()
             .push(entity);
+        if let Some(ref sh) = entity.structural_hash {
+            before_by_structural
+                .entry(sh.as_str())
+                .or_default()
+                .push(entity);
+        }
     }
 
     for after_entity in &unmatched_after {
         if matched_after.contains(&after_entity.id) {
             continue;
         }
-        if let Some(candidates) = before_by_hash.get_mut(after_entity.content_hash.as_str()) {
-            if let Some(before_entity) = candidates.pop() {
-                matched_before.insert(before_entity.id.clone());
-                matched_after.insert(after_entity.id.clone());
+        // Try exact content_hash first
+        let found = before_by_hash
+            .get_mut(after_entity.content_hash.as_str())
+            .and_then(|c| c.pop());
+        // Fall back to structural_hash (formatting/comment changes don't matter)
+        let found = found.or_else(|| {
+            after_entity.structural_hash.as_ref().and_then(|sh| {
+                before_by_structural.get_mut(sh.as_str()).and_then(|c| {
+                    c.iter()
+                        .position(|e| !matched_before.contains(&e.id))
+                        .map(|i| c.remove(i))
+                })
+            })
+        });
 
-                let change_type = if before_entity.file_path != after_entity.file_path {
-                    ChangeType::Moved
-                } else {
-                    ChangeType::Renamed
-                };
+        if let Some(before_entity) = found {
+            matched_before.insert(before_entity.id.clone());
+            matched_after.insert(after_entity.id.clone());
 
-                let old_file_path = if before_entity.file_path != after_entity.file_path {
-                    Some(before_entity.file_path.clone())
-                } else {
-                    None
-                };
+            let change_type = if before_entity.file_path != after_entity.file_path {
+                ChangeType::Moved
+            } else {
+                ChangeType::Renamed
+            };
 
-                changes.push(SemanticChange {
-                    id: format!("change::{}", after_entity.id),
-                    entity_id: after_entity.id.clone(),
-                    change_type,
-                    entity_type: after_entity.entity_type.clone(),
-                    entity_name: after_entity.name.clone(),
-                    file_path: after_entity.file_path.clone(),
-                    old_file_path,
-                    before_content: Some(before_entity.content.clone()),
-                    after_content: Some(after_entity.content.clone()),
-                    commit_sha: commit_sha.map(String::from),
-                    author: author.map(String::from),
-                    timestamp: None,
-                });
-            }
+            let old_file_path = if before_entity.file_path != after_entity.file_path {
+                Some(before_entity.file_path.clone())
+            } else {
+                None
+            };
+
+            changes.push(SemanticChange {
+                id: format!("change::{}", after_entity.id),
+                entity_id: after_entity.id.clone(),
+                change_type,
+                entity_type: after_entity.entity_type.clone(),
+                entity_name: after_entity.name.clone(),
+                file_path: after_entity.file_path.clone(),
+                old_file_path,
+                before_content: Some(before_entity.content.clone()),
+                after_content: Some(after_entity.content.clone()),
+                commit_sha: commit_sha.map(String::from),
+                author: author.map(String::from),
+                timestamp: None,
+            });
         }
     }
 
@@ -249,6 +271,7 @@ mod tests {
             parent_id: None,
             content: content.to_string(),
             content_hash: content_hash(content),
+            structural_hash: None,
             start_line: 1,
             end_line: 1,
             metadata: None,

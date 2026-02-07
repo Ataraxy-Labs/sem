@@ -51,6 +51,7 @@ impl SemanticParserPlugin for CsvParserPlugin {
                 name,
                 parent_id: None,
                 content_hash: content_hash(line),
+                structural_hash: None,
                 content: line.to_string(),
                 start_line: i + 1,
                 end_line: i + 1,
