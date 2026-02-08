@@ -123,6 +123,51 @@
 
       <div class="changelog-entry">
         <div class="changelog-title">
+          <span class="changelog-sha">f1cf19a</span>
+          <span class="changelog-tag perf">perf</span>
+          Incremental graph updates
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--fg)">EntityGraph::update_from_changes()</code> incrementally updates the dependency graph when files change, instead of rebuilding from scratch.
+          Handles Added, Modified, Deleted, and Renamed files. Re-extracts only changed files, rebuilds symbol table, re-resolves references.
+          Much faster than full rebuild on large repos when only a few files changed.
+        </p>
+        <p class="changelog-stats">+444 lines &bull; 3 files &bull; 4 new tests &bull; 18 total tests passing</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">da9f34f</span>
+          <span class="changelog-tag feat">feat</span>
+          sem impact: change impact analysis
+        </div>
+        <p class="changelog-body">
+          New <code style="color:var(--fg)">sem impact &lt;entity_name&gt;</code> command shows transitive dependents &mdash; what would break if you changed an entity.
+          Uses BFS over the entity dependency graph. Output grouped by file, with <code style="color:var(--fg)">--json</code> flag for machine consumption.
+          Shows the blast radius at every depth level: direct dependents, their dependents, and so on.
+        </p>
+        <p class="changelog-stats">+177 lines &bull; 4 files &bull; terminal + JSON output</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">e6dd39f</span>
+          <span class="changelog-tag feat">feat</span>
+          Structural hash + entity dependency graph
+        </div>
+        <p class="changelog-body">
+          Two major features. <strong>Structural hash</strong> (Unison-inspired): computes AST-based hash that strips comments and normalizes whitespace. Two entities with the same structural_hash are logically identical even if formatting differs. Used for rename detection.
+          <strong>Entity dependency graph</strong>: two-pass extraction (entities &rarr; symbol table &rarr; reference edges). Intra-file and cross-file resolution. Forward + reverse dependency lookup. Transitive impact analysis via BFS.
+          New <code style="color:var(--fg)">sem graph</code> CLI command.
+        </p>
+        <p class="changelog-stats">+749 lines &bull; 15 files &bull; 14 tests (up from 10) &bull; structural_hash, EntityGraph, sem graph, sem impact</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: two-pass extraction is key.</strong> You can't resolve references in a single pass because forward declarations aren't available yet. Building the full symbol table first (name &rarr; entity ID), then resolving references in a second pass, is the same approach compilers use. Obvious in hindsight, but the first attempt tried single-pass and produced broken edges for every forward reference.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
           <span class="changelog-sha">01edf1f</span>
           <span class="changelog-tag feat">feat</span>
           Initial release
