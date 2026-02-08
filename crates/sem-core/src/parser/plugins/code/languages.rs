@@ -33,6 +33,14 @@ fn get_rust() -> Option<Language> {
     Some(tree_sitter_rust::LANGUAGE.into())
 }
 
+fn get_java() -> Option<Language> {
+    Some(tree_sitter_java::LANGUAGE.into())
+}
+
+fn get_c() -> Option<Language> {
+    Some(tree_sitter_c::LANGUAGE.into())
+}
+
 static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "typescript",
     extensions: &[".ts"],
@@ -125,6 +133,37 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
     get_language: get_rust,
 };
 
+static JAVA_CONFIG: LanguageConfig = LanguageConfig {
+    id: "java",
+    extensions: &[".java"],
+    entity_node_types: &[
+        "class_declaration",
+        "method_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "field_declaration",
+        "constructor_declaration",
+        "annotation_type_declaration",
+    ],
+    container_node_types: &["class_body", "interface_body", "enum_body"],
+    get_language: get_java,
+};
+
+static C_CONFIG: LanguageConfig = LanguageConfig {
+    id: "c",
+    extensions: &[".c", ".h"],
+    entity_node_types: &[
+        "function_definition",
+        "struct_specifier",
+        "enum_specifier",
+        "union_specifier",
+        "type_definition",
+        "declaration",
+    ],
+    container_node_types: &[],
+    get_language: get_c,
+};
+
 static ALL_CONFIGS: &[&LanguageConfig] = &[
     &TYPESCRIPT_CONFIG,
     &TSX_CONFIG,
@@ -132,6 +171,8 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &PYTHON_CONFIG,
     &GO_CONFIG,
     &RUST_CONFIG,
+    &JAVA_CONFIG,
+    &C_CONFIG,
 ];
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
@@ -145,6 +186,7 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
     // All unique extensions across all language configs
     static EXTENSIONS: &[&str] = &[
         ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs",
+        ".java", ".c", ".h",
     ];
     EXTENSIONS
 }

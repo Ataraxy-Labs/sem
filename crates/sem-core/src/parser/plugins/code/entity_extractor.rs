@@ -122,6 +122,35 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
+    // For C function_definition, the name is inside the declarator
+    if node_type == "function_definition" {
+        if let Some(declarator) = node.child_by_field_name("declarator") {
+            return extract_declarator_name(declarator, source);
+        }
+    }
+
+    // For C declarations (global vars, function prototypes), extract the declarator name
+    if node_type == "declaration" {
+        if let Some(declarator) = node.child_by_field_name("declarator") {
+            // Could be a plain identifier, pointer_declarator, function_declarator, etc.
+            return extract_declarator_name(declarator, source);
+        }
+    }
+
+    // For C struct/enum/union specifiers, try the 'name' field
+    if node_type == "struct_specifier" || node_type == "enum_specifier" || node_type == "union_specifier" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(node_text(name_node, source));
+        }
+    }
+
+    // For C type_definition (typedef), look for the type name
+    if node_type == "type_definition" {
+        if let Some(declarator) = node.child_by_field_name("declarator") {
+            return extract_declarator_name(declarator, source);
+        }
+    }
+
     // Fallback: first identifier child
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -131,6 +160,34 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+/// Extract the name from a C declarator (handles pointer_declarator, function_declarator, etc.)
+fn extract_declarator_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => Some(node_text(node, source)),
+        "pointer_declarator" | "function_declarator" | "array_declarator" | "parenthesized_declarator" => {
+            if let Some(inner) = node.child_by_field_name("declarator") {
+                extract_declarator_name(inner, source)
+            } else {
+                let mut cursor = node.walk();
+                let result = node.named_children(&mut cursor)
+                    .find(|c| c.kind() == "identifier" || c.kind() == "type_identifier")
+                    .map(|c| node_text(c, source));
+                result
+            }
+        }
+        _ => {
+            if let Some(name) = node.child_by_field_name("name") {
+                return Some(node_text(name, source));
+            }
+            let mut cursor = node.walk();
+            let result = node.named_children(&mut cursor)
+                .find(|c| c.kind() == "identifier" || c.kind() == "type_identifier")
+                .map(|c| node_text(c, source));
+            result
+        }
+    }
 }
 
 fn node_text(node: Node, source: &[u8]) -> String {
@@ -143,17 +200,21 @@ fn map_node_type(tree_sitter_type: &str) -> String {
         "method_declaration" | "method_definition" => "method",
         "class_declaration" | "class_definition" => "class",
         "interface_declaration" => "interface",
-        "type_alias_declaration" | "type_declaration" | "type_item" => "type",
-        "enum_declaration" | "enum_item" => "enum",
-        "struct_item" => "struct",
+        "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" => "type",
+        "enum_declaration" | "enum_item" | "enum_specifier" => "enum",
+        "struct_item" | "struct_specifier" => "struct",
+        "union_specifier" => "union",
         "impl_item" => "impl",
         "trait_item" => "trait",
         "mod_item" => "module",
         "export_statement" => "export",
-        "lexical_declaration" | "variable_declaration" | "var_declaration" => "variable",
+        "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
         "const_declaration" | "const_item" => "constant",
         "static_item" => "static",
         "decorated_definition" => "function",
+        "constructor_declaration" => "constructor",
+        "field_declaration" => "field",
+        "annotation_type_declaration" => "annotation",
         other => return other.to_string(),
     }
     .to_string()
