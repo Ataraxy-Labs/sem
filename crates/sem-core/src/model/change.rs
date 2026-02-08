@@ -43,4 +43,8 @@ pub struct SemanticChange {
     pub author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Whether the AST structure changed (true) or only formatting/comments (false).
+    /// None when structural hash is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structural_change: Option<bool>,
 }

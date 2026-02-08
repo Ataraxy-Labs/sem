@@ -41,6 +41,18 @@ fn get_c() -> Option<Language> {
     Some(tree_sitter_c::LANGUAGE.into())
 }
 
+fn get_cpp() -> Option<Language> {
+    Some(tree_sitter_cpp::LANGUAGE.into())
+}
+
+fn get_ruby() -> Option<Language> {
+    Some(tree_sitter_ruby::LANGUAGE.into())
+}
+
+fn get_csharp() -> Option<Language> {
+    Some(tree_sitter_c_sharp::LANGUAGE.into())
+}
+
 static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "typescript",
     extensions: &[".ts"],
@@ -164,6 +176,54 @@ static C_CONFIG: LanguageConfig = LanguageConfig {
     get_language: get_c,
 };
 
+static CPP_CONFIG: LanguageConfig = LanguageConfig {
+    id: "cpp",
+    extensions: &[".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
+    entity_node_types: &[
+        "function_definition",
+        "class_specifier",
+        "struct_specifier",
+        "enum_specifier",
+        "namespace_definition",
+        "template_declaration",
+        "declaration",
+        "type_definition",
+    ],
+    container_node_types: &["field_declaration_list", "declaration_list"],
+    get_language: get_cpp,
+};
+
+static RUBY_CONFIG: LanguageConfig = LanguageConfig {
+    id: "ruby",
+    extensions: &[".rb"],
+    entity_node_types: &[
+        "method",
+        "singleton_method",
+        "class",
+        "module",
+    ],
+    container_node_types: &["body_statement"],
+    get_language: get_ruby,
+};
+
+static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
+    id: "csharp",
+    extensions: &[".cs"],
+    entity_node_types: &[
+        "method_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "struct_declaration",
+        "namespace_declaration",
+        "property_declaration",
+        "constructor_declaration",
+        "field_declaration",
+    ],
+    container_node_types: &["declaration_list"],
+    get_language: get_csharp,
+};
+
 static ALL_CONFIGS: &[&LanguageConfig] = &[
     &TYPESCRIPT_CONFIG,
     &TSX_CONFIG,
@@ -173,6 +233,9 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &RUST_CONFIG,
     &JAVA_CONFIG,
     &C_CONFIG,
+    &CPP_CONFIG,
+    &RUBY_CONFIG,
+    &CSHARP_CONFIG,
 ];
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
@@ -186,7 +249,8 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
     // All unique extensions across all language configs
     static EXTENSIONS: &[&str] = &[
         ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs",
-        ".java", ".c", ".h",
+        ".java", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx",
+        ".rb", ".cs",
     ];
     EXTENSIONS
 }

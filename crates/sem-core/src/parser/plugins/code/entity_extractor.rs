@@ -122,10 +122,48 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
-    // For C function_definition, the name is inside the declarator
+    // For C/C++ function_definition, the name is inside the declarator
     if node_type == "function_definition" {
         if let Some(declarator) = node.child_by_field_name("declarator") {
             return extract_declarator_name(declarator, source);
+        }
+    }
+
+    // For C++ template_declaration, look at the inner declaration
+    if node_type == "template_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let kind = child.kind();
+            if kind != "template_parameter_list" {
+                // The inner declaration (class, function, etc.)
+                if let Some(name) = child.child_by_field_name("name") {
+                    return Some(node_text(name, source));
+                }
+                if let Some(declarator) = child.child_by_field_name("declarator") {
+                    return extract_declarator_name(declarator, source);
+                }
+            }
+        }
+    }
+
+    // For C++ namespace_definition
+    if node_type == "namespace_definition" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(node_text(name_node, source));
+        }
+    }
+
+    // For C++ class_specifier
+    if node_type == "class_specifier" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(node_text(name_node, source));
+        }
+    }
+
+    // For C# property_declaration, namespace_declaration, struct_declaration
+    if node_type == "property_declaration" || node_type == "namespace_declaration" || node_type == "struct_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(node_text(name_node, source));
         }
     }
 
@@ -165,7 +203,11 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
 /// Extract the name from a C declarator (handles pointer_declarator, function_declarator, etc.)
 fn extract_declarator_name(node: Node, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "identifier" | "type_identifier" => Some(node_text(node, source)),
+        "identifier" | "type_identifier" | "field_identifier" => Some(node_text(node, source)),
+        "qualified_identifier" | "scoped_identifier" => {
+            // For C++ qualified names like ClassName::method, return the full qualified name
+            Some(node_text(node, source))
+        }
         "pointer_declarator" | "function_declarator" | "array_declarator" | "parenthesized_declarator" => {
             if let Some(inner) = node.child_by_field_name("declarator") {
                 extract_declarator_name(inner, source)
@@ -197,16 +239,16 @@ fn node_text(node: Node, source: &[u8]) -> String {
 fn map_node_type(tree_sitter_type: &str) -> String {
     match tree_sitter_type {
         "function_declaration" | "function_definition" | "function_item" => "function",
-        "method_declaration" | "method_definition" => "method",
-        "class_declaration" | "class_definition" => "class",
+        "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
+        "class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
         "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" => "type",
         "enum_declaration" | "enum_item" | "enum_specifier" => "enum",
-        "struct_item" | "struct_specifier" => "struct",
+        "struct_item" | "struct_specifier" | "struct_declaration" => "struct",
         "union_specifier" => "union",
         "impl_item" => "impl",
         "trait_item" => "trait",
-        "mod_item" => "module",
+        "mod_item" | "module" | "namespace_definition" | "namespace_declaration" => "module",
         "export_statement" => "export",
         "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
         "const_declaration" | "const_item" => "constant",
@@ -214,7 +256,9 @@ fn map_node_type(tree_sitter_type: &str) -> String {
         "decorated_definition" => "function",
         "constructor_declaration" => "constructor",
         "field_declaration" => "field",
+        "property_declaration" => "property",
         "annotation_type_declaration" => "annotation",
+        "template_declaration" => "template",
         other => return other.to_string(),
     }
     .to_string()

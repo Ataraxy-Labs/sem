@@ -35,6 +35,10 @@ pub fn match_entities(
             matched_after.insert(id.to_string());
 
             if before_entity.content_hash != after_entity.content_hash {
+                let structural_change = match (&before_entity.structural_hash, &after_entity.structural_hash) {
+                    (Some(before_sh), Some(after_sh)) => Some(before_sh != after_sh),
+                    _ => None,
+                };
                 changes.push(SemanticChange {
                     id: format!("change::{id}"),
                     entity_id: id.to_string(),
@@ -48,6 +52,7 @@ pub fn match_entities(
                     commit_sha: commit_sha.map(String::from),
                     author: author.map(String::from),
                     timestamp: None,
+                    structural_change,
                 });
             }
         }
@@ -129,6 +134,7 @@ pub fn match_entities(
                 commit_sha: commit_sha.map(String::from),
                 author: author.map(String::from),
                 timestamp: None,
+                structural_change: None,
             });
         }
     }
@@ -197,6 +203,7 @@ pub fn match_entities(
                         commit_sha: commit_sha.map(String::from),
                         author: author.map(String::from),
                         timestamp: None,
+                        structural_change: None,
                     });
                 }
             }
@@ -218,6 +225,7 @@ pub fn match_entities(
             commit_sha: commit_sha.map(String::from),
             author: author.map(String::from),
             timestamp: None,
+            structural_change: None,
         });
     }
 
@@ -236,6 +244,7 @@ pub fn match_entities(
             commit_sha: commit_sha.map(String::from),
             author: author.map(String::from),
             timestamp: None,
+            structural_change: None,
         });
     }
 

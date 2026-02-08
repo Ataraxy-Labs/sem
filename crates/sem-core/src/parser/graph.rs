@@ -517,6 +517,24 @@ fn is_keyword(word: &str) -> bool {
             // Go
             | "func" | "package" | "range" | "select" | "chan" | "go"
             | "defer" | "map" | "make" | "append" | "len" | "cap"
+            // C/C++
+            | "auto" | "register" | "volatile" | "sizeof" | "typedef"
+            | "template" | "typename" | "namespace" | "virtual" | "inline"
+            | "constexpr" | "nullptr" | "noexcept" | "explicit" | "friend"
+            | "operator" | "using" | "cout" | "endl" | "cerr" | "cin"
+            | "printf" | "scanf" | "malloc" | "free" | "NULL" | "include"
+            | "ifdef" | "ifndef" | "endif" | "define" | "pragma"
+            // Ruby
+            | "end" | "then" | "elsif" | "unless" | "until"
+            | "begin" | "rescue" | "ensure" | "when" | "require"
+            | "attr_accessor" | "attr_reader" | "attr_writer"
+            | "puts" | "nil" | "module" | "defined"
+            // C#
+            | "internal" | "sealed" | "readonly"
+            | "partial" | "delegate" | "event" | "params" | "out"
+            | "object" | "decimal" | "sbyte" | "ushort" | "uint"
+            | "ulong" | "nint" | "nuint" | "dynamic"
+            | "get" | "set" | "value" | "init" | "record"
             // Types (primitives)
             | "string" | "number" | "boolean" | "int" | "float" | "double"
             | "bool" | "char" | "byte" | "i8" | "i16" | "i32" | "i64"

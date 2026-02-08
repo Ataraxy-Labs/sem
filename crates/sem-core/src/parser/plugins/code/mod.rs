@@ -172,6 +172,39 @@ int main() {
     }
 
     #[test]
+    fn test_cpp_entity_extraction() {
+        let code = "namespace math {\nclass Vector3 {\npublic:\n    float length() const { return 0; }\n};\n}\nvoid greet() {}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "main.cpp");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"math"), "got: {:?}", names);
+        assert!(names.contains(&"Vector3"), "got: {:?}", names);
+        assert!(names.contains(&"greet"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_ruby_entity_extraction() {
+        let code = "module Auth\n  class User\n    def greet\n      \"hi\"\n    end\n  end\nend\ndef helper(x)\n  x * 2\nend\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "auth.rb");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Auth"), "got: {:?}", names);
+        assert!(names.contains(&"User"), "got: {:?}", names);
+        assert!(names.contains(&"helper"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_csharp_entity_extraction() {
+        let code = "namespace MyApp {\npublic class User {\n    public string GetName() { return \"\"; }\n}\npublic enum Role { Admin, User }\n}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Models.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"MyApp"), "got: {:?}", names);
+        assert!(names.contains(&"User"), "got: {:?}", names);
+        assert!(names.contains(&"Role"), "got: {:?}", names);
+    }
+
+    #[test]
     fn test_typescript_entity_extraction() {
         // Existing language should still work
         let code = r#"

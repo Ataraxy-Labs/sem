@@ -2,6 +2,7 @@ mod commands;
 mod formatters;
 
 use clap::{Parser, Subcommand};
+use commands::blame::{blame_command, BlameOptions};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
@@ -55,6 +56,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show semantic blame — who last modified each entity
+    Blame {
+        /// File to blame
+        #[arg()]
+        file: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show entity dependency graph
     Graph {
         /// Specific files to analyze (default: all supported files)
@@ -99,6 +110,16 @@ fn main() {
                 from,
                 to,
                 profile,
+            });
+        }
+        Some(Commands::Blame { file, json }) => {
+            blame_command(BlameOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                file_path: file,
+                json,
             });
         }
         Some(Commands::Impact {

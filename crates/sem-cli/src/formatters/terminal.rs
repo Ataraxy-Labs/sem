@@ -29,10 +29,20 @@ pub fn format_terminal(result: &DiffResult) -> String {
                     "⊕".green().to_string(),
                     "[added]".green().to_string(),
                 ),
-                ChangeType::Modified => (
-                    "∆".yellow().to_string(),
-                    "[modified]".yellow().to_string(),
-                ),
+                ChangeType::Modified => {
+                    let is_cosmetic = change.structural_change == Some(false);
+                    if is_cosmetic {
+                        (
+                            "~".dimmed().to_string(),
+                            "[cosmetic]".dimmed().to_string(),
+                        )
+                    } else {
+                        (
+                            "∆".yellow().to_string(),
+                            "[modified]".yellow().to_string(),
+                        )
+                    }
+                }
                 ChangeType::Deleted => (
                     "⊖".red().to_string(),
                     "[deleted]".red().to_string(),
