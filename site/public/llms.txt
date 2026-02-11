@@ -1,0 +1,98 @@
+# sem
+
+> Semantic version control built on Git. Entity-level diff, blame, graph, and impact analysis.
+
+## Overview
+
+sem extends git with entity-level operations. Instead of tracking lines, sem tracks functions, classes, methods, and types. Uses tree-sitter for parsing and AST-normalized structural hashing to detect cosmetic vs structural changes.
+
+Git tracks lines. Developers think in functions. sem bridges the gap.
+
+## Install
+
+```
+cd sem/crates && cargo build --release
+```
+
+Binary at `crates/target/release/sem`.
+
+## Commands
+
+### sem diff
+Entity-level diff between commits. Shows which functions/classes were added, modified, deleted, or renamed. Distinguishes cosmetic changes (whitespace/formatting) from structural changes (logic).
+
+```
+sem diff HEAD~1
+sem diff main..feature-branch
+sem diff HEAD~1 --file src/auth.ts
+```
+
+### sem blame
+Entity-level blame. Shows who last modified each function/class, not each line.
+
+```
+sem blame src/auth.ts
+```
+
+### sem graph
+Cross-file entity dependency graph. Shows what each function calls and what calls it.
+
+```
+sem graph src/auth.ts
+sem graph src/auth.ts --entity validateToken
+```
+
+### sem impact
+Transitive impact analysis. If this entity changes, what else is affected? BFS through dependency graph.
+
+```
+sem impact src/auth.ts validateToken
+```
+
+## Key Features
+
+- 12 languages: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, Fortran
+- Structural hashing: AST-normalized hashes that ignore whitespace, comments, and formatting
+- Cosmetic vs structural change detection in diff
+- Entity-level blame (per function, not per line)
+- Cross-file dependency graph via call/reference analysis
+- Transitive impact analysis (BFS through dependency graph)
+- Incremental graph updates (only re-parse changed files)
+
+## Architecture
+
+Cargo workspace: sem-core (library) + sem-cli (binary).
+
+### sem-core
+- Parser plugins for 12 languages via tree-sitter
+- Entity extraction: functions, classes, methods, interfaces, types, enums, imports
+- Structural hashing: normalize AST, strip whitespace/comments, SHA-256
+- Dependency graph: cross-file call/reference tracking via petgraph
+- Region extraction: split files into Entity and Interstitial regions
+
+### Language Support
+
+| Language | Extensions | Entity Types |
+|----------|-----------|--------------|
+| TypeScript | .ts | functions, classes, interfaces, types, enums |
+| TSX | .tsx | functions, classes, interfaces, types, enums |
+| JavaScript | .js .jsx .mjs .cjs | functions, classes, variables |
+| Python | .py | functions, classes, decorators |
+| Go | .go | functions, methods, types |
+| Rust | .rs | functions, structs, enums, impls, traits, mods |
+| Java | .java | classes, methods, interfaces, enums, fields |
+| C | .c .h | functions, structs, enums, unions, typedefs |
+| C++ | .cpp .cc .cxx .hpp | functions, classes, structs, enums, namespaces, templates |
+| Ruby | .rb | methods, classes, modules |
+| C# | .cs | methods, classes, interfaces, enums, structs, namespaces |
+| Fortran | .f90 .f95 .f03 .f08 .f .for | functions, subroutines, modules, programs, interfaces |
+
+## Used By
+
+- **weave**: Entity-level merge driver for Git (uses sem-core for entity extraction)
+- **agenthub**: Agent-native GitHub platform (uses sem-core for code graph)
+
+## Links
+
+- GitHub: https://github.com/Ataraxy-Labs/sem
+- License: MIT

@@ -35,6 +35,13 @@ export default function Home() {
           >
             Read the Technical Deep Dive
           </a>
+          <a
+            href="/llms.txt"
+            className="px-6 py-3 border border-white/20 rounded-lg hover:border-white/40 transition-colors text-sm"
+            style={{ fontFamily: "var(--font-heading)" }}
+          >
+            llms.txt
+          </a>
         </div>
 
         {/* Install */}
