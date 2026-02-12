@@ -88,9 +88,20 @@ Cargo workspace: sem-core (library) + sem-cli (binary).
 | PHP | .php | functions, classes, methods, interfaces, traits, enums, namespaces |
 | Fortran | .f90 .f95 .f03 .f08 .f .for | functions, subroutines, modules, programs, interfaces |
 
+## Performance
+
+Parallel entity extraction via rayon. Zero-allocation graph traversal.
+
+- Small commit (4 files): 9ms
+- Large commit (13 files, 65 entities): 22ms
+- Range (8 commits, 30 files, 1383 entities): 34ms
+- Cross-repo: weave 6ms, agenthub 21ms
+- sem diff vs git diff: +12ms overhead for full semantic parsing
+
 ## Used By
 
 - **weave**: Entity-level merge driver for Git (uses sem-core for entity extraction)
+- **inspect**: Entity-level code review CLI (uses sem-core for graph and risk scoring)
 - **agenthub**: Agent-native GitHub platform (uses sem-core for code graph)
 
 ## Links
