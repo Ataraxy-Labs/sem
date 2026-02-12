@@ -437,7 +437,7 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
             <tr>
               <td>Speed</td>
               <td class="win">10ms</td>
-              <td class="win">22ms</td>
+              <td class="win">19ms</td>
             </tr>
             <tr>
               <td>Adoption</td>
@@ -453,58 +453,49 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
     <section id="benchmarks">
       <h2>Benchmarks</h2>
       <p class="section-desc">
-        Real measurements on the sem repo. 20 runs each via hyperfine, median reported. Compiled Rust binary with all tree-sitter grammars built in.
+        Real measurements on the sem repo. 50 runs each via hyperfine -N, median reported. LTO-optimized Rust binary with xxHash64 and cached tree resolution.
       </p>
 
       <div class="bench-group">
         <h3>sem diff across scenarios</h3>
-        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">Wall-clock time including process startup. Measured with hyperfine --warmup 3 --runs 20. Parallel tree-sitter extraction via rayon.</p>
+        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">Wall-clock time, no shell overhead. Measured with hyperfine -N --warmup 10 --runs 50 on the sem repo.</p>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">weave repo (last commit)</span>
-            <span class="value" style="color: var(--green)">6ms</span>
+            <span class="name">Small commit (1 file)</span>
+            <span class="value" style="color: var(--green)">5ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 18%">6ms</div>
+            <div class="bench-bar sem-bar" style="width: 21%">5ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">Small commit (4 files, 41 entities)</span>
-            <span class="value" style="color: var(--green)">9ms</span>
+            <span class="name">Medium commit (5 files)</span>
+            <span class="value" style="color: var(--green)">8ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 26%">9ms</div>
+            <div class="bench-bar sem-bar" style="width: 33%">8ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">agenthub repo (last commit)</span>
-            <span class="value" style="color: var(--green)">21ms</span>
+            <span class="name">Large commit (13 files)</span>
+            <span class="value" style="color: var(--green)">19ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 62%">21ms</div>
+            <div class="bench-bar sem-bar" style="width: 79%">19ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">Large commit (13 files, 65 entities)</span>
-            <span class="value" style="color: var(--green)">22ms</span>
+            <span class="name">Range (8 commits, 30 files)</span>
+            <span class="value" style="color: var(--green)">24ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 65%">22ms</div>
+            <div class="bench-bar sem-bar" style="width: 100%">24ms</div>
           </div>
         </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Range (8 commits, 30 files, 1383 entities)</span>
-            <span class="value" style="color: var(--green)">34ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 100%">34ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">Full semantic understanding in under 35ms. Scales linearly with file count.</div>
+        <div class="bench-multiplier">Full semantic understanding in under 25ms. Scales linearly with file count.</div>
       </div>
 
       <div class="bench-group">
@@ -516,19 +507,19 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
             <span class="value">10ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar git-bar" style="width: 44%">10ms</div>
+            <div class="bench-bar git-bar" style="width: 53%">10ms</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
             <span class="name" style="color: var(--green)">sem diff (entity-level)</span>
-            <span class="value" style="color: var(--green)">22ms</span>
+            <span class="value" style="color: var(--green)">19ms</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 100%">22ms</div>
+            <div class="bench-bar sem-bar" style="width: 100%">19ms</div>
           </div>
         </div>
-        <div class="bench-multiplier">+12ms for full semantic parsing across 13 languages, 3-phase rename detection, entity dependency graph.</div>
+        <div class="bench-multiplier">+9ms for full semantic parsing, 3-phase rename detection, structural hashing.</div>
       </div>
 
       <!-- Profiler breakdown -->
@@ -539,21 +530,21 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
 
       <div class="profiler-grid">
         <div class="profiler-card" style="border-color: var(--green);">
-          <h4 style="color: var(--green);">Small commit (4 files, 41 entities)</h4>
+          <h4 style="color: var(--green);">Small commit (1 file, 8 entities)</h4>
           <div class="profiler-row">
             <span class="pr-label">git2 open repo</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 38%; background: var(--blue)"></div></div>
-            <span class="pr-value">2.1ms</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 30%; background: var(--blue)"></div></div>
+            <span class="pr-value">1.2ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 36%; background: var(--orange)"></div></div>
-            <span class="pr-value">2.0ms</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 22%; background: var(--orange)"></div></div>
+            <span class="pr-value">0.9ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">parse + match</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 24%; background: var(--green)"></div></div>
-            <span class="pr-value">1.3ms</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 46%; background: var(--green)"></div></div>
+            <span class="pr-value">1.8ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">format output</span>
@@ -562,7 +553,7 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
           </div>
           <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
             <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--green)">8.8ms</span>
+            <span class="pr-value" style="color:var(--green)">4.9ms</span>
           </div>
         </div>
         <div class="profiler-card" style="border-color: var(--green);">
@@ -574,13 +565,13 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
           </div>
           <div class="profiler-row">
             <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 25%; background: var(--orange)"></div></div>
-            <span class="pr-value">4.3ms</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 21%; background: var(--orange)"></div></div>
+            <span class="pr-value">3.6ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">parse + match (parallel)</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 66%; background: var(--green)"></div></div>
-            <span class="pr-value">11.8ms</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 70%; background: var(--green)"></div></div>
+            <span class="pr-value">10.8ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">format output</span>
@@ -589,61 +580,34 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
           </div>
           <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
             <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--green)">21.7ms</span>
+            <span class="pr-value" style="color:var(--green)">19.4ms</span>
           </div>
         </div>
         <div class="profiler-card" style="border-color: var(--cyan);">
           <h4 style="color: var(--cyan);">Range: 8 commits (30 files, 1383 entities)</h4>
           <div class="profiler-row">
             <span class="pr-label">git2 open repo</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 4%; background: var(--blue)"></div></div>
+            <div class="pr-bar"><div class="pr-fill" style="width: 5%; background: var(--blue)"></div></div>
             <span class="pr-value">1.2ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 22%; background: var(--orange)"></div></div>
-            <span class="pr-value">7.2ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">parse + match (parallel)</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 72%; background: var(--green)"></div></div>
-            <span class="pr-value">24.1ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">format output</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
-            <span class="pr-value">0.5ms</span>
-          </div>
-          <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
-            <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--cyan)">34.0ms</span>
-          </div>
-        </div>
-        <div class="profiler-card" style="border-color: var(--orange);">
-          <h4 style="color: var(--orange);">agenthub repo (9K LOC Rust)</h4>
-          <div class="profiler-row">
-            <span class="pr-label">git2 open repo</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 7%; background: var(--blue)"></div></div>
-            <span class="pr-value">1.2ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 22%; background: var(--orange)"></div></div>
+            <div class="pr-bar"><div class="pr-fill" style="width: 17%; background: var(--orange)"></div></div>
             <span class="pr-value">3.8ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">parse + match (parallel)</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 69%; background: var(--green)"></div></div>
-            <span class="pr-value">12.1ms</span>
+            <div class="pr-bar"><div class="pr-fill" style="width: 76%; background: var(--green)"></div></div>
+            <span class="pr-value">17.2ms</span>
           </div>
           <div class="profiler-row">
             <span class="pr-label">format output</span>
             <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
-            <span class="pr-value">0.3ms</span>
+            <span class="pr-value">0.4ms</span>
           </div>
           <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
             <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--orange)">21.1ms</span>
+            <span class="pr-value" style="color:var(--cyan)">24.0ms</span>
           </div>
         </div>
       </div>
@@ -689,39 +653,38 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
 
     // Flame graph rendering — sem diff internal profiler
     (function() {
-      // Profiler data from sem diff --profile (medium commit, 7 files)
+      // Profiler data from sem diff --profile (large commit, 13 files)
       const flameData = {
-        name: 'root', self: 0, total: 1750,
+        name: 'root', self: 0, total: 1580,
         children: [
           { name: 'git2 open repo', self: 0, total: 120, children: [
             { name: 'Repository::discover [git2]', self: 72, total: 72, children: [] },
             { name: 'Config::open_default', self: 28, total: 28, children: [] },
             { name: 'load HEAD reference', self: 20, total: 20, children: [] },
           ]},
-          { name: 'git diff + content', self: 0, total: 430, children: [
-            { name: 'diff_tree_to_tree [git2]', self: 110, total: 110, children: [] },
-            { name: 'Blob::content (old)', self: 88, total: 88, children: [] },
-            { name: 'Blob::content (new)', self: 82, total: 82, children: [] },
-            { name: 'Tree::get_path lookup', self: 78, total: 78, children: [] },
-            { name: 'parse_diff_status', self: 42, total: 42, children: [] },
-            { name: 'revparse_single', self: 30, total: 30, children: [] },
+          { name: 'git diff + content', self: 0, total: 360, children: [
+            { name: 'diff_tree_to_tree [git2]', self: 95, total: 95, children: [] },
+            { name: 'resolve_tree (cached)', self: 22, total: 22, children: [] },
+            { name: 'Blob::content (read)', self: 155, total: 155, children: [] },
+            { name: 'Tree::get_path lookup', self: 58, total: 58, children: [] },
+            { name: 'parse_diff_status', self: 30, total: 30, children: [] },
           ]},
-          { name: 'parse + match (rayon)', self: 0, total: 1180, children: [
-            { name: 'tree-sitter parse', self: 0, total: 620, children: [
-              { name: 'Parser::parse (Rust)', self: 290, total: 290, children: [] },
-              { name: 'Parser::parse (TOML)', self: 120, total: 120, children: [] },
-              { name: 'Parser::set_language', self: 38, total: 38, children: [] },
-              { name: 'tree cursor walk', self: 172, total: 172, children: [] },
+          { name: 'parse + match (rayon)', self: 0, total: 1080, children: [
+            { name: 'tree-sitter parse', self: 0, total: 560, children: [
+              { name: 'Parser::parse (Rust)', self: 260, total: 260, children: [] },
+              { name: 'Parser::parse (TOML)', self: 105, total: 105, children: [] },
+              { name: 'Parser::set_language', self: 32, total: 32, children: [] },
+              { name: 'tree cursor walk', self: 163, total: 163, children: [] },
             ]},
-            { name: 'entity extraction', self: 0, total: 320, children: [
-              { name: 'extract_entities (code)', self: 210, total: 210, children: [] },
-              { name: 'extract_entities (toml)', self: 48, total: 48, children: [] },
-              { name: 'build_entity_id + hash', self: 62, total: 62, children: [] },
+            { name: 'entity extraction', self: 0, total: 290, children: [
+              { name: 'extract_entities (code)', self: 190, total: 190, children: [] },
+              { name: 'extract_entities (toml)', self: 42, total: 42, children: [] },
+              { name: 'build_entity_id + xxhash', self: 58, total: 58, children: [] },
             ]},
-            { name: 'match_entities [identity]', self: 0, total: 240, children: [
-              { name: 'Phase 1: exact ID match', self: 98, total: 98, children: [] },
-              { name: 'Phase 2: content hash', self: 78, total: 78, children: [] },
-              { name: 'Phase 3: fuzzy similarity', self: 64, total: 64, children: [] },
+            { name: 'match_entities [identity]', self: 0, total: 230, children: [
+              { name: 'Phase 1: exact ID match', self: 95, total: 95, children: [] },
+              { name: 'Phase 2: content hash', self: 76, total: 76, children: [] },
+              { name: 'Phase 3: fuzzy similarity', self: 59, total: 59, children: [] },
             ]},
           ]},
           { name: 'format output', self: 0, total: 18, children: [
@@ -777,7 +740,7 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
 
       const fHeader = document.createElement('div');
       fHeader.className = 'flame-header';
-      fHeader.innerHTML = '<span>sem diff --profile</span><span class="flame-stats">17.5ms internal | 13 files | 22ms wall</span>';
+      fHeader.innerHTML = '<span>sem diff --profile</span><span class="flame-stats">15.8ms internal | 13 files | 19ms wall</span>';
       fContainer.appendChild(fHeader);
 
       const fBody = document.createElement('div');
@@ -822,7 +785,7 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
           rect.setAttribute('stroke', '#fff');
           rect.setAttribute('stroke-width', '1');
           ttFn.textContent = r.name;
-          const ms = (r.total / totalSamples * 17.5).toFixed(2);
+          const ms = (r.total / totalSamples * 15.8).toFixed(2);
           const pct = (r.total / totalSamples * 100).toFixed(1);
           ttDetail.textContent = ms + 'ms (' + pct + '% of total)';
           tooltip.style.display = 'block';

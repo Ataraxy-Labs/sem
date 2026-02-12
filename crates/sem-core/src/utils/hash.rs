@@ -1,10 +1,9 @@
-use sha2::{Digest, Sha256};
+use std::hash::Hasher;
 use tree_sitter::Node;
+use xxhash_rust::xxh3::Xxh3;
 
 pub fn content_hash(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content.as_bytes()))
 }
 
 pub fn short_hash(content: &str, length: usize) -> String {
@@ -14,37 +13,50 @@ pub fn short_hash(content: &str, length: usize) -> String {
 
 /// Compute a structural hash from a tree-sitter AST node.
 /// Strips comments and normalizes whitespace so formatting-only changes
-/// produce the same hash. This enables detecting "reformatted but not changed"
-/// entities — inspired by Unison's content-addressed code model.
+/// produce the same hash. Uses streaming xxHash64 to avoid intermediate
+/// string allocations.
 pub fn structural_hash(node: Node, source: &[u8]) -> String {
-    let mut tokens = Vec::new();
-    collect_structural_tokens(node, source, &mut tokens);
-    let normalized = tokens.join(" ");
-    content_hash(&normalized)
+    let mut hasher = Xxh3::new();
+    hash_structural_tokens(node, source, &mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
-/// Recursively collect leaf tokens from the AST, skipping comments.
-fn collect_structural_tokens(node: Node, source: &[u8], tokens: &mut Vec<String>) {
+/// Recursively hash leaf tokens from the AST, skipping comments.
+/// Zero allocations: hashes directly from source byte slices.
+fn hash_structural_tokens(node: Node, source: &[u8], hasher: &mut Xxh3) {
     let kind = node.kind();
 
-    // Skip all comment types across languages
     if is_comment_node(kind) {
         return;
     }
 
     if node.child_count() == 0 {
-        // Leaf node — collect its text
-        let text = node.utf8_text(source).unwrap_or("").trim();
-        if !text.is_empty() {
-            tokens.push(text.to_string());
+        // Leaf node: hash its text directly from the source buffer
+        let start = node.start_byte();
+        let end = node.end_byte();
+        if start < end && end <= source.len() {
+            let bytes = &source[start..end];
+            // Trim whitespace manually to avoid allocation
+            let trimmed = trim_bytes(bytes);
+            if !trimmed.is_empty() {
+                hasher.write(trimmed);
+                hasher.write(b" ");
+            }
         }
     } else {
-        // Internal node — recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            collect_structural_tokens(child, source, tokens);
+            hash_structural_tokens(child, source, hasher);
         }
     }
+}
+
+/// Trim leading/trailing ASCII whitespace from a byte slice without allocating.
+#[inline]
+fn trim_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+    &bytes[start..end]
 }
 
 fn is_comment_node(kind: &str) -> bool {
@@ -68,7 +80,7 @@ mod tests {
     #[test]
     fn test_content_hash_hex_format() {
         let h = content_hash("test");
-        assert_eq!(h.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+        assert_eq!(h.len(), 16); // xxHash64 = 8 bytes = 16 hex chars
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 

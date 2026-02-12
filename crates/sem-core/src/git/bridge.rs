@@ -263,51 +263,84 @@ impl GitBridge {
         files: &mut [FileChange],
         scope: &DiffScope,
     ) -> Result<(), GitError> {
-        for file in files.iter_mut() {
-            match scope {
-                DiffScope::Working => {
+        match scope {
+            DiffScope::Working => {
+                // Resolve HEAD tree once for all before_content reads
+                let head_tree = self.resolve_tree("HEAD").ok();
+                for file in files.iter_mut() {
                     if file.status != FileStatus::Deleted {
                         file.after_content = self.read_working_file(&file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        file.before_content = self.read_ref_file("HEAD", &file.file_path);
+                        file.before_content = head_tree
+                            .as_ref()
+                            .and_then(|t| self.read_blob_from_tree(t, &file.file_path));
                     }
                 }
-                DiffScope::Staged => {
+            }
+            DiffScope::Staged => {
+                let head_tree = self.resolve_tree("HEAD").ok();
+                for file in files.iter_mut() {
                     if file.status != FileStatus::Deleted {
-                        // Try index first, fall back to working copy
                         file.after_content = self
                             .read_index_file(&file.file_path)
                             .or_else(|| self.read_working_file(&file.file_path));
                     }
                     if file.status != FileStatus::Added {
-                        file.before_content = self.read_ref_file("HEAD", &file.file_path);
+                        file.before_content = head_tree
+                            .as_ref()
+                            .and_then(|t| self.read_blob_from_tree(t, &file.file_path));
                     }
                 }
-                DiffScope::Commit { sha } => {
+            }
+            DiffScope::Commit { sha } => {
+                // Resolve both trees once instead of per-file
+                let after_tree = self.resolve_tree(sha)?;
+                let before_tree = self.resolve_tree(&format!("{sha}~1")).ok();
+                for file in files.iter_mut() {
                     if file.status != FileStatus::Deleted {
-                        file.after_content = self.read_ref_file(sha, &file.file_path);
+                        file.after_content =
+                            self.read_blob_from_tree(&after_tree, &file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        file.before_content =
-                            self.read_ref_file(&format!("{sha}~1"), &file.file_path);
+                        file.before_content = before_tree
+                            .as_ref()
+                            .and_then(|t| self.read_blob_from_tree(t, &file.file_path));
                     }
                 }
-                DiffScope::Range { from, to } => {
+            }
+            DiffScope::Range { from, to } => {
+                let after_tree = self.resolve_tree(to)?;
+                let before_tree = self.resolve_tree(from)?;
+                for file in files.iter_mut() {
                     if file.status != FileStatus::Deleted {
-                        file.after_content = self.read_ref_file(to, &file.file_path);
+                        file.after_content =
+                            self.read_blob_from_tree(&after_tree, &file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        let before_path = file
+                        let path = file
                             .old_file_path
                             .as_deref()
                             .unwrap_or(&file.file_path);
-                        file.before_content = self.read_ref_file(from, before_path);
+                        file.before_content =
+                            self.read_blob_from_tree(&before_tree, path);
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    fn resolve_tree(&self, refspec: &str) -> Result<git2::Tree<'_>, GitError> {
+        let obj = self.repo.revparse_single(refspec)?;
+        let commit = obj.peel_to_commit()?;
+        Ok(commit.tree()?)
+    }
+
+    fn read_blob_from_tree(&self, tree: &git2::Tree, file_path: &str) -> Option<String> {
+        let entry = tree.get_path(Path::new(file_path)).ok()?;
+        let blob = self.repo.find_blob(entry.id()).ok()?;
+        std::str::from_utf8(blob.content()).ok().map(String::from)
     }
 
     fn read_working_file(&self, file_path: &str) -> Option<String> {
@@ -322,14 +355,6 @@ impl GitBridge {
         std::str::from_utf8(blob.content()).ok().map(String::from)
     }
 
-    fn read_ref_file(&self, refspec: &str, file_path: &str) -> Option<String> {
-        let obj = self.repo.revparse_single(refspec).ok()?;
-        let commit = obj.peel_to_commit().ok()?;
-        let tree = commit.tree().ok()?;
-        let entry = tree.get_path(Path::new(file_path)).ok()?;
-        let blob = self.repo.find_blob(entry.id()).ok()?;
-        std::str::from_utf8(blob.content()).ok().map(String::from)
-    }
 
     pub fn get_log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
         let mut revwalk = self.repo.revwalk()?;

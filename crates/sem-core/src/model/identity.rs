@@ -20,8 +20,8 @@ pub fn match_entities(
     author: Option<&str>,
 ) -> MatchResult {
     let mut changes: Vec<SemanticChange> = Vec::new();
-    let mut matched_before: HashSet<String> = HashSet::new();
-    let mut matched_after: HashSet<String> = HashSet::new();
+    let mut matched_before: HashSet<&str> = HashSet::new();
+    let mut matched_after: HashSet<&str> = HashSet::new();
 
     let before_by_id: HashMap<&str, &SemanticEntity> =
         before.iter().map(|e| (e.id.as_str(), e)).collect();
@@ -29,10 +29,10 @@ pub fn match_entities(
         after.iter().map(|e| (e.id.as_str(), e)).collect();
 
     // Phase 1: Exact ID match
-    for (id, after_entity) in &after_by_id {
+    for (&id, after_entity) in &after_by_id {
         if let Some(before_entity) = before_by_id.get(id) {
-            matched_before.insert(id.to_string());
-            matched_after.insert(id.to_string());
+            matched_before.insert(id);
+            matched_after.insert(id);
 
             if before_entity.content_hash != after_entity.content_hash {
                 let structural_change = match (&before_entity.structural_hash, &after_entity.structural_hash) {
@@ -61,16 +61,14 @@ pub fn match_entities(
     // Collect unmatched
     let unmatched_before: Vec<&SemanticEntity> = before
         .iter()
-        .filter(|e| !matched_before.contains(&e.id))
+        .filter(|e| !matched_before.contains(e.id.as_str()))
         .collect();
     let unmatched_after: Vec<&SemanticEntity> = after
         .iter()
-        .filter(|e| !matched_after.contains(&e.id))
+        .filter(|e| !matched_after.contains(e.id.as_str()))
         .collect();
 
     // Phase 2: Content hash match (rename/move detection)
-    // Also uses structural_hash — if formatting/comments changed but logic is same,
-    // structural_hash still matches (inspired by Unison content-addressed model).
     let mut before_by_hash: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
     let mut before_by_structural: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
     for entity in &unmatched_before {
@@ -87,7 +85,7 @@ pub fn match_entities(
     }
 
     for after_entity in &unmatched_after {
-        if matched_after.contains(&after_entity.id) {
+        if matched_after.contains(after_entity.id.as_str()) {
             continue;
         }
         // Try exact content_hash first
@@ -99,15 +97,15 @@ pub fn match_entities(
             after_entity.structural_hash.as_ref().and_then(|sh| {
                 before_by_structural.get_mut(sh.as_str()).and_then(|c| {
                     c.iter()
-                        .position(|e| !matched_before.contains(&e.id))
+                        .position(|e| !matched_before.contains(e.id.as_str()))
                         .map(|i| c.remove(i))
                 })
             })
         });
 
         if let Some(before_entity) = found {
-            matched_before.insert(before_entity.id.clone());
-            matched_after.insert(after_entity.id.clone());
+            matched_before.insert(&before_entity.id);
+            matched_after.insert(&after_entity.id);
 
             let change_type = if before_entity.file_path != after_entity.file_path {
                 ChangeType::Moved
@@ -142,12 +140,12 @@ pub fn match_entities(
     // Phase 3: Fuzzy similarity (>80% threshold)
     let still_unmatched_before: Vec<&SemanticEntity> = unmatched_before
         .iter()
-        .filter(|e| !matched_before.contains(&e.id))
+        .filter(|e| !matched_before.contains(e.id.as_str()))
         .copied()
         .collect();
     let still_unmatched_after: Vec<&SemanticEntity> = unmatched_after
         .iter()
-        .filter(|e| !matched_after.contains(&e.id))
+        .filter(|e| !matched_after.contains(e.id.as_str()))
         .copied()
         .collect();
 
@@ -160,7 +158,7 @@ pub fn match_entities(
                 let mut best_score: f64 = 0.0;
 
                 for before_entity in &still_unmatched_before {
-                    if matched_before.contains(&before_entity.id) {
+                    if matched_before.contains(before_entity.id.as_str()) {
                         continue;
                     }
                     if before_entity.entity_type != after_entity.entity_type {
@@ -175,8 +173,8 @@ pub fn match_entities(
                 }
 
                 if let Some(matched) = best_match {
-                    matched_before.insert(matched.id.clone());
-                    matched_after.insert(after_entity.id.clone());
+                    matched_before.insert(&matched.id);
+                    matched_after.insert(&after_entity.id);
 
                     let change_type = if matched.file_path != after_entity.file_path {
                         ChangeType::Moved
@@ -211,7 +209,7 @@ pub fn match_entities(
     }
 
     // Remaining unmatched before = deleted
-    for entity in before.iter().filter(|e| !matched_before.contains(&e.id)) {
+    for entity in before.iter().filter(|e| !matched_before.contains(e.id.as_str())) {
         changes.push(SemanticChange {
             id: format!("change::deleted::{}", entity.id),
             entity_id: entity.id.clone(),
@@ -230,7 +228,7 @@ pub fn match_entities(
     }
 
     // Remaining unmatched after = added
-    for entity in after.iter().filter(|e| !matched_after.contains(&e.id)) {
+    for entity in after.iter().filter(|e| !matched_after.contains(e.id.as_str())) {
         changes.push(SemanticChange {
             id: format!("change::added::{}", entity.id),
             entity_id: entity.id.clone(),
@@ -253,6 +251,14 @@ pub fn match_entities(
 
 /// Default content similarity using Jaccard index on whitespace-split tokens
 pub fn default_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
+    // Early rejection: if token counts differ too much, Jaccard can't reach 0.8
+    let a_count = a.content.split_whitespace().count();
+    let b_count = b.content.split_whitespace().count();
+    let (min_c, max_c) = if a_count < b_count { (a_count, b_count) } else { (b_count, a_count) };
+    if max_c > 0 && (min_c as f64 / max_c as f64) < 0.6 {
+        return 0.0;
+    }
+
     let tokens_a: HashSet<&str> = a.content.split_whitespace().collect();
     let tokens_b: HashSet<&str> = b.content.split_whitespace().collect();
 

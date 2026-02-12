@@ -92,11 +92,12 @@ Cargo workspace: sem-core (library) + sem-cli (binary).
 
 Parallel entity extraction via rayon. Zero-allocation graph traversal.
 
-- Small commit (4 files): 9ms
-- Large commit (13 files, 65 entities): 22ms
-- Range (8 commits, 30 files, 1383 entities): 34ms
-- Cross-repo: weave 6ms, agenthub 21ms
-- sem diff vs git diff: +12ms overhead for full semantic parsing
+- Small commit (1 file): 5ms
+- Medium commit (5 files): 8ms
+- Large commit (13 files, 65 entities): 19ms
+- Range (8 commits, 30 files, 1383 entities): 24ms
+- sem diff vs git diff: +9ms overhead for full semantic parsing
+- Optimizations: LTO, xxHash64 (replaces SHA-256), cached tree resolution, zero-alloc structural hashing
 
 ## Used By
 
