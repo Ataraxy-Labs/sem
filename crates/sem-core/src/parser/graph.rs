@@ -71,17 +71,10 @@ impl EntityGraph {
         registry: &ParserRegistry,
     ) -> Self {
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
-        // Skip files >500KB (likely generated/minified bundles)
-        const MAX_FILE_SIZE: u64 = 500_000;
-
         let all_entities: Vec<SemanticEntity> = file_paths
             .par_iter()
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
-                let metadata = std::fs::metadata(&full_path).ok()?;
-                if metadata.len() > MAX_FILE_SIZE {
-                    return None;
-                }
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 let plugin = registry.get_plugin(file_path)?;
                 Some(plugin.extract_entities(&content, file_path))
