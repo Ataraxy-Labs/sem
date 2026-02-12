@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
 use crate::parser::registry::ParserRegistry;
@@ -68,28 +70,28 @@ impl EntityGraph {
         file_paths: &[String],
         registry: &ParserRegistry,
     ) -> Self {
-        // Pass 1: Extract all entities and build symbol table
-        let mut all_entities: Vec<SemanticEntity> = Vec::new();
+        // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
+        // Skip files >500KB (likely generated/minified bundles)
+        const MAX_FILE_SIZE: u64 = 500_000;
 
-        for file_path in file_paths {
-            let full_path = root.join(file_path);
-            let content = match std::fs::read_to_string(&full_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let plugin = match registry.get_plugin(file_path) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            let entities = plugin.extract_entities(&content, file_path);
-            all_entities.extend(entities);
-        }
+        let all_entities: Vec<SemanticEntity> = file_paths
+            .par_iter()
+            .filter_map(|file_path| {
+                let full_path = root.join(file_path);
+                let metadata = std::fs::metadata(&full_path).ok()?;
+                if metadata.len() > MAX_FILE_SIZE {
+                    return None;
+                }
+                let content = std::fs::read_to_string(&full_path).ok()?;
+                let plugin = registry.get_plugin(file_path)?;
+                Some(plugin.extract_entities(&content, file_path))
+            })
+            .flatten()
+            .collect();
 
         // Build symbol table: name → entity IDs (can be multiple with same name)
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-        let mut entity_map: HashMap<String, EntityInfo> = HashMap::new();
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
+        let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
 
         for entity in &all_entities {
             symbol_table
@@ -110,46 +112,58 @@ impl EntityGraph {
             );
         }
 
-        // Pass 2: Extract references from entity content
-        let mut edges: Vec<EntityRef> = Vec::new();
+        // Pass 2: Extract references in parallel, then resolve against symbol table
+        // Step 2a: Parallel reference extraction per entity
+        let resolved_refs: Vec<(String, String, RefType)> = all_entities
+            .par_iter()
+            .flat_map(|entity| {
+                let refs = extract_references_from_content(&entity.content, &entity.name);
+                let mut entity_edges = Vec::new();
+                for ref_name in refs {
+                    if let Some(target_ids) = symbol_table.get(ref_name) {
+                        let target = target_ids
+                            .iter()
+                            .find(|id| {
+                                *id != &entity.id
+                                    && entity_map
+                                        .get(*id)
+                                        .map_or(false, |e| e.file_path == entity.file_path)
+                            })
+                            .or_else(|| target_ids.iter().find(|id| *id != &entity.id));
+
+                        if let Some(target_id) = target {
+                            let ref_type = infer_ref_type(&entity.content, &ref_name);
+                            entity_edges.push((
+                                entity.id.clone(),
+                                target_id.clone(),
+                                ref_type,
+                            ));
+                        }
+                    }
+                }
+                entity_edges
+            })
+            .collect();
+
+        // Step 2b: Build edge indexes from resolved references
+        let mut edges: Vec<EntityRef> = Vec::with_capacity(resolved_refs.len());
         let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
         let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
-        for entity in &all_entities {
-            // Extract identifiers from entity content
-            let refs = extract_references_from_content(&entity.content, &entity.name);
-
-            for ref_name in refs {
-                if let Some(target_ids) = symbol_table.get(&ref_name) {
-                    // Resolve: prefer same-file entities, skip self-references
-                    let target = target_ids
-                        .iter()
-                        .find(|id| {
-                            *id != &entity.id
-                                && entity_map
-                                    .get(*id)
-                                    .map_or(false, |e| e.file_path == entity.file_path)
-                        })
-                        .or_else(|| target_ids.iter().find(|id| *id != &entity.id));
-
-                    if let Some(target_id) = target {
-                        let ref_type = infer_ref_type(&entity.content, &ref_name);
-                        edges.push(EntityRef {
-                            from_entity: entity.id.clone(),
-                            to_entity: target_id.clone(),
-                            ref_type,
-                        });
-                        dependents
-                            .entry(target_id.clone())
-                            .or_default()
-                            .push(entity.id.clone());
-                        dependencies
-                            .entry(entity.id.clone())
-                            .or_default()
-                            .push(target_id.clone());
-                    }
-                }
-            }
+        for (from_entity, to_entity, ref_type) in resolved_refs {
+            dependents
+                .entry(to_entity.clone())
+                .or_default()
+                .push(from_entity.clone());
+            dependencies
+                .entry(from_entity.clone())
+                .or_default()
+                .push(to_entity.clone());
+            edges.push(EntityRef {
+                from_entity,
+                to_entity,
+                ref_type,
+            });
         }
 
         EntityGraph {
@@ -185,29 +199,82 @@ impl EntityGraph {
     }
 
     /// Impact analysis: if the given entity changes, what else might be affected?
-    /// Returns all transitive dependents (breadth-first).
+    /// Returns all transitive dependents (breadth-first), capped at 10k.
     pub fn impact_analysis(&self, entity_id: &str) -> Vec<&EntityInfo> {
-        let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
+        self.impact_analysis_capped(entity_id, 10_000)
+    }
+
+    /// Impact analysis with a cap on maximum nodes visited.
+    /// Returns transitive dependents up to the cap. Uses borrowed strings.
+    pub fn impact_analysis_capped(&self, entity_id: &str, max_visited: usize) -> Vec<&EntityInfo> {
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
         let mut result = Vec::new();
 
-        queue.push_back(entity_id.to_string());
-        visited.insert(entity_id.to_string());
+        let start_key = match self.entities.get_key_value(entity_id) {
+            Some((k, _)) => k.as_str(),
+            None => return result,
+        };
+
+        queue.push_back(start_key);
+        visited.insert(start_key);
 
         while let Some(current) = queue.pop_front() {
-            if let Some(deps) = self.dependents.get(&current) {
+            if result.len() >= max_visited {
+                break;
+            }
+            if let Some(deps) = self.dependents.get(current) {
                 for dep in deps {
-                    if visited.insert(dep.clone()) {
-                        if let Some(info) = self.entities.get(dep) {
+                    if visited.insert(dep.as_str()) {
+                        if let Some(info) = self.entities.get(dep.as_str()) {
                             result.push(info);
                         }
-                        queue.push_back(dep.clone());
+                        queue.push_back(dep.as_str());
+                        if result.len() >= max_visited {
+                            break;
+                        }
                     }
                 }
             }
         }
 
         result
+    }
+
+    /// Count transitive dependents without collecting them (faster for large graphs).
+    /// Uses borrowed strings to avoid allocation overhead.
+    pub fn impact_count(&self, entity_id: &str, max_count: usize) -> usize {
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+        let mut count = 0;
+
+        // We need entity_id to live long enough; look it up in our entities map
+        let start_key = match self.entities.get_key_value(entity_id) {
+            Some((k, _)) => k.as_str(),
+            None => return 0,
+        };
+
+        queue.push_back(start_key);
+        visited.insert(start_key);
+
+        while let Some(current) = queue.pop_front() {
+            if count >= max_count {
+                break;
+            }
+            if let Some(deps) = self.dependents.get(current) {
+                for dep in deps {
+                    if visited.insert(dep.as_str()) {
+                        count += 1;
+                        queue.push_back(dep.as_str());
+                        if count >= max_count {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        count
     }
 
     /// Incrementally update the graph from a set of changed files.
@@ -412,7 +479,7 @@ impl EntityGraph {
         let refs = extract_references_from_content(&entity.content, &entity.name);
 
         for ref_name in refs {
-            if let Some(target_ids) = symbol_table.get(&ref_name) {
+            if let Some(target_ids) = symbol_table.get(ref_name) {
                 let target = target_ids
                     .iter()
                     .find(|id| {
@@ -446,32 +513,26 @@ impl EntityGraph {
 }
 
 /// Extract identifier references from entity content using simple token analysis.
-/// This is a lightweight alternative to full AST reference resolution —
-/// it tokenizes the content and finds identifiers that could be references to other entities.
-fn extract_references_from_content(content: &str, own_name: &str) -> Vec<String> {
+/// Returns borrowed slices from the content to avoid allocations.
+fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<&'a str> {
     let mut refs = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
 
-    // Simple tokenizer: split on non-alphanumeric/underscore boundaries
     for word in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        let word = word.trim();
         if word.is_empty() || word == own_name {
             continue;
         }
-        // Skip keywords, literals, very short names (likely loop vars)
         if is_keyword(word) || word.len() < 2 {
             continue;
         }
-        // Skip if starts with lowercase and is < 3 chars (likely variable)
         if word.starts_with(|c: char| c.is_lowercase()) && word.len() < 3 {
             continue;
         }
-        // Must start with a letter or underscore (valid identifier)
         if !word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
             continue;
         }
-        if seen.insert(word.to_string()) {
-            refs.push(word.to_string());
+        if seen.insert(word) {
+            refs.push(word);
         }
     }
 
@@ -703,19 +764,19 @@ mod tests {
     fn test_extract_references() {
         let content = "function processData(input) {\n  const result = validateInput(input);\n  return transform(result);\n}";
         let refs = extract_references_from_content(content, "processData");
-        assert!(refs.contains(&"validateInput".to_string()));
-        assert!(refs.contains(&"transform".to_string()));
-        assert!(!refs.contains(&"processData".to_string())); // self excluded
+        assert!(refs.contains(&"validateInput"));
+        assert!(refs.contains(&"transform"));
+        assert!(!refs.contains(&"processData")); // self excluded
     }
 
     #[test]
     fn test_extract_references_skips_keywords() {
         let content = "function foo() { if (true) { return false; } }";
         let refs = extract_references_from_content(content, "foo");
-        assert!(!refs.contains(&"if".to_string()));
-        assert!(!refs.contains(&"true".to_string()));
-        assert!(!refs.contains(&"return".to_string()));
-        assert!(!refs.contains(&"false".to_string()));
+        assert!(!refs.contains(&"if"));
+        assert!(!refs.contains(&"true"));
+        assert!(!refs.contains(&"return"));
+        assert!(!refs.contains(&"false"));
     }
 
     #[test]
