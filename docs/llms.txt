@@ -51,7 +51,7 @@ sem impact src/auth.ts validateToken
 
 ## Key Features
 
-- 12 languages: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, Fortran
+- 13 languages: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, PHP, Fortran
 - Structural hashing: AST-normalized hashes that ignore whitespace, comments, and formatting
 - Cosmetic vs structural change detection in diff
 - Entity-level blame (per function, not per line)
@@ -64,7 +64,7 @@ sem impact src/auth.ts validateToken
 Cargo workspace: sem-core (library) + sem-cli (binary).
 
 ### sem-core
-- Parser plugins for 12 languages via tree-sitter
+- Parser plugins for 13 languages via tree-sitter
 - Entity extraction: functions, classes, methods, interfaces, types, enums, imports
 - Structural hashing: normalize AST, strip whitespace/comments, SHA-256
 - Dependency graph: cross-file call/reference tracking via petgraph
@@ -85,6 +85,7 @@ Cargo workspace: sem-core (library) + sem-cli (binary).
 | C++ | .cpp .cc .cxx .hpp | functions, classes, structs, enums, namespaces, templates |
 | Ruby | .rb | methods, classes, modules |
 | C# | .cs | methods, classes, interfaces, enums, structs, namespaces |
+| PHP | .php | functions, classes, methods, interfaces, traits, enums, namespaces |
 | Fortran | .f90 .f95 .f03 .f08 .f .for | functions, subroutines, modules, programs, interfaces |
 
 ## Used By

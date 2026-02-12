@@ -53,6 +53,10 @@ fn get_csharp() -> Option<Language> {
     Some(tree_sitter_c_sharp::LANGUAGE.into())
 }
 
+fn get_php() -> Option<Language> {
+    Some(tree_sitter_php::LANGUAGE_PHP.into())
+}
+
 fn get_fortran() -> Option<Language> {
     Some(tree_sitter_fortran::LANGUAGE.into())
 }
@@ -228,6 +232,22 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
     get_language: get_csharp,
 };
 
+static PHP_CONFIG: LanguageConfig = LanguageConfig {
+    id: "php",
+    extensions: &[".php"],
+    entity_node_types: &[
+        "function_definition",
+        "class_declaration",
+        "method_declaration",
+        "interface_declaration",
+        "trait_declaration",
+        "enum_declaration",
+        "namespace_definition",
+    ],
+    container_node_types: &["declaration_list", "enum_declaration_list"],
+    get_language: get_php,
+};
+
 static FORTRAN_CONFIG: LanguageConfig = LanguageConfig {
     id: "fortran",
     extensions: &[".f90", ".f95", ".f03", ".f08", ".f", ".for"],
@@ -255,6 +275,7 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &CPP_CONFIG,
     &RUBY_CONFIG,
     &CSHARP_CONFIG,
+    &PHP_CONFIG,
     &FORTRAN_CONFIG,
 ];
 
@@ -270,7 +291,7 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
     static EXTENSIONS: &[&str] = &[
         ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs",
         ".java", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx",
-        ".rb", ".cs", ".f90", ".f95", ".f03", ".f08", ".f", ".for",
+        ".rb", ".cs", ".php", ".f90", ".f95", ".f03", ".f08", ".f", ".for",
     ];
     EXTENSIONS
 }
