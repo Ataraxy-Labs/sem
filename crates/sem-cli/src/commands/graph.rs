@@ -9,6 +9,7 @@ pub struct GraphOptions {
     pub file_paths: Vec<String>,
     pub entity: Option<String>,
     pub format: GraphFormat,
+    pub file_exts: Vec<String>,
 }
 
 pub enum GraphFormat {
@@ -20,11 +21,15 @@ pub fn graph_command(opts: GraphOptions) {
     let root = Path::new(&opts.cwd);
     let registry = create_default_registry();
 
+    let ext_filter = normalize_exts(&opts.file_exts);
+
     // If no files specified, find all supported files in the repo
     let file_paths = if opts.file_paths.is_empty() {
-        find_supported_files(root, &registry)
-    } else {
+        find_supported_files(root, &registry, &ext_filter)
+    } else if ext_filter.is_empty() {
         opts.file_paths
+    } else {
+        opts.file_paths.into_iter().filter(|f| ext_filter.iter().any(|ext| f.ends_with(ext.as_str()))).collect()
     };
 
     let graph = EntityGraph::build(root, &file_paths, &registry);
@@ -227,14 +232,21 @@ fn ref_symbol(ref_type: &RefType) -> colored::ColoredString {
     }
 }
 
-/// Find all supported files in the repo (public for use by other commands).
-pub fn find_supported_files_public(root: &Path, registry: &sem_core::parser::registry::ParserRegistry) -> Vec<String> {
-    find_supported_files(root, registry)
+/// Normalize extension strings: ensure each starts with '.'
+pub fn normalize_exts(exts: &[String]) -> Vec<String> {
+    exts.iter().map(|e| {
+        if e.starts_with('.') { e.clone() } else { format!(".{}", e) }
+    }).collect()
 }
 
-fn find_supported_files(root: &Path, registry: &sem_core::parser::registry::ParserRegistry) -> Vec<String> {
+/// Find all supported files in the repo (public for use by other commands).
+pub fn find_supported_files_public(root: &Path, registry: &sem_core::parser::registry::ParserRegistry, ext_filter: &[String]) -> Vec<String> {
+    find_supported_files(root, registry, ext_filter)
+}
+
+fn find_supported_files(root: &Path, registry: &sem_core::parser::registry::ParserRegistry, ext_filter: &[String]) -> Vec<String> {
     let mut files = Vec::new();
-    walk_dir(root, root, registry, &mut files);
+    walk_dir(root, root, registry, ext_filter, &mut files);
     files.sort();
     files
 }
@@ -243,6 +255,7 @@ fn walk_dir(
     dir: &Path,
     root: &Path,
     registry: &sem_core::parser::registry::ParserRegistry,
+    ext_filter: &[String],
     files: &mut Vec<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -261,9 +274,13 @@ fn walk_dir(
         }
 
         if path.is_dir() {
-            walk_dir(&path, root, registry, files);
+            walk_dir(&path, root, registry, ext_filter, files);
         } else if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
+            // If ext filter is set, only include matching extensions
+            if !ext_filter.is_empty() && !ext_filter.iter().any(|ext| rel_str.ends_with(ext.as_str())) {
+                continue;
+            }
             if registry.get_plugin(&rel_str).is_some() {
                 files.push(rel_str);
             }

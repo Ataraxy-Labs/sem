@@ -41,6 +41,10 @@ enum Commands {
         /// Show internal timing profile
         #[arg(long, hide = true)]
         profile: bool,
+
+        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        #[arg(long)]
+        file_exts: Vec<String>,
     },
     /// Show impact of changing an entity (what else would break?)
     Impact {
@@ -55,6 +59,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        #[arg(long)]
+        file_exts: Vec<String>,
     },
     /// Show semantic blame — who last modified each entity
     Blame {
@@ -79,6 +87,10 @@ enum Commands {
         /// Output format: terminal or json
         #[arg(long, default_value = "terminal")]
         format: String,
+
+        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        #[arg(long)]
+        file_exts: Vec<String>,
     },
 }
 
@@ -93,6 +105,7 @@ fn main() {
             to,
             format,
             profile,
+            file_exts,
         }) => {
             let output_format = match format.as_str() {
                 "json" => OutputFormat::Json,
@@ -110,6 +123,7 @@ fn main() {
                 from,
                 to,
                 profile,
+                file_exts,
             });
         }
         Some(Commands::Blame { file, json }) => {
@@ -126,6 +140,7 @@ fn main() {
             entity,
             files,
             json,
+            file_exts,
         }) => {
             impact_command(ImpactOptions {
                 cwd: std::env::current_dir()
@@ -135,12 +150,14 @@ fn main() {
                 entity_name: entity,
                 file_paths: files,
                 json,
+                file_exts,
             });
         }
         Some(Commands::Graph {
             files,
             entity,
             format,
+            file_exts,
         }) => {
             let graph_format = match format.as_str() {
                 "json" => GraphFormat::Json,
@@ -155,6 +172,7 @@ fn main() {
                 file_paths: files,
                 entity,
                 format: graph_format,
+                file_exts,
             });
         }
         None => {
@@ -170,6 +188,7 @@ fn main() {
                 from: None,
                 to: None,
                 profile: false,
+                file_exts: vec![],
             });
         }
     }

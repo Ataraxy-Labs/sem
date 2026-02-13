@@ -17,6 +17,7 @@ pub struct DiffOptions {
     pub from: Option<String>,
     pub to: Option<String>,
     pub profile: bool,
+    pub file_exts: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,18 @@ pub fn diff_command(opts: DiffOptions) {
         }
     };
     let git_diff_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    // Filter by file extensions if specified
+    let file_changes = if opts.file_exts.is_empty() {
+        file_changes
+    } else {
+        let exts: Vec<String> = opts.file_exts.iter().map(|e| {
+            if e.starts_with('.') { e.clone() } else { format!(".{}", e) }
+        }).collect();
+        file_changes.into_iter().filter(|fc| {
+            exts.iter().any(|ext| fc.file_path.ends_with(ext.as_str()))
+        }).collect()
+    };
 
     if file_changes.is_empty() {
         println!("\x1b[2mNo changes detected.\x1b[0m");

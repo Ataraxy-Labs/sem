@@ -9,17 +9,22 @@ pub struct ImpactOptions {
     pub entity_name: String,
     pub file_paths: Vec<String>,
     pub json: bool,
+    pub file_exts: Vec<String>,
 }
 
 pub fn impact_command(opts: ImpactOptions) {
     let root = Path::new(&opts.cwd);
     let registry = create_default_registry();
 
+    let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+
     // If no files specified, find all supported files in the repo
     let file_paths = if opts.file_paths.is_empty() {
-        super::graph::find_supported_files_public(root, &registry)
-    } else {
+        super::graph::find_supported_files_public(root, &registry, &ext_filter)
+    } else if ext_filter.is_empty() {
         opts.file_paths
+    } else {
+        opts.file_paths.into_iter().filter(|f| ext_filter.iter().any(|ext| f.ends_with(ext.as_str()))).collect()
     };
 
     let graph = EntityGraph::build(root, &file_paths, &registry);
