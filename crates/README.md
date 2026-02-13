@@ -21,7 +21,12 @@ sem blame src/auth.ts
 sem graph
 
 # Impact analysis (if this entity changes, what else is affected?)
-sem impact src/auth.ts::validateToken
+sem impact validateToken
+
+# Filter to specific languages in a multi-language repo
+sem graph --file-exts .py
+sem diff --file-exts .py .rs
+sem impact validateToken --file-exts .py
 ```
 
 ## Languages

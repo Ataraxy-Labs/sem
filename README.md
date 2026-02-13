@@ -58,13 +58,18 @@ sem diff --from HEAD~5 --to HEAD
 # JSON output (for AI agents, CI pipelines)
 sem diff --format json
 
-# Semantic commit history
-sem log -n 5
+# Only include specific languages
+sem diff --file-exts .py .rs
+sem graph --file-exts .py
 
-# SQL queries against stored changes
-sem init
-sem diff --store
-sem query "SELECT entity_type, entity_name, change_type FROM changes"
+# Entity dependency graph
+sem graph
+
+# Impact analysis (what breaks if this entity changes?)
+sem impact validateToken
+
+# Entity-level blame
+sem blame src/auth.ts
 ```
 
 ## What it parses

@@ -124,6 +124,21 @@
 
       <div class="changelog-entry">
         <div class="changelog-title">
+          <span class="changelog-sha">59f40ed</span>
+          <span class="changelog-tag feat">feat</span>
+          v0.3.1: --file-exts flag for language filtering
+        </div>
+        <p class="changelog-body">
+          New <code style="color:var(--fg)">--file-exts</code> flag on <code style="color:var(--fg)">sem diff</code>, <code style="color:var(--fg)">sem graph</code>, and <code style="color:var(--fg)">sem impact</code>.
+          Lets you scope analysis to specific languages in multi-language repos.
+          Example: <code style="color:var(--fg)">sem graph --file-exts .py</code> to build the dependency graph for Python files only.
+          Accepts extensions with or without the leading dot. First feature shipped from a community request (<a href="https://github.com/Ataraxy-Labs/sem/issues/1" style="color:var(--cyan)">#1</a>).
+        </p>
+        <p class="changelog-stats">+63 lines &bull; 4 files &bull; diff, graph, impact commands &bull; closes #1</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
           <span class="changelog-sha">f1cf19a</span>
           <span class="changelog-tag perf">perf</span>
           Incremental graph updates

@@ -301,6 +301,42 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
           <div class="flag"><code>-c, --commit &lt;sha&gt;</code> <span>Diff a specific commit</span></div>
           <div class="flag"><code>--from &lt;ref&gt; --to &lt;ref&gt;</code> <span>Diff a commit range</span></div>
           <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
+          <div class="flag"><code>--file-exts &lt;ext&gt;...</code> <span>Only include files with these extensions (e.g. .py .rs)</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem graph</span>
+          <span class="cmd-doc-desc">Cross-file entity dependency graph</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>--entity &lt;name&gt;</code> <span>Show dependencies/dependents for a specific entity</span></div>
+          <div class="flag"><code>--format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
+          <div class="flag"><code>--file-exts &lt;ext&gt;...</code> <span>Only include files with these extensions</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem impact</span>
+          <span class="cmd-doc-desc">Show what breaks if an entity changes</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>&lt;entity&gt;</code> <span>Name of the entity to analyze</span></div>
+          <div class="flag"><code>--json</code> <span>Output as JSON</span></div>
+          <div class="flag"><code>--file-exts &lt;ext&gt;...</code> <span>Only include files with these extensions</span></div>
+        </div>
+      </div>
+
+      <div class="cmd-doc">
+        <div class="cmd-doc-header">
+          <span class="cmd-doc-name">sem blame</span>
+          <span class="cmd-doc-desc">Entity-level blame: who last modified each function/class</span>
+        </div>
+        <div class="cmd-doc-flags">
+          <div class="flag"><code>&lt;file&gt;</code> <span>File to blame</span></div>
+          <div class="flag"><code>--json</code> <span>Output as JSON</span></div>
         </div>
       </div>
     </section>

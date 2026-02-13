@@ -8,7 +8,7 @@ use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
 
 #[derive(Parser)]
-#[command(name = "sem", version = "0.2.0", about = "Semantic version control")]
+#[command(name = "sem", version = "0.3.1", about = "Semantic version control")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

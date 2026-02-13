@@ -38,15 +38,27 @@ sem blame src/auth.ts
 Cross-file entity dependency graph. Shows what each function calls and what calls it.
 
 ```
-sem graph src/auth.ts
-sem graph src/auth.ts --entity validateToken
+sem graph
+sem graph --entity validateToken
+sem graph --file-exts .py
 ```
 
 ### sem impact
 Transitive impact analysis. If this entity changes, what else is affected? BFS through dependency graph.
 
 ```
-sem impact src/auth.ts validateToken
+sem impact validateToken
+sem impact validateToken --file-exts .py
+```
+
+## Global Flags
+
+### --file-exts
+Available on `sem diff`, `sem graph`, and `sem impact`. Filters analysis to only include files with the specified extensions. Useful for multi-language repos where you want to scope to one language.
+
+```
+sem diff --file-exts .py .rs
+sem graph --file-exts .py
 ```
 
 ## Key Features
