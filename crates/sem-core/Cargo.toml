@@ -2,6 +2,7 @@
 name = "sem-core"
 version = "0.3.2"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 git2 = "0.19"
