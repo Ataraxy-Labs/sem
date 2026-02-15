@@ -255,7 +255,7 @@ fn map_node_type(tree_sitter_type: &str) -> String {
         "static_item" => "static",
         "decorated_definition" => "function",
         "constructor_declaration" => "constructor",
-        "field_declaration" => "field",
+        "field_declaration" | "public_field_definition" | "field_definition" => "field",
         "property_declaration" => "property",
         "annotation_type_declaration" => "annotation",
         "template_declaration" => "template",
