@@ -8,7 +8,8 @@ pub enum DiffScope {
     Range { from: String, to: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FileStatus {
     Added,
     Modified,
@@ -16,12 +17,16 @@ pub enum FileStatus {
     Renamed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileChange {
     pub file_path: String,
     pub status: FileStatus,
+    #[serde(default)]
     pub old_file_path: Option<String>,
+    #[serde(default)]
     pub before_content: Option<String>,
+    #[serde(default)]
     pub after_content: Option<String>,
 }
 

@@ -34,6 +34,10 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
 
+        /// Read FileChange[] JSON from stdin instead of git
+        #[arg(long)]
+        stdin: bool,
+
         /// Output format: terminal or json
         #[arg(long, default_value = "terminal")]
         format: String,
@@ -103,6 +107,7 @@ fn main() {
             commit,
             from,
             to,
+            stdin,
             format,
             profile,
             file_exts,
@@ -122,6 +127,7 @@ fn main() {
                 commit,
                 from,
                 to,
+                stdin,
                 profile,
                 file_exts,
             });
@@ -187,6 +193,7 @@ fn main() {
                 commit: None,
                 from: None,
                 to: None,
+                stdin: false,
                 profile: false,
                 file_exts: vec![],
             });
