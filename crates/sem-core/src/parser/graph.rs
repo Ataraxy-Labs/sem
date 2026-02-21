@@ -518,10 +518,15 @@ fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<
         if is_keyword(word) || word.len() < 2 {
             continue;
         }
+        // Skip very short lowercase identifiers (likely local vars: i, x, a, ok, id, etc.)
         if word.starts_with(|c: char| c.is_lowercase()) && word.len() < 3 {
             continue;
         }
         if !word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+            continue;
+        }
+        // Skip common local variable names that create false graph edges
+        if is_common_local_name(word) {
             continue;
         }
         if seen.insert(word) {
@@ -532,17 +537,52 @@ fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<
     refs
 }
 
-/// Infer reference type from context.
+/// Names that are overwhelmingly local variables, not entity references.
+/// These create massive false-positive edges in the dependency graph.
+fn is_common_local_name(word: &str) -> bool {
+    matches!(
+        word,
+        "result" | "results" | "data" | "config" | "value" | "values"
+            | "item" | "items" | "input" | "output" | "args" | "opts"
+            | "name" | "path" | "file" | "line" | "count" | "index"
+            | "temp" | "prev" | "next" | "curr" | "current" | "node"
+            | "left" | "right" | "root" | "head" | "tail" | "body"
+            | "text" | "content" | "source" | "target" | "entry"
+            | "error" | "errors" | "message" | "response" | "request"
+            | "context" | "state" | "props" | "event" | "handler"
+            | "callback" | "options" | "params" | "query" | "list"
+            | "base" | "info" | "meta" | "kind" | "mode" | "flag"
+            | "size" | "length" | "width" | "height" | "start" | "stop"
+            | "begin" | "done" | "found" | "status" | "code" | "test"
+    )
+}
+
+/// Infer reference type from context using word-boundary-aware matching.
 fn infer_ref_type(content: &str, ref_name: &str) -> RefType {
-    // Check if it's a function call: name followed by (
+    // Check if it's a function call: ref_name followed by ( with word boundary before
     let call_pattern = format!("{}(", ref_name);
-    if content.contains(&call_pattern) {
-        return RefType::Calls;
+    if let Some(pos) = content.find(&call_pattern) {
+        // Verify word boundary: char before must not be alphanumeric or _
+        let is_boundary = pos == 0 || {
+            let prev = content.as_bytes()[pos - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        };
+        if is_boundary {
+            return RefType::Calls;
+        }
     }
-    // Check if it's in an import/use context
-    if content.contains("import ") || content.contains("use ") {
-        return RefType::Imports;
+
+    // Check if it's in an import/use statement (line-level, not substring)
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if (trimmed.starts_with("import ") || trimmed.starts_with("use ")
+            || trimmed.starts_with("from ") || trimmed.starts_with("require("))
+            && trimmed.contains(ref_name)
+        {
+            return RefType::Imports;
+        }
     }
+
     // Default to type reference
     RefType::TypeRef
 }

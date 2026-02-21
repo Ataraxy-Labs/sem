@@ -34,7 +34,11 @@ fn visit_node(
 
     if config.entity_node_types.contains(&node_type) {
         if let Some(name) = extract_name(node, source) {
-            let entity_type = map_node_type(node_type);
+            let entity_type = if node_type == "decorated_definition" {
+                map_decorated_type(node)
+            } else {
+                map_node_type(node_type)
+            };
             let content = node_text(node, source);
 
             let struct_hash = structural_hash(node, source);
@@ -253,7 +257,7 @@ fn map_node_type(tree_sitter_type: &str) -> String {
         "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
         "const_declaration" | "const_item" => "constant",
         "static_item" => "static",
-        "decorated_definition" => "function",
+        "decorated_definition" => "decorated_definition", // resolved by map_decorated_type
         "constructor_declaration" => "constructor",
         "field_declaration" | "public_field_definition" | "field_definition" => "field",
         "property_declaration" => "property",
@@ -262,4 +266,17 @@ fn map_node_type(tree_sitter_type: &str) -> String {
         other => return other.to_string(),
     }
     .to_string()
+}
+
+/// For Python decorated_definition, check the inner node to determine the real type.
+fn map_decorated_type(node: Node) -> String {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "class_definition" => return "class".to_string(),
+            "function_definition" => return "function".to_string(),
+            _ => {}
+        }
+    }
+    "function".to_string()
 }
