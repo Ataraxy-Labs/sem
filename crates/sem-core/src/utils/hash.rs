@@ -21,7 +21,9 @@ pub fn structural_hash(node: Node, source: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Recursively hash leaf tokens from the AST, skipping comments.
+/// Recursively hash tokens from the AST, skipping comments.
+/// Hashes both node types (structure) and leaf text (content) so that
+/// structurally different ASTs with identical leaf tokens produce different hashes.
 /// Zero allocations: hashes directly from source byte slices.
 fn hash_structural_tokens(node: Node, source: &[u8], hasher: &mut Xxh3) {
     let kind = node.kind();
@@ -44,6 +46,10 @@ fn hash_structural_tokens(node: Node, source: &[u8], hasher: &mut Xxh3) {
             }
         }
     } else {
+        // Hash the node type to capture structure, not just leaf content.
+        // e.g. `x = foo(bar)` vs `foo(bar) = x` have same leaves but different structure.
+        hasher.write(kind.as_bytes());
+        hasher.write(b":");
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             hash_structural_tokens(child, source, hasher);

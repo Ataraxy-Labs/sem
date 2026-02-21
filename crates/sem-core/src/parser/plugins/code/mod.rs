@@ -1,12 +1,21 @@
 mod entity_extractor;
 mod languages;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use crate::model::entity::SemanticEntity;
 use crate::parser::plugin::SemanticParserPlugin;
 use languages::{get_all_code_extensions, get_language_config};
 use entity_extractor::extract_entities;
 
 pub struct CodeParserPlugin;
+
+// Thread-local parser cache: one Parser per language per thread.
+// Avoids creating a new Parser for every file during parallel graph builds.
+thread_local! {
+    static PARSER_CACHE: RefCell<HashMap<&'static str, tree_sitter::Parser>> = RefCell::new(HashMap::new());
+}
 
 impl SemanticParserPlugin for CodeParserPlugin {
     fn id(&self) -> &str {
@@ -34,17 +43,21 @@ impl SemanticParserPlugin for CodeParserPlugin {
             None => return Vec::new(),
         };
 
-        let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&language).is_err() {
-            return Vec::new();
-        }
+        PARSER_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let parser = cache.entry(config.id).or_insert_with(|| {
+                let mut p = tree_sitter::Parser::new();
+                let _ = p.set_language(&language);
+                p
+            });
 
-        let tree = match parser.parse(content.as_bytes(), None) {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
+            let tree = match parser.parse(content.as_bytes(), None) {
+                Some(t) => t,
+                None => return Vec::new(),
+            };
 
-        extract_entities(&tree, file_path, config, content)
+            extract_entities(&tree, file_path, config, content)
+        })
     }
 }
 
