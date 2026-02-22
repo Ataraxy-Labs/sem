@@ -148,6 +148,8 @@ function mapNodeType(treeSitterType: string): string {
     const_item: 'constant',
     static_item: 'static',
     decorated_definition: 'function',
+    public_field_definition: 'property',
+    field_definition: 'property',
   };
   return mapping[treeSitterType] ?? treeSitterType;
 }
