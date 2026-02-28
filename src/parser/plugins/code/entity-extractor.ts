@@ -18,6 +18,10 @@ interface TreeSitterTree {
   rootNode: TreeSitterNode;
 }
 
+type VisitContext = {
+  insideFunction: boolean;
+};
+
 export function extractEntities(
   tree: TreeSitterTree,
   filePath: string,
@@ -25,7 +29,7 @@ export function extractEntities(
   sourceCode: string,
 ): SemanticEntity[] {
   const entities: SemanticEntity[] = [];
-  visitNode(tree.rootNode, filePath, config, entities, undefined, sourceCode);
+  visitNode(tree.rootNode, filePath, config, entities, undefined, sourceCode, { insideFunction: false });
   return entities;
 }
 
@@ -36,13 +40,28 @@ function visitNode(
   entities: SemanticEntity[],
   parentId: string | undefined,
   sourceCode: string,
+  context: VisitContext,
 ): void {
+  // For export statements, always look inside for the actual declaration.
+  // This avoids losing nested entities when `export` wraps a class/function.
+  if (node.type === 'export_statement') {
+    const declaration = node.childForFieldName('declaration');
+    if (declaration) {
+      visitNode(declaration, filePath, config, entities, parentId, sourceCode, context);
+      return;
+    }
+  }
+
+  let currentParentId = parentId;
   if (config.entityNodeTypes.includes(node.type)) {
     const name = extractName(node, config, sourceCode);
-    const entityType = mapNodeType(node.type);
-    const content = node.text;
+    const entityType = mapNodeType(node);
+    const shouldSkip =
+      (context.insideFunction && entityType === 'variable') ||
+      (node.type === 'pair' && !isFunctionLikePair(node));
 
-    if (name) {
+    if (name && !shouldSkip) {
+      const content = node.text;
       const entity: SemanticEntity = {
         id: buildEntityId(filePath, entityType, name, parentId),
         filePath,
@@ -56,31 +75,18 @@ function visitNode(
       };
 
       entities.push(entity);
-
-      // Visit children for nested entities (methods inside classes, etc.)
-      for (const child of node.namedChildren) {
-        if (config.containerNodeTypes.includes(child.type)) {
-          for (const nested of child.namedChildren) {
-            visitNode(nested, filePath, config, entities, entity.id, sourceCode);
-          }
-        }
-      }
-      return;
+      currentParentId = entity.id;
     }
   }
 
-  // For export statements, look inside for the actual declaration
-  if (node.type === 'export_statement') {
-    const declaration = node.childForFieldName('declaration');
-    if (declaration) {
-      visitNode(declaration, filePath, config, entities, parentId, sourceCode);
-      return;
-    }
-  }
+  const nextContext: VisitContext = {
+    insideFunction: context.insideFunction || isFunctionContainer(node),
+  };
 
-  // Recurse into top-level children
+  // Recurse into children to capture nested entities (e.g. object-literal
+  // methods inside factory functions, handlers inside React components).
   for (const child of node.namedChildren) {
-    visitNode(child, filePath, config, entities, parentId, sourceCode);
+    visitNode(child, filePath, config, entities, currentParentId, sourceCode, nextContext);
   }
 }
 
@@ -111,9 +117,13 @@ function extractName(node: TreeSitterNode, config: LanguageConfig, sourceCode: s
     }
   }
 
+  if (node.type === 'pair') {
+    return getPairKeyName(node);
+  }
+
   // Fallback: first identifier child
   for (const child of node.namedChildren) {
-    if (child.type === 'identifier' || child.type === 'type_identifier') {
+    if (child.type === 'identifier' || child.type === 'type_identifier' || child.type === 'property_identifier') {
       return child.text;
     }
   }
@@ -121,7 +131,15 @@ function extractName(node: TreeSitterNode, config: LanguageConfig, sourceCode: s
   return undefined;
 }
 
-function mapNodeType(treeSitterType: string): string {
+function mapNodeType(node: TreeSitterNode): string {
+  if (node.type === 'pair') {
+    return isFunctionLikePair(node) ? 'method' : 'property';
+  }
+
+  if ((node.type === 'lexical_declaration' || node.type === 'variable_declaration') && isFunctionLikeDeclaration(node)) {
+    return 'function';
+  }
+
   const mapping: Record<string, string> = {
     function_declaration: 'function',
     function_definition: 'function',
@@ -151,5 +169,63 @@ function mapNodeType(treeSitterType: string): string {
     public_field_definition: 'property',
     field_definition: 'property',
   };
-  return mapping[treeSitterType] ?? treeSitterType;
+  return mapping[node.type] ?? node.type;
+}
+
+function isFunctionLikeDeclaration(node: TreeSitterNode): boolean {
+  for (const child of node.namedChildren) {
+    if (child.type !== 'variable_declarator') continue;
+
+    const value = child.childForFieldName('value');
+    if (value && isFunctionLikeNodeType(value.type)) {
+      return true;
+    }
+
+    const normalized = child.text.replace(/\s+/g, ' ').trim();
+    if (/^[^=]+=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/.test(normalized)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isFunctionLikeNodeType(nodeType: string): boolean {
+  return (
+    nodeType === 'arrow_function' ||
+    nodeType === 'function' ||
+    nodeType === 'function_expression' ||
+    nodeType === 'generator_function' ||
+    nodeType === 'generator_function_declaration'
+  );
+}
+
+function isFunctionContainer(node: TreeSitterNode): boolean {
+  return (
+    node.type === 'function_declaration' ||
+    node.type === 'function_definition' ||
+    node.type === 'method_definition' ||
+    node.type === 'method_declaration' ||
+    node.type === 'arrow_function' ||
+    node.type === 'function' ||
+    node.type === 'function_expression' ||
+    node.type === 'generator_function' ||
+    node.type === 'generator_function_declaration'
+  );
+}
+
+function getPairKeyName(node: TreeSitterNode): string | undefined {
+  const key = node.childForFieldName('key');
+  if (!key) return undefined;
+  return key.text.replace(/^['"`]|['"`]$/g, '');
+}
+
+function getPairValueNode(node: TreeSitterNode): TreeSitterNode | null {
+  return node.childForFieldName('value');
+}
+
+function isFunctionLikePair(node: TreeSitterNode): boolean {
+  const value = getPairValueNode(node);
+  if (!value) return false;
+  return isFunctionLikeNodeType(value.type);
 }

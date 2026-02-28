@@ -51,4 +51,42 @@ describe('CodeParserPlugin', () => {
     const calc = entities.find(e => e.name === 'Calculator');
     expect(calc?.entityType).toBe('class');
   });
+
+  it('parses TSX files with JSX syntax', () => {
+    const content = `
+      export const App = () => {
+        return <main><h1>Hello</h1></main>;
+      };
+    `;
+
+    const entities = parser.extractEntities(content, 'app.tsx');
+    const appEntity = entities.find(e => e.name === 'App');
+
+    expect(appEntity).toBeDefined();
+    expect(appEntity?.entityType).toBe('function');
+  });
+
+  it('extracts function-like object pairs as methods and skips inner variables', () => {
+    const content = `
+      export const createHandlers = () => {
+        const helper = 1;
+
+        return {
+          onClick: () => helper,
+          title: 'plain value',
+        };
+      };
+    `;
+
+    const entities = parser.extractEntities(content, 'handlers.ts');
+    const names = entities.map(e => e.name);
+
+    expect(names).toContain('createHandlers');
+    expect(names).toContain('onClick');
+    expect(names).not.toContain('helper');
+    expect(names).not.toContain('title');
+
+    const onClick = entities.find(e => e.name === 'onClick');
+    expect(onClick?.entityType).toBe('method');
+  });
 });
