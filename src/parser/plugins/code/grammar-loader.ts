@@ -3,9 +3,13 @@ import type { LanguageConfig } from './languages.js';
 // Lazy-loaded grammar cache
 const grammarCache = new Map<string, unknown>();
 
-export function loadGrammar(config: LanguageConfig): unknown {
-  if (grammarCache.has(config.id)) {
-    return grammarCache.get(config.id)!;
+export function loadGrammar(config: LanguageConfig, extension: string): unknown {
+  const cacheKey = config.grammarPackage === 'tree-sitter-typescript'
+    ? (extension === '.tsx' ? 'tsx' : 'typescript')
+    : config.id;
+
+  if (grammarCache.has(cacheKey)) {
+    return grammarCache.get(cacheKey)!;
   }
 
   try {
@@ -15,7 +19,7 @@ export function loadGrammar(config: LanguageConfig): unknown {
     if (config.grammarPackage === 'tree-sitter-typescript') {
       // tree-sitter-typescript exports { typescript, tsx }
       const pkg = require('tree-sitter-typescript');
-      grammar = config.extensions.includes('.tsx') ? pkg.tsx : pkg.typescript;
+      grammar = extension === '.tsx' ? pkg.tsx : pkg.typescript;
       // Cache both variants
       grammarCache.set('typescript', pkg.typescript);
       grammarCache.set('tsx', pkg.tsx);
@@ -23,9 +27,9 @@ export function loadGrammar(config: LanguageConfig): unknown {
       grammar = require(config.grammarPackage);
     }
 
-    grammarCache.set(config.id, grammar);
+    grammarCache.set(cacheKey, grammar);
     return grammar;
   } catch (err) {
-    throw new Error(`Failed to load grammar for ${config.id}: ${(err as Error).message}`);
+    throw new Error(`Failed to load grammar for ${config.id} (${extension}): ${(err as Error).message}`);
   }
 }

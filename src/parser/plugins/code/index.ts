@@ -36,7 +36,7 @@ export class CodeParserPlugin implements SemanticParserPlugin {
 
     let grammar: unknown;
     try {
-      grammar = loadGrammar(config);
+      grammar = loadGrammar(config, ext);
     } catch {
       return []; // Grammar not installed
     }
