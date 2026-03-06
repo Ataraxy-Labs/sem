@@ -32,6 +32,50 @@ fn visit_node(
 ) {
     let node_type = node.kind();
 
+    // Handle call-based entities (Elixir: def, defmodule, etc.)
+    if node_type == "call" && !config.call_entity_identifiers.is_empty() {
+        if let Some((name, entity_type)) = extract_call_entity(node, config, source) {
+            let content_str = node_text(node, source);
+            let content = content_str.to_string();
+            let struct_hash = structural_hash(node, source);
+            let entity = SemanticEntity {
+                id: build_entity_id(file_path, entity_type, &name, parent_id),
+                file_path: file_path.to_string(),
+                entity_type: entity_type.to_string(),
+                name: name.clone(),
+                parent_id: parent_id.map(String::from),
+                content_hash: content_hash(&content),
+                structural_hash: Some(struct_hash),
+                content,
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                metadata: None,
+            };
+
+            let entity_id = entity.id.clone();
+            entities.push(entity);
+
+            // Visit container children for nested entities (defs inside defmodule)
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if config.container_node_types.contains(&child.kind()) {
+                    let mut inner_cursor = child.walk();
+                    for nested in child.named_children(&mut inner_cursor) {
+                        visit_node(
+                            nested,
+                            file_path,
+                            config,
+                            entities,
+                            Some(&entity_id),
+                            source,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     if config.entity_node_types.contains(&node_type) {
         if let Some(name) = extract_name(node, source) {
             let entity_type = if node_type == "decorated_definition" {
@@ -266,6 +310,120 @@ fn map_node_type<'a>(tree_sitter_type: &'a str) -> &'a str {
         "template_declaration" => "template",
         other => other,
     }
+}
+
+/// Extract entity info from a call node (Elixir macros like def, defmodule, etc.)
+fn extract_call_entity(node: Node, config: &LanguageConfig, source: &[u8]) -> Option<(String, &'static str)> {
+    let target = node.child_by_field_name("target")?;
+    if target.kind() != "identifier" {
+        return None;
+    }
+    let keyword = node_text(target, source);
+
+    if !config.call_entity_identifiers.contains(&keyword) {
+        return None;
+    }
+
+    let entity_type = match keyword {
+        "defmodule" => "module",
+        "def" | "defp" | "defdelegate" => "function",
+        "defmacro" | "defmacrop" => "macro",
+        "defguard" | "defguardp" => "guard",
+        "defprotocol" => "protocol",
+        "defimpl" => "impl",
+        "defstruct" => "struct",
+        "defexception" => "exception",
+        _ => return None,
+    };
+
+    // Get arguments node (child by kind, not field name)
+    let mut cursor = node.walk();
+    let args = node.named_children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
+
+    let name = match keyword {
+        "defmodule" | "defprotocol" => {
+            extract_first_alias_or_identifier(args, source)?
+        }
+        "defimpl" => {
+            let base = extract_first_alias_or_identifier(args, source)?;
+            if let Some(target) = extract_keyword_value(args, "for", source) {
+                format!("{} for {}", base, target)
+            } else {
+                base
+            }
+        }
+        "defstruct" => "__struct__".to_string(),
+        "defexception" => "__exception__".to_string(),
+        _ => {
+            // def, defp, defmacro, defguard, defdelegate
+            // First arg is a call (fn with params), identifier (arity-0),
+            // or binary_operator (defguard with when clause)
+            let mut cursor = args.walk();
+            let first_arg = args.named_children(&mut cursor).next()?;
+            extract_fn_name_from_arg(first_arg, source)?
+        }
+    };
+
+    Some((name, entity_type))
+}
+
+/// Extract function name from a def/defp/defmacro/defguard argument.
+/// Handles: call (fn with params), identifier (arity-0), binary_operator (defguard when clause)
+fn extract_fn_name_from_arg(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "call" => {
+            if let Some(fn_target) = node.child_by_field_name("target") {
+                Some(node_text(fn_target, source).to_string())
+            } else {
+                let mut c = node.walk();
+                let id = node.named_children(&mut c)
+                    .find(|n| n.kind() == "identifier")?;
+                Some(node_text(id, source).to_string())
+            }
+        }
+        "identifier" => Some(node_text(node, source).to_string()),
+        "binary_operator" => {
+            // defguard is_positive(x) when ... -> left side has the actual call/identifier
+            let left = node.child_by_field_name("left")?;
+            extract_fn_name_from_arg(left, source)
+        }
+        _ => None,
+    }
+}
+
+fn extract_first_alias_or_identifier(args: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        match child.kind() {
+            "alias" => return Some(node_text(child, source).to_string()),
+            "identifier" => return Some(node_text(child, source).to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_keyword_value(args: Node, key: &str, source: &[u8]) -> Option<String> {
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() == "keywords" {
+            let mut kw_cursor = child.walk();
+            for pair in child.named_children(&mut kw_cursor) {
+                if pair.kind() == "pair" {
+                    if let Some(pair_key) = pair.child_by_field_name("key") {
+                        let key_text = node_text(pair_key, source).trim();
+                        if key_text == format!("{}:", key) || key_text == key {
+                            if let Some(pair_value) = pair.child_by_field_name("value") {
+                                return Some(node_text(pair_value, source).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// For Python decorated_definition, check the inner node to determine the real type.

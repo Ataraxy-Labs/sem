@@ -6,6 +6,7 @@ pub struct LanguageConfig {
     pub extensions: &'static [&'static str],
     pub entity_node_types: &'static [&'static str],
     pub container_node_types: &'static [&'static str],
+    pub call_entity_identifiers: &'static [&'static str],
     pub get_language: fn() -> Option<Language>,
 }
 
@@ -65,6 +66,14 @@ fn get_swift() -> Option<Language> {
     Some(tree_sitter_swift::LANGUAGE.into())
 }
 
+fn get_elixir() -> Option<Language> {
+    Some(tree_sitter_elixir::LANGUAGE.into())
+}
+
+fn get_bash() -> Option<Language> {
+    Some(tree_sitter_bash::LANGUAGE.into())
+}
+
 static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "typescript",
     extensions: &[".ts"],
@@ -81,6 +90,7 @@ static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
         "public_field_definition",
     ],
     container_node_types: &["class_body", "interface_body", "enum_body"],
+    call_entity_identifiers: &[],
     get_language: get_typescript,
 };
 
@@ -100,6 +110,7 @@ static TSX_CONFIG: LanguageConfig = LanguageConfig {
         "public_field_definition",
     ],
     container_node_types: &["class_body", "interface_body", "enum_body"],
+    call_entity_identifiers: &[],
     get_language: get_tsx,
 };
 
@@ -116,6 +127,7 @@ static JAVASCRIPT_CONFIG: LanguageConfig = LanguageConfig {
         "field_definition",
     ],
     container_node_types: &["class_body"],
+    call_entity_identifiers: &[],
     get_language: get_javascript,
 };
 
@@ -128,6 +140,7 @@ static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
         "decorated_definition",
     ],
     container_node_types: &["block"],
+    call_entity_identifiers: &[],
     get_language: get_python,
 };
 
@@ -142,6 +155,7 @@ static GO_CONFIG: LanguageConfig = LanguageConfig {
         "const_declaration",
     ],
     container_node_types: &[],
+    call_entity_identifiers: &[],
     get_language: get_go,
 };
 
@@ -160,6 +174,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
         "type_item",
     ],
     container_node_types: &["declaration_list"],
+    call_entity_identifiers: &[],
     get_language: get_rust,
 };
 
@@ -176,6 +191,7 @@ static JAVA_CONFIG: LanguageConfig = LanguageConfig {
         "annotation_type_declaration",
     ],
     container_node_types: &["class_body", "interface_body", "enum_body"],
+    call_entity_identifiers: &[],
     get_language: get_java,
 };
 
@@ -191,6 +207,7 @@ static C_CONFIG: LanguageConfig = LanguageConfig {
         "declaration",
     ],
     container_node_types: &[],
+    call_entity_identifiers: &[],
     get_language: get_c,
 };
 
@@ -208,6 +225,7 @@ static CPP_CONFIG: LanguageConfig = LanguageConfig {
         "type_definition",
     ],
     container_node_types: &["field_declaration_list", "declaration_list"],
+    call_entity_identifiers: &[],
     get_language: get_cpp,
 };
 
@@ -221,6 +239,7 @@ static RUBY_CONFIG: LanguageConfig = LanguageConfig {
         "module",
     ],
     container_node_types: &["body_statement"],
+    call_entity_identifiers: &[],
     get_language: get_ruby,
 };
 
@@ -239,6 +258,7 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
         "field_declaration",
     ],
     container_node_types: &["declaration_list"],
+    call_entity_identifiers: &[],
     get_language: get_csharp,
 };
 
@@ -255,6 +275,7 @@ static PHP_CONFIG: LanguageConfig = LanguageConfig {
         "namespace_definition",
     ],
     container_node_types: &["declaration_list", "enum_declaration_list"],
+    call_entity_identifiers: &[],
     get_language: get_php,
 };
 
@@ -270,6 +291,7 @@ static FORTRAN_CONFIG: LanguageConfig = LanguageConfig {
         "type_declaration",
     ],
     container_node_types: &[],
+    call_entity_identifiers: &[],
     get_language: get_fortran,
 };
 
@@ -289,7 +311,30 @@ static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
         "associatedtype_declaration",
     ],
     container_node_types: &["class_body", "protocol_body", "enum_class_body"],
+    call_entity_identifiers: &[],
     get_language: get_swift,
+};
+
+static ELIXIR_CONFIG: LanguageConfig = LanguageConfig {
+    id: "elixir",
+    extensions: &[".ex", ".exs"],
+    entity_node_types: &[],
+    container_node_types: &["do_block"],
+    call_entity_identifiers: &[
+        "defmodule", "def", "defp", "defmacro", "defmacrop",
+        "defguard", "defguardp", "defprotocol", "defimpl",
+        "defstruct", "defexception", "defdelegate",
+    ],
+    get_language: get_elixir,
+};
+
+static BASH_CONFIG: LanguageConfig = LanguageConfig {
+    id: "bash",
+    extensions: &[".sh"],
+    entity_node_types: &["function_definition"],
+    container_node_types: &[],
+    call_entity_identifiers: &[],
+    get_language: get_bash,
 };
 
 static ALL_CONFIGS: &[&LanguageConfig] = &[
@@ -307,6 +352,8 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &PHP_CONFIG,
     &FORTRAN_CONFIG,
     &SWIFT_CONFIG,
+    &ELIXIR_CONFIG,
+    &BASH_CONFIG,
 ];
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
@@ -323,6 +370,8 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
         ".java", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx",
         ".rb", ".cs", ".php", ".f90", ".f95", ".f03", ".f08", ".f", ".for",
         ".swift",
+        ".ex", ".exs",
+        ".sh",
     ];
     EXTENSIONS
 }

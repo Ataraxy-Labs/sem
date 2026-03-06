@@ -268,6 +268,81 @@ func helper(x: Int) -> Int {
     }
 
     #[test]
+    fn test_elixir_entity_extraction() {
+        let code = r#"
+defmodule MyApp.Accounts do
+  def create_user(attrs) do
+    %User{}
+    |> User.changeset(attrs)
+    |> Repo.insert()
+  end
+
+  defp validate(attrs) do
+    # private helper
+    :ok
+  end
+
+  defmacro is_admin(user) do
+    quote do
+      unquote(user).role == :admin
+    end
+  end
+
+  defguard is_positive(x) when is_integer(x) and x > 0
+end
+
+defprotocol Printable do
+  def to_string(data)
+end
+
+defimpl Printable, for: Integer do
+  def to_string(i), do: Integer.to_string(i)
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "accounts.ex");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        eprintln!("Elixir entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+
+        assert!(names.contains(&"MyApp.Accounts"), "Should find module, got: {:?}", names);
+        assert!(names.contains(&"create_user"), "Should find def, got: {:?}", names);
+        assert!(names.contains(&"validate"), "Should find defp, got: {:?}", names);
+        assert!(names.contains(&"is_admin"), "Should find defmacro, got: {:?}", names);
+        assert!(names.contains(&"Printable"), "Should find defprotocol, got: {:?}", names);
+
+        // Verify nesting: create_user should have MyApp.Accounts as parent
+        let create_user = entities.iter().find(|e| e.name == "create_user").unwrap();
+        assert!(create_user.parent_id.is_some(), "create_user should be nested under module");
+    }
+
+    #[test]
+    fn test_bash_entity_extraction() {
+        let code = r#"#!/bin/bash
+
+greet() {
+    echo "Hello, $1!"
+}
+
+function deploy {
+    echo "deploying..."
+}
+
+# not a function
+echo "main script"
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "deploy.sh");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        eprintln!("Bash entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+
+        assert!(names.contains(&"greet"), "Should find greet(), got: {:?}", names);
+        assert!(names.contains(&"deploy"), "Should find function deploy, got: {:?}", names);
+        assert_eq!(entities.len(), 2, "Should only find functions, got: {:?}", names);
+    }
+
+    #[test]
     fn test_typescript_entity_extraction() {
         // Existing language should still work
         let code = r#"
