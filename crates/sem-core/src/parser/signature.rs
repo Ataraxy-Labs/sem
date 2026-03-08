@@ -181,21 +181,14 @@ fn find_function_node(node: Node) -> Option<Node> {
 
     // Direct function node types across languages
     const FUNCTION_KINDS: &[&str] = &[
-        // TS/JS/Python
-        "function_declaration",
-        "function_definition",
-        "method_definition",
-        "arrow_function",
-        // Rust
-        "function_item",
-        // Go
-        "method_declaration",
-        // Java/C#/PHP
-        "method_declaration",
-        "constructor_declaration",
-        // Swift
-        "function_declaration",
-        "init_declaration",
+        "function_declaration",  // TS/JS/Swift
+        "function_definition",   // Python
+        "method_definition",     // TS/JS/Python
+        "arrow_function",        // TS/JS
+        "function_item",         // Rust
+        "method_declaration",    // Go/Java/C#/PHP
+        "constructor_declaration", // Java/C#
+        "init_declaration",      // Swift
     ];
 
     if FUNCTION_KINDS.contains(&kind) {
