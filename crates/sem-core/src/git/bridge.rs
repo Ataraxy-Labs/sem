@@ -362,6 +362,32 @@ impl GitBridge {
     }
 
 
+    /// Get commit log for a range (from exclusive, to inclusive).
+    pub fn get_log_range(&self, from: &str, to: &str) -> Result<Vec<CommitInfo>, GitError> {
+        let from_oid = self.repo.revparse_single(from)?.peel_to_commit()?.id();
+        let to_oid = self.repo.revparse_single(to)?.peel_to_commit()?.id();
+
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push(to_oid)?;
+        revwalk.hide(from_oid)?;
+
+        let mut commits = Vec::new();
+        for oid_result in revwalk {
+            let oid = oid_result?;
+            let commit = self.repo.find_commit(oid)?;
+            let sha = oid.to_string();
+            commits.push(CommitInfo {
+                short_sha: sha[..7.min(sha.len())].to_string(),
+                sha,
+                author: commit.author().name().unwrap_or("unknown").to_string(),
+                date: commit.time().seconds().to_string(),
+                message: commit.message().unwrap_or("").to_string(),
+            });
+        }
+
+        Ok(commits)
+    }
+
     pub fn get_log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
