@@ -6,6 +6,7 @@ use commands::blame::{blame_command, BlameOptions};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
+use commands::changelog::{changelog_command, ChangelogFormat, ChangelogOptions};
 use commands::review::{review_command, ReviewFormat, ReviewOptions};
 
 #[derive(Parser)]
@@ -82,6 +83,40 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Generate changelog / release notes from a commit range
+    Changelog {
+        /// Show only staged changes
+        #[arg(long)]
+        staged: bool,
+
+        /// Show changes from a specific commit
+        #[arg(long)]
+        commit: Option<String>,
+
+        /// Start of commit range
+        #[arg(long)]
+        from: Option<String>,
+
+        /// End of commit range
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Output format: terminal, markdown, or json
+        #[arg(long, default_value = "terminal")]
+        format: String,
+
+        /// Section heading (default: "Unreleased")
+        #[arg(long, default_value = "Unreleased")]
+        heading: String,
+
+        /// Date string for the changelog header
+        #[arg(long)]
+        date: Option<String>,
+
+        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        #[arg(long)]
+        file_exts: Vec<String>,
     },
     /// Semantic PR review: groups changes by impact and assesses risk
     Review {
@@ -192,6 +227,39 @@ fn main() {
                 file_exts,
             });
         }
+        Some(Commands::Changelog {
+            staged,
+            commit,
+            from,
+            to,
+            format,
+            heading,
+            date,
+            file_exts,
+        }) => {
+            let changelog_format = match format.as_str() {
+                "json" => ChangelogFormat::Json,
+                "markdown" | "md" => ChangelogFormat::Markdown,
+                _ => ChangelogFormat::Terminal,
+            };
+
+            let date_str = date.unwrap_or_else(today_date);
+
+            changelog_command(ChangelogOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                from,
+                to,
+                commit,
+                staged,
+                format: changelog_format,
+                heading,
+                date: date_str,
+                file_exts,
+            });
+        }
         Some(Commands::Review {
             staged,
             commit,
@@ -259,4 +327,31 @@ fn main() {
             });
         }
     }
+}
+
+fn today_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    // Reuse the same lite date formatting approach from blame
+    let days = secs / 86400;
+    let mut y: i64 = 1970;
+    let mut remaining = days;
+    loop {
+        let yd = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if remaining < yd { break; }
+        remaining -= yd;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    for (i, &md) in mdays.iter().enumerate() {
+        if remaining < md { m = i + 1; break; }
+        remaining -= md;
+    }
+    let d = remaining + 1;
+    format!("{y:04}-{m:02}-{d:02}")
 }
