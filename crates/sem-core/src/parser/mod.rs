@@ -5,3 +5,4 @@ pub mod graph;
 pub mod plugins;
 pub mod review;
 pub mod changelog;
+pub mod signature;

@@ -10,6 +10,7 @@ use crate::model::change::ChangeType;
 use crate::parser::differ::DiffResult;
 use crate::parser::graph::EntityGraph;
 use crate::parser::review::{self, ReviewChange};
+use crate::parser::signature::{analyze_signature_change, SignatureChangeKind};
 
 /// Changelog category per Keep-a-Changelog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -68,6 +69,9 @@ pub struct ChangelogEntry {
     /// Conventional commit type extracted from commit messages, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conventional_type: Option<String>,
+    /// Signature change classification (e.g. "body only", "parameter removed").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_change: Option<String>,
 }
 
 /// Full changelog output.
@@ -109,6 +113,10 @@ pub fn build_changelog(
     let review = review::build_review(diff, graph);
     let conventional = parse_conventional_commits(commits);
 
+    // Build lookup: entity_id → SemanticChange for signature analysis
+    let change_lookup: std::collections::HashMap<&str, &crate::model::change::SemanticChange> =
+        diff.changes.iter().map(|c| (c.entity_id.as_str(), c)).collect();
+
     // Collect breaking commit scopes for cross-referencing
     let breaking_scopes: HashSet<String> = conventional
         .iter()
@@ -142,8 +150,37 @@ pub fn build_changelog(
                 }
             }
             ChangeType::Modified => {
-                if is_conventional_breaking {
+                // Use signature analysis to determine breaking vs non-breaking
+                let sig_change = change_lookup
+                    .get(rc.entity_id.as_str())
+                    .and_then(|sc| {
+                        let before = sc.before_content.as_deref()?;
+                        let after = sc.after_content.as_deref()?;
+                        Some(analyze_signature_change(before, after, &rc.file_path))
+                    });
+
+                let is_sig_breaking = sig_change
+                    .as_ref()
+                    .map(|s| s.is_breaking())
+                    .unwrap_or(false);
+
+                if is_sig_breaking {
+                    let mut entry = make_entry(rc, ChangelogCategory::Breaking, conv_type);
+                    // Enhance description with signature detail
+                    if let Some(ref sig) = sig_change {
+                        entry.description = format_sig_description(rc, sig);
+                        entry.signature_change = Some(sig.label().to_string());
+                    }
+                    breaking.push(entry);
+                } else if is_conventional_breaking {
                     breaking.push(make_entry(rc, ChangelogCategory::Breaking, conv_type));
+                } else if let Some(ref sig) = sig_change {
+                    let mut entry = make_entry(rc, ChangelogCategory::Changed, conv_type);
+                    entry.signature_change = Some(sig.label().to_string());
+                    if !matches!(sig, SignatureChangeKind::BodyOnly) {
+                        entry.description = format_sig_description(rc, sig);
+                    }
+                    changed.push(entry);
                 } else {
                     changed.push(make_entry(rc, ChangelogCategory::Changed, conv_type));
                 }
@@ -184,6 +221,7 @@ pub fn build_changelog(
                 description: format!("`{}` {} in {}", rc.entity_name, vd, rc.file_path),
                 dependent_count: None,
                 conventional_type: conv_type,
+                signature_change: None,
             }
         } else {
             make_entry(rc, ChangelogCategory::Changed, conv_type)
@@ -269,6 +307,7 @@ fn make_entry(
             None
         },
         conventional_type,
+        signature_change: None,
     }
 }
 
@@ -313,6 +352,7 @@ fn make_deleted_entry(
             None
         },
         conventional_type,
+        signature_change: None,
     }
 }
 
@@ -340,6 +380,60 @@ fn make_renamed_entry(
         description,
         dependent_count: Some(rc.dependent_count),
         conventional_type,
+        signature_change: None,
+    }
+}
+
+/// Format a description with signature change details.
+fn format_sig_description(rc: &ReviewChange, sig: &SignatureChangeKind) -> String {
+    match sig {
+        SignatureChangeKind::ParamsRemoved { removed } => {
+            let dep_note = if rc.dependent_count > 0 {
+                format!("\n  ({} dependents — downstream callers will need updates)", rc.dependent_count)
+            } else {
+                String::new()
+            };
+            format!(
+                "`{}` — signature changed, removed `{}` parameter{}{}",
+                rc.entity_name,
+                removed.join("`, `"),
+                if removed.len() == 1 { "" } else { "s" },
+                dep_note
+            )
+        }
+        SignatureChangeKind::ParamsReordered => {
+            format!(
+                "`{}` — signature changed, parameters reordered",
+                rc.entity_name
+            )
+        }
+        SignatureChangeKind::ParamsAdded { added } => {
+            format!(
+                "`{}` — {} `{}` parameter{} added",
+                rc.entity_name,
+                rc.entity_type,
+                added.join("`, `"),
+                if added.len() == 1 { "" } else { "s" }
+            )
+        }
+        SignatureChangeKind::ReturnTypeChanged { before, after } => {
+            format!(
+                "`{}` — return type changed: {} → {}",
+                rc.entity_name, before, after
+            )
+        }
+        SignatureChangeKind::BodyOnly => {
+            format!(
+                "`{}` — {} body changed in {}",
+                rc.entity_name, rc.entity_type, rc.file_path
+            )
+        }
+        _ => {
+            format!(
+                "`{}` — {} {} in {}",
+                rc.entity_name, rc.entity_type, sig.label(), rc.file_path
+            )
+        }
     }
 }
 
@@ -571,6 +665,7 @@ mod tests {
             description: "broke it".into(),
             dependent_count: Some(5),
             conventional_type: None,
+            signature_change: None,
         }];
         let (bump, _) = compute_semver(&breaking, &[], &[], &[], &[]);
         assert_eq!(bump, SemverBump::Major);
@@ -586,6 +681,7 @@ mod tests {
             description: "new thing".into(),
             dependent_count: None,
             conventional_type: None,
+            signature_change: None,
         }];
         let (bump, _) = compute_semver(&[], &added, &[], &[], &[]);
         assert_eq!(bump, SemverBump::Minor);
