@@ -110,7 +110,7 @@ pub fn changelog_command(opts: ChangelogOptions) {
 
     // Build entity graph
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
-    let all_files = super::graph::find_supported_files_public(root, &registry, &ext_filter);
+    let all_files = sem_core::utils::files::find_supported_files(root, &registry, &ext_filter);
     let graph = EntityGraph::build(root, &all_files, &registry);
 
     // Get commit messages for conventional commit parsing

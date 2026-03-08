@@ -107,7 +107,7 @@ pub fn blame_command(opts: BlameOptions) {
 
                     // Format date
                     let ts = sig.when().seconds();
-                    let naive = chrono_lite_format(ts);
+                    let naive = sem_core::utils::date::format_unix_date(ts);
                     latest_date = naive;
                 }
             }
@@ -193,43 +193,4 @@ pub fn blame_command(opts: BlameOptions) {
         println!("│");
         println!("└{}", "─".repeat(60));
     }
-}
-
-/// Simple timestamp formatting without external deps.
-fn chrono_lite_format(unix_seconds: i64) -> String {
-    // Convert unix timestamp to date string
-    let days = unix_seconds / 86400;
-    let mut y = 1970;
-    let mut remaining_days = days;
-
-    loop {
-        let year_days = if is_leap(y) { 366 } else { 365 };
-        if remaining_days < year_days {
-            break;
-        }
-        remaining_days -= year_days;
-        y += 1;
-    }
-
-    let month_days = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut m = 0;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining_days < md {
-            m = i;
-            break;
-        }
-        remaining_days -= md;
-    }
-
-    let d = remaining_days + 1;
-    format!("{:04}-{:02}-{:02}", y, m + 1, d)
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }

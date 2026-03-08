@@ -362,12 +362,14 @@ impl GitBridge {
     }
 
 
-    /// Walk commits from `to` (or HEAD) backward, optionally stopping at `from`.
-    pub fn walk_commits(
+    /// Walk commits lazily from `to` (or HEAD) backward, stopping at `from`.
+    /// The callback returns `true` to continue or `false` to stop early.
+    pub fn for_each_commit(
         &self,
         from: Option<&str>,
         to: Option<&str>,
-    ) -> Result<Vec<CommitInfo>, GitError> {
+        mut f: impl FnMut(CommitInfo) -> bool,
+    ) -> Result<(), GitError> {
         let mut revwalk = self.repo.revwalk()?;
 
         match to {
@@ -389,20 +391,36 @@ impl GitBridge {
             revwalk.hide(from_oid)?;
         }
 
-        let mut commits = Vec::new();
         for oid_result in revwalk {
             let oid = oid_result?;
             let commit = self.repo.find_commit(oid)?;
             let sha = oid.to_string();
-            commits.push(CommitInfo {
+            let info = CommitInfo {
                 short_sha: sha[..7.min(sha.len())].to_string(),
                 sha,
                 author: commit.author().name().unwrap_or("unknown").to_string(),
-                date: commit.time().seconds().to_string(),
+                date: commit.time().seconds(),
                 message: commit.message().unwrap_or("").to_string(),
-            });
+            };
+            if !f(info) {
+                break;
+            }
         }
 
+        Ok(())
+    }
+
+    /// Collect all commits in a range into a Vec.
+    pub fn walk_commits(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<CommitInfo>, GitError> {
+        let mut commits = Vec::new();
+        self.for_each_commit(from, to, |c| {
+            commits.push(c);
+            true
+        })?;
         Ok(commits)
     }
 
@@ -412,26 +430,11 @@ impl GitBridge {
     }
 
     pub fn get_log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-
         let mut commits = Vec::new();
-        for (i, oid_result) in revwalk.enumerate() {
-            if i >= limit {
-                break;
-            }
-            let oid = oid_result?;
-            let commit = self.repo.find_commit(oid)?;
-            let sha = oid.to_string();
-            commits.push(CommitInfo {
-                short_sha: sha[..7.min(sha.len())].to_string(),
-                sha,
-                author: commit.author().name().unwrap_or("unknown").to_string(),
-                date: commit.time().seconds().to_string(),
-                message: commit.message().unwrap_or("").to_string(),
-            });
-        }
-
+        self.for_each_commit(None, None, |c| {
+            commits.push(c);
+            commits.len() < limit
+        })?;
         Ok(commits)
     }
 }

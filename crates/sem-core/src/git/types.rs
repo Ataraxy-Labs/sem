@@ -35,6 +35,6 @@ pub struct CommitInfo {
     pub sha: String,
     pub short_sha: String,
     pub author: String,
-    pub date: String,
+    pub date: i64,
     pub message: String,
 }
