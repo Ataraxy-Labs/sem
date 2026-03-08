@@ -75,7 +75,7 @@ pub fn resolve_entity(
             return Err(EntityResolutionError::NotFound);
         }
     } else {
-        find_files(repo_root, registry, file_exts)
+        crate::utils::files::find_supported_files(repo_root, registry, file_exts)
     };
 
     let is_full_id = entity_name.contains("::");
@@ -124,58 +124,6 @@ pub fn resolve_entity(
 }
 
 // ---------------------------------------------------------------------------
-// File discovery (mirrors graph.rs approach)
-// ---------------------------------------------------------------------------
-
-fn find_files(root: &Path, registry: &ParserRegistry, file_exts: &[String]) -> Vec<String> {
-    let mut files = Vec::new();
-    walk_dir(root, root, registry, file_exts, &mut files);
-    files
-}
-
-fn walk_dir(
-    dir: &Path,
-    root: &Path,
-    registry: &ParserRegistry,
-    file_exts: &[String],
-    files: &mut Vec<String>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.')
-                || name == "node_modules"
-                || name == "target"
-                || name == "vendor"
-                || name == "__pycache__"
-            {
-                continue;
-            }
-            walk_dir(&path, root, registry, file_exts, files);
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            if !file_exts.is_empty()
-                && !file_exts.iter().any(|ext| rel.ends_with(ext.as_str()))
-            {
-                continue;
-            }
-            if registry.get_plugin(&rel).is_some() {
-                files.push(rel);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Build entity log (history across commits)
 // ---------------------------------------------------------------------------
 
@@ -187,19 +135,15 @@ pub fn build_entity_log(
     to_ref: Option<&str>,
     follow_renames: bool,
 ) -> Result<EntityLogResult, String> {
-    let commits = git
-        .walk_commits(from_ref, to_ref)
-        .map_err(|e| format!("failed to walk commits: {e}"))?;
-
     let mut tracked_name = entity.name.clone();
     let mut tracked_file = entity.file_path.clone();
     let mut events: Vec<EntityLogEvent> = Vec::new();
 
-    for commit in &commits {
+    git.for_each_commit(from_ref, to_ref, |commit| {
         // 1. Cheap: get changed file paths only (no content).
         let diff_files = match git.get_commit_diff_files(&commit.sha) {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => return true, // skip this commit, continue walking
         };
 
         // 2. Filter to files touching the tracked path.
@@ -207,12 +151,12 @@ pub fn build_entity_log(
             .iter()
             .filter(|fc| {
                 fc.file_path == tracked_file
-                    || fc.old_file_path.as_deref() == Some(&tracked_file)
+                    || fc.old_file_path.as_deref() == Some(tracked_file.as_str())
             })
             .collect();
 
         if relevant.is_empty() {
-            continue;
+            return true; // continue
         }
 
         // 3. Resolve both trees once per commit, then read blobs.
@@ -254,15 +198,12 @@ pub fn build_entity_log(
         );
 
         // 5. Find the change that matches our tracked entity.
-        let mut found_event: Option<EntityLogEvent> = None;
-        let mut was_added = false;
-
         for change in &diff.changes {
             if change.entity_name != tracked_name {
                 continue;
             }
 
-            let date = format_unix_date(&commit.date);
+            let date = crate::utils::date::format_unix_date(commit.date);
             let first_line = commit
                 .message
                 .lines()
@@ -272,10 +213,7 @@ pub fn build_entity_log(
                 .to_string();
 
             let (event_type, description) = match change.change_type {
-                ChangeType::Added => {
-                    was_added = true;
-                    (EntityEventType::Added, first_line)
-                }
+                ChangeType::Added => (EntityEventType::Added, first_line),
                 ChangeType::Deleted => (EntityEventType::Deleted, first_line),
                 ChangeType::Renamed => {
                     let old_name = change.old_entity_name.clone().unwrap_or_default();
@@ -299,45 +237,10 @@ pub fn build_entity_log(
                     }
                     (evt, desc)
                 }
-                ChangeType::Modified => {
-                    // Run signature analysis when both sides are available.
-                    if let (Some(ref before), Some(ref after)) =
-                        (&change.before_content, &change.after_content)
-                    {
-                        let sig =
-                            analyze_signature_change(before, after, &change.file_path);
-                        match sig {
-                            SignatureChangeKind::BodyOnly
-                            | SignatureChangeKind::NotApplicable => {
-                                let desc = if change.structural_change == Some(false) {
-                                    "formatting only".to_string()
-                                } else {
-                                    first_line
-                                };
-                                (EntityEventType::Modified, desc)
-                            }
-                            _ => {
-                                let label = sig.label().to_string();
-                                (
-                                    EntityEventType::SignatureChanged {
-                                        detail: label.clone(),
-                                    },
-                                    label,
-                                )
-                            }
-                        }
-                    } else {
-                        let desc = if change.structural_change == Some(false) {
-                            "formatting only".to_string()
-                        } else {
-                            first_line
-                        };
-                        (EntityEventType::Modified, desc)
-                    }
-                }
+                ChangeType::Modified => classify_modification(change, &first_line),
             };
 
-            found_event = Some(EntityLogEvent {
+            events.push(EntityLogEvent {
                 sha: commit.sha.clone(),
                 short_sha: commit.short_sha.clone(),
                 date,
@@ -345,17 +248,17 @@ pub fn build_entity_log(
                 event_type,
                 description,
             });
+
+            // Stop walking if entity was just created.
+            if change.change_type == ChangeType::Added {
+                return false;
+            }
             break; // one event per entity per commit
         }
 
-        if let Some(evt) = found_event {
-            events.push(evt);
-        }
-
-        if was_added {
-            break; // entity didn't exist before this commit
-        }
-    }
+        true // continue walking
+    })
+    .map_err(|e| format!("failed to walk commits: {e}"))?;
 
     // Commits were newest-first; reverse so output is oldest-first.
     events.reverse();
@@ -368,50 +271,40 @@ pub fn build_entity_log(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn format_unix_date(timestamp_str: &str) -> String {
-    let secs: i64 = timestamp_str.parse().unwrap_or(0);
-    let days = secs / 86400;
-    let mut y: i64 = 1970;
-    let mut remaining = days;
-    loop {
-        let yd = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            366
+fn classify_modification(
+    change: &crate::model::change::SemanticChange,
+    first_line: &str,
+) -> (EntityEventType, String) {
+    if let (Some(ref before), Some(ref after)) =
+        (&change.before_content, &change.after_content)
+    {
+        let sig = analyze_signature_change(before, after, &change.file_path);
+        match sig {
+            SignatureChangeKind::BodyOnly | SignatureChangeKind::NotApplicable => {
+                let desc = if change.structural_change == Some(false) {
+                    "formatting only".to_string()
+                } else {
+                    first_line.to_string()
+                };
+                (EntityEventType::Modified, desc)
+            }
+            _ => {
+                let label = sig.label().to_string();
+                (
+                    EntityEventType::SignatureChanged {
+                        detail: label.clone(),
+                    },
+                    label,
+                )
+            }
+        }
+    } else {
+        let desc = if change.structural_change == Some(false) {
+            "formatting only".to_string()
         } else {
-            365
+            first_line.to_string()
         };
-        if remaining < yd {
-            break;
-        }
-        remaining -= yd;
-        y += 1;
+        (EntityEventType::Modified, desc)
     }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let mdays = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut m = 0;
-    for (i, &md) in mdays.iter().enumerate() {
-        if remaining < md {
-            m = i + 1;
-            break;
-        }
-        remaining -= md;
-    }
-    let d = remaining + 1;
-    format!("{y:04}-{m:02}-{d:02}")
 }
+

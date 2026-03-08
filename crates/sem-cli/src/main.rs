@@ -9,6 +9,7 @@ use commands::impact::{impact_command, ImpactOptions};
 use commands::changelog::{changelog_command, ChangelogFormat, ChangelogOptions};
 use commands::log::{log_command, LogFormat, LogOptions};
 use commands::review::{review_command, ReviewFormat, ReviewOptions};
+use sem_core::utils::date::today_date;
 
 #[derive(Parser)]
 #[command(name = "sem", version = "0.3.1", about = "Semantic version control")]
@@ -386,31 +387,4 @@ fn main() {
             });
         }
     }
-}
-
-fn today_date() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    // Reuse the same lite date formatting approach from blame
-    let days = secs / 86400;
-    let mut y: i64 = 1970;
-    let mut remaining = days;
-    loop {
-        let yd = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if remaining < yd { break; }
-        remaining -= yd;
-        y += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0;
-    for (i, &md) in mdays.iter().enumerate() {
-        if remaining < md { m = i + 1; break; }
-        remaining -= md;
-    }
-    let d = remaining + 1;
-    format!("{y:04}-{m:02}-{d:02}")
 }
