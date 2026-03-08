@@ -6,6 +6,7 @@ use commands::blame::{blame_command, BlameOptions};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
+use commands::review::{review_command, ReviewFormat, ReviewOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = "0.3.1", about = "Semantic version control")]
@@ -81,6 +82,32 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Semantic PR review: groups changes by impact and assesses risk
+    Review {
+        /// Show only staged changes
+        #[arg(long)]
+        staged: bool,
+
+        /// Show changes from a specific commit
+        #[arg(long)]
+        commit: Option<String>,
+
+        /// Start of commit range
+        #[arg(long)]
+        from: Option<String>,
+
+        /// End of commit range
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Output format: terminal or json
+        #[arg(long, default_value = "terminal")]
+        format: String,
+
+        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        #[arg(long)]
+        file_exts: Vec<String>,
     },
     /// Show entity dependency graph
     Graph {
@@ -162,6 +189,32 @@ fn main() {
                 entity_name: entity,
                 file_paths: files,
                 json,
+                file_exts,
+            });
+        }
+        Some(Commands::Review {
+            staged,
+            commit,
+            from,
+            to,
+            format,
+            file_exts,
+        }) => {
+            let review_format = match format.as_str() {
+                "json" => ReviewFormat::Json,
+                _ => ReviewFormat::Terminal,
+            };
+
+            review_command(ReviewOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                from,
+                to,
+                commit,
+                staged,
+                format: review_format,
                 file_exts,
             });
         }
