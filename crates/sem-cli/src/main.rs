@@ -12,7 +12,7 @@ use commands::review::{review_command, ReviewFormat, ReviewOptions};
 use sem_core::utils::date::today_date;
 
 #[derive(Parser)]
-#[command(name = "sem", version = "0.3.1", about = "Semantic version control")]
+#[command(name = "sem", version = env!("CARGO_PKG_VERSION"), about = "Semantic version control")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
