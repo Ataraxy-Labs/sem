@@ -6,3 +6,4 @@ pub mod plugins;
 pub mod review;
 pub mod changelog;
 pub mod signature;
+pub mod log;

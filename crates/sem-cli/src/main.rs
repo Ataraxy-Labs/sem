@@ -7,6 +7,7 @@ use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
 use commands::changelog::{changelog_command, ChangelogFormat, ChangelogOptions};
+use commands::log::{log_command, LogFormat, LogOptions};
 use commands::review::{review_command, ReviewFormat, ReviewOptions};
 
 #[derive(Parser)]
@@ -141,6 +142,36 @@ enum Commands {
         format: String,
 
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        #[arg(long)]
+        file_exts: Vec<String>,
+    },
+    /// Show full history of a single entity across commits
+    Log {
+        /// Entity name to track
+        #[arg(long)]
+        entity: String,
+
+        /// Scope to a specific file if entity name is ambiguous
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Start of history range
+        #[arg(long)]
+        from: Option<String>,
+
+        /// End of history range (default: HEAD)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Output format: terminal or json
+        #[arg(long, default_value = "terminal")]
+        format: String,
+
+        /// Follow renames (default: true)
+        #[arg(long, default_value_t = true)]
+        follow: bool,
+
+        /// Only include files with these extensions
         #[arg(long)]
         file_exts: Vec<String>,
     },
@@ -283,6 +314,34 @@ fn main() {
                 commit,
                 staged,
                 format: review_format,
+                file_exts,
+            });
+        }
+        Some(Commands::Log {
+            entity,
+            file,
+            from,
+            to,
+            format,
+            follow,
+            file_exts,
+        }) => {
+            let log_format = match format.as_str() {
+                "json" => LogFormat::Json,
+                _ => LogFormat::Terminal,
+            };
+
+            log_command(LogOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                entity_name: entity,
+                file,
+                from,
+                to,
+                format: log_format,
+                follow,
                 file_exts,
             });
         }

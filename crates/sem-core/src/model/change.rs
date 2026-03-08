@@ -47,4 +47,7 @@ pub struct SemanticChange {
     /// None when structural hash is unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structural_change: Option<bool>,
+    /// The previous entity name before a rename. Populated for Renamed/Moved changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_entity_name: Option<String>,
 }
