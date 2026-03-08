@@ -45,12 +45,12 @@ brew install sem-cli
 Or build from source (requires Rust):
 
 ```bash
-git clone https://github.com/antiartificial/sem
+git clone https://github.com/Ataraxy-Labs/sem
 cd sem/crates
 cargo install --path sem-cli
 ```
 
-Or grab a binary from [GitHub Releases](https://github.com/antiartificial/sem/releases).
+Or grab a binary from [GitHub Releases](https://github.com/Ataraxy-Labs/sem/releases).
 
 Or run via Docker:
 
