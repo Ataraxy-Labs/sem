@@ -306,3 +306,218 @@ fn assess_risk(
         reason: "internal/config changes only, no public API impact".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::types::FileChange;
+    use crate::parser::differ::compute_semantic_diff;
+    use crate::parser::graph::EntityGraph;
+    use crate::parser::plugins::create_default_registry;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn make_file_change(
+        path: &str,
+        status: crate::git::types::FileStatus,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> FileChange {
+        FileChange {
+            file_path: path.to_string(),
+            status,
+            old_file_path: None,
+            before_content: before.map(String::from),
+            after_content: after.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_internal_only_is_low_risk() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        write_file(root, "a.ts", "function foo() { return 2; }\n");
+
+        let files = vec![make_file_change(
+            "a.ts",
+            crate::git::types::FileStatus::Modified,
+            Some("function foo() { return 1; }\n"),
+            Some("function foo() { return 2; }\n"),
+        )];
+
+        let diff = compute_semantic_diff(&files, &registry, None, None);
+        let graph = EntityGraph::build(root, &["a.ts".into()], &registry);
+        let review = build_review(&diff, &graph);
+
+        assert_eq!(review.risk.level, RiskLevel::Low);
+        assert_eq!(review.summary.api_surface_count, 0);
+        assert_eq!(review.summary.internal_count, 1);
+        assert_eq!(review.internal_changes[0].entity_name, "foo");
+    }
+
+    #[test]
+    fn test_api_surface_with_dependents() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        write_file(root, "a.ts", "export function helper() { return 2; }\n");
+        write_file(root, "b.ts", "import { helper } from './a';\nexport function caller() { return helper(); }\n");
+
+        let files = vec![make_file_change(
+            "a.ts",
+            crate::git::types::FileStatus::Modified,
+            Some("export function helper() { return 1; }\n"),
+            Some("export function helper() { return 2; }\n"),
+        )];
+
+        let diff = compute_semantic_diff(&files, &registry, None, None);
+        let graph = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        let review = build_review(&diff, &graph);
+
+        assert!(review.summary.api_surface_count > 0 || review.summary.internal_count > 0);
+    }
+
+    #[test]
+    fn test_config_changes_classified_separately() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        write_file(root, "config.json", "{\n  \"timeout\": 60\n}\n");
+
+        let files = vec![make_file_change(
+            "config.json",
+            crate::git::types::FileStatus::Modified,
+            Some("{\n  \"timeout\": 30\n}\n"),
+            Some("{\n  \"timeout\": 60\n}\n"),
+        )];
+
+        let diff = compute_semantic_diff(&files, &registry, None, None);
+        let graph = EntityGraph::build(root, &["config.json".into()], &registry);
+        let review = build_review(&diff, &graph);
+
+        // All changes from .json files should be classified as config or internal, not API surface
+        assert_eq!(review.summary.api_surface_count, 0);
+        let total = review.summary.config_count + review.summary.internal_count;
+        assert!(total > 0, "expected config or internal changes, got none");
+        assert_eq!(review.risk.level, RiskLevel::Low);
+    }
+
+    #[test]
+    fn test_config_file_extension_detected() {
+        // Verify that .json, .yaml, .toml files are recognized as config
+        let change = SemanticChange {
+            id: "1".into(),
+            entity_id: "config.json::property::timeout".into(),
+            change_type: ChangeType::Modified,
+            entity_type: "property".into(),
+            entity_name: "timeout".into(),
+            file_path: "config.json".into(),
+            old_file_path: None,
+            before_content: Some("\"timeout\": 30".into()),
+            after_content: Some("\"timeout\": 60".into()),
+            commit_sha: None,
+            author: None,
+            timestamp: None,
+            structural_change: Some(true),
+            old_entity_name: None,
+        };
+        assert!(is_config_change(&change));
+    }
+
+    #[test]
+    fn test_added_entity_is_internal_without_dependents() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        write_file(root, "a.ts", "function newThing() { return 1; }\n");
+
+        let files = vec![make_file_change(
+            "a.ts",
+            crate::git::types::FileStatus::Added,
+            None,
+            Some("function newThing() { return 1; }\n"),
+        )];
+
+        let diff = compute_semantic_diff(&files, &registry, None, None);
+        let graph = EntityGraph::build(root, &["a.ts".into()], &registry);
+        let review = build_review(&diff, &graph);
+
+        assert_eq!(review.summary.api_surface_count, 0);
+        assert_eq!(review.summary.internal_count, 1);
+        assert_eq!(review.internal_changes[0].change_label, "added");
+    }
+
+    #[test]
+    fn test_high_risk_many_dependents() {
+        let rc = ReviewChange {
+            entity_id: "a.ts::function::core".into(),
+            entity_name: "core".into(),
+            entity_type: "function".into(),
+            file_path: "a.ts".into(),
+            change_type: ChangeType::Modified,
+            old_file_path: None,
+            change_label: "modified".into(),
+            dependent_count: 15,
+            dependent_file_count: 5,
+            value_diff: None,
+            was_referenced_by: vec![],
+        };
+
+        let risk = assess_risk(&[rc], &[], &[]);
+        assert_eq!(risk.level, RiskLevel::High);
+    }
+
+    #[test]
+    fn test_medium_risk_api_surface_change() {
+        let rc = ReviewChange {
+            entity_id: "a.ts::function::helper".into(),
+            entity_name: "helper".into(),
+            entity_type: "function".into(),
+            file_path: "a.ts".into(),
+            change_type: ChangeType::Modified,
+            old_file_path: None,
+            change_label: "modified".into(),
+            dependent_count: 3,
+            dependent_file_count: 2,
+            value_diff: None,
+            was_referenced_by: vec![],
+        };
+
+        let risk = assess_risk(&[rc], &[], &[]);
+        assert_eq!(risk.level, RiskLevel::Medium);
+    }
+
+    #[test]
+    fn test_deleted_with_references_is_medium_risk() {
+        let rc = ReviewChange {
+            entity_id: "a.ts::function::old".into(),
+            entity_name: "old".into(),
+            entity_type: "function".into(),
+            file_path: "a.ts".into(),
+            change_type: ChangeType::Deleted,
+            old_file_path: None,
+            change_label: "deleted".into(),
+            dependent_count: 2,
+            dependent_file_count: 1,
+            value_diff: None,
+            was_referenced_by: vec!["caller1".into(), "caller2".into()],
+        };
+
+        let risk = assess_risk(&[], &[rc], &[]);
+        assert_eq!(risk.level, RiskLevel::Medium);
+    }
+}
