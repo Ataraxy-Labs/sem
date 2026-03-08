@@ -41,7 +41,8 @@ fn walk_dir(
                 continue;
             }
         }
-        if path.is_dir() {
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
             walk_dir(&path, root, registry, ext_filter, files);
         } else if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();

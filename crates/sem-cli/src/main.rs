@@ -198,6 +198,10 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     match cli.command {
         Some(Commands::Diff {
@@ -217,10 +221,7 @@ fn main() {
             };
 
             diff_command(DiffOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 format: output_format,
                 staged,
                 commit,
@@ -234,10 +235,7 @@ fn main() {
         }
         Some(Commands::Blame { file, json }) => {
             blame_command(BlameOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 file_path: file,
                 json,
             });
@@ -249,10 +247,7 @@ fn main() {
             file_exts,
         }) => {
             impact_command(ImpactOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 entity_name: entity,
                 file_paths: files,
                 json,
@@ -278,10 +273,7 @@ fn main() {
             let date_str = date.unwrap_or_else(today_date);
 
             changelog_command(ChangelogOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 from,
                 to,
                 commit,
@@ -306,10 +298,7 @@ fn main() {
             };
 
             review_command(ReviewOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 from,
                 to,
                 commit,
@@ -333,10 +322,7 @@ fn main() {
             };
 
             log_command(LogOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 entity_name: entity,
                 file,
                 from,
@@ -358,10 +344,7 @@ fn main() {
             };
 
             graph_command(GraphOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 file_paths: files,
                 entity,
                 format: graph_format,
@@ -371,10 +354,7 @@ fn main() {
         None => {
             // Default to diff when no subcommand is given
             diff_command(DiffOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd: cwd.clone(),
                 format: OutputFormat::Terminal,
                 staged: false,
                 commit: None,
