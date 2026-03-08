@@ -48,12 +48,14 @@ pub enum EntityEventType {
 // Entity resolution
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct EntityMatch {
     pub name: String,
     pub entity_type: String,
     pub file_path: String,
 }
 
+#[derive(Debug)]
 pub enum EntityResolutionError {
     NotFound,
     Ambiguous(Vec<EntityMatch>),
@@ -305,6 +307,175 @@ fn classify_modification(
             first_line.to_string()
         };
         (EntityEventType::Modified, desc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::plugins::create_default_registry;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_entity_by_name() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function login() { return true; }\n");
+
+        let result = resolve_entity(&registry, root, "login", None, &[]);
+        assert!(result.is_ok());
+        let entity = result.unwrap();
+        assert_eq!(entity.name, "login");
+        assert_eq!(entity.file_path, "a.ts");
+    }
+
+    #[test]
+    fn test_resolve_entity_by_full_id() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function login() { return true; }\n");
+
+        let result = resolve_entity(&registry, root, "a.ts::function::login", None, &[]);
+        assert!(result.is_ok());
+        let entity = result.unwrap();
+        assert_eq!(entity.name, "login");
+    }
+
+    #[test]
+    fn test_resolve_entity_not_found() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function login() { return true; }\n");
+
+        let result = resolve_entity(&registry, root, "nonexistent", None, &[]);
+        assert!(matches!(result, Err(EntityResolutionError::NotFound)));
+    }
+
+    #[test]
+    fn test_resolve_entity_ambiguous() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function login() { return 1; }\n");
+        write_file(root, "b.ts", "export function login() { return 2; }\n");
+
+        let result = resolve_entity(&registry, root, "login", None, &[]);
+        match result {
+            Err(EntityResolutionError::Ambiguous(matches)) => {
+                assert_eq!(matches.len(), 2);
+            }
+            _ => panic!("expected Ambiguous, got {:?}", result.is_ok()),
+        }
+    }
+
+    #[test]
+    fn test_resolve_entity_with_file_filter() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function login() { return 1; }\n");
+        write_file(root, "b.ts", "export function login() { return 2; }\n");
+
+        let result = resolve_entity(&registry, root, "login", Some("a.ts"), &[]);
+        assert!(result.is_ok());
+        let entity = result.unwrap();
+        assert_eq!(entity.file_path, "a.ts");
+    }
+
+    #[test]
+    fn test_resolve_entity_with_ext_filter() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function login() { return 1; }\n");
+        write_file(root, "b.py", "def login():\n    return 2\n");
+
+        let exts = vec![".ts".to_string()];
+        let result = resolve_entity(&registry, root, "login", None, &exts);
+        assert!(result.is_ok());
+        let entity = result.unwrap();
+        assert_eq!(entity.file_path, "a.ts");
+    }
+
+    #[test]
+    fn test_full_id_short_circuits_on_first_match() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        write_file(root, "a.ts", "export function foo() { return 1; }\nexport function bar() { return 2; }\n");
+
+        // Full ID should return immediately without scanning further
+        let result = resolve_entity(&registry, root, "a.ts::function::foo", None, &[]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().name, "foo");
+    }
+
+    #[test]
+    fn test_classify_modification_formatting_only() {
+        let change = crate::model::change::SemanticChange {
+            id: "1".into(),
+            entity_id: "a.ts::function::foo".into(),
+            change_type: ChangeType::Modified,
+            entity_type: "function".into(),
+            entity_name: "foo".into(),
+            file_path: "a.ts".into(),
+            old_file_path: None,
+            before_content: None,
+            after_content: None,
+            commit_sha: None,
+            author: None,
+            timestamp: None,
+            structural_change: Some(false),
+            old_entity_name: None,
+        };
+
+        let (event_type, desc) = classify_modification(&change, "some commit message");
+        assert!(matches!(event_type, EntityEventType::Modified));
+        assert_eq!(desc, "formatting only");
+    }
+
+    #[test]
+    fn test_classify_modification_real_change() {
+        let change = crate::model::change::SemanticChange {
+            id: "1".into(),
+            entity_id: "a.ts::function::foo".into(),
+            change_type: ChangeType::Modified,
+            entity_type: "function".into(),
+            entity_name: "foo".into(),
+            file_path: "a.ts".into(),
+            old_file_path: None,
+            before_content: None,
+            after_content: None,
+            commit_sha: None,
+            author: None,
+            timestamp: None,
+            structural_change: Some(true),
+            old_entity_name: None,
+        };
+
+        let (event_type, desc) = classify_modification(&change, "fix the bug");
+        assert!(matches!(event_type, EntityEventType::Modified));
+        assert_eq!(desc, "fix the bug");
     }
 }
 

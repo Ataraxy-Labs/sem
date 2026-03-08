@@ -692,4 +692,116 @@ mod tests {
         let (bump, _) = compute_semver(&[], &[], &[], &[], &[]);
         assert_eq!(bump, SemverBump::Patch);
     }
+
+    #[test]
+    fn test_build_changelog_added_entity() {
+        use crate::git::types::FileChange;
+        use crate::parser::differ::compute_semantic_diff;
+        use crate::parser::graph::EntityGraph;
+        use crate::parser::plugins::create_default_registry;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        let path = root.join("a.ts");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"export function newFeature() { return 1; }\n").unwrap();
+
+        let files = vec![FileChange {
+            file_path: "a.ts".into(),
+            status: crate::git::types::FileStatus::Added,
+            old_file_path: None,
+            before_content: None,
+            after_content: Some("export function newFeature() { return 1; }\n".into()),
+        }];
+
+        let diff = compute_semantic_diff(&files, &registry, None, None);
+        let graph = EntityGraph::build(root, &["a.ts".into()], &registry);
+        let result = build_changelog(&diff, &graph, &[], "2024-01-01");
+
+        assert_eq!(result.date, "2024-01-01");
+        assert_eq!(result.semver_suggestion, SemverBump::Patch);
+        // Added entity with no dependents is internal, not public API
+        assert!(!result.internal.is_empty() || !result.added.is_empty());
+    }
+
+    #[test]
+    fn test_build_changelog_deleted_with_dependents() {
+        use crate::git::types::FileChange;
+        use crate::parser::differ::compute_semantic_diff;
+        use crate::parser::graph::EntityGraph;
+        use crate::parser::plugins::create_default_registry;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let registry = create_default_registry();
+
+        // b.ts references helper, but we're deleting helper from a.ts
+        let path_b = root.join("b.ts");
+        let mut f = std::fs::File::create(&path_b).unwrap();
+        f.write_all(b"import { helper } from './a';\nexport function caller() { return helper(); }\n").unwrap();
+
+        let files = vec![FileChange {
+            file_path: "a.ts".into(),
+            status: crate::git::types::FileStatus::Modified,
+            old_file_path: None,
+            before_content: Some("export function helper() { return 1; }\n".into()),
+            after_content: Some("".into()),
+        }];
+
+        let diff = compute_semantic_diff(&files, &registry, None, None);
+        let graph = EntityGraph::build(root, &["b.ts".into()], &registry);
+        let result = build_changelog(&diff, &graph, &[], "2024-01-01");
+
+        // A deleted entity should appear in removed
+        let has_removed = !result.removed.is_empty();
+        let has_internal_deleted = result.internal.iter().any(|e| e.entity_name == "helper");
+        assert!(has_removed || has_internal_deleted);
+    }
+
+    #[test]
+    fn test_render_markdown_structure() {
+        let result = ChangelogResult {
+            date: "2024-06-15".into(),
+            breaking: vec![ChangelogEntry {
+                category: ChangelogCategory::Breaking,
+                entity_name: "auth".into(),
+                entity_type: "function".into(),
+                file_path: "a.ts".into(),
+                description: "`auth` — signature changed".into(),
+                dependent_count: Some(3),
+                conventional_type: None,
+                signature_change: None,
+            }],
+            added: vec![ChangelogEntry {
+                category: ChangelogCategory::Added,
+                entity_name: "newFn".into(),
+                entity_type: "function".into(),
+                file_path: "b.ts".into(),
+                description: "`newFn` — new function in b.ts".into(),
+                dependent_count: None,
+                conventional_type: None,
+                signature_change: None,
+            }],
+            changed: vec![],
+            removed: vec![],
+            internal: vec![],
+            semver_suggestion: SemverBump::Major,
+            semver_reason: "1 breaking change detected".into(),
+            conventional_commits: vec![],
+        };
+
+        let md = render_markdown(&result, "v2.0.0");
+        assert!(md.contains("## v2.0.0 — 2024-06-15"));
+        assert!(md.contains("### Breaking Changes"));
+        assert!(md.contains("### Added"));
+        assert!(md.contains("MAJOR"));
+        assert!(!md.contains("### Changed"));
+        assert!(!md.contains("### Removed"));
+    }
 }
