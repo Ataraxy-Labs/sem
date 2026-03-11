@@ -1,5 +1,8 @@
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { SemanticParserPlugin } from './plugin.js';
 import { getExtension } from '../utils/path.js';
+import { detectPluginByMime } from '../utils/mime.js';
 
 export class ParserRegistry {
   private plugins = new Map<string, SemanticParserPlugin>();
@@ -18,6 +21,16 @@ export class ParserRegistry {
     if (pluginId) {
       return this.plugins.get(pluginId);
     }
+
+    // Try MIME detection via `file` command for files that exist on disk
+    const absolutePath = resolve(process.cwd(), filePath);
+    if (existsSync(absolutePath)) {
+      const mimePluginId = detectPluginByMime(absolutePath);
+      if (mimePluginId) {
+        return this.plugins.get(mimePluginId);
+      }
+    }
+
     // Fallback plugin
     return this.plugins.get('fallback');
   }
