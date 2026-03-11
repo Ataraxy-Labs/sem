@@ -150,7 +150,7 @@ impl GitBridge {
         Ok(files)
     }
 
-    fn get_commit_diff_files(&self, sha: &str) -> Result<Vec<FileChange>, GitError> {
+    pub fn get_commit_diff_files(&self, sha: &str) -> Result<Vec<FileChange>, GitError> {
         let obj = self.repo.revparse_single(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
@@ -323,13 +323,13 @@ impl GitBridge {
         Ok(())
     }
 
-    fn resolve_tree(&self, refspec: &str) -> Result<git2::Tree<'_>, GitError> {
+    pub fn resolve_tree(&self, refspec: &str) -> Result<git2::Tree<'_>, GitError> {
         let obj = self.repo.revparse_single(refspec)?;
         let commit = obj.peel_to_commit()?;
         Ok(commit.tree()?)
     }
 
-    fn read_blob_from_tree(&self, tree: &git2::Tree, file_path: &str) -> Option<String> {
+    pub fn read_blob_from_tree(&self, tree: &git2::Tree, file_path: &str) -> Option<String> {
         let entry = tree.get_path(Path::new(file_path)).ok()?;
         let blob = self.repo.find_blob(entry.id()).ok()?;
         std::str::from_utf8(blob.content()).ok().map(String::from)
@@ -348,27 +348,79 @@ impl GitBridge {
     }
 
 
-    pub fn get_log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+    /// Walk commits lazily from `to` (or HEAD) backward, stopping at `from`.
+    /// The callback returns `true` to continue or `false` to stop early.
+    pub fn for_each_commit(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        mut f: impl FnMut(CommitInfo) -> bool,
+    ) -> Result<(), GitError> {
         let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
 
-        let mut commits = Vec::new();
-        for (i, oid_result) in revwalk.enumerate() {
-            if i >= limit {
-                break;
+        match to {
+            Some(to_ref) => {
+                let to_oid = self.repo.revparse_single(to_ref)?.peel_to_commit()?.id();
+                revwalk.push(to_oid)?;
             }
+            None => {
+                revwalk.push_head()?;
+            }
+        }
+
+        if let Some(from_ref) = from {
+            let from_oid = self
+                .repo
+                .revparse_single(from_ref)?
+                .peel_to_commit()?
+                .id();
+            revwalk.hide(from_oid)?;
+        }
+
+        for oid_result in revwalk {
             let oid = oid_result?;
             let commit = self.repo.find_commit(oid)?;
             let sha = oid.to_string();
-            commits.push(CommitInfo {
+            let info = CommitInfo {
                 short_sha: sha[..7.min(sha.len())].to_string(),
                 sha,
                 author: commit.author().name().unwrap_or("unknown").to_string(),
-                date: commit.time().seconds().to_string(),
+                date: commit.time().seconds(),
                 message: commit.message().unwrap_or("").to_string(),
-            });
+            };
+            if !f(info) {
+                break;
+            }
         }
 
+        Ok(())
+    }
+
+    /// Collect all commits in a range into a Vec.
+    pub fn walk_commits(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<CommitInfo>, GitError> {
+        let mut commits = Vec::new();
+        self.for_each_commit(from, to, |c| {
+            commits.push(c);
+            true
+        })?;
+        Ok(commits)
+    }
+
+    /// Get commit log for a range (from exclusive, to inclusive).
+    pub fn get_log_range(&self, from: &str, to: &str) -> Result<Vec<CommitInfo>, GitError> {
+        self.walk_commits(Some(from), Some(to))
+    }
+
+    pub fn get_log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+        let mut commits = Vec::new();
+        self.for_each_commit(None, None, |c| {
+            commits.push(c);
+            commits.len() < limit
+        })?;
         Ok(commits)
     }
 }

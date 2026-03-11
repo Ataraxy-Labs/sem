@@ -53,6 +53,7 @@ pub fn match_entities(
                     author: author.map(String::from),
                     timestamp: None,
                     structural_change,
+                    old_entity_name: None,
                 });
             }
         }
@@ -119,6 +120,12 @@ pub fn match_entities(
                 None
             };
 
+            let old_entity_name = if before_entity.name != after_entity.name {
+                Some(before_entity.name.clone())
+            } else {
+                None
+            };
+
             changes.push(SemanticChange {
                 id: format!("change::{}", after_entity.id),
                 entity_id: after_entity.id.clone(),
@@ -133,6 +140,7 @@ pub fn match_entities(
                 author: author.map(String::from),
                 timestamp: None,
                 structural_change: None,
+                old_entity_name,
             });
         }
     }
@@ -208,6 +216,12 @@ pub fn match_entities(
                         None
                     };
 
+                    let old_entity_name = if matched.name != after_entity.name {
+                        Some(matched.name.clone())
+                    } else {
+                        None
+                    };
+
                     changes.push(SemanticChange {
                         id: format!("change::{}", after_entity.id),
                         entity_id: after_entity.id.clone(),
@@ -222,6 +236,7 @@ pub fn match_entities(
                         author: author.map(String::from),
                         timestamp: None,
                         structural_change: None,
+                        old_entity_name,
                     });
                 }
             }
@@ -244,6 +259,7 @@ pub fn match_entities(
             author: author.map(String::from),
             timestamp: None,
             structural_change: None,
+            old_entity_name: None,
         });
     }
 
@@ -263,6 +279,7 @@ pub fn match_entities(
             author: author.map(String::from),
             timestamp: None,
             structural_change: None,
+            old_entity_name: None,
         });
     }
 
