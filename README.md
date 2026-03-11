@@ -1,8 +1,18 @@
-# sem
+<p align="center">
+  <img src="assets/banner.svg" alt="sem" width="600" />
+</p>
 
-Semantic version control. Entity-level diffs on top of Git.
+<p align="center">
+  Entity-level diffs on top of Git. Instead of <em>line 43 changed</em>, sem tells you <em>function validateToken was added in src/auth.ts</em>.
+</p>
 
-Instead of *line 43 changed*, sem tells you *function validateToken was added in src/auth.ts*.
+<p align="center">
+  <a href="https://github.com/Ataraxy-Labs/sem/releases/latest"><img src="https://img.shields.io/github/v/release/Ataraxy-Labs/sem?color=blue&label=release" alt="Release"></a>
+  <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
+  <img src="https://img.shields.io/badge/tests-46_passing-brightgreen" alt="Tests">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License"></a>
+  <img src="https://img.shields.io/badge/languages-19-blue" alt="Languages">
+</p>
 
 ```
 sem diff
