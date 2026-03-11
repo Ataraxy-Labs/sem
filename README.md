@@ -80,6 +80,9 @@ sem diff --commit abc1234
 # Commit range
 sem diff --from HEAD~5 --to HEAD
 
+# Plain text output (git status style)
+sem diff --format plain
+
 # JSON output (for AI agents, CI pipelines)
 sem diff --format json
 
