@@ -31,13 +31,13 @@ export function computeSemanticDiff(
     let beforeEntities: SemanticEntity[] = [];
     let afterEntities: SemanticEntity[] = [];
 
-    const fallback = registry.getPluginById('fallback')!;
+    const fallback = registry.getPluginById('fallback');
 
     if (file.beforeContent) {
       try {
         beforeEntities = plugin.extractEntities(file.beforeContent, file.oldFilePath ?? file.filePath);
       } catch {
-        if (plugin !== fallback) {
+        if (plugin !== fallback && fallback) {
           beforeEntities = fallback.extractEntities(file.beforeContent, file.oldFilePath ?? file.filePath);
         }
       }
@@ -47,7 +47,7 @@ export function computeSemanticDiff(
       try {
         afterEntities = plugin.extractEntities(file.afterContent, file.filePath);
       } catch {
-        if (plugin !== fallback) {
+        if (plugin !== fallback && fallback) {
           afterEntities = fallback.extractEntities(file.afterContent, file.filePath);
         }
       }
