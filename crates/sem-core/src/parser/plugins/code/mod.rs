@@ -414,6 +414,42 @@ function outer() {
     }
 
     #[test]
+    fn test_rust_impl_blocks_unique_names() {
+        let code = r#"
+trait Greeting {
+    fn greet(&self) -> String;
+}
+
+struct Person;
+struct Robot;
+struct Cat;
+
+impl Greeting for Person {
+    fn greet(&self) -> String { "Hello".to_string() }
+}
+
+impl Greeting for Robot {
+    fn greet(&self) -> String { "Beep".to_string() }
+}
+
+impl Greeting for Cat {
+    fn greet(&self) -> String { "Meow".to_string() }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "impls.rs");
+        let impl_entities: Vec<&_> = entities.iter()
+            .filter(|e| e.entity_type == "impl")
+            .collect();
+        let names: Vec<&str> = impl_entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert_eq!(impl_entities.len(), 3, "Should find 3 impl blocks, got: {:?}", names);
+        assert!(names.contains(&"Greeting for Person"), "got: {:?}", names);
+        assert!(names.contains(&"Greeting for Robot"), "got: {:?}", names);
+        assert!(names.contains(&"Greeting for Cat"), "got: {:?}", names);
+    }
+
+    #[test]
     fn test_nested_functions_go() {
         // Go doesn't have named nested functions, but has nested type/var declarations
         let code = "package main\n\nfunc outer() {\n    var x int = 42\n    _ = x\n}\n";

@@ -284,6 +284,27 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
 
     // For variable/lexical declarations, try to get the declarator name
     let node_type = node.kind();
+
+    // For Rust impl blocks, construct unique name from trait + type
+    // e.g. "impl Display for Foo" -> "Display for Foo", "impl Foo" -> "Foo"
+    if node_type == "impl_item" {
+        let trait_node = node.child_by_field_name("trait");
+        let type_node = node.child_by_field_name("type");
+        match (trait_node, type_node) {
+            (Some(trait_n), Some(type_n)) => {
+                return Some(format!(
+                    "{} for {}",
+                    node_text(trait_n, source),
+                    node_text(type_n, source)
+                ));
+            }
+            (None, Some(type_n)) => {
+                return Some(node_text(type_n, source).to_string());
+            }
+            _ => {} // fall through to generic fallback
+        }
+    }
+
     if node_type == "lexical_declaration" || node_type == "variable_declaration" {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
