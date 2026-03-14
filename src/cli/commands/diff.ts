@@ -8,12 +8,13 @@ import { computeSemanticDiff } from '../../parser/differ.js';
 import { SemDatabase } from '../../storage/database.js';
 import { formatTerminal } from '../formatters/terminal.js';
 import { formatJson } from '../formatters/json.js';
+import { formatMarkdown } from '../formatters/markdown.js';
 import { createDefaultRegistry } from '../../parser/plugins/index.js';
 import { loadConfig, validateChanges, formatValidationResults } from './validate.js';
 
 export interface DiffOptions {
   cwd?: string;
-  format?: 'terminal' | 'json';
+  format?: 'terminal' | 'json' | 'markdown';
   staged?: boolean;
   commit?: string;
   from?: string;
@@ -87,6 +88,8 @@ export async function diffCommand(opts: DiffOptions = {}): Promise<void> {
   const format = opts.format ?? 'terminal';
   if (format === 'json') {
     console.log(formatJson(result));
+  } else if (format === 'markdown') {
+    console.log(formatMarkdown(result));
   } else {
     console.log(formatTerminal(result));
   }
