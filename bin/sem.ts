@@ -38,7 +38,7 @@ program
 program
   .command('diff')
   .description('Show semantic diff of changes')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, plain, or json', 'terminal')
   .option('-s, --staged', 'Show staged changes only')
   .option('-c, --commit <sha>', 'Show changes in a specific commit')
   .option('--from <ref>', 'Start of commit range')
