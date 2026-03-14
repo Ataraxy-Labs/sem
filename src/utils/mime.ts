@@ -15,16 +15,6 @@ const MIME_TO_PLUGIN: Record<string, string> = {
   // Markdown
   'text/markdown': 'markdown',
   'text/x-markdown': 'markdown',
-  // Code (TypeScript, JavaScript, Python, Go, Rust)
-  'application/typescript': 'code',
-  'text/typescript': 'code',
-  'text/x-typescript': 'code',
-  'application/javascript': 'code',
-  'text/javascript': 'code',
-  'text/x-python': 'code',
-  'text/x-script.python': 'code',
-  'text/x-go': 'code',
-  'text/x-rustsrc': 'code',
 };
 
 let fileCommandAvailable: boolean | undefined;
