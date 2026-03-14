@@ -85,7 +85,7 @@ fn visit_node(
             let entity_type = if node_type == "decorated_definition" {
                 map_decorated_type(node)
             } else {
-                map_node_type(node_type)
+                map_node_type(node, source)
             };
             let should_skip = should_skip_entity(config, enclosing_entity_node_type, node_type);
             if !should_skip {
@@ -522,8 +522,20 @@ fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-fn map_node_type<'a>(tree_sitter_type: &'a str) -> &'a str {
-    match tree_sitter_type {
+fn map_node_type<'a>(node: Node, source: &'a [u8]) -> &'a str {
+    match node.kind() {
+        "lexical_declaration" => {
+            get_function_like_declaration_type(node, source).unwrap_or_else(|| {
+                if node_text(node, source).trim_start().starts_with("const") {
+                    "constant"
+                } else {
+                    "variable"
+                }
+            })
+        }
+        "variable_declaration" | "var_declaration" => {
+            get_function_like_declaration_type(node, source).unwrap_or("variable")
+        }
         "function_declaration" | "function_definition" | "function_item" => "function",
         "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
         "class_declaration" | "class_definition" | "class_specifier" => "class",
@@ -536,7 +548,7 @@ fn map_node_type<'a>(tree_sitter_type: &'a str) -> &'a str {
         "trait_item" => "trait",
         "mod_item" | "module" | "namespace_definition" | "namespace_declaration" => "module",
         "export_statement" => "export",
-        "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
+        "declaration" => "variable",
         "const_declaration" | "const_item" => "constant",
         "static_item" => "static",
         "decorated_definition" => "decorated_definition",
@@ -547,6 +559,44 @@ fn map_node_type<'a>(tree_sitter_type: &'a str) -> &'a str {
         "template_declaration" => "template",
         other => other,
     }
+}
+
+fn get_function_like_declaration_type<'a>(node: Node, source: &'a [u8]) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+
+        if let Some(value) = child.child_by_field_name("value") {
+            match value.kind() {
+                "generator_function" | "generator_function_declaration" => return Some("generator"),
+                "arrow_function" | "function" | "function_expression" => return Some("function"),
+                _ => {}
+            }
+        }
+
+        let normalized = node_text(child, source).split_whitespace().collect::<Vec<_>>().join(" ");
+        let Some((_, rhs)) = normalized.split_once('=') else {
+            continue;
+        };
+        let rhs = rhs.trim_start();
+        let rhs = rhs.strip_prefix("async ").map(str::trim_start).unwrap_or(rhs);
+
+        if rhs.starts_with("function*") || rhs.starts_with("function *") {
+            return Some("generator");
+        }
+
+        let starts_like_identifier = rhs
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphabetic());
+        if rhs.starts_with("function") || (rhs.contains("=>") && (rhs.starts_with('(') || starts_like_identifier)) {
+            return Some("function");
+        }
+    }
+
+    None
 }
 
 /// Extract entity info from a call node (Elixir macros like def, defmodule, etc.)

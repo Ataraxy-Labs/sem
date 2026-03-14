@@ -66,6 +66,44 @@ describe('CodeParserPlugin', () => {
     expect(appEntity?.entityType).toBe('function');
   });
 
+  it('parses JSX files with JSX syntax', () => {
+    const content = `
+      export const App = () => {
+        return <main><h1>Hello</h1></main>;
+      };
+    `;
+
+    const entities = parser.extractEntities(content, 'app.jsx');
+    const appEntity = entities.find(e => e.name === 'App');
+
+    expect(appEntity).toBeDefined();
+    expect(appEntity?.entityType).toBe('function');
+  });
+
+  it('classifies bindings by declaration kind and assigned function shape in JS and TS', () => {
+    const content = `
+      const constantValue = "abc";
+      let mutableValue = "def";
+      var legacyValue = "ghi";
+
+      var arrowFn = () => 1;
+      const functionExpr = function () { return 2; };
+      let generatorExpr = function* () { yield 3; };
+    `;
+
+    for (const filePath of ['bindings.ts', 'bindings.js']) {
+      const entities = parser.extractEntities(content, filePath);
+      const types = Object.fromEntries(entities.map(entity => [entity.name, entity.entityType]));
+
+      expect(types.constantValue).toBe('constant');
+      expect(types.mutableValue).toBe('variable');
+      expect(types.legacyValue).toBe('variable');
+      expect(types.arrowFn).toBe('function');
+      expect(types.functionExpr).toBe('function');
+      expect(types.generatorExpr).toBe('generator');
+    }
+  });
+
   it('extracts function-like object pairs as methods and skips inner variables', () => {
     const content = `
       export const createHandlers = () => {
