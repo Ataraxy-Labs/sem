@@ -34,7 +34,13 @@ pub fn format_markdown(result: &DiffResult) -> String {
                         "Δ"
                     }
                 }
-                ChangeType::Deleted => "-",
+                ChangeType::Modified => {
+                    if change.structural_change == Some(false) {
+                        "~"
+                    } else {
+                        "Δ"
+                    }
+                }
                 ChangeType::Moved => "→",
                 ChangeType::Renamed => "↻",
             };
