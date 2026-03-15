@@ -1321,4 +1321,613 @@ class="app"></div>"#;
             names
         );
     }
+
+    #[test]
+    fn test_svelte_each_block_extraction() {
+        let code = r#"<script>
+let items = $state(['a', 'b', 'c']);
+</script>
+
+{#each items as item, i (item)}
+  <li>{i}: {item}</li>
+{:else}
+  <p>No items</p>
+{/each}
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Each.svelte");
+
+        let each = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_each_block")
+            .expect("should extract each block");
+        assert!(each.name.starts_with("each@"));
+        assert_eq!(each.start_line, 5);
+        assert_eq!(each.end_line, 9);
+
+        let fragment = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_fragment")
+            .unwrap();
+        assert_eq!(each.parent_id.as_deref(), Some(fragment.id.as_str()));
+
+        let li = entities
+            .iter()
+            .find(|e| e.name.starts_with("li@"))
+            .expect("should extract li element inside each");
+        assert_eq!(li.parent_id.as_deref(), Some(each.id.as_str()));
+
+        let p = entities
+            .iter()
+            .find(|e| e.name.starts_with("p@"))
+            .expect("should extract p element inside {:else} fallback");
+        assert_eq!(
+            p.parent_id.as_deref(),
+            Some(each.id.as_str()),
+            "fallback content should be parented to the each block"
+        );
+    }
+
+    #[test]
+    fn test_svelte_key_block_extraction() {
+        let code = r#"{#key value}
+  <Widget />
+{/key}
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Key.svelte");
+
+        let key = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_key_block")
+            .expect("should extract key block");
+        assert!(key.name.starts_with("key@"));
+        assert_eq!(key.start_line, 1);
+        assert_eq!(key.end_line, 3);
+
+        let widget = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_component" && e.name.starts_with("Widget@"))
+            .expect("should extract Widget component inside key block");
+        assert_eq!(widget.parent_id.as_deref(), Some(key.id.as_str()));
+    }
+
+    #[test]
+    fn test_svelte_await_block_extraction() {
+        let code = r#"{#await promise}
+  <p>Loading...</p>
+{:then value}
+  <p>{value}</p>
+{:catch error}
+  <p>{error.message}</p>
+{/await}
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Await.svelte");
+
+        let await_block = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_await_block")
+            .expect("should extract await block");
+        assert!(await_block.name.starts_with("await@"));
+        assert_eq!(await_block.start_line, 1);
+        assert_eq!(await_block.end_line, 7);
+
+        let ps: Vec<_> = entities
+            .iter()
+            .filter(|e| e.name.starts_with("p@"))
+            .collect();
+        assert_eq!(ps.len(), 3, "should extract p elements from pending, then, and catch branches");
+        for p in &ps {
+            assert_eq!(
+                p.parent_id.as_deref(),
+                Some(await_block.id.as_str()),
+                "all p elements should be parented to await block"
+            );
+        }
+    }
+
+    #[test]
+    fn test_svelte_nested_if_else_chain() {
+        let code = r#"{#if a}
+  <p>A</p>
+{:else if b}
+  <p>B</p>
+{:else}
+  <p>C</p>
+{/if}
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "IfElse.svelte");
+
+        let ifs: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "svelte_if_block")
+            .collect();
+        assert_eq!(ifs.len(), 2, "should extract both if and else-if as separate if blocks");
+
+        let outer_if = &ifs[0];
+        let inner_if = &ifs[1];
+        assert_eq!(
+            inner_if.parent_id.as_deref(),
+            Some(outer_if.id.as_str()),
+            "else-if block should be nested under the outer if"
+        );
+
+        let ps: Vec<_> = entities
+            .iter()
+            .filter(|e| e.name.starts_with("p@"))
+            .collect();
+        assert_eq!(ps.len(), 3, "should extract all three p elements from branches");
+    }
+
+    #[test]
+    fn test_svelte_structural_hash_stable_across_whitespace() {
+        let compact = r#"<div class="app"><span>hello</span></div>"#;
+        let spaced = r#"<div class="app">
+  <span>hello</span>
+</div>"#;
+
+        let plugin = SvelteParserPlugin;
+        let compact_entities = plugin.extract_entities(compact, "Compact.svelte");
+        let spaced_entities = plugin.extract_entities(spaced, "Spaced.svelte");
+
+        let compact_div = compact_entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_element" && e.name.starts_with("div@"))
+            .unwrap();
+        let spaced_div = spaced_entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_element" && e.name.starts_with("div@"))
+            .unwrap();
+
+        assert_ne!(
+            compact_div.content_hash, spaced_div.content_hash,
+            "content hashes should differ because raw text differs"
+        );
+    }
+
+    #[test]
+    fn test_svelte_content_hash_changes_on_logic_change() {
+        let before = r#"<script>
+function add(a, b) { return a + b; }
+</script>
+"#;
+        let after = r#"<script>
+function add(a, b) { return a * b; }
+</script>
+"#;
+        let plugin = SvelteParserPlugin;
+        let before_entities = plugin.extract_entities(before, "Calc.svelte");
+        let after_entities = plugin.extract_entities(after, "Calc.svelte");
+
+        let before_add = before_entities
+            .iter()
+            .find(|e| e.name == "add")
+            .unwrap();
+        let after_add = after_entities
+            .iter()
+            .find(|e| e.name == "add")
+            .unwrap();
+
+        assert_ne!(
+            before_add.content_hash, after_add.content_hash,
+            "changing function body should change content hash"
+        );
+        assert_eq!(before_add.entity_type, "function");
+        assert_eq!(after_add.entity_type, "function");
+
+        let before_script = before_entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_instance_script")
+            .unwrap();
+        let after_script = after_entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_instance_script")
+            .unwrap();
+        assert_ne!(
+            before_script.content_hash, after_script.content_hash,
+            "script block content hash should also change"
+        );
+    }
+
+    #[test]
+    fn test_svelte_entity_parent_hierarchy() {
+        let code = r#"<script lang="ts">
+export function greet(name: string) {
+  return `Hello ${name}`;
+}
+</script>
+
+<main>
+  <section>
+    <p>{greet("world")}</p>
+  </section>
+</main>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "App.svelte");
+
+        let script = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_instance_script")
+            .unwrap();
+        assert!(
+            script.parent_id.is_none(),
+            "script block should be a top-level entity"
+        );
+
+        let greet = entities.iter().find(|e| e.name == "greet").unwrap();
+        assert_eq!(
+            greet.parent_id.as_deref(),
+            Some(script.id.as_str()),
+            "greet function should be parented to the script block"
+        );
+        assert_eq!(greet.entity_type, "function");
+
+        let fragment = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_fragment")
+            .unwrap();
+        assert!(fragment.parent_id.is_none(), "fragment should be top-level");
+
+        let main_el = entities
+            .iter()
+            .find(|e| e.name.starts_with("main@"))
+            .unwrap();
+        assert_eq!(main_el.parent_id.as_deref(), Some(fragment.id.as_str()));
+
+        let section = entities
+            .iter()
+            .find(|e| e.name.starts_with("section@"))
+            .unwrap();
+        assert_eq!(section.parent_id.as_deref(), Some(main_el.id.as_str()));
+    }
+
+    #[test]
+    fn test_svelte_metadata_fields() {
+        let code = r#"<script lang="ts" context="module">
+export const VERSION = "1.0";
+</script>
+
+<script lang="ts">
+let count = $state(0);
+</script>
+
+<style>
+div { color: red; }
+</style>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Meta.svelte");
+
+        let module_script = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_module_script")
+            .unwrap();
+        let meta = module_script.metadata.as_ref().unwrap();
+        assert_eq!(meta.get("svelte.kind").map(|s| s.as_str()), Some("module_script"));
+        assert_eq!(meta.get("svelte.context").map(|s| s.as_str()), Some("module"));
+        assert_eq!(meta.get("svelte.lang").map(|s| s.as_str()), Some("ts"));
+
+        let instance_script = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_instance_script")
+            .unwrap();
+        let meta = instance_script.metadata.as_ref().unwrap();
+        assert_eq!(meta.get("svelte.context").map(|s| s.as_str()), Some("default"));
+        assert_eq!(meta.get("svelte.lang").map(|s| s.as_str()), Some("ts"));
+
+        let style = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_style")
+            .unwrap();
+        let meta = style.metadata.as_ref().unwrap();
+        assert_eq!(meta.get("svelte.kind").map(|s| s.as_str()), Some("style"));
+    }
+
+    #[test]
+    fn test_svelte_rune_declarations_in_script() {
+        let code = r#"<script lang="ts">
+let count = $state(0);
+let doubled = $derived(count * 2);
+
+$effect(() => {
+  console.log(count);
+});
+
+function increment() {
+  count++;
+}
+</script>
+
+<button onclick={increment}>{count} (doubled: {doubled})</button>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Runes.svelte");
+
+        let script_children: Vec<_> = entities
+            .iter()
+            .filter(|e| {
+                e.parent_id
+                    .as_ref()
+                    .map(|pid| {
+                        entities
+                            .iter()
+                            .any(|p| p.id == *pid && p.entity_type == "svelte_instance_script")
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let child_names: Vec<&str> = script_children.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            child_names.contains(&"count"),
+            "should extract count rune declaration, got: {:?}",
+            child_names
+        );
+        assert!(
+            child_names.contains(&"doubled"),
+            "should extract doubled rune declaration, got: {:?}",
+            child_names
+        );
+        assert!(
+            child_names.contains(&"increment"),
+            "should extract increment function, got: {:?}",
+            child_names
+        );
+    }
+
+    #[test]
+    fn test_svelte_html_and_const_tags() {
+        let code = r#"{@html "<b>bold</b>"}
+{@const x = 42}
+<p>{x}</p>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Tags.svelte");
+
+        let html = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_html_tag")
+            .expect("should extract @html tag");
+        assert!(html.name.starts_with("html@"));
+
+        let const_tag = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_const_tag")
+            .expect("should extract @const tag");
+        assert!(const_tag.name.starts_with("const@"));
+
+        let fragment = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_fragment")
+            .unwrap();
+        assert_eq!(html.parent_id.as_deref(), Some(fragment.id.as_str()));
+        assert_eq!(const_tag.parent_id.as_deref(), Some(fragment.id.as_str()));
+    }
+
+    #[test]
+    fn test_svelte_component_with_children() {
+        let code = r#"<Dialog>
+  <h2>Title</h2>
+  <p>Content</p>
+</Dialog>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Composed.svelte");
+
+        let dialog = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_component" && e.name.starts_with("Dialog@"))
+            .expect("should extract Dialog component");
+
+        let h2 = entities
+            .iter()
+            .find(|e| e.name.starts_with("h2@"))
+            .expect("should extract h2 inside Dialog");
+        assert_eq!(
+            h2.parent_id.as_deref(),
+            Some(dialog.id.as_str()),
+            "h2 should be parented to Dialog component"
+        );
+
+        let p = entities
+            .iter()
+            .find(|e| e.name.starts_with("p@"))
+            .expect("should extract p inside Dialog");
+        assert_eq!(p.parent_id.as_deref(), Some(dialog.id.as_str()));
+    }
+
+    #[test]
+    fn test_svelte_module_file_lang_detection() {
+        let ts_code = "export const API_URL: string = 'https://example.com';";
+        let js_code = "export const API_URL = 'https://example.com';";
+
+        let plugin = SvelteParserPlugin;
+        let ts_entities = plugin.extract_entities(ts_code, "config.svelte.ts");
+        let js_entities = plugin.extract_entities(js_code, "config.svelte.js");
+
+        let ts_module = ts_entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_module")
+            .unwrap();
+        let ts_meta = ts_module.metadata.as_ref().unwrap();
+        assert_eq!(ts_meta.get("svelte.lang").map(|s| s.as_str()), Some("ts"));
+
+        let js_module = js_entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_module")
+            .unwrap();
+        let js_meta = js_module.metadata.as_ref().unwrap();
+        assert_eq!(js_meta.get("svelte.lang").map(|s| s.as_str()), Some("js"));
+    }
+
+    #[test]
+    fn test_svelte_empty_component_produces_no_fragment() {
+        let code = "";
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Empty.svelte");
+        assert!(
+            entities.is_empty(),
+            "empty component should produce no entities, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_svelte_expression_tag_extraction() {
+        let code = r#"<p>{user.name}</p>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Expr.svelte");
+
+        let expr = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_expression_tag")
+            .expect("should extract expression tag");
+        assert!(expr.name.starts_with("expression@"));
+
+        let p = entities
+            .iter()
+            .find(|e| e.name.starts_with("p@"))
+            .unwrap();
+        assert_eq!(
+            expr.parent_id.as_deref(),
+            Some(p.id.as_str()),
+            "expression tag should be parented to its containing element"
+        );
+    }
+
+    #[test]
+    fn test_svelte_svelte_body_and_document() {
+        let code = r#"<svelte:body onscroll={() => {}} />
+<svelte:document onfullscreenchange={() => {}} />
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Special.svelte");
+
+        let body = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_body")
+            .expect("should extract svelte:body");
+        assert!(body.name.starts_with("svelte:body@"));
+
+        let doc = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_document")
+            .expect("should extract svelte:document");
+        assert!(doc.name.starts_with("svelte:document@"));
+    }
+
+    #[test]
+    fn test_svelte_snippet_with_render() {
+        let code = r#"{#snippet row(item)}
+  <tr><td>{item.name}</td></tr>
+{/snippet}
+
+<table>
+  {#each items as item}
+    {@render row(item)}
+  {/each}
+</table>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Table.svelte");
+
+        let snippet = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_snippet")
+            .expect("should extract snippet");
+        assert!(snippet.name.starts_with("snippet@"));
+
+        let tr = entities
+            .iter()
+            .find(|e| e.name.starts_with("tr@"))
+            .expect("should extract tr inside snippet");
+        assert_eq!(
+            tr.parent_id.as_deref(),
+            Some(snippet.id.as_str()),
+            "tr should be parented to the snippet"
+        );
+
+        let render = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_render_tag")
+            .expect("should extract @render tag");
+        assert!(render.name.starts_with("render@"));
+
+        let each = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_each_block")
+            .unwrap();
+        assert_eq!(
+            render.parent_id.as_deref(),
+            Some(each.id.as_str()),
+            "@render should be parented to the each block"
+        );
+    }
+
+    #[test]
+    fn test_svelte_multiple_scripts_disambiguation() {
+        let code = r#"<script>
+let a = 1;
+</script>
+<script>
+let b = 2;
+</script>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "Multi.svelte");
+
+        let scripts: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "svelte_instance_script")
+            .collect();
+        assert_eq!(scripts.len(), 2, "should extract both script blocks");
+        assert_ne!(
+            scripts[0].name, scripts[1].name,
+            "script blocks should have disambiguated names"
+        );
+        assert_eq!(scripts[0].name, "script");
+        assert_eq!(scripts[1].name, "script:2");
+    }
+
+    #[test]
+    fn test_svelte_entity_id_format() {
+        let code = r#"<script>
+function hello() {}
+</script>
+
+<div>text</div>
+"#;
+        let plugin = SvelteParserPlugin;
+        let entities = plugin.extract_entities(code, "src/routes/+page.svelte");
+
+        let script = entities
+            .iter()
+            .find(|e| e.entity_type == "svelte_instance_script")
+            .unwrap();
+        assert!(
+            script.id.contains("src/routes/+page.svelte"),
+            "entity ID should contain file path, got: {}",
+            script.id
+        );
+        assert!(
+            script.id.contains("svelte_instance_script"),
+            "entity ID should contain entity type, got: {}",
+            script.id
+        );
+
+        let hello = entities.iter().find(|e| e.name == "hello").unwrap();
+        assert!(
+            hello.id.contains("hello"),
+            "child entity ID should contain the entity name, got: {}",
+            hello.id
+        );
+        assert!(
+            hello.parent_id.is_some(),
+            "script-extracted function should have a parent ID"
+        );
+    }
 }
