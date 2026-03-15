@@ -40,5 +40,5 @@ tempfile = "3.24.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "svelte_parse"
+name = "svelte"
 harness = false
