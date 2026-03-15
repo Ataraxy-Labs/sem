@@ -122,7 +122,7 @@ fn trim_bytes(bytes: &[u8]) -> &[u8] {
 fn is_comment_node(kind: &str) -> bool {
     matches!(
         kind,
-        "comment" | "line_comment" | "block_comment" | "doc_comment"
+        "comment" | "line_comment" | "block_comment" | "doc_comment" | "tag_comment"
     )
 }
 
