@@ -109,3 +109,92 @@ pub fn compute_semantic_diff(
         renamed_count,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::types::{FileChange, FileStatus};
+    use crate::parser::plugins::create_default_registry;
+
+    #[test]
+    fn test_svelte_tag_comment_diff_is_non_structural() {
+        let registry = create_default_registry();
+        let before = r#"<div class="app"></div>"#;
+        let after = r#"<div // Svelte 5 tag comment
+class="app"></div>"#;
+
+        let result = compute_semantic_diff(
+            &[FileChange {
+                file_path: "src/routes/+page.svelte".to_string(),
+                status: FileStatus::Modified,
+                old_file_path: None,
+                before_content: Some(before.to_string()),
+                after_content: Some(after.to_string()),
+            }],
+            &registry,
+            None,
+            None,
+        );
+
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|change| change.entity_type == "svelte_element"
+                    && change.structural_change == Some(false)),
+            "expected regular element tag comment change to be treated as non-structural: {:?}",
+            result.changes
+        );
+
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|change| change.entity_type == "svelte_fragment"
+                    && change.structural_change == Some(false)),
+            "expected fragment tag comment change to be treated as non-structural: {:?}",
+            result.changes
+        );
+    }
+
+    #[test]
+    fn test_svelte_block_tag_comment_diff_is_non_structural() {
+        let registry = create_default_registry();
+        let before = r#"<div class="app"></div>"#;
+        let after = r#"<div /* Svelte 5 tag comment */
+class="app"></div>"#;
+
+        let result = compute_semantic_diff(
+            &[FileChange {
+                file_path: "src/routes/+page.svelte".to_string(),
+                status: FileStatus::Modified,
+                old_file_path: None,
+                before_content: Some(before.to_string()),
+                after_content: Some(after.to_string()),
+            }],
+            &registry,
+            None,
+            None,
+        );
+
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|change| change.entity_type == "svelte_element"
+                    && change.structural_change == Some(false)),
+            "expected regular element block comment change to be treated as non-structural: {:?}",
+            result.changes
+        );
+
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|change| change.entity_type == "svelte_fragment"
+                    && change.structural_change == Some(false)),
+            "expected fragment block comment change to be treated as non-structural: {:?}",
+            result.changes
+        );
+    }
+}
