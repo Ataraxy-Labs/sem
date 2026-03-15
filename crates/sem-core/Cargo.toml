@@ -25,7 +25,7 @@ tree-sitter-bash = "0.23"
 tree-sitter-hcl = "1.1"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-xml = "0.7"
-svelte-syntax = "0.1.2"
+svelte-syntax = "0.1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
