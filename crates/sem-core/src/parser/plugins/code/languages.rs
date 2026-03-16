@@ -13,6 +13,10 @@ pub struct LanguageConfig {
     pub container_node_types: &'static [&'static str],
     pub call_entity_identifiers: &'static [&'static str],
     pub suppressed_nested_entities: &'static [SuppressedNestedEntity],
+    /// Node types that introduce a new scope. The general (non-container) recursion
+    /// in visit_node will not descend into these nodes, preventing local variables
+    /// inside function bodies from being extracted as top-level entities.
+    pub scope_boundary_types: &'static [&'static str],
     pub get_language: fn() -> Option<Language>,
 }
 
@@ -92,6 +96,69 @@ fn get_xml() -> Option<Language> {
     Some(tree_sitter_xml::LANGUAGE_XML.into())
 }
 
+/// Inside JS/TS function bodies, suppress variable declarations so that local
+/// variables are not extracted as nested entities. Inner function/class
+/// declarations are still extracted for diff granularity.
+const JS_TS_SUPPRESSED_NESTED: &[SuppressedNestedEntity] = &[
+    SuppressedNestedEntity {
+        parent_entity_node_type: "function_declaration",
+        child_entity_node_type: "lexical_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "function_declaration",
+        child_entity_node_type: "variable_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "generator_function_declaration",
+        child_entity_node_type: "lexical_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "generator_function_declaration",
+        child_entity_node_type: "variable_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "method_definition",
+        child_entity_node_type: "lexical_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "method_definition",
+        child_entity_node_type: "variable_declaration",
+    },
+    // Scope boundaries: suppress local variables inside arrow functions,
+    // function expressions, and generator functions, while still allowing
+    // inner class/function declarations to be extracted.
+    SuppressedNestedEntity {
+        parent_entity_node_type: "arrow_function",
+        child_entity_node_type: "lexical_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "arrow_function",
+        child_entity_node_type: "variable_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "function_expression",
+        child_entity_node_type: "lexical_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "function_expression",
+        child_entity_node_type: "variable_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "generator_function",
+        child_entity_node_type: "lexical_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "generator_function",
+        child_entity_node_type: "variable_declaration",
+    },
+];
+
+const JS_TS_SCOPE_BOUNDARIES: &[&str] = &[
+    "arrow_function",
+    "function_expression",
+    "generator_function",
+];
+
 static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "typescript",
     extensions: &[".ts"],
@@ -109,7 +176,8 @@ static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["class_body", "interface_body", "enum_body", "statement_block"],
     call_entity_identifiers: &[],
-    suppressed_nested_entities: &[],
+    suppressed_nested_entities: JS_TS_SUPPRESSED_NESTED,
+    scope_boundary_types: JS_TS_SCOPE_BOUNDARIES,
     get_language: get_typescript,
 };
 
@@ -130,7 +198,8 @@ static TSX_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["class_body", "interface_body", "enum_body", "statement_block"],
     call_entity_identifiers: &[],
-    suppressed_nested_entities: &[],
+    suppressed_nested_entities: JS_TS_SUPPRESSED_NESTED,
+    scope_boundary_types: JS_TS_SCOPE_BOUNDARIES,
     get_language: get_tsx,
 };
 
@@ -148,7 +217,8 @@ static JAVASCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["class_body", "statement_block"],
     call_entity_identifiers: &[],
-    suppressed_nested_entities: &[],
+    suppressed_nested_entities: JS_TS_SUPPRESSED_NESTED,
+    scope_boundary_types: JS_TS_SCOPE_BOUNDARIES,
     get_language: get_javascript,
 };
 
@@ -163,6 +233,7 @@ static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["block"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_python,
 };
 
@@ -179,6 +250,7 @@ static GO_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["block"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_go,
 };
 
@@ -199,6 +271,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["declaration_list", "block"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_rust,
 };
 
@@ -217,6 +290,7 @@ static JAVA_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["class_body", "interface_body", "enum_body", "block"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_java,
 };
 
@@ -234,6 +308,7 @@ static C_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["compound_statement"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_c,
 };
 
@@ -253,6 +328,7 @@ static CPP_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["field_declaration_list", "declaration_list", "compound_statement"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_cpp,
 };
 
@@ -268,6 +344,7 @@ static RUBY_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["body_statement"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_ruby,
 };
 
@@ -288,6 +365,7 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["declaration_list", "block"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_csharp,
 };
 
@@ -306,6 +384,7 @@ static PHP_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["declaration_list", "enum_declaration_list", "compound_statement"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_php,
 };
 
@@ -323,6 +402,7 @@ static FORTRAN_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &[],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_fortran,
 };
 
@@ -344,6 +424,7 @@ static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["class_body", "protocol_body", "enum_class_body", "function_body"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_swift,
 };
 
@@ -358,6 +439,7 @@ static ELIXIR_CONFIG: LanguageConfig = LanguageConfig {
         "defstruct", "defexception", "defdelegate",
     ],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_elixir,
 };
 
@@ -368,6 +450,7 @@ static BASH_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["compound_statement"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_bash,
 };
 
@@ -381,6 +464,7 @@ static HCL_CONFIG: LanguageConfig = LanguageConfig {
         parent_entity_node_type: "block",
         child_entity_node_type: "attribute",
     }],
+    scope_boundary_types: &[],
     get_language: get_hcl,
 };
 
@@ -399,6 +483,7 @@ static KOTLIN_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["class_body", "enum_class_body"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_kotlin,
 };
 
@@ -409,6 +494,7 @@ static XML_CONFIG: LanguageConfig = LanguageConfig {
     container_node_types: &["content"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
     get_language: get_xml,
 };
 

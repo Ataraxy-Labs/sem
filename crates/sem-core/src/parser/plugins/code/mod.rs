@@ -599,4 +599,243 @@ fun topLevel(x: Int): Int = x * 2
         assert!(names.contains(&"dependencies"), "got: {:?}", names);
         assert!(names.contains(&"build"), "got: {:?}", names);
     }
+
+    #[test]
+    fn test_arrow_callback_scope_boundary_typescript() {
+        // Arrow function callbacks: locals are suppressed, but inner
+        // class/function declarations are still extracted. Nested callbacks
+        // also suppress their locals.
+        let code = r#"
+const activeQueues = [
+  { queue: queues.fooQueue, processor: foo.process },
+];
+
+activeQueues.forEach((handler: any) => {
+  const queue = handler.queue;
+  let retries = 0;
+
+  class QueueHandler {
+    handle() { return queue; }
+  }
+
+  function createHandler() {
+    return new QueueHandler();
+  }
+
+  queue.process((job) => {
+    const orderId = job.data.orderId;
+    return orderId;
+  });
+});
+
+function handleFailure(job: any, err: any) {
+  console.error('failed', err);
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "process.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let top_level: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.parent_id.is_none())
+            .map(|e| e.name.as_str())
+            .collect();
+
+        // Top-level entities preserved
+        assert!(top_level.contains(&"activeQueues"), "got: {:?}", top_level);
+        assert!(top_level.contains(&"handleFailure"), "got: {:?}", top_level);
+
+        // Declarations inside callback extracted
+        assert!(names.contains(&"QueueHandler"), "got: {:?}", names);
+        assert!(names.contains(&"handle"), "got: {:?}", names);
+        assert!(names.contains(&"createHandler"), "got: {:?}", names);
+
+        // Locals inside callbacks suppressed
+        assert!(!names.contains(&"queue"), "got: {:?}", names);
+        assert!(!names.contains(&"retries"), "got: {:?}", names);
+        assert!(!names.contains(&"orderId"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_top_level_iife_wrapper_still_extracts_typescript_entities() {
+        let code = r#"
+function factory() {
+  class Foo {
+    method(): number {
+      return 1;
+    }
+  }
+
+  function bar(): Foo {
+    return new Foo();
+  }
+}
+
+factory();
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "wrapped.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"factory"),
+            "Should find top-level wrapper function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Foo"),
+            "Should find class inside top-level wrapper, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"bar"),
+            "Should find function inside top-level wrapper, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_top_level_iife_still_extracts_typescript_entities() {
+        let code = r#"
+(() => {
+  class Foo {
+    method(): number {
+      return 1;
+    }
+  }
+
+  function bar(): Foo {
+    return new Foo();
+  }
+})();
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "iife.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"Foo"),
+            "Should find class inside top-level IIFE, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"bar"),
+            "Should find function inside top-level IIFE, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_function_locals_not_extracted_as_nested_entities_typescript() {
+        let code = r#"
+export default function foo() {
+  const x = 1;
+  return x;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "default-export.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"foo"),
+            "Should find exported function, got: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"x"),
+            "Local inside function should not be extracted as an entity, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_function_expression_scope_boundary_typescript() {
+        // Function expressions: assigned to variables, or used as callback
+        // arguments. Locals are suppressed in all cases.
+        let code = r#"
+const foo = function namedExpr(x: number) {
+  const inner = x + 1;
+  return inner;
+};
+
+const bar = function(y: number) {
+  const local = y * 2;
+  return local;
+};
+
+const items = [1, 2, 3];
+
+items.forEach(function process(item) {
+  const doubled = item * 2;
+  console.log(doubled);
+});
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "funexpr.ts");
+        let top_level: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.parent_id.is_none())
+            .map(|e| e.name.as_str())
+            .collect();
+        let all_names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        // Top-level variable declarations preserved
+        assert!(top_level.contains(&"foo"), "got: {:?}", top_level);
+        assert!(top_level.contains(&"bar"), "got: {:?}", top_level);
+        assert!(top_level.contains(&"items"), "got: {:?}", top_level);
+
+        // Locals inside function expressions suppressed
+        assert!(!all_names.contains(&"inner"), "got: {:?}", all_names);
+        assert!(!all_names.contains(&"local"), "got: {:?}", all_names);
+        assert!(!all_names.contains(&"doubled"), "got: {:?}", all_names);
+
+        // Named function expression used as callback argument not extracted
+        assert!(!top_level.contains(&"process"), "got: {:?}", top_level);
+    }
+
+    #[test]
+    fn test_variable_assigned_arrow_extracts_inner_entities() {
+        // Arrow function assigned to a variable: inner class/function
+        // declarations should be extracted, locals should be suppressed.
+        let code = r#"
+const handler = () => {
+  class Inner {
+    run() { return 1; }
+  }
+
+  function make() {
+    return new Inner();
+  }
+
+  const local = 42;
+};
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "assigned.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"handler"), "got: {:?}", names);
+        assert!(names.contains(&"Inner"), "got: {:?}", names);
+        assert!(names.contains(&"run"), "got: {:?}", names);
+        assert!(names.contains(&"make"), "got: {:?}", names);
+        assert!(!names.contains(&"local"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_variable_assigned_function_expression_extracts_inner_entities() {
+        // Function expression assigned to a variable: same behavior.
+        let code = r#"
+const handler = function() {
+  class Inner {}
+  function make() { return new Inner(); }
+  const local = 42;
+};
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "funexpr-inner.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"handler"), "got: {:?}", names);
+        assert!(names.contains(&"Inner"), "got: {:?}", names);
+        assert!(names.contains(&"make"), "got: {:?}", names);
+        assert!(!names.contains(&"local"), "got: {:?}", names);
+    }
 }

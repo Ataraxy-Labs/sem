@@ -30,7 +30,7 @@ fn visit_node(
     entities: &mut Vec<SemanticEntity>,
     parent_id: Option<&str>,
     source: &[u8],
-    enclosing_entity_node_type: Option<&'static str>,
+    suppression_context: Option<&str>,
 ) {
     let node_type = node.kind();
 
@@ -70,7 +70,7 @@ fn visit_node(
                             entities,
                             Some(&entity_id),
                             source,
-                            enclosing_entity_node_type,
+                            suppression_context,
                         );
                     }
                 }
@@ -81,13 +81,13 @@ fn visit_node(
 
     if config.entity_node_types.contains(&node_type) {
         if let Some(name) = extract_name(node, source) {
-            let name = qualify_hcl_name(&name, node_type, parent_id, enclosing_entity_node_type);
+            let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
             let entity_type = if node_type == "decorated_definition" {
                 map_decorated_type(node)
             } else {
                 map_node_type(node_type)
             };
-            let should_skip = should_skip_entity(config, enclosing_entity_node_type, node_type);
+            let should_skip = should_skip_entity(config, suppression_context, node_type);
             if !should_skip {
                 let content_str = node_text(node, source);
                 let content = content_str.to_string();
@@ -111,7 +111,7 @@ fn visit_node(
                 entities.push(entity);
 
                 // Visit children for nested entities (methods inside classes, etc.)
-                let next_enclosing_entity_node_type = Some(node_type);
+                let next_suppression_context = Some(node_type);
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     if config.container_node_types.contains(&child.kind()) {
@@ -124,11 +124,36 @@ fn visit_node(
                                 entities,
                                 Some(&entity_id),
                                 source,
-                                next_enclosing_entity_node_type,
+                                next_suppression_context,
                             );
                         }
                     }
                 }
+
+                // For variable declarations, also traverse into initializers
+                // that are scope boundaries (arrow functions, function expressions)
+                // so that inner class/function declarations are extracted.
+                if node_type == "lexical_declaration" || node_type == "variable_declaration" {
+                    let mut vd_cursor = node.walk();
+                    for child in node.named_children(&mut vd_cursor) {
+                        if child.kind() == "variable_declarator" {
+                            if let Some(value) = child.child_by_field_name("value") {
+                                if config.scope_boundary_types.contains(&value.kind()) {
+                                    visit_node(
+                                        value,
+                                        file_path,
+                                        config,
+                                        entities,
+                                        Some(&entity_id),
+                                        source,
+                                        Some(value.kind()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 return;
             }
         }
@@ -137,14 +162,23 @@ fn visit_node(
     // For export statements, look inside for the actual declaration
     if node_type == "export_statement" {
         if let Some(declaration) = node.child_by_field_name("declaration") {
-            visit_node(declaration, file_path, config, entities, parent_id, source, enclosing_entity_node_type);
+            visit_node(declaration, file_path, config, entities, parent_id, source, suppression_context);
             return;
         }
     }
 
-    // Recurse into top-level children
+    // Recurse into children. When we enter a scope boundary (e.g. arrow
+    // functions, function expressions) we propagate the boundary's node type
+    // as the suppression context so that suppressed_nested_entities rules
+    // filter out local variable declarations while still allowing inner
+    // class/function declarations to be extracted.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        let child_enclosing = if config.scope_boundary_types.contains(&child.kind()) {
+            Some(child.kind())
+        } else {
+            suppression_context
+        };
         visit_node(
             child,
             file_path,
@@ -152,7 +186,7 @@ fn visit_node(
             entities,
             parent_id,
             source,
-            enclosing_entity_node_type,
+            child_enclosing,
         );
     }
 }
@@ -452,9 +486,9 @@ fn qualify_hcl_name(
     name: &str,
     node_type: &str,
     parent_id: Option<&str>,
-    enclosing_entity_node_type: Option<&'static str>,
+    suppression_context: Option<&str>,
 ) -> String {
-    if node_type != "block" || enclosing_entity_node_type != Some("block") {
+    if node_type != "block" || suppression_context != Some("block") {
         return name.to_string();
     }
 
@@ -472,11 +506,11 @@ fn parent_entity_name_from_id(parent_id: &str) -> Option<&str> {
 // Apply language-specific nested entity suppression rules from config.
 fn should_skip_entity(
     config: &LanguageConfig,
-    enclosing_entity_node_type: Option<&'static str>,
+    suppression_context: Option<&str>,
     node_type: &str,
 ) -> bool {
     config.suppressed_nested_entities.iter().any(|rule| {
-        enclosing_entity_node_type == Some(rule.parent_entity_node_type)
+        suppression_context == Some(rule.parent_entity_node_type)
             && node_type == rule.child_entity_node_type
     })
 }
@@ -522,7 +556,7 @@ fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-fn map_node_type<'a>(tree_sitter_type: &'a str) -> &'a str {
+fn map_node_type(tree_sitter_type: &str) -> &str {
     match tree_sitter_type {
         "function_declaration" | "function_definition" | "function_item" => "function",
         "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
