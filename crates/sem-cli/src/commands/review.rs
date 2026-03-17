@@ -17,6 +17,7 @@ pub struct ReviewOptions {
     pub commit: Option<String>,
     pub staged: bool,
     pub format: ReviewFormat,
+    pub full: bool,
     pub file_exts: Vec<String>,
 }
 
@@ -115,7 +116,7 @@ pub fn review_command(opts: ReviewOptions) {
 
     match opts.format {
         ReviewFormat::Json => print_json(&review),
-        ReviewFormat::Terminal => print_terminal(&review),
+        ReviewFormat::Terminal => print_terminal(&review, opts.full),
     }
 }
 
@@ -124,7 +125,7 @@ fn print_json(review: &ReviewResult) {
     println!("{output}");
 }
 
-fn print_terminal(review: &ReviewResult) {
+fn print_terminal(review: &ReviewResult, full: bool) {
     let mut lines: Vec<String> = Vec::new();
 
     // API Surface Changes
@@ -134,7 +135,7 @@ fn print_terminal(review: &ReviewResult) {
         let pad = 55usize.saturating_sub(header.len());
         lines.push(format!("┌{header}{}", "─".repeat(pad)).dimmed().to_string());
         for rc in &review.api_surface_changes {
-            lines.push(format_review_change(rc, true));
+            lines.push(format_review_change(rc, true, full));
         }
         lines.push(format!("└{}", "─".repeat(55)).dimmed().to_string());
     }
@@ -146,7 +147,7 @@ fn print_terminal(review: &ReviewResult) {
         let pad = 55usize.saturating_sub(header.len());
         lines.push(format!("┌{header}{}", "─".repeat(pad)).dimmed().to_string());
         for rc in &review.internal_changes {
-            lines.push(format_review_change(rc, false));
+            lines.push(format_review_change(rc, false, full));
         }
         lines.push(format!("└{}", "─".repeat(55)).dimmed().to_string());
     }
@@ -207,7 +208,7 @@ fn change_symbol(ct: ChangeType) -> String {
     }
 }
 
-fn format_review_change(rc: &ReviewChange, show_dependents: bool) -> String {
+fn format_review_change(rc: &ReviewChange, show_dependents: bool, full: bool) -> String {
     let mut lines = Vec::new();
     let sym = change_symbol(rc.change_type);
     let tag = format!("[{}]", rc.change_label);
@@ -246,17 +247,26 @@ fn format_review_change(rc: &ReviewChange, show_dependents: bool) -> String {
     }
 
     if rc.change_type == ChangeType::Deleted && !rc.was_referenced_by.is_empty() {
-        let refs: Vec<&str> = rc.was_referenced_by.iter().take(3).map(|s| s.as_str()).collect();
-        let suffix = if rc.was_referenced_by.len() > 3 {
-            format!(" (+{} more)", rc.was_referenced_by.len() - 3)
+        if full {
+            let refs: Vec<&str> = rc.was_referenced_by.iter().map(|s| s.as_str()).collect();
+            lines.push(format!(
+                "{}    {}",
+                "│".dimmed(),
+                format!("↳ was called by: {}", refs.join(", ")).dimmed(),
+            ));
         } else {
-            String::new()
-        };
-        lines.push(format!(
-            "{}    {}",
-            "│".dimmed(),
-            format!("↳ was called by: {}{}", refs.join(", "), suffix).dimmed(),
-        ));
+            let refs: Vec<&str> = rc.was_referenced_by.iter().take(3).map(|s| s.as_str()).collect();
+            let suffix = if rc.was_referenced_by.len() > 3 {
+                format!(" (+{} more, use --full to show all)", rc.was_referenced_by.len() - 3)
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "{}    {}",
+                "│".dimmed(),
+                format!("↳ was called by: {}{}", refs.join(", "), suffix).dimmed(),
+            ));
+        }
     }
 
     if let Some(ref old_path) = rc.old_file_path {

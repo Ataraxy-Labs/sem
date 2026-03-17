@@ -20,6 +20,7 @@ pub struct ChangelogOptions {
     pub format: ChangelogFormat,
     pub heading: String,
     pub date: String,
+    pub full: bool,
     pub file_exts: Vec<String>,
 }
 
@@ -124,8 +125,8 @@ pub fn changelog_command(opts: ChangelogOptions) {
 
     match opts.format {
         ChangelogFormat::Json => print_json(&result),
-        ChangelogFormat::Markdown => print_markdown(&result, &opts.heading),
-        ChangelogFormat::Terminal => print_terminal(&result, &opts.heading),
+        ChangelogFormat::Markdown => print_markdown(&result, &opts.heading, opts.full),
+        ChangelogFormat::Terminal => print_terminal(&result, &opts.heading, opts.full),
     }
 }
 
@@ -133,11 +134,11 @@ fn print_json(result: &ChangelogResult) {
     println!("{}", serde_json::to_string_pretty(result).unwrap_or_default());
 }
 
-fn print_markdown(result: &ChangelogResult, heading: &str) {
-    println!("{}", render_markdown(result, heading));
+fn print_markdown(result: &ChangelogResult, heading: &str, full: bool) {
+    println!("{}", render_markdown(result, heading, full));
 }
 
-fn print_terminal(result: &ChangelogResult, heading: &str) {
+fn print_terminal(result: &ChangelogResult, heading: &str, full: bool) {
     let mut lines = Vec::new();
 
     lines.push(String::new());
@@ -184,7 +185,7 @@ fn print_terminal(result: &ChangelogResult, heading: &str) {
         lines.push(String::new());
         let total = result.internal.len();
         lines.push(format!("{}", "### Internal".dimmed().bold()));
-        if total <= 5 {
+        if full || total <= 5 {
             for entry in &result.internal {
                 lines.push(format!("  {} {}", "·".dimmed(), entry.description.dimmed()));
             }
@@ -195,7 +196,7 @@ fn print_terminal(result: &ChangelogResult, heading: &str) {
             lines.push(format!(
                 "  {} {}",
                 "·".dimmed(),
-                format!("... and {} more internal changes", total - 5).dimmed()
+                format!("... and {} more internal changes (use --full to show all)", total - 5).dimmed()
             ));
         }
     }

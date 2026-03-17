@@ -116,6 +116,10 @@ enum Commands {
         #[arg(long)]
         date: Option<String>,
 
+        /// Show all changes without truncation
+        #[arg(long)]
+        full: bool,
+
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long)]
         file_exts: Vec<String>,
@@ -141,6 +145,10 @@ enum Commands {
         /// Output format: terminal or json
         #[arg(long, default_value = "terminal")]
         format: String,
+
+        /// Show all changes without truncation
+        #[arg(long)]
+        full: bool,
 
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long)]
@@ -168,9 +176,9 @@ enum Commands {
         #[arg(long, default_value = "terminal")]
         format: String,
 
-        /// Follow renames (default: true)
-        #[arg(long, default_value_t = true)]
-        follow: bool,
+        /// Disable rename following
+        #[arg(long)]
+        no_follow: bool,
 
         /// Only include files with these extensions
         #[arg(long)]
@@ -262,6 +270,7 @@ fn main() {
             format,
             heading,
             date,
+            full,
             file_exts,
         }) => {
             let changelog_format = match format.as_str() {
@@ -281,6 +290,7 @@ fn main() {
                 format: changelog_format,
                 heading,
                 date: date_str,
+                full,
                 file_exts,
             });
         }
@@ -290,6 +300,7 @@ fn main() {
             from,
             to,
             format,
+            full,
             file_exts,
         }) => {
             let review_format = match format.as_str() {
@@ -304,6 +315,7 @@ fn main() {
                 commit,
                 staged,
                 format: review_format,
+                full,
                 file_exts,
             });
         }
@@ -313,7 +325,7 @@ fn main() {
             from,
             to,
             format,
-            follow,
+            no_follow,
             file_exts,
         }) => {
             let log_format = match format.as_str() {
@@ -328,7 +340,7 @@ fn main() {
                 from,
                 to,
                 format: log_format,
-                follow,
+                follow: !no_follow,
                 file_exts,
             });
         }

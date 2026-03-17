@@ -123,7 +123,6 @@ pub fn build_changelog(
         .filter(|c| c.is_breaking)
         .filter_map(|c| c.scope.clone())
         .collect();
-    let has_breaking_commits = conventional.iter().any(|c| c.is_breaking);
 
     let mut breaking = Vec::new();
     let mut added = Vec::new();
@@ -134,8 +133,7 @@ pub fn build_changelog(
     // Classify API surface changes
     for rc in &review.api_surface_changes {
         let conv_type = find_conventional_type(&conventional, &rc.entity_name);
-        let is_conventional_breaking = is_entity_breaking(&breaking_scopes, &rc.entity_name)
-            || has_breaking_commits && rc.dependent_count >= 5;
+        let is_conventional_breaking = is_entity_breaking(&breaking_scopes, &rc.entity_name);
 
         match rc.change_type {
             ChangeType::Added => {
@@ -521,24 +519,29 @@ fn compute_semver(
     breaking: &[ChangelogEntry],
     added: &[ChangelogEntry],
     _changed: &[ChangelogEntry],
-    _removed: &[ChangelogEntry],
+    removed: &[ChangelogEntry],
     _internal: &[ChangelogEntry],
 ) -> (SemverBump, String) {
-    if !breaking.is_empty() {
+    // Removals of public entities with dependents are breaking even if
+    // not already in the breaking bucket (e.g. deleted without conventional commit).
+    let removed_with_deps = removed
+        .iter()
+        .any(|e| e.dependent_count.unwrap_or(0) > 0);
+
+    if !breaking.is_empty() || removed_with_deps {
+        let count = breaking.len() + if removed_with_deps { 1 } else { 0 };
         (
             SemverBump::Major,
             format!(
                 "{} breaking change{} detected",
-                breaking.len(),
-                if breaking.len() == 1 { "" } else { "s" }
+                count,
+                if count == 1 { "" } else { "s" }
             ),
         )
     } else if !added.is_empty() {
         (
             SemverBump::Minor,
-            format!(
-                "new public API added, no breaking changes",
-            ),
+            "new public API added, no breaking changes".to_string(),
         )
     } else {
         (
@@ -549,7 +552,7 @@ fn compute_semver(
 }
 
 /// Render changelog as Keep-a-Changelog markdown (no LLM).
-pub fn render_markdown(result: &ChangelogResult, heading: &str) -> String {
+pub fn render_markdown(result: &ChangelogResult, heading: &str, full: bool) -> String {
     let mut lines = Vec::new();
 
     lines.push(format!("## {} — {}", heading, result.date));
@@ -588,10 +591,9 @@ pub fn render_markdown(result: &ChangelogResult, heading: &str) -> String {
     }
 
     if !result.internal.is_empty() {
-        // Collapse internal: show count + up to 5 items
         let total = result.internal.len();
         lines.push("### Internal".to_string());
-        if total <= 5 {
+        if full || total <= 5 {
             for entry in &result.internal {
                 lines.push(format!("- {}", entry.description));
             }
@@ -796,7 +798,7 @@ mod tests {
             conventional_commits: vec![],
         };
 
-        let md = render_markdown(&result, "v2.0.0");
+        let md = render_markdown(&result, "v2.0.0", false);
         assert!(md.contains("## v2.0.0 — 2024-06-15"));
         assert!(md.contains("### Breaking Changes"));
         assert!(md.contains("### Added"));

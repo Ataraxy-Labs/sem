@@ -162,6 +162,8 @@ pub fn build_entity_log(
         }
 
         // 3. Resolve both trees once per commit, then read blobs.
+        //    For the root commit, sha~1 won't resolve — before_tree will be None,
+        //    so before_content will be None and the diff detects entity as Added.
         let after_tree = git.resolve_tree(&commit.sha).ok();
         let before_tree = git.resolve_tree(&format!("{}~1", commit.sha)).ok();
 
@@ -201,7 +203,7 @@ pub fn build_entity_log(
 
         // 5. Find the change that matches our tracked entity.
         for change in &diff.changes {
-            if change.entity_name != tracked_name {
+            if change.entity_name != tracked_name || change.file_path != tracked_file {
                 continue;
             }
 

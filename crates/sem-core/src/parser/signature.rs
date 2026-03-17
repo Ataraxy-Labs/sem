@@ -36,13 +36,17 @@ impl SignatureChangeKind {
             self,
             SignatureChangeKind::ParamsRemoved { .. }
                 | SignatureChangeKind::ParamsReordered
+                | SignatureChangeKind::ReturnTypeChanged { .. }
         )
     }
 
     pub fn label(&self) -> &str {
         match self {
             SignatureChangeKind::BodyOnly => "body only",
-            SignatureChangeKind::ParamsAdded { .. } => "parameter added",
+            // We don't check for default values, so we can't distinguish
+            // safe additions (JS/TS/Python defaults) from breaking ones
+            // (Rust/Go/Java required params). Label conservatively.
+            SignatureChangeKind::ParamsAdded { .. } => "signature changed",
             SignatureChangeKind::ParamsRemoved { .. } => "parameter removed",
             SignatureChangeKind::ParamsReordered => "parameters reordered",
             SignatureChangeKind::ReturnTypeChanged { .. } => "return type changed",
