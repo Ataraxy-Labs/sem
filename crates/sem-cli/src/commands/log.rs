@@ -3,7 +3,6 @@ use std::path::Path;
 use std::process;
 
 use colored::Colorize;
-use sem_core::git::bridge::GitBridge;
 use sem_core::parser::log::{
     build_entity_log, resolve_entity, EntityEventType, EntityLogResult, EntityResolutionError,
 };
@@ -30,13 +29,7 @@ pub fn log_command(opts: LogOptions) {
     let root = Path::new(&opts.cwd);
     let registry = create_default_registry();
 
-    let git = match GitBridge::open(root) {
-        Ok(g) => g,
-        Err(_) => {
-            eprintln!("{}", "Error: Not inside a Git repository.".red());
-            process::exit(1);
-        }
-    };
+    let git = super::common::open_git_or_exit(root);
 
     // Use git repo root for file scanning so entity paths match git paths.
     let repo_root = git.repo_root();

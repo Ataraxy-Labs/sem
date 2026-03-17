@@ -38,7 +38,8 @@ pub fn review_command(opts: ReviewOptions) {
         opts.to.as_deref(),
         opts.staged,
     );
-    let file_changes = common::filter_by_exts(file_changes, &opts.file_exts);
+    let ext_filter = common::normalize_exts(&opts.file_exts);
+    let file_changes = common::filter_by_exts(file_changes, &ext_filter);
 
     if file_changes.is_empty() {
         println!("{}", "No changes detected.".dimmed());
@@ -54,8 +55,6 @@ pub fn review_command(opts: ReviewOptions) {
     }
 
     // Build entity graph for dependent analysis.
-    // Collect all files referenced in changes + discover supported files.
-    let ext_filter = common::normalize_exts(&opts.file_exts);
     let all_files = sem_core::utils::files::find_supported_files(root, &registry, &ext_filter);
     let graph = EntityGraph::build(root, &all_files, &registry);
 

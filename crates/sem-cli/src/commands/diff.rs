@@ -83,7 +83,8 @@ pub fn diff_command(opts: DiffOptions) {
     };
     let git_diff_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let file_changes = common::filter_by_exts(file_changes, &opts.file_exts);
+    let ext_filter = common::normalize_exts(&opts.file_exts);
+    let file_changes = common::filter_by_exts(file_changes, &ext_filter);
 
     if file_changes.is_empty() {
         println!("\x1b[2mNo changes detected.\x1b[0m");

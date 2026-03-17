@@ -1,7 +1,7 @@
 //! Changelog generation: classifies entity-level changes into Keep-a-Changelog
 //! categories (Breaking, Added, Changed, Removed, Internal) with semver suggestion.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -117,11 +117,21 @@ pub fn build_changelog(
     let change_lookup: std::collections::HashMap<&str, &crate::model::change::SemanticChange> =
         diff.changes.iter().map(|c| (c.entity_id.as_str(), c)).collect();
 
-    // Collect breaking commit scopes for cross-referencing
-    let breaking_scopes: HashSet<String> = conventional
+    // Collect breaking commit scopes for cross-referencing (borrow to avoid cloning)
+    let breaking_scopes: HashSet<&str> = conventional
         .iter()
         .filter(|c| c.is_breaking)
-        .filter_map(|c| c.scope.clone())
+        .filter_map(|c| c.scope.as_deref())
+        .collect();
+
+    // Pre-build lookup: scope/description → commit_type for O(1) per entity
+    let conv_type_by_scope: HashMap<&str, &str> = conventional
+        .iter()
+        .filter_map(|c| Some((c.scope.as_deref()?, c.commit_type.as_str())))
+        .collect();
+    let conv_type_by_desc: Vec<(&str, &str)> = conventional
+        .iter()
+        .map(|c| (c.description.as_str(), c.commit_type.as_str()))
         .collect();
 
     let mut breaking = Vec::new();
@@ -132,7 +142,7 @@ pub fn build_changelog(
 
     // Classify API surface changes
     for rc in &review.api_surface_changes {
-        let conv_type = find_conventional_type(&conventional, &rc.entity_name);
+        let conv_type = find_conventional_type(&conv_type_by_scope, &conv_type_by_desc, &rc.entity_name);
         let is_conventional_breaking = is_entity_breaking(&breaking_scopes, &rc.entity_name);
 
         match rc.change_type {
@@ -195,7 +205,7 @@ pub fn build_changelog(
 
     // Classify internal changes
     for rc in &review.internal_changes {
-        let conv_type = find_conventional_type(&conventional, &rc.entity_name);
+        let conv_type = find_conventional_type(&conv_type_by_scope, &conv_type_by_desc, &rc.entity_name);
         match rc.change_type {
             ChangeType::Deleted if !rc.was_referenced_by.is_empty() => {
                 // Deleted with references — potential breakage, but internal
@@ -209,7 +219,7 @@ pub fn build_changelog(
 
     // Config changes go to Changed or Internal
     for rc in &review.config_changes {
-        let conv_type = find_conventional_type(&conventional, &rc.entity_name);
+        let conv_type = find_conventional_type(&conv_type_by_scope, &conv_type_by_desc, &rc.entity_name);
         let entry = if let Some(ref vd) = rc.value_diff {
             ChangelogEntry {
                 category: ChangelogCategory::Changed,
@@ -491,28 +501,25 @@ fn parse_single_conventional(sha: &str, message: &str) -> Option<ConventionalCom
 }
 
 fn find_conventional_type(
-    conventional: &[ConventionalCommit],
+    by_scope: &HashMap<&str, &str>,
+    by_desc: &[(&str, &str)],
     entity_name: &str,
 ) -> Option<String> {
-    // Try to match by scope first, then by description mention
-    for cc in conventional {
-        if let Some(ref scope) = cc.scope {
-            if scope == entity_name || scope.contains(entity_name) {
-                return Some(cc.commit_type.clone());
-            }
-        }
+    // O(1) exact scope match first
+    if let Some(&ct) = by_scope.get(entity_name) {
+        return Some(ct.to_string());
     }
-    for cc in conventional {
-        if cc.description.contains(entity_name) {
-            return Some(cc.commit_type.clone());
+    // Fallback: description mention
+    for &(desc, ct) in by_desc {
+        if desc.contains(entity_name) {
+            return Some(ct.to_string());
         }
     }
     None
 }
 
-fn is_entity_breaking(breaking_scopes: &HashSet<String>, entity_name: &str) -> bool {
+fn is_entity_breaking(breaking_scopes: &HashSet<&str>, entity_name: &str) -> bool {
     breaking_scopes.contains(entity_name)
-        || breaking_scopes.iter().any(|s| s.contains(entity_name))
 }
 
 fn compute_semver(
