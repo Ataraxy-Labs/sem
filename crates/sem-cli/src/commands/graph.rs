@@ -21,7 +21,7 @@ pub fn graph_command(opts: GraphOptions) {
     let root = Path::new(&opts.cwd);
     let registry = create_default_registry();
 
-    let ext_filter = normalize_exts(&opts.file_exts);
+    let ext_filter = super::common::normalize_exts(&opts.file_exts);
 
     // If no files specified, find all supported files in the repo
     let file_paths = if opts.file_paths.is_empty() {
@@ -230,11 +230,4 @@ fn ref_symbol(ref_type: &RefType) -> colored::ColoredString {
         RefType::TypeRef => "⊳".cyan(),
         RefType::Imports => "↓".green(),
     }
-}
-
-/// Normalize extension strings: ensure each starts with '.'
-pub fn normalize_exts(exts: &[String]) -> Vec<String> {
-    exts.iter().map(|e| {
-        if e.starts_with('.') { e.clone() } else { format!(".{}", e) }
-    }).collect()
 }

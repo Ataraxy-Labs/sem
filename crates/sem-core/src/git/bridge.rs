@@ -395,12 +395,14 @@ impl GitBridge {
             let oid = oid_result?;
             let commit = self.repo.find_commit(oid)?;
             let sha = oid.to_string();
+            let parent_sha = commit.parent(0).ok().map(|p| p.id().to_string());
             let info = CommitInfo {
                 short_sha: sha[..7.min(sha.len())].to_string(),
                 sha,
                 author: commit.author().name().unwrap_or("unknown").to_string(),
                 date: commit.time().seconds(),
                 message: commit.message().unwrap_or("").to_string(),
+                parent_sha,
             };
             if !f(info) {
                 break;

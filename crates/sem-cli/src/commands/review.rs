@@ -1,14 +1,13 @@
 use std::path::Path;
-use std::process;
 
 use colored::Colorize;
-use sem_core::git::bridge::GitBridge;
-use sem_core::git::types::DiffScope;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::review::{build_review, ReviewChange, ReviewResult, RiskLevel};
+
+use super::common::{self, open_git_or_exit};
 
 pub struct ReviewOptions {
     pub cwd: String,
@@ -30,67 +29,16 @@ pub enum ReviewFormat {
 pub fn review_command(opts: ReviewOptions) {
     let root = Path::new(&opts.cwd);
     let registry = create_default_registry();
+    let git = open_git_or_exit(root);
 
-    // Get file changes from git
-    let git = match GitBridge::open(root) {
-        Ok(g) => g,
-        Err(_) => {
-            eprintln!("\x1b[31mError: Not inside a Git repository.\x1b[0m");
-            process::exit(1);
-        }
-    };
-
-    let file_changes = if let Some(ref sha) = opts.commit {
-        let scope = DiffScope::Commit { sha: sha.clone() };
-        match git.get_changed_files(&scope) {
-            Ok(files) => files,
-            Err(e) => {
-                eprintln!("\x1b[31mError: {e}\x1b[0m");
-                process::exit(1);
-            }
-        }
-    } else if let (Some(ref from), Some(ref to)) = (&opts.from, &opts.to) {
-        let scope = DiffScope::Range {
-            from: from.clone(),
-            to: to.clone(),
-        };
-        match git.get_changed_files(&scope) {
-            Ok(files) => files,
-            Err(e) => {
-                eprintln!("\x1b[31mError: {e}\x1b[0m");
-                process::exit(1);
-            }
-        }
-    } else if opts.staged {
-        let scope = DiffScope::Staged;
-        match git.get_changed_files(&scope) {
-            Ok(files) => files,
-            Err(e) => {
-                eprintln!("\x1b[31mError: {e}\x1b[0m");
-                process::exit(1);
-            }
-        }
-    } else {
-        match git.detect_and_get_files() {
-            Ok((_scope, files)) => files,
-            Err(_) => {
-                eprintln!("\x1b[31mError: Not inside a Git repository.\x1b[0m");
-                process::exit(1);
-            }
-        }
-    };
-
-    // Filter by extensions
-    let file_changes = if opts.file_exts.is_empty() {
-        file_changes
-    } else {
-        let exts: Vec<String> = opts.file_exts.iter().map(|e| {
-            if e.starts_with('.') { e.clone() } else { format!(".{}", e) }
-        }).collect();
-        file_changes.into_iter().filter(|fc| {
-            exts.iter().any(|ext| fc.file_path.ends_with(ext.as_str()))
-        }).collect()
-    };
+    let file_changes = common::resolve_file_changes(
+        &git,
+        opts.commit.as_deref(),
+        opts.from.as_deref(),
+        opts.to.as_deref(),
+        opts.staged,
+    );
+    let file_changes = common::filter_by_exts(file_changes, &opts.file_exts);
 
     if file_changes.is_empty() {
         println!("{}", "No changes detected.".dimmed());
@@ -107,7 +55,7 @@ pub fn review_command(opts: ReviewOptions) {
 
     // Build entity graph for dependent analysis.
     // Collect all files referenced in changes + discover supported files.
-    let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let ext_filter = common::normalize_exts(&opts.file_exts);
     let all_files = sem_core::utils::files::find_supported_files(root, &registry, &ext_filter);
     let graph = EntityGraph::build(root, &all_files, &registry);
 

@@ -256,7 +256,7 @@ fn extract_leaf_value(content: &str) -> Option<&str> {
 fn assess_risk(
     api_surface: &[ReviewChange],
     internal: &[ReviewChange],
-    _config: &[ReviewChange],
+    config: &[ReviewChange],
 ) -> RiskAssessment {
     // High risk: any API surface change with >=10 dependents
     if let Some(highest) = api_surface.iter().max_by_key(|c| c.dependent_count) {
@@ -300,7 +300,22 @@ fn assess_risk(
         };
     }
 
-    // Low risk: internal-only or config-only
+    // Medium risk: config changes that could affect runtime behavior
+    if !config.is_empty() {
+        let modified_config = config.iter().filter(|c| c.change_type == ChangeType::Modified).count();
+        if modified_config > 0 {
+            return RiskAssessment {
+                level: RiskLevel::Medium,
+                reason: format!(
+                    "{} config/data file{} modified",
+                    modified_config,
+                    if modified_config == 1 { "" } else { "s" }
+                ),
+            };
+        }
+    }
+
+    // Low risk: internal-only or config additions
     RiskAssessment {
         level: RiskLevel::Low,
         reason: "internal/config changes only, no public API impact".to_string(),
@@ -412,7 +427,8 @@ mod tests {
         assert_eq!(review.summary.api_surface_count, 0);
         let total = review.summary.config_count + review.summary.internal_count;
         assert!(total > 0, "expected config or internal changes, got none");
-        assert_eq!(review.risk.level, RiskLevel::Low);
+        // Modified config files are medium risk (could affect runtime behavior)
+        assert_eq!(review.risk.level, RiskLevel::Medium);
     }
 
     #[test]

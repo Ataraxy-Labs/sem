@@ -162,10 +162,13 @@ pub fn build_entity_log(
         }
 
         // 3. Resolve both trees once per commit, then read blobs.
-        //    For the root commit, sha~1 won't resolve — before_tree will be None,
-        //    so before_content will be None and the diff detects entity as Added.
+        //    For root commits, parent_sha is None so before_tree is None,
+        //    and the diff correctly detects the entity as Added.
         let after_tree = git.resolve_tree(&commit.sha).ok();
-        let before_tree = git.resolve_tree(&format!("{}~1", commit.sha)).ok();
+        let before_tree = commit
+            .parent_sha
+            .as_deref()
+            .and_then(|ps| git.resolve_tree(ps).ok());
 
         let mut hydrated: Vec<FileChange> = Vec::with_capacity(relevant.len());
         for fc in &relevant {
