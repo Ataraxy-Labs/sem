@@ -188,6 +188,34 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
         }
     }
 
+    // Go var/const/type declarations: name is inside var_spec/const_spec/type_spec.
+    // Grouped forms like `var (...)` wrap specs in var_spec_list/type_spec_list.
+    if node_type == "var_declaration"
+        || node_type == "const_declaration"
+        || node_type == "type_declaration"
+    {
+        let spec_kinds = ["var_spec", "const_spec", "type_spec"];
+        let list_kinds = ["var_spec_list", "type_spec_list"];
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if spec_kinds.contains(&child.kind()) {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    return Some((name_node.start_byte(), name_node.end_byte()));
+                }
+            }
+            if list_kinds.contains(&child.kind()) {
+                let mut inner = child.walk();
+                for spec in child.named_children(&mut inner) {
+                    if spec_kinds.contains(&spec.kind()) {
+                        if let Some(name_node) = spec.child_by_field_name("name") {
+                            return Some((name_node.start_byte(), name_node.end_byte()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Decorated definitions (Python): look at the inner definition
     if node_type == "decorated_definition" {
         let mut cursor = node.walk();
@@ -311,6 +339,35 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
             if child.kind() == "variable_declarator" {
                 if let Some(decl_name) = child.child_by_field_name("name") {
                     return Some(node_text(decl_name, source).to_string());
+                }
+            }
+        }
+    }
+
+    // For Go var/const/type declarations, name is inside var_spec/const_spec/type_spec child.
+    // Grouped forms like `var (...)` wrap specs in var_spec_list/type_spec_list.
+    if node_type == "var_declaration"
+        || node_type == "const_declaration"
+        || node_type == "type_declaration"
+    {
+        let spec_kinds = ["var_spec", "const_spec", "type_spec"];
+        let list_kinds = ["var_spec_list", "type_spec_list"];
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if spec_kinds.contains(&child.kind()) {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    return Some(node_text(name_node, source).to_string());
+                }
+            }
+            // Grouped form: var (...) / type (...)
+            if list_kinds.contains(&child.kind()) {
+                let mut inner = child.walk();
+                for spec in child.named_children(&mut inner) {
+                    if spec_kinds.contains(&spec.kind()) {
+                        if let Some(name_node) = spec.child_by_field_name("name") {
+                            return Some(node_text(name_node, source).to_string());
+                        }
+                    }
                 }
             }
         }
