@@ -37,21 +37,24 @@ program
 
 program
   .command('diff')
-  .description('Show semantic diff of changes')
+  .description('Show semantic diff of changes (supports git diff syntax)')
+  .argument('[args...]', 'Git refs, files, or pathspecs (supports ref1..ref2, ref1...ref2, -- paths)')
   .option('-f, --format <format>', 'Output format: terminal, plain, or json', 'terminal')
   .option('-s, --staged', 'Show staged changes only')
+  .option('--cached', 'Show staged changes only (alias for --staged)')
   .option('-c, --commit <sha>', 'Show changes in a specific commit')
   .option('--from <ref>', 'Start of commit range')
   .option('--to <ref>', 'End of commit range')
   .option('--store', 'Store changes in the sem database')
-  .action(async (opts) => {
+  .action(async (args: string[], opts) => {
     await diffCommand({
       format: opts.format,
-      staged: opts.staged,
+      staged: opts.staged || opts.cached,
       commit: opts.commit,
       from: opts.from,
       to: opts.to,
       store: opts.store,
+      args,
     });
   });
 

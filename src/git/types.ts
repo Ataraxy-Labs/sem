@@ -2,7 +2,8 @@ export type DiffScope =
   | { type: 'working' }       // Unstaged changes
   | { type: 'staged' }        // Staged changes
   | { type: 'commit'; sha: string }  // Single commit
-  | { type: 'range'; from: string; to: string };  // Commit range
+  | { type: 'range'; from: string; to: string }  // Commit range
+  | { type: 'refToWorking'; refspec: string };  // Ref vs working tree (git diff <ref>)
 
 export interface FileChange {
   filePath: string;

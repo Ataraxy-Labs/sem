@@ -34,6 +34,11 @@ export async function readChangedFiles(git: SimpleGit, scope: DiffScope): Promis
       files.push(...parseDiffNameStatus(diff));
       break;
     }
+    case 'refToWorking': {
+      const diff = await git.diff([scope.refspec, '--name-status']);
+      files.push(...parseDiffNameStatus(diff));
+      break;
+    }
   }
 
   return files.filter(f => !shouldIgnore(f.filePath));

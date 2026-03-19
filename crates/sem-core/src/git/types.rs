@@ -6,6 +6,8 @@ pub enum DiffScope {
     Staged,
     Commit { sha: String },
     Range { from: String, to: String },
+    /// Compare a ref's tree to the working directory (like `git diff <ref>`)
+    RefToWorking { refspec: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

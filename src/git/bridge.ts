@@ -115,6 +115,15 @@ export class GitBridge {
         }
         break;
       }
+      case 'refToWorking': {
+        if (file.status !== 'deleted') {
+          fetches.push(getFileContent(this.git, file.filePath, undefined, this.repoRoot).then(c => { file.afterContent = c; }));
+        }
+        if (file.status !== 'added') {
+          fetches.push(getFileContent(this.git, file.filePath, scope.refspec).then(c => { file.beforeContent = c; }));
+        }
+        break;
+      }
     }
 
     await Promise.all(fetches);
@@ -161,5 +170,19 @@ export class GitBridge {
   async getHeadSha(): Promise<string> {
     const sha = await this.git.revparse(['HEAD']);
     return sha.trim();
+  }
+
+  async resolveMergeBase(ref1: string, ref2: string): Promise<string> {
+    const result = await this.git.raw(['merge-base', ref1, ref2]);
+    return result.trim();
+  }
+
+  async isValidRev(refspec: string): Promise<boolean> {
+    try {
+      await this.git.revparse([refspec]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

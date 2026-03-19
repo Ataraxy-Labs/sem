@@ -52,9 +52,9 @@ impl GitBridge {
     }
 
     /// Combined detect scope + get files in one call (fast path)
-    pub fn detect_and_get_files(&self) -> Result<(DiffScope, Vec<FileChange>), GitError> {
+    pub fn detect_and_get_files(&self, pathspecs: &[String]) -> Result<(DiffScope, Vec<FileChange>), GitError> {
         // Check for staged changes
-        let staged_files = self.get_staged_diff_files()?;
+        let staged_files = self.get_staged_diff_files(pathspecs)?;
         if !staged_files.is_empty() {
             let mut files = staged_files;
             self.populate_contents(&mut files, &DiffScope::Staged)?;
@@ -62,8 +62,8 @@ impl GitBridge {
         }
 
         // Check for working tree changes + untracked
-        let mut working_files = self.get_working_diff_files()?;
-        let untracked = self.get_untracked_files()?;
+        let mut working_files = self.get_working_diff_files(pathspecs)?;
+        let untracked = self.get_untracked_files(pathspecs)?;
         working_files.extend(untracked);
 
         if !working_files.is_empty() {
@@ -76,17 +76,18 @@ impl GitBridge {
     }
 
     /// Get changed files for a specific scope
-    pub fn get_changed_files(&self, scope: &DiffScope) -> Result<Vec<FileChange>, GitError> {
+    pub fn get_changed_files(&self, scope: &DiffScope, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let mut files = match scope {
             DiffScope::Working => {
-                let mut files = self.get_working_diff_files()?;
-                let untracked = self.get_untracked_files()?;
+                let mut files = self.get_working_diff_files(pathspecs)?;
+                let untracked = self.get_untracked_files(pathspecs)?;
                 files.extend(untracked);
                 files
             }
-            DiffScope::Staged => self.get_staged_diff_files()?,
-            DiffScope::Commit { sha } => self.get_commit_diff_files(sha)?,
-            DiffScope::Range { from, to } => self.get_range_diff_files(from, to)?,
+            DiffScope::Staged => self.get_staged_diff_files(pathspecs)?,
+            DiffScope::Commit { sha } => self.get_commit_diff_files(sha, pathspecs)?,
+            DiffScope::Range { from, to } => self.get_range_diff_files(from, to, pathspecs)?,
+            DiffScope::RefToWorking { refspec } => self.get_ref_to_working_diff_files(refspec, pathspecs)?,
         };
 
         // Filter .sem/ files
@@ -96,7 +97,28 @@ impl GitBridge {
         Ok(files)
     }
 
-    fn get_staged_diff_files(&self) -> Result<Vec<FileChange>, GitError> {
+    /// Resolve the merge base between two refs
+    pub fn resolve_merge_base(&self, ref1: &str, ref2: &str) -> Result<String, GitError> {
+        let obj1 = self.repo.revparse_single(ref1)?;
+        let obj2 = self.repo.revparse_single(ref2)?;
+        let oid = self.repo.merge_base(obj1.id(), obj2.id())?;
+        Ok(oid.to_string())
+    }
+
+    /// Check if a string resolves to a valid git revision
+    pub fn is_valid_rev(&self, refspec: &str) -> bool {
+        self.repo.revparse_single(refspec).is_ok()
+    }
+
+    fn make_diff_opts(pathspecs: &[String]) -> DiffOptions {
+        let mut opts = DiffOptions::new();
+        for spec in pathspecs {
+            opts.pathspec(spec.as_str());
+        }
+        opts
+    }
+
+    fn get_staged_diff_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let head_tree = match self.repo.head() {
             Ok(head) => {
                 let commit = head.peel_to_commit()?;
@@ -105,28 +127,32 @@ impl GitBridge {
             Err(_) => None, // No commits yet
         };
 
+        let mut opts = Self::make_diff_opts(pathspecs);
         let diff = self.repo.diff_tree_to_index(
             head_tree.as_ref(),
             Some(&self.repo.index()?),
-            None,
+            Some(&mut opts),
         )?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
 
-    fn get_working_diff_files(&self) -> Result<Vec<FileChange>, GitError> {
-        let mut opts = DiffOptions::new();
+    fn get_working_diff_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
+        let mut opts = Self::make_diff_opts(pathspecs);
         opts.include_untracked(false);
 
         let diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
         Ok(self.diff_to_file_changes(&diff))
     }
 
-    fn get_untracked_files(&self) -> Result<Vec<FileChange>, GitError> {
+    fn get_untracked_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)
             .exclude_submodules(true);
+        for spec in pathspecs {
+            opts.pathspec(spec.as_str());
+        }
 
         let statuses = self.repo.statuses(Some(&mut opts))?;
         let mut files = Vec::new();
@@ -150,7 +176,7 @@ impl GitBridge {
         Ok(files)
     }
 
-    fn get_commit_diff_files(&self, sha: &str) -> Result<Vec<FileChange>, GitError> {
+    fn get_commit_diff_files(&self, sha: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let obj = self.repo.revparse_single(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
@@ -161,28 +187,40 @@ impl GitBridge {
             None
         };
 
+        let mut opts = Self::make_diff_opts(pathspecs);
         let diff = self.repo.diff_tree_to_tree(
             parent_tree.as_ref(),
             Some(&tree),
-            None,
+            Some(&mut opts),
         )?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
 
-    fn get_range_diff_files(&self, from: &str, to: &str) -> Result<Vec<FileChange>, GitError> {
+    fn get_range_diff_files(&self, from: &str, to: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let from_obj = self.repo.revparse_single(from)?;
         let to_obj = self.repo.revparse_single(to)?;
 
         let from_tree = from_obj.peel_to_commit()?.tree()?;
         let to_tree = to_obj.peel_to_commit()?.tree()?;
 
+        let mut opts = Self::make_diff_opts(pathspecs);
         let diff = self.repo.diff_tree_to_tree(
             Some(&from_tree),
             Some(&to_tree),
-            None,
+            Some(&mut opts),
         )?;
 
+        Ok(self.diff_to_file_changes(&diff))
+    }
+
+    fn get_ref_to_working_diff_files(&self, refspec: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
+        let tree = self.resolve_tree(refspec)?;
+        let mut opts = Self::make_diff_opts(pathspecs);
+        let diff = self.repo.diff_tree_to_workdir_with_index(
+            Some(&tree),
+            Some(&mut opts),
+        )?;
         Ok(self.diff_to_file_changes(&diff))
     }
 
@@ -319,6 +357,18 @@ impl GitBridge {
                     }
                 }
             }
+            DiffScope::RefToWorking { refspec } => {
+                let before_tree = self.resolve_tree(refspec)?;
+                for file in files.iter_mut() {
+                    if file.status != FileStatus::Deleted {
+                        file.after_content = self.read_working_file(&file.file_path);
+                    }
+                    if file.status != FileStatus::Added {
+                        file.before_content =
+                            self.read_blob_from_tree(&before_tree, &file.file_path);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -430,7 +480,7 @@ mod tests {
         );
 
         let bridge = GitBridge::open(temp.path()).unwrap();
-        let (scope, files) = bridge.detect_and_get_files().unwrap();
+        let (scope, files) = bridge.detect_and_get_files(&[]).unwrap();
 
         assert!(matches!(scope, DiffScope::Working));
         assert!(files.is_empty());
@@ -453,7 +503,7 @@ mod tests {
         let files = bridge
             .get_changed_files(&DiffScope::Commit {
                 sha: head_oid.to_string(),
-            })
+            }, &[])
             .unwrap();
 
         assert_eq!(files.len(), 1);
@@ -470,7 +520,7 @@ mod tests {
         fs::write(temp.path().join("sample.rs"), "fn a() {}\r\n").unwrap();
 
         let bridge = GitBridge::open(temp.path()).unwrap();
-        let files = bridge.get_changed_files(&DiffScope::Working).unwrap();
+        let files = bridge.get_changed_files(&DiffScope::Working, &[]).unwrap();
 
         assert_eq!(files.len(), 1, "expected git to detect the CRLF change as modified");
 
@@ -490,7 +540,7 @@ mod tests {
         fs::write(temp.path().join("sample.rs"), "fn a() {}\r\nfn b() {}\r\n").unwrap();
 
         let bridge = GitBridge::open(temp.path()).unwrap();
-        let files = bridge.get_changed_files(&DiffScope::Working).unwrap();
+        let files = bridge.get_changed_files(&DiffScope::Working, &[]).unwrap();
 
         assert_eq!(files.len(), 1, "expected git to detect the modification");
 
