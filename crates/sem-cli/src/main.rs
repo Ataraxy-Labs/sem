@@ -119,6 +119,7 @@ fn main() {
         }) => {
             let output_format = match format.as_str() {
                 "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
                 _ => OutputFormat::Terminal,
             };
 
