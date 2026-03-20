@@ -18,5 +18,6 @@ path = "src/main.rs"
 sem-core = { path = "../sem-core", version = "0.3.12" }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
-git2 = "0.19"
+similar = "2"
+git2 = "0.20"
 serde_json = "1"

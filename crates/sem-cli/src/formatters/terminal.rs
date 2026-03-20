@@ -1,9 +1,10 @@
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::DiffResult;
+use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
 
-pub fn format_terminal(result: &DiffResult) -> String {
+pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     if result.changes.is_empty() {
         return "No semantic changes detected.".dimmed().to_string();
     }
@@ -69,8 +70,71 @@ pub fn format_terminal(result: &DiffResult) -> String {
                 tag,
             ));
 
-            // Show content diff for modified properties
-            if change.change_type == ChangeType::Modified {
+            // Show content diff
+            if verbose {
+                match change.change_type {
+                    ChangeType::Added => {
+                        if let Some(ref content) = change.after_content {
+                            for line in content.lines() {
+                                lines.push(format!(
+                                    "{}    {}",
+                                    "│".dimmed(),
+                                    format!("+ {line}").green(),
+                                ));
+                            }
+                        }
+                    }
+                    ChangeType::Deleted => {
+                        if let Some(ref content) = change.before_content {
+                            for line in content.lines() {
+                                lines.push(format!(
+                                    "{}    {}",
+                                    "│".dimmed(),
+                                    format!("- {line}").red(),
+                                ));
+                            }
+                        }
+                    }
+                    ChangeType::Modified => {
+                        if let (Some(before), Some(after)) =
+                            (&change.before_content, &change.after_content)
+                        {
+                            let diff = TextDiff::from_lines(before.as_str(), after.as_str());
+                            for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
+                                lines.push(format!(
+                                    "{}    {}",
+                                    "│".dimmed(),
+                                    format!("{}", hunk.header()).dimmed(),
+                                ));
+                                for op in hunk.ops() {
+                                    for diff_change in diff.iter_changes(op) {
+                                        let line = diff_change.value().trim_end_matches('\n');
+                                        let formatted = match diff_change.tag() {
+                                            ChangeTag::Delete => format!(
+                                                "{}    {}",
+                                                "│".dimmed(),
+                                                format!("- {line}").red(),
+                                            ),
+                                            ChangeTag::Insert => format!(
+                                                "{}    {}",
+                                                "│".dimmed(),
+                                                format!("+ {line}").green(),
+                                            ),
+                                            ChangeTag::Equal => format!(
+                                                "{}    {}",
+                                                "│".dimmed(),
+                                                format!("  {line}").dimmed(),
+                                            ),
+                                        };
+                                        lines.push(formatted);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if change.change_type == ChangeType::Modified {
                 if let (Some(before), Some(after)) =
                     (&change.before_content, &change.after_content)
                 {
