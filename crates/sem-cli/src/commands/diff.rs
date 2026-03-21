@@ -8,7 +8,7 @@ use sem_core::git::types::{DiffScope, FileChange};
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::plugins::create_default_registry;
 
-use crate::formatters::{json::format_json, terminal::format_terminal};
+use crate::formatters::{json::format_json, markdown::format_markdown, terminal::format_terminal};
 
 pub struct DiffOptions {
     pub cwd: String,
@@ -28,6 +28,7 @@ pub struct DiffOptions {
 pub enum OutputFormat {
     Terminal,
     Json,
+    Markdown,
 }
 
 pub fn diff_command(opts: DiffOptions) {
@@ -151,6 +152,7 @@ pub fn diff_command(opts: DiffOptions) {
     let t4 = Instant::now();
     let output = match opts.format {
         OutputFormat::Json => format_json(&result),
+        OutputFormat::Markdown => format_markdown(&result),
         OutputFormat::Terminal => format_terminal(&result, opts.verbose),
     };
     let format_ms = t4.elapsed().as_secs_f64() * 1000.0;

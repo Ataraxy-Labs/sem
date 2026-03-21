@@ -30,7 +30,7 @@ program
 program
   .command('status')
   .description('Show semantic status of changes')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .action(async (opts) => {
     await statusCommand({ format: opts.format });
   });
@@ -38,7 +38,7 @@ program
 program
   .command('diff')
   .description('Show semantic diff of changes')
-  .option('-f, --format <format>', 'Output format: terminal, plain, or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, plain, json, or markdown', 'terminal')
   .option('-s, --staged', 'Show staged changes only')
   .option('-c, --commit <sha>', 'Show changes in a specific commit')
   .option('--from <ref>', 'Start of commit range')
@@ -59,7 +59,7 @@ program
   .command('log')
   .description('Show semantic commit history')
   .option('-n, --count <n>', 'Number of commits to show', '5')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .option('--store', 'Store changes in the sem database')
   .action(async (opts) => {
     await logCommand({
@@ -72,7 +72,7 @@ program
 program
   .command('blame <file>')
   .description('Show who last touched each entity in a file')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .option('-d, --depth <n>', 'Number of commits to search', '50')
   .action(async (file: string, opts) => {
     await blameCommand(file, {
@@ -84,7 +84,7 @@ program
 program
   .command('history <entity>')
   .description('Show full history of an entity (e.g. "auth.ts::function::login")')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .option('-d, --depth <n>', 'Number of commits to search', '50')
   .action(async (entity: string, opts) => {
     await historyCommand(entity, {
@@ -96,7 +96,7 @@ program
 program
   .command('review <branch-or-pr>')
   .description('Semantic review of a branch or PR (e.g. "feature-branch" or "42")')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .option('-b, --base <ref>', 'Base branch to compare against', 'main')
   .action(async (target: string, opts) => {
     await reviewCommand(target, {
@@ -108,7 +108,7 @@ program
 program
   .command('watch')
   .description('Watch for semantic changes in real-time')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .option('--debounce <ms>', 'Debounce interval in ms', '500')
   .action(async (opts) => {
     await watchCommand({
@@ -120,7 +120,7 @@ program
 program
   .command('query <sql>')
   .description('Run a SQL query against the sem database')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .action(async (sql: string, opts) => {
     await queryCommand(sql, { format: opts.format });
   });
@@ -130,7 +130,7 @@ program
   .description('Add, remove, or list labels on an entity')
   .option('-r, --remove', 'Remove the label')
   .option('-l, --list', 'List labels')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .action(async (entityId: string, label: string | undefined, opts) => {
     await labelCommand(entityId, label, {
       remove: opts.remove,
@@ -144,7 +144,7 @@ program
   .description('Add or view comments on an entity')
   .option('-a, --author <name>', 'Comment author')
   .option('--reply <id>', 'Reply to comment ID')
-  .option('-f, --format <format>', 'Output format: terminal or json', 'terminal')
+  .option('-f, --format <format>', 'Output format: terminal, json, or markdown', 'terminal')
   .action(async (entityId: string, body: string | undefined, opts) => {
     await commentCommand(entityId, body, {
       author: opts.author,
