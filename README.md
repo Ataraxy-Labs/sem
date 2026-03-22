@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
   <img src="https://img.shields.io/badge/tests-46_passing-brightgreen" alt="Tests">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License"></a>
-  <img src="https://img.shields.io/badge/languages-20-blue" alt="Languages">
+  <img src="https://img.shields.io/badge/languages-21-blue" alt="Languages">
 </p>
 
 ```
@@ -126,7 +126,7 @@ git config --global --unset diff.external
 
 ## What it parses
 
-20 programming languages with full entity extraction via tree-sitter:
+21 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -149,6 +149,7 @@ git config --global --unset diff.external
 | Fortran | `.f90` `.f95` `.f` | functions, subroutines, modules, programs |
 | Vue | `.vue` | template/script/style blocks + inner TS/JS entities |
 | XML | `.xml` `.plist` `.svg` `.csproj` | elements (nested, tag-name identity) |
+| ERB | `.erb` `.html.erb` | blocks, expressions, code tags |
 
 Plus structured data formats:
 

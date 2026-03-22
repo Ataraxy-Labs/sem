@@ -838,4 +838,64 @@ const handler = function() {
         assert!(names.contains(&"make"), "got: {:?}", names);
         assert!(!names.contains(&"local"), "got: {:?}", names);
     }
+
+    #[test]
+    fn test_go_var_declaration() {
+        let code = r#"package featuremgmt
+
+type FeatureFlag struct {
+	Name        string
+	Description string
+	Stage       string
+}
+
+var standardFeatureFlags = []FeatureFlag{
+	{
+		Name:        "panelTitleSearch",
+		Description: "Search for dashboards using panel title",
+		Stage:       "PublicPreview",
+	},
+}
+
+func GetFlags() []FeatureFlag {
+	return standardFeatureFlags
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "flags.go");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        eprintln!("Go entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+
+        assert!(names.contains(&"FeatureFlag"), "Should find type FeatureFlag, got: {:?}", names);
+        assert!(names.contains(&"standardFeatureFlags"), "Should find var standardFeatureFlags, got: {:?}", names);
+        assert!(names.contains(&"GetFlags"), "Should find func GetFlags, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_go_grouped_var_declaration() {
+        let code = r#"package test
+
+var (
+	simple = 42
+	flags = []string{"a", "b"}
+)
+
+const (
+	x = 1
+	y = 2
+)
+
+func main() {}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "test.go");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        eprintln!("Go grouped entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+
+        assert!(names.contains(&"flags") || names.contains(&"simple"), "Should find grouped var, got: {:?}", names);
+        assert!(names.contains(&"x"), "Should find grouped const x, got: {:?}", names);
+        assert!(names.contains(&"main"), "Should find func main, got: {:?}", names);
+    }
 }

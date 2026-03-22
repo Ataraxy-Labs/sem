@@ -15,7 +15,7 @@ export default function Home() {
           Semantic version control built on Git. Entity-level diff, blame, graph, and impact analysis.
         </p>
         <p className="text-lg text-gray-500 mb-10 max-w-2xl">
-          Git tracks lines. Developers think in functions. sem bridges the gap with AST-normalized structural hashing across 19 languages.
+          Git tracks lines. Developers think in functions. sem bridges the gap with AST-normalized structural hashing across 21 languages.
         </p>
 
         <div className="flex flex-wrap gap-4 mb-16">
@@ -131,7 +131,7 @@ PaymentError         charlie    b2c3d4e   2025-11-20`}</code></pre>
           {/* sem graph */}
           <div className="mb-12">
             <h3 className="text-xl font-semibold mb-4" style={{ fontFamily: "var(--font-heading)" }}>sem graph</h3>
-            <p className="text-gray-400 mb-4">Cross-file entity dependency graph. Name-based analysis that works across all 19 languages without a type checker.</p>
+            <p className="text-gray-400 mb-4">Cross-file entity dependency graph. Name-based analysis that works across all 21 languages without a type checker.</p>
             <pre><code>{`$ sem graph src/payment.rs
 
 process_payment
@@ -204,10 +204,10 @@ Total impact: 4 entities across 4 files`}</code></pre>
       <section className="px-6 py-16 border-t border-white/10">
         <div className="max-w-5xl mx-auto">
           <h2 className="text-3xl font-bold mb-8" style={{ fontFamily: "var(--font-heading)" }}>
-            19 Languages
+            21 Languages
           </h2>
           <div className="flex flex-wrap gap-3">
-            {["TypeScript", "TSX", "JavaScript", "Python", "Go", "Rust", "Java", "C", "C++", "Ruby", "C#", "PHP", "Swift", "Kotlin", "Elixir", "Bash", "HCL", "Fortran", "Vue"].map((lang) => (
+            {["TypeScript", "TSX", "JavaScript", "Python", "Go", "Rust", "Java", "C", "C++", "Ruby", "C#", "PHP", "Swift", "Kotlin", "Elixir", "Bash", "HCL", "Fortran", "Vue", "XML", "ERB"].map((lang) => (
               <span key={lang} className="px-4 py-2 border border-white/15 rounded-lg text-sm text-gray-300">
                 {lang}
               </span>

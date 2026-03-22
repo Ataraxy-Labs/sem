@@ -18,6 +18,7 @@ pub struct DiffOptions {
     pub from: Option<String>,
     pub to: Option<String>,
     pub stdin: bool,
+    pub verbose: bool,
     pub profile: bool,
     pub file_exts: Vec<String>,
     pub files: Vec<String>,
@@ -150,7 +151,7 @@ pub fn diff_command(opts: DiffOptions) {
     let t4 = Instant::now();
     let output = match opts.format {
         OutputFormat::Json => format_json(&result),
-        OutputFormat::Terminal => format_terminal(&result),
+        OutputFormat::Terminal => format_terminal(&result, opts.verbose),
     };
     let format_ms = t4.elapsed().as_secs_f64() * 1000.0;
 

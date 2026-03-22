@@ -51,7 +51,7 @@ sem impact src/auth.ts validateToken
 
 ## Key Features
 
-- 12 languages: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, Fortran
+- 21 languages: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, PHP, Swift, Kotlin, Elixir, Bash, HCL/Terraform, Fortran, Vue, XML, ERB
 - Structural hashing: AST-normalized hashes that ignore whitespace, comments, and formatting
 - Cosmetic vs structural change detection in diff
 - Entity-level blame (per function, not per line)
@@ -64,7 +64,7 @@ sem impact src/auth.ts validateToken
 Cargo workspace: sem-core (library) + sem-cli (binary).
 
 ### sem-core
-- Parser plugins for 12 languages via tree-sitter
+- Parser plugins for 21 languages via tree-sitter
 - Entity extraction: functions, classes, methods, interfaces, types, enums, imports
 - Structural hashing: normalize AST, strip whitespace/comments, SHA-256
 - Dependency graph: cross-file call/reference tracking via petgraph
@@ -85,7 +85,16 @@ Cargo workspace: sem-core (library) + sem-cli (binary).
 | C++ | .cpp .cc .cxx .hpp | functions, classes, structs, enums, namespaces, templates |
 | Ruby | .rb | methods, classes, modules |
 | C# | .cs | methods, classes, interfaces, enums, structs, namespaces |
+| PHP | .php | functions, classes, methods, interfaces, traits |
+| Swift | .swift | functions, classes, structs, enums, protocols, extensions |
+| Kotlin | .kt .kts | functions, classes, objects, interfaces, enums |
+| Elixir | .ex .exs | functions, modules, macros |
+| Bash | .sh .bash | functions |
+| HCL | .tf .hcl | resources, variables, outputs, locals, modules |
 | Fortran | .f90 .f95 .f03 .f08 .f .for | functions, subroutines, modules, programs, interfaces |
+| Vue | .vue | template, script, style blocks |
+| XML | .xml .plist .svg .csproj | elements, nested structures |
+| ERB | .erb .html.erb | blocks, expressions, code tags |
 
 ## Used By
 

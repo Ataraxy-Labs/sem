@@ -46,6 +46,10 @@ enum Commands {
         #[arg(long, default_value = "terminal")]
         format: String,
 
+        /// Show inline content diffs for each entity
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
         /// Show internal timing profile
         #[arg(long, hide = true)]
         profile: bool,
@@ -113,6 +117,7 @@ fn main() {
             from,
             to,
             stdin,
+            verbose,
             format,
             profile,
             file_exts,
@@ -133,6 +138,7 @@ fn main() {
                 from,
                 to,
                 stdin,
+                verbose,
                 profile,
                 file_exts,
                 files,
@@ -200,6 +206,7 @@ fn main() {
                 from: None,
                 to: None,
                 stdin: false,
+                verbose: false,
                 profile: false,
                 file_exts: vec![],
                 files: vec![],

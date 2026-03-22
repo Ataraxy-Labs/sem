@@ -5,6 +5,7 @@ pub mod toml_plugin;
 pub mod csv_plugin;
 pub mod markdown;
 pub mod vue;
+pub mod erb;
 pub mod fallback;
 
 use crate::parser::registry::ParserRegistry;
@@ -19,6 +20,7 @@ pub fn create_default_registry() -> ParserRegistry {
     registry.register(Box::new(toml_plugin::TomlParserPlugin));
     registry.register(Box::new(csv_plugin::CsvParserPlugin));
     registry.register(Box::new(markdown::MarkdownParserPlugin));
+    registry.register(Box::new(erb::ErbParserPlugin));
     // Fallback must be last
     registry.register(Box::new(fallback::FallbackParserPlugin));
 
