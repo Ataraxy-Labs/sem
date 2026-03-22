@@ -1,5 +1,5 @@
 mod entity_extractor;
-mod languages;
+pub mod languages;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

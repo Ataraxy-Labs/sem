@@ -124,6 +124,122 @@ To disable and go back to normal git diff:
 git config --global --unset diff.external
 ```
 
+## Entity history
+
+Track the full history of any function, class, or entity across your git history — following it through renames and moves.
+
+```bash
+sem log --entity authenticateUser
+
+  src/auth/login.ts :: function :: authenticateUser
+
+  a1b2c3d  2024-01-15  alice         [added]              add auth module
+  d4e5f6a  2024-02-01  bob           [modified]           update session handling
+  e7f8a9b  2024-03-10  carol         [signature changed]  parameters changed
+  f0a1b2c  2024-04-05  bob           [renamed]            was: authenticate
+  c3d4e5f  2024-05-20  alice         [modified]           formatting only
+
+  5 events — 3 authors — 2024-01-15 to 2024-05-20
+```
+
+Most git tools lose track of an entity when it gets renamed or moved to another file. `sem log` follows it backward through the history automatically, so you get the full story in one view.
+
+It also tells you whether a change touched the function signature (parameters added, removed, return type changed) or just the body. If someone only reformatted the code, it says so.
+
+```bash
+# If the name is ambiguous, sem tells you and suggests how to narrow it
+sem log --entity login
+# error: 'login' is ambiguous. Did you mean one of:
+#   1. src/auth/login.ts :: function :: login
+#   2. src/api/routes.ts :: function :: login
+# Use --file <path> to disambiguate.
+
+# Scope to a specific file
+sem log --entity login --file src/auth/login.ts
+
+# Limit to a commit range
+sem log --entity login --from v1.0.0 --to v2.0.0
+
+# JSON output
+sem log --entity login --format json
+```
+
+## Semantic review
+
+Get a structured review of any set of changes, grouped by what actually matters: API surface changes that affect callers, internal implementation details, and config/data updates.
+
+```bash
+sem review --from main --to HEAD
+
+┌─ API Surface Changes ───────────────────────────────
+│  ⊕ function  validateToken          [added]
+│    0 dependents (new)
+│  ∆ function  authenticateUser       [signature changed]
+│    ~12 dependents across 4 files
+│  ⊖ function  legacyAuth             [deleted]
+│    ↳ was called by: loginHandler, refreshToken, adminAuth
+└──────────────────────────────────────────────────────
+
+┌─ Internal Changes ──────────────────────────────────
+│  ∆ function  hashPassword           [body only]
+│  ⊕ function  buildSessionKey        [added]
+└──────────────────────────────────────────────────────
+
+┌─ Config / Data Changes ─────────────────────────────
+│  ∆ property  production.pool_size   [5 → 20]
+└──────────────────────────────────────────────────────
+
+Summary: 3 API surface, 2 internal, 1 config
+Risk: high (breaking API change: deleted entity with dependents)
+```
+
+For each API surface change, it shows how many other entities depend on it. If you delete something that was referenced elsewhere, it flags exactly who was calling it. Risk is based on the actual dependency graph.
+
+```bash
+# Review staged changes before committing
+sem review --staged
+
+# Review a specific commit
+sem review --commit abc1234
+
+# JSON for CI integration
+sem review --format json
+```
+
+## Changelog generation
+
+Generate a changelog from a commit range, automatically categorized with a semver bump suggestion.
+
+```bash
+sem changelog --from v1.2.0 --to HEAD
+
+## Unreleased — 2024-06-15
+
+### Breaking Changes
+  ! authenticateUser signature changed (parameters removed)
+
+### Added
+  + function validateToken in src/auth/login.ts
+
+### Changed
+  ~ function hashPassword body modified in src/auth/crypto.ts
+
+### Removed
+  - function legacyAuth deleted from src/auth/login.ts
+
+Suggested version bump: MAJOR (breaking API change: deleted entity with dependents)
+```
+
+It uses the dependency graph to figure out whether a change is API-facing or internal, and suggests a semver bump based on what actually changed in the code — not just the commit message.
+
+```bash
+# Markdown for release notes
+sem changelog --from v1.0.0 --to v2.0.0 --format markdown --heading "v2.0.0"
+
+# JSON for automation
+sem changelog --format json
+```
+
 ## What it parses
 
 21 programming languages with full entity extraction via tree-sitter:

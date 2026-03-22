@@ -35,6 +35,9 @@ pub struct CommitInfo {
     pub sha: String,
     pub short_sha: String,
     pub author: String,
-    pub date: String,
+    pub date: i64,
     pub message: String,
+    /// First parent SHA, if any (None for root commits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_sha: Option<String>,
 }

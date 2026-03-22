@@ -16,11 +16,11 @@ pub fn impact_command(opts: ImpactOptions) {
     let root = Path::new(&opts.cwd);
     let registry = create_default_registry();
 
-    let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let ext_filter = super::common::normalize_exts(&opts.file_exts);
 
     // If no files specified, find all supported files in the repo
     let file_paths = if opts.file_paths.is_empty() {
-        super::graph::find_supported_files_public(root, &registry, &ext_filter)
+        sem_core::utils::files::find_supported_files(root, &registry, &ext_filter)
     } else if ext_filter.is_empty() {
         opts.file_paths
     } else {
