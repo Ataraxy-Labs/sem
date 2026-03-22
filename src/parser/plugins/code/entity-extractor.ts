@@ -57,7 +57,7 @@ function visitNode(
     const name = extractName(node, config, sourceCode);
     const entityType = mapNodeType(node);
     const shouldSkip =
-      (context.insideFunction && entityType === 'variable') ||
+      (context.insideFunction && (entityType === 'variable' || entityType === 'constant')) ||
       (node.type === 'pair' && !isFunctionLikePair(node));
 
     if (name && !shouldSkip) {
@@ -136,8 +136,12 @@ function mapNodeType(node: TreeSitterNode): string {
     return isFunctionLikePair(node) ? 'method' : 'property';
   }
 
-  if ((node.type === 'lexical_declaration' || node.type === 'variable_declaration') && isFunctionLikeDeclaration(node)) {
-    return 'function';
+  if (node.type === 'lexical_declaration') {
+    return getFunctionLikeDeclarationType(node) ?? (/^\s*const\b/.test(node.text) ? 'constant' : 'variable');
+  }
+
+  if (node.type === 'variable_declaration' || node.type === 'var_declaration') {
+    return getFunctionLikeDeclarationType(node) ?? 'variable';
   }
 
   const mapping: Record<string, string> = {
@@ -172,22 +176,30 @@ function mapNodeType(node: TreeSitterNode): string {
   return mapping[node.type] ?? node.type;
 }
 
-function isFunctionLikeDeclaration(node: TreeSitterNode): boolean {
+function getFunctionLikeDeclarationType(node: TreeSitterNode): 'function' | 'generator' | undefined {
   for (const child of node.namedChildren) {
     if (child.type !== 'variable_declarator') continue;
 
     const value = child.childForFieldName('value');
+    if (value?.type === 'generator_function' || value?.type === 'generator_function_declaration') {
+      return 'generator';
+    }
+
     if (value && isFunctionLikeNodeType(value.type)) {
-      return true;
+      return 'function';
     }
 
     const normalized = child.text.replace(/\s+/g, ' ').trim();
+    if (/^[^=]+=\s*(?:async\s+)?function\s*\*/.test(normalized)) {
+      return 'generator';
+    }
+
     if (/^[^=]+=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/.test(normalized)) {
-      return true;
+      return 'function';
     }
   }
 
-  return false;
+  return undefined;
 }
 
 function isFunctionLikeNodeType(nodeType: string): boolean {

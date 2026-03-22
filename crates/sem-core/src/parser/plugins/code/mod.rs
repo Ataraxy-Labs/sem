@@ -364,6 +364,37 @@ export class Greeter {
     }
 
     #[test]
+    fn test_js_ts_binding_classification() {
+        let code = r#"
+const constantValue = "abc";
+let mutableValue = "def";
+var legacyValue = "ghi";
+
+var arrowFn = () => 1;
+const functionExpr = function () { return 2; };
+let generatorExpr = function* () { yield 3; };
+"#;
+        let plugin = CodeParserPlugin;
+
+        for file_path in ["bindings.ts", "bindings.js"] {
+            let entities = plugin.extract_entities(code, file_path);
+            let entity_type = |name: &str| {
+                entities
+                    .iter()
+                    .find(|entity| entity.name == name)
+                    .map(|entity| entity.entity_type.as_str())
+            };
+
+            assert_eq!(entity_type("constantValue"), Some("constant"), "{file_path}");
+            assert_eq!(entity_type("mutableValue"), Some("variable"), "{file_path}");
+            assert_eq!(entity_type("legacyValue"), Some("variable"), "{file_path}");
+            assert_eq!(entity_type("arrowFn"), Some("function"), "{file_path}");
+            assert_eq!(entity_type("functionExpr"), Some("function"), "{file_path}");
+            assert_eq!(entity_type("generatorExpr"), Some("generator"), "{file_path}");
+        }
+    }
+
+    #[test]
     fn test_nested_functions_typescript() {
         let code = r#"
 function outer() {

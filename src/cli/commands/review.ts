@@ -94,7 +94,7 @@ export async function reviewCommand(branchOrPR: string, opts: ReviewOptions = {}
   const risks: string[] = [];
 
   const deletedFunctions = result.changes.filter(
-    c => c.changeType === 'deleted' && (c.entityType === 'function' || c.entityType === 'method')
+    c => c.changeType === 'deleted' && (c.entityType === 'function' || c.entityType === 'method' || c.entityType === 'generator')
   );
   if (deletedFunctions.length > 0) {
     risks.push(chalk.red(`  ⚠  ${deletedFunctions.length} function${deletedFunctions.length > 1 ? 's' : ''} deleted: ${deletedFunctions.map(f => f.entityName).join(', ')}`));
