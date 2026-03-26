@@ -164,48 +164,6 @@ sem log --entity login --from v1.0.0 --to v2.0.0
 sem log --entity login --format json
 ```
 
-## Semantic review
-
-Get a structured review of any set of changes, grouped by what actually matters: API surface changes that affect callers, internal implementation details, and config/data updates.
-
-```bash
-sem review --from main --to HEAD
-
-┌─ API Surface Changes ───────────────────────────────
-│  ⊕ function  validateToken          [added]
-│    0 dependents (new)
-│  ∆ function  authenticateUser       [signature changed]
-│    ~12 dependents across 4 files
-│  ⊖ function  legacyAuth             [deleted]
-│    ↳ was called by: loginHandler, refreshToken, adminAuth
-└──────────────────────────────────────────────────────
-
-┌─ Internal Changes ──────────────────────────────────
-│  ∆ function  hashPassword           [body only]
-│  ⊕ function  buildSessionKey        [added]
-└──────────────────────────────────────────────────────
-
-┌─ Config / Data Changes ─────────────────────────────
-│  ∆ property  production.pool_size   [5 → 20]
-└──────────────────────────────────────────────────────
-
-Summary: 3 API surface, 2 internal, 1 config
-Risk: high (breaking API change: deleted entity with dependents)
-```
-
-For each API surface change, it shows how many other entities depend on it. If you delete something that was referenced elsewhere, it flags exactly who was calling it. Risk is based on the actual dependency graph.
-
-```bash
-# Review staged changes before committing
-sem review --staged
-
-# Review a specific commit
-sem review --commit abc1234
-
-# JSON for CI integration
-sem review --format json
-```
-
 ## Changelog generation
 
 Generate a changelog from a commit range, automatically categorized with a semver bump suggestion.

@@ -8,7 +8,6 @@ use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
 use commands::changelog::{changelog_command, ChangelogFormat, ChangelogOptions};
 use commands::log::{log_command, LogFormat, LogOptions};
-use commands::review::{review_command, ReviewFormat, ReviewOptions};
 use sem_core::utils::date::today_date;
 
 #[derive(Parser)]
@@ -115,36 +114,6 @@ enum Commands {
         /// Date string for the changelog header
         #[arg(long)]
         date: Option<String>,
-
-        /// Show all changes without truncation
-        #[arg(long)]
-        full: bool,
-
-        /// Only include files with these extensions (e.g. --file-exts .py .rs)
-        #[arg(long)]
-        file_exts: Vec<String>,
-    },
-    /// Semantic PR review: groups changes by impact and assesses risk
-    Review {
-        /// Show only staged changes
-        #[arg(long)]
-        staged: bool,
-
-        /// Show changes from a specific commit
-        #[arg(long)]
-        commit: Option<String>,
-
-        /// Start of commit range
-        #[arg(long)]
-        from: Option<String>,
-
-        /// End of commit range
-        #[arg(long)]
-        to: Option<String>,
-
-        /// Output format: terminal or json
-        #[arg(long, default_value = "terminal")]
-        format: String,
 
         /// Show all changes without truncation
         #[arg(long)]
@@ -290,31 +259,6 @@ fn main() {
                 format: changelog_format,
                 heading,
                 date: date_str,
-                full,
-                file_exts,
-            });
-        }
-        Some(Commands::Review {
-            staged,
-            commit,
-            from,
-            to,
-            format,
-            full,
-            file_exts,
-        }) => {
-            let review_format = match format.as_str() {
-                "json" => ReviewFormat::Json,
-                _ => ReviewFormat::Terminal,
-            };
-
-            review_command(ReviewOptions {
-                cwd: cwd.clone(),
-                from,
-                to,
-                commit,
-                staged,
-                format: review_format,
                 full,
                 file_exts,
             });
