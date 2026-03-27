@@ -150,6 +150,7 @@ git config --global --unset diff.external
 | Vue | `.vue` | template/script/style blocks + inner TS/JS entities |
 | XML | `.xml` `.plist` `.svg` `.csproj` | elements (nested, tag-name identity) |
 | ERB | `.erb` `.html.erb` | blocks, expressions, code tags |
+| Svelte | `.svelte` `.svelte.js` `.svelte.ts` | component blocks + rune JS/TS modules |
 
 Plus structured data formats:
 
