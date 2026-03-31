@@ -1,4 +1,4 @@
-import { parse } from 'jsonc-parser';
+import { parse, type ParseError } from 'jsonc-parser';
 import type { SemanticParserPlugin } from '../../plugin.js';
 import type { SemanticEntity } from '../../../model/entity.js';
 import { contentHash } from '../../../utils/hash.js';
@@ -11,7 +11,7 @@ export class JsonParserPlugin implements SemanticParserPlugin {
   extractEntities(content: string, filePath: string): SemanticEntity[] {
     let parsed: unknown;
     if (filePath.endsWith('.jsonc')) {
-      const errors: unknown[] = [];
+      const errors: ParseError[] = [];
       parsed = parse(content, errors);
       if (errors.length > 0 && parsed === undefined) throw new Error('JSONC parse failed');
     } else {
