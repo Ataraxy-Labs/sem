@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import chalk from 'chalk';
 import type { SemanticChange } from '../../model/change.js';
+import type { EntityType } from '../../model/entity-type.js';
 import type { DiffResult } from '../../parser/differ.js';
 
 export interface ValidationRule {
@@ -11,7 +12,7 @@ export interface ValidationRule {
   severity: 'error' | 'warning' | 'info';
   match: {
     changeType?: string | string[];
-    entityType?: string | string[];
+    entityType?: EntityType | EntityType[];
     filePath?: string;
   };
   condition?: string; // Simple expression: "value > 100", "content.includes('TODO')"

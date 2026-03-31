@@ -3,6 +3,7 @@ import { GitBridge } from '../../git/bridge.js';
 import { createDefaultRegistry } from '../../parser/plugins/index.js';
 import { computeSemanticDiff } from '../../parser/differ.js';
 import type { SemanticChange } from '../../model/change.js';
+import type { EntityType } from '../../model/entity-type.js';
 
 export interface StatusOptions {
   cwd?: string;
@@ -100,7 +101,7 @@ export async function statusCommand(opts: StatusOptions = {}): Promise<void> {
     const summary = parts.join(' ');
 
     // Collect entity types
-    const types = new Map<string, number>();
+    const types = new Map<EntityType, number>();
     for (const c of changes) {
       types.set(c.entityType, (types.get(c.entityType) ?? 0) + 1);
     }

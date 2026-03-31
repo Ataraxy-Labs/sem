@@ -1,8 +1,10 @@
+import type { EntityType } from './entity-type.js';
+
 export interface SemanticEntity {
   /** Unique ID: "filePath::entityType::name" or "filePath::parentId::name" */
   id: string;
   filePath: string;
-  entityType: string;
+  entityType: EntityType;
   name: string;
   parentId?: string;
   content: string;
@@ -14,7 +16,7 @@ export interface SemanticEntity {
   metadata?: Record<string, string>;
 }
 
-export function buildEntityId(filePath: string, entityType: string, name: string, parentId?: string): string {
+export function buildEntityId(filePath: string, entityType: EntityType, name: string, parentId?: string): string {
   if (parentId) {
     return `${filePath}::${parentId}::${name}`;
   }

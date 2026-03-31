@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import type { SemanticEntity } from '../model/entity.js';
 import type { SemanticChange } from '../model/change.js';
+import type { EntityType } from '../model/entity-type.js';
 import { SCHEMA_DDL } from './schema.js';
 
 export class SemDatabase {
@@ -56,7 +57,7 @@ export class SemDatabase {
     return rows.map(row => ({
       id: row.id as string,
       filePath: row.file_path as string,
-      entityType: row.entity_type as string,
+      entityType: row.entity_type as EntityType,
       name: row.name as string,
       parentId: (row.parent_id as string) || undefined,
       content: row.content as string,
@@ -85,7 +86,7 @@ export class SemDatabase {
     tx(changes);
   }
 
-  getChanges(opts?: { filePath?: string; changeType?: string; entityType?: string; commitSha?: string; limit?: number }): SemanticChange[] {
+  getChanges(opts?: { filePath?: string; changeType?: string; entityType?: EntityType; commitSha?: string; limit?: number }): SemanticChange[] {
     let sql = 'SELECT * FROM changes WHERE 1=1';
     const params: unknown[] = [];
 
@@ -118,7 +119,7 @@ export class SemDatabase {
       id: row.id as string,
       entityId: row.entity_id as string,
       changeType: row.change_type as SemanticChange['changeType'],
-      entityType: row.entity_type as string,
+      entityType: row.entity_type as EntityType,
       entityName: row.entity_name as string,
       filePath: row.file_path as string,
       oldFilePath: (row.old_file_path as string) || undefined,

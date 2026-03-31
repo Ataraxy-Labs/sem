@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import { GitBridge } from '../../git/bridge.js';
 import { createDefaultRegistry } from '../../parser/plugins/index.js';
 import type { SemanticEntity } from '../../model/entity.js';
+import type { EntityType } from '../../model/entity-type.js';
 
 export interface BlameOptions {
   cwd?: string;
@@ -12,7 +13,7 @@ export interface BlameOptions {
 
 interface BlameEntry {
   entityId: string;
-  entityType: string;
+  entityType: EntityType;
   entityName: string;
   filePath: string;
   author: string;

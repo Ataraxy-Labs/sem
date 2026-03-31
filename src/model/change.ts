@@ -1,10 +1,11 @@
+import type { EntityType } from './entity-type.js';
 export type ChangeType = 'added' | 'modified' | 'deleted' | 'moved' | 'renamed';
 
 export interface SemanticChange {
   id: string;
   entityId: string;
   changeType: ChangeType;
-  entityType: string;
+  entityType: EntityType;
   entityName: string;
   filePath: string;
   oldFilePath?: string;

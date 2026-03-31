@@ -1,4 +1,5 @@
 import type { SemanticEntity } from '../../../model/entity.js';
+import type { EntityType } from '../../../model/entity-type.js';
 import { buildEntityId } from '../../../model/entity.js';
 import { contentHash } from '../../../utils/hash.js';
 import type { LanguageConfig } from './languages.js';
@@ -131,7 +132,7 @@ function extractName(node: TreeSitterNode, config: LanguageConfig, sourceCode: s
   return undefined;
 }
 
-function mapNodeType(node: TreeSitterNode): string {
+function mapNodeType(node: TreeSitterNode): EntityType {
   if (node.type === 'pair') {
     return isFunctionLikePair(node) ? 'method' : 'property';
   }
@@ -140,7 +141,7 @@ function mapNodeType(node: TreeSitterNode): string {
     return 'function';
   }
 
-  const mapping: Record<string, string> = {
+  const mapping: Record<string, EntityType> = {
     function_declaration: 'function',
     function_definition: 'function',
     function_item: 'function',
