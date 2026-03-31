@@ -13,7 +13,7 @@ export interface LanguageConfig {
 export const LANGUAGE_CONFIGS: LanguageConfig[] = [
   {
     id: 'typescript',
-    extensions: ['.ts', '.tsx'],
+    extensions: ['.ts', '.tsx', '.cts', '.mts'],
     grammarPackage: 'tree-sitter-typescript',
     entityNodeTypes: [
       'function_declaration',

@@ -74,7 +74,7 @@ Cargo workspace: sem-core (library) + sem-cli (binary).
 
 | Language | Extensions | Entity Types |
 |----------|-----------|--------------|
-| TypeScript | .ts | functions, classes, interfaces, types, enums |
+| TypeScript | .ts .tsx .mts .cts | functions, classes, interfaces, types, enums |
 | TSX | .tsx | functions, classes, interfaces, types, enums |
 | JavaScript | .js .jsx .mjs .cjs | functions, classes, variables |
 | Python | .py | functions, classes, decorators |

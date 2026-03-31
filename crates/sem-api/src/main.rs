@@ -73,7 +73,7 @@ struct SearchReq {
 // ── Repo management ──────────────────────────────────────────────
 
 const SUPPORTED_EXT: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "py", "go", "rs", "java",
+    "ts", "tsx", "js", "jsx", "mts", "mjs", "cjs", "cts", "py", "go", "rs", "java",
     "c", "cpp", "cc", "h", "hpp", "rb", "cs", "php",
 ];
 

@@ -130,7 +130,7 @@ git config --global --unset diff.external
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
-| TypeScript | `.ts` `.tsx` | functions, classes, interfaces, types, enums, exports |
+| TypeScript | `.ts` `.tsx`, `.mts`, `.cts` | functions, classes, interfaces, types, enums, exports |
 | JavaScript | `.js` `.jsx` `.mjs` `.cjs` | functions, classes, variables, exports |
 | Python | `.py` | functions, classes, decorated definitions |
 | Go | `.go` | functions, methods, types, vars, consts |
