@@ -19,9 +19,9 @@ interface TreeSitterTree {
   rootNode: TreeSitterNode;
 }
 
-type VisitContext = {
+interface VisitContext {
   insideFunction: boolean;
-};
+}
 
 export function extractEntities(
   tree: TreeSitterTree,
