@@ -56,20 +56,14 @@ export class MarkdownParserPlugin implements SemanticParserPlugin {
         sectionStack.push(currentSection);
       } else if (currentSection) {
         currentSection.lines.push(line);
-      } else {
+      } else if (line.trim()) {
         // Content before first heading — preamble
-        if (line.trim()) {
-          if (!currentSection) {
-            currentSection = {
-              level: 0,
-              name: '(preamble)',
-              startLine: i + 1,
-              lines: [line],
-            };
-          } else {
-            currentSection.lines.push(line);
-          }
-        }
+        currentSection = {
+          level: 0,
+          name: '(preamble)',
+          startLine: i + 1,
+          lines: [line],
+        };
       }
     }
 
