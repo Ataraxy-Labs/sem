@@ -1,2 +1,26 @@
-// TODO: Refine this with the actual types used.
-export type EntityType = string | (string & {});
+export const ENTITY_TYPES = [
+  'chunk',
+  'class',
+  'constant',
+  'element',
+  'enum',
+  'export',
+  'function',
+  'heading',
+  'impl',
+  'interface',
+  'method',
+  'module',
+  'object',
+  'preamble',
+  'property',
+  'row',
+  'section',
+  'static',
+  'struct',
+  'trait',
+  'type',
+  'variable',
+] as const;
+
+export type EntityType = (typeof ENTITY_TYPES)[number];
