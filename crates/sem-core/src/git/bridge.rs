@@ -412,6 +412,67 @@ impl GitBridge {
     }
 
 
+    /// Read file content at a specific git ref (commit SHA, branch, tag, etc.)
+    pub fn read_file_at_ref(&self, refspec: &str, file_path: &str) -> Result<Option<String>, GitError> {
+        let tree = self.resolve_tree(refspec)?;
+        Ok(self.read_blob_from_tree(&tree, file_path))
+    }
+
+    /// Get commits that modified a specific file, walking history from HEAD.
+    /// Returns commits in reverse chronological order (newest first).
+    pub fn get_file_commits(&self, file_path: &str, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push_head()?;
+        revwalk.set_sorting(git2::Sort::TIME)?;
+
+        let mut commits = Vec::new();
+        let path = Path::new(file_path);
+
+        for oid_result in revwalk {
+            let oid = oid_result?;
+            let commit = self.repo.find_commit(oid)?;
+            let tree = commit.tree()?;
+
+            // Check if this file exists in this commit's tree
+            let file_in_commit = tree.get_path(path).ok().map(|e| e.id());
+
+            // Compare with parent to see if the file changed
+            let file_in_parent = if commit.parent_count() > 0 {
+                commit.parent(0)
+                    .ok()
+                    .and_then(|p| p.tree().ok())
+                    .and_then(|t| t.get_path(path).ok().map(|e| e.id()))
+            } else {
+                None // No parent = initial commit, file was added
+            };
+
+            // Include if file changed between parent and this commit
+            let changed = match (file_in_commit, file_in_parent) {
+                (Some(cur), Some(prev)) => cur != prev,  // content changed
+                (Some(_), None) => true,                   // file added
+                (None, Some(_)) => true,                   // file deleted
+                (None, None) => false,                     // file not present in either
+            };
+
+            if changed {
+                let sha = oid.to_string();
+                commits.push(CommitInfo {
+                    short_sha: sha[..7.min(sha.len())].to_string(),
+                    sha,
+                    author: commit.author().name().unwrap_or("unknown").to_string(),
+                    date: commit.time().seconds().to_string(),
+                    message: commit.message().unwrap_or("").to_string(),
+                });
+
+                if commits.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(commits)
+    }
+
     pub fn get_log(&self, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;

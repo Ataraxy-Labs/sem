@@ -6,6 +6,7 @@ use commands::blame::{blame_command, BlameOptions};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::graph::{graph_command, GraphFormat, GraphOptions};
 use commands::impact::{impact_command, ImpactOptions};
+use commands::log::{log_command, LogOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = env!("CARGO_PKG_VERSION"), about = "Semantic version control")]
@@ -108,6 +109,28 @@ enum Commands {
         #[arg(long)]
         file_exts: Vec<String>,
     },
+    /// Show evolution of an entity through git history
+    Log {
+        /// Name of the entity to trace
+        #[arg()]
+        entity: String,
+
+        /// File containing the entity (auto-detected if omitted)
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Maximum number of commits to scan
+        #[arg(long, default_value = "50")]
+        limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show content diff between versions
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
 }
 
 fn main() {
@@ -198,6 +221,25 @@ fn main() {
                 entity,
                 format: graph_format,
                 file_exts,
+            });
+        }
+        Some(Commands::Log {
+            entity,
+            file,
+            limit,
+            json,
+            verbose,
+        }) => {
+            log_command(LogOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                entity_name: entity,
+                file_path: file,
+                limit,
+                json,
+                verbose,
             });
         }
         None => {
