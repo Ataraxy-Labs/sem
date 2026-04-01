@@ -17,6 +17,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: sem-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: sem-linux-arm64
+            cross_linker: gcc-aarch64-linux-gnu
           - target: aarch64-apple-darwin
             os: macos-14
             name: sem-darwin-arm64
@@ -29,10 +33,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install cross-compilation toolchain
+        if: matrix.cross_linker != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_linker }}
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Configure cargo for cross-compilation
+        if: matrix.cross_linker != ''
+        run: |
+          mkdir -p ~/.cargo
+          echo "[target.${{ matrix.target }}]" >> ~/.cargo/config.toml
+          echo 'linker = "${{ matrix.cross_linker }}"' >> ~/.cargo/config.toml
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p sem-cli
