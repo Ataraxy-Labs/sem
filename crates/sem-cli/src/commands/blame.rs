@@ -159,16 +159,13 @@ pub fn blame_command(opts: BlameOptions) {
                 &r.commit_sha
             };
 
-            let indent = if results.iter().any(|other| {
+            let is_nested = results.iter().any(|other| {
                 other.name != r.name
                     && other.start_line <= r.start_line
                     && other.end_line >= r.end_line
                     && !(other.start_line == r.start_line && other.end_line == r.end_line)
-            }) {
-                "│    "
-            } else {
-                "│  "
-            };
+            });
+            let marker = if is_nested { "│   └" } else { "│  ⊕" };
 
             let summary_short = if r.summary.len() > 40 {
                 format!("{}...", &r.summary[..37])
@@ -177,8 +174,8 @@ pub fn blame_command(opts: BlameOptions) {
             };
 
             println!(
-                "{}  {:<max_type_len$}  {:<max_name_len$}  {}  {}  {}  {}",
-                indent,
+                "{} {:<max_type_len$}  {:<max_name_len$}  {}  {}  {}  {}",
+                marker,
                 r.entity_type.dimmed(),
                 r.name.bold(),
                 sha_short.yellow(),
