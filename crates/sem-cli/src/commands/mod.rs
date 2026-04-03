@@ -5,11 +5,14 @@ pub mod impact;
 pub mod log;
 pub mod setup;
 
-/// Truncate a string to `max_chars` characters (not bytes), appending "..." if truncated.
-/// This is safe for multibyte characters (e.g. CJK, emoji).
+/// Truncate a string to `max_chars` Unicode scalar values (codepoints), appending "..." if
+/// truncated. Safe for multibyte encodings (CJK, simple emoji). Note: does not split on grapheme
+/// cluster boundaries — ZWJ emoji sequences may render incorrectly at the truncation point.
 pub fn truncate_str(s: &str, max_chars: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count > max_chars {
+    if max_chars <= 3 {
+        return s.chars().take(max_chars).collect();
+    }
+    if s.chars().count() > max_chars {
         let truncated: String = s.chars().take(max_chars - 3).collect();
         format!("{truncated}...")
     } else {
@@ -76,5 +79,27 @@ mod tests {
     #[test]
     fn empty_string() {
         assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn max_chars_zero() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn max_chars_one() {
+        assert_eq!(truncate_str("hello", 1), "h");
+    }
+
+    #[test]
+    fn max_chars_three_with_longer_string() {
+        // Boundary: max_chars == 3, string is longer → no room for "...", just take 3 chars
+        assert_eq!(truncate_str("hello", 3), "hel");
+    }
+
+    #[test]
+    fn max_chars_four_triggers_ellipsis() {
+        // max_chars == 4, string is longer → take 1 char + "..."
+        assert_eq!(truncate_str("hello", 4), "h...");
     }
 }
