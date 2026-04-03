@@ -85,7 +85,12 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             };
 
             let type_label = format!("{:<10}", change.entity_type);
-            let name_label = format!("{:<25}", change.entity_name);
+            let name_display = if let Some(ref old_name) = change.old_entity_name {
+                format!("{old_name} -> {}", change.entity_name)
+            } else {
+                change.entity_name.clone()
+            };
+            let name_label = format!("{:<25}", name_display);
 
             lines.push(format!(
                 "{}  {} {} {} {}",

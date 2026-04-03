@@ -376,12 +376,19 @@ impl SemServer {
             .changes
             .iter()
             .map(|c| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "file": c.file_path,
                     "entity_name": c.entity_name,
                     "entity_type": c.entity_type,
                     "change_type": c.change_type.to_string(),
-                })
+                });
+                if let Some(ref old_name) = c.old_entity_name {
+                    obj["old_entity_name"] = serde_json::json!(old_name);
+                }
+                if let Some(ref old_path) = c.old_file_path {
+                    obj["old_file_path"] = serde_json::json!(old_path);
+                }
+                obj
             })
             .collect();
 

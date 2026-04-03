@@ -39,9 +39,14 @@ pub fn format_markdown(result: &DiffResult) -> String {
                 ChangeType::Renamed => "↻",
             };
 
+            let name_display = if let Some(ref old_name) = change.old_entity_name {
+                format!("{old_name} -> {}", change.entity_name)
+            } else {
+                change.entity_name.clone()
+            };
             lines.push(format!(
                 "| {} | {} | {} |",
-                status, change.entity_type, change.entity_name
+                status, change.entity_type, name_display
             ));
 
             // Show content diff for modified entities with short before/after

@@ -30,11 +30,16 @@ pub fn format_plain(result: &DiffResult) -> String {
             };
 
             let type_label = format!("{:<12}", change.entity_type);
+            let name_display = if let Some(ref old_name) = change.old_entity_name {
+                format!("{old_name} -> {}", change.entity_name)
+            } else {
+                change.entity_name.clone()
+            };
             lines.push(format!(
                 "  {}  {}{}",
                 letter,
                 type_label.dimmed(),
-                change.entity_name,
+                name_display,
             ));
 
             if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {

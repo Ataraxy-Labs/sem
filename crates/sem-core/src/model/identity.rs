@@ -46,6 +46,7 @@ pub fn match_entities(
                     entity_type: after_entity.entity_type.clone(),
                     entity_name: after_entity.name.clone(),
                     file_path: after_entity.file_path.clone(),
+                    old_entity_name: None,
                     old_file_path: None,
                     before_content: Some(before_entity.content.clone()),
                     after_content: Some(after_entity.content.clone()),
@@ -119,6 +120,12 @@ pub fn match_entities(
                 None
             };
 
+            let old_entity_name = if before_entity.name != after_entity.name {
+                Some(before_entity.name.clone())
+            } else {
+                None
+            };
+
             changes.push(SemanticChange {
                 id: format!("change::{}", after_entity.id),
                 entity_id: after_entity.id.clone(),
@@ -126,6 +133,7 @@ pub fn match_entities(
                 entity_type: after_entity.entity_type.clone(),
                 entity_name: after_entity.name.clone(),
                 file_path: after_entity.file_path.clone(),
+                old_entity_name,
                 old_file_path,
                 before_content: Some(before_entity.content.clone()),
                 after_content: Some(after_entity.content.clone()),
@@ -208,6 +216,12 @@ pub fn match_entities(
                         None
                     };
 
+                    let old_entity_name = if matched.name != after_entity.name {
+                        Some(matched.name.clone())
+                    } else {
+                        None
+                    };
+
                     changes.push(SemanticChange {
                         id: format!("change::{}", after_entity.id),
                         entity_id: after_entity.id.clone(),
@@ -215,6 +229,7 @@ pub fn match_entities(
                         entity_type: after_entity.entity_type.clone(),
                         entity_name: after_entity.name.clone(),
                         file_path: after_entity.file_path.clone(),
+                        old_entity_name,
                         old_file_path,
                         before_content: Some(matched.content.clone()),
                         after_content: Some(after_entity.content.clone()),
@@ -237,6 +252,7 @@ pub fn match_entities(
             entity_type: entity.entity_type.clone(),
             entity_name: entity.name.clone(),
             file_path: entity.file_path.clone(),
+            old_entity_name: None,
             old_file_path: None,
             before_content: Some(entity.content.clone()),
             after_content: None,
@@ -256,6 +272,7 @@ pub fn match_entities(
             entity_type: entity.entity_type.clone(),
             entity_name: entity.name.clone(),
             file_path: entity.file_path.clone(),
+            old_entity_name: None,
             old_file_path: None,
             before_content: None,
             after_content: Some(entity.content.clone()),
