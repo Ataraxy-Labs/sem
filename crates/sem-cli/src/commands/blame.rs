@@ -4,6 +4,8 @@ use colored::Colorize;
 use git2::Repository;
 use sem_core::parser::plugins::create_default_registry;
 
+use super::truncate_str;
+
 pub struct BlameOptions {
     pub cwd: String,
     pub file_path: String,
@@ -167,11 +169,7 @@ pub fn blame_command(opts: BlameOptions) {
             });
             let marker = if is_nested { "│   └" } else { "│  ⊕" };
 
-            let summary_short = if r.summary.len() > 40 {
-                format!("{}...", &r.summary[..37])
-            } else {
-                r.summary.clone()
-            };
+            let summary_short = truncate_str(&r.summary, 40);
 
             println!(
                 "{} {:<max_type_len$}  {:<max_name_len$}  {}  {}  {}  {}",

@@ -4,6 +4,8 @@ use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
 use sem_core::parser::plugins::create_default_registry;
 
+use super::truncate_str;
+
 pub struct LogOptions {
     pub cwd: String,
     pub entity_name: String,
@@ -296,11 +298,7 @@ fn print_terminal(
     let max_change_len = entries.iter().map(|e| e.change_type.label().len()).max().unwrap_or(10);
 
     for entry in entries {
-        let msg_short = if entry.message.len() > 50 {
-            format!("{}...", &entry.message[..47])
-        } else {
-            entry.message.clone()
-        };
+        let msg_short = truncate_str(&entry.message, 50);
 
         println!(
             "│  {}  {:<max_author$}  {}  {:<max_change$}  {}",
