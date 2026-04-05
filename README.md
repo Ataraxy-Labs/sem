@@ -39,7 +39,7 @@ Summary: 1 added, 1 modified, 1 deleted across 2 files
 ## Install
 
 ```bash
-brew install ataraxy-labs/tap/sem
+brew install sem-cli
 ```
 
 Or build from source (requires Rust):
