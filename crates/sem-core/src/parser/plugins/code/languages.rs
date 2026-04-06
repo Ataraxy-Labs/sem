@@ -96,6 +96,10 @@ fn get_xml() -> Option<Language> {
     Some(tree_sitter_xml::LANGUAGE_XML.into())
 }
 
+fn get_dart() -> Option<Language> {
+    Some(tree_sitter_dart::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -498,6 +502,28 @@ static XML_CONFIG: LanguageConfig = LanguageConfig {
     get_language: get_xml,
 };
 
+static DART_CONFIG: LanguageConfig = LanguageConfig {
+    id: "dart",
+    extensions: &[".dart"],
+    entity_node_types: &[
+        "class_declaration",
+        "mixin_declaration",
+        "extension_declaration",
+        "extension_type_declaration",
+        "enum_declaration",
+        "type_alias",
+        "class_member",
+        "function_signature",
+        "getter_signature",
+        "setter_signature",
+    ],
+    container_node_types: &["class_body", "enum_body", "extension_body"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_dart,
+};
+
 static ALL_CONFIGS: &[&LanguageConfig] = &[
     &TYPESCRIPT_CONFIG,
     &TSX_CONFIG,
@@ -518,6 +544,7 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &HCL_CONFIG,
     &KOTLIN_CONFIG,
     &XML_CONFIG,
+    &DART_CONFIG,
 ];
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
@@ -536,6 +563,7 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
         ".kt", ".kts",
         ".xml", ".plist", ".svg", ".xhtml", ".csproj", ".fsproj", ".vbproj", ".props", ".targets",
         ".nuspec", ".resx", ".xaml", ".axml",
+        "dart",
     ];
     EXTENSIONS
 }
