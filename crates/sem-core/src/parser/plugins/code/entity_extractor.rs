@@ -91,10 +91,25 @@ fn visit_node(
             };
             let should_skip = should_skip_entity(config, suppression_context, node_type);
             if !should_skip {
-                let content_str = node_text(node, source);
-                let content = content_str.to_string();
+                // Dart top-level signatures are split from their body node.
+                // When a sibling function_body exists, extend the entity to
+                // cover the full definition so body changes are detected.
+                let body = sibling_function_body(node);
+                let end_byte = body.map_or(node.end_byte(), |b| b.end_byte());
+                let content = std::str::from_utf8(&source[node.start_byte()..end_byte])
+                    .unwrap_or("")
+                    .to_string();
+                let end_line =
+                    body.map_or(node.end_position().row + 1, |b| b.end_position().row + 1);
+                let struct_hash = match body {
+                    Some(b) => {
+                        let sig = compute_structural_hash(node, source);
+                        let bod = structural_hash(b, source);
+                        content_hash(&format!("{}{}", sig, bod))
+                    }
+                    None => compute_structural_hash(node, source),
+                };
 
-                let struct_hash = compute_structural_hash(node, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, entity_type, &name, parent_id),
                     file_path: file_path.to_string(),
@@ -105,7 +120,7 @@ fn visit_node(
                     structural_hash: Some(struct_hash),
                     content,
                     start_line: node.start_position().row + 1,
-                    end_line: node.end_position().row + 1,
+                    end_line,
                     metadata: None,
                 };
 
@@ -190,6 +205,18 @@ fn visit_node(
             source,
             child_enclosing,
         );
+    }
+}
+
+/// For Dart top-level function/getter/setter signatures, return the sibling
+/// function_body node so the entity content can be extended to include it.
+fn sibling_function_body(node: Node) -> Option<Node> {
+    match node.kind() {
+        "function_signature" | "getter_signature" | "setter_signature" => {
+            let sibling = node.next_named_sibling()?;
+            (sibling.kind() == "function_body").then_some(sibling)
+        }
+        _ => None,
     }
 }
 
