@@ -1144,6 +1144,80 @@ class Foo {
             "Content hash should differ since raw content includes the name"
         );
     }
+
+    #[test]
+    fn test_dart_top_level_getter_setter() {
+        let code = r#"
+int _value = 0;
+
+int get currentValue {
+  return _value;
+}
+
+set currentValue(int v) {
+  _value = v;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "accessors.dart");
+        eprintln!(
+            "Dart top-level accessors: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.content))
+                .collect::<Vec<_>>()
+        );
+
+        let getter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "getter");
+        assert!(getter.is_some(), "Should find top-level getter, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            getter.unwrap().content.contains("return _value"),
+            "Top-level getter content should include the body"
+        );
+        assert!(getter.unwrap().parent_id.is_none(), "Top-level getter should have no parent");
+
+        // tree-sitter-dart 0.1.0 parses top-level setters as function_signature
+        // (treating `set` as a type_identifier). setter_signature is only
+        // produced inside class_member → method_signature.
+        let setter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "function");
+        assert!(setter.is_some(), "Should find top-level setter as function, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            setter.unwrap().content.contains("_value = v"),
+            "Top-level setter content should include the body"
+        );
+    }
+
+    #[test]
+    fn test_dart_field_entity_type() {
+        let code = r#"
+class Config {
+  final String name;
+  static const int maxRetries = 3;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "config.dart");
+        eprintln!(
+            "Dart fields: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let name_field = entities.iter().find(|e| e.name == "name" && e.parent_id.is_some());
+        assert!(name_field.is_some(), "Should find field 'name', got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(name_field.unwrap().entity_type, "field");
+
+        let max_retries = entities.iter().find(|e| e.name == "maxRetries");
+        assert!(max_retries.is_some(), "Should find field 'maxRetries', got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(max_retries.unwrap().entity_type, "field");
+    }
+
     #[test]
     fn test_dart_identifier_list_fields() {
         // identifier_list produces bare identifier children (no "name" field),
