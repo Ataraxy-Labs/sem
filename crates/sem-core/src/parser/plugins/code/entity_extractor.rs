@@ -660,11 +660,7 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
         "class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
-        "type_alias_declaration"
-        | "type_declaration"
-        | "type_item"
-        | "type_definition"
-        | "type_alias" => "type",
+        "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
         "enum_declaration" | "enum_item" | "enum_specifier" => "enum",
         "mixin_declaration" => "mixin",
         "extension_declaration" | "extension_type_declaration" => "extension",
