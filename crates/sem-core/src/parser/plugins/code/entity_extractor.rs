@@ -615,12 +615,22 @@ fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
 
 fn map_node_type(tree_sitter_type: &str) -> &str {
     match tree_sitter_type {
-        "function_declaration" | "function_definition" | "function_item" => "function",
+        "function_declaration" | "function_definition" | "function_item" | "function_signature" => {
+            "function"
+        }
         "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
         "class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
-        "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" => "type",
+        "type_alias_declaration"
+        | "type_declaration"
+        | "type_item"
+        | "type_definition"
+        | "type_alias" => "type",
         "enum_declaration" | "enum_item" | "enum_specifier" => "enum",
+        "mixin_declaration" => "mixin",
+        "extension_declaration" | "extension_type_declaration" => "extension",
+        "getter_signature" => "getter",
+        "setter_signature" => "setter",
         "struct_item" | "struct_specifier" | "struct_declaration" => "struct",
         "union_specifier" => "union",
         "impl_item" => "impl",
