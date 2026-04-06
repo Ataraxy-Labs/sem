@@ -563,7 +563,7 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
         ".kt", ".kts",
         ".xml", ".plist", ".svg", ".xhtml", ".csproj", ".fsproj", ".vbproj", ".props", ".targets",
         ".nuspec", ".resx", ".xaml", ".axml",
-        "dart",
+        ".dart",
     ];
     EXTENSIONS
 }
