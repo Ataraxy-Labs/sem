@@ -76,7 +76,9 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
 
         // Check for ... (merge-base) syntax first (before ..)
         if let Some((from, to)) = arg.split_once("...") {
-            if !from.is_empty() && !to.is_empty() {
+            if !from.is_empty() || !to.is_empty() {
+                let from = if from.is_empty() { "HEAD" } else { from };
+                let to = if to.is_empty() { "HEAD" } else { to };
                 return ParsedArgs {
                     scope: Some(ParsedScope::MergeBaseRange(from.to_string(), to.to_string())),
                     pathspecs,
@@ -84,14 +86,23 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
             }
         }
 
-        // Check for .. (range) syntax
+        // Check for .. (range) syntax: rev1..rev2, rev1.., ..rev2
         if let Some((from, to)) = arg.split_once("..") {
-            if !from.is_empty() && !to.is_empty() {
+            if !from.is_empty() || !to.is_empty() {
+                let from = if from.is_empty() { "HEAD" } else { from };
+                let to = if to.is_empty() { "HEAD" } else { to };
                 return ParsedArgs {
                     scope: Some(ParsedScope::Range(from.to_string(), to.to_string())),
                     pathspecs,
                 };
             }
+        }
+
+        // If it exists as a file or directory on disk, treat as pathspec
+        if Path::new(arg).exists() {
+            let mut pathspecs = pathspecs;
+            pathspecs.push(arg.clone());
+            return ParsedArgs { scope: None, pathspecs };
         }
 
         // Single ref → compare to working tree

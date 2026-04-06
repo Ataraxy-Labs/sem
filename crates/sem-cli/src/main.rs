@@ -2,7 +2,8 @@ mod cache;
 mod commands;
 mod formatters;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use colored::control;
 use colored::Colorize;
 use commands::blame::{blame_command, BlameOptions};
 use commands::context::{context_command, ContextOptions};
@@ -16,6 +17,13 @@ use commands::log::{log_command, LogOptions};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ColorMode {
+    Always,
+    Auto,
+    Never,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +73,10 @@ enum Commands {
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long)]
         file_exts: Vec<String>,
+
+        /// When to use colors: always, auto, never
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
     },
     /// Show impact of changing an entity (deps, dependents, transitive impact, tests)
     Impact {
@@ -174,6 +186,14 @@ enum Commands {
     Unsetup,
 }
 
+fn apply_color_mode(mode: ColorMode) {
+    match mode {
+        ColorMode::Always => control::set_override(true),
+        ColorMode::Never => control::set_override(false),
+        ColorMode::Auto => {}
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -190,7 +210,9 @@ fn main() {
             format,
             profile,
             file_exts,
+            color,
         }) => {
+            apply_color_mode(color);
             let output_format = match format.as_str() {
                 "json" => OutputFormat::Json,
                 "markdown" | "md" => OutputFormat::Markdown,
