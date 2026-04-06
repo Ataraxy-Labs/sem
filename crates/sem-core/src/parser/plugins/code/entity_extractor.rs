@@ -890,12 +890,20 @@ fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
                     // Field declarations: name is one level deeper
                     if sig.kind() == "initialized_identifier_list"
                         || sig.kind() == "static_final_declaration_list"
-                        || sig.kind() == "identifier_list"
                     {
                         let mut deep = sig.walk();
                         for entry in sig.named_children(&mut deep) {
                             if let Some(name_node) = entry.child_by_field_name("name") {
                                 return Some(node_text(name_node, source).to_string());
+                            }
+                        }
+                    }
+                    // identifier_list has bare identifier children (no "name" field)
+                    if sig.kind() == "identifier_list" {
+                        let mut deep = sig.walk();
+                        for entry in sig.named_children(&mut deep) {
+                            if entry.kind() == "identifier" {
+                                return Some(node_text(entry, source).to_string());
                             }
                         }
                     }
@@ -943,12 +951,20 @@ fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
                     }
                     if sig.kind() == "initialized_identifier_list"
                         || sig.kind() == "static_final_declaration_list"
-                        || sig.kind() == "identifier_list"
                     {
                         let mut deep = sig.walk();
                         for entry in sig.named_children(&mut deep) {
                             if let Some(name_node) = entry.child_by_field_name("name") {
                                 return Some((name_node.start_byte(), name_node.end_byte()));
+                            }
+                        }
+                    }
+                    // identifier_list has bare identifier children (no "name" field)
+                    if sig.kind() == "identifier_list" {
+                        let mut deep = sig.walk();
+                        for entry in sig.named_children(&mut deep) {
+                            if entry.kind() == "identifier" {
+                                return Some((entry.start_byte(), entry.end_byte()));
                             }
                         }
                     }

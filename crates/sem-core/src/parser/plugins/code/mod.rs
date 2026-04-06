@@ -1144,4 +1144,36 @@ class Foo {
             "Content hash should differ since raw content includes the name"
         );
     }
+    #[test]
+    fn test_dart_identifier_list_fields() {
+        // identifier_list produces bare identifier children (no "name" field),
+        // unlike initialized_identifier_list which wraps each in an
+        // initialized_identifier node with a "name" field.
+        let code = r#"
+abstract class Shape {
+  abstract double x, y;
+  abstract String label;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "shape.dart");
+        eprintln!(
+            "Dart identifier_list fields: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let x_field = entities.iter().find(|e| e.name == "x");
+        assert!(x_field.is_some(), "Should find field 'x' from identifier_list, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(x_field.unwrap().entity_type, "field");
+        assert!(x_field.unwrap().parent_id.is_some(), "field 'x' should be nested under Shape");
+
+        let label_field = entities.iter().find(|e| e.name == "label");
+        assert!(label_field.is_some(), "Should find field 'label' from single-element identifier_list, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(label_field.unwrap().entity_type, "field");
+    }
 }
