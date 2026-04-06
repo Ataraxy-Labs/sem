@@ -108,6 +108,15 @@ pub fn match_entities(
             matched_before.insert(&before_entity.id);
             matched_after.insert(&after_entity.id);
 
+            // If name and file are the same, only the parent qualifier in the ID changed
+            // (e.g. parent class was renamed). Skip — the entity itself is unchanged.
+            if before_entity.name == after_entity.name
+                && before_entity.file_path == after_entity.file_path
+                && before_entity.content_hash == after_entity.content_hash
+            {
+                continue;
+            }
+
             let change_type = if before_entity.file_path != after_entity.file_path {
                 ChangeType::Moved
             } else {
@@ -203,6 +212,14 @@ pub fn match_entities(
                 if let Some(matched) = best_match {
                     matched_before.insert(&matched.id);
                     matched_after.insert(&after_entity.id);
+
+                    // If name and file are the same, only the parent qualifier changed.
+                    if matched.name == after_entity.name
+                        && matched.file_path == after_entity.file_path
+                        && matched.content_hash == after_entity.content_hash
+                    {
+                        continue;
+                    }
 
                     let change_type = if matched.file_path != after_entity.file_path {
                         ChangeType::Moved

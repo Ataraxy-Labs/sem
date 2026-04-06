@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use git2::{
-    Delta, Diff, DiffOptions, ErrorCode, Repository, StatusOptions,
+    Delta, Diff, DiffOptions, ErrorCode, Repository,
 };
 use thiserror::Error;
 
@@ -61,10 +61,8 @@ impl GitBridge {
             return Ok((DiffScope::Staged, files));
         }
 
-        // Check for working tree changes + untracked
+        // Check for working tree changes (match git diff: no untracked files)
         let mut working_files = self.get_working_diff_files(pathspecs)?;
-        let untracked = self.get_untracked_files(pathspecs)?;
-        working_files.extend(untracked);
 
         if !working_files.is_empty() {
             self.populate_contents(&mut working_files, &DiffScope::Working)?;
@@ -79,10 +77,7 @@ impl GitBridge {
     pub fn get_changed_files(&self, scope: &DiffScope, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let mut files = match scope {
             DiffScope::Working => {
-                let mut files = self.get_working_diff_files(pathspecs)?;
-                let untracked = self.get_untracked_files(pathspecs)?;
-                files.extend(untracked);
-                files
+                self.get_working_diff_files(pathspecs)?
             }
             DiffScope::Staged => self.get_staged_diff_files(pathspecs)?,
             DiffScope::Commit { sha } => self.get_commit_diff_files(sha, pathspecs)?,
@@ -143,37 +138,6 @@ impl GitBridge {
 
         let diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
         Ok(self.diff_to_file_changes(&diff))
-    }
-
-    fn get_untracked_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .exclude_submodules(true);
-        for spec in pathspecs {
-            opts.pathspec(spec.as_str());
-        }
-
-        let statuses = self.repo.statuses(Some(&mut opts))?;
-        let mut files = Vec::new();
-
-        for entry in statuses.iter() {
-            if entry.status().contains(git2::Status::WT_NEW) {
-                if let Some(path) = entry.path() {
-                    if !path.starts_with(".sem/") {
-                        files.push(FileChange {
-                            file_path: path.to_string(),
-                            status: FileStatus::Added,
-                            old_file_path: None,
-                            before_content: None,
-                            after_content: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(files)
     }
 
     fn get_commit_diff_files(&self, sha: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
