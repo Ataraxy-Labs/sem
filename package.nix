@@ -6,13 +6,13 @@
 pkgs.rustPlatform.buildRustPackage rec {
   pname = "sem";
   version = let
-    name = pname + "-cli";
+    crate_name = pname + "-cli";
   in
-    (builtins.fromTOML (lib.readFile ./${name}/Cargo.toml)).package.version;
+    (builtins.fromTOML (lib.readFile "${src}/${crate_name}/Cargo.toml")).package.version;
 
   src = ./crates;
   cargoLock = {
-    lockFile = ./Cargo.lock;
+    lockFile = "${src}/Cargo.lock";
     outputHashes = {
       # "dummy-0.14.0" = lib.fakeHash;
     };

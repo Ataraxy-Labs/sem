@@ -3,6 +3,7 @@ target/
 *.db
 .DS_Store
 
-# Nixos
-.direnv/
+# Nixos artifacts
 .envrc
+.direnv/
+result/
