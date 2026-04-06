@@ -852,6 +852,21 @@ fn map_class_member_type(node: Node) -> &'static str {
     "member"
 }
 
+/// Dart constructor signatures use `field("name", seq(identifier, optional(".", identifier)))`,
+/// so the "name" field label is shared by multiple identifier nodes. Collect them all and
+/// join with "." to produce e.g. "Calculator.withDefault" for named constructors.
+const DART_CONSTRUCTOR_SIG_KINDS: &[&str] = &[
+    "constructor_signature",
+    "constant_constructor_signature",
+    "factory_constructor_signature",
+    "redirecting_factory_constructor_signature",
+];
+
+fn extract_dart_constructor_full_name(sig: Node, source: &[u8]) -> Option<String> {
+    let (start, end) = dart_constructor_name_byte_range(sig)?;
+    std::str::from_utf8(&source[start..end]).ok().map(|s| s.to_string())
+}
+
 /// Extract the name from a Dart class_member node.
 /// The name is nested inside method_signature or declaration → inner signature → name field.
 fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
@@ -861,6 +876,9 @@ fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
             "method_signature" | "declaration" => {
                 let mut inner = child.walk();
                 for sig in child.named_children(&mut inner) {
+                    if DART_CONSTRUCTOR_SIG_KINDS.contains(&sig.kind()) {
+                        return extract_dart_constructor_full_name(sig, source);
+                    }
                     if let Some(name_node) = sig.child_by_field_name("name") {
                         return Some(node_text(name_node, source).to_string());
                     }
@@ -872,6 +890,7 @@ fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
                     // Field declarations: name is one level deeper
                     if sig.kind() == "initialized_identifier_list"
                         || sig.kind() == "static_final_declaration_list"
+                        || sig.kind() == "identifier_list"
                     {
                         let mut deep = sig.walk();
                         for entry in sig.named_children(&mut deep) {
@@ -888,6 +907,21 @@ fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// Byte range spanning all "name" field children of a Dart constructor signature,
+/// covering the full `Calculator.withDefault` span including the dot.
+fn dart_constructor_name_byte_range(sig: Node) -> Option<(usize, usize)> {
+    let mut cursor = sig.walk();
+    let mut start = None;
+    let mut end = None;
+    for n in sig.children_by_field_name("name", &mut cursor) {
+        if start.is_none() {
+            start = Some(n.start_byte());
+        }
+        end = Some(n.end_byte());
+    }
+    start.zip(end)
+}
+
 /// Find the byte range of the name inside a Dart class_member node (for structural hashing).
 fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
     let mut cursor = node.walk();
@@ -896,6 +930,9 @@ fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
             "method_signature" | "declaration" => {
                 let mut inner = child.walk();
                 for sig in child.named_children(&mut inner) {
+                    if DART_CONSTRUCTOR_SIG_KINDS.contains(&sig.kind()) {
+                        return dart_constructor_name_byte_range(sig);
+                    }
                     if let Some(name_node) = sig.child_by_field_name("name") {
                         return Some((name_node.start_byte(), name_node.end_byte()));
                     }
@@ -906,6 +943,7 @@ fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
                     }
                     if sig.kind() == "initialized_identifier_list"
                         || sig.kind() == "static_final_declaration_list"
+                        || sig.kind() == "identifier_list"
                     {
                         let mut deep = sig.walk();
                         for entry in sig.named_children(&mut deep) {

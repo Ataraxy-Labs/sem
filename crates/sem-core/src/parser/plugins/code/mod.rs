@@ -942,6 +942,10 @@ class Calculator {
 
   Calculator.withDefault() : name = 'default';
 
+  factory Calculator.create(String name) {
+    return Calculator(name);
+  }
+
   int add(int a, int b) {
     return a + b;
   }
@@ -979,6 +983,8 @@ typedef Callback = void Function(int);
 int add(int a, int b) {
   return a + b;
 }
+
+extension type Wrapper(int value) implements int {}
 "#;
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "calculator.dart");
@@ -992,59 +998,49 @@ int add(int a, int b) {
         );
 
         // Top-level declarations
-        assert!(
-            names.contains(&"Calculator"),
-            "Should find class, got: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"Loggable"),
-            "Should find mixin, got: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"StringExt"),
-            "Should find extension, got: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"Status"),
-            "Should find enum, got: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"Callback"),
-            "Should find typedef, got: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"add"),
-            "Should find top-level function, got: {:?}",
-            names
-        );
+        assert!(names.contains(&"Calculator"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"Loggable"), "Should find mixin, got: {:?}", names);
+        assert!(names.contains(&"StringExt"), "Should find extension, got: {:?}", names);
+        assert!(names.contains(&"Status"), "Should find enum, got: {:?}", names);
+        assert!(names.contains(&"Callback"), "Should find typedef, got: {:?}", names);
+        assert!(names.contains(&"add"), "Should find top-level function, got: {:?}", names);
+        assert!(names.contains(&"Wrapper"), "Should find extension type, got: {:?}", names);
 
         // Class members with correct types
-        let add_method = entities
-            .iter()
-            .find(|e| e.name == "add" && e.parent_id.is_some());
-        assert!(
-            add_method.is_some(),
-            "Should find add method inside Calculator, got: {:?}",
-            names
-        );
+        let add_method = entities.iter().find(|e| e.name == "add" && e.parent_id.is_some());
+        assert!(add_method.is_some(), "Should find add method inside Calculator");
         assert_eq!(add_method.unwrap().entity_type, "method");
+
+        // Named constructor gets distinct name from unnamed constructor
+        let unnamed_ctor = entities.iter().find(|e| e.name == "Calculator" && e.entity_type == "constructor");
+        assert!(unnamed_ctor.is_some(), "Should find unnamed constructor");
+        let named_ctor = entities.iter().find(|e| e.name == "Calculator.withDefault");
+        assert!(named_ctor.is_some(), "Should find named constructor Calculator.withDefault, got: {:?}", names);
+        assert_eq!(named_ctor.unwrap().entity_type, "constructor");
+        assert_ne!(unnamed_ctor.unwrap().id, named_ctor.unwrap().id, "Named and unnamed constructors must have different entity IDs");
+
+        // Factory constructor
+        let factory_ctor = entities.iter().find(|e| e.name == "Calculator.create");
+        assert!(factory_ctor.is_some(), "Should find factory constructor Calculator.create, got: {:?}", names);
+        assert_eq!(factory_ctor.unwrap().entity_type, "constructor");
+
+        // Getter, setter, operator
+        let getter = entities.iter().find(|e| e.name == "doubleAdd");
+        assert!(getter.is_some(), "Should find getter doubleAdd");
+        assert_eq!(getter.unwrap().entity_type, "getter");
+
+        let setter = entities.iter().find(|e| e.name == "label");
+        assert!(setter.is_some(), "Should find setter label");
+        assert_eq!(setter.unwrap().entity_type, "setter");
+
+        let operator = entities.iter().find(|e| e.name == "operator +");
+        assert!(operator.is_some(), "Should find operator +");
+        assert_eq!(operator.unwrap().entity_type, "method");
 
         // Mixin members have parent
         let log_method = entities.iter().find(|e| e.name == "log");
-        assert!(
-            log_method.is_some(),
-            "Should find log in Loggable, got: {:?}",
-            names
-        );
-        assert!(
-            log_method.unwrap().parent_id.is_some(),
-            "log should have parent_id"
-        );
+        assert!(log_method.is_some(), "Should find log in Loggable");
+        assert!(log_method.unwrap().parent_id.is_some(), "log should have parent_id");
 
         // Entity type mapping
         let callback = entities.iter().find(|e| e.name == "Callback").unwrap();
@@ -1055,6 +1051,9 @@ int add(int a, int b) {
 
         let ext = entities.iter().find(|e| e.name == "StringExt").unwrap();
         assert_eq!(ext.entity_type, "extension");
+
+        let wrapper = entities.iter().find(|e| e.name == "Wrapper").unwrap();
+        assert_eq!(wrapper.entity_type, "extension");
     }
 
     #[test]
@@ -1110,6 +1109,39 @@ String greet(String name) => 'Hello, $name!';
         assert_eq!(
             greet_fn.content_hash, greet_v2.content_hash,
             "Unchanged function should keep the same content_hash"
+        );
+    }
+
+    #[test]
+    fn test_dart_renamed_named_constructor_same_structural_hash() {
+        let code_a = r#"
+class Foo {
+  Foo.fromJson(Map<String, dynamic> json) {
+    print(json);
+  }
+}
+"#;
+        let code_b = r#"
+class Foo {
+  Foo.fromMap(Map<String, dynamic> json) {
+    print(json);
+  }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities_a = plugin.extract_entities(code_a, "a.dart");
+        let entities_b = plugin.extract_entities(code_b, "b.dart");
+
+        let ctor_a = entities_a.iter().find(|e| e.name == "Foo.fromJson").unwrap();
+        let ctor_b = entities_b.iter().find(|e| e.name == "Foo.fromMap").unwrap();
+
+        assert_eq!(
+            ctor_a.structural_hash, ctor_b.structural_hash,
+            "Renamed named constructor with identical body should have same structural_hash"
+        );
+        assert_ne!(
+            ctor_a.content_hash, ctor_b.content_hash,
+            "Content hash should differ since raw content includes the name"
         );
     }
 }
