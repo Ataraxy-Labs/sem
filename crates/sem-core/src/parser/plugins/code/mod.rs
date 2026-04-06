@@ -929,4 +929,187 @@ func main() {}
         assert!(names.contains(&"x"), "Should find grouped const x, got: {:?}", names);
         assert!(names.contains(&"main"), "Should find func main, got: {:?}", names);
     }
+
+    #[test]
+    fn test_dart_entity_extraction() {
+        let code = r#"
+import 'dart:math';
+
+class Calculator {
+  final String name;
+
+  Calculator(this.name);
+
+  Calculator.withDefault() : name = 'default';
+
+  int add(int a, int b) {
+    return a + b;
+  }
+
+  int get doubleAdd => add(1, 1) * 2;
+
+  set label(String value) {
+    // no-op
+  }
+
+  int operator +(Calculator other) {
+    return 0;
+  }
+}
+
+mixin Loggable {
+  void log(String message) {
+    print(message);
+  }
+}
+
+extension StringExt on String {
+  bool get isBlank => trim().isEmpty;
+}
+
+enum Status {
+  active,
+  inactive;
+
+  String display() => name.toUpperCase();
+}
+
+typedef Callback = void Function(int);
+
+int add(int a, int b) {
+  return a + b;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "calculator.dart");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!(
+            "Dart entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        // Top-level declarations
+        assert!(
+            names.contains(&"Calculator"),
+            "Should find class, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Loggable"),
+            "Should find mixin, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"StringExt"),
+            "Should find extension, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Callback"),
+            "Should find typedef, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find top-level function, got: {:?}",
+            names
+        );
+
+        // Class members with correct types
+        let add_method = entities
+            .iter()
+            .find(|e| e.name == "add" && e.parent_id.is_some());
+        assert!(
+            add_method.is_some(),
+            "Should find add method inside Calculator, got: {:?}",
+            names
+        );
+        assert_eq!(add_method.unwrap().entity_type, "method");
+
+        // Mixin members have parent
+        let log_method = entities.iter().find(|e| e.name == "log");
+        assert!(
+            log_method.is_some(),
+            "Should find log in Loggable, got: {:?}",
+            names
+        );
+        assert!(
+            log_method.unwrap().parent_id.is_some(),
+            "log should have parent_id"
+        );
+
+        // Entity type mapping
+        let callback = entities.iter().find(|e| e.name == "Callback").unwrap();
+        assert_eq!(callback.entity_type, "type", "typedef should map to 'type'");
+
+        let loggable = entities.iter().find(|e| e.name == "Loggable").unwrap();
+        assert_eq!(loggable.entity_type, "mixin");
+
+        let ext = entities.iter().find(|e| e.name == "StringExt").unwrap();
+        assert_eq!(ext.entity_type, "extension");
+    }
+
+    #[test]
+    fn test_dart_top_level_function_includes_body() {
+        let code = r#"
+int add(int a, int b) {
+  return a + b;
+}
+
+String greet(String name) => 'Hello, $name!';
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "funcs.dart");
+        eprintln!(
+            "Dart top-level: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.content))
+                .collect::<Vec<_>>()
+        );
+
+        let add_fn = entities.iter().find(|e| e.name == "add").unwrap();
+        assert!(
+            add_fn.content.contains("return a + b"),
+            "Top-level function content should include the body, got: {:?}",
+            add_fn.content
+        );
+
+        let greet_fn = entities.iter().find(|e| e.name == "greet").unwrap();
+        assert!(
+            greet_fn.content.contains("Hello"),
+            "Expression body should be included, got: {:?}",
+            greet_fn.content
+        );
+
+        // Body changes should produce different content_hash
+        let code_v2 = r#"
+int add(int a, int b) {
+  return a * b;
+}
+
+String greet(String name) => 'Hello, $name!';
+"#;
+        let entities_v2 = plugin.extract_entities(code_v2, "funcs.dart");
+        let add_v2 = entities_v2.iter().find(|e| e.name == "add").unwrap();
+        assert_ne!(
+            add_fn.content_hash, add_v2.content_hash,
+            "Body change should produce different content_hash"
+        );
+
+        // Unchanged function should keep the same hash
+        let greet_v2 = entities_v2.iter().find(|e| e.name == "greet").unwrap();
+        assert_eq!(
+            greet_fn.content_hash, greet_v2.content_hash,
+            "Unchanged function should keep the same content_hash"
+        );
+    }
 }
