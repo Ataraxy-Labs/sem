@@ -94,7 +94,7 @@ fn visit_node(
                 // Dart top-level signatures are split from their body node.
                 // When a sibling function_body exists, extend the entity to
                 // cover the full definition so body changes are detected.
-                let body = sibling_function_body(node);
+                let body = if config.id == "dart" { sibling_function_body(node) } else { None };
                 let end_byte = body.map_or(node.end_byte(), |b| b.end_byte());
                 let content = std::str::from_utf8(&source[node.start_byte()..end_byte])
                     .unwrap_or("")
