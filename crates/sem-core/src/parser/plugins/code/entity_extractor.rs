@@ -904,7 +904,9 @@ fn walk_dart_class_member<T>(
                     if sig.kind() == "operator_signature" {
                         return resolve(sig, source);
                     }
-                    // Field declarations: name is one level deeper
+                    // Field declarations: name is one level deeper.
+                    // Only the first identifier is captured (one entity per class_member node),
+                    // so `abstract double x, y;` yields only `x`.
                     if sig.kind() == "initialized_identifier_list"
                         || sig.kind() == "static_final_declaration_list"
                     {
