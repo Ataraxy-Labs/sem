@@ -34,6 +34,7 @@ tree-sitter-xml = "0.7"
 tree-sitter-embedded-template = "0.25"
 tree-sitter-ocaml = "0.24"
 tree-sitter-htmlx-svelte = "0.1.7"
+tree-sitter-dart = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

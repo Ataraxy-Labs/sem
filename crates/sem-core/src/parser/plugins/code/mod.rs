@@ -931,6 +931,324 @@ func main() {}
     }
 
     #[test]
+    fn test_dart_entity_extraction() {
+        let code = r#"
+import 'dart:math';
+
+class Calculator {
+  final String name;
+
+  Calculator(this.name);
+
+  Calculator.withDefault() : name = 'default';
+
+  factory Calculator.create(String name) {
+    return Calculator(name);
+  }
+
+  int add(int a, int b) {
+    return a + b;
+  }
+
+  int get doubleAdd => add(1, 1) * 2;
+
+  set label(String value) {
+    // no-op
+  }
+
+  int operator +(Calculator other) {
+    return 0;
+  }
+}
+
+mixin Loggable {
+  void log(String message) {
+    print(message);
+  }
+}
+
+extension StringExt on String {
+  bool get isBlank => trim().isEmpty;
+}
+
+enum Status {
+  active,
+  inactive;
+
+  String display() => name.toUpperCase();
+}
+
+typedef Callback = void Function(int);
+
+int add(int a, int b) {
+  return a + b;
+}
+
+extension type Wrapper(int value) implements int {}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "calculator.dart");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!(
+            "Dart entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        // Top-level declarations
+        assert!(names.contains(&"Calculator"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"Loggable"), "Should find mixin, got: {:?}", names);
+        assert!(names.contains(&"StringExt"), "Should find extension, got: {:?}", names);
+        assert!(names.contains(&"Status"), "Should find enum, got: {:?}", names);
+        assert!(names.contains(&"Callback"), "Should find typedef, got: {:?}", names);
+        assert!(names.contains(&"add"), "Should find top-level function, got: {:?}", names);
+        assert!(names.contains(&"Wrapper"), "Should find extension type, got: {:?}", names);
+
+        // Class members with correct types
+        let add_method = entities.iter().find(|e| e.name == "add" && e.parent_id.is_some());
+        assert!(add_method.is_some(), "Should find add method inside Calculator");
+        assert_eq!(add_method.unwrap().entity_type, "method");
+
+        // Named constructor gets distinct name from unnamed constructor
+        let unnamed_ctor = entities.iter().find(|e| e.name == "Calculator" && e.entity_type == "constructor");
+        assert!(unnamed_ctor.is_some(), "Should find unnamed constructor");
+        let named_ctor = entities.iter().find(|e| e.name == "Calculator.withDefault");
+        assert!(named_ctor.is_some(), "Should find named constructor Calculator.withDefault, got: {:?}", names);
+        assert_eq!(named_ctor.unwrap().entity_type, "constructor");
+        assert_ne!(unnamed_ctor.unwrap().id, named_ctor.unwrap().id, "Named and unnamed constructors must have different entity IDs");
+
+        // Factory constructor
+        let factory_ctor = entities.iter().find(|e| e.name == "Calculator.create");
+        assert!(factory_ctor.is_some(), "Should find factory constructor Calculator.create, got: {:?}", names);
+        assert_eq!(factory_ctor.unwrap().entity_type, "constructor");
+
+        // Getter, setter, operator
+        let getter = entities.iter().find(|e| e.name == "doubleAdd");
+        assert!(getter.is_some(), "Should find getter doubleAdd");
+        assert_eq!(getter.unwrap().entity_type, "getter");
+
+        let setter = entities.iter().find(|e| e.name == "label");
+        assert!(setter.is_some(), "Should find setter label");
+        assert_eq!(setter.unwrap().entity_type, "setter");
+
+        let operator = entities.iter().find(|e| e.name == "operator +");
+        assert!(operator.is_some(), "Should find operator +");
+        assert_eq!(operator.unwrap().entity_type, "method");
+
+        // Mixin members have parent
+        let log_method = entities.iter().find(|e| e.name == "log");
+        assert!(log_method.is_some(), "Should find log in Loggable");
+        assert!(log_method.unwrap().parent_id.is_some(), "log should have parent_id");
+
+        // Entity type mapping
+        let callback = entities.iter().find(|e| e.name == "Callback").unwrap();
+        assert_eq!(callback.entity_type, "type", "typedef should map to 'type'");
+
+        let loggable = entities.iter().find(|e| e.name == "Loggable").unwrap();
+        assert_eq!(loggable.entity_type, "mixin");
+
+        let ext = entities.iter().find(|e| e.name == "StringExt").unwrap();
+        assert_eq!(ext.entity_type, "extension");
+
+        let wrapper = entities.iter().find(|e| e.name == "Wrapper").unwrap();
+        assert_eq!(wrapper.entity_type, "extension");
+    }
+
+    #[test]
+    fn test_dart_top_level_function_includes_body() {
+        let code = r#"
+int add(int a, int b) {
+  return a + b;
+}
+
+String greet(String name) => 'Hello, $name!';
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "funcs.dart");
+        eprintln!(
+            "Dart top-level: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.content))
+                .collect::<Vec<_>>()
+        );
+
+        let add_fn = entities.iter().find(|e| e.name == "add").unwrap();
+        assert!(
+            add_fn.content.contains("return a + b"),
+            "Top-level function content should include the body, got: {:?}",
+            add_fn.content
+        );
+
+        let greet_fn = entities.iter().find(|e| e.name == "greet").unwrap();
+        assert!(
+            greet_fn.content.contains("Hello"),
+            "Expression body should be included, got: {:?}",
+            greet_fn.content
+        );
+
+        // Body changes should produce different content_hash
+        let code_v2 = r#"
+int add(int a, int b) {
+  return a * b;
+}
+
+String greet(String name) => 'Hello, $name!';
+"#;
+        let entities_v2 = plugin.extract_entities(code_v2, "funcs.dart");
+        let add_v2 = entities_v2.iter().find(|e| e.name == "add").unwrap();
+        assert_ne!(
+            add_fn.content_hash, add_v2.content_hash,
+            "Body change should produce different content_hash"
+        );
+
+        // Unchanged function should keep the same hash
+        let greet_v2 = entities_v2.iter().find(|e| e.name == "greet").unwrap();
+        assert_eq!(
+            greet_fn.content_hash, greet_v2.content_hash,
+            "Unchanged function should keep the same content_hash"
+        );
+    }
+
+    #[test]
+    fn test_dart_renamed_named_constructor_same_structural_hash() {
+        let code_a = r#"
+class Foo {
+  Foo.fromJson(Map<String, dynamic> json) {
+    print(json);
+  }
+}
+"#;
+        let code_b = r#"
+class Foo {
+  Foo.fromMap(Map<String, dynamic> json) {
+    print(json);
+  }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities_a = plugin.extract_entities(code_a, "a.dart");
+        let entities_b = plugin.extract_entities(code_b, "b.dart");
+
+        let ctor_a = entities_a.iter().find(|e| e.name == "Foo.fromJson").unwrap();
+        let ctor_b = entities_b.iter().find(|e| e.name == "Foo.fromMap").unwrap();
+
+        assert_eq!(
+            ctor_a.structural_hash, ctor_b.structural_hash,
+            "Renamed named constructor with identical body should have same structural_hash"
+        );
+        assert_ne!(
+            ctor_a.content_hash, ctor_b.content_hash,
+            "Content hash should differ since raw content includes the name"
+        );
+    }
+
+    #[test]
+    fn test_dart_top_level_getter_setter() {
+        let code = r#"
+int _value = 0;
+
+int get currentValue {
+  return _value;
+}
+
+set currentValue(int v) {
+  _value = v;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "accessors.dart");
+        eprintln!(
+            "Dart top-level accessors: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.content))
+                .collect::<Vec<_>>()
+        );
+
+        let getter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "getter");
+        assert!(getter.is_some(), "Should find top-level getter, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            getter.unwrap().content.contains("return _value"),
+            "Top-level getter content should include the body"
+        );
+        assert!(getter.unwrap().parent_id.is_none(), "Top-level getter should have no parent");
+
+        // tree-sitter-dart 0.1.0 parses top-level setters as function_signature
+        // (treating `set` as a type_identifier). setter_signature is only
+        // produced inside class_member → method_signature.
+        let setter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "function");
+        assert!(setter.is_some(), "Should find top-level setter as function, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            setter.unwrap().content.contains("_value = v"),
+            "Top-level setter content should include the body"
+        );
+    }
+
+    #[test]
+    fn test_dart_field_entity_type() {
+        let code = r#"
+class Config {
+  final String name;
+  static const int maxRetries = 3;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "config.dart");
+        eprintln!(
+            "Dart fields: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let name_field = entities.iter().find(|e| e.name == "name" && e.parent_id.is_some());
+        assert!(name_field.is_some(), "Should find field 'name', got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(name_field.unwrap().entity_type, "field");
+
+        let max_retries = entities.iter().find(|e| e.name == "maxRetries");
+        assert!(max_retries.is_some(), "Should find field 'maxRetries', got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(max_retries.unwrap().entity_type, "field");
+    }
+
+    #[test]
+    fn test_dart_identifier_list_fields() {
+        // identifier_list produces bare identifier children (no "name" field),
+        // unlike initialized_identifier_list which wraps each in an
+        // initialized_identifier node with a "name" field.
+        let code = r#"
+abstract class Shape {
+  abstract double x, y;
+  abstract String label;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "shape.dart");
+        eprintln!(
+            "Dart identifier_list fields: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let x_field = entities.iter().find(|e| e.name == "x");
+        assert!(x_field.is_some(), "Should find field 'x' from identifier_list, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(x_field.unwrap().entity_type, "field");
+        assert!(x_field.unwrap().parent_id.is_some(), "field 'x' should be nested under Shape");
+
+        let label_field = entities.iter().find(|e| e.name == "label");
+        assert!(label_field.is_some(), "Should find field 'label' from single-element identifier_list, got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert_eq!(label_field.unwrap().entity_type, "field");
     fn test_ocaml_entity_extraction() {
         let code = r#"
 type color = Red | Green | Blue

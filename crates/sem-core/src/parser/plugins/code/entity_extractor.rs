@@ -144,15 +144,32 @@ fn visit_node(
             let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
             let entity_type = if node_type == "decorated_definition" {
                 map_decorated_type(node)
+            } else if node_type == "class_member" {
+                map_class_member_type(node)
             } else {
                 map_node_type(node_type)
             };
             let should_skip = should_skip_entity(config, suppression_context, node_type);
             if !should_skip {
-                let content_str = node_text(node, source);
-                let content = content_str.to_string();
+                // Dart top-level signatures are split from their body node.
+                // When a sibling function_body exists, extend the entity to
+                // cover the full definition so body changes are detected.
+                let body = if config.id == "dart" { sibling_function_body(node) } else { None };
+                let end_byte = body.map_or(node.end_byte(), |b| b.end_byte());
+                let content = std::str::from_utf8(&source[node.start_byte()..end_byte])
+                    .unwrap_or("")
+                    .to_string();
+                let end_line =
+                    body.map_or(node.end_position().row + 1, |b| b.end_position().row + 1);
+                let struct_hash = match body {
+                    Some(b) => {
+                        let sig = compute_structural_hash(node, source);
+                        let bod = structural_hash(b, source);
+                        content_hash(&format!("{}{}", sig, bod))
+                    }
+                    None => compute_structural_hash(node, source),
+                };
 
-                let struct_hash = compute_structural_hash(node, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, entity_type, &name, parent_id),
                     file_path: file_path.to_string(),
@@ -163,7 +180,7 @@ fn visit_node(
                     structural_hash: Some(struct_hash),
                     content,
                     start_line: node.start_position().row + 1,
-                    end_line: node.end_position().row + 1,
+                    end_line,
                     metadata: None,
                 };
 
@@ -251,6 +268,18 @@ fn visit_node(
     }
 }
 
+/// For Dart top-level function/getter/setter signatures, return the sibling
+/// function_body node so the entity content can be extended to include it.
+fn sibling_function_body(node: Node) -> Option<Node> {
+    match node.kind() {
+        "function_signature" | "getter_signature" | "setter_signature" => {
+            let sibling = node.next_named_sibling()?;
+            (sibling.kind() == "function_body").then_some(sibling)
+        }
+        _ => None,
+    }
+}
+
 /// Compute the structural hash for an entity, excluding the name token so that
 /// renames of otherwise identical entities produce the same hash.
 fn compute_structural_hash(node: Node, source: &[u8]) -> String {
@@ -308,6 +337,11 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
                 }
             }
         }
+    }
+
+    // Dart class_member: name is inside method_signature or declaration
+    if node_type == "class_member" {
+        return find_dart_class_member_name_range(node, _source);
     }
 
     // Decorated definitions (Python): look at the inner definition
@@ -641,6 +675,9 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
+    // For Dart class_member, the name is nested inside method_signature or declaration
+    if node_type == "class_member" {
+        return extract_dart_class_member_name(node, source);
     // OCaml: exception_definition -> constructor_declaration -> constructor_name
     if node_type == "exception_definition" {
         let mut cursor = node.walk();
@@ -792,12 +829,18 @@ fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
 
 fn map_node_type(tree_sitter_type: &str) -> &str {
     match tree_sitter_type {
-        "function_declaration" | "function_definition" | "function_item" => "function",
+        "function_declaration" | "function_definition" | "function_item" | "function_signature" => {
+            "function"
+        }
         "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
         "class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
-        "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" => "type",
+        "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
         "enum_declaration" | "enum_item" | "enum_specifier" => "enum",
+        "mixin_declaration" => "mixin",
+        "extension_declaration" | "extension_type_declaration" => "extension",
+        "getter_signature" => "getter",
+        "setter_signature" => "setter",
         "struct_item" | "struct_specifier" | "struct_declaration" => "struct",
         "union_specifier" => "union",
         "impl_item" => "impl",
@@ -946,6 +989,157 @@ fn map_decorated_type(node: Node) -> &'static str {
     "function"
 }
 
+/// For Dart class_member, determine the entity type from the inner signature or declaration.
+fn map_class_member_type(node: Node) -> &'static str {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "method_signature" => {
+                let mut inner = child.walk();
+                for sig in child.named_children(&mut inner) {
+                    return match sig.kind() {
+                        "function_signature" => "method",
+                        "getter_signature" => "getter",
+                        "setter_signature" => "setter",
+                        "constructor_signature" | "factory_constructor_signature" => "constructor",
+                        "operator_signature" => "method",
+                        _ => continue,
+                    };
+                }
+            }
+            "declaration" => {
+                let mut inner = child.walk();
+                for sig in child.named_children(&mut inner) {
+                    return match sig.kind() {
+                        "function_signature" => "method",
+                        "getter_signature" => "getter",
+                        "setter_signature" => "setter",
+                        "constructor_signature"
+                        | "constant_constructor_signature"
+                        | "factory_constructor_signature"
+                        | "redirecting_factory_constructor_signature" => "constructor",
+                        "operator_signature" => "method",
+                        "initialized_identifier_list"
+                        | "static_final_declaration_list"
+                        | "identifier_list" => "field",
+                        _ => continue,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    "member"
+}
+
+/// Dart constructor signatures use `field("name", seq(identifier, optional(".", identifier)))`,
+/// so the "name" field label is shared by multiple identifier nodes. Collect them all and
+/// join with "." to produce e.g. "Calculator.withDefault" for named constructors.
+const DART_CONSTRUCTOR_SIG_KINDS: &[&str] = &[
+    "constructor_signature",
+    "constant_constructor_signature",
+    "factory_constructor_signature",
+    "redirecting_factory_constructor_signature",
+];
+
+fn extract_dart_constructor_full_name(sig: Node, source: &[u8]) -> Option<String> {
+    let (start, end) = dart_constructor_name_byte_range(sig)?;
+    std::str::from_utf8(&source[start..end]).ok().map(|s| s.to_string())
+}
+
+/// Byte range spanning all "name" field children of a Dart constructor signature,
+/// covering the full `Calculator.withDefault` span including the dot.
+fn dart_constructor_name_byte_range(sig: Node) -> Option<(usize, usize)> {
+    let mut cursor = sig.walk();
+    let mut start = None;
+    let mut end = None;
+    for n in sig.children_by_field_name("name", &mut cursor) {
+        if start.is_none() {
+            start = Some(n.start_byte());
+        }
+        end = Some(n.end_byte());
+    }
+    start.zip(end)
+}
+
+/// Walk a Dart `class_member` node's tree to find the name-bearing node,
+/// then call `resolve` to convert it into the caller's desired type.
+fn walk_dart_class_member<T>(
+    node: Node,
+    source: &[u8],
+    resolve: impl Fn(Node, &[u8]) -> Option<T>,
+) -> Option<T> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "method_signature" | "declaration" => {
+                let mut inner = child.walk();
+                for sig in child.named_children(&mut inner) {
+                    if DART_CONSTRUCTOR_SIG_KINDS.contains(&sig.kind()) {
+                        return resolve(sig, source);
+                    }
+                    if let Some(name_node) = sig.child_by_field_name("name") {
+                        return resolve(name_node, source);
+                    }
+                    if sig.kind() == "operator_signature" {
+                        return resolve(sig, source);
+                    }
+                    // Field declarations: name is one level deeper.
+                    // Only the first identifier is captured (one entity per class_member node),
+                    // so `abstract double x, y;` yields only `x`.
+                    if sig.kind() == "initialized_identifier_list"
+                        || sig.kind() == "static_final_declaration_list"
+                    {
+                        let mut deep = sig.walk();
+                        for entry in sig.named_children(&mut deep) {
+                            if let Some(name_node) = entry.child_by_field_name("name") {
+                                return resolve(name_node, source);
+                            }
+                        }
+                    }
+                    // identifier_list has bare identifier children (no "name" field)
+                    if sig.kind() == "identifier_list" {
+                        let mut deep = sig.walk();
+                        for entry in sig.named_children(&mut deep) {
+                            if entry.kind() == "identifier" {
+                                return resolve(entry, source);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
+    walk_dart_class_member(node, source, |found, src| {
+        if DART_CONSTRUCTOR_SIG_KINDS.contains(&found.kind()) {
+            return extract_dart_constructor_full_name(found, src);
+        }
+        if found.kind() == "operator_signature" {
+            return found
+                .child_by_field_name("operator")
+                .map(|op| format!("operator {}", node_text(op, src)));
+        }
+        Some(node_text(found, src).to_string())
+    })
+}
+
+fn find_dart_class_member_name_range(node: Node, source: &[u8]) -> Option<(usize, usize)> {
+    walk_dart_class_member(node, source, |found, _src| {
+        if DART_CONSTRUCTOR_SIG_KINDS.contains(&found.kind()) {
+            return dart_constructor_name_byte_range(found);
+        }
+        if found.kind() == "operator_signature" {
+            return found
+                .child_by_field_name("operator")
+                .map(|op| (op.start_byte(), op.end_byte()));
+        }
+        Some((found.start_byte(), found.end_byte()))
+    })
 /// For an OCaml let_binding node, check if it has parameters or a function body
 /// to determine whether it's a "function" or a "value".
 fn map_ocaml_let_binding(node: Node) -> &'static str {
