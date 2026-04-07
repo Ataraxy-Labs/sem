@@ -2,6 +2,7 @@ mod cache;
 mod commands;
 mod formatters;
 
+use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::control;
 use colored::Colorize;
@@ -186,6 +187,12 @@ enum Commands {
     Setup,
     /// Restore default `git diff` behavior
     Unsetup,
+    /// Generate shell completions
+    Completions {
+        /// The shell to generate the completions for
+        #[arg(value_enum)]
+        shell: clap_complete_command::Shell,
+    },
 }
 
 fn apply_color_mode(mode: ColorMode) {
@@ -349,6 +356,9 @@ fn main() {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }
+        }
+        Some(Commands::Completions { shell }) => {
+            shell.generate(&mut Cli::command(), &mut std::io::stdout());
         }
         None => {
             // Default to diff when no subcommand is given
