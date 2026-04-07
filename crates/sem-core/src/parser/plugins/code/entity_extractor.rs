@@ -281,7 +281,7 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
 
     // Dart class_member: name is inside method_signature or declaration
     if node_type == "class_member" {
-        return find_dart_class_member_name_range(node);
+        return find_dart_class_member_name_range(node, _source);
     }
 
     // Decorated definitions (Python): look at the inner definition
@@ -867,54 +867,6 @@ fn extract_dart_constructor_full_name(sig: Node, source: &[u8]) -> Option<String
     std::str::from_utf8(&source[start..end]).ok().map(|s| s.to_string())
 }
 
-/// Extract the name from a Dart class_member node.
-/// The name is nested inside method_signature or declaration → inner signature → name field.
-fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "method_signature" | "declaration" => {
-                let mut inner = child.walk();
-                for sig in child.named_children(&mut inner) {
-                    if DART_CONSTRUCTOR_SIG_KINDS.contains(&sig.kind()) {
-                        return extract_dart_constructor_full_name(sig, source);
-                    }
-                    if let Some(name_node) = sig.child_by_field_name("name") {
-                        return Some(node_text(name_node, source).to_string());
-                    }
-                    if sig.kind() == "operator_signature" {
-                        if let Some(op) = sig.child_by_field_name("operator") {
-                            return Some(format!("operator {}", node_text(op, source)));
-                        }
-                    }
-                    // Field declarations: name is one level deeper
-                    if sig.kind() == "initialized_identifier_list"
-                        || sig.kind() == "static_final_declaration_list"
-                    {
-                        let mut deep = sig.walk();
-                        for entry in sig.named_children(&mut deep) {
-                            if let Some(name_node) = entry.child_by_field_name("name") {
-                                return Some(node_text(name_node, source).to_string());
-                            }
-                        }
-                    }
-                    // identifier_list has bare identifier children (no "name" field)
-                    if sig.kind() == "identifier_list" {
-                        let mut deep = sig.walk();
-                        for entry in sig.named_children(&mut deep) {
-                            if entry.kind() == "identifier" {
-                                return Some(node_text(entry, source).to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Byte range spanning all "name" field children of a Dart constructor signature,
 /// covering the full `Calculator.withDefault` span including the dot.
 fn dart_constructor_name_byte_range(sig: Node) -> Option<(usize, usize)> {
@@ -930,8 +882,13 @@ fn dart_constructor_name_byte_range(sig: Node) -> Option<(usize, usize)> {
     start.zip(end)
 }
 
-/// Find the byte range of the name inside a Dart class_member node (for structural hashing).
-fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
+/// Walk a Dart `class_member` node's tree to find the name-bearing node,
+/// then call `resolve` to convert it into the caller's desired type.
+fn walk_dart_class_member<T>(
+    node: Node,
+    source: &[u8],
+    resolve: impl Fn(Node, &[u8]) -> Option<T>,
+) -> Option<T> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -939,23 +896,22 @@ fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
                 let mut inner = child.walk();
                 for sig in child.named_children(&mut inner) {
                     if DART_CONSTRUCTOR_SIG_KINDS.contains(&sig.kind()) {
-                        return dart_constructor_name_byte_range(sig);
+                        return resolve(sig, source);
                     }
                     if let Some(name_node) = sig.child_by_field_name("name") {
-                        return Some((name_node.start_byte(), name_node.end_byte()));
+                        return resolve(name_node, source);
                     }
                     if sig.kind() == "operator_signature" {
-                        if let Some(op) = sig.child_by_field_name("operator") {
-                            return Some((op.start_byte(), op.end_byte()));
-                        }
+                        return resolve(sig, source);
                     }
+                    // Field declarations: name is one level deeper
                     if sig.kind() == "initialized_identifier_list"
                         || sig.kind() == "static_final_declaration_list"
                     {
                         let mut deep = sig.walk();
                         for entry in sig.named_children(&mut deep) {
                             if let Some(name_node) = entry.child_by_field_name("name") {
-                                return Some((name_node.start_byte(), name_node.end_byte()));
+                                return resolve(name_node, source);
                             }
                         }
                     }
@@ -964,7 +920,7 @@ fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
                         let mut deep = sig.walk();
                         for entry in sig.named_children(&mut deep) {
                             if entry.kind() == "identifier" {
-                                return Some((entry.start_byte(), entry.end_byte()));
+                                return resolve(entry, source);
                             }
                         }
                     }
@@ -974,4 +930,32 @@ fn find_dart_class_member_name_range(node: Node) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+fn extract_dart_class_member_name(node: Node, source: &[u8]) -> Option<String> {
+    walk_dart_class_member(node, source, |found, src| {
+        if DART_CONSTRUCTOR_SIG_KINDS.contains(&found.kind()) {
+            return extract_dart_constructor_full_name(found, src);
+        }
+        if found.kind() == "operator_signature" {
+            return found
+                .child_by_field_name("operator")
+                .map(|op| format!("operator {}", node_text(op, src)));
+        }
+        Some(node_text(found, src).to_string())
+    })
+}
+
+fn find_dart_class_member_name_range(node: Node, source: &[u8]) -> Option<(usize, usize)> {
+    walk_dart_class_member(node, source, |found, _src| {
+        if DART_CONSTRUCTOR_SIG_KINDS.contains(&found.kind()) {
+            return dart_constructor_name_byte_range(found);
+        }
+        if found.kind() == "operator_signature" {
+            return found
+                .child_by_field_name("operator")
+                .map(|op| (op.start_byte(), op.end_byte()));
+        }
+        Some((found.start_byte(), found.end_byte()))
+    })
 }
