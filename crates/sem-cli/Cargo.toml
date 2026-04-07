@@ -25,6 +25,7 @@ ignore = "0.4"
 openssl-sys = { version = "0.9", optional = true }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+clap_complete_command = "0.6.1"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/sem-{ target }{ archive-suffix }"
