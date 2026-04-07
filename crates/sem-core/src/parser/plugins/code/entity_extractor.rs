@@ -79,6 +79,66 @@ fn visit_node(
         }
     }
 
+    // OCaml: value_definition, module_definition, class_definition, and
+    // class_type_definition can each contain multiple bindings via `... and ...`.
+    // Extract each binding as a separate entity.
+    if node_type == "value_definition" && config.entity_node_types.contains(&node_type) {
+        let mut cursor = node.walk();
+        let bindings: Vec<_> = node.named_children(&mut cursor)
+            .filter(|c| c.kind() == "let_binding")
+            .collect();
+        if !bindings.is_empty() {
+            for binding in bindings {
+                let names = extract_ocaml_let_binding_names(binding, source);
+                let entity_type = map_ocaml_let_binding(binding);
+                let content_str = node_text(binding, source);
+                let content = content_str.to_string();
+                let struct_hash = compute_structural_hash(binding, source);
+                for name in names {
+                    let entity = SemanticEntity {
+                        id: build_entity_id(file_path, entity_type, &name, parent_id),
+                        file_path: file_path.to_string(),
+                        entity_type: entity_type.to_string(),
+                        name,
+                        parent_id: parent_id.map(String::from),
+                        content_hash: content_hash(&content),
+                        structural_hash: Some(struct_hash.clone()),
+                        content: content.clone(),
+                        start_line: binding.start_position().row + 1,
+                        end_line: binding.end_position().row + 1,
+                        metadata: None,
+                    };
+                    entities.push(entity);
+                }
+            }
+            return;
+        }
+    }
+
+    if node_type == "module_definition" && config.entity_node_types.contains(&node_type) {
+        let extracted = extract_ocaml_named_bindings(
+            node, "module_binding", "module_name",
+            map_node_type(node_type), file_path, parent_id, source, config, entities,
+        );
+        if extracted { return; }
+    }
+
+    if node_type == "class_definition" && config.entity_node_types.contains(&node_type) {
+        let extracted = extract_ocaml_named_bindings(
+            node, "class_binding", "class_name",
+            map_node_type(node_type), file_path, parent_id, source, config, entities,
+        );
+        if extracted { return; }
+    }
+
+    if node_type == "class_type_definition" && config.entity_node_types.contains(&node_type) {
+        let extracted = extract_ocaml_named_bindings(
+            node, "class_type_binding", "class_type_name",
+            map_node_type(node_type), file_path, parent_id, source, config, entities,
+        );
+        if extracted { return; }
+    }
+
     if config.entity_node_types.contains(&node_type) {
         if let Some(name) = extract_name(node, source) {
             let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
@@ -284,6 +344,78 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
         }
     }
 
+    // OCaml: individual binding nodes (used when compute_structural_hash is called
+    // on a binding directly, e.g., from the multi-binding extraction in visit_node)
+    if node_type == "let_binding" {
+        if let Some(pattern) = node.child_by_field_name("pattern") {
+            return Some((pattern.start_byte(), pattern.end_byte()));
+        }
+    }
+
+    if node_type == "module_binding" || node_type == "class_binding" || node_type == "class_type_binding" {
+        let name_kind = match node_type {
+            "module_binding" => "module_name",
+            "class_binding" => "class_name",
+            "class_type_binding" => "class_type_name",
+            _ => unreachable!(),
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == name_kind {
+                return Some((child.start_byte(), child.end_byte()));
+            }
+        }
+    }
+
+    // OCaml: module_type_definition -> module_type_name
+    if node_type == "module_type_definition" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "module_type_name" {
+                return Some((child.start_byte(), child.end_byte()));
+            }
+        }
+    }
+
+    // OCaml and C type_definition
+    if node_type == "type_definition" {
+        // OCaml: type_definition -> type_binding -> field "name"
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "type_binding" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    return Some((name_node.start_byte(), name_node.end_byte()));
+                }
+            }
+        }
+        // C type_definition falls through to the "declaration || type_definition" block below
+    }
+
+    // OCaml: exception_definition -> constructor_declaration -> constructor_name
+    if node_type == "exception_definition" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "constructor_declaration" {
+                let mut inner = child.walk();
+                for inner_child in child.named_children(&mut inner) {
+                    if inner_child.kind() == "constructor_name" {
+                        return Some((inner_child.start_byte(), inner_child.end_byte()));
+                    }
+                }
+            }
+        }
+    }
+
+    // OCaml: external / value_specification -> value_name
+    if node_type == "external" || node_type == "value_specification" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "value_name" || child.kind() == "parenthesized_operator" {
+                return Some((child.start_byte(), child.end_byte()));
+            }
+        }
+    }
+
     // C declarations
     if node_type == "declaration" || node_type == "type_definition" {
         if let Some(declarator) = node.child_by_field_name("declarator") {
@@ -482,10 +614,55 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
-    // For C type_definition (typedef), look for the type name
+    // OCaml: module_type_definition -> module_type_name
+    if node_type == "module_type_definition" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "module_type_name" {
+                return Some(node_text(child, source).to_string());
+            }
+        }
+    }
+
+    // OCaml and C type_definition
     if node_type == "type_definition" {
+        // OCaml: type_definition -> type_binding -> field "name" (type_constructor)
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "type_binding" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    return Some(node_text(name_node, source).to_string());
+                }
+            }
+        }
+        // C type_definition (typedef): look for declarator
         if let Some(declarator) = node.child_by_field_name("declarator") {
             return extract_declarator_name(declarator, source);
+        }
+    }
+
+    // OCaml: exception_definition -> constructor_declaration -> constructor_name
+    if node_type == "exception_definition" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "constructor_declaration" {
+                let mut inner = child.walk();
+                for inner_child in child.named_children(&mut inner) {
+                    if inner_child.kind() == "constructor_name" {
+                        return Some(node_text(inner_child, source).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // OCaml: external / value_specification -> value_name
+    if node_type == "external" || node_type == "value_specification" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "value_name" || child.kind() == "parenthesized_operator" {
+                return Some(node_text(child, source).to_string());
+            }
         }
     }
 
@@ -625,11 +802,16 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "union_specifier" => "union",
         "impl_item" => "impl",
         "trait_item" => "trait",
-        "mod_item" | "module" | "namespace_definition" | "namespace_declaration" => "module",
+        "mod_item" | "module" | "module_definition" | "namespace_definition" | "namespace_declaration" => "module",
         "export_statement" => "export",
         "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
         "const_declaration" | "const_item" => "constant",
         "static_item" => "static",
+        "value_specification" => "val",
+        "module_type_definition" => "module_type",
+        "exception_definition" => "exception",
+        "class_type_definition" => "class_type",
+        "external" => "external",
         "decorated_definition" => "decorated_definition",
         "constructor_declaration" => "constructor",
         "field_declaration" | "public_field_definition" | "field_definition" => "field",
@@ -762,4 +944,143 @@ fn map_decorated_type(node: Node) -> &'static str {
         }
     }
     "function"
+}
+
+/// For an OCaml let_binding node, check if it has parameters or a function body
+/// to determine whether it's a "function" or a "value".
+fn map_ocaml_let_binding(node: Node) -> &'static str {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "parameter" {
+            return "function";
+        }
+    }
+    // `let f = fun ...` or `let f = function ...`
+    if let Some(body) = node.child_by_field_name("body") {
+        if body.kind() == "fun_expression" || body.kind() == "function_expression" {
+            return "function";
+        }
+    }
+    "value"
+}
+
+/// Extract names from an OCaml let_binding node.
+/// For simple bindings (`let x = ...`), returns `["x"]`.
+/// For operator bindings (`let ( + ) = ...`), returns `["( + )"]`.
+/// For destructured bindings (`let (a, b) = ...`), returns `["a", "b"]`.
+fn extract_ocaml_let_binding_names(binding: Node, source: &[u8]) -> Vec<String> {
+    let pattern = match binding.child_by_field_name("pattern") {
+        Some(p) => p,
+        None => return vec![],
+    };
+    if pattern.kind() == "value_name" || pattern.kind() == "parenthesized_operator" {
+        return vec![node_text(pattern, source).to_string()];
+    }
+    // Destructured pattern: collect all value_name leaves
+    let mut names = vec![];
+    collect_value_names(pattern, source, &mut names);
+    names
+}
+
+fn collect_value_names(node: Node, source: &[u8], names: &mut Vec<String>) {
+    if node.kind() == "value_name" {
+        names.push(node_text(node, source).to_string());
+        return;
+    }
+    // Punned record field (`{ x; y }`) — field_pattern with no pattern field.
+    // The bound name is the field_name itself.
+    if node.kind() == "field_pattern" {
+        if let Some(pattern) = node.child_by_field_name("pattern") {
+            collect_value_names(pattern, source, names);
+        } else {
+            // Punned: extract the field_name from the field_path
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "field_path" {
+                    let mut inner = child.walk();
+                    for fc in child.named_children(&mut inner) {
+                        if fc.kind() == "field_name" {
+                            names.push(node_text(fc, source).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_value_names(child, source, names);
+    }
+}
+
+/// Extract entities from OCaml multi-binding definitions (module, class, class type).
+/// Each binding_kind child (e.g., "module_binding") gets its own entity.
+/// Returns true if bindings were found and extracted.
+#[allow(clippy::too_many_arguments)]
+fn extract_ocaml_named_bindings(
+    node: Node,
+    binding_kind: &str,
+    name_kind: &str,
+    entity_type: &str,
+    file_path: &str,
+    parent_id: Option<&str>,
+    source: &[u8],
+    config: &LanguageConfig,
+    entities: &mut Vec<SemanticEntity>,
+) -> bool {
+    let mut cursor = node.walk();
+    let bindings: Vec<_> = node.named_children(&mut cursor)
+        .filter(|c| c.kind() == binding_kind)
+        .collect();
+    if bindings.is_empty() {
+        return false;
+    }
+    for binding in bindings {
+        let mut inner = binding.walk();
+        let name = binding.named_children(&mut inner)
+            .find(|c| c.kind() == name_kind)
+            .map(|c| node_text(c, source).to_string());
+        if let Some(name) = name {
+            let content_str = node_text(binding, source);
+            let content = content_str.to_string();
+            let struct_hash = compute_structural_hash(binding, source);
+            let entity = SemanticEntity {
+                id: build_entity_id(file_path, entity_type, &name, parent_id),
+                file_path: file_path.to_string(),
+                entity_type: entity_type.to_string(),
+                name: name.clone(),
+                parent_id: parent_id.map(String::from),
+                content_hash: content_hash(&content),
+                structural_hash: Some(struct_hash),
+                content,
+                start_line: binding.start_position().row + 1,
+                end_line: binding.end_position().row + 1,
+                metadata: None,
+            };
+
+            let entity_id = entity.id.clone();
+            entities.push(entity);
+
+            // Visit container children for nested entities
+            let mut container_cursor = binding.walk();
+            for child in binding.named_children(&mut container_cursor) {
+                if config.container_node_types.contains(&child.kind()) {
+                    let mut inner_cursor = child.walk();
+                    for nested in child.named_children(&mut inner_cursor) {
+                        visit_node(
+                            nested,
+                            file_path,
+                            config,
+                            entities,
+                            Some(&entity_id),
+                            source,
+                            Some(node.kind()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    true
 }

@@ -929,4 +929,232 @@ func main() {}
         assert!(names.contains(&"x"), "Should find grouped const x, got: {:?}", names);
         assert!(names.contains(&"main"), "Should find func main, got: {:?}", names);
     }
+
+    #[test]
+    fn test_ocaml_entity_extraction() {
+        let code = r#"
+type color = Red | Green | Blue
+
+type point = {
+  x : float;
+  y : float;
+}
+
+exception Not_found of string
+
+let greet name =
+  Printf.printf "Hello, %s!\n" name
+
+let add a b = a + b
+
+let version = "1.0"
+
+let color_to_string = function
+  | Red -> "red"
+  | Blue -> "blue"
+
+let inc = fun x -> x + 1
+
+module MyModule = struct
+  let helper x = x * 2
+end
+
+module type Printable = sig
+  val to_string : 'a -> string
+end
+
+external caml_input : in_channel -> bytes -> int -> int -> int = "caml_input"
+
+class point_class x_init = object
+  val mutable x = x_init
+  method get_x = x
+end
+
+class type measurable = object
+  method measure : float
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "example.ml");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        assert_eq!(find("color").entity_type, "type");
+        assert_eq!(find("point").entity_type, "type");
+        assert_eq!(find("Not_found").entity_type, "exception");
+        assert_eq!(find("greet").entity_type, "function");
+        assert_eq!(find("add").entity_type, "function");
+        assert_eq!(find("version").entity_type, "value");
+        assert_eq!(find("color_to_string").entity_type, "function");
+        assert_eq!(find("inc").entity_type, "function");
+        assert_eq!(find("MyModule").entity_type, "module");
+        assert_eq!(find("Printable").entity_type, "module_type");
+        assert_eq!(find("caml_input").entity_type, "external");
+        assert_eq!(find("point_class").entity_type, "class");
+        assert_eq!(find("measurable").entity_type, "class_type");
+    }
+
+    #[test]
+    fn test_ocaml_nested_module_entities() {
+        let code = r#"
+module Outer = struct
+  let x = 42
+
+  module Inner = struct
+    let y = 0
+  end
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "nested.ml");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml nested: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        let outer = find("Outer");
+        let x = find("x");
+        let inner = find("Inner");
+        let y = find("y");
+
+        assert_eq!(outer.entity_type, "module");
+        assert_eq!(x.entity_type, "value");
+        assert_eq!(inner.entity_type, "module");
+        assert_eq!(y.entity_type, "value");
+
+        assert!(x.parent_id.as_ref().is_some_and(|p| p == &outer.id), "x should be nested under Outer");
+        assert!(inner.parent_id.as_ref().is_some_and(|p| p == &outer.id), "Inner should be nested under Outer");
+        assert!(y.parent_id.as_ref().is_some_and(|p| p == &inner.id), "y should be nested under Inner");
+    }
+
+    #[test]
+    fn test_ocaml_interface_entity_extraction() {
+        let code = r#"
+type t
+
+val create : string -> t
+val to_string : t -> string
+
+exception Invalid_input of string
+
+module type Serializable = sig
+  val serialize : t -> string
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "example.mli");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml interface entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        assert_eq!(find("t").entity_type, "type");
+        assert_eq!(find("create").entity_type, "val");
+        assert_eq!(find("to_string").entity_type, "val");
+        assert_eq!(find("Invalid_input").entity_type, "exception");
+        assert_eq!(find("Serializable").entity_type, "module_type");
+    }
+
+    #[test]
+    fn test_ocaml_mutual_recursion_let() {
+        let code = r#"
+let rec even n = (n = 0) || odd (n - 1)
+and odd n = (n <> 0) && even (n - 1)
+
+let rec ping x = pong (x - 1)
+and pong x = if x <= 0 then 0 else ping (x - 1)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "mutual.ml");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml mutual let: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        assert_eq!(find("even").entity_type, "function");
+        assert_eq!(find("odd").entity_type, "function");
+        assert_eq!(find("ping").entity_type, "function");
+        assert_eq!(find("pong").entity_type, "function");
+    }
+
+    #[test]
+    fn test_ocaml_mutual_recursion_module() {
+        let code = r#"
+module rec A : sig val x : int end = struct
+  let x = B.y + 1
+end
+and B : sig val y : int end = struct
+  let y = 0
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "mutual_mod.ml");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml mutual module: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        let a = find("A");
+        let b = find("B");
+        assert_eq!(a.entity_type, "module");
+        assert_eq!(b.entity_type, "module");
+
+        let x = find("x");
+        let y = find("y");
+        assert!(x.parent_id.as_ref().is_some_and(|p| p == &a.id), "x should be nested under A");
+        assert!(y.parent_id.as_ref().is_some_and(|p| p == &b.id), "y should be nested under B");
+    }
+
+    #[test]
+    fn test_ocaml_destructured_let() {
+        let code = r#"
+let (a, b) = (1, 2)
+
+let { x; y } = point
+
+let simple = 42
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "destruct.ml");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml destructured: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        assert_eq!(find("a").entity_type, "value");
+        assert_eq!(find("b").entity_type, "value");
+        assert_eq!(find("x").entity_type, "value");
+        assert_eq!(find("y").entity_type, "value");
+        assert_eq!(find("simple").entity_type, "value");
+    }
+
+    #[test]
+    fn test_ocaml_mutual_recursion_class() {
+        let code = r#"
+class foo = object
+  method x = 1
+end
+and bar = object
+  method y = 2
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "classes.ml");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("OCaml mutual class: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        let find = |name: &str| entities.iter().find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+
+        assert_eq!(find("foo").entity_type, "class");
+        assert_eq!(find("bar").entity_type, "class");
+    }
 }
