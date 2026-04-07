@@ -1249,6 +1249,9 @@ abstract class Shape {
         assert!(label_field.is_some(), "Should find field 'label' from single-element identifier_list, got: {:?}",
             entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
         assert_eq!(label_field.unwrap().entity_type, "field");
+    }
+
+    #[test]
     fn test_ocaml_entity_extraction() {
         let code = r#"
 type color = Red | Green | Blue

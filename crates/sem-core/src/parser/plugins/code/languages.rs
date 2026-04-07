@@ -98,7 +98,8 @@ fn get_xml() -> Option<Language> {
 
 fn get_dart() -> Option<Language> {
     Some(tree_sitter_dart::LANGUAGE.into())
-  
+}
+
 fn get_ocaml() -> Option<Language> {
     Some(tree_sitter_ocaml::LANGUAGE_OCAML.into())
 }

@@ -678,6 +678,8 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
     // For Dart class_member, the name is nested inside method_signature or declaration
     if node_type == "class_member" {
         return extract_dart_class_member_name(node, source);
+    }
+
     // OCaml: exception_definition -> constructor_declaration -> constructor_name
     if node_type == "exception_definition" {
         let mut cursor = node.walk();
@@ -1140,6 +1142,8 @@ fn find_dart_class_member_name_range(node: Node, source: &[u8]) -> Option<(usize
         }
         Some((found.start_byte(), found.end_byte()))
     })
+}
+
 /// For an OCaml let_binding node, check if it has parameters or a function body
 /// to determine whether it's a "function" or a "value".
 fn map_ocaml_let_binding(node: Node) -> &'static str {
