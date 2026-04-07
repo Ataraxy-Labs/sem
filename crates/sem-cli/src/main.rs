@@ -2,7 +2,8 @@ mod cache;
 mod commands;
 mod formatters;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use colored::control;
 use colored::Colorize;
 use commands::blame::{blame_command, BlameOptions};
 use commands::context::{context_command, ContextOptions};
@@ -16,6 +17,13 @@ use commands::log::{log_command, LogOptions};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ColorMode {
+    Always,
+    Auto,
+    Never,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +73,10 @@ enum Commands {
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long)]
         file_exts: Vec<String>,
+
+        /// When to use colors: always, auto, never
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
     },
     /// Show impact of changing an entity (deps, dependents, transitive impact, tests)
     Impact {
@@ -95,6 +107,10 @@ enum Commands {
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long)]
         file_exts: Vec<String>,
+
+        /// Skip the SQLite entity cache (rebuild from scratch)
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Show semantic blame — who last modified each entity
     Blame {
@@ -159,11 +175,25 @@ enum Commands {
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long)]
         file_exts: Vec<String>,
+
+        /// Skip the SQLite entity cache (rebuild from scratch)
+        #[arg(long)]
+        no_cache: bool,
     },
+    /// Start the MCP server (stdin/stdout transport)
+    Mcp,
     /// Replace `git diff` with `sem diff` globally
     Setup,
     /// Restore default `git diff` behavior
     Unsetup,
+}
+
+fn apply_color_mode(mode: ColorMode) {
+    match mode {
+        ColorMode::Always => control::set_override(true),
+        ColorMode::Never => control::set_override(false),
+        ColorMode::Auto => {}
+    }
 }
 
 fn main() {
@@ -182,7 +212,9 @@ fn main() {
             format,
             profile,
             file_exts,
+            color,
         }) => {
+            apply_color_mode(color);
             let output_format = match format.as_str() {
                 "json" => OutputFormat::Json,
                 "markdown" | "md" => OutputFormat::Markdown,
@@ -225,6 +257,7 @@ fn main() {
             tests,
             json,
             file_exts,
+            no_cache,
         }) => {
             let mode = if deps {
                 ImpactMode::Deps
@@ -246,6 +279,7 @@ fn main() {
                 json,
                 file_exts,
                 mode,
+                no_cache,
             });
         }
         Some(Commands::Log {
@@ -283,6 +317,7 @@ fn main() {
             budget,
             json,
             file_exts,
+            no_cache,
         }) => {
             context_command(ContextOptions {
                 cwd: std::env::current_dir()
@@ -294,7 +329,14 @@ fn main() {
                 budget,
                 json,
                 file_exts,
+                no_cache,
             });
+        }
+        Some(Commands::Mcp) => {
+            if let Err(e) = sem_mcp::run() {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
         }
         Some(Commands::Setup) => {
             if let Err(e) = commands::setup::run() {

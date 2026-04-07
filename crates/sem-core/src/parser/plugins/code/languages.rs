@@ -98,6 +98,13 @@ fn get_xml() -> Option<Language> {
 
 fn get_dart() -> Option<Language> {
     Some(tree_sitter_dart::LANGUAGE.into())
+  
+fn get_ocaml() -> Option<Language> {
+    Some(tree_sitter_ocaml::LANGUAGE_OCAML.into())
+}
+
+fn get_ocaml_interface() -> Option<Language> {
+    Some(tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
 }
 
 /// Inside JS/TS function bodies, suppress variable declarations so that local
@@ -523,6 +530,46 @@ static DART_CONFIG: LanguageConfig = LanguageConfig {
     scope_boundary_types: &[],
     get_language: get_dart,
 };
+  
+static OCAML_CONFIG: LanguageConfig = LanguageConfig {
+    id: "ocaml",
+    extensions: &[".ml"],
+    entity_node_types: &[
+        "value_definition",
+        "module_definition",
+        "module_type_definition",
+        "type_definition",
+        "exception_definition",
+        "class_definition",
+        "class_type_definition",
+        "external",
+    ],
+    container_node_types: &["structure", "module_binding"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_ocaml,
+};
+
+static OCAML_INTERFACE_CONFIG: LanguageConfig = LanguageConfig {
+    id: "ocaml_interface",
+    extensions: &[".mli"],
+    entity_node_types: &[
+        "value_specification",
+        "module_definition",
+        "module_type_definition",
+        "type_definition",
+        "exception_definition",
+        "class_definition",
+        "class_type_definition",
+        "external",
+    ],
+    container_node_types: &["signature", "module_binding"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_ocaml_interface,
+};
 
 static ALL_CONFIGS: &[&LanguageConfig] = &[
     &TYPESCRIPT_CONFIG,
@@ -545,6 +592,8 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &KOTLIN_CONFIG,
     &XML_CONFIG,
     &DART_CONFIG,
+    &OCAML_CONFIG,
+    &OCAML_INTERFACE_CONFIG,
 ];
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
@@ -564,6 +613,7 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
         ".xml", ".plist", ".svg", ".xhtml", ".csproj", ".fsproj", ".vbproj", ".props", ".targets",
         ".nuspec", ".resx", ".xaml", ".axml",
         ".dart",
+        ".ml", ".mli",
     ];
     EXTENSIONS
 }

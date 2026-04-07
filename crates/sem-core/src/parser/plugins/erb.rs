@@ -241,7 +241,8 @@ fn truncate_name(s: &str) -> String {
     if s.len() <= 60 {
         s.to_string()
     } else {
-        format!("{}...", &s[..57])
+        let boundary = s.floor_char_boundary(57);
+        format!("{}...", &s[..boundary])
     }
 }
 

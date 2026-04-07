@@ -2,7 +2,7 @@ use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::DiffResult;
 use std::collections::BTreeMap;
 
-pub fn format_markdown(result: &DiffResult) -> String {
+pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     if result.changes.is_empty() {
         return "No semantic changes detected.".to_string();
     }
@@ -49,8 +49,50 @@ pub fn format_markdown(result: &DiffResult) -> String {
                 status, change.entity_type, name_display
             ));
 
-            // Show content diff for modified entities with short before/after
-            if change.change_type == ChangeType::Modified {
+            // Show content diff
+            if verbose {
+                match change.change_type {
+                    ChangeType::Added => {
+                        if let Some(ref content) = change.after_content {
+                            post_table.push(String::new());
+                            post_table.push(format!("**`{}`**", change.entity_name));
+                            post_table.push("```diff".to_string());
+                            for line in content.lines() {
+                                post_table.push(format!("+ {line}"));
+                            }
+                            post_table.push("```".to_string());
+                        }
+                    }
+                    ChangeType::Deleted => {
+                        if let Some(ref content) = change.before_content {
+                            post_table.push(String::new());
+                            post_table.push(format!("**`{}`**", change.entity_name));
+                            post_table.push("```diff".to_string());
+                            for line in content.lines() {
+                                post_table.push(format!("- {line}"));
+                            }
+                            post_table.push("```".to_string());
+                        }
+                    }
+                    ChangeType::Modified => {
+                        if let (Some(before), Some(after)) =
+                            (&change.before_content, &change.after_content)
+                        {
+                            post_table.push(String::new());
+                            post_table.push(format!("**`{}`**", change.entity_name));
+                            post_table.push("```diff".to_string());
+                            for line in before.lines() {
+                                post_table.push(format!("- {line}"));
+                            }
+                            for line in after.lines() {
+                                post_table.push(format!("+ {line}"));
+                            }
+                            post_table.push("```".to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            } else if change.change_type == ChangeType::Modified {
                 if let (Some(before), Some(after)) =
                     (&change.before_content, &change.after_content)
                 {

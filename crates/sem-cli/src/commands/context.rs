@@ -12,6 +12,7 @@ pub struct ContextOptions {
     pub budget: usize,
     pub json: bool,
     pub file_exts: Vec<String>,
+    pub no_cache: bool,
 }
 
 pub fn context_command(opts: ContextOptions) {
@@ -20,7 +21,7 @@ pub fn context_command(opts: ContextOptions) {
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
 
     let file_paths = super::graph::find_supported_files_public(root, &registry, &ext_filter);
-    let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry);
+    let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     let entity = find_entity(&graph, &opts.entity_name, opts.file_path.as_deref());
     let entries = build_context(&graph, &entity.id, &all_entities, opts.budget);

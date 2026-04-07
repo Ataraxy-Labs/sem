@@ -68,21 +68,26 @@ pub fn get_or_build_graph(
     root: &Path,
     file_paths: &[String],
     registry: &ParserRegistry,
+    no_cache: bool,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
-    // Try loading from cache
-    if let Ok(disk) = DiskCache::open(root) {
-        if let Some(cached) = disk.load(root, file_paths) {
-            return cached;
+    if !no_cache {
+        // Try loading from cache
+        if let Ok(disk) = DiskCache::open(root) {
+            if let Some(cached) = disk.load(root, file_paths) {
+                return cached;
+            }
         }
     }
 
-    // Cache miss: build from scratch
+    // Cache miss (or --no-cache): build from scratch
     let graph = EntityGraph::build(root, file_paths, registry);
     let entities = extract_all_entities(root, file_paths, registry);
 
-    // Best-effort save
-    if let Ok(disk) = DiskCache::open(root) {
-        let _ = disk.save(root, file_paths, &graph, &entities);
+    if !no_cache {
+        // Best-effort save
+        if let Ok(disk) = DiskCache::open(root) {
+            let _ = disk.save(root, file_paths, &graph, &entities);
+        }
     }
 
     (graph, entities)

@@ -4,6 +4,7 @@ use std::process;
 use std::time::Instant;
 
 use sem_core::git::bridge::GitBridge;
+use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange};
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::plugins::create_default_registry;
@@ -75,7 +76,9 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
 
         // Check for ... (merge-base) syntax first (before ..)
         if let Some((from, to)) = arg.split_once("...") {
-            if !from.is_empty() && !to.is_empty() {
+            if !from.is_empty() || !to.is_empty() {
+                let from = if from.is_empty() { "HEAD" } else { from };
+                let to = if to.is_empty() { "HEAD" } else { to };
                 return ParsedArgs {
                     scope: Some(ParsedScope::MergeBaseRange(from.to_string(), to.to_string())),
                     pathspecs,
@@ -83,14 +86,23 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
             }
         }
 
-        // Check for .. (range) syntax
+        // Check for .. (range) syntax: rev1..rev2, rev1.., ..rev2
         if let Some((from, to)) = arg.split_once("..") {
-            if !from.is_empty() && !to.is_empty() {
+            if !from.is_empty() || !to.is_empty() {
+                let from = if from.is_empty() { "HEAD" } else { from };
+                let to = if to.is_empty() { "HEAD" } else { to };
                 return ParsedArgs {
                     scope: Some(ParsedScope::Range(from.to_string(), to.to_string())),
                     pathspecs,
                 };
             }
+        }
+
+        // If it exists as a file or directory on disk, treat as pathspec
+        if Path::new(arg).exists() {
+            let mut pathspecs = pathspecs;
+            pathspecs.push(arg.clone());
+            return ParsedArgs { scope: None, pathspecs };
         }
 
         // Single ref → compare to working tree
@@ -129,7 +141,37 @@ pub fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
 
     let t0 = Instant::now();
-    let parsed = parse_args(std::mem::take(&mut opts.args));
+    let mut parsed = parse_args(std::mem::take(&mut opts.args));
+
+    // Resolve jj revsets to git SHAs if we're in a jj repo
+    let root = Path::new(&opts.cwd);
+    if sem_core::git::jj::is_jj_repo(root) {
+        if let Some(ref mut scope) = parsed.scope {
+            match scope {
+                ParsedScope::RefToWorking(ref mut r) => {
+                    *r = maybe_resolve_ref(r, root);
+                }
+                ParsedScope::Range(ref mut from, ref mut to) => {
+                    *from = maybe_resolve_ref(from, root);
+                    *to = maybe_resolve_ref(to, root);
+                }
+                ParsedScope::MergeBaseRange(ref mut a, ref mut b) => {
+                    *a = maybe_resolve_ref(a, root);
+                    *b = maybe_resolve_ref(b, root);
+                }
+                ParsedScope::FileCompare(_, _) => {}
+            }
+        }
+        if let Some(ref mut sha) = opts.commit {
+            *sha = maybe_resolve_ref(sha, root);
+        }
+        if let Some(ref mut from) = opts.from {
+            *from = maybe_resolve_ref(from, root);
+        }
+        if let Some(ref mut to) = opts.to {
+            *to = maybe_resolve_ref(to, root);
+        }
+    }
 
     let (file_changes, from_stdin) = if opts.stdin {
         // Read FileChange[] from stdin — no git repo needed
@@ -313,7 +355,7 @@ fn run_diff_pipeline(
     let t4 = Instant::now();
     let output = match opts.format {
         OutputFormat::Json => format_json(&result),
-        OutputFormat::Markdown => format_markdown(&result),
+        OutputFormat::Markdown => format_markdown(&result, opts.verbose),
         OutputFormat::Plain => format_plain(&result),
         OutputFormat::Terminal => format_terminal(&result, opts.verbose),
     };

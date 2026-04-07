@@ -11,6 +11,7 @@ pub struct ImpactOptions {
     pub json: bool,
     pub file_exts: Vec<String>,
     pub mode: ImpactMode,
+    pub no_cache: bool,
 }
 
 pub enum ImpactMode {
@@ -26,7 +27,7 @@ pub fn impact_command(opts: ImpactOptions) {
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
     let file_paths = super::graph::find_supported_files_public(root, &registry, &ext_filter);
-    let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry);
+    let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     let entity = find_entity(&graph, &opts.entity_name, opts.file_hint.as_deref());
 
