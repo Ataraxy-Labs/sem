@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
   <img src="https://img.shields.io/badge/tests-118_passing-brightgreen" alt="Tests">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License"></a>
-  <img src="https://img.shields.io/badge/languages-21-blue" alt="Languages">
+  <img src="https://img.shields.io/badge/languages-22-blue" alt="Languages">
 </p>
 
 ```
@@ -198,7 +198,7 @@ sem unsetup
 
 ## What it parses
 
-21 programming languages with full entity extraction via tree-sitter:
+22 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -223,6 +223,7 @@ sem unsetup
 | XML | `.xml` `.plist` `.svg` `.csproj` | elements (nested, tag-name identity) |
 | ERB | `.erb` `.html.erb` | blocks, expressions, code tags |
 | Svelte | `.svelte` `.svelte.js` `.svelte.ts` | component blocks + rune JS/TS modules |
+| Dart | `.dart` | classes, mixins, extensions, enums, type aliases, functions |
 
 Plus structured data formats:
 
