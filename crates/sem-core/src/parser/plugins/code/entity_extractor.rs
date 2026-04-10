@@ -142,13 +142,7 @@ fn visit_node(
     if config.entity_node_types.contains(&node_type) {
         if let Some(name) = extract_name(node, source) {
             let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
-            let entity_type = if node_type == "decorated_definition" {
-                map_decorated_type(node)
-            } else if node_type == "class_member" {
-                map_class_member_type(node)
-            } else {
-                map_node_type(node_type)
-            };
+            let entity_type = map_entity_type(node, config);
             let should_skip = should_skip_entity(config, suppression_context, node_type);
             if !should_skip {
                 // Dart top-level signatures are split from their body node.
@@ -1032,6 +1026,38 @@ fn map_class_member_type(node: Node) -> &'static str {
         }
     }
     "member"
+}
+
+fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
+    match node.kind() {
+        "decorated_definition" => map_decorated_type(node),
+        "class_member" => map_class_member_type(node),
+        _ => promote_js_ts_const_function(node, config).unwrap_or_else(|| map_node_type(node.kind())),
+    }
+}
+
+fn promote_js_ts_const_function(node: Node, config: &LanguageConfig) -> Option<&'static str> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript") {
+        return None;
+    }
+
+    if node.kind() != "lexical_declaration" {
+        return None;
+    }
+
+    let declaration_kind = node.child_by_field_name("kind")?;
+    if declaration_kind.kind() != "const" {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    let declarator = node.named_children(&mut cursor).find(|child| child.kind() == "variable_declarator")?;
+    let value = declarator.child_by_field_name("value")?;
+
+    match value.kind() {
+        "arrow_function" | "function_expression" | "generator_function" => Some("function"),
+        _ => None,
+    }
 }
 
 /// Dart constructor signatures use `field("name", seq(identifier, optional(".", identifier)))`,

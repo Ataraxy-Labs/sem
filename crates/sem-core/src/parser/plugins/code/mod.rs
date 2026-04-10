@@ -806,12 +806,17 @@ items.forEach(function process(item) {
             .filter(|e| e.parent_id.is_none())
             .map(|e| e.name.as_str())
             .collect();
+        let find = |name: &str| entities.iter().find(|e| e.name == name).unwrap();
         let all_names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
 
-        // Top-level variable declarations preserved
+        // Top-level declarations preserved, and const-assigned function
+        // expressions are promoted from variable to function.
         assert!(top_level.contains(&"foo"), "got: {:?}", top_level);
         assert!(top_level.contains(&"bar"), "got: {:?}", top_level);
         assert!(top_level.contains(&"items"), "got: {:?}", top_level);
+        assert_eq!(find("foo").entity_type, "function");
+        assert_eq!(find("bar").entity_type, "function");
+        assert_eq!(find("items").entity_type, "variable");
 
         // Locals inside function expressions suppressed
         assert!(!all_names.contains(&"inner"), "got: {:?}", all_names);
@@ -841,8 +846,10 @@ const handler = () => {
 "#;
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "assigned.ts");
+        let handler = entities.iter().find(|e| e.name == "handler").unwrap();
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
 
+        assert_eq!(handler.entity_type, "function");
         assert!(names.contains(&"handler"), "got: {:?}", names);
         assert!(names.contains(&"Inner"), "got: {:?}", names);
         assert!(names.contains(&"run"), "got: {:?}", names);
@@ -862,12 +869,42 @@ const handler = function() {
 "#;
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "funexpr-inner.ts");
+        let handler = entities.iter().find(|e| e.name == "handler").unwrap();
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
 
+        assert_eq!(handler.entity_type, "function");
         assert!(names.contains(&"handler"), "got: {:?}", names);
         assert!(names.contains(&"Inner"), "got: {:?}", names);
         assert!(names.contains(&"make"), "got: {:?}", names);
         assert!(!names.contains(&"local"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_let_assigned_arrow_stays_variable_typescript() {
+        let code = r#"
+let handler = () => {
+  return 42;
+};
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "let-assigned.ts");
+        let handler = entities.iter().find(|e| e.name == "handler").unwrap();
+
+        assert_eq!(handler.entity_type, "variable");
+    }
+
+    #[test]
+    fn test_const_assigned_arrow_promoted_to_function_javascript() {
+        let code = r#"
+const handler = () => {
+  return 42;
+};
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "handler.js");
+        let handler = entities.iter().find(|e| e.name == "handler").unwrap();
+
+        assert_eq!(handler.entity_type, "function");
     }
 
     #[test]
