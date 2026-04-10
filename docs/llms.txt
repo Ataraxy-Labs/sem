@@ -41,6 +41,19 @@ sem diff --file-exts .py .rs      # filter by extension
 sem diff -v                       # verbose inline content diffs
 ```
 
+### sem grep
+Graph-backed entity search. Find semantic candidates before impact analysis, migrations, or review.
+
+```
+sem grep auth                              # name match
+sem grep exec --content                    # search inside entity bodies too
+sem grep authenticate --type function      # filter by entity type
+sem grep --path src/auth --type function   # filter by file path
+sem grep --depends-on exec --ref-kind calls
+sem grep --tests --depends-on validateToken
+sem grep --min-dependents 20 --json
+```
+
 ### sem blame
 Entity-level blame. Who last modified each function/class, not each line.
 

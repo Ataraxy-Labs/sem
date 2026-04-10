@@ -379,7 +379,7 @@
 
     <!-- ═══ Capabilities ═══ -->
     <section class="fade-in" style="border-top: 1px solid var(--border);">
-      <h2>Six commands. One binary.</h2>
+      <h2>Seven commands. One binary.</h2>
       <p class="section-desc">
         Everything works in any Git repo. No config. No plugins.
       </p>
@@ -394,10 +394,12 @@
         </div>
 
         <div class="cmd-card">
-          <div class="cmd-name"><code>sem blame</code></div>
-          <div class="cmd-desc">Who changed it? Per-entity blame showing the last commit that touched each function, class, or method.</div>
-          <pre class="cmd-example"><span class="d">│</span>  <span class="g">⊕</span> <span class="w">render_inline_diff</span>  <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span>
-<span class="d">│</span>  <span class="g">⊕</span> <span class="w">format_terminal</span>     <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span></pre>
+          <div class="cmd-name"><code>sem grep</code></div>
+          <div class="cmd-desc">What exists? Graph-backed entity search for discovery, migrations, and targeted review scope.</div>
+          <pre class="cmd-example"><span class="d">grep: 3 matches</span>
+  <span class="w">src/auth/login.ts</span>
+    <span class="d">function</span> <span class="w">authenticateUser</span>  <span class="d">(deps: 4, dependents: 2)</span>
+    <span class="d">function</span> <span class="w">authorizeRequest</span> <span class="d">(deps: 3, dependents: 1)</span></pre>
         </div>
 
         <div class="cmd-card">
@@ -407,6 +409,13 @@
   <span class="d">→ depends on:</span>  <span class="c">db.findUser</span>, <span class="c">rateLimiter</span>
   <span class="d">← used by:</span>    <span class="c">loginRoute</span>, <span class="c">authMiddleware</span>
   <span class="r">! 42 entities transitively affected</span></pre>
+        </div>
+
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem blame</code></div>
+          <div class="cmd-desc">Who changed it? Per-entity blame showing the last commit that touched each function, class, or method.</div>
+          <pre class="cmd-example"><span class="d">│</span>  <span class="g">⊕</span> <span class="w">render_inline_diff</span>  <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span>
+<span class="d">│</span>  <span class="g">⊕</span> <span class="w">format_terminal</span>     <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span></pre>
         </div>
 
         <div class="cmd-card">
@@ -584,6 +593,35 @@
         ], pause: 80 },
         { text: '│', cls: 'd', pause: 20 },
         { text: '└──────────────────────────────────────────────────────', cls: 'd', pause: 150 },
+        { text: '', pause: 600 },
+        // --- sem grep ---
+        { text: '$ sem grep auth --type function', cls: 'cmd', pause: 500, typing: true },
+        { text: '', pause: 300 },
+        { parts: [
+          { text: 'grep: ', cls: 'd' },
+          { text: '3 matches', cls: 'w' },
+        ], pause: 80 },
+        { parts: [
+          { text: '  src/auth/login.ts', cls: 'w' },
+        ], pause: 80 },
+        { parts: [
+          { text: '    function ', cls: 'd' },
+          { text: 'authenticateUser', cls: 'w' },
+          { text: ' (deps: 4, dependents: 2)', cls: 'd' },
+        ], pause: 80 },
+        { parts: [
+          { text: '    function ', cls: 'd' },
+          { text: 'authorizeRequest', cls: 'w' },
+          { text: ' (deps: 3, dependents: 1)', cls: 'd' },
+        ], pause: 80 },
+        { parts: [
+          { text: '  tests/auth/login_test.ts', cls: 'w' },
+        ], pause: 80 },
+        { parts: [
+          { text: '    function ', cls: 'd' },
+          { text: 'test_authenticateUser', cls: 'w' },
+          { text: ' (deps: 1, dependents: 0)', cls: 'd' },
+        ], pause: 150 },
         { text: '', pause: 600 },
         // --- sem impact ---
         { text: '$ sem impact authenticateUser', cls: 'cmd', pause: 500, typing: true },

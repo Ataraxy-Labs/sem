@@ -111,6 +111,30 @@ echo '[{"filePath":"src/main.rs","status":"modified","beforeContent":"...","afte
 sem diff --file-exts .py .rs
 ```
 
+### sem grep
+
+Graph-backed entity search for discovery, migrations, and review narrowing.
+
+```bash
+# Find entities by name
+sem grep auth
+
+# Search inside entity bodies too
+sem grep exec --content
+
+# Filter by entity type and path
+sem grep authenticate --type function --path src/auth
+
+# Find direct callers of an entity
+sem grep --depends-on exec --ref-kind calls
+
+# Narrow to test code only
+sem grep --tests --depends-on authenticateUser
+
+# Rank likely hotspots
+sem grep --min-dependents 20 --json
+```
+
 ### sem impact
 
 Cross-file dependency graph shows what breaks if an entity changes.
