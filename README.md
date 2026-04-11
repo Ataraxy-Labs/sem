@@ -27,27 +27,9 @@ sem is a semantic version control tool that works on top of Git. It parses your 
 
 It works in any Git repo with no setup.
 
-```
-sem diff
-
-┌─ src/auth/login.ts ──────────────────────────────────
-│
-│  ⊕ function  validateToken          [added]
-│  ∆ function  authenticateUser       [modified]
-│  ⊖ function  legacyAuth             [deleted]
-│
-└──────────────────────────────────────────────────────
-
-┌─ config/database.yml ─────────────────────────────────
-│
-│  ∆ property  production.pool_size   [modified]
-│    - 5
-│    + 20
-│
-└──────────────────────────────────────────────────────
-
-Summary: 1 added, 1 modified, 1 deleted across 2 files
-```
+<p align="center">
+  <img src="assets/terminal.svg" alt="sem diff" width="800" />
+</p>
 
 ## Install
 

@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="460" viewBox="0 0 800 460">
+
+  <!-- Terminal window -->
+  <rect x="0" y="0" width="800" height="460" rx="10" ry="10" fill="#0d1117"/>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="800" height="36" rx="10" ry="10" fill="#161b22"/>
+  <rect x="0" y="20" width="800" height="16" fill="#161b22"/>
+
+  <!-- Traffic lights -->
+  <circle cx="20" cy="18" r="6" fill="#ff5f57"/>
+  <circle cx="40" cy="18" r="6" fill="#febc2e"/>
+  <circle cx="60" cy="18" r="6" fill="#28c840"/>
+
+  <!-- Title text -->
+  <text x="400" y="22" font-family="ui-monospace, 'SF Mono', Menlo, Monaco, 'Cascadia Mono', 'Segoe UI Mono', 'Roboto Mono', 'Oxygen Mono', 'Ubuntu Monospace', 'Source Code Pro', 'Fira Mono', 'Droid Sans Mono', 'Courier New', monospace" font-size="12" fill="#8b949e" text-anchor="middle">Terminal</text>
+
+  <!-- Content area -->
+  <g transform="translate(24, 56)" font-family="ui-monospace, 'SF Mono', Menlo, Monaco, 'Cascadia Mono', 'Segoe UI Mono', 'Roboto Mono', 'Oxygen Mono', 'Ubuntu Monospace', 'Source Code Pro', 'Fira Mono', 'Droid Sans Mono', 'Courier New', monospace" font-size="13.5">
+
+    <!-- Prompt + command -->
+    <text y="0" fill="#7ee787">$</text>
+    <text x="16" y="0" fill="#e6edf3"> sem diff</text>
+
+    <!-- File 1: src/auth/login.ts -->
+    <text y="40" fill="#6e7681">&#x250C;&#x2500;</text>
+    <text x="24" y="40" fill="#e6edf3" font-weight="bold"> src/auth/login.ts</text>
+    <text x="232" y="40" fill="#6e7681"> &#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;</text>
+
+    <text y="64" fill="#6e7681">&#x2502;</text>
+
+    <text y="88" fill="#6e7681">&#x2502;</text>
+    <text x="24" y="88" fill="#7ee787">&#x2295;</text>
+    <text x="44" y="88" fill="#79c0ff"> function</text>
+    <text x="136" y="88" fill="#e6edf3">  validateToken</text>
+    <text x="368" y="88" fill="#7ee787">[added]</text>
+
+    <text y="112" fill="#6e7681">&#x2502;</text>
+    <text x="24" y="112" fill="#d29922">&#x0394;</text>
+    <text x="44" y="112" fill="#79c0ff"> function</text>
+    <text x="136" y="112" fill="#e6edf3">  authenticateUser</text>
+    <text x="368" y="112" fill="#d29922">[modified]</text>
+
+    <text y="136" fill="#6e7681">&#x2502;</text>
+    <text x="24" y="136" fill="#f85149">&#x2296;</text>
+    <text x="44" y="136" fill="#79c0ff"> function</text>
+    <text x="136" y="136" fill="#e6edf3">  legacyAuth</text>
+    <text x="368" y="136" fill="#f85149">[deleted]</text>
+
+    <text y="160" fill="#6e7681">&#x2502;</text>
+    <text y="176" fill="#6e7681">&#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;</text>
+
+    <!-- File 2: config/database.yml -->
+    <text y="216" fill="#6e7681">&#x250C;&#x2500;</text>
+    <text x="24" y="216" fill="#e6edf3" font-weight="bold"> config/database.yml</text>
+    <text x="256" y="216" fill="#6e7681"> &#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;</text>
+
+    <text y="240" fill="#6e7681">&#x2502;</text>
+
+    <text y="264" fill="#6e7681">&#x2502;</text>
+    <text x="24" y="264" fill="#d29922">&#x0394;</text>
+    <text x="44" y="264" fill="#79c0ff"> property</text>
+    <text x="136" y="264" fill="#e6edf3">  production.pool_size</text>
+    <text x="368" y="264" fill="#d29922">[modified]</text>
+
+    <text y="288" fill="#6e7681">&#x2502;</text>
+    <text x="40" y="288" fill="#f85149">    - 5</text>
+
+    <text y="312" fill="#6e7681">&#x2502;</text>
+    <text x="40" y="312" fill="#7ee787">    + 20</text>
+
+    <text y="336" fill="#6e7681">&#x2502;</text>
+    <text y="352" fill="#6e7681">&#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;</text>
+
+    <!-- Summary -->
+    <text y="392" fill="#8b949e">Summary: </text>
+    <text x="82" y="392" fill="#7ee787">1 added</text>
+    <text x="148" y="392" fill="#8b949e">, </text>
+    <text x="162" y="392" fill="#d29922">1 modified</text>
+    <text x="252" y="392" fill="#8b949e">, </text>
+    <text x="266" y="392" fill="#f85149">1 deleted</text>
+    <text x="346" y="392" fill="#8b949e"> across 2 files</text>
+
+  </g>
+</svg>
