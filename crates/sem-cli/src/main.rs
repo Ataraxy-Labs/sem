@@ -170,9 +170,9 @@ enum Commands {
         #[arg(long, short = 'c')]
         content: bool,
 
-        /// Match text filters case-insensitively
-        #[arg(long, short = 'i')]
-        ignore_case: bool,
+        /// Match text filters literally, including case and identifier separators
+        #[arg(long)]
+        case_sensitive: bool,
 
         /// Only include these entity types (e.g. --type function --type class)
         #[arg(long = "type", num_args = 1..)]
@@ -382,7 +382,7 @@ fn main() {
         Some(Commands::Grep {
             pattern,
             content,
-            ignore_case,
+            case_sensitive,
             entity_types,
             path,
             tests,
@@ -401,7 +401,7 @@ fn main() {
                     .to_string(),
                 pattern,
                 content,
-                ignore_case,
+                case_sensitive,
                 entity_types,
                 path_substring: path,
                 tests,

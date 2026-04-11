@@ -46,6 +46,8 @@ Graph-backed entity search. Find semantic candidates before impact analysis, mig
 
 ```
 sem grep auth                              # name match
+sem grep auth-user                         # matches AuthUser, auth_user, AUTH-USER
+sem grep AuthUser --case-sensitive         # literal case/style match
 sem grep exec --content                    # search inside entity bodies too
 sem grep authenticate --type function      # filter by entity type
 sem grep --path src/auth --type function   # filter by file path

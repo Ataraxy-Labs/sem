@@ -11,7 +11,7 @@ pub struct GrepOptions {
     pub cwd: String,
     pub pattern: Option<String>,
     pub content: bool,
-    pub ignore_case: bool,
+    pub case_sensitive: bool,
     pub entity_types: Vec<String>,
     pub path_substring: Option<String>,
     pub tests: bool,
@@ -140,15 +140,15 @@ fn find_matches(
             &source.content,
             opts.pattern.as_deref(),
             opts.content,
-            opts.ignore_case,
+            opts.case_sensitive,
         ) {
             continue;
         }
-        if !matches_type(&entity.entity_type, &opts.entity_types, opts.ignore_case) {
+        if !matches_type(&entity.entity_type, &opts.entity_types, opts.case_sensitive) {
             continue;
         }
         if let Some(path_substring) = opts.path_substring.as_deref() {
-            if !matches_text(&entity.file_path, path_substring, opts.ignore_case) {
+            if !matches_text(&entity.file_path, path_substring, opts.case_sensitive) {
                 continue;
             }
         }
@@ -182,7 +182,7 @@ fn find_matches(
                 &outgoing_edges,
                 &opts.depends_on,
                 opts.ref_kind,
-                opts.ignore_case,
+                opts.case_sensitive,
             )
         };
 
@@ -231,7 +231,7 @@ fn find_matching_dependencies(
     outgoing_edges: &HashMap<&str, Vec<&EntityRef>>,
     depends_on: &[String],
     ref_kind: Option<RefKind>,
-    ignore_case: bool,
+    case_sensitive: bool,
 ) -> Vec<String> {
     let mut matched: HashSet<String> = HashSet::new();
 
@@ -250,7 +250,7 @@ fn find_matching_dependencies(
 
             if depends_on
                 .iter()
-                .any(|pattern| matches_text(&target.name, pattern, ignore_case))
+                .any(|pattern| matches_text(&target.name, pattern, case_sensitive))
             {
                 matched.insert(target.name.clone());
             }
@@ -267,33 +267,51 @@ fn matches_pattern(
     content: &str,
     pattern: Option<&str>,
     search_content: bool,
-    ignore_case: bool,
+    case_sensitive: bool,
 ) -> bool {
     let Some(pattern) = pattern else {
         return true;
     };
 
-    matches_text(&entity.name, pattern, ignore_case)
-        || (search_content && matches_text(content, pattern, ignore_case))
+    matches_text(&entity.name, pattern, case_sensitive)
+        || (search_content && matches_text(content, pattern, case_sensitive))
 }
 
-fn matches_type(value: &str, filters: &[String], ignore_case: bool) -> bool {
+fn matches_type(value: &str, filters: &[String], case_sensitive: bool) -> bool {
     filters.is_empty()
         || filters.iter().any(|filter| {
-            if ignore_case {
-                value.eq_ignore_ascii_case(filter)
-            } else {
+            if case_sensitive {
                 value == filter
+            } else {
+                value.eq_ignore_ascii_case(filter)
             }
         })
 }
 
-fn matches_text(haystack: &str, needle: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        haystack.to_lowercase().contains(&needle.to_lowercase())
-    } else {
-        haystack.contains(needle)
+fn matches_text(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        return haystack.contains(needle);
     }
+
+    let needle_lower = needle.to_lowercase();
+    if haystack.to_lowercase().contains(&needle_lower) {
+        return true;
+    }
+
+    let normalized_needle = normalize_identifier_text(needle);
+    !normalized_needle.is_empty()
+        && normalize_identifier_text(haystack).contains(&normalized_needle)
+}
+
+fn normalize_identifier_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '_' | '-') {
+            continue;
+        }
+        normalized.extend(ch.to_lowercase());
+    }
+    normalized
 }
 
 fn print_terminal(matches: &[GrepMatch], opts: &GrepOptions) {
@@ -370,7 +388,7 @@ fn print_json(matches: &[GrepMatch], opts: &GrepOptions) {
             "matches": matches.len(),
             "pattern": opts.pattern.as_deref(),
             "content": opts.content,
-            "ignoreCase": opts.ignore_case,
+            "caseSensitive": opts.case_sensitive,
             "types": &opts.entity_types,
             "path": opts.path_substring.as_deref(),
             "tests": opts.tests,
@@ -402,7 +420,7 @@ mod tests {
     use sem_core::model::entity::SemanticEntity;
     use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 
-    use super::{find_matches, GrepOptions, RefKind};
+    use super::{find_matches, matches_text, GrepOptions, RefKind};
 
     fn entity_info(
         id: &str,
@@ -443,7 +461,7 @@ mod tests {
             cwd: ".".to_string(),
             pattern: None,
             content: false,
-            ignore_case: false,
+            case_sensitive: false,
             entity_types: Vec::new(),
             path_substring: None,
             tests: false,
@@ -559,6 +577,47 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect();
         assert_eq!(names, vec!["exec", "runShell"]);
+    }
+
+    #[test]
+    fn grep_matches_common_identifier_styles_by_default() {
+        let (graph, entities) = fixture_graph();
+        let mut opts = test_options();
+
+        opts.pattern = Some("auth-controller".to_string());
+        let kebab_to_pascal = find_matches(&graph, &entities, &opts);
+        assert_eq!(kebab_to_pascal.len(), 1);
+        assert_eq!(kebab_to_pascal[0].name, "AuthController");
+
+        opts.pattern = Some("RUN_SHELL".to_string());
+        let screaming_to_camel = find_matches(&graph, &entities, &opts);
+        assert_eq!(screaming_to_camel.len(), 1);
+        assert_eq!(screaming_to_camel[0].name, "runShell");
+    }
+
+    #[test]
+    fn grep_case_sensitive_requires_literal_text() {
+        let (graph, entities) = fixture_graph();
+        let mut opts = test_options();
+        opts.case_sensitive = true;
+        opts.pattern = Some("RUN_SHELL".to_string());
+
+        let matches = find_matches(&graph, &entities, &opts);
+        assert!(matches.is_empty());
+
+        opts.pattern = Some("runShell".to_string());
+        let matches = find_matches(&graph, &entities, &opts);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "runShell");
+    }
+
+    #[test]
+    fn smart_text_matching_is_not_sparse() {
+        assert!(matches_text("authenticate_user", "authenticateUser", false));
+        assert!(matches_text("AUTHENTICATE-USER", "authenticate_user", false));
+        assert!(!matches_text("authenticate user", "authenticateUser", false));
+        assert!(!matches_text("handle_mouse_event", "hm", false));
+        assert!(!matches_text("authenticate_user", "authenticateUser", true));
     }
 
     #[test]

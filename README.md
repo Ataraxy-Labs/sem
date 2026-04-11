@@ -119,6 +119,12 @@ Graph-backed entity search for discovery, migrations, and review narrowing.
 # Find entities by name
 sem grep auth
 
+# Default matching ignores case plus _/- identifier style differences
+sem grep auth-user
+
+# Require literal case and identifier separators
+sem grep AuthUser --case-sensitive
+
 # Search inside entity bodies too
 sem grep exec --content
 
