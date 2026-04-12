@@ -19,6 +19,7 @@ pub struct DiffOptions {
     pub from: Option<String>,
     pub to: Option<String>,
     pub stdin: bool,
+    pub patch: bool,
     pub verbose: bool,
     pub profile: bool,
     pub file_exts: Vec<String>,
@@ -137,6 +138,95 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
     process::exit(1);
 }
 
+/// Parse a unified diff (e.g. from `git diff`) into FileChange entries.
+/// Uses blob SHAs from `index` lines to retrieve full file contents via `git show`.
+fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
+    use sem_core::git::types::FileStatus;
+
+    struct PatchEntry {
+        file_path: String,
+        old_file_path: Option<String>,
+        status: FileStatus,
+        old_sha: Option<String>,
+        new_sha: Option<String>,
+    }
+
+    let mut entries: Vec<PatchEntry> = Vec::new();
+    let mut current: Option<PatchEntry> = None;
+
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            // Flush previous entry
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            // Parse "a/path b/path" — the b-side path is after the last " b/"
+            let file_path = if let Some(pos) = rest.rfind(" b/") {
+                rest[pos + 3..].to_string()
+            } else {
+                rest.to_string()
+            };
+            current = Some(PatchEntry {
+                file_path,
+                old_file_path: None,
+                status: FileStatus::Modified,
+                old_sha: None,
+                new_sha: None,
+            });
+        } else if let Some(ref mut entry) = current {
+            if line.starts_with("new file mode") {
+                entry.status = FileStatus::Added;
+            } else if line.starts_with("deleted file mode") {
+                entry.status = FileStatus::Deleted;
+            } else if let Some(rest) = line.strip_prefix("rename from ") {
+                entry.old_file_path = Some(rest.to_string());
+                entry.status = FileStatus::Renamed;
+            } else if let Some(rest) = line.strip_prefix("rename to ") {
+                entry.file_path = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("index ") {
+                // "index abc123..def456 100644" or "index abc123..def456"
+                let shas_part = rest.split_whitespace().next().unwrap_or("");
+                if let Some((old, new)) = shas_part.split_once("..") {
+                    if old != "0000000" && !old.chars().all(|c| c == '0') {
+                        entry.old_sha = Some(old.to_string());
+                    }
+                    if new != "0000000" && !new.chars().all(|c| c == '0') {
+                        entry.new_sha = Some(new.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(entry) = current.take() {
+        entries.push(entry);
+    }
+
+    // Resolve blob contents via git show
+    let git_show = |sha: &str| -> Option<String> {
+        let output = process::Command::new("git")
+            .args(["show", sha])
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            String::from_utf8(output.stdout).ok()
+        } else {
+            None
+        }
+    };
+
+    entries
+        .into_iter()
+        .map(|e| FileChange {
+            file_path: e.file_path,
+            old_file_path: e.old_file_path,
+            status: e.status,
+            before_content: e.old_sha.as_deref().and_then(git_show),
+            after_content: e.new_sha.as_deref().and_then(git_show),
+        })
+        .collect()
+}
+
 pub fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
 
@@ -184,6 +274,15 @@ pub fn diff_command(mut opts: DiffOptions) {
             eprintln!("\x1b[31mError parsing stdin JSON: {e}\x1b[0m");
             process::exit(1);
         });
+        (changes, true)
+    } else if opts.patch {
+        // Read unified diff from stdin and parse it
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap_or_else(|e| {
+            eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
+            process::exit(1);
+        });
+        let changes = parse_unified_diff(&input, &opts.cwd);
         (changes, true)
     } else if let Some(ParsedScope::FileCompare(ref a, ref b)) = parsed.scope {
         // Compare two arbitrary files: sem diff file1.ts file2.ts

@@ -59,6 +59,10 @@ enum Commands {
         #[arg(long)]
         stdin: bool,
 
+        /// Read unified diff from stdin (e.g. git diff | sem diff --patch)
+        #[arg(long)]
+        patch: bool,
+
         /// Output format: terminal, json, or markdown
         #[arg(long, default_value = "terminal")]
         format: String,
@@ -215,6 +219,7 @@ fn main() {
             from,
             to,
             stdin,
+            patch,
             verbose,
             format,
             profile,
@@ -240,6 +245,7 @@ fn main() {
                 from,
                 to,
                 stdin,
+                patch,
                 verbose,
                 profile,
                 file_exts,
@@ -373,6 +379,7 @@ fn main() {
                 from: None,
                 to: None,
                 stdin: false,
+                patch: false,
                 verbose: false,
                 profile: false,
                 file_exts: vec![],
