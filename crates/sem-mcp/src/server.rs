@@ -3,7 +3,6 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use git2::Repository;
 use lru::LruCache;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -425,11 +424,9 @@ impl SemServer {
             }
         }
 
-        let repo = Repository::discover(&ctx.repo_root)
-            .map_err(|e| internal_err(format!("Git error: {}", e)))?;
-
-        let blame = repo
-            .blame_file(Path::new(&rel_path), None)
+        let blame = ctx
+            .git
+            .blame_file(Path::new(&rel_path))
             .map_err(|e| internal_err(format!("Cannot blame {}: {}", rel_path, e)))?;
 
         let mut results: Vec<serde_json::Value> = Vec::new();
@@ -450,11 +447,7 @@ impl SemServer {
                         latest_author = sig.name().unwrap_or("unknown").to_string();
                         let oid = hunk.final_commit_id();
                         latest_sha = format!("{}", oid);
-                        latest_summary = repo
-                            .find_commit(oid)
-                            .ok()
-                            .and_then(|c| c.summary().map(String::from))
-                            .unwrap_or_default();
+                        latest_summary = ctx.git.commit_summary(oid).unwrap_or_default();
                         latest_date = chrono_lite_format(sig.when().seconds());
                     }
                 }

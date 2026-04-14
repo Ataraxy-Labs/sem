@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use colored::Colorize;
-use git2::Repository;
+use sem_core::git::bridge::GitBridge;
 use sem_core::parser::plugins::create_default_registry;
 
 use super::truncate_str;
@@ -56,16 +56,16 @@ pub fn blame_command(opts: BlameOptions) {
     }
 
     // Open git repo and run blame
-    let repo: git2::Repository = match Repository::discover(root) {
+    let git = match GitBridge::open(root) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{} Not a git repository: {}", "error:".red().bold(), e);
+            eprintln!("{} Cannot open git repository: {}", "error:".red().bold(), e);
             std::process::exit(1);
         }
     };
 
     // Resolve file path relative to repo root for git blame
-    let repo_root = repo.workdir().unwrap_or(root);
+    let repo_root = git.repo_root();
     let abs_file = std::fs::canonicalize(root.join(&opts.file_path)).unwrap_or(full_path.clone());
     let repo_root_canonical = std::fs::canonicalize(repo_root).unwrap_or(repo_root.to_path_buf());
     let relative_path = abs_file
@@ -73,7 +73,7 @@ pub fn blame_command(opts: BlameOptions) {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| opts.file_path.clone());
 
-    let blame: git2::Blame = match repo.blame_file(Path::new(&relative_path), None) {
+    let blame = match git.blame_file(Path::new(&relative_path)) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{} Cannot blame {}: {}", "error:".red().bold(), opts.file_path, e);
@@ -101,11 +101,7 @@ pub fn blame_command(opts: BlameOptions) {
                     latest_author = sig.name().unwrap_or("unknown").to_string();
                     let oid = hunk.final_commit_id();
                     latest_sha = format!("{}", oid);
-                    latest_summary = repo
-                        .find_commit(oid)
-                        .ok()
-                        .and_then(|c| c.summary().map(String::from))
-                        .unwrap_or_default();
+                    latest_summary = git.commit_summary(oid).unwrap_or_default();
 
                     // Format date
                     let ts = sig.when().seconds();

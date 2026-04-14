@@ -1,9 +1,9 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
-use git2::{
-    Delta, Diff, DiffOptions, ErrorCode, Repository,
-};
+use git2::{Blame, Delta, Diff, DiffOptions, ErrorCode, Oid, Repository};
 use thiserror::Error;
 
 use super::types::{CommitInfo, DiffScope, FileChange, FileStatus};
@@ -25,13 +25,18 @@ pub struct GitBridge {
 
 impl GitBridge {
     pub fn open(path: &Path) -> Result<Self, GitError> {
-        let repo = Repository::discover(path).map_err(|e| {
-            if e.code() == ErrorCode::NotFound {
-                GitError::NotARepo
-            } else {
-                GitError::Git2(e)
+        let repo = match Repository::discover(path) {
+            Ok(repo) => repo,
+            Err(error) if should_retry_with_command_line_safe_directory(&error, path) => {
+                let _guard = owner_validation_lock()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _owner_validation = OwnerValidationDisabled::new()?;
+                let repo = Repository::discover(path);
+                repo.map_err(map_git_error)?
             }
-        })?;
+            Err(error) => return Err(map_git_error(error)),
+        };
         let repo_root = repo
             .workdir()
             .ok_or(GitError::NotARepo)?
@@ -41,6 +46,17 @@ impl GitBridge {
 
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    pub fn blame_file(&self, file_path: &Path) -> Result<Blame<'_>, GitError> {
+        Ok(self.repo.blame_file(file_path, None)?)
+    }
+
+    pub fn commit_summary(&self, oid: Oid) -> Option<String> {
+        self.repo
+            .find_commit(oid)
+            .ok()
+            .and_then(|commit| commit.summary().map(String::from))
     }
 
     pub fn get_head_sha(&self) -> Result<String, GitError> {
@@ -455,10 +471,103 @@ impl GitBridge {
     }
 }
 
+fn map_git_error(error: git2::Error) -> GitError {
+    if error.code() == ErrorCode::NotFound {
+        GitError::NotARepo
+    } else {
+        GitError::Git2(error)
+    }
+}
+
+fn should_retry_with_command_line_safe_directory(error: &git2::Error, path: &Path) -> bool {
+    let safe_directories = command_line_safe_directories();
+    should_retry_with_safe_directory(error, path, &safe_directories)
+}
+
+fn should_retry_with_safe_directory(error: &git2::Error, path: &Path, safe_directories: &[String]) -> bool {
+    error.code() == ErrorCode::Owner
+        && nearest_git_root(path).is_some_and(|repo_root| {
+            safe_directories.iter().any(|safe_directory| {
+                safe_directory == "*"
+                    || paths_match(&repo_root, Path::new(safe_directory))
+            })
+        })
+}
+
+fn command_line_safe_directories() -> Vec<String> {
+    let count = env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+
+    (0..count)
+        .filter_map(|index| {
+            let key = env::var(format!("GIT_CONFIG_KEY_{index}")).ok()?;
+            if key.eq_ignore_ascii_case("safe.directory") {
+                env::var(format!("GIT_CONFIG_VALUE_{index}")).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn nearest_git_root(path: &Path) -> Option<PathBuf> {
+    let mut current = if path.is_file() {
+        path.parent()?
+    } else {
+        path
+    };
+
+    loop {
+        if current.join(".git").exists() {
+            return Some(fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf()));
+        }
+
+        current = current.parent()?;
+    }
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn owner_validation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct OwnerValidationDisabled;
+
+impl OwnerValidationDisabled {
+    fn new() -> Result<Self, GitError> {
+        // libgit2 stores this as a process-global option; callers hold owner_validation_lock.
+        unsafe { git2::opts::set_verify_owner_validation(false)? };
+        Ok(Self)
+    }
+}
+
+impl Drop for OwnerValidationDisabled {
+    fn drop(&mut self) {
+        // Restore the default before the owner-validation lock is released.
+        unsafe {
+            let _ = git2::opts::set_verify_owner_validation(true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git2::{Oid, Repository, Signature};
+    use git2::{ErrorClass, Oid, Repository, Signature};
     use tempfile::TempDir;
 
     fn commit_file(repo: &Repository, file_path: &str, contents: &str, message: &str) -> Oid {
@@ -502,6 +611,43 @@ mod tests {
 
         assert!(matches!(scope, DiffScope::Working));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn owner_error_retries_for_command_line_safe_directory() {
+        let temp = TempDir::new().unwrap();
+        Repository::init(temp.path()).unwrap();
+
+        let owner_error = git2::Error::new(
+            ErrorCode::Owner,
+            ErrorClass::Config,
+            "owner mismatch",
+        );
+        let safe_directories = [temp.path().to_string_lossy().to_string()];
+
+        assert!(should_retry_with_safe_directory(
+            &owner_error,
+            temp.path(),
+            &safe_directories,
+        ));
+
+        let other_directories = [temp.path().join("other").to_string_lossy().to_string()];
+        assert!(!should_retry_with_safe_directory(
+            &owner_error,
+            temp.path(),
+            &other_directories,
+        ));
+
+        let not_found_error = git2::Error::new(
+            ErrorCode::NotFound,
+            ErrorClass::Repository,
+            "not found",
+        );
+        assert!(!should_retry_with_safe_directory(
+            &not_found_error,
+            temp.path(),
+            &["*".to_string()],
+        ));
     }
 
     #[test]

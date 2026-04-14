@@ -323,8 +323,8 @@ pub fn diff_command(mut opts: DiffOptions) {
     } else {
         let git = match GitBridge::open(Path::new(&opts.cwd)) {
             Ok(g) => g,
-            Err(_) => {
-                eprintln!("\x1b[31mError: Not inside a Git repository.\x1b[0m");
+            Err(e) => {
+                eprintln!("\x1b[31mError: {e}\x1b[0m");
                 process::exit(1);
             }
         };
@@ -404,8 +404,8 @@ pub fn diff_command(mut opts: DiffOptions) {
         } else {
             match git.detect_and_get_files(&parsed.pathspecs) {
                 Ok((scope, files)) => (scope, files),
-                Err(_) => {
-                    eprintln!("\x1b[31mError: Not inside a Git repository.\x1b[0m");
+                Err(e) => {
+                    eprintln!("\x1b[31mError: {e}\x1b[0m");
                     process::exit(1);
                 }
             }
