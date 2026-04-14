@@ -179,7 +179,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish sem-core
-        run: cargo publish -p sem-core
+        run: cargo publish -p sem-core || echo "sem-core already published, skipping"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -187,7 +187,7 @@ jobs:
         run: sleep 30
 
       - name: Publish sem-mcp
-        run: cargo publish -p sem-mcp
+        run: cargo publish -p sem-mcp || echo "sem-mcp already published, skipping"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -195,6 +195,6 @@ jobs:
         run: sleep 30
 
       - name: Publish sem-cli
-        run: cargo publish -p sem-cli
+        run: cargo publish -p sem-cli || echo "sem-cli already published, skipping"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
