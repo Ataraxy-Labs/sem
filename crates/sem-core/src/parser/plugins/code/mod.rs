@@ -1633,4 +1633,88 @@ end program main
         assert!(find("add").parent_id.is_some());
         assert!(find("greet").parent_id.is_some());
     }
+
+    #[test]
+    fn test_scala_entity_extraction() {
+        let code = r#"
+package com.example
+
+import scala.collection.mutable
+
+class UserService(val name: String) {
+  def getUsers(): List[User] = db.findAll()
+
+  def createUser(user: User): Unit = db.save(user)
+
+  private def validate(user: User): Boolean = true
+}
+
+object UserService {
+  def apply(name: String): UserService = new UserService(name)
+
+  val DefaultName: String = "default"
+}
+
+trait Repository[T] {
+  def findById(id: String): Option[T]
+  def findAll(): List[T]
+}
+
+case class User(id: String, name: String)
+
+type UserId = String
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "UserService.scala");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("Scala entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
+        assert!(names.contains(&"Repository"), "Should find trait Repository, got: {:?}", names);
+        assert!(names.contains(&"getUsers"), "Should find method getUsers, got: {:?}", names);
+        assert!(names.contains(&"createUser"), "Should find method createUser, got: {:?}", names);
+
+        // Methods should be nested under class
+        let get_users = entities.iter().find(|e| e.name == "getUsers").unwrap();
+        assert!(get_users.parent_id.is_some(), "getUsers should have parent_id");
+    }
+
+    #[test]
+    fn test_scala3_entity_extraction() {
+        let code = r#"
+package com.example
+
+enum Color:
+  case Red, Green, Blue
+
+enum Planet(mass: Double, radius: Double):
+  case Mercury extends Planet(3.303e+23, 2.4397e6)
+  case Venus   extends Planet(4.869e+24, 6.0518e6)
+
+object Main:
+  def main(args: Array[String]): Unit =
+    println("Hello, World!")
+
+trait Greeter:
+  def greet(name: String): String
+
+given Greeter with
+  def greet(name: String): String = s"Hello, $name!"
+
+extension (s: String)
+  def shout: String = s.toUpperCase + "!"
+
+type Predicate[A] = A => Boolean
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Main.scala");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("Scala 3 entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"Color"), "Should find enum Color, got: {:?}", names);
+        assert!(names.contains(&"Planet"), "Should find enum Planet, got: {:?}", names);
+        assert!(names.contains(&"Main"), "Should find object Main, got: {:?}", names);
+        assert!(names.contains(&"Greeter"), "Should find trait Greeter, got: {:?}", names);
+        assert!(names.contains(&"Predicate"), "Should find type alias Predicate, got: {:?}", names);
+    }
 }

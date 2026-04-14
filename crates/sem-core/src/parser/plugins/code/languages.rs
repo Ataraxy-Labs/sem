@@ -112,6 +112,10 @@ fn get_ocaml_interface() -> Option<Language> {
     Some(tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
 }
 
+fn get_scala() -> Option<Language> {
+    Some(tree_sitter_scala::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -593,6 +597,29 @@ static OCAML_INTERFACE_CONFIG: LanguageConfig = LanguageConfig {
     get_language: get_ocaml_interface,
 };
 
+static SCALA_CONFIG: LanguageConfig = LanguageConfig {
+    id: "scala",
+    extensions: &[".scala", ".sc"],
+    entity_node_types: &[
+        "class_definition",
+        "object_definition",
+        "trait_definition",
+        "enum_definition",
+        "function_definition",
+        "function_declaration",
+        "val_definition",
+        "given_definition",
+        "extension_definition",
+        "type_definition",
+        "package_object",
+    ],
+    container_node_types: &["template_body", "enum_body", "with_template_body"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_scala,
+};
+
 static ALL_CONFIGS: &[&LanguageConfig] = &[
     &TYPESCRIPT_CONFIG,
     &TSX_CONFIG,
@@ -617,6 +644,7 @@ static ALL_CONFIGS: &[&LanguageConfig] = &[
     &PERL_CONFIG,
     &OCAML_CONFIG,
     &OCAML_INTERFACE_CONFIG,
+    &SCALA_CONFIG,
 ];
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
@@ -638,6 +666,7 @@ pub fn get_all_code_extensions() -> &'static [&'static str] {
         ".dart",
         ".pl", ".pm", ".t",
         ".ml", ".mli",
+        ".scala", ".sc",
     ];
     EXTENSIONS
 }
