@@ -19,7 +19,7 @@ All cargo commands run from repo root. CI builds from `crates/` directory.
 
 ## Key Paths
 
-- Parsers: `crates/sem-core/src/parser/plugins/` (23 language plugins + shebang detection)
+- Parsers: `crates/sem-core/src/parser/plugins/` (24 language plugins + shebang detection)
 - Commands: `crates/sem-cli/src/commands/`
 - Entity model: `crates/sem-core/src/model/`
 - Git integration: `crates/sem-core/src/git/`
