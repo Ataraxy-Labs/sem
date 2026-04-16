@@ -630,15 +630,9 @@ static ZIG_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &[
         "function_declaration",
         "test_declaration",
-        "struct_declaration",
-        "union_declaration",
-        "enum_declaration",
         "variable_declaration",
-        "constant_declaration",
-        "container_declaration",
-        "type_declaration",
     ],
-    container_node_types: &["block","container_decl"],
+    container_node_types: &["block"],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[
         SuppressedNestedEntity {

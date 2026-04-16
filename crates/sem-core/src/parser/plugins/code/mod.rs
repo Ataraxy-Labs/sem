@@ -1718,7 +1718,7 @@ type Predicate[A] = A => Boolean
         assert!(names.contains(&"Predicate"), "Should find type alias Predicate, got: {:?}", names);
     }
 
-        #[test]
+    #[test]
     fn test_zig_entity_extraction() {
         let code = r#"
 const std = @import("std");
@@ -1750,20 +1750,31 @@ fn add(a: i32, b: i32) i32 {
 pub fn main() !void {
     greet("world");
 }
+
+test "basic addition" {
+    const result = add(2, 3);
+    _ = result;
+}
 "#;
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "main.zig");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        let types: std::collections::HashMap<&str, &str> = entities
+            .iter()
+            .map(|e| (e.name.as_str(), e.entity_type.as_str()))
+            .collect();
 
-        eprintln!("Zig entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        assert!(names.contains(&"greet"), "Should find greet, got: {:?}", names);
+        assert!(names.contains(&"add"), "Should find add, got: {:?}", names);
+        assert!(names.contains(&"main"), "Should find main, got: {:?}", names);
+        assert!(names.contains(&"Point"), "Should find Point, got: {:?}", names);
+        assert!(names.contains(&"Color"), "Should find Color, got: {:?}", names);
+        assert!(names.contains(&"Person"), "Should find Person, got: {:?}", names);
 
-        assert!(names.contains(&"greet"), "Should find greet function, got: {:?}", names);
-        assert!(names.contains(&"add"), "Should find add function, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find main function, got: {:?}", names);
-
-        assert!(names.contains(&"Point"), "Should find Point struct, got: {:?}", names);
-        assert!(names.contains(&"Color"), "Should find Color enum, got: {:?}", names);
-        assert!(names.contains(&"Person"), "Should find Person struct, got: {:?}", names);
+        assert_eq!(types["greet"], "function");
+        assert_eq!(types["add"], "function");
+        assert_eq!(types["Point"], "struct");
+        assert_eq!(types["Color"], "enum");
+        assert_eq!(types["Person"], "struct");
     }
 }

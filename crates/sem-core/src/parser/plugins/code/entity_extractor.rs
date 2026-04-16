@@ -1062,8 +1062,29 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
     match node.kind() {
         "decorated_definition" => map_decorated_type(node),
         "class_member" => map_class_member_type(node),
-        _ => promote_js_ts_const_function(node, config).unwrap_or_else(|| map_node_type(node.kind())),
+        _ => promote_zig_variable(node, config)
+            .or_else(|| promote_js_ts_const_function(node, config))
+            .unwrap_or_else(|| map_node_type(node.kind())),
     }
+}
+
+/// In Zig, `const Point = struct { ... }` is a variable_declaration whose RHS
+/// is a struct/enum/union expression. Promote the entity type accordingly.
+fn promote_zig_variable(node: Node, config: &LanguageConfig) -> Option<&'static str> {
+    if config.id != "zig" || node.kind() != "variable_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "struct_declaration" => return Some("struct"),
+            "enum_declaration" => return Some("enum"),
+            "union_declaration" => return Some("union"),
+            "error_set_declaration" => return Some("type"),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn promote_js_ts_const_function(node: Node, config: &LanguageConfig) -> Option<&'static str> {
