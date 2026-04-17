@@ -20,7 +20,7 @@
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
   <img src="https://img.shields.io/badge/tests-133_passing-brightgreen" alt="Tests">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License"></a>
-  <img src="https://img.shields.io/badge/languages-23-blue" alt="Languages">
+  <img src="https://img.shields.io/badge/languages-26-blue" alt="Languages">
 </p>
 
 sem is a semantic version control tool that works on top of Git. It parses your code with tree-sitter, extracts every function, class, and method as an entity, and diffs at the entity level instead of lines. This means you see "function `blahh` was modified" instead of "lines x-y changed."
@@ -206,7 +206,7 @@ sem unsetup
 
 ## What it parses
 
-23 programming languages with full entity extraction via tree-sitter:
+26 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -233,6 +233,9 @@ sem unsetup
 | Svelte | `.svelte` `.svelte.js` `.svelte.ts` | component blocks + rune JS/TS modules |
 | Perl | `.pl` `.pm` `.t` | subroutines, packages |
 | Dart | `.dart` | classes, mixins, extensions, enums, type aliases, functions |
+| OCaml | `.ml` `.mli` | values, modules, types, classes, externals |
+| Scala | `.scala` `.sc` `.sbt` | classes, objects, traits, enums, functions, vals, extensions |
+| Zig | `.zig` | functions, tests, variables |
 
 Plus structured data formats:
 
