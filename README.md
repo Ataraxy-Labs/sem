@@ -165,12 +165,17 @@ sem log authenticateUser --json
 
 ### sem entities
 
-List all entities in a file with their types and line ranges.
+List all entities under a file or directory path. No path is the same as `.`.
 
 ```bash
+sem entities
+
+sem entities .
+
 sem entities src/auth.ts
 
 # JSON output
+sem entities --json
 sem entities src/auth.ts --json
 ```
 

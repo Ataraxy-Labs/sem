@@ -154,11 +154,11 @@ enum Commands {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
-    /// List entities in a file
+    /// List entities under a file or directory path
     Entities {
-        /// File to extract entities from
+        /// File or directory path to extract entities from (defaults to .)
         #[arg()]
-        file: String,
+        path: Option<String>,
 
         /// Output as JSON
         #[arg(long)]
@@ -338,13 +338,13 @@ fn main() {
                 verbose,
             });
         }
-        Some(Commands::Entities { file, json }) => {
+        Some(Commands::Entities { path, json }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string(),
-                file_path: file,
+                path,
                 json,
             });
         }
