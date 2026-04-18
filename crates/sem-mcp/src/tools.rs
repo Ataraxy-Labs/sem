@@ -4,8 +4,8 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EntitiesParams {
-    #[schemars(description = "Path to the file (relative to repo root or absolute)")]
-    pub file_path: String,
+    #[schemars(description = "Optional path to a file or directory. If omitted, defaults to '.'.")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
