@@ -1316,7 +1316,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sem-cli"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "clap",
  "clap_complete_command",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "sem-core"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "git2",
  "rayon",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "sem-mcp"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "git2",
  "lru",
@@ -1984,9 +1984,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-scala"
-version = "0.25.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83079f50ea7d03e0faf6be6260ed97538e6df7349ec3cbcbf5771f7b38e3c8b7"
+checksum = "de5a4a7ff23a55474ce6a741d52aaeca7a82fe9421bb982b86e98c6ac8629397"
 dependencies = [
  "cc",
  "tree-sitter-language",
