@@ -47,7 +47,7 @@ pub fn verify_contracts(
     registry: &ParserRegistry,
     target_file: Option<&str>,
 ) -> Vec<ContractViolation> {
-    let graph = EntityGraph::build(root, file_paths, registry);
+    let (graph, _) = EntityGraph::build(root, file_paths, registry);
 
     let mut content_map: HashMap<String, String> = HashMap::new();
     for fp in file_paths {

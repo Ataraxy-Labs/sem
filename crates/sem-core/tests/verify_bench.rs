@@ -47,7 +47,7 @@ fn build_graph_from_entities(
 
     let file_strs: Vec<String> = files.iter().map(|f| f.to_string()).collect();
     let scope_result =
-        scope_resolve::resolve_with_scopes(root, &file_strs, entities, &entity_map);
+        scope_resolve::resolve_with_scopes(root, &file_strs, entities, &entity_map, None);
 
     let edges: Vec<EntityRef> = scope_result
         .edges

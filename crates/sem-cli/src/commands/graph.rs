@@ -1,10 +1,46 @@
 use std::path::Path;
 
+use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::EntityGraph;
+use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
 
 use crate::cache::DiskCache;
+
+pub struct GraphOptions {
+    pub cwd: String,
+    pub json: bool,
+    pub file_exts: Vec<String>,
+    pub no_cache: bool,
+}
+
+pub fn graph_command(opts: GraphOptions) {
+    let root = Path::new(&opts.cwd);
+    let registry = create_default_registry();
+    let ext_filter = normalize_exts(&opts.file_exts);
+    let file_paths = find_supported_files_public(root, &registry, &ext_filter);
+    let (graph, _entities) = get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
+
+    if opts.json {
+        let output = serde_json::json!({
+            "entities": graph.entities.values().collect::<Vec<_>>(),
+            "edges": &graph.edges,
+            "stats": {
+                "entityCount": graph.entities.len(),
+                "edgeCount": graph.edges.len()
+            }
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        println!(
+            "{} {} entities, {} edges",
+            "⊕".green(),
+            graph.entities.len().to_string().bold(),
+            graph.edges.len().to_string().bold(),
+        );
+    }
+}
 
 /// Normalize extension strings: ensure each starts with '.'
 pub fn normalize_exts(exts: &[String]) -> Vec<String> {
@@ -86,6 +122,7 @@ pub fn get_or_build_graph(
                     file_paths,
                     partial.cached_entities,
                     partial.cached_edges,
+                    partial.stale_file_entities,
                     registry,
                 );
                 let _ = disk.save_incremental(
@@ -101,8 +138,7 @@ pub fn get_or_build_graph(
     }
 
     // Full rebuild
-    let graph = EntityGraph::build(root, file_paths, registry);
-    let entities = extract_all_entities(root, file_paths, registry);
+    let (graph, entities) = EntityGraph::build(root, file_paths, registry);
 
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {

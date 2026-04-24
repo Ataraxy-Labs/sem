@@ -27,6 +27,14 @@ impl SemanticParserPlugin for CodeParserPlugin {
     }
 
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        self.extract_entities_with_tree(content, file_path).0
+    }
+
+    fn extract_entities_with_tree(
+        &self,
+        content: &str,
+        file_path: &str,
+    ) -> (Vec<SemanticEntity>, Option<tree_sitter::Tree>) {
         let ext = std::path::Path::new(file_path)
             .extension()
             .and_then(|e| e.to_str())
@@ -41,14 +49,14 @@ impl SemanticParserPlugin for CodeParserPlugin {
                     .and_then(|se| get_language_config(&se))
                 {
                     Some(c) => c,
-                    None => return Vec::new(),
+                    None => return (Vec::new(), None),
                 }
             }
         };
 
         let language = match (config.get_language)() {
             Some(lang) => lang,
-            None => return Vec::new(),
+            None => return (Vec::new(), None),
         };
 
         PARSER_CACHE.with(|cache| {
@@ -61,10 +69,11 @@ impl SemanticParserPlugin for CodeParserPlugin {
 
             let tree = match parser.parse(content.as_bytes(), None) {
                 Some(t) => t,
-                None => return Vec::new(),
+                None => return (Vec::new(), None),
             };
 
-            extract_entities(&tree, file_path, config, content)
+            let entities = extract_entities(&tree, file_path, config, content);
+            (entities, Some(tree))
         })
     }
 }

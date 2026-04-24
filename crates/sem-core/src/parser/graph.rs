@@ -100,18 +100,29 @@ impl EntityGraph {
         root: &Path,
         file_paths: &[String],
         registry: &ParserRegistry,
-    ) -> Self {
+    ) -> (Self, Vec<SemanticEntity>) {
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
-        let all_entities: Vec<SemanticEntity> = file_paths
+        // Also collect (file_path, content, tree) for scope_resolve reuse
+        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = file_paths
             .par_iter()
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 let plugin = registry.get_plugin_with_content(file_path, &content)?;
-                Some(plugin.extract_entities(&content, file_path))
+                let (entities, tree) = plugin.extract_entities_with_tree(&content, file_path);
+                let parsed = tree.map(|t| (file_path.clone(), content, t));
+                Some((entities, parsed))
             })
-            .flatten()
             .collect();
+
+        let mut all_entities: Vec<SemanticEntity> = Vec::new();
+        let mut parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+        for (entities, parsed) in per_file {
+            all_entities.extend(entities);
+            if let Some(p) = parsed {
+                parsed_files.push(p);
+            }
+        }
 
         // Build symbol table: name → entity IDs (can be multiple with same name)
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
@@ -190,14 +201,15 @@ impl EntityGraph {
         // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
         let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map);
 
-        // Run scope-aware resolver for supported languages
+        // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
-            f.ends_with(".py") || f.ends_with(".ts") || f.ends_with(".tsx")
-                || f.ends_with(".js") || f.ends_with(".jsx")
-                || f.ends_with(".rs") || f.ends_with(".go")
+            let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
+            crate::parser::plugins::code::languages::get_language_config(ext)
+                .and_then(|c| c.scope_resolve)
+                .is_some()
         });
         let (scope_edges, scope_resolved_entities) = if has_scope_lang {
-            let result = scope_resolve::resolve_with_scopes(root, file_paths, &all_entities, &entity_map);
+            let result = scope_resolve::resolve_with_scopes(root, file_paths, &all_entities, &entity_map, Some(parsed_files));
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
@@ -352,12 +364,14 @@ impl EntityGraph {
             });
         }
 
-        EntityGraph {
+        let graph = EntityGraph {
             entities: entity_map,
             edges,
             dependents,
             dependencies,
-        }
+        };
+
+        (graph, all_entities)
     }
 
     /// Incrementally build an entity graph: reparse only stale files, reuse cached data for clean files.
@@ -371,21 +385,62 @@ impl EntityGraph {
         all_file_paths: &[String],
         cached_entities: Vec<SemanticEntity>,
         cached_edges: Vec<EntityRef>,
+        stale_file_cached_entities: Vec<SemanticEntity>,
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
         // Build set of stale file paths for quick lookup
         let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
 
-        // Parse stale files in parallel to get new entities
-        let new_entities: Vec<SemanticEntity> = stale_files
+        // Parse stale files in parallel to get new entities + trees
+        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = stale_files
             .par_iter()
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 let plugin = registry.get_plugin_with_content(file_path, &content)?;
-                Some(plugin.extract_entities(&content, file_path))
+                let (entities, tree) = plugin.extract_entities_with_tree(&content, file_path);
+                let parsed = tree.map(|t| (file_path.clone(), content, t));
+                Some((entities, parsed))
             })
-            .flatten()
+            .collect();
+
+        let mut new_entities: Vec<SemanticEntity> = Vec::new();
+        let mut parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+        for (entities, parsed) in per_file {
+            new_entities.extend(entities);
+            if let Some(p) = parsed {
+                parsed_files.push(p);
+            }
+        }
+
+        // Entity-level diffing: compare new stale-file entities against cached versions
+        // Build content_hash lookup from cached stale-file entities
+        let cached_hashes: HashMap<&str, &str> = stale_file_cached_entities
+            .iter()
+            .map(|e| (e.id.as_str(), e.content_hash.as_str()))
+            .collect();
+
+        // Classify new stale-file entities
+        let mut truly_changed_ids: HashSet<String> = HashSet::new();
+        let mut content_clean_ids: HashSet<String> = HashSet::new();
+        for entity in &new_entities {
+            match cached_hashes.get(entity.id.as_str()) {
+                Some(old_hash) if *old_hash == entity.content_hash.as_str() => {
+                    content_clean_ids.insert(entity.id.clone());
+                }
+                _ => {
+                    // Hash differs or entity is new
+                    truly_changed_ids.insert(entity.id.clone());
+                }
+            }
+        }
+
+        // Detect deleted entities: in cached stale but not in new
+        let new_entity_ids: HashSet<&str> = new_entities.iter().map(|e| e.id.as_str()).collect();
+        let deleted_ids: HashSet<&str> = stale_file_cached_entities
+            .iter()
+            .filter(|e| !new_entity_ids.contains(e.id.as_str()))
+            .map(|e| e.id.as_str())
             .collect();
 
         // Merge: cached (clean) entities + new (stale) entities
@@ -394,38 +449,59 @@ impl EntityGraph {
             .chain(new_entities.into_iter())
             .collect();
 
-        // Collect stale entity IDs
+        // Find affected clean entities: only care about edges pointing to truly_changed/deleted
+        let mut affected_clean_ids: HashSet<String> = HashSet::new();
+        for edge in &cached_edges {
+            let to_truly_changed = truly_changed_ids.contains(&edge.to_entity)
+                || deleted_ids.contains(edge.to_entity.as_str());
+            if to_truly_changed && !stale_set.contains(
+                all_entities.iter()
+                    .find(|e| e.id == edge.from_entity)
+                    .map(|e| e.file_path.as_str())
+                    .unwrap_or("")
+            ) {
+                affected_clean_ids.insert(edge.from_entity.clone());
+            }
+        }
+
+        // Collect all stale entity IDs (for edge filtering)
         let stale_entity_ids: HashSet<&str> = all_entities
             .iter()
             .filter(|e| stale_set.contains(e.file_path.as_str()))
             .map(|e| e.id.as_str())
             .collect();
 
-        // Find affected clean entities: those with cached edges pointing to/from stale entities
-        let mut affected_clean_ids: HashSet<String> = HashSet::new();
-        for edge in &cached_edges {
-            if stale_entity_ids.contains(edge.to_entity.as_str()) {
-                if !stale_entity_ids.contains(edge.from_entity.as_str()) {
-                    affected_clean_ids.insert(edge.from_entity.clone());
-                }
-            }
-        }
-
-        // Keep only edges where both endpoints are clean AND from_entity is not affected
+        // Keep edges where:
+        // - Both endpoints are clean files AND from_entity is not affected, OR
+        // - From a content_clean stale entity whose targets are also clean/content_clean
         let kept_edges: Vec<EntityRef> = cached_edges
             .into_iter()
             .filter(|e| {
-                !stale_entity_ids.contains(e.from_entity.as_str())
-                    && !stale_entity_ids.contains(e.to_entity.as_str())
+                let from_stale = stale_entity_ids.contains(e.from_entity.as_str());
+                let to_stale = stale_entity_ids.contains(e.to_entity.as_str());
+
+                if !from_stale && !to_stale && !affected_clean_ids.contains(&e.from_entity) {
+                    // Both clean, from not affected
+                    return true;
+                }
+                if content_clean_ids.contains(&e.from_entity)
+                    && !truly_changed_ids.contains(&e.to_entity)
+                    && !deleted_ids.contains(e.to_entity.as_str())
                     && !affected_clean_ids.contains(&e.from_entity)
+                {
+                    // From content_clean stale entity, target not truly changed
+                    return true;
+                }
+                false
             })
             .collect();
 
-        // Set of entity IDs that need resolution
+        // Set of entity IDs that need resolution: truly_changed + affected clean
+        // (content_clean stale entities keep their cached edges)
         let needs_resolution: HashSet<&str> = all_entities
             .iter()
             .filter(|e| {
-                stale_entity_ids.contains(e.id.as_str())
+                truly_changed_ids.contains(&e.id)
                     || affected_clean_ids.contains(&e.id)
             })
             .map(|e| e.id.as_str())
@@ -516,12 +592,20 @@ impl EntityGraph {
             .collect();
 
         let has_scope_lang = resolve_file_paths.iter().any(|f| {
-            f.ends_with(".py") || f.ends_with(".ts") || f.ends_with(".tsx")
-                || f.ends_with(".js") || f.ends_with(".jsx")
-                || f.ends_with(".rs") || f.ends_with(".go")
+            let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
+            crate::parser::plugins::code::languages::get_language_config(ext)
+                .and_then(|c| c.scope_resolve)
+                .is_some()
         });
         let (scope_edges, scope_resolved_entities) = if has_scope_lang {
-            let result = scope_resolve::resolve_with_scopes(root, &resolve_file_paths, &all_entities, &entity_map);
+            // Pass pre-parsed stale-file trees; scope_resolve reads affected clean files from disk
+            let resolve_set: HashSet<&str> = resolve_file_paths.iter().map(|s| s.as_str()).collect();
+            let relevant_parsed: Vec<(String, String, tree_sitter::Tree)> = parsed_files
+                .into_iter()
+                .filter(|(fp, _, _)| resolve_set.contains(fp.as_str()))
+                .collect();
+            let pre = if relevant_parsed.is_empty() { None } else { Some(relevant_parsed) };
+            let result = scope_resolve::resolve_with_scopes(root, &resolve_file_paths, &all_entities, &entity_map, pre);
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
@@ -1764,7 +1848,7 @@ mod tests {
         write_file(root, "a.ts", "export function foo() { return bar(); }\n");
         write_file(root, "b.ts", "export function bar() { return 1; }\n");
 
-        let mut graph = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        let (mut graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
         assert_eq!(graph.entities.len(), 2);
 
         // Add a new file
@@ -1800,7 +1884,7 @@ mod tests {
         write_file(root, "a.ts", "export function foo() { return bar(); }\n");
         write_file(root, "b.ts", "export function bar() { return 1; }\n");
 
-        let mut graph = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        let (mut graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
         assert_eq!(graph.entities.len(), 2);
 
         // Delete b.ts
@@ -1835,7 +1919,7 @@ mod tests {
         write_file(root, "a.ts", "export function foo() { return bar(); }\n");
         write_file(root, "b.ts", "export function bar() { return 1; }\nexport function baz() { return 2; }\n");
 
-        let mut graph = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        let (mut graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
         assert_eq!(graph.entities.len(), 3);
 
         // Modify a.ts to call baz instead of bar
@@ -1866,7 +1950,7 @@ mod tests {
         let root = dir.path();
 
         write_file(root, "a.ts", "export function foo() { return 1; }\n");
-        let mut graph = EntityGraph::build(root, &["a.ts".into()], &registry);
+        let (mut graph, _) = EntityGraph::build(root, &["a.ts".into()], &registry);
         assert_eq!(graph.entities.len(), 1);
 
         // Add file with content provided directly (no disk read needed)
@@ -1954,7 +2038,7 @@ class MyService:
         return True
 ");
 
-        let graph = EntityGraph::build(root, &["service.py".into()], &registry);
+        let (graph, _) = EntityGraph::build(root, &["service.py".into()], &registry);
 
         // process should have an edge to validate via self.validate()
         let process_id = graph.entities.keys()
@@ -1984,7 +2068,7 @@ class UserService {
 }
 ");
 
-        let graph = EntityGraph::build(root, &["service.ts".into()], &registry);
+        let (graph, _) = EntityGraph::build(root, &["service.ts".into()], &registry);
 
         let process_id = graph.entities.keys()
             .find(|id| id.contains("process"))
@@ -2009,7 +2093,7 @@ class MathUtils {
 function caller() { return MathUtils.compute(); }
 ");
 
-        let graph = EntityGraph::build(root, &["utils.ts".into()], &registry);
+        let (graph, _) = EntityGraph::build(root, &["utils.ts".into()], &registry);
 
         let caller_id = graph.entities.keys()
             .find(|id| id.contains("caller"))
@@ -2035,7 +2119,7 @@ import { helper } from './helper';
 export function main() { return helper(); }
 ");
 
-        let graph = EntityGraph::build(
+        let (graph, _) = EntityGraph::build(
             root,
             &["helper.ts".into(), "main.ts".into()],
             &registry,
@@ -2073,7 +2157,7 @@ class ClassB:
         return 2
 ");
 
-        let graph = EntityGraph::build(
+        let (graph, _) = EntityGraph::build(
             root,
             &["a.py".into(), "b.py".into()],
             &registry,
@@ -2111,7 +2195,7 @@ export function caller() {
 }
 ");
 
-        let graph = EntityGraph::build(root, &["app.ts".into()], &registry);
+        let (graph, _) = EntityGraph::build(root, &["app.ts".into()], &registry);
 
         let caller_id = graph.entities.keys()
             .find(|id| id.contains("caller"))

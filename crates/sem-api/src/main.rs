@@ -174,7 +174,7 @@ async fn graph(Json(req): Json<GraphReq>) -> Result<impl IntoResponse, AppError>
         let repo_path = resolve_repo(&req.repo)?;
         let registry = create_default_registry();
         let files = get_files(&repo_path, req.files);
-        let g = EntityGraph::build(&repo_path, &files, &registry);
+        let (g, _) = EntityGraph::build(&repo_path, &files, &registry);
         let entity_count = g.entities.len();
         let edge_count = g.edges.len();
         Ok(serde_json::json!({
@@ -193,7 +193,7 @@ async fn dependencies(Json(req): Json<EntityReq>) -> Result<impl IntoResponse, A
         let repo_path = resolve_repo(&req.repo)?;
         let registry = create_default_registry();
         let files = get_files(&repo_path, req.files);
-        let g = EntityGraph::build(&repo_path, &files, &registry);
+        let (g, _) = EntityGraph::build(&repo_path, &files, &registry);
         let deps = g.get_dependencies(&req.entity);
         let count = deps.len();
         Ok(serde_json::json!({
@@ -211,7 +211,7 @@ async fn dependents(Json(req): Json<EntityReq>) -> Result<impl IntoResponse, App
         let repo_path = resolve_repo(&req.repo)?;
         let registry = create_default_registry();
         let files = get_files(&repo_path, req.files);
-        let g = EntityGraph::build(&repo_path, &files, &registry);
+        let (g, _) = EntityGraph::build(&repo_path, &files, &registry);
         let deps = g.get_dependents(&req.entity);
         let count = deps.len();
         Ok(serde_json::json!({
@@ -229,7 +229,7 @@ async fn impact(Json(req): Json<ImpactReq>) -> Result<impl IntoResponse, AppErro
         let repo_path = resolve_repo(&req.repo)?;
         let registry = create_default_registry();
         let files = get_files(&repo_path, req.files);
-        let g = EntityGraph::build(&repo_path, &files, &registry);
+        let (g, _) = EntityGraph::build(&repo_path, &files, &registry);
         let max = req.max.unwrap_or(10_000);
         let affected = g.impact_analysis_capped(&req.entity, max);
         let count = affected.len();
@@ -271,7 +271,7 @@ async fn search(Json(req): Json<SearchReq>) -> Result<impl IntoResponse, AppErro
         let repo_path = resolve_repo(&req.repo)?;
         let registry = create_default_registry();
         let files = get_files(&repo_path, req.files);
-        let g = EntityGraph::build(&repo_path, &files, &registry);
+        let (g, _) = EntityGraph::build(&repo_path, &files, &registry);
 
         let query_lower = req.query.to_lowercase();
         let matches: Vec<&EntityInfo> = g

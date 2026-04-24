@@ -32,7 +32,7 @@ fn graph_accuracy_python() {
 
     let registry = create_default_registry();
     let file_refs: Vec<String> = files.iter().map(|f| f.to_string()).collect();
-    let graph = EntityGraph::build(root, &file_refs, &registry);
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
 
     let expected_edges: Vec<(&str, &str)> = vec![
         ("create_user", "User"),
@@ -94,7 +94,7 @@ fn graph_accuracy_rust() {
 
     let registry = create_default_registry();
     let file_refs: Vec<String> = files.iter().map(|f| f.to_string()).collect();
-    let graph = EntityGraph::build(root, &file_refs, &registry);
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
 
     let expected_edges: Vec<(&str, &str)> = vec![
         ("Parser::new", "Config"),

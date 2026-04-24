@@ -266,6 +266,7 @@ impl SemServer {
                     file_paths,
                     partial.cached_entities,
                     partial.cached_edges,
+                    partial.stale_file_entities,
                     &self.registry,
                 );
                 let _ = disk.save_incremental(
@@ -289,8 +290,7 @@ impl SemServer {
         }
 
         // Fresh build
-        let graph = EntityGraph::build(repo_root, file_paths, &self.registry);
-        let entities = Self::extract_all_entities(repo_root, file_paths, &self.registry);
+        let (graph, entities) = EntityGraph::build(repo_root, file_paths, &self.registry);
 
         // Persist to SQLite (best-effort)
         if let Ok(disk) = cache::DiskCache::open(repo_root) {

@@ -11,6 +11,8 @@ pub struct PartialCache {
     pub stale_files: Vec<String>,
     pub cached_entities: Vec<SemanticEntity>,
     pub cached_edges: Vec<EntityRef>,
+    /// Cached entities from stale files (for entity-level content_hash comparison)
+    pub stale_file_entities: Vec<SemanticEntity>,
 }
 
 /// Compute a manifest hash from file paths + mtimes.
@@ -325,11 +327,12 @@ impl DiskCache {
 
         let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
 
+        // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
             .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
             .ok()?;
-        let cached_entities: Vec<SemanticEntity> = entity_stmt
+        let all_cached: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
                 let metadata_json: Option<String> = row.get(10)?;
                 let metadata = metadata_json.and_then(|j| serde_json::from_str(&j).ok());
@@ -349,10 +352,19 @@ impl DiskCache {
             })
             .ok()?
             .filter_map(|r| r.ok())
-            .filter(|e| !stale_set.contains(e.file_path.as_str()))
             .collect();
 
-        let clean_entity_ids: HashSet<String> = cached_entities.iter().map(|e| e.id.clone()).collect();
+        let mut cached_entities = Vec::new();
+        let mut stale_file_entities = Vec::new();
+        for e in all_cached {
+            if stale_set.contains(e.file_path.as_str()) {
+                stale_file_entities.push(e);
+            } else {
+                cached_entities.push(e);
+            }
+        }
+
+        // Load ALL cached edges (build_incremental decides which to keep)
         let mut edge_stmt = self
             .conn
             .prepare("SELECT from_entity, to_entity, ref_type FROM edges")
@@ -373,10 +385,6 @@ impl DiskCache {
             })
             .ok()?
             .filter_map(|r| r.ok())
-            .filter(|e| {
-                clean_entity_ids.contains(&e.from_entity)
-                    && clean_entity_ids.contains(&e.to_entity)
-            })
             .collect();
 
         let stale_files: Vec<String> = stale_files
@@ -388,6 +396,7 @@ impl DiskCache {
             stale_files,
             cached_entities,
             cached_edges,
+            stale_file_entities,
         })
     }
 
