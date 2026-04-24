@@ -64,9 +64,9 @@ enum Commands {
         #[arg(long)]
         patch: bool,
 
-        /// Output format: terminal, json, or markdown
+        /// Output format
         #[arg(long, default_value = "terminal")]
-        format: String,
+        format: OutputFormat,
 
         /// Show inline content diffs for each entity
         #[arg(long, short = 'v')]
@@ -80,7 +80,7 @@ enum Commands {
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
-        /// When to use colors: always, auto, never
+        /// When to use colors
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
@@ -247,12 +247,6 @@ fn main() {
             directory,
         }) => {
             apply_color_mode(color);
-            let output_format = match format.as_str() {
-                "json" => OutputFormat::Json,
-                "markdown" | "md" => OutputFormat::Markdown,
-                "plain" => OutputFormat::Plain,
-                _ => OutputFormat::Terminal,
-            };
 
             let cwd = directory.unwrap_or_else(|| {
                 std::env::current_dir()
@@ -263,7 +257,7 @@ fn main() {
 
             diff_command(DiffOptions {
                 cwd,
-                format: output_format,
+                format,
                 staged: staged || cached,
                 commit,
                 from,
