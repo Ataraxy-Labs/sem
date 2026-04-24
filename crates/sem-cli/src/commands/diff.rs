@@ -31,7 +31,7 @@ pub enum OutputFormat {
     Terminal,
     Plain,
     Json,
-    #[value(alias="md")]
+    #[value(alias = "md")]
     Markdown,
 }
 
