@@ -1,11 +1,17 @@
 [package]
 name = "sem-core"
-version = "0.3.7"
+version = "0.3.24"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 20 languages via tree-sitter and diffs at the entity level."
+repository = "https://github.com/Ataraxy-Labs/sem"
+homepage = "https://github.com/Ataraxy-Labs/sem"
+keywords = ["diff", "semantic", "tree-sitter", "ast", "code-analysis"]
+categories = ["development-tools", "parser-implementations"]
+readme = "../../README.md"
 
 [dependencies]
-git2 = "0.19"
+git2 = "0.20"
 tree-sitter = "0.26"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
@@ -22,6 +28,15 @@ tree-sitter-fortran = "0.5"
 tree-sitter-swift = "0.7"
 tree-sitter-elixir = "0.3"
 tree-sitter-bash = "0.23"
+tree-sitter-hcl = "1.1"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-xml = "0.7"
+tree-sitter-embedded-template = "0.25"
+tree-sitter-ocaml = "0.24"
+tree-sitter-htmlx-svelte = "0.1.7"
+tree-sitter-dart = "0.1.0"
+tree-sitter-perl-next = "0.1"
+tree-sitter-scala = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -30,6 +45,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 regex = "1"
 thiserror = "2"
 rayon = "1.10"
+tree-sitter-zig = "1.1.2"
 
 [dev-dependencies]
 tempfile = "3.24.0"

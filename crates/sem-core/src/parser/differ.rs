@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use crate::git::types::FileChange;
 use crate::model::change::{ChangeType, SemanticChange};
+use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
 use crate::parser::registry::ParserRegistry;
 use std::collections::HashSet;
@@ -29,7 +30,10 @@ pub fn compute_semantic_diff(
     let per_file_changes: Vec<(String, Vec<SemanticChange>)> = file_changes
         .par_iter()
         .filter_map(|file| {
-            let plugin = registry.get_plugin(&file.file_path)?;
+            let content_hint = file.after_content.as_deref()
+                .or(file.before_content.as_deref())
+                .unwrap_or("");
+            let plugin = registry.get_plugin_with_content(&file.file_path, content_hint)?;
 
             let before_entities = if let Some(ref content) = file.before_content {
                 let before_path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
@@ -58,7 +62,7 @@ pub fn compute_semantic_diff(
                           b: &crate::model::entity::SemanticEntity|
              -> f64 { plugin.compute_similarity(a, b) };
 
-            let result = match_entities(
+            let mut result = match_entities(
                 &before_entities,
                 &after_entities,
                 &file.file_path,
@@ -66,6 +70,14 @@ pub fn compute_semantic_diff(
                 commit_sha,
                 author,
             );
+
+            // Suppress parent entities whose modification is already explained
+            // by child entity changes (e.g. impl blocks when methods changed).
+            let all_entities: Vec<&SemanticEntity> =
+                before_entities.iter().chain(after_entities.iter()).collect();
+            suppress_redundant_parents(&mut result.changes, &all_entities);
+
+            result.changes.sort_by_key(|change| change.entity_line);
 
             if result.changes.is_empty() {
                 None
@@ -107,5 +119,37 @@ pub fn compute_semantic_diff(
         deleted_count,
         moved_count,
         renamed_count,
+    }
+}
+
+/// Remove "Modified" parent entities from the change list when at least one
+/// child entity also appears as a change.  This avoids showing e.g. an impl
+/// block as modified when the real change is in a method inside it.
+fn suppress_redundant_parents(
+    changes: &mut Vec<SemanticChange>,
+    entities: &[&SemanticEntity],
+) {
+    if changes.len() < 2 {
+        return;
+    }
+
+    // Build set of entity IDs that have changes
+    let changed_ids: HashSet<&str> = changes.iter().map(|c| c.entity_id.as_str()).collect();
+
+    // Find parent entity IDs that should be suppressed: a parent is redundant
+    // when it is Modified and at least one of its children also has a change.
+    let mut suppress: HashSet<String> = HashSet::new();
+    for entity in entities {
+        if let Some(ref pid) = entity.parent_id {
+            if changed_ids.contains(entity.id.as_str()) && changed_ids.contains(pid.as_str()) {
+                suppress.insert(pid.clone());
+            }
+        }
+    }
+
+    if !suppress.is_empty() {
+        changes.retain(|c| {
+            !(c.change_type == ChangeType::Modified && suppress.contains(&c.entity_id))
+        });
     }
 }

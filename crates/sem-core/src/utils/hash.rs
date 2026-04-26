@@ -21,6 +21,20 @@ pub fn structural_hash(node: Node, source: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Compute a structural hash that excludes tokens within a given byte range.
+/// Used to strip the entity name from the hash so that renames of otherwise
+/// identical entities produce the same hash, enabling Phase 2 rename detection.
+pub fn structural_hash_excluding_range(
+    node: Node,
+    source: &[u8],
+    exclude_start: usize,
+    exclude_end: usize,
+) -> String {
+    let mut hasher = Xxh3::new();
+    hash_structural_tokens_excluding(node, source, &mut hasher, exclude_start, exclude_end);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Recursively hash tokens from the AST, skipping comments.
 /// Hashes both node types (structure) and leaf text (content) so that
 /// structurally different ASTs with identical leaf tokens produce different hashes.
@@ -57,6 +71,46 @@ fn hash_structural_tokens(node: Node, source: &[u8], hasher: &mut Xxh3) {
     }
 }
 
+/// Like `hash_structural_tokens` but skips any leaf node whose byte range
+/// overlaps the excluded range (the entity name).
+fn hash_structural_tokens_excluding(
+    node: Node,
+    source: &[u8],
+    hasher: &mut Xxh3,
+    exclude_start: usize,
+    exclude_end: usize,
+) {
+    let kind = node.kind();
+
+    if is_comment_node(kind) {
+        return;
+    }
+
+    if node.child_count() == 0 {
+        let start = node.start_byte();
+        let end = node.end_byte();
+        // Skip leaf nodes that overlap the excluded range
+        if start < exclude_end && end > exclude_start {
+            return;
+        }
+        if start < end && end <= source.len() {
+            let bytes = &source[start..end];
+            let trimmed = trim_bytes(bytes);
+            if !trimmed.is_empty() {
+                hasher.write(trimmed);
+                hasher.write(b" ");
+            }
+        }
+    } else {
+        hasher.write(kind.as_bytes());
+        hasher.write(b":");
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            hash_structural_tokens_excluding(child, source, hasher, exclude_start, exclude_end);
+        }
+    }
+}
+
 /// Trim leading/trailing ASCII whitespace from a byte slice without allocating.
 #[inline]
 fn trim_bytes(bytes: &[u8]) -> &[u8] {
@@ -68,7 +122,7 @@ fn trim_bytes(bytes: &[u8]) -> &[u8] {
 fn is_comment_node(kind: &str) -> bool {
     matches!(
         kind,
-        "comment" | "line_comment" | "block_comment" | "doc_comment"
+        "comment" | "line_comment" | "block_comment" | "doc_comment" | "tag_comment"
     )
 }
 

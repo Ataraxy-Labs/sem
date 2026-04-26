@@ -21,65 +21,84 @@ impl SemanticParserPlugin for YamlParserPlugin {
         let top_level_keys = find_top_level_keys(&lines);
 
         if top_level_keys.is_empty() {
+            // No top-level keys: treat the whole file as a single chunk so
+            // changes to comment-only or marker-only YAML files are detected.
+            if !content.trim().is_empty() {
+                return vec![SemanticEntity {
+                    id: build_entity_id(file_path, "chunk", "(document)", None),
+                    file_path: file_path.to_string(),
+                    entity_type: "chunk".to_string(),
+                    name: "(document)".to_string(),
+                    parent_id: None,
+                    content_hash: content_hash(content),
+                    structural_hash: None,
+                    content: content.to_string(),
+                    start_line: 1,
+                    end_line: lines.len(),
+                    metadata: None,
+                }];
+            }
             return Vec::new();
         }
 
-        // Parse with serde_yaml for content hashing
-        let parsed: serde_yaml::Value = match serde_yaml::from_str(content) {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
-        let mapping = match parsed.as_mapping() {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-
-        // Build a lookup from key name to serialized value
-        let mut value_map: std::collections::HashMap<String, (String, bool)> =
-            std::collections::HashMap::new();
-        for (key, value) in mapping {
-            let key_str = match key.as_str() {
-                Some(s) => s.to_string(),
-                None => format!("{:?}", key),
-            };
-            let is_section = value.is_mapping() || value.is_sequence();
-            let value_str = if is_section {
-                serde_yaml::to_string(value)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
+        // Determine entity types using serde_yaml for section vs property.
+        let section_keys: std::collections::HashSet<String> =
+            if let Ok(serde_yaml::Value::Mapping(mapping)) = serde_yaml::from_str(content) {
+                mapping
+                    .iter()
+                    .filter(|(_, v)| v.is_mapping() || v.is_sequence())
+                    .filter_map(|(k, _)| k.as_str().map(String::from))
+                    .collect()
             } else {
-                yaml_value_to_string(value)
+                std::collections::HashSet::new()
             };
-            value_map.insert(key_str, (value_str, is_section));
-        }
 
         let mut entities = Vec::new();
+
+        // Capture preamble (comments, document markers) before the first key
+        if top_level_keys[0].line > 1 {
+            let preamble_end =
+                trim_trailing_blanks_yaml(&lines, 1, top_level_keys[0].line);
+            if preamble_end >= 1 {
+                let preamble_content = lines[..preamble_end].join("\n");
+                if !preamble_content.trim().is_empty() {
+                    entities.push(SemanticEntity {
+                        id: build_entity_id(file_path, "chunk", "(preamble)", None),
+                        file_path: file_path.to_string(),
+                        entity_type: "chunk".to_string(),
+                        name: "(preamble)".to_string(),
+                        parent_id: None,
+                        content_hash: content_hash(&preamble_content),
+                        structural_hash: None,
+                        content: preamble_content,
+                        start_line: 1,
+                        end_line: preamble_end,
+                        metadata: None,
+                    });
+                }
+            }
+        }
+
         for (i, tk) in top_level_keys.iter().enumerate() {
             let end_line = if i + 1 < top_level_keys.len() {
-                // End just before the next top-level key (skip trailing blanks)
                 let next_start = top_level_keys[i + 1].line;
                 trim_trailing_blanks_yaml(&lines, tk.line, next_start)
             } else {
-                // Last key: extend to end of file (skip trailing blanks)
                 trim_trailing_blanks_yaml(&lines, tk.line, lines.len() + 1)
             };
 
             let entity_content = lines[tk.line - 1..end_line].join("\n");
-            let (value_str, is_section) = value_map
-                .get(&tk.key)
-                .cloned()
-                .unwrap_or_else(|| (entity_content.clone(), false));
-
+            let is_section = section_keys.contains(&tk.key);
             let entity_type = if is_section { "section" } else { "property" };
 
+            // Hash raw text so comment changes within a section are detected.
             entities.push(SemanticEntity {
                 id: build_entity_id(file_path, entity_type, &tk.key, None),
                 file_path: file_path.to_string(),
                 entity_type: entity_type.to_string(),
                 name: tk.key.clone(),
                 parent_id: None,
-                content_hash: content_hash(&value_str),
+                content_hash: content_hash(&entity_content),
                 structural_hash: None,
                 content: entity_content,
                 start_line: tk.line,
@@ -136,16 +155,6 @@ fn trim_trailing_blanks_yaml(lines: &[&str], start: usize, next_start: usize) ->
     end
 }
 
-fn yaml_value_to_string(value: &serde_yaml::Value) -> String {
-    match value {
-        serde_yaml::Value::String(s) => s.clone(),
-        serde_yaml::Value::Number(n) => n.to_string(),
-        serde_yaml::Value::Bool(b) => b.to_string(),
-        serde_yaml::Value::Null => "null".to_string(),
-        _ => format!("{:?}", value),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +183,43 @@ mod tests {
         assert_eq!(entities[3].name, "description");
         assert_eq!(entities[3].start_line, 6);
         assert_eq!(entities[3].end_line, 6);
+    }
+
+    #[test]
+    fn test_yaml_preamble() {
+        let content = "# Config file\n---\nname: my-app\nversion: 1.0.0\n";
+        let plugin = YamlParserPlugin;
+        let entities = plugin.extract_entities(content, "config.yaml");
+
+        assert_eq!(entities[0].name, "(preamble)");
+        assert_eq!(entities[0].entity_type, "chunk");
+        assert_eq!(entities[0].start_line, 1);
+
+        assert_eq!(entities[1].name, "name");
+        assert_eq!(entities[2].name, "version");
+    }
+
+    #[test]
+    fn test_yaml_comment_only_file() {
+        let content = "# Just a comment\n# Another line\n";
+        let plugin = YamlParserPlugin;
+        let entities = plugin.extract_entities(content, "notes.yaml");
+
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "(document)");
+        assert_eq!(entities[0].entity_type, "chunk");
+    }
+
+    #[test]
+    fn test_yaml_comment_changes_detected() {
+        let content_a = "name: my-app\n# old comment\nversion: 1.0.0\n";
+        let content_b = "name: my-app\n# new comment\nversion: 1.0.0\n";
+        let plugin = YamlParserPlugin;
+        let entities_a = plugin.extract_entities(content_a, "config.yaml");
+        let entities_b = plugin.extract_entities(content_b, "config.yaml");
+
+        // The "name" entity includes the comment line in its range, so
+        // its content_hash should differ between versions.
+        assert_ne!(entities_a[0].content_hash, entities_b[0].content_hash);
     }
 }

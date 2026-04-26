@@ -1,0 +1,125 @@
+{
+  "description": "Ground truth dependency edges for the synthetic Python project. Each edge represents a real function-level call or reference that a perfect call graph tool should find.",
+  "edges": [
+    {
+      "caller": "core.validate",
+      "callee": "core.sanitize",
+      "category": "same_file",
+      "note": "validate() calls sanitize(data)"
+    },
+    {
+      "caller": "core.transform",
+      "callee": "core.validate",
+      "category": "same_file",
+      "note": "transform() calls validate(data)"
+    },
+    {
+      "caller": "noise.another_function",
+      "callee": "noise.unrelated_function",
+      "category": "same_file",
+      "note": "another_function() calls unrelated_function()"
+    },
+    {
+      "caller": "processors.process_batch",
+      "callee": "processors.apply_to_all",
+      "category": "same_file",
+      "note": "process_batch() calls apply_to_all(items, sanitize)"
+    },
+    {
+      "caller": "io_handler.process_input",
+      "callee": "core.validate",
+      "category": "cross_file",
+      "note": "from project.core import validate; calls validate(raw_data)"
+    },
+    {
+      "caller": "io_handler.process_input",
+      "callee": "core.sanitize",
+      "category": "cross_file",
+      "note": "from project.core import sanitize; calls sanitize(raw_data)"
+    },
+    {
+      "caller": "io_handler.create_user",
+      "callee": "core.sanitize",
+      "category": "cross_file",
+      "note": "from project.core import sanitize; calls sanitize(name)"
+    },
+    {
+      "caller": "io_handler.create_user",
+      "callee": "models.UserModel",
+      "category": "cross_file",
+      "note": "from project.models import UserModel; calls UserModel(clean_name, email)"
+    },
+    {
+      "caller": "api.handle_transform",
+      "callee": "core.transform",
+      "category": "cross_file",
+      "note": "from project.core import transform; calls transform(data)"
+    },
+    {
+      "caller": "compat.validate_and_compute",
+      "callee": "core.validate",
+      "category": "cross_file",
+      "note": "from project.core import validate; calls validate(data)"
+    },
+    {
+      "caller": "compat.validate_and_compute",
+      "callee": "utils.expensive_compute",
+      "category": "cross_file",
+      "note": "from project.utils import expensive_compute; calls expensive_compute(n)"
+    },
+    {
+      "caller": "models.UserModel.__init__",
+      "callee": "models.BaseModel.__init__",
+      "category": "super_call",
+      "note": "super().__init__(name) resolves to BaseModel.__init__"
+    },
+    {
+      "caller": "models.UserModel.serialize",
+      "callee": "models.BaseModel.serialize",
+      "category": "super_call",
+      "note": "super().serialize() resolves to BaseModel.serialize"
+    },
+    {
+      "caller": "utils.expensive_compute",
+      "callee": "utils.memoize",
+      "category": "decorator",
+      "note": "@memoize decorator wraps expensive_compute"
+    },
+    {
+      "caller": "api.handle_request",
+      "callee": "core.validate",
+      "category": "alias",
+      "note": "from project.core import validate as core_validate; calls core_validate()"
+    },
+    {
+      "caller": "api.handle_request",
+      "callee": "api.validate",
+      "category": "name_collision",
+      "note": "calls local validate(request) which shadows the import"
+    },
+    {
+      "caller": "processors.apply_to_all",
+      "callee": "core.sanitize",
+      "category": "callback",
+      "note": "calls func(item) where func=sanitize passed from process_batch"
+    },
+    {
+      "caller": "processors.process_batch",
+      "callee": "core.sanitize",
+      "category": "callback",
+      "note": "passes sanitize as callback argument to apply_to_all"
+    },
+    {
+      "caller": "models.UserModel",
+      "callee": "models.BaseModel",
+      "category": "inheritance",
+      "note": "class UserModel(BaseModel) inherits from BaseModel"
+    }
+  ],
+  "false_positive_traps": [
+    {
+      "file": "noise.py",
+      "description": "Mentions validate and sanitize in docstrings/comments but never calls them. Has unused import of sanitize. Any edges from noise.unrelated_function to core entities are false positives."
+    }
+  ]
+}

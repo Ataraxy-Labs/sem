@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>sem — MCP Benchmarks</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0a0a0a;
+      --fg: #e0e0e0;
+      --dim: #999;
+      --dim2: #666;
+      --border: #222;
+      --accent: #fff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --blue: #60a5fa;
+      --cyan: #22d3ee;
+      --purple: #a78bfa;
+      --orange: #fb923c;
+      --surface: #111;
+      --surface2: #141414;
+      --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    }
+
+    body {
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--fg); text-decoration-color: var(--dim); text-underline-offset: 3px; }
+    a:hover { color: var(--accent); text-decoration-color: var(--accent); }
+
+    .container { max-width: 800px; margin: 0 auto; padding: 0 24px; }
+
+    /* Nav */
+    nav {
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 50;
+      border-bottom: 1px solid var(--border);
+    }
+    nav .nav-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); text-decoration: none; }
+    nav .links { display: flex; gap: 20px; font-size: 13px; color: var(--dim); }
+
+    /* Sections */
+    section { padding: 60px 0; border-top: 1px solid var(--border); }
+    section:first-of-type { border-top: none; }
+    section h2 {
+      font-size: 22px; font-weight: 600; color: var(--accent);
+      margin-bottom: 12px; letter-spacing: -0.5px;
+    }
+    section .section-desc {
+      font-size: 14px; color: var(--dim); margin-bottom: 32px; line-height: 1.7;
+    }
+
+    /* Benchmark bars */
+    .bench-group { margin-bottom: 32px; }
+    .bench-group h3 { font-size: 14px; color: var(--fg); margin-bottom: 16px; }
+    .bench-row { margin-bottom: 12px; }
+    .bench-label {
+      display: flex; justify-content: space-between; font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .bench-label .name { color: var(--fg); }
+    .bench-label .value { color: var(--dim); font-variant-numeric: tabular-nums; }
+    .bench-bar-track {
+      height: 24px; background: #181818; border-radius: 4px; overflow: hidden;
+      position: relative;
+    }
+    .bench-bar {
+      height: 100%; border-radius: 4px; display: flex; align-items: center;
+      padding-left: 8px; font-size: 11px; color: #000; font-weight: 600;
+      width: 0%; transition: width 1s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .bench-bar.green { background: var(--green); }
+    .bench-bar.blue { background: var(--blue); }
+    .bench-bar.red { background: var(--red); }
+    .bench-bar.yellow { background: var(--yellow); }
+    .bench-bar.orange { background: var(--orange); }
+    .bench-bar.sem-bar { background: var(--green); }
+    .bench-bar.git-bar { background: var(--blue); }
+
+    /* Insight callout */
+    .insight {
+      font-size: 13px; color: var(--dim); line-height: 1.7;
+      padding: 16px; background: var(--surface); border-radius: 8px;
+      border-left: 3px solid var(--green); margin-top: 20px;
+    }
+
+    /* Speed pills */
+    .speed-row {
+      display: flex; gap: 16px; margin-top: 32px; flex-wrap: wrap;
+    }
+    .speed-pill {
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 12px 20px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 8px;
+    }
+    .speed-pill .number {
+      font-size: 24px; font-weight: 700; color: var(--green);
+      letter-spacing: -1px;
+    }
+    .speed-pill .label { font-size: 12px; color: var(--dim); }
+
+    /* Metric comparison */
+    .metric-vs {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+      margin-bottom: 24px;
+    }
+    .metric-card {
+      padding: 20px; border: 1px solid var(--border); border-radius: 8px;
+      text-align: center;
+    }
+    .metric-card .metric-number {
+      font-size: 36px; font-weight: 700; letter-spacing: -2px;
+      margin-bottom: 4px;
+    }
+    .metric-card .metric-label {
+      font-size: 12px; color: var(--dim); line-height: 1.5;
+    }
+    .metric-card.baseline .metric-number { color: var(--blue); }
+    .metric-card.sem .metric-number { color: var(--green); }
+
+    /* Footer */
+    footer {
+      padding: 40px 0; border-top: 1px solid var(--border);
+      text-align: center; font-size: 12px; color: var(--dim);
+    }
+
+    /* Bench multiplier */
+    .bench-multiplier {
+      font-size: 12px; color: var(--green); font-weight: 600; margin-top: 4px;
+    }
+
+    @media (max-width: 640px) {
+      nav .links { gap: 12px; font-size: 12px; }
+      .metric-vs { grid-template-columns: 1fr; }
+      .speed-row { gap: 10px; }
+      .speed-pill { padding: 10px 14px; }
+      .speed-pill .number { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a class="logo" href="index.html">sem</a>
+      <div class="links">
+        <a href="agents.html">Agents</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="changelog.html">Changelog</a>
+        <a href="details.html">Details</a>
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+        <a href="llms.txt">llms.txt</a>
+      </div>
+    </div>
+  </nav>
+  <div class="container">
+
+    <!-- Hero -->
+    <section id="hero">
+      <h2>sem-mcp performance</h2>
+      <p class="section-desc">
+        6 MCP tools. Entity-level intelligence for agents.<br>
+        Real numbers from sem's own codebase (48 Rust files).
+      </p>
+
+      <div class="speed-row" style="margin-top: 0;">
+        <div class="speed-pill">
+          <span class="number">6</span>
+          <span class="label">MCP tools</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">75%</span>
+          <span class="label">fewer tokens</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">4.7x</span>
+          <span class="label">faster with caching</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">2.3x</span>
+          <span class="label">agent accuracy</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Token Efficiency -->
+    <section id="tokens">
+      <h2>Token efficiency</h2>
+      <p class="section-desc">
+        How many tokens does an agent need to understand <code style="color:var(--cyan)">EntityGraph</code> and everything it affects?
+      </p>
+
+      <div class="bench-group">
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Read all 73 source files</span>
+            <span class="value">~32,000 tokens</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar red" data-width="100">32,000</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_context (8K budget)</span>
+            <span class="value">8,000 tokens &middot; 121 entities packed</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="25">8,000</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_context (4K budget)</span>
+            <span class="value">4,000 tokens &middot; 44 entities packed</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="12.5">4,000</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Read just graph.rs</span>
+            <span class="value">~3,906 tokens &middot; 1 file, no cross-file deps</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="12.2">3,906</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_context (2K budget)</span>
+            <span class="value">1,887 tokens &middot; target entity only</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="5.9">1,887</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="insight">
+        <code style="color:var(--green)">sem_context</code> packs the target entity + all dependents + transitive signatures into a token budget. The agent gets the blast radius, not the whole repo. At 8K tokens, it fits 121 entities from across the codebase.
+      </div>
+    </section>
+
+    <!-- Impact Precision -->
+    <section id="impact">
+      <h2>Impact precision</h2>
+      <p class="section-desc">
+        "How many things break if <code style="color:var(--cyan)">EntityGraph</code> changes?"
+      </p>
+
+      <div class="metric-vs">
+        <div class="metric-card baseline">
+          <div class="metric-number">30</div>
+          <div class="metric-label">
+            <code style="color:var(--blue)">grep EntityGraph</code><br>
+            string matches (imports, comments, type annotations)
+          </div>
+        </div>
+        <div class="metric-card sem">
+          <div class="metric-number">304</div>
+          <div class="metric-label">
+            <code style="color:var(--green)">sem_impact</code><br>
+            entities in the transitive dependency chain
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-group">
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">grep results</span>
+            <span class="value">30 matches</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="9.9">30</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_impact (transitive)</span>
+            <span class="value">304 entities</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="100">304</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="insight">
+        grep finds string matches. <code style="color:var(--green)">sem_impact</code> walks the entity dependency graph and finds everything that transitively depends on the target. No hallucination, no false positives, no missed cross-file callers. In 56ms.
+      </div>
+    </section>
+
+    <!-- Test Targeting -->
+    <section id="tests">
+      <h2>Test targeting</h2>
+      <p class="section-desc">
+        "Which tests should I run after changing <code style="color:var(--cyan)">EntityGraph</code>?"
+      </p>
+
+      <div class="metric-vs">
+        <div class="metric-card baseline">
+          <div class="metric-number">44</div>
+          <div class="metric-label">
+            <code style="color:var(--blue)">cargo test</code><br>
+            run everything
+          </div>
+        </div>
+        <div class="metric-card sem">
+          <div class="metric-number">24</div>
+          <div class="metric-label">
+            <code style="color:var(--green)">sem_impact(mode="tests")</code><br>
+            tests that actually depend on EntityGraph
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-group">
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Run all tests</span>
+            <span class="value">44 tests</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="100">44</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_impact(mode="tests")</span>
+            <span class="value">24 tests</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="54.5">24</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="insight">
+        Impact analysis filtered to test entities. Agents know exactly which tests matter for their change. 45% fewer tests to run, zero guessing.
+      </div>
+    </section>
+
+    <!-- Agent Accuracy -->
+    <section id="accuracy">
+      <h2>Agent accuracy</h2>
+      <p class="section-desc">
+        Same questions about code changes, answered by Claude Sonnet 4.5. One gets <code style="color:var(--green)">sem diff</code> JSON, the other gets raw <code style="color:var(--blue)">git diff</code>.
+      </p>
+
+      <div style="display: flex; gap: 14px; margin-bottom: 24px; font-size: 12px;">
+        <div style="display: flex; align-items: center; gap: 6px;">
+          <div style="width: 12px; height: 12px; border-radius: 2px; background: var(--green);"></div>
+          <span style="color: var(--dim);">sem diff</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px;">
+          <div style="width: 12px; height: 12px; border-radius: 2px; background: var(--blue);"></div>
+          <span style="color: var(--dim);">git diff</span>
+        </div>
+      </div>
+
+      <div class="bench-group">
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Q1: List added functions (F1)</span>
+            <span class="value"><span style="color:var(--green)">93%</span> vs <span style="color:var(--blue)">75%</span></span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" data-width="93">93%</div>
+          </div>
+          <div class="bench-bar-track" style="margin-top: 2px;">
+            <div class="bench-bar git-bar" data-width="75">75%</div>
+          </div>
+        </div>
+
+        <div class="bench-row" style="margin-top: 16px;">
+          <div class="bench-label">
+            <span class="name">Q2: Files with modified entities (F1)</span>
+            <span class="value"><span style="color:var(--green)">100%</span> vs <span style="color:var(--blue)">55%</span></span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" data-width="100">100%</div>
+          </div>
+          <div class="bench-bar-track" style="margin-top: 2px;">
+            <div class="bench-bar git-bar" data-width="55">55%</div>
+          </div>
+        </div>
+
+        <div class="bench-row" style="margin-top: 16px;">
+          <div class="bench-label">
+            <span class="name">Q3: Entity type counts (accuracy)</span>
+            <span class="value"><span style="color:var(--green)">91%</span> vs <span style="color:var(--blue)">13%</span></span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" data-width="91">91%</div>
+          </div>
+          <div class="bench-bar-track" style="margin-top: 2px;">
+            <div class="bench-bar git-bar" data-width="13">13%</div>
+          </div>
+        </div>
+
+        <div class="bench-row" style="margin-top: 16px;">
+          <div class="bench-label">
+            <span class="name">Q4: Added/modified/deleted counts (exact)</span>
+            <span class="value"><span style="color:var(--green)">100%</span> vs <span style="color:var(--blue)">22%</span></span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar sem-bar" data-width="100">100%</div>
+          </div>
+          <div class="bench-bar-track" style="margin-top: 2px;">
+            <div class="bench-bar git-bar" data-width="22">22%</div>
+          </div>
+        </div>
+
+        <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
+          <span style="font-size: 14px; color: var(--accent); font-weight: 600;">Overall average</span>
+          <span style="font-size: 13px;"><span style="color:var(--green)">96%</span> vs <span style="color:var(--blue)">41%</span></span>
+        </div>
+        <div class="bench-multiplier" style="margin-top: 8px;">+131% improvement with structured entity diffs.</div>
+      </div>
+
+      <p style="font-size: 12px; color: var(--dim2); margin-top: 12px;">
+        <a href="agents.html" style="color: var(--dim);">See detailed findings and failure modes &rarr;</a>
+      </p>
+    </section>
+
+    <!-- Graph Caching -->
+    <section id="caching">
+      <h2>Graph caching</h2>
+      <p class="section-desc">
+        Agents call multiple graph tools per session. Without caching, each tool rebuilds the entity graph from scratch.
+        With caching, the first call builds it once and every subsequent call reuses it.
+      </p>
+
+      <div class="metric-vs">
+        <div class="metric-card baseline">
+          <div class="metric-number">495ms</div>
+          <div class="metric-label">
+            5 graph calls<br>
+            no caching (separate processes)
+          </div>
+        </div>
+        <div class="metric-card sem">
+          <div class="metric-number">106ms</div>
+          <div class="metric-label">
+            5 graph calls<br>
+            in one session (memory cache)
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-group">
+        <h3>6 tool calls: entities + diff + blame + impact + log + context</h3>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Without caching (5 rebuilds)</span>
+            <span class="value">495ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="100">495ms</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">With caching (1 build + 4 cache hits)</span>
+            <span class="value" style="color: var(--green)">106ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="21.4">106ms</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">4.7x faster. 389ms saved per session.</div>
+      </div>
+
+      <div class="speed-row">
+        <div class="speed-pill">
+          <span class="number">114ms</span>
+          <span class="label">cold start (no cache)</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">96ms</span>
+          <span class="label">SQLite warm start</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">21ms</span>
+          <span class="label">avg per call (cached)</span>
+        </div>
+      </div>
+
+      <div class="insight">
+        Two cache layers: in-memory (keyed by file manifest hash) and SQLite at <code style="color:var(--green)">.sem/cache.db</code>.
+        Memory cache serves sequential calls in the same session. SQLite cache survives process restarts.
+        If any file's mtime changes, the cache is invalidated and the graph rebuilds.
+      </div>
+    </section>
+
+    <!-- Latency -->
+    <section id="latency">
+      <h2>Latency (per tool)</h2>
+      <p class="section-desc">
+        Every tool, measured against sem's own codebase (48 Rust files). Single-process cold calls.
+      </p>
+
+      <div class="bench-group" id="latency-bars">
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_entities</span>
+            <span class="value">30ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="22.1" style="min-width: 36px;">30ms</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_diff</span>
+            <span class="value">47ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="34.6" style="min-width: 36px;">47ms</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_blame</span>
+            <span class="value">40ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="29.4" style="min-width: 36px;">40ms</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_log</span>
+            <span class="value">85ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="62.5" style="min-width: 36px;">85ms</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_impact</span>
+            <span class="value">120ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar yellow" data-width="88.2" style="min-width: 36px;">120ms</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem_context</span>
+            <span class="value">136ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar yellow" data-width="100" style="min-width: 42px;">136ms</div>
+          </div>
+        </div>
+
+      </div>
+
+      <p style="font-size: 11px; color: var(--dim2); margin-top: 24px;">
+        Cold per-process calls. In a live session with graph caching, graph tools (impact, context) average 21ms after the first call.
+      </p>
+    </section>
+
+    <footer>
+      <p style="margin-bottom: 12px; font-size: 13px; color: var(--dim);">
+        All numbers from sem's own codebase. <code style="color:var(--dim)">bench_mcp.sh</code> reproduces everything.
+      </p>
+      <p style="margin-bottom: 8px;">
+        <a href="agents.html">Agent Accuracy</a>
+        &nbsp;&middot;&nbsp;
+        <a href="details.html">Details</a>
+        &nbsp;&middot;&nbsp;
+        <a href="changelog.html">Changelog</a>
+        &nbsp;&middot;&nbsp;
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+      </p>
+      <p>Built by <a href="https://ataraxy-labs.com">Ataraxy Labs</a></p>
+    </footer>
+  </div>
+
+  <script>
+    // Animate bars on scroll into view
+    (function() {
+      var bars = document.querySelectorAll('.bench-bar[data-width]');
+      var observer = new IntersectionObserver(function(entries) {
+        entries.forEach(function(entry) {
+          if (entry.isIntersecting) {
+            var bar = entry.target;
+            var w = bar.getAttribute('data-width');
+            requestAnimationFrame(function() {
+              bar.style.width = w + '%';
+            });
+            observer.unobserve(bar);
+          }
+        });
+      }, { threshold: 0.1 });
+      bars.forEach(function(bar) { observer.observe(bar); });
+    })();
+  </script>
+</body>
+</html>

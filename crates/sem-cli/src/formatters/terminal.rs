@@ -1,9 +1,36 @@
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::DiffResult;
+use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
 
-pub fn format_terminal(result: &DiffResult) -> String {
+/// Runs word-level diff on two lines and returns (delete_line, insert_line)
+/// with changed words highlighted (strikethrough+red / bold+green).
+fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
+    let diff = TextDiff::from_words(old_line, new_line);
+    let mut del = String::new();
+    let mut ins = String::new();
+
+    for change in diff.iter_all_changes() {
+        let val = change.value();
+        match change.tag() {
+            ChangeTag::Equal => {
+                del.push_str(&val.red().to_string());
+                ins.push_str(&val.green().to_string());
+            }
+            ChangeTag::Delete => {
+                del.push_str(&val.red().strikethrough().bold().to_string());
+            }
+            ChangeTag::Insert => {
+                ins.push_str(&val.green().bold().to_string());
+            }
+        }
+    }
+
+    (del, ins)
+}
+
+pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     if result.changes.is_empty() {
         return "No semantic changes detected.".dimmed().to_string();
     }
@@ -58,9 +85,14 @@ pub fn format_terminal(result: &DiffResult) -> String {
             };
 
             let type_label = format!("{:<10}", change.entity_type);
+            let base_name = if let Some(ref old_name) = change.old_entity_name {
+                format!("{old_name} -> {}", change.entity_name)
+            } else {
+                change.entity_name.clone()
+            };
             let display_name = match &change.parent_name {
-                Some(p) => format!("{}::{}", p, change.entity_name),
-                None => change.entity_name.clone(),
+                Some(p) => format!("{}::{}", p, base_name),
+                None => base_name,
             };
             let truncated = if display_name.len() > 25 {
                 format!("{}…", &display_name[..24])
@@ -78,8 +110,99 @@ pub fn format_terminal(result: &DiffResult) -> String {
                 tag,
             ));
 
-            // Show content diff for modified properties
-            if change.change_type == ChangeType::Modified {
+            // Show content diff
+            if verbose {
+                match change.change_type {
+                    ChangeType::Added => {
+                        if let Some(ref content) = change.after_content {
+                            for line in content.lines() {
+                                lines.push(format!(
+                                    "{}    {}",
+                                    "│".dimmed(),
+                                    format!("+ {line}").green(),
+                                ));
+                            }
+                        }
+                    }
+                    ChangeType::Deleted => {
+                        if let Some(ref content) = change.before_content {
+                            for line in content.lines() {
+                                lines.push(format!(
+                                    "{}    {}",
+                                    "│".dimmed(),
+                                    format!("- {line}").red(),
+                                ));
+                            }
+                        }
+                    }
+                    ChangeType::Modified => {
+                        if let (Some(before), Some(after)) =
+                            (&change.before_content, &change.after_content)
+                        {
+                            let diff = TextDiff::from_lines(before.as_str(), after.as_str());
+                            for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
+                                lines.push(format!(
+                                    "{}    {}",
+                                    "│".dimmed(),
+                                    format!("{}", hunk.header()).dimmed(),
+                                ));
+                                for op in hunk.ops() {
+                                    let mut deletes: Vec<String> = Vec::new();
+                                    let mut inserts: Vec<String> = Vec::new();
+
+                                    for diff_change in diff.iter_changes(op) {
+                                        let line = diff_change.value().trim_end_matches('\n');
+                                        match diff_change.tag() {
+                                            ChangeTag::Delete => deletes.push(line.to_string()),
+                                            ChangeTag::Insert => inserts.push(line.to_string()),
+                                            ChangeTag::Equal => {
+                                                lines.push(format!(
+                                                    "{}    {}",
+                                                    "│".dimmed(),
+                                                    format!("  {line}").dimmed(),
+                                                ));
+                                            }
+                                        }
+                                    }
+
+                                    let paired = deletes.len().min(inserts.len());
+                                    for i in 0..paired {
+                                        let (del, ins) =
+                                            render_inline_diff(&deletes[i], &inserts[i]);
+                                        lines.push(format!(
+                                            "{}    {} {}",
+                                            "│".dimmed(),
+                                            "-".red(),
+                                            del,
+                                        ));
+                                        lines.push(format!(
+                                            "{}    {} {}",
+                                            "│".dimmed(),
+                                            "+".green(),
+                                            ins,
+                                        ));
+                                    }
+                                    for d in &deletes[paired..] {
+                                        lines.push(format!(
+                                            "{}    {}",
+                                            "│".dimmed(),
+                                            format!("- {d}").red(),
+                                        ));
+                                    }
+                                    for i in &inserts[paired..] {
+                                        lines.push(format!(
+                                            "{}    {}",
+                                            "│".dimmed(),
+                                            format!("+ {i}").green(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if change.change_type == ChangeType::Modified {
                 if let (Some(before), Some(after)) =
                     (&change.before_content, &change.after_content)
                 {

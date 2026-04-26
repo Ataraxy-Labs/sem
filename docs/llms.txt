@@ -1,17 +1,23 @@
 # sem
 
-> Semantic version control built on Git. Entity-level diff, blame, graph, and impact analysis.
+> Entity-level semantic diff on top of Git. Functions, classes, methods instead of lines.
 
 ## Overview
 
-sem extends git with entity-level operations. Instead of tracking lines, sem tracks functions, classes, methods, and types. Uses tree-sitter for parsing and AST-normalized structural hashing to detect cosmetic vs structural changes.
+sem extends Git with entity-level operations. Instead of tracking lines, sem tracks functions, classes, methods, and types. Uses tree-sitter for parsing and AST-normalized structural hashing to detect cosmetic vs structural changes.
 
 Git tracks lines. Developers think in functions. sem bridges the gap.
 
 ## Install
 
 ```
-cd sem/crates && cargo build --release
+brew install sem-cli
+```
+
+Or build from source:
+```
+git clone https://github.com/Ataraxy-Labs/sem
+cd sem/crates && cargo install --path sem-cli
 ```
 
 Binary at `crates/target/release/sem`.
@@ -19,19 +25,28 @@ Binary at `crates/target/release/sem`.
 ## Commands
 
 ### sem diff
-Entity-level diff between commits. Shows which functions/classes were added, modified, deleted, or renamed. Distinguishes cosmetic changes (whitespace/formatting) from structural changes (logic).
+Entity-level diff. Shows which functions/classes were added, modified, deleted, or renamed. Distinguishes cosmetic changes (whitespace/formatting) from structural changes (logic).
 
 ```
-sem diff HEAD~1
-sem diff main..feature-branch
-sem diff HEAD~1 --file src/auth.ts
+sem diff                          # working changes
+sem diff --staged                 # staged only
+sem diff --commit abc1234         # specific commit
+sem diff --from HEAD~5 --to HEAD  # commit range
+sem diff file1.ts file2.ts       # compare two files (no git needed)
+sem diff --format json            # JSON output for agents/CI
+sem diff --format plain           # git-status style
+sem diff --format markdown        # markdown tables
+sem diff --stdin --format json    # read file changes from stdin
+sem diff --file-exts .py .rs      # filter by extension
+sem diff -v                       # verbose inline content diffs
 ```
 
 ### sem blame
-Entity-level blame. Shows who last modified each function/class, not each line.
+Entity-level blame. Who last modified each function/class, not each line.
 
 ```
 sem blame src/auth.ts
+sem blame src/auth.ts --json
 ```
 
 ### sem graph
@@ -41,6 +56,7 @@ Cross-file entity dependency graph. Shows what each function calls and what call
 sem graph
 sem graph --entity validateToken
 sem graph --file-exts .py
+sem graph --format json
 ```
 
 ### sem impact
@@ -48,76 +64,120 @@ Transitive impact analysis. If this entity changes, what else is affected? BFS t
 
 ```
 sem impact validateToken
+sem impact validateToken --json
 sem impact validateToken --file-exts .py
-```
-
-## Global Flags
-
-### --file-exts
-Available on `sem diff`, `sem graph`, and `sem impact`. Filters analysis to only include files with the specified extensions. Useful for multi-language repos where you want to scope to one language.
-
-```
-sem diff --file-exts .py .rs
-sem graph --file-exts .py
 ```
 
 ## Key Features
 
-- 13 languages: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, PHP, Fortran
-- Structural hashing: AST-normalized hashes that ignore whitespace, comments, and formatting
+- 26 languages with full entity extraction via tree-sitter
+- Structural hashing: AST-normalized hashes that ignore whitespace, comments, formatting
 - Cosmetic vs structural change detection in diff
 - Entity-level blame (per function, not per line)
 - Cross-file dependency graph via call/reference analysis
 - Transitive impact analysis (BFS through dependency graph)
-- Incremental graph updates (only re-parse changed files)
+- Three-phase entity matching: exact ID, structural hash (rename detection), fuzzy similarity
+- JSON output for AI agents and CI pipelines
+- Stdin mode for non-git usage
+
+## Language Support
+
+26 programming languages:
+
+| Language | Extensions | Entity Types |
+|----------|-----------|--------------|
+| TypeScript | .ts .tsx .mts .cts | functions, classes, interfaces, types, enums, exports |
+| JavaScript | .js .jsx .mjs .cjs | functions, classes, variables, exports |
+| Python | .py | functions, classes, decorated definitions |
+| Go | .go | functions, methods, types, vars, consts |
+| Rust | .rs | functions, structs, enums, impls, traits, mods, consts |
+| Java | .java | classes, methods, interfaces, enums, fields, constructors |
+| C | .c .h | functions, structs, enums, unions, typedefs |
+| C++ | .cpp .cc .hpp | functions, classes, structs, enums, namespaces, templates |
+| C# | .cs | classes, methods, interfaces, enums, structs, properties |
+| Ruby | .rb | methods, classes, modules |
+| PHP | .php | functions, classes, methods, interfaces, traits, enums |
+| Swift | .swift | functions, classes, protocols, structs, enums, properties |
+| Elixir | .ex .exs | modules, functions, macros, guards, protocols |
+| Bash | .sh | functions |
+| HCL/Terraform | .hcl .tf .tfvars | blocks, attributes (qualified names) |
+| Kotlin | .kt .kts | classes, interfaces, objects, functions, properties |
+| Fortran | .f90 .f95 .f | functions, subroutines, modules, programs |
+| Vue | .vue | template/script/style blocks + inner TS/JS entities |
+| XML | .xml .plist .svg .csproj | elements (nested, tag-name identity) |
+| ERB | .erb | blocks, expressions, code tags |
+| Svelte | .svelte .svelte.js .svelte.ts | component blocks, rune modules + inner JS/TS entities |
+| Dart | .dart | classes, mixins, extensions, enums, type aliases, functions |
+| Perl | .pl .pm .t | subroutines, packages |
+| OCaml | .ml .mli | values, modules, types, classes, externals |
+| Scala | .scala .sc .sbt | classes, objects, traits, enums, functions, vals, extensions |
+| Zig | .zig | functions, tests, variables |
+
+Plus structured data formats:
+
+| Format | Extensions | Entity Types |
+|--------|-----------|--------------|
+| JSON | .json | properties, objects (RFC 6901 paths) |
+| YAML | .yml .yaml | sections, properties (dot paths) |
+| TOML | .toml | sections, properties |
+| CSV | .csv .tsv | rows (first column as ID) |
+| Markdown | .md .mdx | heading-based sections |
+
+Everything else falls back to chunk-based diffing.
+
+## JSON Output
+
+```
+sem diff --format json
+```
+
+Returns:
+```json
+{
+  "summary": { "fileCount": 2, "added": 1, "modified": 1, "deleted": 1, "total": 3 },
+  "changes": [
+    {
+      "entityId": "src/auth.ts::function::validateToken",
+      "changeType": "added",
+      "entityType": "function",
+      "entityName": "validateToken",
+      "filePath": "src/auth.ts"
+    }
+  ]
+}
+```
 
 ## Architecture
 
 Cargo workspace: sem-core (library) + sem-cli (binary).
 
-### sem-core
-- Parser plugins for 13 languages via tree-sitter
-- Entity extraction: functions, classes, methods, interfaces, types, enums, imports
-- Structural hashing: normalize AST, strip whitespace/comments, SHA-256
-- Dependency graph: cross-file call/reference tracking via petgraph
-- Region extraction: split files into Entity and Interstitial regions
-
-### Language Support
-
-| Language | Extensions | Entity Types |
-|----------|-----------|--------------|
-| TypeScript | .ts | functions, classes, interfaces, types, enums |
-| TSX | .tsx | functions, classes, interfaces, types, enums |
-| JavaScript | .js .jsx .mjs .cjs | functions, classes, variables |
-| Python | .py | functions, classes, decorators |
-| Go | .go | functions, methods, types |
-| Rust | .rs | functions, structs, enums, impls, traits, mods |
-| Java | .java | classes, methods, interfaces, enums, fields |
-| C | .c .h | functions, structs, enums, unions, typedefs |
-| C++ | .cpp .cc .cxx .hpp | functions, classes, structs, enums, namespaces, templates |
-| Ruby | .rb | methods, classes, modules |
-| C# | .cs | methods, classes, interfaces, enums, structs, namespaces |
-| PHP | .php | functions, classes, methods, interfaces, traits, enums, namespaces |
-| Fortran | .f90 .f95 .f03 .f08 .f .for | functions, subroutines, modules, programs, interfaces |
+- tree-sitter for code parsing (native Rust, not WASM)
+- git2 for in-process Git operations
+- rayon for parallel file processing
+- xxhash for structural hashing
+- Plugin system for adding new languages and formats
 
 ## Performance
 
-Parallel entity extraction via rayon. Zero-allocation graph traversal.
-
 - Small commit (1 file): 5ms
 - Medium commit (5 files): 8ms
-- Large commit (13 files, 65 entities): 19ms
-- Range (8 commits, 30 files, 1383 entities): 24ms
-- sem diff vs git diff: +9ms overhead for full semantic parsing
-- Optimizations: LTO, xxHash64 (replaces SHA-256), cached tree resolution, zero-alloc structural hashing
+- Large commit (13 files): 19ms
+- Range (8 commits, 30 files): 24ms
+- Faster than git diff for equivalent operations
 
-## Used By
+## As a Library
 
-- **weave**: Entity-level merge driver for Git (uses sem-core for entity extraction)
-- **inspect**: Entity-level code review CLI (uses sem-core for graph and risk scoring)
-- **agenthub**: Agent-native GitHub platform (uses sem-core for code graph)
+sem-core can be used as a Rust library dependency:
+
+```toml
+[dependencies]
+sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.3" }
+```
+
+Used by weave (semantic merge driver) and inspect (entity-level code review).
 
 ## Links
 
 - GitHub: https://github.com/Ataraxy-Labs/sem
-- License: MIT
+- Website: https://ataraxy-labs.github.io/sem
+- License: MIT OR Apache-2.0

@@ -41,15 +41,19 @@
 
     /* Nav */
     nav {
-      padding: 20px 0;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
       position: sticky;
       top: 0;
       background: var(--bg);
       z-index: 50;
+      border-bottom: 1px solid var(--border);
+    }
+    nav .nav-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); text-decoration: none; }
     nav .logo:hover { color: var(--accent); }
@@ -101,20 +105,20 @@
   </style>
 </head>
 <body>
-  <div class="container">
-    <nav>
+  <nav>
+    <div class="nav-inner">
       <a href="index.html" class="logo">sem</a>
       <div class="links">
-        <a href="index.html#commands">Commands</a>
-        <a href="index.html#formats">Formats</a>
-        <a href="index.html#output">Output</a>
-        <a href="index.html#benchmarks">Benchmarks</a>
         <a href="agents.html">Agents</a>
+        <a href="benchmarks.html">Benchmarks</a>
         <a href="changelog.html">Changelog</a>
+        <a href="details.html">Details</a>
         <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
         <a href="llms.txt">llms.txt</a>
       </div>
-    </nav>
+    </div>
+  </nav>
+  <div class="container">
 
     <section>
       <h2>Changelog</h2>
@@ -124,14 +128,245 @@
 
       <div class="changelog-entry">
         <div class="changelog-title">
+          <span class="changelog-sha">a1a6fbf</span>
+          <span class="changelog-tag feat">feat</span>
+          Word-level inline diffs
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--fg)">sem diff --verbose</code> now highlights the specific words that changed within each line,
+          instead of coloring entire lines red/green. Uses <code style="color:var(--fg)">similar::TextDiff::from_words()</code>
+          on paired delete/insert lines. Changed words get bold+strikethrough (deletes) or bold (inserts).
+        </p>
+        <p class="changelog-stats">+72 lines &bull; terminal formatter only</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">14b572a</span>
+          <span class="changelog-tag fix">fix</span>
+          Multibyte string truncation
+        </div>
+        <p class="changelog-body">
+          Fixed a panic when truncating strings containing multibyte characters (CJK, emoji) in blame and log output.
+          Single-pass truncation using <code style="color:var(--fg)">char_indices</code> instead of collecting chars.
+          Thanks <a href="https://github.com/mako-357" style="color:var(--cyan)">@mako-357</a> (<a href="https://github.com/Ataraxy-Labs/sem/pull/47" style="color:var(--cyan)">#47</a>).
+        </p>
+        <p class="changelog-stats">+12 tests &bull; 4 files</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">3b7b2bf</span>
+          <span class="changelog-tag perf">perf</span>
+          Consolidate commands (12 to 6) and MCP tools (9 to 6)
+        </div>
+        <p class="changelog-body">
+          Removed redundant CLI commands (<code style="color:var(--fg)">status</code>, <code style="color:var(--fg)">watch</code>,
+          <code style="color:var(--fg)">review</code>, <code style="color:var(--fg)">comment</code>,
+          <code style="color:var(--fg)">label</code>, <code style="color:var(--fg)">history</code>).
+          Final 6: <code style="color:var(--fg)">diff</code>, <code style="color:var(--fg)">impact</code>,
+          <code style="color:var(--fg)">blame</code>, <code style="color:var(--fg)">log</code>,
+          <code style="color:var(--fg)">entities</code>, <code style="color:var(--fg)">context</code>.
+          MCP server trimmed from 9 to 6 tools: one tool per CLI command. Do fewer things, do them well.
+        </p>
+        <p class="changelog-stats">Removed ~800 lines &bull; cleaner surface area</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: every command you ship is a promise you have to maintain.</strong> We added 7 commands in a single commit because they were easy to build. But half of them overlapped (history vs log, review vs diff --verbose) and the rest nobody used. Cutting 6 commands felt like losing progress, but the result was a CLI where every command actually matters. Saying no is harder than saying yes.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">3138180</span>
+          <span class="changelog-tag feat">feat</span>
+          MCP server + sem setup
+        </div>
+        <p class="changelog-body">
+          New <code style="color:var(--fg)">sem-mcp</code> crate: an MCP server exposing 6 tools
+          (<code style="color:var(--fg)">sem_entities</code>, <code style="color:var(--fg)">sem_diff</code>,
+          <code style="color:var(--fg)">sem_blame</code>, <code style="color:var(--fg)">sem_impact</code>,
+          <code style="color:var(--fg)">sem_log</code>, <code style="color:var(--fg)">sem_context</code>) for AI agent integration.
+          New <code style="color:var(--fg)">sem setup</code> command replaces <code style="color:var(--fg)">git diff</code> globally
+          and installs a pre-commit hook showing entity-level blast radius.
+          <code style="color:var(--fg)">sem unsetup</code> to revert.
+        </p>
+        <p class="changelog-stats">+1,200 lines &bull; new workspace crate &bull; 6 MCP tools</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: agents are the real user.</strong> We built the CLI for humans first, then realized AI agents were calling sem more often than people were. The MCP server wasn't an afterthought, it was the natural interface. An agent doesn't need colored terminal output, it needs structured JSON from a tool it can call. Building for agents first changed how we thought about every feature after this.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">33b03d8</span>
+          <span class="changelog-tag feat">feat</span>
+          sem log: entity history
+        </div>
+        <p class="changelog-body">
+          New <code style="color:var(--fg)">sem log &lt;entity&gt;</code> command traces a single entity through git history.
+          Shows every commit that added, modified, or deleted a specific function. Auto-detects the file.
+          Supports <code style="color:var(--fg)">--verbose</code> for content diffs between versions and
+          <code style="color:var(--fg)">--json</code> for machine output.
+        </p>
+        <p class="changelog-stats">+450 lines &bull; blame.rs, log.rs, bridge.rs</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: git log is file-centric, but developers think in entities.</strong> "What happened to this function?" is a question git can't answer directly. You'd need git log -p, then mentally filter hundreds of diff lines to find the ones that touched your function. sem log scans commits and re-extracts entities at each version, so it can tell you exactly when a function was added, when its logic changed, and when it was deleted. The cost is re-parsing per commit, but with tree-sitter it's fast enough to feel instant.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">ccdce6f</span>
+          <span class="changelog-tag feat">feat</span>
+          Windows + Linux ARM64 releases
+        </div>
+        <p class="changelog-body">
+          CI now builds release binaries for Windows (x86_64) and Linux ARM64 (aarch64).
+          Vendored OpenSSL for cross-compilation on aarch64-linux.
+        </p>
+        <p class="changelog-stats">4 release targets: macOS ARM64, Linux x86_64, Linux ARM64, Windows x86_64</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">48bdd8f</span>
+          <span class="changelog-tag feat">feat</span>
+          TypeScript .mts/.cts support
+        </div>
+        <p class="changelog-body">
+          Added <code style="color:var(--fg)">.mts</code> and <code style="color:var(--fg)">.cts</code> extensions for TypeScript ES module and CommonJS module files.
+          Thanks <a href="https://github.com/MattCozendey" style="color:var(--cyan)">@MattCozendey</a> (<a href="https://github.com/Ataraxy-Labs/sem/pull/43" style="color:var(--cyan)">#43</a>).
+        </p>
+        <p class="changelog-stats">+2 extensions &bull; tests added</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">7c8c047</span>
+          <span class="changelog-tag feat">feat</span>
+          Svelte support
+        </div>
+        <p class="changelog-body">
+          Full Svelte 5 parser plugin via tree-sitter-htmlx-svelte. Extracts component blocks (script, style, template elements),
+          Svelte-specific blocks (each, if, await, key, snippet), special elements (svelte:component, svelte:window, etc.),
+          and delegates embedded script/style to the code parser for inner entity extraction with line-offset reparenting.
+          Supports compound extensions (<code style="color:var(--fg)">.svelte.ts</code>, <code style="color:var(--fg)">.svelte.js</code>) for rune modules.
+          Thanks <a href="https://github.com/themixednuts" style="color:var(--cyan)">@themixednuts</a> (<a href="https://github.com/Ataraxy-Labs/sem/pull/31" style="color:var(--cyan)">#31</a>).
+        </p>
+        <p class="changelog-stats">+2,065 lines &bull; 29 tests &bull; 22nd format</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: component frameworks need two parsers, not one.</strong> A Svelte file has its own structure (if blocks, each blocks, snippets) but also embeds real TypeScript inside script tags. The first attempt tried one parser for everything. The fix was treating Svelte as a container that delegates to the existing code parser for embedded scripts, with line-offset reparenting so entity positions stay accurate. Same pattern works for Vue and ERB.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">f2f57ef</span>
+          <span class="changelog-tag feat">feat</span>
+          Full git diff syntax support
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--fg)">sem diff</code> now supports the same positional argument syntax as <code style="color:var(--fg)">git diff</code>.
+          Single ref (<code style="color:var(--fg)">sem diff HEAD~3</code>), two-dot range (<code style="color:var(--fg)">sem diff main..feature</code>),
+          three-dot merge-base (<code style="color:var(--fg)">sem diff main...feature</code>), pathspec filtering (<code style="color:var(--fg)">sem diff -- src/</code>),
+          and <code style="color:var(--fg)">--cached</code> alias for <code style="color:var(--fg)">--staged</code>.
+          Also adds <code style="color:var(--fg)">--format plain</code> to the Rust CLI.
+          Thanks <a href="https://github.com/taciturnaxolotl" style="color:var(--cyan)">@taciturnaxolotl</a> for the contribution (<a href="https://github.com/Ataraxy-Labs/sem/pull/37" style="color:var(--cyan)">#37</a>).
+        </p>
+        <p class="changelog-stats">+400 lines &bull; 11 files &bull; new RefToWorking scope, merge-base resolution, pathspec filtering</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">30816d4</span>
+          <span class="changelog-tag feat">feat</span>
+          Markdown diff formatting
+        </div>
+        <p class="changelog-body">
+          New <code style="color:var(--fg)">--format markdown</code> output for <code style="color:var(--fg)">sem diff</code>.
+          Renders entity changes as clean markdown tables with status symbols, useful for PR comments and CI pipelines.
+          Thanks <a href="https://github.com/Ataraxy-Labs/sem/pull/32" style="color:var(--cyan)">#32</a> for the contribution.
+        </p>
+        <p class="changelog-stats">+200 lines &bull; Rust + TypeScript formatters</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">8c10b73</span>
+          <span class="changelog-tag fix">fix</span>
+          JS/TS scope boundary extraction
+        </div>
+        <p class="changelog-body">
+          Fixed entity extraction for JavaScript and TypeScript to respect scope boundaries.
+          Local variables inside function bodies were being extracted as top-level entities.
+          Now only extracts declarations at module/class scope. Important correctness fix for weave merge quality.
+          Thanks <a href="https://github.com/c22" style="color:var(--cyan)">@c22</a> (<a href="https://github.com/Ataraxy-Labs/sem/pull/35" style="color:var(--cyan)">#35</a>).
+        </p>
+        <p class="changelog-stats">+300 lines &bull; 7 new tests &bull; entity_extractor.rs, languages.rs</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">7f781d2</span>
+          <span class="changelog-tag feat">feat</span>
+          Verbose inline content diffs
+        </div>
+        <p class="changelog-body">
+          New <code style="color:var(--fg)">sem diff -v</code> flag shows inline before/after content for each modified entity.
+          Lets you see exactly what changed inside a function without switching to <code style="color:var(--fg)">git diff</code>.
+        </p>
+        <p class="changelog-stats">+70 lines &bull; terminal formatter</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">807318b</span>
+          <span class="changelog-tag feat">feat</span>
+          ERB parser plugin
+        </div>
+        <p class="changelog-body">
+          New parser for ERB templates (<code style="color:var(--fg)">.erb</code>) via tree-sitter-embedded-template.
+          Extracts blocks, expressions, and code tags as entities. Handles all ERB variants including <code style="color:var(--fg)">&lt;%-</code> dash directives.
+        </p>
+        <p class="changelog-stats">+414 lines &bull; 21st language</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">2e6a8f8</span>
+          <span class="changelog-tag fix">fix</span>
+          Go grouped declaration extraction
+        </div>
+        <p class="changelog-body">
+          Fixed extraction of Go grouped <code style="color:var(--fg)">var()</code>, <code style="color:var(--fg)">const()</code>, and <code style="color:var(--fg)">type()</code> declarations.
+          Previously only extracted the first declaration in each group. Now extracts each individual declaration as a separate entity.
+        </p>
+        <p class="changelog-stats">sem-core 0.3.12</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">070d6d4</span>
+          <span class="changelog-tag feat">feat</span>
+          Published to crates.io + Homebrew
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--fg)">sem-core</code> and <code style="color:var(--fg)">sem-cli</code> are now on crates.io.
+          Install with <code style="color:var(--fg)">brew install sem-cli</code> or <code style="color:var(--fg)">cargo install sem-cli</code>.
+        </p>
+        <p class="changelog-stats">v0.3.10 &bull; crates.io + homebrew-core</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
           <span class="changelog-sha">59f40ed</span>
           <span class="changelog-tag feat">feat</span>
           v0.3.1: --file-exts flag for language filtering
         </div>
         <p class="changelog-body">
-          New <code style="color:var(--fg)">--file-exts</code> flag on <code style="color:var(--fg)">sem diff</code>, <code style="color:var(--fg)">sem graph</code>, and <code style="color:var(--fg)">sem impact</code>.
+          New <code style="color:var(--fg)">--file-exts</code> flag on <code style="color:var(--fg)">sem diff</code>, <code style="color:var(--fg)">sem impact</code>, and <code style="color:var(--fg)">sem context</code>.
           Lets you scope analysis to specific languages in multi-language repos.
-          Example: <code style="color:var(--fg)">sem graph --file-exts .py</code> to build the dependency graph for Python files only.
+          Example: <code style="color:var(--fg)">sem diff --file-exts .py</code> to only diff Python files.
           Accepts extensions with or without the leading dot. First feature shipped from a community request (<a href="https://github.com/Ataraxy-Labs/sem/issues/1" style="color:var(--cyan)">#1</a>).
         </p>
         <p class="changelog-stats">+63 lines &bull; 4 files &bull; diff, graph, impact commands &bull; closes #1</p>
@@ -174,7 +409,7 @@
         <p class="changelog-body">
           Two major features. <strong>Structural hash</strong> (Unison-inspired): computes AST-based hash that strips comments and normalizes whitespace. Two entities with the same structural_hash are logically identical even if formatting differs. Used for rename detection.
           <strong>Entity dependency graph</strong>: two-pass extraction (entities &rarr; symbol table &rarr; reference edges). Intra-file and cross-file resolution. Forward + reverse dependency lookup. Transitive impact analysis via BFS.
-          New <code style="color:var(--fg)">sem graph</code> CLI command.
+          Powers <code style="color:var(--fg)">sem impact</code> and <code style="color:var(--fg)">sem context</code>.
         </p>
         <p class="changelog-stats">+749 lines &bull; 15 files &bull; 14 tests (up from 10) &bull; structural_hash, EntityGraph, sem graph, sem impact</p>
         <div class="changelog-mistake">
@@ -202,13 +437,13 @@
         <div class="changelog-title">
           <span class="changelog-sha">9f7f1c7</span>
           <span class="changelog-tag feat">feat</span>
-          7 new commands
+          sem blame
         </div>
         <p class="changelog-body">
-          Added <code style="color:var(--fg)">blame</code>, <code style="color:var(--fg)">status</code>, <code style="color:var(--fg)">watch</code>, <code style="color:var(--fg)">review</code>, <code style="color:var(--fg)">history</code>, <code style="color:var(--fg)">label</code>, <code style="color:var(--fg)">comment</code>.
-          Entity-level blame (who last touched each function), semantic PR review with risk signals, real-time file watching, threaded comments on entities.
+          Added <code style="color:var(--fg)">sem blame</code>: entity-level blame showing who last touched each function, class, or method.
+          (Also added status, watch, review, history, label, comment commands, later removed in the consolidation to keep the CLI focused.)
         </p>
-        <p class="changelog-stats">+1,191 lines &bull; 12 files &bull; 15 functions, 12 interfaces, 3 variables, 1 class added</p>
+        <p class="changelog-stats">+1,191 lines &bull; 12 files</p>
       </div>
 
       <div class="changelog-entry">
@@ -265,7 +500,7 @@
           Homebrew distribution
         </div>
         <p class="changelog-body">
-          <code style="color:var(--fg)">brew install sem-diff</code> &mdash; single command install via Homebrew tap.
+          <code style="color:var(--fg)">brew install sem-cli</code> &mdash; single command install via Homebrew tap.
           Formula builds from source using Cargo, compiles all tree-sitter grammars in, links against system libgit2.
           Includes a test that verifies entity extraction on a Python function.
         </p>

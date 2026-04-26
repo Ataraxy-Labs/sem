@@ -1,0 +1,31 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: crates
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc -p sem-cli
+
+      - name: Run tests
+        run: cargo test -p sem-core -p sem-cli
+
+      - name: Check binary exists
+        run: dir target\x86_64-pc-windows-msvc\release\sem.exe

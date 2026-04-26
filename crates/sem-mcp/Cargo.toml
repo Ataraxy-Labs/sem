@@ -1,0 +1,32 @@
+[package]
+name = "sem-mcp"
+version = "0.3.24"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "MCP server for entity-level semantic code intelligence. 6 tools: entities, diff, blame, impact, log, context."
+repository = "https://github.com/Ataraxy-Labs/sem"
+homepage = "https://github.com/Ataraxy-Labs/sem"
+keywords = ["mcp", "semantic", "agent", "code-analysis", "impact"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
+
+[[bin]]
+name = "sem-mcp"
+path = "src/main.rs"
+
+[dependencies]
+sem-core = { path = "../sem-core", version = "0.3.23" }
+git2 = "0.20"
+lru = "0.16"
+rmcp = { version = "1", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
+[features]
+default = []
+vendored-openssl = ["openssl"]

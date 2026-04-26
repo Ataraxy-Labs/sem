@@ -10,8 +10,8 @@
     :root {
       --bg: #0a0a0a;
       --fg: #e0e0e0;
-      --dim: #666;
-      --dim2: #444;
+      --dim: #999;
+      --dim2: #666;
       --border: #222;
       --accent: #fff;
       --green: #4ade80;
@@ -41,15 +41,19 @@
 
     /* Nav */
     nav {
-      padding: 20px 0;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
       position: sticky;
       top: 0;
       background: var(--bg);
       z-index: 50;
+      border-bottom: 1px solid var(--border);
+    }
+    nav .nav-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); text-decoration: none; }
     nav .links { display: flex; gap: 20px; font-size: 13px; color: var(--dim); }
@@ -119,20 +123,20 @@
   </style>
 </head>
 <body>
-  <div class="container">
-    <nav>
+  <nav>
+    <div class="nav-inner">
       <a class="logo" href="index.html">sem</a>
       <div class="links">
-        <a href="index.html#commands">Commands</a>
-        <a href="index.html#formats">Formats</a>
-        <a href="index.html#output">Output</a>
-        <a href="index.html#benchmarks">Benchmarks</a>
         <a href="agents.html">Agents</a>
+        <a href="benchmarks.html">Benchmarks</a>
         <a href="changelog.html">Changelog</a>
+        <a href="details.html">Details</a>
         <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
         <a href="llms.txt">llms.txt</a>
       </div>
-    </nav>
+    </div>
+  </nav>
+  <div class="container">
 
     <!-- Agent Accuracy -->
     <section id="agent-accuracy">

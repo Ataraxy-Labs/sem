@@ -1,16 +1,49 @@
 [package]
 name = "sem-cli"
-version = "0.3.7"
+version = "0.3.24"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Semantic version control CLI. Shows what entities changed (functions, classes, methods) instead of lines."
+repository = "https://github.com/Ataraxy-Labs/sem"
+homepage = "https://github.com/Ataraxy-Labs/sem"
+keywords = ["diff", "semantic", "git", "cli", "code-review"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
 
 [[bin]]
 name = "sem"
 path = "src/main.rs"
 
 [dependencies]
-sem-core = { path = "../sem-core" }
+sem-core = { path = "../sem-core", version = "0.3.23" }
+sem-mcp = { path = "../sem-mcp", version = "0.3.23" }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
-git2 = "0.19"
+similar = "2"
+git2 = "0.20"
+ignore = "0.4"
+openssl-sys = { version = "0.9", optional = true }
 serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap_complete_command = "0.6.1"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/sem-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/sem-linux-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/sem-linux-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/sem-darwin-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/sem-windows-x86_64.zip"
+pkg-fmt = "zip"
+
+[features]
+vendored-openssl = ["openssl-sys/vendored"]

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>sem — Semantic Version Control</title>
+  <title>sem</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -19,8 +19,6 @@
       --red: #f87171;
       --blue: #60a5fa;
       --cyan: #22d3ee;
-      --purple: #a78bfa;
-      --orange: #fb923c;
       --surface: #111;
       --surface2: #141414;
       --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
@@ -37,31 +35,46 @@
     a { color: var(--fg); text-decoration-color: var(--dim); text-underline-offset: 3px; }
     a:hover { color: var(--accent); text-decoration-color: var(--accent); }
 
-    .container { max-width: 800px; margin: 0 auto; padding: 0 24px; }
+    .container { max-width: 860px; margin: 0 auto; padding: 0 24px; }
 
     /* Nav */
     nav {
-      padding: 20px 0;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
       position: sticky;
       top: 0;
       background: var(--bg);
       z-index: 50;
+      border-bottom: 1px solid var(--border);
     }
-    nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); }
+    nav .nav-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); text-decoration: none; }
     nav .links { display: flex; gap: 20px; font-size: 13px; color: var(--dim); }
 
     /* Install box */
-    .install-box:hover { border-color: #444 !important; }
-    .install-box .copied.show { opacity: 1 !important; }
+    .install-box {
+      display: inline-block; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 20px; font-size: 14px; color: var(--fg);
+      cursor: pointer; position: relative;
+      transition: border-color 0.2s;
+    }
+    .install-box:hover { border-color: #444; }
+    .install-box .copied {
+      position: absolute; top: -28px; left: 50%; transform: translateX(-50%);
+      font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;
+    }
+    .install-box .copied.show { opacity: 1; }
 
     /* Terminal */
     .terminal {
       background: #0d0d0d; border: 1px solid var(--border);
-      border-radius: 10px; margin: 24px 0; overflow: hidden;
+      border-radius: 10px; overflow: hidden;
     }
     .terminal-bar {
       background: var(--surface2); padding: 10px 16px;
@@ -72,6 +85,7 @@
     .terminal-title { font-size: 12px; color: var(--dim); margin-left: 8px; }
     .terminal-body {
       padding: 20px 24px; font-size: 13px; line-height: 1.7; overflow-x: auto;
+      min-height: 340px;
     }
     .terminal-body .cmd { color: var(--accent); }
     .terminal-body .g { color: var(--green); }
@@ -79,135 +93,147 @@
     .terminal-body .r { color: var(--red); }
     .terminal-body .d { color: var(--dim2); }
     .terminal-body .b { color: var(--blue); }
-    .terminal-body .c { color: var(--cyan); }
-    .terminal-body .p { color: var(--purple); }
-    .terminal-body .o { color: var(--orange); }
     .terminal-body .w { color: var(--accent); font-weight: 600; }
 
     /* Sections */
-    section { padding: 60px 0; border-top: 1px solid var(--border); }
+    section { padding: 80px 0; }
     section h2 {
-      font-size: 22px; font-weight: 600; color: var(--accent);
-      margin-bottom: 12px; letter-spacing: -0.5px;
+      font-size: 28px; font-weight: 700; color: var(--accent);
+      margin-bottom: 12px; letter-spacing: -1px;
     }
     section .section-desc {
-      font-size: 14px; color: var(--dim); margin-bottom: 32px; line-height: 1.7;
+      font-size: 15px; color: var(--dim); margin-bottom: 40px; line-height: 1.7;
     }
 
-    /* Tables */
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th {
-      text-align: left; padding: 10px 16px; color: var(--dim);
-      font-weight: 400; border-bottom: 1px solid var(--border);
+    /* Side by side */
+    .side-by-side {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
     }
-    td { padding: 10px 16px; border-bottom: 1px solid #181818; color: var(--fg); }
-    tr:last-child td { border-bottom: none; }
-    td.win { color: var(--green); font-weight: 600; }
-    td.lose { color: var(--dim); }
-    td.na { color: var(--dim2); }
+    .side-by-side .terminal { flex: 1; }
+    .side-label {
+      font-size: 12px; font-weight: 600; margin-bottom: 8px;
+      letter-spacing: 0.5px; text-transform: uppercase;
+    }
+    .side-label.git-label { color: var(--blue); }
+    .side-label.sem-label { color: var(--green); }
 
-    /* Comparison table */
-    .comparison-table { overflow-x: auto; }
-    .comparison-table table { min-width: 640px; }
-    .comparison-table th:first-child { width: 200px; }
-    .check { color: var(--green); }
-    .cross { color: var(--red); }
-    .meh { color: var(--yellow); }
+    .git-diff-line { font-size: 12px; line-height: 1.5; }
+    .git-diff-line .add { color: var(--green); }
+    .git-diff-line .del { color: var(--red); }
+    .git-diff-line .hunk { color: var(--cyan); }
+    .git-diff-line .path { color: var(--accent); font-weight: 600; }
+    .git-diff-line .meta { color: var(--dim2); }
 
-    /* Commands */
-    .commands { display: flex; flex-direction: column; gap: 12px; }
-    .cmd-row { display: flex; gap: 16px; align-items: baseline; }
-    .cmd-row code {
-      background: var(--surface); padding: 6px 12px; border-radius: 6px;
-      font-size: 13px; color: var(--fg); white-space: nowrap; flex-shrink: 0;
-      min-width: 260px;
+    /* Command grid */
+    .cmd-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
     }
-    .cmd-row span { font-size: 12px; color: var(--dim); }
-
-    /* Benchmark bars */
-    .bench-group { margin-bottom: 32px; }
-    .bench-group h3 { font-size: 14px; color: var(--fg); margin-bottom: 16px; }
-    .bench-row { margin-bottom: 12px; }
-    .bench-label {
-      display: flex; justify-content: space-between; font-size: 12px;
-      margin-bottom: 4px;
-    }
-    .bench-label .name { color: var(--fg); }
-    .bench-label .value { color: var(--dim); }
-    .bench-bar-track {
-      height: 24px; background: #181818; border-radius: 4px; overflow: hidden;
-      position: relative;
-    }
-    .bench-bar {
-      height: 100%; border-radius: 4px; display: flex; align-items: center;
-      padding-left: 8px; font-size: 11px; color: #000; font-weight: 600;
-      transition: width 0.8s ease-out;
-    }
-    .bench-bar.sem-bar { background: var(--green); }
-    .bench-bar.git-bar { background: var(--blue); }
-    .bench-multiplier {
-      font-size: 12px; color: var(--green); font-weight: 600; margin-top: 4px;
-    }
-
-    /* Flame graph section */
-    .flame-legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 16px 0 20px; }
-    .flame-legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); }
-    .flame-swatch { width: 12px; height: 12px; border-radius: 2px; }
-    .flame-container {
-      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    .cmd-card {
+      padding: 20px;
       background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      transition: border-color 0.2s;
     }
-    .flame-header {
-      padding: 10px 16px; border-bottom: 1px solid var(--border);
-      font-size: 13px; color: var(--fg); display: flex;
-      justify-content: space-between; align-items: center;
+    .cmd-card:hover { border-color: #444; }
+    .cmd-card .cmd-name {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 6px;
     }
-    .flame-header .flame-stats { color: var(--dim); font-size: 12px; }
-    .flame-body { padding: 12px; overflow-x: auto; }
-    .flame-tooltip {
-      position: fixed; background: #222; border: 1px solid #555; padding: 8px 12px;
-      border-radius: 4px; font-size: 12px; pointer-events: none; z-index: 100;
-      display: none; max-width: 500px;
+    .cmd-card .cmd-name code {
+      color: var(--cyan);
+      background: none;
+      padding: 0;
     }
-    .flame-tooltip .tt-fn { color: #fff; font-weight: bold; }
-    .flame-tooltip .tt-detail { color: #aaa; margin-top: 4px; }
+    .cmd-card .cmd-desc {
+      font-size: 12px;
+      color: var(--dim);
+      line-height: 1.5;
+    }
+    .cmd-card .cmd-example {
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--dim2);
+      background: var(--bg);
+      padding: 8px 12px;
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+    .cmd-card .cmd-example .g { color: var(--green); }
+    .cmd-card .cmd-example .y { color: var(--yellow); }
+    .cmd-card .cmd-example .r { color: var(--red); }
+    .cmd-card .cmd-example .w { color: var(--accent); font-weight: 600; }
+    .cmd-card .cmd-example .d { color: var(--dim2); }
+    .cmd-card .cmd-example .c { color: var(--cyan); }
 
-    /* Profiler breakdown */
-    .profiler-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 24px; }
-    .profiler-card {
-      padding: 20px; border: 1px solid var(--border); border-radius: 8px;
+    /* Language grid */
+    .lang-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
     }
-    .profiler-card h4 { font-size: 13px; color: var(--accent); margin-bottom: 12px; }
-    .profiler-row {
-      display: flex; justify-content: space-between; align-items: center;
-      padding: 4px 0; font-size: 12px;
+    .lang-chip {
+      padding: 8px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--dim);
+      transition: all 0.2s;
+      cursor: default;
     }
-    .profiler-row .pr-label { color: var(--dim); }
-    .profiler-row .pr-value { color: var(--fg); font-weight: 600; }
-    .profiler-row .pr-bar {
-      flex: 1; height: 6px; background: #1a1a1a; border-radius: 3px;
-      margin: 0 12px; overflow: hidden;
+    .lang-chip:hover {
+      color: var(--accent);
+      border-color: #444;
+      transform: translateY(-1px);
     }
-    .profiler-row .pr-fill { height: 100%; border-radius: 3px; }
+    .lang-chip.data {
+      border-style: dashed;
+    }
 
-    /* Command docs */
-    .cmd-doc { margin-bottom: 28px; }
-    .cmd-doc-header {
-      display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px;
+    /* Speed pill */
+    .speed-row {
+      display: flex;
+      gap: 24px;
+      margin-top: 48px;
+      flex-wrap: wrap;
     }
-    .cmd-doc-name {
-      font-size: 14px; font-weight: 600; color: var(--accent);
-      background: var(--surface); padding: 4px 10px; border-radius: 4px;
+    .speed-pill {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 12px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
     }
-    .cmd-doc-desc { font-size: 13px; color: var(--dim); }
-    .cmd-doc-flags { margin-top: 8px; padding-left: 16px; }
-    .cmd-doc-flags .flag {
-      font-size: 12px; color: var(--fg); margin-bottom: 2px;
+    .speed-pill .number {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--green);
+      letter-spacing: -1px;
     }
-    .cmd-doc-flags .flag code {
-      color: var(--cyan); background: none; padding: 0;
+    .speed-pill .label {
+      font-size: 12px;
+      color: var(--dim);
     }
-    .cmd-doc-flags .flag span { color: var(--dim); }
+
+    /* Fade in on scroll */
+    .fade-in {
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.6s ease-out, transform 0.6s ease-out;
+    }
+    .fade-in.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
 
     /* Footer */
     footer {
@@ -215,42 +241,48 @@
       text-align: center; font-size: 12px; color: var(--dim);
     }
 
-    @media (max-width: 640px) {
-      .profiler-grid { grid-template-columns: 1fr; }
-      .cmd-row { flex-direction: column; gap: 4px; }
-      .cmd-row code { min-width: auto; }
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+
+    @media (max-width: 700px) {
+      .side-by-side { grid-template-columns: 1fr; }
+      .cmd-grid { grid-template-columns: 1fr; }
       nav .links { gap: 12px; font-size: 12px; }
+      section h2 { font-size: 22px; }
+      .speed-row { gap: 12px; }
+      .terminal-body { min-height: 300px; font-size: 11px; }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <nav>
+  <nav>
+    <div class="nav-inner">
       <div class="logo">sem</div>
       <div class="links">
-        <a href="#commands">Commands</a>
-        <a href="#formats">Formats</a>
-        <a href="#output">Output</a>
-        <a href="#benchmarks">Benchmarks</a>
         <a href="agents.html">Agents</a>
+        <a href="benchmarks.html">Benchmarks</a>
         <a href="changelog.html">Changelog</a>
+        <a href="details.html">Details</a>
         <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
         <a href="llms.txt">llms.txt</a>
       </div>
-    </nav>
+    </div>
+  </nav>
+  <div class="container">
 
-    <!-- ═══ Header ═══ -->
-    <div style="padding: 48px 0 32px; text-align: center;">
-      <h1 style="font-size: 36px; font-weight: 700; color: var(--accent); letter-spacing: -1.5px; margin-bottom: 12px;">Know what changed.</h1>
-      <p style="font-size: 14px; color: var(--dim); margin-bottom: 24px; line-height: 1.7; max-width: 520px; margin-left: auto; margin-right: auto;">
-        Entity-level diffs on top of Git. Structured output for AI agents, CI pipelines, and humans who want more than line numbers.
+    <!-- ═══ Act 1: Hero ═══ -->
+    <div style="padding: 64px 0 40px; text-align: center;">
+      <h1 style="font-size: 44px; font-weight: 700; color: var(--accent); letter-spacing: -2px; margin-bottom: 16px;">
+        Know what changed.
+      </h1>
+      <p style="font-size: 16px; color: var(--dim); margin-bottom: 32px; line-height: 1.7; max-width: 480px; margin-left: auto; margin-right: auto;">
+        Semantic understanding on top of Git.<br>
+        Diff, blame, impact, log. Functions, not lines.
       </p>
-      <div class="install-box" onclick="copyCmd(this, 'cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli')" style="display: inline-block; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; font-size: 14px; color: var(--fg); cursor: pointer; position: relative;">
-        <span class="copied" style="position: absolute; top: -28px; left: 50%; transform: translateX(-50%); font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.2s;">copied</span>
-        <span style="color: var(--dim);">$</span> cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli
-      </div>
-      <div style="margin-top: 12px; font-size: 12px; color: var(--dim2);">
-        or: <span onclick="copyCmd(this, 'brew install ataraxy-labs/tap/sem')" style="color: var(--dim); cursor: pointer; border-bottom: 1px dashed var(--dim2);">brew install ataraxy-labs/tap/sem</span>
+      <div class="install-box" onclick="copyCmd(this)">
+        <span class="copied">copied</span>
+        <span style="color: var(--dim);">$</span> brew install sem-cli
       </div>
     </div>
 
@@ -262,588 +294,434 @@
         <div class="terminal-title">~/project</div>
       </div>
       <div class="terminal-body">
-<pre><span class="cmd">$ sem diff</span>
-
-<span class="d">┌─ src/auth/login.ts ──────────────────────────────────</span>
-<span class="d">│</span>
-<span class="d">│</span>  <span class="g">⊕</span> <span class="d">function </span> <span class="w">validateToken</span>          <span class="g">[added]</span>
-<span class="d">│</span>  <span class="y">∆</span> <span class="d">function </span> <span class="w">authenticateUser</span>       <span class="y">[modified]</span>
-<span class="d">│</span>  <span class="r">⊖</span> <span class="d">function </span> <span class="w">legacyAuth</span>             <span class="r">[deleted]</span>
-<span class="d">│</span>
-<span class="d">└──────────────────────────────────────────────────────</span>
-
-<span class="d">┌─ config/database.yml ─────────────────────────────────</span>
-<span class="d">│</span>
-<span class="d">│</span>  <span class="y">∆</span> <span class="d">property </span> <span class="w">production.pool_size</span>   <span class="y">[modified]</span>
-<span class="d">│</span>    <span class="r">- 5</span>
-<span class="d">│</span>    <span class="g">+ 20</span>
-<span class="d">│</span>
-<span class="d">└──────────────────────────────────────────────────────</span>
-
-Summary: 1 added, 1 modified, 1 deleted across 2 files</pre>
+<pre id="hero-terminal"></pre>
       </div>
     </div>
 
-    <!-- ═══ Commands ═══ -->
-    <section id="commands">
-      <h2>Commands</h2>
+    <!-- ═══ Act 2: The Proof ═══ -->
+    <section class="fade-in">
+      <h2>Same commit. Different lens.</h2>
       <p class="section-desc">
-        <code style="color:var(--cyan)">--format json</code> for machine-readable output. More commands coming soon.
+        Left: what git shows you. Right: what actually happened.
       </p>
 
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem diff</span>
-          <span class="cmd-doc-desc">Semantic diff of changes</span>
+      <div class="side-by-side">
+        <div>
+          <div class="side-label git-label">git diff</div>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <div class="terminal-dot"></div>
+              <div class="terminal-dot"></div>
+              <div class="terminal-dot"></div>
+            </div>
+            <div class="terminal-body git-diff-line" style="font-size: 11.5px; line-height: 1.5; min-height: 280px;">
+<pre><span class="path">diff --git a/src/auth/login.ts b/src/auth/login.ts</span>
+<span class="meta">index 4a2b1c0..8f3d2e1 100644</span>
+<span class="meta">--- a/src/auth/login.ts</span>
+<span class="meta">+++ b/src/auth/login.ts</span>
+<span class="hunk">@@ -12,6 +12,18 @@</span>
+<span class="add">+export function validateToken(token: string) {</span>
+<span class="add">+  const decoded = jwt.verify(token, SECRET);</span>
+<span class="add">+  if (!decoded.exp || decoded.exp < Date.now()) {</span>
+<span class="add">+    throw new TokenExpiredError();</span>
+<span class="add">+  }</span>
+<span class="add">+  return decoded;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="hunk">@@ -24,8 +36,10 @@</span>
+ export async function authenticateUser(
+<span class="del">-  const user = await db.findUser(email);</span>
+<span class="del">-  if (!user) return null;</span>
+<span class="add">+  const user = await db.findUser(email);</span>
+<span class="add">+  if (!user) throw new UserNotFoundError();</span>
+<span class="add">+  await rateLimiter.check(email);</span>
+<span class="hunk">@@ -45,12 +59,0 @@</span>
+<span class="del">-export function legacyAuth(user, pass) {</span>
+<span class="del">-  return db.query('SELECT * FROM users</span>
+<span class="del">-    WHERE email = ? AND password = ?',</span>
+<span class="del">-    [user, pass]);</span>
+<span class="del">-}</span></pre>
+            </div>
+          </div>
         </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>-s, --staged</code> <span>Show staged changes only</span></div>
-          <div class="flag"><code>-c, --commit &lt;sha&gt;</code> <span>Diff a specific commit</span></div>
-          <div class="flag"><code>--from &lt;ref&gt; --to &lt;ref&gt;</code> <span>Diff a commit range</span></div>
-          <div class="flag"><code>-f, --format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
-          <div class="flag"><code>--file-exts &lt;ext&gt;...</code> <span>Only include files with these extensions (e.g. .py .rs)</span></div>
+
+        <div>
+          <div class="side-label sem-label">sem diff</div>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <div class="terminal-dot"></div>
+              <div class="terminal-dot"></div>
+              <div class="terminal-dot"></div>
+            </div>
+            <div class="terminal-body" style="min-height: 280px;">
+<pre>
+<span class="d">┌─ src/auth/login.ts ────────────────</span>
+<span class="d">│</span>
+<span class="d">│</span>  <span class="g">⊕</span> <span class="d">function</span>  <span class="w">validateToken</span>    <span class="g">[added]</span>
+<span class="d">│</span>  <span class="y">∆</span> <span class="d">function</span>  <span class="w">authenticateUser</span> <span class="y">[modified]</span>
+<span class="d">│</span>  <span class="r">⊖</span> <span class="d">function</span>  <span class="w">legacyAuth</span>       <span class="r">[deleted]</span>
+<span class="d">│</span>
+<span class="d">└────────────────────────────────────</span>
+
+<span style="color: var(--dim);">3 entities changed across 1 file</span></pre>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem graph</span>
-          <span class="cmd-doc-desc">Cross-file entity dependency graph</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>--entity &lt;name&gt;</code> <span>Show dependencies/dependents for a specific entity</span></div>
-          <div class="flag"><code>--format &lt;fmt&gt;</code> <span>terminal (default) or json</span></div>
-          <div class="flag"><code>--file-exts &lt;ext&gt;...</code> <span>Only include files with these extensions</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem impact</span>
-          <span class="cmd-doc-desc">Show what breaks if an entity changes</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>&lt;entity&gt;</code> <span>Name of the entity to analyze</span></div>
-          <div class="flag"><code>--json</code> <span>Output as JSON</span></div>
-          <div class="flag"><code>--file-exts &lt;ext&gt;...</code> <span>Only include files with these extensions</span></div>
-        </div>
-      </div>
-
-      <div class="cmd-doc">
-        <div class="cmd-doc-header">
-          <span class="cmd-doc-name">sem blame</span>
-          <span class="cmd-doc-desc">Entity-level blame: who last modified each function/class</span>
-        </div>
-        <div class="cmd-doc-flags">
-          <div class="flag"><code>&lt;file&gt;</code> <span>File to blame</span></div>
-          <div class="flag"><code>--json</code> <span>Output as JSON</span></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ═══ Supported formats ═══ -->
-    <section id="formats">
-      <h2>Supported formats</h2>
-      <table>
-        <thead>
-          <tr><th>Format</th><th>Extensions</th><th>Entities</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>TypeScript</td><td>.ts .tsx</td><td>functions, classes, interfaces, types, enums</td></tr>
-          <tr><td>JavaScript</td><td>.js .jsx .mjs .cjs</td><td>functions, classes, variables</td></tr>
-          <tr><td>Python</td><td>.py</td><td>functions, classes, decorators</td></tr>
-          <tr><td>Go</td><td>.go</td><td>functions, methods, types</td></tr>
-          <tr><td>Rust</td><td>.rs</td><td>functions, structs, enums, impls, traits</td></tr>
-          <tr><td>JSON</td><td>.json</td><td>properties, objects (RFC 6901 paths)</td></tr>
-          <tr><td>YAML</td><td>.yml .yaml</td><td>sections, properties (dot paths)</td></tr>
-          <tr><td>TOML</td><td>.toml</td><td>sections, properties</td></tr>
-          <tr><td>CSV</td><td>.csv .tsv</td><td>rows (first column as ID)</td></tr>
-          <tr><td>Markdown</td><td>.md .mdx</td><td>heading-based sections</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <!-- ═══ How matching works ═══ -->
-    <section>
-      <h2>Entity matching</h2>
-      <p class="section-desc">Three-phase algorithm that detects additions, modifications, deletions, renames, and moves.</p>
-      <div class="commands">
-        <div class="cmd-row">
-          <code>Phase 1 — Exact ID</code>
-          <span>Same entity ID in before/after? Modified or unchanged.</span>
-        </div>
-        <div class="cmd-row">
-          <code>Phase 2 — Content hash</code>
-          <span>Same SHA-256, different name? Renamed or moved.</span>
-        </div>
-        <div class="cmd-row">
-          <code>Phase 3 — Fuzzy similarity</code>
-          <span>>80% Jaccard token overlap? Probable rename.</span>
-        </div>
+      <div style="margin-top: 24px; text-align: center;">
+        <p style="font-size: 13px; color: var(--dim);">
+          AI agents are <span style="color: var(--green); font-weight: 600;">2.3x more accurate</span> when given sem output vs raw line diffs.
+          <a href="agents.html" style="color: var(--green);">See the benchmark.</a>
+        </p>
       </div>
     </section>
 
-    <!-- ═══ Output formats ═══ -->
-    <section id="output">
-      <h2>Output</h2>
+    <!-- ═══ Capabilities ═══ -->
+    <section class="fade-in" style="border-top: 1px solid var(--border);">
+      <h2>Six commands. One binary.</h2>
       <p class="section-desc">
-        Structured JSON. Pipe sem into your AI agent, CI pipeline, or automation.
+        Everything works in any Git repo. No config. No plugins.
       </p>
-      <div class="terminal">
-        <div class="terminal-bar">
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-dot"></div>
-          <div class="terminal-title">sem diff --format json | jq</div>
+
+      <div class="cmd-grid">
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem diff</code></div>
+          <div class="cmd-desc">What changed? Entity-level diffs with rename detection, structural hashing, and word-level inline highlights.</div>
+          <pre class="cmd-example"><span class="d">│</span>  <span class="g">⊕</span> <span class="d">function</span>  <span class="w">validateToken</span>    <span class="g">[added]</span>
+<span class="d">│</span>  <span class="y">∆</span> <span class="d">function</span>  <span class="w">authenticateUser</span> <span class="y">[modified]</span>
+<span class="d">│</span>  <span class="r">⊖</span> <span class="d">function</span>  <span class="w">legacyAuth</span>       <span class="r">[deleted]</span></pre>
         </div>
-        <div class="terminal-body">
-<pre><span class="d">{</span>
-  <span class="b">"summary"</span>: <span class="d">{</span>
-    <span class="b">"fileCount"</span>: <span class="y">2</span>,
-    <span class="b">"added"</span>: <span class="g">1</span>,
-    <span class="b">"modified"</span>: <span class="y">1</span>,
-    <span class="b">"deleted"</span>: <span class="r">1</span>,
-    <span class="b">"total"</span>: <span class="w">3</span>
-  <span class="d">}</span>,
-  <span class="b">"changes"</span>: <span class="d">[</span>
-    <span class="d">{</span>
-      <span class="b">"entityId"</span>: <span class="c">"src/auth.ts::function::validateToken"</span>,
-      <span class="b">"changeType"</span>: <span class="g">"added"</span>,
-      <span class="b">"entityType"</span>: <span class="d">"function"</span>,
-      <span class="b">"entityName"</span>: <span class="w">"validateToken"</span>,
-      <span class="b">"filePath"</span>: <span class="d">"src/auth.ts"</span>
-    <span class="d">}</span>
-  <span class="d">]</span>
-<span class="d">}</span></pre>
+
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem blame</code></div>
+          <div class="cmd-desc">Who changed it? Per-entity blame showing the last commit that touched each function, class, or method.</div>
+          <pre class="cmd-example"><span class="d">│</span>  <span class="g">⊕</span> <span class="w">render_inline_diff</span>  <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span>
+<span class="d">│</span>  <span class="g">⊕</span> <span class="w">format_terminal</span>     <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span></pre>
+        </div>
+
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem impact</code></div>
+          <div class="cmd-desc">What breaks? Cross-file dependency graph shows every entity that depends on a given function, plus affected tests.</div>
+          <pre class="cmd-example"><span class="w">⊕ function authenticateUser</span>
+  <span class="d">→ depends on:</span>  <span class="c">db.findUser</span>, <span class="c">rateLimiter</span>
+  <span class="d">← used by:</span>    <span class="c">loginRoute</span>, <span class="c">authMiddleware</span>
+  <span class="r">! 42 entities transitively affected</span></pre>
+        </div>
+
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem log</code></div>
+          <div class="cmd-desc">How did it evolve? Git history for a single entity. See every commit that touched a specific function.</div>
+          <pre class="cmd-example"><span class="d">│</span>  <span class="c">ae576ab</span>  <span class="d">Rohan  02-05</span>  <span class="g">added</span>
+<span class="d">│</span>  <span class="c">a105183</span>  <span class="d">Rohan  02-08</span>  <span class="y">modified (logic)</span>
+<span class="d">│</span>  <span class="c">a1a6fbf</span>  <span class="d">Rohan  04-03</span>  <span class="y">modified (logic)</span></pre>
+        </div>
+
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem entities</code></div>
+          <div class="cmd-desc">What's under a path? Lists every function, class, method, and type with line ranges.</div>
+          <pre class="cmd-example"><span class="d">entities: src/auth/login.ts</span>
+  <span class="w">function validateToken</span>     <span class="d">(L12:24)</span>
+  <span class="w">function authenticateUser</span>  <span class="d">(L26:45)</span>
+  <span class="w">interface AuthConfig</span>       <span class="d">(L47:52)</span></pre>
+        </div>
+
+        <div class="cmd-card">
+          <div class="cmd-name"><code>sem context</code></div>
+          <div class="cmd-desc">Smart context for AI. Token-budgeted context window: the entity, its dependencies, and dependents. Fits in any LLM prompt.</div>
+          <pre class="cmd-example"><span class="d">context for</span> <span class="w">authenticateUser</span> <span class="d">(budget: 8000)</span>
+  <span class="g">target:</span>          <span class="d">~705 tokens</span>
+  <span class="c">dependencies:</span>    <span class="d">~256 tokens</span>
+  <span class="y">dependents:</span>      <span class="d">~812 tokens</span></pre>
+        </div>
+      </div>
+
+      <p style="text-align: center; margin-top: 24px; font-size: 13px; color: var(--dim);">
+        All commands support <code style="color: var(--cyan); background: none;">--json</code> for machine-readable output.
+        <a href="details.html" style="color: var(--cyan);">Full reference.</a>
+      </p>
+    </section>
+
+    <!-- ═══ Act 3: Languages ═══ -->
+    <section class="fade-in" style="border-top: 1px solid var(--border);">
+      <h2>Your stack. Covered.</h2>
+      <p class="section-desc">
+        26 languages. 5 data formats. One binary.
+      </p>
+
+      <div class="lang-grid">
+        <div class="lang-chip">TypeScript</div>
+        <div class="lang-chip">JavaScript</div>
+        <div class="lang-chip">Python</div>
+        <div class="lang-chip">Go</div>
+        <div class="lang-chip">Rust</div>
+        <div class="lang-chip">Java</div>
+        <div class="lang-chip">C</div>
+        <div class="lang-chip">C++</div>
+        <div class="lang-chip">C#</div>
+        <div class="lang-chip">Ruby</div>
+        <div class="lang-chip">PHP</div>
+        <div class="lang-chip">Swift</div>
+        <div class="lang-chip">Kotlin</div>
+        <div class="lang-chip">Elixir</div>
+        <div class="lang-chip">Bash</div>
+        <div class="lang-chip">HCL</div>
+        <div class="lang-chip">Fortran</div>
+        <div class="lang-chip">Vue</div>
+        <div class="lang-chip">Svelte</div>
+        <div class="lang-chip">XML</div>
+        <div class="lang-chip">ERB</div>
+        <div class="lang-chip">Dart</div>
+        <div class="lang-chip">Perl</div>
+        <div class="lang-chip">OCaml</div>
+        <div class="lang-chip">Scala</div>
+        <div class="lang-chip">Zig</div>
+        <div class="lang-chip data">JSON</div>
+        <div class="lang-chip data">YAML</div>
+        <div class="lang-chip data">TOML</div>
+        <div class="lang-chip data">CSV</div>
+        <div class="lang-chip data">Markdown</div>
+      </div>
+
+      <div class="speed-row">
+        <div class="speed-pill">
+          <span class="number">8ms</span>
+          <span class="label">typical diff</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">26</span>
+          <span class="label">languages</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">0</span>
+          <span class="label">config needed</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">4,000+</span>
+          <span class="label">downloads</span>
         </div>
       </div>
     </section>
 
-    <!-- ═══ sem vs git ═══ -->
-    <section>
-      <h2>sem vs git</h2>
-      <p class="section-desc">
-        git gives you lines. sem gives you entities — functions, properties, rows, sections.
-      </p>
-      <div class="comparison-table">
-        <table>
-          <thead>
-            <tr>
-              <th>Feature</th>
-              <th>git diff</th>
-              <th>sem diff</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Diff granularity</td>
-              <td class="lose">lines</td>
-              <td class="win">entities (functions, classes, properties)</td>
-            </tr>
-            <tr>
-              <td>Code parsing</td>
-              <td class="lose">no</td>
-              <td class="win">tree-sitter (TS, Python, Go, Rust, JS)</td>
-            </tr>
-            <tr>
-              <td>JSON / YAML / TOML</td>
-              <td class="lose">lines</td>
-              <td class="win">key-path entities</td>
-            </tr>
-            <tr>
-              <td>CSV</td>
-              <td class="lose">lines</td>
-              <td class="win">row + cell identity</td>
-            </tr>
-            <tr>
-              <td>Rename detection</td>
-              <td class="lose">heuristic (file-level)</td>
-              <td class="win">3-phase (ID + hash + fuzzy)</td>
-            </tr>
-            <tr>
-              <td>Machine-readable output</td>
-              <td class="lose">patch format</td>
-              <td class="win">JSON</td>
-            </tr>
-            <tr>
-              <td>Agent accuracy</td>
-              <td class="lose">41.5% avg</td>
-              <td class="win">95.9% avg (<a href="agents.html" style="color:var(--green)">benchmark</a>)</td>
-            </tr>
-            <tr>
-              <td>Speed</td>
-              <td>9ms</td>
-              <td class="win">8ms</td>
-            </tr>
-            <tr>
-              <td>Adoption</td>
-              <td>-</td>
-              <td class="win">single binary, drop into any Git repo</td>
-            </tr>
-          </tbody>
-        </table>
+    <!-- ═══ Try it ═══ -->
+    <section class="fade-in" style="border-top: 1px solid var(--border); text-align: center;">
+      <h2>Try it. 10 seconds.</h2>
+      <div style="margin-top: 32px;">
+        <div class="terminal" style="max-width: 540px; margin: 0 auto; text-align: left;">
+          <div class="terminal-bar">
+            <div class="terminal-dot"></div>
+            <div class="terminal-dot"></div>
+            <div class="terminal-dot"></div>
+          </div>
+          <div class="terminal-body" style="min-height: auto; font-size: 13px; line-height: 1.9;">
+<pre><span style="color: var(--dim);">$</span> <span style="color: var(--accent);">brew install sem-cli</span>
+<span style="color: var(--dim);">$</span> <span style="color: var(--accent);">sem setup</span>
+<span style="color: var(--green);">✓</span> Created wrapper script
+<span style="color: var(--green);">✓</span> Set git config --global diff.external = sem
+<span style="color: var(--green);">✓</span> Pre-commit hook installed
+
+<span style="color: var(--green); font-weight: 600;">Done!</span> Running <span style="color: var(--accent);">git diff</span> in any repo will now use sem.
+<span style="color: var(--dim);">  To revert, run: sem unsetup</span></pre>
+          </div>
+        </div>
+        <p style="font-size: 13px; color: var(--dim); margin-top: 20px;">
+          One command. Every <code style="color: var(--cyan); background: none;">git diff</code> becomes a <code style="color: var(--cyan); background: none;">sem diff</code>. No config files.<br>
+          <span style="color: var(--dim2);">Also: </span>
+          <span onclick="copyCmd(this)" style="cursor: pointer; color: var(--dim); border-bottom: 1px dashed var(--dim2);">cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli</span>
+        </p>
       </div>
-    </section>
-
-    <!-- ═══ Benchmarks ═══ -->
-    <section id="benchmarks">
-      <h2>Benchmarks</h2>
-      <p class="section-desc">
-        Real measurements on the sem repo. 50 runs each via hyperfine -N, median reported. LTO-optimized Rust binary with xxHash64 and cached tree resolution.
-      </p>
-
-      <div class="bench-group">
-        <h3>sem diff across scenarios</h3>
-        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">Wall-clock time, no shell overhead. Measured with hyperfine -N --warmup 10 --runs 50 on the sem repo.</p>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Small commit (1 file)</span>
-            <span class="value" style="color: var(--green)">5ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 21%">5ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Medium commit (5 files)</span>
-            <span class="value" style="color: var(--green)">8ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 33%">8ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Large commit (13 files)</span>
-            <span class="value" style="color: var(--green)">19ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 79%">19ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Range (8 commits, 30 files)</span>
-            <span class="value" style="color: var(--green)">24ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 100%">24ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">Full semantic understanding in under 25ms. Scales linearly with file count.</div>
-      </div>
-
-      <div class="bench-group">
-        <h3>sem diff vs git diff</h3>
-        <p style="font-size: 12px; color: var(--dim); margin-bottom: 16px;">Same commit (5 files), same repo. sem adds entity-level parsing on top of git's line diff.</p>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">git diff (line-level only)</span>
-            <span class="value">9ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar git-bar" style="width: 100%">9ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name" style="color: var(--green)">sem diff (entity-level)</span>
-            <span class="value" style="color: var(--green)">8ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar sem-bar" style="width: 89%">8ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">Faster than git diff while adding semantic parsing, rename detection, and structural hashing.</div>
-      </div>
-
-      <!-- Profiler breakdown -->
-      <h3 style="font-size: 16px; color: var(--accent); margin: 40px 0 12px;">Internal profiler</h3>
-      <p class="section-desc" style="margin-bottom: 16px;">
-        Built-in instrumentation via <code style="color:var(--cyan)">sem diff --profile</code>. Shows where time is spent inside the binary.
-      </p>
-
-      <div class="profiler-grid">
-        <div class="profiler-card" style="border-color: var(--green);">
-          <h4 style="color: var(--green);">Small commit (1 file, 8 entities)</h4>
-          <div class="profiler-row">
-            <span class="pr-label">git2 open repo</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 30%; background: var(--blue)"></div></div>
-            <span class="pr-value">1.2ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 22%; background: var(--orange)"></div></div>
-            <span class="pr-value">0.9ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">parse + match</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 46%; background: var(--green)"></div></div>
-            <span class="pr-value">1.8ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">format output</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
-            <span class="pr-value">0.1ms</span>
-          </div>
-          <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
-            <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--green)">4.9ms</span>
-          </div>
-        </div>
-        <div class="profiler-card" style="border-color: var(--green);">
-          <h4 style="color: var(--green);">Large commit (13 files, 65 entities)</h4>
-          <div class="profiler-row">
-            <span class="pr-label">git2 open repo</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 7%; background: var(--blue)"></div></div>
-            <span class="pr-value">1.2ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 21%; background: var(--orange)"></div></div>
-            <span class="pr-value">3.6ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">parse + match (parallel)</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 70%; background: var(--green)"></div></div>
-            <span class="pr-value">10.8ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">format output</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
-            <span class="pr-value">0.2ms</span>
-          </div>
-          <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
-            <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--green)">19.4ms</span>
-          </div>
-        </div>
-        <div class="profiler-card" style="border-color: var(--cyan);">
-          <h4 style="color: var(--cyan);">Range: 8 commits (30 files, 1383 entities)</h4>
-          <div class="profiler-row">
-            <span class="pr-label">git2 open repo</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 5%; background: var(--blue)"></div></div>
-            <span class="pr-value">1.2ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">git diff + content</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 17%; background: var(--orange)"></div></div>
-            <span class="pr-value">3.8ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">parse + match (parallel)</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 76%; background: var(--green)"></div></div>
-            <span class="pr-value">17.2ms</span>
-          </div>
-          <div class="profiler-row">
-            <span class="pr-label">format output</span>
-            <div class="pr-bar"><div class="pr-fill" style="width: 2%; background: var(--purple)"></div></div>
-            <span class="pr-value">0.4ms</span>
-          </div>
-          <div class="profiler-row" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border)">
-            <span class="pr-label" style="color:var(--accent)">Total (wall)</span>
-            <span class="pr-value" style="color:var(--cyan)">24.0ms</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Flame graph visualization -->
-      <h3 style="font-size: 16px; color: var(--accent); margin: 40px 0 12px;">Flame graph</h3>
-      <p class="section-desc" style="margin-bottom: 8px;">
-        CPU time breakdown for <code style="color:var(--cyan)">sem diff --commit</code> (large, 13 files). Hover for details.
-      </p>
-      <div class="flame-legend">
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#3498db"></div> git2 repo</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#e67e22"></div> git diff + content</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#2ecc71"></div> tree-sitter parse</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#f1c40f"></div> entity matching</div>
-        <div class="flame-legend-item"><div class="flame-swatch" style="background:#9b59b6"></div> format output</div>
-      </div>
-      <div id="flame-graph-mount"></div>
     </section>
 
     <footer>
+      <p style="margin-bottom: 8px;">
+        <a href="details.html">Commands & Benchmarks</a>
+        &nbsp;&middot;&nbsp;
+        <a href="agents.html">Agent Accuracy</a>
+        &nbsp;&middot;&nbsp;
+        <a href="changelog.html">Changelog</a>
+        &nbsp;&middot;&nbsp;
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+      </p>
       <p>Built by <a href="https://ataraxy-labs.com">Ataraxy Labs</a></p>
     </footer>
   </div>
 
-  <!-- Flame graph tooltip -->
-  <div class="flame-tooltip" id="tooltip">
-    <div class="tt-fn" id="tt-fn"></div>
-    <div class="tt-detail" id="tt-detail"></div>
-  </div>
-
   <script>
-    function copyCmd(el, cmd) {
-      navigator.clipboard.writeText(cmd);
-      // Find or create a "copied" indicator
+    function copyCmd(el) {
+      navigator.clipboard.writeText('brew install sem-cli');
       let copied = el.querySelector('.copied');
       if (copied) {
         copied.classList.add('show');
         setTimeout(() => copied.classList.remove('show'), 1500);
       }
     }
-    // Legacy compat
-    function copyInstall(el) { copyCmd(el, 'cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli'); }
 
-    // Flame graph rendering — sem diff internal profiler
+    // Hero terminal typing animation
     (function() {
-      // Profiler data from sem diff --profile (large commit, 13 files)
-      const flameData = {
-        name: 'root', self: 0, total: 1580,
-        children: [
-          { name: 'git2 open repo', self: 0, total: 120, children: [
-            { name: 'Repository::discover [git2]', self: 72, total: 72, children: [] },
-            { name: 'Config::open_default', self: 28, total: 28, children: [] },
-            { name: 'load HEAD reference', self: 20, total: 20, children: [] },
-          ]},
-          { name: 'git diff + content', self: 0, total: 360, children: [
-            { name: 'diff_tree_to_tree [git2]', self: 95, total: 95, children: [] },
-            { name: 'resolve_tree (cached)', self: 22, total: 22, children: [] },
-            { name: 'Blob::content (read)', self: 155, total: 155, children: [] },
-            { name: 'Tree::get_path lookup', self: 58, total: 58, children: [] },
-            { name: 'parse_diff_status', self: 30, total: 30, children: [] },
-          ]},
-          { name: 'parse + match (rayon)', self: 0, total: 1080, children: [
-            { name: 'tree-sitter parse', self: 0, total: 560, children: [
-              { name: 'Parser::parse (Rust)', self: 260, total: 260, children: [] },
-              { name: 'Parser::parse (TOML)', self: 105, total: 105, children: [] },
-              { name: 'Parser::set_language', self: 32, total: 32, children: [] },
-              { name: 'tree cursor walk', self: 163, total: 163, children: [] },
-            ]},
-            { name: 'entity extraction', self: 0, total: 290, children: [
-              { name: 'extract_entities (code)', self: 190, total: 190, children: [] },
-              { name: 'extract_entities (toml)', self: 42, total: 42, children: [] },
-              { name: 'build_entity_id + xxhash', self: 58, total: 58, children: [] },
-            ]},
-            { name: 'match_entities [identity]', self: 0, total: 230, children: [
-              { name: 'Phase 1: exact ID match', self: 95, total: 95, children: [] },
-              { name: 'Phase 2: content hash', self: 76, total: 76, children: [] },
-              { name: 'Phase 3: fuzzy similarity', self: 59, total: 59, children: [] },
-            ]},
-          ]},
-          { name: 'format output', self: 0, total: 18, children: [
-            { name: 'format_terminal', self: 14, total: 14, children: [] },
-            { name: 'write to stdout', self: 4, total: 4, children: [] },
-          ]},
-          { name: 'registry init', self: 2, total: 2, children: [] },
-        ]
-      };
+      const el = document.getElementById('hero-terminal');
+      if (!el) return;
 
-      const mount = document.getElementById('flame-graph-mount');
-      const tooltip = document.getElementById('tooltip');
-      const ttFn = document.getElementById('tt-fn');
-      const ttDetail = document.getElementById('tt-detail');
+      const lines = [
+        // --- sem diff ---
+        { text: '$ sem diff', cls: 'cmd', pause: 500, typing: true },
+        { text: '', pause: 300 },
+        { text: '┌─ src/auth/login.ts ──────────────────────────────────', cls: 'd', pause: 50 },
+        { text: '│', cls: 'd', pause: 30 },
+        { parts: [
+          { text: '│  ', cls: 'd' },
+          { text: '⊕', cls: 'g' },
+          { text: ' function  ', cls: 'd' },
+          { text: 'validateToken', cls: 'w' },
+          { text: '          ', cls: '' },
+          { text: '[added]', cls: 'g' },
+        ], pause: 80 },
+        { parts: [
+          { text: '│  ', cls: 'd' },
+          { text: '∆', cls: 'y' },
+          { text: ' function  ', cls: 'd' },
+          { text: 'authenticateUser', cls: 'w' },
+          { text: '       ', cls: '' },
+          { text: '[modified]', cls: 'y' },
+        ], pause: 80 },
+        { parts: [
+          { text: '│  ', cls: 'd' },
+          { text: '⊖', cls: 'r' },
+          { text: ' function  ', cls: 'd' },
+          { text: 'legacyAuth', cls: 'w' },
+          { text: '             ', cls: '' },
+          { text: '[deleted]', cls: 'r' },
+        ], pause: 80 },
+        { text: '│', cls: 'd', pause: 20 },
+        { text: '└──────────────────────────────────────────────────────', cls: 'd', pause: 150 },
+        { text: '', pause: 600 },
+        // --- sem impact ---
+        { text: '$ sem impact authenticateUser', cls: 'cmd', pause: 500, typing: true },
+        { text: '', pause: 300 },
+        { parts: [
+          { text: '⊕ function ', cls: 'd' },
+          { text: 'authenticateUser', cls: 'w' },
+          { text: ' (src/auth/login.ts:26)', cls: 'd' },
+        ], pause: 80 },
+        { text: '', pause: 40 },
+        { parts: [
+          { text: '  → depends on:    ', cls: 'd' },
+          { text: 'db.findUser', cls: 'b' },
+          { text: ', ', cls: 'd' },
+          { text: 'rateLimiter.check', cls: 'b' },
+        ], pause: 80 },
+        { parts: [
+          { text: '  ← used by:       ', cls: 'd' },
+          { text: 'loginRoute', cls: 'b' },
+          { text: ', ', cls: 'd' },
+          { text: 'authMiddleware', cls: 'b' },
+        ], pause: 80 },
+        { parts: [
+          { text: '  ', cls: '' },
+          { text: '! 42 entities transitively affected', cls: 'r' },
+        ], pause: 80 },
+        { parts: [
+          { text: '  ', cls: '' },
+          { text: '⚡ 7 tests affected', cls: 'y' },
+        ], pause: 150 },
+        { text: '', pause: 600 },
+        // --- sem blame ---
+        { text: '$ sem blame src/auth/login.ts', cls: 'cmd', pause: 500, typing: true },
+        { text: '', pause: 300 },
+        { text: '┌─ src/auth/login.ts', cls: 'd', pause: 50 },
+        { text: '│', cls: 'd', pause: 20 },
+        { parts: [
+          { text: '│  ', cls: 'd' },
+          { text: '⊕', cls: 'g' },
+          { text: ' ', cls: '' },
+          { text: 'validateToken', cls: 'w' },
+          { text: '        ', cls: '' },
+          { text: 'a3f91bc', cls: 'b' },
+          { text: '  Alice   03-28', cls: 'd' },
+        ], pause: 80 },
+        { parts: [
+          { text: '│  ', cls: 'd' },
+          { text: '⊕', cls: 'g' },
+          { text: ' ', cls: '' },
+          { text: 'authenticateUser', cls: 'w' },
+          { text: '     ', cls: '' },
+          { text: 'f7d42e0', cls: 'b' },
+          { text: '  Bob     02-14', cls: 'd' },
+        ], pause: 80 },
+        { parts: [
+          { text: '│  ', cls: 'd' },
+          { text: '⊕', cls: 'g' },
+          { text: ' ', cls: '' },
+          { text: 'AuthConfig', cls: 'w' },
+          { text: '           ', cls: '' },
+          { text: 'e1a08f3', cls: 'b' },
+          { text: '  Alice   01-09', cls: 'd' },
+        ], pause: 80 },
+        { text: '│', cls: 'd', pause: 20 },
+        { text: '└──────────────────────────────────────────────────────', cls: 'd', pause: 0 },
+      ];
 
-      const WIDTH = 760;
-      const ROW_H = 22;
-      const totalSamples = flameData.total;
-
-      function getColor(name) {
-        if (name.includes('git2') || name.includes('Repository') || name.includes('Config') || name.includes('HEAD')) return '#3498db';
-        if (name.includes('diff') || name.includes('Blob') || name.includes('Tree') || name.includes('revparse')) return '#e67e22';
-        if (name.includes('tree-sitter') || name.includes('Parser') || name.includes('cursor')) return '#2ecc71';
-        if (name.includes('match') || name.includes('Phase') || name.includes('similarity') || name.includes('hash') || name.includes('identity')) return '#f1c40f';
-        if (name.includes('extract') || name.includes('entity') || name.includes('build_entity')) return '#2ecc71';
-        if (name.includes('format') || name.includes('stdout') || name.includes('registry')) return '#9b59b6';
-        if (name.includes('parse + match')) return '#2ecc71';
-        return '#9b59b6';
+      function makeSpan(text, cls) {
+        if (!cls) return document.createTextNode(text);
+        const s = document.createElement('span');
+        s.className = cls;
+        s.textContent = text;
+        return s;
       }
 
-      const rects = [];
-      function layout(node, depth, x0) {
-        if (node.name !== 'root') {
-          const w = (node.total / totalSamples) * WIDTH;
-          if (w >= 2) {
-            rects.push({ name: node.name, x: x0, depth, w, self: node.self, total: node.total });
+      function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+      async function typeText(parent, text, cls) {
+        const node = cls ? document.createElement('span') : null;
+        if (node) { node.className = cls; parent.appendChild(node); }
+        const target = node || parent;
+        for (let i = 0; i < text.length; i++) {
+          target.textContent += text[i];
+          await sleep(30 + Math.random() * 30);
+        }
+      }
+
+      async function run() {
+        for (const line of lines) {
+          if (line.typing) {
+            await typeText(el, line.text, line.cls);
+            el.appendChild(document.createTextNode('\n'));
+          } else if (line.parts) {
+            for (const part of line.parts) {
+              el.appendChild(makeSpan(part.text, part.cls));
+            }
+            el.appendChild(document.createTextNode('\n'));
+          } else {
+            el.appendChild(makeSpan(line.text, line.cls));
+            el.appendChild(document.createTextNode('\n'));
           }
+          if (line.pause) await sleep(line.pause);
         }
-        let cx = x0;
-        for (const child of node.children) {
-          const cw = (child.total / totalSamples) * WIDTH;
-          layout(child, node.name === 'root' ? depth : depth + 1, cx);
-          cx += cw;
-        }
+        const cursor = document.createElement('span');
+        cursor.textContent = '█';
+        cursor.style.animation = 'blink 1s step-end infinite';
+        el.appendChild(document.createTextNode('$ '));
+        el.appendChild(cursor);
       }
-      layout(flameData, 0, 0);
 
-      const maxDepth = rects.reduce((m, r) => Math.max(m, r.depth), 0);
-      const svgH = (maxDepth + 2) * ROW_H + 8;
-
-      const fContainer = document.createElement('div');
-      fContainer.className = 'flame-container';
-
-      const fHeader = document.createElement('div');
-      fHeader.className = 'flame-header';
-      fHeader.innerHTML = '<span>sem diff --profile</span><span class="flame-stats">15.8ms internal | 13 files | 19ms wall</span>';
-      fContainer.appendChild(fHeader);
-
-      const fBody = document.createElement('div');
-      fBody.className = 'flame-body';
-
-      const ns = 'http://www.w3.org/2000/svg';
-      const svg = document.createElementNS(ns, 'svg');
-      svg.setAttribute('width', WIDTH);
-      svg.setAttribute('height', svgH);
-      svg.style.display = 'block';
-
-      rects.forEach(r => {
-        const g = document.createElementNS(ns, 'g');
-        const ry = svgH - (r.depth + 1) * ROW_H - 4;
-        const rect = document.createElementNS(ns, 'rect');
-        rect.setAttribute('x', r.x);
-        rect.setAttribute('y', ry);
-        rect.setAttribute('width', Math.max(r.w - 1, 1));
-        rect.setAttribute('height', ROW_H - 2);
-        rect.setAttribute('fill', getColor(r.name));
-        rect.setAttribute('rx', 3);
-        rect.style.opacity = '0.8';
-        rect.style.cursor = 'default';
-        rect.style.transition = 'opacity 0.15s';
-        g.appendChild(rect);
-
-        if (r.w > 50) {
-          const text = document.createElementNS(ns, 'text');
-          text.setAttribute('x', r.x + 6);
-          text.setAttribute('y', ry + 15);
-          text.setAttribute('fill', '#000');
-          text.setAttribute('font-size', '11');
-          text.setAttribute('font-family', 'SF Mono, Fira Code, monospace');
-          const maxChars = Math.floor(r.w / 7.5);
-          text.textContent = r.name.length > maxChars ? r.name.slice(0, maxChars - 1) + '..' : r.name;
-          text.style.pointerEvents = 'none';
-          g.appendChild(text);
-        }
-
-        g.addEventListener('mouseenter', () => {
-          rect.style.opacity = '1';
-          rect.setAttribute('stroke', '#fff');
-          rect.setAttribute('stroke-width', '1');
-          ttFn.textContent = r.name;
-          const ms = (r.total / totalSamples * 15.8).toFixed(2);
-          const pct = (r.total / totalSamples * 100).toFixed(1);
-          ttDetail.textContent = ms + 'ms (' + pct + '% of total)';
-          tooltip.style.display = 'block';
-        });
-        g.addEventListener('mousemove', (e) => {
-          tooltip.style.left = (e.clientX + 12) + 'px';
-          tooltip.style.top = (e.clientY - 40) + 'px';
-        });
-        g.addEventListener('mouseleave', () => {
-          rect.style.opacity = '0.8';
-          rect.removeAttribute('stroke');
-          tooltip.style.display = 'none';
-        });
-
-        svg.appendChild(g);
+      const observer = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting) { observer.disconnect(); run(); }
       });
-
-      fBody.appendChild(svg);
-      fContainer.appendChild(fBody);
-      mount.appendChild(fContainer);
+      observer.observe(el);
     })();
 
+    // Scroll-triggered fade-in
+    (function() {
+      const els = document.querySelectorAll('.fade-in');
+      const observer = new IntersectionObserver((entries) => {
+        entries.forEach(e => {
+          if (e.isIntersecting) {
+            e.target.classList.add('visible');
+            observer.unobserve(e.target);
+          }
+        });
+      }, { threshold: 0.15 });
+      els.forEach(el => observer.observe(el));
+    })();
   </script>
 </body>
 </html>

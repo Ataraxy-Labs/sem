@@ -31,7 +31,7 @@ sem impact validateToken --file-exts .py
 
 ## Languages
 
-11 tree-sitter parser plugins: TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#.
+23 tree-sitter parser plugins: TypeScript, JavaScript, Python, Go, Rust, Java, C, C++, C#, Ruby, PHP, Swift, Elixir, Bash, HCL/Terraform, Kotlin, Fortran, Perl, Dart, OCaml, plus Vue, Svelte, ERB. Shebang detection for extensionless files.
 
 Falls back to chunk-based diffing for unsupported file types.
 
@@ -49,7 +49,7 @@ sem-cli/     # Binary: diff, blame, graph, impact commands
 
 The library that weave, agenthub, effect-system, agent-lint, unified-build, and agent-bench all depend on.
 
-- **Parser registry** with 11 language plugins via tree-sitter
+- **Parser registry** with 23 language plugins via tree-sitter + shebang detection
 - **Structural hashing** (AST-normalized, ignores whitespace/comments)
 - **Semantic diff** with 3-phase entity matching (exact ID, content hash, fuzzy similarity)
 - **Cosmetic vs structural** change detection
@@ -68,7 +68,7 @@ cargo build --release
 
 ```bash
 cargo test
-# 25 tests
+# 134 tests
 ```
 
 ## License

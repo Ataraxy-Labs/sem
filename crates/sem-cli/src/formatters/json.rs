@@ -11,6 +11,7 @@ pub fn format_json(result: &DiffResult) -> String {
                 "changeType": c.change_type,
                 "entityType": c.entity_type,
                 "entityName": c.entity_name,
+                "oldEntityName": c.old_entity_name,
                 "filePath": c.file_path,
                 "oldFilePath": c.old_file_path,
                 "beforeContent": c.before_content,
@@ -34,5 +35,5 @@ pub fn format_json(result: &DiffResult) -> String {
         "changes": changes,
     });
 
-    serde_json::to_string_pretty(&output).unwrap_or_default()
+    serde_json::to_string(&output).unwrap_or_default()
 }
