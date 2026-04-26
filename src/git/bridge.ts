@@ -62,13 +62,7 @@ export class GitBridge {
       }
       files = files.filter(f => !f.filePath.startsWith('.sem/'));
     } else {
-      try {
-        const head = await this.getHeadSha();
-        scope = { type: 'commit', sha: head };
-        files = await readChangedFiles(this.git, scope);
-      } catch {
-        return { scope: { type: 'working' }, files: [] };
-      }
+      return { scope: { type: 'working' }, files: [] };
     }
 
     // Fetch all file contents in parallel
@@ -145,12 +139,7 @@ export class GitBridge {
       return { type: 'working' };
     }
 
-    try {
-      const head = await this.getHeadSha();
-      return { type: 'commit', sha: head };
-    } catch {
-      return { type: 'working' };
-    }
+    return { type: 'working' };
   }
 
   async getLog(limit: number = 20): Promise<CommitInfo[]> {

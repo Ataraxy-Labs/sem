@@ -89,7 +89,7 @@ static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
         "method_definition",
         "public_field_definition",
     ],
-    container_node_types: &["class_body", "interface_body", "enum_body"],
+    container_node_types: &["class_body", "interface_body", "enum_body", "statement_block"],
     call_entity_identifiers: &[],
     get_language: get_typescript,
 };
@@ -109,7 +109,7 @@ static TSX_CONFIG: LanguageConfig = LanguageConfig {
         "method_definition",
         "public_field_definition",
     ],
-    container_node_types: &["class_body", "interface_body", "enum_body"],
+    container_node_types: &["class_body", "interface_body", "enum_body", "statement_block"],
     call_entity_identifiers: &[],
     get_language: get_tsx,
 };
@@ -126,7 +126,7 @@ static JAVASCRIPT_CONFIG: LanguageConfig = LanguageConfig {
         "method_definition",
         "field_definition",
     ],
-    container_node_types: &["class_body"],
+    container_node_types: &["class_body", "statement_block"],
     call_entity_identifiers: &[],
     get_language: get_javascript,
 };
@@ -154,7 +154,7 @@ static GO_CONFIG: LanguageConfig = LanguageConfig {
         "var_declaration",
         "const_declaration",
     ],
-    container_node_types: &[],
+    container_node_types: &["block"],
     call_entity_identifiers: &[],
     get_language: get_go,
 };
@@ -173,7 +173,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
         "static_item",
         "type_item",
     ],
-    container_node_types: &["declaration_list"],
+    container_node_types: &["declaration_list", "block"],
     call_entity_identifiers: &[],
     get_language: get_rust,
 };
@@ -190,7 +190,7 @@ static JAVA_CONFIG: LanguageConfig = LanguageConfig {
         "constructor_declaration",
         "annotation_type_declaration",
     ],
-    container_node_types: &["class_body", "interface_body", "enum_body"],
+    container_node_types: &["class_body", "interface_body", "enum_body", "block"],
     call_entity_identifiers: &[],
     get_language: get_java,
 };
@@ -206,7 +206,7 @@ static C_CONFIG: LanguageConfig = LanguageConfig {
         "type_definition",
         "declaration",
     ],
-    container_node_types: &[],
+    container_node_types: &["compound_statement"],
     call_entity_identifiers: &[],
     get_language: get_c,
 };
@@ -224,7 +224,7 @@ static CPP_CONFIG: LanguageConfig = LanguageConfig {
         "declaration",
         "type_definition",
     ],
-    container_node_types: &["field_declaration_list", "declaration_list"],
+    container_node_types: &["field_declaration_list", "declaration_list", "compound_statement"],
     call_entity_identifiers: &[],
     get_language: get_cpp,
 };
@@ -257,7 +257,7 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
         "constructor_declaration",
         "field_declaration",
     ],
-    container_node_types: &["declaration_list"],
+    container_node_types: &["declaration_list", "block"],
     call_entity_identifiers: &[],
     get_language: get_csharp,
 };
@@ -274,7 +274,7 @@ static PHP_CONFIG: LanguageConfig = LanguageConfig {
         "enum_declaration",
         "namespace_definition",
     ],
-    container_node_types: &["declaration_list", "enum_declaration_list"],
+    container_node_types: &["declaration_list", "enum_declaration_list", "compound_statement"],
     call_entity_identifiers: &[],
     get_language: get_php,
 };
@@ -310,7 +310,7 @@ static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
         "operator_declaration",
         "associatedtype_declaration",
     ],
-    container_node_types: &["class_body", "protocol_body", "enum_class_body"],
+    container_node_types: &["class_body", "protocol_body", "enum_class_body", "function_body"],
     call_entity_identifiers: &[],
     get_language: get_swift,
 };
@@ -332,7 +332,7 @@ static BASH_CONFIG: LanguageConfig = LanguageConfig {
     id: "bash",
     extensions: &[".sh"],
     entity_node_types: &["function_definition"],
-    container_node_types: &[],
+    container_node_types: &["compound_statement"],
     call_entity_identifiers: &[],
     get_language: get_bash,
 };

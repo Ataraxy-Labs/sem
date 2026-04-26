@@ -71,16 +71,8 @@ impl GitBridge {
             return Ok((DiffScope::Working, working_files));
         }
 
-        // Fall back to HEAD commit
-        match self.get_head_sha() {
-            Ok(sha) => {
-                let scope = DiffScope::Commit { sha: sha.clone() };
-                let mut files = self.get_commit_diff_files(&sha)?;
-                self.populate_contents(&mut files, &scope)?;
-                Ok((scope, files))
-            }
-            Err(_) => Ok((DiffScope::Working, Vec::new())),
-        }
+        // A clean worktree should report no live changes.
+        Ok((DiffScope::Working, Vec::new()))
     }
 
     /// Get changed files for a specific scope
@@ -378,5 +370,80 @@ impl GitBridge {
         }
 
         Ok(commits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::{Oid, Repository, Signature};
+    use tempfile::TempDir;
+
+    fn commit_file(repo: &Repository, file_path: &str, contents: &str, message: &str) -> Oid {
+        fs::write(repo.workdir().unwrap().join(file_path), contents).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(file_path)).unwrap();
+        index.write().unwrap();
+
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
+
+        match repo.head() {
+            Ok(head) => {
+                let parent = repo.find_commit(head.target().unwrap()).unwrap();
+                repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+                    .unwrap()
+            }
+            Err(_) => repo
+                .commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn clean_worktree_does_not_fall_back_to_head_commit() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        commit_file(&repo, "sample.ts", "export function a() {\n  return 1;\n}\n", "init");
+        commit_file(
+            &repo,
+            "sample.ts",
+            "export function a() {\n  return 2;\n}\n",
+            "change a",
+        );
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let (scope, files) = bridge.detect_and_get_files().unwrap();
+
+        assert!(matches!(scope, DiffScope::Working));
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn explicit_commit_scope_still_reads_head_commit_diff() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        commit_file(&repo, "sample.ts", "export function a() {\n  return 1;\n}\n", "init");
+        let head_oid = commit_file(
+            &repo,
+            "sample.ts",
+            "export function a() {\n  return 2;\n}\n",
+            "change a",
+        );
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge
+            .get_changed_files(&DiffScope::Commit {
+                sha: head_oid.to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path, "sample.ts");
+        assert_eq!(files[0].status, FileStatus::Modified);
     }
 }

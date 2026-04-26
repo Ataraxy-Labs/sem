@@ -58,7 +58,16 @@ pub fn format_terminal(result: &DiffResult) -> String {
             };
 
             let type_label = format!("{:<10}", change.entity_type);
-            let name_label = format!("{:<25}", change.entity_name);
+            let display_name = match &change.parent_name {
+                Some(p) => format!("{}::{}", p, change.entity_name),
+                None => change.entity_name.clone(),
+            };
+            let truncated = if display_name.len() > 25 {
+                format!("{}…", &display_name[..24])
+            } else {
+                display_name
+            };
+            let name_label = format!("{:<25}", truncated);
 
             lines.push(format!(
                 "{}  {} {} {} {}",

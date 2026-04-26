@@ -1,6 +1,6 @@
 [package]
 name = "sem-core"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 

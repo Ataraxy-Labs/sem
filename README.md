@@ -40,7 +40,7 @@ Or grab a binary from [GitHub Releases](https://github.com/Ataraxy-Labs/sem/rele
 
 ## Usage
 
-Works in any Git repo. No setup required.
+Works in any Git repo. No setup required. Also works outside Git for arbitrary file comparison.
 
 ```bash
 # Semantic diff of working changes
@@ -57,6 +57,9 @@ sem diff --from HEAD~5 --to HEAD
 
 # JSON output (for AI agents, CI pipelines)
 sem diff --format json
+
+# Compare any two files (no git repo needed)
+sem diff file1.ts file2.ts
 
 # Read file changes from stdin (no git repo needed)
 echo '[{"filePath":"src/main.rs","status":"modified","beforeContent":"...","afterContent":"..."}]' \
@@ -77,7 +80,7 @@ sem blame src/auth.ts
 
 ## What it parses
 
-13 programming languages with full entity extraction via tree-sitter:
+17 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -92,7 +95,11 @@ sem blame src/auth.ts
 | C# | `.cs` | classes, methods, interfaces, enums, structs, properties |
 | Ruby | `.rb` | methods, classes, modules |
 | PHP | `.php` | functions, classes, methods, interfaces, traits, enums |
+| Swift | `.swift` | functions, classes, protocols, structs, enums, properties |
+| Elixir | `.ex` `.exs` | modules, functions, macros, guards, protocols |
+| Bash | `.sh` | functions |
 | Fortran | `.f90` `.f95` `.f` | functions, subroutines, modules, programs |
+| Vue | `.vue` | template/script/style blocks + inner TS/JS entities |
 
 Plus structured data formats:
 

@@ -362,4 +362,65 @@ export class Greeter {
         assert!(names.contains(&"hello"), "Should find hello function");
         assert!(names.contains(&"Greeter"), "Should find Greeter class");
     }
+
+    #[test]
+    fn test_nested_functions_typescript() {
+        let code = r#"
+function outer() {
+    function inner() {
+        return 42;
+    }
+    return inner();
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "nested.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("Nested TS: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"outer"), "Should find outer, got: {:?}", names);
+        assert!(names.contains(&"inner"), "Should find inner, got: {:?}", names);
+
+        let inner = entities.iter().find(|e| e.name == "inner").unwrap();
+        assert!(inner.parent_id.is_some(), "inner should have parent_id");
+    }
+
+    #[test]
+    fn test_nested_functions_python() {
+        let code = "def outer():\n    def inner():\n        return 42\n    return inner()\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "nested.py");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"), "got: {:?}", names);
+        assert!(names.contains(&"inner"), "got: {:?}", names);
+
+        let inner = entities.iter().find(|e| e.name == "inner").unwrap();
+        assert!(inner.parent_id.is_some(), "inner should have parent_id");
+    }
+
+    #[test]
+    fn test_nested_functions_rust() {
+        let code = "fn outer() {\n    fn inner() -> i32 {\n        42\n    }\n    inner();\n}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "nested.rs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"), "got: {:?}", names);
+        assert!(names.contains(&"inner"), "got: {:?}", names);
+
+        let inner = entities.iter().find(|e| e.name == "inner").unwrap();
+        assert!(inner.parent_id.is_some(), "inner should have parent_id");
+    }
+
+    #[test]
+    fn test_nested_functions_go() {
+        // Go doesn't have named nested functions, but has nested type/var declarations
+        let code = "package main\n\nfunc outer() {\n    var x int = 42\n    _ = x\n}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "nested.go");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"), "got: {:?}", names);
+    }
 }
