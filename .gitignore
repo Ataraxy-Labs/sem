@@ -10,3 +10,4 @@ vendor/
 .envrc
 .direnv/
 result/
+tmp/
