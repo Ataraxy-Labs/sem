@@ -14,6 +14,7 @@ pub fn format_json(result: &DiffResult) -> String {
                 "oldEntityName": c.old_entity_name,
                 "filePath": c.file_path,
                 "oldFilePath": c.old_file_path,
+                "oldParentId": c.old_parent_id,
                 "beforeContent": c.before_content,
                 "afterContent": c.after_content,
                 "commitSha": c.commit_sha,

@@ -40,6 +40,8 @@ pub struct SemanticChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub before_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_content: Option<String>,

@@ -145,7 +145,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                             }
                         }
                     }
-                    ChangeType::Modified | ChangeType::Renamed => {
+                    ChangeType::Modified | ChangeType::Renamed | ChangeType::Moved => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
@@ -248,6 +248,14 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                         "{}    {}",
                         "│".dimmed(),
                         format!("from {old_path}").dimmed(),
+                    ));
+                } else if let Some(ref old_parent) = change.old_parent_id {
+                    // Intra-file move: extract parent name from entity ID
+                    let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
+                    lines.push(format!(
+                        "{}    {}",
+                        "│".dimmed(),
+                        format!("moved from {parent_name}").dimmed(),
                     ));
                 }
             }

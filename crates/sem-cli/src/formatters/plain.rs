@@ -46,6 +46,9 @@ pub fn format_plain(result: &DiffResult) -> String {
             if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
                     lines.push(format!("       {}", format!("from {old_path}").dimmed()));
+                } else if let Some(ref old_parent) = change.old_parent_id {
+                    let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
+                    lines.push(format!("       {}", format!("moved from {parent_name}").dimmed()));
                 }
             }
         }

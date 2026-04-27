@@ -10,6 +10,8 @@ pub struct MatchResult {
 fn classify_match(before: &SemanticEntity, after: &SemanticEntity) -> ChangeType {
     if before.file_path != after.file_path {
         ChangeType::Moved
+    } else if before.parent_id != after.parent_id {
+        ChangeType::Moved // intra-file scope move (e.g. method moved between classes)
     } else {
         ChangeType::Renamed
     }
@@ -47,6 +49,9 @@ fn make_change(
         }),
         old_file_path: before_entity.and_then(|b| {
             (b.file_path != after_entity.file_path).then(|| b.file_path.clone())
+        }),
+        old_parent_id: before_entity.and_then(|b| {
+            (b.parent_id != after_entity.parent_id).then(|| b.parent_id.clone()).flatten()
         }),
         before_content: before_entity.map(|b| b.content.clone()),
         after_content: if change_type == ChangeType::Deleted || change_type == ChangeType::Reordered {
@@ -148,11 +153,13 @@ pub fn match_entities(
             matched_before.insert(&before_entity.id);
             matched_after.insert(&after_entity.id);
 
-            // If name and file are the same, only the parent qualifier in the ID changed
+            // If name, file, and parent are the same, only the parent qualifier in the ID changed
             // (e.g. parent class was renamed). Skip — the entity itself is unchanged.
+            // But if parent_id differs, this is an intra-file move (e.g. method moved between classes).
             if before_entity.name == after_entity.name
                 && before_entity.file_path == after_entity.file_path
                 && before_entity.content_hash == after_entity.content_hash
+                && before_entity.parent_id == after_entity.parent_id
             {
                 continue;
             }
@@ -246,10 +253,11 @@ pub fn match_entities(
                 matched_before.insert(&matched.id);
                 matched_after.insert(&after_entity.id);
 
-                // If name and file are the same, only the parent qualifier changed.
+                // If name, file, and parent are the same, only the parent qualifier changed.
                 if matched.name == after_entity.name
                     && matched.file_path == after_entity.file_path
                     && matched.content_hash == after_entity.content_hash
+                    && matched.parent_id == after_entity.parent_id
                 {
                     continue;
                 }
@@ -632,6 +640,58 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].entity_name, "Foo");
         assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+    }
+
+    fn make_entity_with_parent(id: &str, name: &str, content: &str, file_path: &str, parent_id: Option<&str>) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            entity_type: "method".to_string(),
+            name: name.to_string(),
+            parent_id: parent_id.map(String::from),
+            content: content.to_string(),
+            content_hash: content_hash(content),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 1,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_intra_file_move_between_classes() {
+        // Method moves from ClassA to ClassB in the same file
+        let before = vec![make_entity_with_parent(
+            "a.rs::class::ClassA::foo", "foo", "fn foo() { do_thing() }",
+            "a.rs", Some("a.rs::class::ClassA"),
+        )];
+        let after = vec![make_entity_with_parent(
+            "a.rs::class::ClassB::foo", "foo", "fn foo() { do_thing() }",
+            "a.rs", Some("a.rs::class::ClassB"),
+        )];
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Moved);
+        assert_eq!(result.changes[0].old_parent_id, Some("a.rs::class::ClassA".to_string()));
+    }
+
+    #[test]
+    fn test_same_parent_is_rename_not_move() {
+        // Same parent, different name = rename (not move)
+        // Content must be identical (same hash) so Phase 2 catches it
+        let body = "fn method(&self) { let x = self.compute(); self.validate(x); self.store(x) }";
+        let before = vec![make_entity_with_parent(
+            "a.rs::class::Foo::old_method", "old_method", body,
+            "a.rs", Some("a.rs::class::Foo"),
+        )];
+        let after = vec![make_entity_with_parent(
+            "a.rs::class::Foo::new_method", "new_method", body,
+            "a.rs", Some("a.rs::class::Foo"),
+        )];
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Renamed);
+        assert!(result.changes[0].old_parent_id.is_none());
     }
 
     fn make_entity_at(id: &str, name: &str, content: &str, file_path: &str, line: usize) -> SemanticEntity {

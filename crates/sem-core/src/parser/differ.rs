@@ -252,6 +252,7 @@ fn detect_orphan_changes(
         file_path: file.file_path.clone(),
         old_entity_name: None,
         old_file_path: None,
+        old_parent_id: None,
         before_content: if before_orphan.is_empty() {
             None
         } else {

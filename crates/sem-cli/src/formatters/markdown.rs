@@ -76,7 +76,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                             post_table.push("```".to_string());
                         }
                     }
-                    ChangeType::Modified => {
+                    ChangeType::Modified | ChangeType::Moved => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
@@ -147,6 +147,10 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                 if let Some(ref old_path) = change.old_file_path {
                     post_table.push(String::new());
                     post_table.push(format!("> from {old_path}"));
+                } else if let Some(ref old_parent) = change.old_parent_id {
+                    let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
+                    post_table.push(String::new());
+                    post_table.push(format!("> moved from {parent_name}"));
                 }
             }
         }
