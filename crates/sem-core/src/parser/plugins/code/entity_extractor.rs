@@ -159,11 +159,21 @@ fn visit_node(
                 // cover the full definition so body changes are detected.
                 let body = if config.id == "dart" { sibling_function_body(node) } else { None };
                 let end_byte = body.map_or(node.end_byte(), |b| b.end_byte());
-                let content = std::str::from_utf8(&source[node.start_byte()..end_byte])
-                    .unwrap_or("")
-                    .to_string();
                 let end_line =
                     body.map_or(node.end_position().row + 1, |b| b.end_position().row + 1);
+
+                // Extend start backward to include outer attributes (e.g. Rust
+                // #[derive(...)], #[cfg(...)], #[test]) so attribute changes
+                // are captured as part of the entity diff.
+                let (start_byte, start_line) =
+                    preceding_attributes_start(node, config).map_or(
+                        (node.start_byte(), node.start_position().row + 1),
+                        |(sb, sr)| (sb, sr + 1),
+                    );
+
+                let content = std::str::from_utf8(&source[start_byte..end_byte])
+                    .unwrap_or("")
+                    .to_string();
                 let struct_hash = match body {
                     Some(b) => {
                         let sig = compute_structural_hash(node, source);
@@ -182,7 +192,7 @@ fn visit_node(
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
                     content,
-                    start_line: node.start_position().row + 1,
+                    start_line,
                     end_line,
                     metadata: None,
                 };
@@ -269,6 +279,35 @@ fn visit_node(
             child_enclosing,
         );
     }
+}
+
+/// For languages with outer attributes/annotations that are sibling nodes
+/// (e.g. Rust `#[derive(...)]`, `#[cfg(...)]`), walk backward to find the
+/// earliest preceding attribute so the entity span includes them.
+/// Returns (start_byte, start_row) of the first attribute if any found.
+fn preceding_attributes_start(node: Node, config: &LanguageConfig) -> Option<(usize, usize)> {
+    let attr_kind = match config.id {
+        "rust" => "attribute_item",
+        _ => return None,
+    };
+
+    let mut earliest_start_byte = node.start_byte();
+    let mut earliest_start_row = node.start_position().row;
+    let mut found = false;
+    let mut current = node;
+
+    while let Some(prev) = current.prev_named_sibling() {
+        if prev.kind() == attr_kind {
+            earliest_start_byte = prev.start_byte();
+            earliest_start_row = prev.start_position().row;
+            found = true;
+            current = prev;
+        } else {
+            break;
+        }
+    }
+
+    found.then_some((earliest_start_byte, earliest_start_row))
 }
 
 /// For Dart top-level function/getter/setter signatures, return the sibling

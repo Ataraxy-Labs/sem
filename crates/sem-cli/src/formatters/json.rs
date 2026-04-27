@@ -18,6 +18,7 @@ pub fn format_json(result: &DiffResult) -> String {
                 "afterContent": c.after_content,
                 "commitSha": c.commit_sha,
                 "author": c.author,
+                "structuralChange": c.structural_change,
             })
         })
         .collect();
@@ -31,6 +32,7 @@ pub fn format_json(result: &DiffResult) -> String {
             "moved": result.moved_count,
             "renamed": result.renamed_count,
             "reordered": result.reordered_count,
+            "orphan": result.orphan_count,
             "total": result.changes.len(),
         },
         "changes": changes,

@@ -463,6 +463,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
         "const_item",
         "static_item",
         "type_item",
+        "macro_definition",
     ],
     container_node_types: &["declaration_list", "block"],
     call_entity_identifiers: &[],

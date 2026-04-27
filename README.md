@@ -71,6 +71,8 @@ docker build -t sem .
 docker run --rm -it -u "$(id -u):$(id -g)" -v "$(pwd):/repo" sem diff
 ```
 
+> **Note:** GNU Parallel also installs a `sem` binary (`/usr/bin/sem`). If you have both installed, make sure the sem you want is first in your `$PATH`. Run `sem --version` to check which one you're using. ([#77](https://github.com/Ataraxy-Labs/sem/issues/77))
+
 ## Commands
 
 Works in any Git repo. No setup required. Also works outside Git for arbitrary file comparison.

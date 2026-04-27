@@ -2019,17 +2019,13 @@ function hello() {}
                 .collect::<Vec<_>>()
         );
 
+        // script parent is suppressed because its child (count) is also Added
         assert!(
-            result
+            !result
                 .changes
                 .iter()
                 .any(|c| c.entity_name == "script" && c.entity_type == "svelte_instance_script"),
-            "expected script entity: {:?}",
-            result
-                .changes
-                .iter()
-                .map(|c| (&c.entity_name, &c.entity_type))
-                .collect::<Vec<_>>()
+            "script parent should be suppressed when children are also added"
         );
         assert!(
             result

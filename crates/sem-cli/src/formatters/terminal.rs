@@ -44,6 +44,15 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     }
 
     for (file_path, indices) in &by_file {
+        // Skip files where all changes are orphans in non-verbose mode
+        if !verbose
+            && indices
+                .iter()
+                .all(|&i| result.changes[i].entity_type == "orphan")
+        {
+            continue;
+        }
+
         let header = format!("─ {file_path} ");
         let pad_len = 55usize.saturating_sub(header.len());
         lines.push(format!("┌{header}{}", "─".repeat(pad_len)).dimmed().to_string());
@@ -51,6 +60,12 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
 
         for &idx in indices {
             let change = &result.changes[idx];
+
+            // Orphan changes (module-level) only shown in verbose mode
+            if change.entity_type == "orphan" && !verbose {
+                continue;
+            }
+
             let (symbol, tag) = match change.change_type {
                 ChangeType::Added => (
                     "⊕".green().to_string(),
@@ -130,7 +145,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                             }
                         }
                     }
-                    ChangeType::Modified => {
+                    ChangeType::Modified | ChangeType::Renamed => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
