@@ -1,0 +1,41 @@
+name: Semver Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  semver:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks
+
+      - name: Find baseline tag
+        id: baseline
+        run: |
+          TAG=$(git tag --sort=-v:refname | grep '^v' | head -1)
+          if [ -z "$TAG" ]; then
+            echo "No previous tag found, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Checking against baseline $TAG"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run semver checks on sem-core
+        if: steps.baseline.outputs.skip == 'false'
+        run: cargo semver-checks -p sem-core --baseline-rev ${{ steps.baseline.outputs.tag }}

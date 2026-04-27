@@ -35,8 +35,35 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  create-tag:
+  semver-check:
     needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks
+
+      - name: Find previous tag
+        id: baseline
+        run: |
+          TAG=$(git tag --sort=-v:refname | grep '^v' | head -1)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check semver compatibility
+        run: cargo semver-checks -p sem-core --baseline-rev ${{ steps.baseline.outputs.tag }}
+
+  create-tag:
+    needs: [check-version, semver-check]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
