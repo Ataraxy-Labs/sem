@@ -249,6 +249,7 @@ fn detect_orphan_changes(
         entity_type: "orphan".to_string(),
         entity_name: "module-level".to_string(),
         entity_line: 0,
+        parent_name: None,
         file_path: file.file_path.clone(),
         old_entity_name: None,
         old_file_path: None,

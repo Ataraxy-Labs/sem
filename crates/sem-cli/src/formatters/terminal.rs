@@ -104,12 +104,21 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             };
 
             let type_label = format!("{:<10}", change.entity_type);
-            let name_display = if let Some(ref old_name) = change.old_entity_name {
+            let base_name = if let Some(ref old_name) = change.old_entity_name {
                 format!("{old_name} -> {}", change.entity_name)
             } else {
                 change.entity_name.clone()
             };
-            let name_label = format!("{:<25}", name_display);
+            let display_name = match &change.parent_name {
+                Some(p) => format!("{p}::{base_name}"),
+                None => base_name,
+            };
+            let truncated = if display_name.len() > 25 {
+                format!("{}…", display_name.char_indices().nth(24).map(|(i, _)| &display_name[..i]).unwrap_or(&display_name))
+            } else {
+                display_name
+            };
+            let name_label = format!("{:<25}", truncated);
 
             lines.push(format!(
                 "{}  {} {} {} {}",

@@ -35,6 +35,8 @@ pub struct SemanticChange {
     pub entity_name: String,
     #[serde(default)]
     pub entity_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_entity_name: Option<String>,

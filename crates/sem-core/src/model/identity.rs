@@ -3,6 +3,12 @@ use std::collections::{HashMap, HashSet};
 use super::change::{ChangeType, SemanticChange};
 use super::entity::SemanticEntity;
 
+/// Extracts the leaf name from a parent_id string (last "::" segment).
+fn parent_name(entity: &SemanticEntity) -> Option<String> {
+    let pid = entity.parent_id.as_ref()?;
+    pid.rsplit("::").next().map(String::from)
+}
+
 pub struct MatchResult {
     pub changes: Vec<SemanticChange>,
 }
@@ -43,6 +49,7 @@ fn make_change(
         entity_type: primary.entity_type.clone(),
         entity_name: primary.name.clone(),
         entity_line: primary.start_line,
+        parent_name: parent_name(primary),
         file_path: primary.file_path.clone(),
         old_entity_name: before_entity.and_then(|b| {
             (b.name != after_entity.name).then(|| b.name.clone())
