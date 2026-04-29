@@ -12,6 +12,7 @@ pub struct ImpactOptions {
     pub json: bool,
     pub file_exts: Vec<String>,
     pub mode: ImpactMode,
+    pub depth: usize,
     pub no_cache: bool,
 }
 
@@ -36,7 +37,7 @@ pub fn impact_command(opts: ImpactOptions) {
         ImpactMode::Deps => print_deps(&graph, entity, opts.json),
         ImpactMode::Dependents => print_dependents(&graph, entity, opts.json),
         ImpactMode::Tests => print_tests(&graph, entity, &all_entities, opts.json),
-        ImpactMode::All => print_all(&graph, entity, &all_entities, opts.json),
+        ImpactMode::All => print_all(&graph, entity, &all_entities, opts.json, opts.depth),
     }
 }
 
@@ -213,20 +214,27 @@ fn print_all(
     entity: &sem_core::parser::graph::EntityInfo,
     all_entities: &[sem_core::model::entity::SemanticEntity],
     json: bool,
+    depth: usize,
 ) {
     let deps = graph.get_dependencies(&entity.id);
     let dependents = graph.get_dependents(&entity.id);
-    let impact = graph.impact_analysis(&entity.id);
+    let impact_bounded = graph.impact_analysis_bounded(&entity.id, depth);
     let tests = graph.test_impact(&entity.id, all_entities);
 
     if json {
+        let impact_entities: Vec<serde_json::Value> = impact_bounded.iter().map(|(e, d)| {
+            let mut v = entity_json(e);
+            v.as_object_mut().unwrap().insert("depth".to_string(), serde_json::json!(d));
+            v
+        }).collect();
         let output = serde_json::json!({
             "entity": entity_json(entity),
             "dependencies": entity_list_json(&deps),
             "dependents": entity_list_json(&dependents),
             "impact": {
-                "total": impact.len(),
-                "entities": entity_list_json(&impact),
+                "depth": depth,
+                "total": impact_bounded.len(),
+                "entities": impact_entities,
             },
             "tests": entity_list_json(&tests),
         });
@@ -262,8 +270,8 @@ fn print_all(
             }
         }
 
-        // Transitive impact
-        if impact.is_empty() {
+        // Transitive impact grouped by depth
+        if impact_bounded.is_empty() {
             println!(
                 "\n  {} {}",
                 "✓".green().bold(),
@@ -271,33 +279,28 @@ fn print_all(
                     .dimmed()
             );
         } else {
+            let max_depth_seen = impact_bounded.iter().map(|(_, d)| *d).max().unwrap_or(0);
+            let depth_label = if depth == 0 { "unlimited".to_string() } else { format!("depth {}", depth) };
             println!(
                 "\n  {} {}",
                 "!".red().bold(),
-                format!("{} entities transitively affected:", impact.len()).red(),
+                format!("{} entities transitively affected ({}):", impact_bounded.len(), depth_label).red(),
             );
-            let mut by_file: std::collections::HashMap<&str, Vec<_>> =
-                std::collections::HashMap::new();
-            for imp in &impact {
-                by_file
-                    .entry(imp.file_path.as_str())
-                    .or_default()
-                    .push(imp);
-            }
-            let mut files: Vec<_> = by_file.keys().copied().collect();
-            files.sort();
-            for file in files {
-                println!("    {}", file.bold());
-                let mut entities = by_file[file].clone();
-                entities.sort_by_key(|e| e.start_line);
-                for imp in entities {
+
+            for d in 1..=max_depth_seen {
+                let at_depth: Vec<_> = impact_bounded.iter().filter(|(_, dd)| *dd == d).map(|(e, _)| *e).collect();
+                if at_depth.is_empty() { continue; }
+
+                let label = if d == 1 { "Direct dependents".to_string() } else { format!("Depth {}", d) };
+                println!("\n    {} ({})", label.bold(), at_depth.len());
+                for imp in &at_depth {
                     println!(
-                        "      {} {} {} (L{}–{})",
-                        "!".red(),
+                        "      {} {} {} ({}:L{})",
+                        "→".red(),
                         imp.entity_type.dimmed(),
                         imp.name.bold(),
+                        imp.file_path.dimmed(),
                         imp.start_line,
-                        imp.end_line,
                     );
                 }
             }

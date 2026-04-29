@@ -127,6 +127,10 @@ enum Commands {
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
+        /// Max traversal depth for transitive impact (default 2, 0 = unlimited)
+        #[arg(long, default_value = "2")]
+        depth: usize,
+
         /// Skip the SQLite entity cache (rebuild from scratch)
         #[arg(long)]
         no_cache: bool,
@@ -377,6 +381,7 @@ fn main() {
             format,
             json,
             file_exts,
+            depth,
             no_cache,
         }) => {
             let mode = if deps {
@@ -400,6 +405,7 @@ fn main() {
                 json: resolve_json(format, json),
                 file_exts,
                 mode,
+                depth,
                 no_cache,
             });
         }

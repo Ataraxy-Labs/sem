@@ -808,6 +808,41 @@ impl EntityGraph {
         self.impact_analysis_capped(entity_id, 10_000)
     }
 
+    /// Depth-limited impact analysis. Returns transitive dependents with their BFS depth.
+    /// `max_depth == 0` means unlimited. Default depth of 2 covers direct + one transitive level.
+    pub fn impact_analysis_bounded(&self, entity_id: &str, max_depth: usize) -> Vec<(&EntityInfo, usize)> {
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut queue: std::collections::VecDeque<(&str, usize)> = std::collections::VecDeque::new();
+        let mut result = Vec::new();
+
+        let start_key = match self.entities.get_key_value(entity_id) {
+            Some((k, _)) => k.as_str(),
+            None => return result,
+        };
+
+        queue.push_back((start_key, 0));
+        visited.insert(start_key);
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if let Some(deps) = self.dependents.get(current) {
+                let next_depth = depth + 1;
+                if max_depth > 0 && next_depth > max_depth {
+                    continue;
+                }
+                for dep in deps {
+                    if visited.insert(dep.as_str()) {
+                        if let Some(info) = self.entities.get(dep.as_str()) {
+                            result.push((info, next_depth));
+                        }
+                        queue.push_back((dep.as_str(), next_depth));
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Impact analysis with a cap on maximum nodes visited.
     /// Returns transitive dependents up to the cap. Uses borrowed strings.
     pub fn impact_analysis_capped(&self, entity_id: &str, max_visited: usize) -> Vec<&EntityInfo> {

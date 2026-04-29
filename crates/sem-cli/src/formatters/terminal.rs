@@ -311,5 +311,31 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         result.file_count,
     ));
 
+    // Warn if fallback chunking was used (unsupported file extension)
+    let chunk_files: Vec<&str> = result
+        .changes
+        .iter()
+        .filter(|c| c.entity_type == "chunk")
+        .map(|c| c.file_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !chunk_files.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            format!(
+                "Warning: {} used line-based chunking (unsupported file extension).",
+                chunk_files.join(", ")
+            )
+            .yellow()
+            .to_string(),
+        );
+        lines.push(
+            "If this language should be supported, open an issue: https://github.com/Ataraxy-Labs/sem/issues"
+                .dimmed()
+                .to_string(),
+        );
+    }
+
     lines.join("\n")
 }

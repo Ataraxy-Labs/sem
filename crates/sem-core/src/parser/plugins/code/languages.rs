@@ -574,7 +574,7 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
 
 static PHP_CONFIG: LanguageConfig = LanguageConfig {
     id: "php",
-    extensions: &[".php"],
+    extensions: &[".php", ".inc", ".phtml", ".module"],
     entity_node_types: &[
         "function_definition",
         "class_declaration",
@@ -1505,19 +1505,10 @@ pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
 }
 
 pub fn get_all_code_extensions() -> &'static [&'static str] {
-    // All unique extensions across all language configs
-    static EXTENSIONS: &[&str] = &[
-        ".ts",".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py", ".pyi", ".go", ".rs", ".java", ".c", ".h",
-        ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".rb", ".cs", ".php", ".f90", ".f95", ".f03",
-        ".f08", ".f", ".for", ".swift", ".ex", ".exs", ".sh", ".hcl", ".tf", ".tfvars",
-        ".kt", ".kts",
-        ".xml", ".plist", ".svg", ".xhtml", ".csproj", ".fsproj", ".vbproj", ".props", ".targets",
-        ".nuspec", ".resx", ".xaml", ".axml",
-        ".dart",
-        ".pl", ".pm", ".t",
-        ".ml", ".mli",
-        ".scala", ".sc", ".sbt", ".kojo", ".mill",
-        ".zig",
-    ];
-    EXTENSIONS
+    // Derived from ALL_CONFIGS to avoid duplication drift.
+    // When you add an extension to a LanguageConfig, it's automatically included here.
+    static EXTENSIONS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        ALL_CONFIGS.iter().flat_map(|c| c.extensions.iter().copied()).collect()
+    });
+    &EXTENSIONS
 }
