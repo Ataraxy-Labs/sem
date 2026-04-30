@@ -6,7 +6,7 @@ use crate::model::change::{ChangeType, SemanticChange};
 use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
 use crate::parser::registry::ParserRegistry;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,9 +75,7 @@ pub fn compute_semantic_diff(
 
             // Suppress parent entities whose modification is already explained
             // by child entity changes (e.g. impl blocks when methods changed).
-            let all_entities: Vec<&SemanticEntity> =
-                before_entities.iter().chain(after_entities.iter()).collect();
-            suppress_redundant_parents(&mut result.changes, &all_entities);
+            suppress_redundant_parents(&mut result.changes, &before_entities, &after_entities);
 
             // Detect orphan changes (lines that changed outside any entity span).
             let orphans = detect_orphan_changes(
@@ -151,33 +149,74 @@ pub fn compute_semantic_diff(
 /// because they have independent meaningful content.
 fn suppress_redundant_parents(
     changes: &mut Vec<SemanticChange>,
-    entities: &[&SemanticEntity],
+    before: &[SemanticEntity],
+    after: &[SemanticEntity],
 ) {
     if changes.len() < 2 {
         return;
     }
 
-    // Container types whose only purpose is grouping child entities.
-    // Functions, structs, enums etc. are NOT containers because they have
-    // independent meaningful content (body logic, fields, variants).
     const CONTAINER_TYPES: &[&str] = &[
         "impl", "trait", "module", "class", "interface", "mixin",
         "extension", "namespace", "export", "package",
         "svelte_instance_script", "svelte_module_script",
     ];
 
-    // Build set of entity IDs that have changes
+    let before_by_id: HashMap<&str, &SemanticEntity> =
+        before.iter().map(|e| (e.id.as_str(), e)).collect();
+    let after_by_id: HashMap<&str, &SemanticEntity> =
+        after.iter().map(|e| (e.id.as_str(), e)).collect();
+
+    let mut before_children: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for e in before {
+        if let Some(ref pid) = e.parent_id {
+            before_children.entry(pid.as_str()).or_default().push(e);
+        }
+    }
+    let mut after_children: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for e in after {
+        if let Some(ref pid) = e.parent_id {
+            after_children.entry(pid.as_str()).or_default().push(e);
+        }
+    }
+
     let changed_ids: HashSet<&str> = changes.iter().map(|c| c.entity_id.as_str()).collect();
 
-    // Find parent entity IDs that should be suppressed: a parent is redundant
-    // when at least one of its children also has a change and the parent is a
-    // container type (impl, trait, module).
     let mut suppress: HashSet<String> = HashSet::new();
-    for entity in entities {
-        if let Some(ref pid) = entity.parent_id {
-            if changed_ids.contains(entity.id.as_str()) && changed_ids.contains(pid.as_str()) {
-                suppress.insert(pid.clone());
+    for change in changes.iter() {
+        if !matches!(change.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted) {
+            continue;
+        }
+        if !CONTAINER_TYPES.contains(&change.entity_type.as_str()) {
+            continue;
+        }
+        let eid = change.entity_id.as_str();
+        let b_children = before_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+        let a_children = after_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+
+        let has_changed_child = b_children.iter().any(|c| changed_ids.contains(c.id.as_str()))
+            || a_children.iter().any(|c| changed_ids.contains(c.id.as_str()));
+        if !has_changed_child {
+            continue;
+        }
+
+        // For Added/Deleted containers: suppress unconditionally — the children carry the detail.
+        // For Modified: only suppress if the container's own declaration didn't change.
+        let should_suppress = if change.change_type == ChangeType::Modified {
+            match (before_by_id.get(eid), after_by_id.get(eid)) {
+                (Some(bp), Some(ap)) => {
+                    let before_own = strip_children_content(&bp.content, bp.start_line, b_children);
+                    let after_own = strip_children_content(&ap.content, ap.start_line, a_children);
+                    before_own == after_own
+                }
+                _ => false,
             }
+        } else {
+            true
+        };
+
+        if should_suppress {
+            suppress.insert(change.entity_id.clone());
         }
     }
 
@@ -188,6 +227,26 @@ fn suppress_redundant_parents(
                 && CONTAINER_TYPES.contains(&c.entity_type.as_str()))
         });
     }
+}
+
+fn strip_children_content(content: &str, parent_start_line: usize, children: &[&SemanticEntity]) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut excluded: HashSet<usize> = HashSet::new();
+    for child in children {
+        let start_idx = child.start_line.saturating_sub(parent_start_line);
+        let end_idx = child.end_line.saturating_sub(parent_start_line);
+        for i in start_idx..=end_idx.max(start_idx) {
+            if i < lines.len() {
+                excluded.insert(i);
+            }
+        }
+    }
+    lines.iter().enumerate()
+        .filter(|(i, _)| !excluded.contains(i))
+        .map(|(_, l)| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Detect changes in lines that fall outside any entity span.
@@ -269,4 +328,59 @@ fn detect_orphan_changes(
         timestamp: None,
         structural_change: Some(true),
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::types::{FileChange, FileStatus};
+    use crate::parser::plugins::create_default_registry;
+
+    fn modified_file(path: &str, before: &str, after: &str) -> FileChange {
+        FileChange {
+            file_path: path.to_string(),
+            status: FileStatus::Modified,
+            old_file_path: None,
+            before_content: Some(before.to_string()),
+            after_content: Some(after.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_parent_suppressed_when_only_child_modified() {
+        let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
+        let after  = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&[modified_file("svc.py", before, after)], &registry, None, None);
+
+        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
+        assert!(
+            result.changes.iter().any(|c| c.entity_name == "get_user"),
+            "expected method get_user in changes, got: {names:?}"
+        );
+        assert!(
+            !result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
+            "class should be suppressed when only the method body changed, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_parent_not_suppressed_when_own_declaration_changes() {
+        let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
+        let after  = "class UserService(BaseService):\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&[modified_file("svc.py", before, after)], &registry, None, None);
+
+        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
+        assert!(
+            result.changes.iter().any(|c| c.entity_name == "get_user"),
+            "expected method get_user in changes, got: {names:?}"
+        );
+        assert!(
+            result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
+            "class should remain Modified when its own declaration changed, got: {names:?}"
+        );
+    }
 }

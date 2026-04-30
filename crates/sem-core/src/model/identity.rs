@@ -289,36 +289,6 @@ pub fn match_entities(
         changes.push(make_change(entity, ChangeType::Added, None, commit_sha, author));
     }
 
-    // Deduplicate: when a parent (class) is Modified and one or more of its
-    // children (methods) are also Modified, drop the parent. The child diffs
-    // are more specific and the parent body overlaps with them.
-    // Only applies to Modified; Added/Deleted should still show all entities.
-    let modified_ids: HashSet<&str> = changes
-        .iter()
-        .filter(|c| c.change_type == ChangeType::Modified)
-        .map(|c| c.entity_id.as_str())
-        .collect();
-
-    if modified_ids.len() > 1 {
-        let mut parents_to_remove: HashSet<&str> = HashSet::new();
-        for entity in after.iter().chain(before.iter()) {
-            if let Some(ref pid) = entity.parent_id {
-                if modified_ids.contains(entity.id.as_str())
-                    && modified_ids.contains(pid.as_str())
-                {
-                    parents_to_remove.insert(pid.as_str());
-                }
-            }
-        }
-
-        if !parents_to_remove.is_empty() {
-            changes.retain(|c| {
-                !(c.change_type == ChangeType::Modified
-                    && parents_to_remove.contains(c.entity_id.as_str()))
-            });
-        }
-    }
-
     MatchResult { changes }
 }
 
@@ -576,10 +546,11 @@ mod tests {
         let after = vec![class_after, method_after];
         let result = match_entities(&before, &after, "a.ts", None, None, None);
 
-        // Should only report the method change, not the class
-        assert_eq!(result.changes.len(), 1);
-        assert_eq!(result.changes[0].entity_name, "genPg");
-        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        // match_entities no longer deduplicates — suppression happens in differ.rs.
+        // Both the class and the method are Modified here.
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.iter().all(|t| *t == ChangeType::Modified));
     }
 
     #[test]
