@@ -580,8 +580,8 @@ impl SemServer {
                 let result: Vec<serde_json::Value> = deps
                     .iter()
                     .map(|d| serde_json::json!({
-                            "name": d.name, "type": d.entity_type,
-                            "file": d.file_path, "lines": [d.start_line, d.end_line],
+                        "name": d.name, "type": d.entity_type,
+                        "file": d.file_path, "lines": [d.start_line, d.end_line],
                     }))
                     .collect();
                 serde_json::json!({
@@ -596,8 +596,8 @@ impl SemServer {
                 let result: Vec<serde_json::Value> = deps
                     .iter()
                     .map(|d| serde_json::json!({
-                            "name": d.name, "type": d.entity_type,
-                            "file": d.file_path, "lines": [d.start_line, d.end_line],
+                        "name": d.name, "type": d.entity_type,
+                        "file": d.file_path, "lines": [d.start_line, d.end_line],
                     }))
                     .collect();
                 serde_json::json!({
@@ -612,8 +612,8 @@ impl SemServer {
                 let result: Vec<serde_json::Value> = tests
                     .iter()
                     .map(|d| serde_json::json!({
-                            "name": d.name, "type": d.entity_type,
-                            "file": d.file_path, "lines": [d.start_line, d.end_line],
+                        "name": d.name, "type": d.entity_type,
+                        "file": d.file_path, "lines": [d.start_line, d.end_line],
                     }))
                     .collect();
                 serde_json::json!({
@@ -633,10 +633,10 @@ impl SemServer {
 
                 let map_entities = |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
                     list.iter().map(|d| serde_json::json!({
-                                    "name": d.name, "type": d.entity_type,
-                                    "file": d.file_path, "lines": [d.start_line, d.end_line],
+                        "name": d.name, "type": d.entity_type,
+                        "file": d.file_path, "lines": [d.start_line, d.end_line],
                     })).collect()
-                    };
+                };
 
                 serde_json::json!({
                     "entity": params.entity_name,

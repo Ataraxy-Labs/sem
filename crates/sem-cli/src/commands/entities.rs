@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
@@ -22,7 +21,12 @@ pub fn entities_command(opts: EntitiesOptions) {
     let (entities, include_file) = if full_path.is_file() {
         (
             extract_file_entities(&full_path, &registry, &path_label).unwrap_or_else(|e| {
-                eprintln!("{e}");
+                eprintln!(
+                    "{} Cannot read '{}': {}",
+                    "error:".red().bold(),
+                    path_label,
+                    e
+                );
                 std::process::exit(1);
             }),
             false,
@@ -149,10 +153,7 @@ fn extract_file_entities(
 
     let plugin = match registry.get_plugin_with_content(file_path, &content) {
         Some(p) => p,
-        None => {
-            eprintln!("{} No parser for '{}'", "error:".red().bold(), file_path);
-            std::process::exit(1);
-        }
+        None => return Ok(Vec::new()),
     };
 
     Ok(plugin.extract_entities(&content, file_path))
