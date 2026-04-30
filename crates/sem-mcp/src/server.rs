@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -178,7 +179,11 @@ impl SemServer {
         let mut entities = Vec::new();
         for rel_path in file_paths {
             let abs_path = root.join(rel_path);
-            let content = Self::read_file_at(&abs_path, rel_path)?;
+            let content = match std::fs::read_to_string(&abs_path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == ErrorKind::InvalidData => continue,
+                Err(err) => return Err(format!("Failed to read {}: {}", rel_path, err)),
+            };
             entities.extend(self.cached_extract_entities(&content, rel_path).await);
         }
         Ok(entities)
@@ -575,8 +580,8 @@ impl SemServer {
                 let result: Vec<serde_json::Value> = deps
                     .iter()
                     .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            "name": d.name, "type": d.entity_type,
+                            "file": d.file_path, "lines": [d.start_line, d.end_line],
                     }))
                     .collect();
                 serde_json::json!({
@@ -591,8 +596,8 @@ impl SemServer {
                 let result: Vec<serde_json::Value> = deps
                     .iter()
                     .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            "name": d.name, "type": d.entity_type,
+                            "file": d.file_path, "lines": [d.start_line, d.end_line],
                     }))
                     .collect();
                 serde_json::json!({
@@ -607,8 +612,8 @@ impl SemServer {
                 let result: Vec<serde_json::Value> = tests
                     .iter()
                     .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            "name": d.name, "type": d.entity_type,
+                            "file": d.file_path, "lines": [d.start_line, d.end_line],
                     }))
                     .collect();
                 serde_json::json!({
@@ -628,10 +633,10 @@ impl SemServer {
 
                 let map_entities = |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
                     list.iter().map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
+                                    "name": d.name, "type": d.entity_type,
+                                    "file": d.file_path, "lines": [d.start_line, d.end_line],
                     })).collect()
-                };
+                    };
 
                 serde_json::json!({
                     "entity": params.entity_name,

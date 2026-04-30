@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
@@ -19,7 +20,13 @@ pub fn entities_command(opts: EntitiesOptions) {
     let (path_label, full_path) = resolve_path(root, path_arg);
 
     let (entities, include_file) = if full_path.is_file() {
-        (extract_file_entities(&full_path, &registry, &path_label), false)
+        (
+            extract_file_entities(&full_path, &registry, &path_label).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }),
+            false,
+        )
     } else if full_path.is_dir() {
         let file_paths = find_supported_files_in_path(root, &full_path, &registry);
         (extract_files_entities(root, &file_paths, &registry), true)
@@ -109,11 +116,17 @@ fn extract_files_entities(
 ) -> Vec<SemanticEntity> {
     let mut entities = Vec::new();
     for file_path in file_paths {
-        entities.extend(extract_file_entities(
-            &root.join(file_path),
-            registry,
-            file_path,
-        ));
+        match extract_file_entities(&root.join(file_path), registry, file_path) {
+            Ok(new_ents) => entities.extend(new_ents),
+            Err(e) => {
+                eprintln!(
+                    "{} Cannot read '{}': {}",
+                    "error:".red().bold(),
+                    file_path,
+                    e
+                );
+            }
+        }
     }
     entities
 }
@@ -131,19 +144,8 @@ fn extract_file_entities(
     full_path: &Path,
     registry: &ParserRegistry,
     file_path: &str,
-) -> Vec<SemanticEntity> {
-    let content = match std::fs::read_to_string(&full_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "{} Cannot read '{}': {}",
-                "error:".red().bold(),
-                file_path,
-                e
-            );
-            std::process::exit(1);
-        }
-    };
+) -> Result<Vec<SemanticEntity>, std::io::Error> {
+    let content = std::fs::read_to_string(&full_path)?;
 
     let plugin = match registry.get_plugin_with_content(file_path, &content) {
         Some(p) => p,
@@ -153,7 +155,7 @@ fn extract_file_entities(
         }
     };
 
-    plugin.extract_entities(&content, file_path)
+    Ok(plugin.extract_entities(&content, file_path))
 }
 
 fn entity_json(entity: &SemanticEntity, include_file: bool) -> serde_json::Value {
