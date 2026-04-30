@@ -141,12 +141,6 @@ pub fn compute_semantic_diff(
     }
 }
 
-/// Remove "Modified" parent entities from the change list when at least one
-/// child entity also appears as a change.  This avoids showing e.g. an impl
-/// block as modified when the real change is in a method inside it.
-/// Only suppresses container entity types (impl, trait, module) where the
-/// parent is just a wrapper. Functions, structs, etc. are never suppressed
-/// because they have independent meaningful content.
 fn suppress_redundant_parents(
     changes: &mut Vec<SemanticChange>,
     before: &[SemanticEntity],
@@ -160,6 +154,7 @@ fn suppress_redundant_parents(
         "impl", "trait", "module", "class", "interface", "mixin",
         "extension", "namespace", "export", "package",
         "svelte_instance_script", "svelte_module_script",
+        "object",
     ];
 
     let before_by_id: HashMap<&str, &SemanticEntity> =
@@ -200,11 +195,12 @@ fn suppress_redundant_parents(
             continue;
         }
 
-        // For Added/Deleted containers: suppress unconditionally — the children carry the detail.
-        // For Modified: only suppress if the container's own declaration didn't change.
+        // Added/Deleted: suppress unconditionally; the children carry the detail.
+        // Modified: only suppress if the container's own declaration is unchanged
+        // and the value type didn't transition.
         let should_suppress = if change.change_type == ChangeType::Modified {
             match (before_by_id.get(eid), after_by_id.get(eid)) {
-                (Some(bp), Some(ap)) => {
+                (Some(bp), Some(ap)) if bp.entity_type == ap.entity_type => {
                     let before_own = strip_children_content(&bp.content, bp.start_line, b_children);
                     let after_own = strip_children_content(&ap.content, ap.start_line, a_children);
                     before_own == after_own
@@ -220,11 +216,47 @@ fn suppress_redundant_parents(
         }
     }
 
+    // Suppress an old parent that a Moved child left behind when the old
+    // parent itself appears as a change — handles the parent-rename case
+    // where the parent itself failed to match.
+    for change in changes.iter() {
+        if change.change_type == ChangeType::Moved {
+            if let Some(ref old_pid) = change.old_parent_id {
+                if changed_ids.contains(old_pid.as_str()) {
+                    suppress.insert(old_pid.clone());
+                }
+            }
+        }
+    }
+
     if !suppress.is_empty() {
+        changes.retain(|c| !suppress.contains(&c.entity_id));
+    }
+
+    // Drop a Moved child whose key is unchanged and whose old parent matches
+    // a Renamed entity — the child only "moved" because the parent renamed.
+    let renamed_before_ids: HashSet<&str> = changes
+        .iter()
+        .filter(|c| c.change_type == ChangeType::Renamed)
+        .filter_map(|c| {
+            let old_name = c.old_entity_name.as_deref()?;
+            let after_entity = after_by_id.get(c.entity_id.as_str())?;
+            before.iter()
+                .find(|e| {
+                    e.name == old_name
+                        && e.entity_type == after_entity.entity_type
+                        && e.parent_id == after_entity.parent_id
+                })
+                .map(|e| e.id.as_str())
+        })
+        .collect();
+
+    if !renamed_before_ids.is_empty() {
         changes.retain(|c| {
-            !(matches!(c.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted)
-                && suppress.contains(&c.entity_id)
-                && CONTAINER_TYPES.contains(&c.entity_type.as_str()))
+            !(c.change_type == ChangeType::Moved
+                && c.old_entity_name.is_none()
+                && c.old_parent_id.as_deref()
+                    .map_or(false, |pid| renamed_before_ids.contains(pid)))
         });
     }
 }
