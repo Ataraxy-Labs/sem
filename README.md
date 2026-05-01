@@ -275,6 +275,20 @@ Plus structured data formats:
 
 Everything else falls back to chunk-based diffing.
 
+### Custom extensions and extensionless files
+
+For files with non-standard extensions, create a `.semrc` in your project root:
+
+```
+.xyz = cpp
+.j = json
+.mypy = python
+```
+
+sem also reads `.gitattributes` patterns (`diff=` and `linguist-language=`) if you already have those set up. `.semrc` takes priority when both define the same extension.
+
+For files with no extension at all, sem detects the language automatically from content (imports, declarations, shebang lines, vim modelines). This covers 19 languages with no config needed.
+
 ## How matching works
 
 Three-phase entity matching:
@@ -339,7 +353,7 @@ sem-core can be used as a Rust library dependency:
 
 ```toml
 [dependencies]
-sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.4" }
+sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.5" }
 ```
 
 Used by [weave](https://github.com/Ataraxy-Labs/weave) (semantic merge driver) and [inspect](https://github.com/Ataraxy-Labs/inspect) (entity-level code review).
