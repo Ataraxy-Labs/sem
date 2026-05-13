@@ -185,107 +185,289 @@ pub struct ImportRule {
 }
 
 fn get_typescript() -> Option<Language> {
-    Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+    #[cfg(feature = "lang-typescript")]
+    {
+        Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+    }
+    #[cfg(not(feature = "lang-typescript"))]
+    {
+        None
+    }
 }
 
 fn get_tsx() -> Option<Language> {
-    Some(tree_sitter_typescript::LANGUAGE_TSX.into())
+    #[cfg(feature = "lang-typescript")]
+    {
+        Some(tree_sitter_typescript::LANGUAGE_TSX.into())
+    }
+    #[cfg(not(feature = "lang-typescript"))]
+    {
+        None
+    }
 }
 
 fn get_javascript() -> Option<Language> {
-    Some(tree_sitter_javascript::LANGUAGE.into())
+    #[cfg(feature = "lang-javascript")]
+    {
+        Some(tree_sitter_javascript::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-javascript"))]
+    {
+        None
+    }
 }
 
 fn get_python() -> Option<Language> {
-    Some(tree_sitter_python::LANGUAGE.into())
+    #[cfg(feature = "lang-python")]
+    {
+        Some(tree_sitter_python::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-python"))]
+    {
+        None
+    }
 }
 
 fn get_go() -> Option<Language> {
-    Some(tree_sitter_go::LANGUAGE.into())
+    #[cfg(feature = "lang-go")]
+    {
+        Some(tree_sitter_go::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-go"))]
+    {
+        None
+    }
 }
 
 fn get_rust() -> Option<Language> {
-    Some(tree_sitter_rust::LANGUAGE.into())
+    #[cfg(feature = "lang-rust")]
+    {
+        Some(tree_sitter_rust::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-rust"))]
+    {
+        None
+    }
 }
 
 fn get_java() -> Option<Language> {
-    Some(tree_sitter_java::LANGUAGE.into())
+    #[cfg(feature = "lang-java")]
+    {
+        Some(tree_sitter_java::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-java"))]
+    {
+        None
+    }
 }
 
 fn get_c() -> Option<Language> {
-    Some(tree_sitter_c::LANGUAGE.into())
+    #[cfg(feature = "lang-c")]
+    {
+        Some(tree_sitter_c::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-c"))]
+    {
+        None
+    }
 }
 
 fn get_cpp() -> Option<Language> {
-    Some(tree_sitter_cpp::LANGUAGE.into())
+    #[cfg(feature = "lang-cpp")]
+    {
+        Some(tree_sitter_cpp::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-cpp"))]
+    {
+        None
+    }
 }
 
 fn get_ruby() -> Option<Language> {
-    Some(tree_sitter_ruby::LANGUAGE.into())
+    #[cfg(feature = "lang-ruby")]
+    {
+        Some(tree_sitter_ruby::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-ruby"))]
+    {
+        None
+    }
 }
 
 fn get_csharp() -> Option<Language> {
-    Some(tree_sitter_c_sharp::LANGUAGE.into())
+    #[cfg(feature = "lang-csharp")]
+    {
+        Some(tree_sitter_c_sharp::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-csharp"))]
+    {
+        None
+    }
 }
 
 fn get_php() -> Option<Language> {
-    Some(tree_sitter_php::LANGUAGE_PHP.into())
+    #[cfg(feature = "lang-php")]
+    {
+        Some(tree_sitter_php::LANGUAGE_PHP.into())
+    }
+    #[cfg(not(feature = "lang-php"))]
+    {
+        None
+    }
 }
 
 fn get_fortran() -> Option<Language> {
-    Some(tree_sitter_fortran::LANGUAGE.into())
+    #[cfg(feature = "lang-fortran")]
+    {
+        Some(tree_sitter_fortran::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-fortran"))]
+    {
+        None
+    }
 }
 
 fn get_swift() -> Option<Language> {
-    Some(tree_sitter_swift::LANGUAGE.into())
+    #[cfg(feature = "lang-swift")]
+    {
+        Some(tree_sitter_swift::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-swift"))]
+    {
+        None
+    }
 }
 
 fn get_elixir() -> Option<Language> {
-    Some(tree_sitter_elixir::LANGUAGE.into())
+    #[cfg(feature = "lang-elixir")]
+    {
+        Some(tree_sitter_elixir::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-elixir"))]
+    {
+        None
+    }
 }
 
 fn get_bash() -> Option<Language> {
-    Some(tree_sitter_bash::LANGUAGE.into())
+    #[cfg(feature = "lang-bash")]
+    {
+        Some(tree_sitter_bash::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-bash"))]
+    {
+        None
+    }
 }
 
 fn get_hcl() -> Option<Language> {
-    Some(tree_sitter_hcl::LANGUAGE.into())
+    #[cfg(feature = "lang-hcl")]
+    {
+        Some(tree_sitter_hcl::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-hcl"))]
+    {
+        None
+    }
 }
 
 fn get_kotlin() -> Option<Language> {
-    Some(tree_sitter_kotlin_ng::LANGUAGE.into())
+    #[cfg(feature = "lang-kotlin")]
+    {
+        Some(tree_sitter_kotlin_ng::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-kotlin"))]
+    {
+        None
+    }
 }
 
 fn get_xml() -> Option<Language> {
-    Some(tree_sitter_xml::LANGUAGE_XML.into())
+    #[cfg(feature = "lang-xml")]
+    {
+        Some(tree_sitter_xml::LANGUAGE_XML.into())
+    }
+    #[cfg(not(feature = "lang-xml"))]
+    {
+        None
+    }
 }
 
 fn get_dart() -> Option<Language> {
-    Some(tree_sitter_dart::LANGUAGE.into())
+    #[cfg(feature = "lang-dart")]
+    {
+        Some(tree_sitter_dart::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-dart"))]
+    {
+        None
+    }
 }
 
 fn get_perl() -> Option<Language> {
-    Some(tree_sitter_perl_next::LANGUAGE.into())
+    #[cfg(feature = "lang-perl")]
+    {
+        Some(tree_sitter_perl_next::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-perl"))]
+    {
+        None
+    }
 }
 
 fn get_ocaml() -> Option<Language> {
-    Some(tree_sitter_ocaml::LANGUAGE_OCAML.into())
+    #[cfg(feature = "lang-ocaml")]
+    {
+        Some(tree_sitter_ocaml::LANGUAGE_OCAML.into())
+    }
+    #[cfg(not(feature = "lang-ocaml"))]
+    {
+        None
+    }
 }
 
 fn get_ocaml_interface() -> Option<Language> {
-    Some(tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
+    #[cfg(feature = "lang-ocaml")]
+    {
+        Some(tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
+    }
+    #[cfg(not(feature = "lang-ocaml"))]
+    {
+        None
+    }
 }
 
 fn get_scala() -> Option<Language> {
-    Some(tree_sitter_scala::LANGUAGE.into())
+    #[cfg(feature = "lang-scala")]
+    {
+        Some(tree_sitter_scala::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-scala"))]
+    {
+        None
+    }
 }
 
 fn get_zig() -> Option<Language> {
-    Some(tree_sitter_zig::LANGUAGE.into())
+    #[cfg(feature = "lang-zig")]
+    {
+        Some(tree_sitter_zig::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-zig"))]
+    {
+        None
+    }
 }
 
 fn get_nix() -> Option<Language> {
-    Some(tree_sitter_nix::LANGUAGE.into())
+    #[cfg(feature = "lang-nix")]
+    {
+        Some(tree_sitter_nix::LANGUAGE.into())
+    }
+    #[cfg(not(feature = "lang-nix"))]
+    {
+        None
+    }
 }
 
 /// Inside JS/TS function bodies, suppress variable declarations so that local
