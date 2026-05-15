@@ -74,64 +74,75 @@ pub struct ResolutionEntry {
 /// 2. Build a scope tree (module -> class -> function)
 /// 3. Walk entity AST subtrees to find reference nodes
 /// 4. Resolve each reference via scope chain + type tracking
+/// Pre-built lookup tables that can be shared between `EntityGraph::build()` and
+/// `resolve_with_scopes()` to avoid redundant O(E) passes.
+pub struct PreBuiltLookups {
+    pub symbol_table: HashMap<String, Vec<String>>,
+    pub class_members: HashMap<String, Vec<(String, String)>>,
+    pub entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
+}
+
 pub fn resolve_with_scopes(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+    pre_built: Option<PreBuiltLookups>,
 ) -> ScopeResult {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
 
-    // Build global lookups
-    let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-    for entity in all_entities {
-        symbol_table
-            .entry(entity.name.clone())
-            .or_default()
-            .push(entity.id.clone());
-    }
+    // Use pre-built lookups if provided, otherwise build from scratch
+    let (symbol_table, class_members, entity_ranges) = if let Some(pb) = pre_built {
+        (pb.symbol_table, pb.class_members, pb.entity_ranges)
+    } else {
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
+        for entity in all_entities {
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+        }
 
-    // class_name -> [(member_name, member_entity_id)]
-    let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for entity in all_entities {
-        if let Some(ref pid) = entity.parent_id {
-            if let Some(parent) = entity_map.get(pid) {
-                if matches!(
-                    parent.entity_type.as_str(),
-                    "class" | "struct" | "interface" | "impl"
-                ) {
+        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for entity in all_entities {
+            if let Some(ref pid) = entity.parent_id {
+                if let Some(parent) = entity_map.get(pid) {
+                    if matches!(
+                        parent.entity_type.as_str(),
+                        "class" | "struct" | "interface" | "impl"
+                    ) {
+                        class_members
+                            .entry(parent.name.clone())
+                            .or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+        }
+
+        for entity in all_entities {
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
                     class_members
-                        .entry(parent.name.clone())
+                        .entry(struct_name)
                         .or_default()
                         .push((entity.name.clone(), entity.id.clone()));
                 }
             }
         }
-    }
 
-    // Go: methods are declared at file level with receiver syntax, not inside structs.
-    // Parse the receiver to populate class_members.
-    for entity in all_entities {
-        if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
-            if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
-                class_members
-                    .entry(struct_name)
-                    .or_default()
-                    .push((entity.name.clone(), entity.id.clone()));
-            }
+        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        for entity in all_entities {
+            entity_ranges
+                .entry(entity.file_path.clone())
+                .or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
-    }
 
-    // Entity line ranges for mapping AST nodes back to entities
-    let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
-    for entity in all_entities {
-        entity_ranges
-            .entry(entity.file_path.clone())
-            .or_default()
-            .push((entity.start_line, entity.end_line, entity.id.clone()));
-    }
+        (symbol_table, class_members, entity_ranges)
+    };
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
     let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
@@ -1110,7 +1121,7 @@ fn extract_base_type(type_node: tree_sitter::Node, source: &[u8]) -> String {
 }
 
 /// Parse Go receiver type from method content: `func (r *ReceiverType) Name(...)`
-fn extract_go_receiver_type(content: &str) -> Option<String> {
+pub fn extract_go_receiver_type(content: &str) -> Option<String> {
     let after_func = content.strip_prefix("func")?.trim_start();
     let paren_start = after_func.find('(')?;
     let paren_end = after_func.find(')')?;

@@ -200,6 +200,36 @@ impl EntityGraph {
         // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
         let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map, Some(&parsed_files));
 
+        // Build pre-built lookups to share with scope resolver (avoids 4 x O(E) redundant passes)
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for entity in &all_entities {
+            if let Some(ref pid) = entity.parent_id {
+                if let Some(parent) = entity_map.get(pid) {
+                    if matches!(parent.entity_type.as_str(), "class" | "struct" | "interface" | "impl") {
+                        scope_class_members.entry(parent.name.clone()).or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+            // Go receiver-based methods
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content) {
+                    scope_class_members.entry(struct_name).or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                }
+            }
+        }
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        for entity in &all_entities {
+            scope_entity_ranges.entry(entity.file_path.clone()).or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
+        }
+        let pre_built = scope_resolve::PreBuiltLookups {
+            symbol_table: symbol_table.clone(),
+            class_members: scope_class_members,
+            entity_ranges: scope_entity_ranges,
+        };
+
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
             let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
@@ -208,7 +238,7 @@ impl EntityGraph {
                 .is_some()
         });
         let (scope_edges, scope_resolved_entities) = if has_scope_lang {
-            let result = scope_resolve::resolve_with_scopes(root, file_paths, &all_entities, &entity_map, Some(parsed_files));
+            let result = scope_resolve::resolve_with_scopes(root, file_paths, &all_entities, &entity_map, Some(parsed_files), Some(pre_built));
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
@@ -603,7 +633,7 @@ impl EntityGraph {
                 .filter(|(fp, _, _)| resolve_set.contains(fp.as_str()))
                 .collect();
             let pre = if relevant_parsed.is_empty() { None } else { Some(relevant_parsed) };
-            let result = scope_resolve::resolve_with_scopes(root, &resolve_file_paths, &all_entities, &entity_map, pre);
+            let result = scope_resolve::resolve_with_scopes(root, &resolve_file_paths, &all_entities, &entity_map, pre, None);
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();

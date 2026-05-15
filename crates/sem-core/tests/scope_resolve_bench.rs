@@ -183,7 +183,7 @@ fn scope_resolve_comparison() {
 
     // --- Run new scope-aware resolver ---
     let scope_result =
-        scope_resolve::resolve_with_scopes(root, &file_refs, &all_entities, &entity_map, None);
+        scope_resolve::resolve_with_scopes(root, &file_refs, &all_entities, &entity_map, None, None);
 
     let new_edges: Vec<(String, String)> = scope_result
         .edges
@@ -748,7 +748,7 @@ fn run_scope_resolve_for_lang(
         }))
         .collect();
 
-    let scope_result = scope_resolve::resolve_with_scopes(root, &file_refs, &all_entities, &entity_map, None);
+    let scope_result = scope_resolve::resolve_with_scopes(root, &file_refs, &all_entities, &entity_map, None, None);
     let new_edges: Vec<(String, String)> = scope_result.edges.iter()
         .map(|(from, to, _)| (from.clone(), to.clone()))
         .collect();
