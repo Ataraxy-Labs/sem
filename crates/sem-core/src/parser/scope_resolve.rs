@@ -133,6 +133,26 @@ pub fn resolve_with_scopes(
             .push((entity.start_line, entity.end_line, entity.id.clone()));
     }
 
+    // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
+    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for entity in all_entities {
+        entities_by_file
+            .entry(entity.file_path.as_str())
+            .or_default()
+            .push(entity);
+    }
+
+    // Build parent_id indexed entity lookup: parent_id -> Vec<&SemanticEntity>
+    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for entity in all_entities {
+        if let Some(ref pid) = entity.parent_id {
+            children_by_parent
+                .entry(pid.as_str())
+                .or_default()
+                .push(entity);
+        }
+    }
+
     // Return type map: function_entity_id -> class_name (if function returns ClassName())
     let mut return_type_map: HashMap<String, String> = HashMap::new();
 
@@ -182,34 +202,55 @@ pub fn resolve_with_scopes(
 
     // Pass 1: Scan ALL files for return types and instance attr types first
     // This ensures cross-file return type info is available during resolution
-    for (file_path, content, tree) in parsed_files {
-        let source = content.as_bytes();
-        let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-        let config = match get_language_config(ext).and_then(|c| c.scope_resolve) {
-            Some(c) => c,
-            None => continue,
-        };
+    // Parallelized: each file produces local maps, then merged sequentially.
+    let pass1_results: Vec<(
+        HashMap<String, String>,
+        HashMap<(String, String), String>,
+        HashMap<String, Vec<String>>,
+        HashMap<(String, String), String>,
+    )> = parsed_files
+        .par_iter()
+        .filter_map(|(file_path, content, tree)| {
+            let source = content.as_bytes();
+            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+            let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
 
-        scan_return_types(
-            tree.root_node(),
-            file_path,
-            all_entities,
-            source,
-            &mut return_type_map,
-            config,
-        );
+            let file_entities = entities_by_file.get(file_path.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
 
-        scan_init_self_attrs(
-            tree.root_node(),
-            file_path,
-            all_entities,
-            entity_map,
-            source,
-            &mut instance_attr_types,
-            &mut init_params,
-            &mut attr_to_param,
-            config,
-        );
+            let mut local_return_type_map: HashMap<String, String> = HashMap::new();
+            scan_return_types(
+                tree.root_node(),
+                file_path,
+                file_entities,
+                source,
+                &mut local_return_type_map,
+                config,
+            );
+
+            let mut local_instance_attr_types: HashMap<(String, String), String> = HashMap::new();
+            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::new();
+            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::new();
+            scan_init_self_attrs(
+                tree.root_node(),
+                file_path,
+                file_entities,
+                entity_map,
+                source,
+                &mut local_instance_attr_types,
+                &mut local_init_params,
+                &mut local_attr_to_param,
+                config,
+            );
+
+            Some((local_return_type_map, local_instance_attr_types, local_init_params, local_attr_to_param))
+        })
+        .collect();
+
+    for (local_rtm, local_iat, local_ip, local_atp) in pass1_results {
+        return_type_map.extend(local_rtm);
+        instance_attr_types.extend(local_iat);
+        init_params.extend(local_ip);
+        attr_to_param.extend(local_atp);
     }
 
     // Pass 1b: Infer constructor parameter types from call sites
@@ -256,13 +297,20 @@ pub fn resolve_with_scopes(
                 }
             }
 
+            let file_entities: Vec<&SemanticEntity> = entities_by_file
+                .get(file_path.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .to_vec();
+
             build_scopes_from_ast(
                 tree.root_node(),
                 0,
                 &mut scopes,
                 &mut entity_scope_map,
                 &mut entity_inner_scope,
-                all_entities,
+                &file_entities,
+                &children_by_parent,
                 entity_map,
                 file_path,
                 source,
@@ -290,11 +338,6 @@ pub fn resolve_with_scopes(
                 file_path,
                 entity_map,
             );
-
-            let file_entities: Vec<&SemanticEntity> = all_entities
-                .iter()
-                .filter(|e| e.file_path == *file_path)
-                .collect();
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
@@ -395,9 +438,10 @@ fn build_scopes_from_ast(
     scopes: &mut Vec<Scope>,
     entity_scope_map: &mut HashMap<String, usize>,
     entity_inner_scope: &mut HashMap<String, usize>,
-    all_entities: &[SemanticEntity],
+    file_entities: &[&SemanticEntity],
+    children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
     entity_map: &HashMap<String, EntityInfo>,
-    file_path: &str,
+    _file_path: &str,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) {
@@ -447,11 +491,10 @@ fn build_scopes_from_ast(
                 }
             };
 
-            let class_entity = all_entities.iter().find(|e| {
-                e.file_path == file_path
-                    && e.name == class_name
+            let class_entity = file_entities.iter().find(|e| {
+                e.name == class_name
                     && matches!(e.entity_type.as_str(), "class" | "struct" | "interface")
-            });
+            }).copied();
 
             if let Some(ce) = class_entity {
                 let existing_scope = entity_inner_scope.get(&ce.id).copied();
@@ -473,8 +516,8 @@ fn build_scopes_from_ast(
                     idx
                 };
 
-                for entity in all_entities {
-                    if entity.parent_id.as_ref() == Some(&ce.id) {
+                if let Some(children) = children_by_parent.get(ce.id.as_str()) {
+                    for entity in children {
                         scopes[class_scope_idx]
                             .defs
                             .insert(entity.name.clone(), entity.id.clone());
@@ -542,12 +585,12 @@ fn build_scopes_from_ast(
                 kind: "function",
             });
 
-            let func_entity = all_entities.iter().find(|e| {
-                e.file_path == file_path && e.name == func_name && {
+            let func_entity = file_entities.iter().find(|e| {
+                e.name == func_name && {
                     let line = node.start_position().row + 1;
                     e.start_line <= line && line <= e.end_line
                 }
-            });
+            }).copied();
 
             if let Some(fe) = func_entity {
                 scopes[func_scope_idx].owner_id = Some(fe.id.clone());
@@ -1086,8 +1129,8 @@ fn extract_go_receiver_type(content: &str) -> Option<String> {
 /// Scan function bodies/signatures for return types to build a return type map.
 fn scan_return_types(
     root: tree_sitter::Node,
-    file_path: &str,
-    all_entities: &[SemanticEntity],
+    _file_path: &str,
+    file_entities: &[&SemanticEntity],
     source: &[u8],
     return_type_map: &mut HashMap<String, String>,
     config: &ScopeResolveConfig,
@@ -1104,12 +1147,12 @@ fn scan_return_types(
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("");
 
-            let func_entity = all_entities.iter().find(|e| {
-                e.file_path == file_path && e.name == func_name && {
+            let func_entity = file_entities.iter().find(|e| {
+                e.name == func_name && {
                     let line = node.start_position().row + 1;
                     e.start_line <= line && line <= e.end_line
                 }
-            });
+            }).copied();
 
             if let Some(fe) = func_entity {
                 // Try explicit return type annotation first
@@ -1193,7 +1236,7 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
 fn scan_init_self_attrs(
     root: tree_sitter::Node,
     _file_path: &str,
-    _all_entities: &[SemanticEntity],
+    _file_entities: &[&SemanticEntity],
     _entity_map: &HashMap<String, EntityInfo>,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
@@ -1653,16 +1696,28 @@ fn infer_constructor_param_types(
     }
 
     // Scan all files for constructor call sites: ClassName(arg1, arg2, ...)
-    for (_file_path, content, tree) in parsed_files {
-        let source = content.as_bytes();
-        scan_constructor_calls(
-            tree.root_node(),
-            source,
-            &func_name_returns,
-            init_params,
-            attr_to_param,
-            instance_attr_types,
-        );
+    // Parallelized: each file produces local results, then merged.
+    let local_results: Vec<HashMap<(String, String), String>> = parsed_files
+        .par_iter()
+        .map(|(_file_path, content, tree)| {
+            let source = content.as_bytes();
+            let mut local_attr_types: HashMap<(String, String), String> = HashMap::new();
+            scan_constructor_calls(
+                tree.root_node(),
+                source,
+                &func_name_returns,
+                init_params,
+                attr_to_param,
+                &mut local_attr_types,
+            );
+            local_attr_types
+        })
+        .collect();
+
+    for local in local_results {
+        for (key, val) in local {
+            instance_attr_types.entry(key).or_insert(val);
+        }
     }
 }
 
