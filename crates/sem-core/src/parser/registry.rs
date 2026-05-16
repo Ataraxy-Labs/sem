@@ -1,8 +1,18 @@
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::model::entity::SemanticEntity;
+
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        { $slice.par_iter() }
+        #[cfg(not(feature = "parallel"))]
+        { $slice.iter() }
+    }};
+}
 use super::plugin::SemanticParserPlugin;
 
 pub struct ParserRegistry {
@@ -239,8 +249,7 @@ impl ParserRegistry {
         root: &Path,
         file_paths: &[String],
     ) -> Vec<SemanticEntity> {
-        file_paths
-            .par_iter()
+        maybe_par_iter!(file_paths)
             .flat_map(|fp| {
                 let full = root.join(fp);
                 let content = match std::fs::read_to_string(&full) {

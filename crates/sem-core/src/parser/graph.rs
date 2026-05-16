@@ -11,9 +11,20 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// Helper macro to select parallel or sequential iteration based on feature flag.
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        { $slice.par_iter() }
+        #[cfg(not(feature = "parallel"))]
+        { $slice.iter() }
+    }};
+}
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
@@ -103,8 +114,7 @@ impl EntityGraph {
     ) -> (Self, Vec<SemanticEntity>) {
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Also collect (file_path, content, tree) for scope_resolve reuse
-        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = file_paths
-            .par_iter()
+        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = maybe_par_iter!(file_paths)
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
@@ -270,8 +280,7 @@ impl EntityGraph {
         // Phase 2: Bag-of-words resolution (existing logic, skipping consumed words)
         // Skip entities already resolved by scope resolver (Python files)
         // Skip entities from non-code file types (JSON, SQL, etc.) that can't produce edges
-        let resolved_refs: Vec<(String, String, RefType)> = all_entities
-            .par_iter()
+        let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
             .flat_map(|entity| {
                 // Skip entities already resolved by scope resolver
                 if scope_resolved_entities.contains(&entity.id) {
@@ -455,8 +464,7 @@ impl EntityGraph {
         let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
 
         // Parse stale files in parallel to get new entities + trees
-        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = stale_files
-            .par_iter()
+        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = maybe_par_iter!(stale_files)
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
@@ -677,8 +685,7 @@ impl EntityGraph {
         };
 
         // Resolve references only for entities in needs_resolution
-        let resolved_refs: Vec<(String, String, RefType)> = all_entities
-            .par_iter()
+        let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
             .filter(|e| needs_resolution.contains(e.id.as_str()))
             .flat_map(|entity| {
                 if scope_resolved_entities.contains(&entity.id) {
@@ -1311,8 +1318,7 @@ fn build_import_table(
     // We no longer need a go_pkg_index here since Go files are skipped below.
 
     // Process files in parallel, each producing local import entries
-    let per_file_imports: Vec<Vec<((String, String), String)>> = file_paths
-        .par_iter()
+    let per_file_imports: Vec<Vec<((String, String), String)>> = maybe_par_iter!(file_paths)
         .filter_map(|file_path| {
             // Go imports are handled entirely by the scope resolver — skip here
             if file_path.ends_with(".go") {

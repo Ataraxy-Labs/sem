@@ -15,9 +15,19 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::model::entity::SemanticEntity;
+
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        { $slice.par_iter() }
+        #[cfg(not(feature = "parallel"))]
+        { $slice.iter() }
+    }};
+}
 use crate::parser::graph::{EntityInfo, RefType};
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
@@ -235,8 +245,7 @@ pub(crate) fn resolve_with_scopes_full(
         HashMap<(String, String), String>,
         HashMap<String, Vec<String>>,
         HashMap<(String, String), String>,
-    )> = parsed_files
-        .par_iter()
+    )> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
             let source = content.as_bytes();
             let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
@@ -294,8 +303,7 @@ pub(crate) fn resolve_with_scopes_full(
     );
 
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
-    let per_file_results: Vec<(Vec<(String, String, RefType)>, Vec<ResolutionEntry>)> = parsed_files
-        .par_iter()
+    let per_file_results: Vec<(Vec<(String, String, RefType)>, Vec<ResolutionEntry>)> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
             let source = content.as_bytes();
             let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
@@ -1782,8 +1790,7 @@ fn infer_constructor_param_types(
 
     // Scan all files for constructor call sites: ClassName(arg1, arg2, ...)
     // Parallelized: each file produces local results, then merged.
-    let local_results: Vec<HashMap<(String, String), String>> = parsed_files
-        .par_iter()
+    let local_results: Vec<HashMap<(String, String), String>> = maybe_par_iter!(parsed_files)
         .map(|(_file_path, content, tree)| {
             let source = content.as_bytes();
             let mut local_attr_types: HashMap<(String, String), String> = HashMap::new();
