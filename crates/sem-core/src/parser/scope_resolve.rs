@@ -80,6 +80,9 @@ pub struct PreBuiltLookups {
     pub symbol_table: HashMap<String, Vec<String>>,
     pub class_members: HashMap<String, Vec<(String, String)>>,
     pub entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
+    /// Go package index: pkg_name → [(entity_name, entity_id)]
+    /// Avoids O(symbol_table) scan per Go import.
+    pub go_pkg_index: HashMap<String, Vec<(String, String)>>,
 }
 
 pub fn resolve_with_scopes(
@@ -94,8 +97,8 @@ pub fn resolve_with_scopes(
     let mut log: Vec<ResolutionEntry> = Vec::new();
 
     // Use pre-built lookups if provided, otherwise build from scratch
-    let (symbol_table, class_members, entity_ranges) = if let Some(pb) = pre_built {
-        (pb.symbol_table, pb.class_members, pb.entity_ranges)
+    let (symbol_table, class_members, entity_ranges, go_pkg_index) = if let Some(pb) = pre_built {
+        (pb.symbol_table, pb.class_members, pb.entity_ranges, pb.go_pkg_index)
     } else {
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
         for entity in all_entities {
@@ -141,7 +144,10 @@ pub fn resolve_with_scopes(
                 .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
 
-        (symbol_table, class_members, entity_ranges)
+        // Build Go package index for O(1) import lookup
+        let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
+
+        (symbol_table, class_members, entity_ranges, go_pkg_index)
     };
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
@@ -338,6 +344,7 @@ pub fn resolve_with_scopes(
                 &mut local_import_table,
                 &mut scopes,
                 config,
+                &go_pkg_index,
             );
 
             // Resolve pending call types using the complete return type map
@@ -1146,6 +1153,45 @@ pub fn extract_go_receiver_type(content: &str) -> Option<String> {
     }
 }
 
+/// Build Go package index: pkg_name → [(entity_name, entity_id)]
+/// Maps file stems and parent directory names to entities for O(1) package import lookup.
+fn build_go_pkg_index(
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> HashMap<String, Vec<(String, String)>> {
+    let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (name, target_ids) in symbol_table.iter() {
+        for target_id in target_ids {
+            if let Some(entity) = entity_map.get(target_id) {
+                if !entity.file_path.ends_with(".go") {
+                    continue;
+                }
+                let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
+                let file_stem = file_stem.strip_suffix(".go").unwrap_or(file_stem);
+                idx.entry(file_stem.to_string())
+                    .or_default()
+                    .push((name.clone(), target_id.clone()));
+                if let Some(parent_start) = entity.file_path.rfind('/') {
+                    let parent_path = &entity.file_path[..parent_start];
+                    if let Some(dir_name_start) = parent_path.rfind('/') {
+                        let dir_name = &parent_path[dir_name_start + 1..];
+                        if dir_name != file_stem {
+                            idx.entry(dir_name.to_string())
+                                .or_default()
+                                .push((name.clone(), target_id.clone()));
+                        }
+                    } else if !parent_path.is_empty() && parent_path != file_stem {
+                        idx.entry(parent_path.to_string())
+                            .or_default()
+                            .push((name.clone(), target_id.clone()));
+                    }
+                }
+            }
+        }
+    }
+    idx
+}
+
 /// Scan function bodies/signatures for return types to build a return type map.
 fn scan_return_types(
     root: tree_sitter::Node,
@@ -1887,6 +1933,7 @@ fn extract_imports_from_ast(
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     config: &ScopeResolveConfig,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -1908,7 +1955,7 @@ fn extract_imports_from_ast(
                     true
                 }
                 "import_declaration" => {
-                    extract_go_import(child, file_path, source, symbol_table, entity_map, import_table, scopes);
+                    extract_go_import(child, file_path, source, symbol_table, entity_map, import_table, scopes, go_pkg_index);
                     true
                 }
                 _ => false,
@@ -2066,16 +2113,17 @@ fn extract_go_import(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "import_spec" || child.kind() == "import_spec_list" {
-            extract_go_import_specs(child, file_path, source, symbol_table, entity_map, import_table, scopes);
+            extract_go_import_specs(child, file_path, source, symbol_table, entity_map, import_table, scopes, go_pkg_index);
         } else if child.kind() == "interpreted_string_literal" || child.kind() == "raw_string_literal" {
             let path = child.utf8_text(source).unwrap_or("")
                 .trim_matches('"').trim_matches('`');
             let pkg_name = path.rsplit('/').next().unwrap_or(path);
-            register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes);
+            register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes, go_pkg_index);
         }
     }
 }
@@ -2088,6 +2136,7 @@ fn extract_go_import_specs(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -2100,7 +2149,7 @@ fn extract_go_import_specs(
                     let path = pn.utf8_text(source).unwrap_or("")
                         .trim_matches('"').trim_matches('`');
                     let pkg_name = path.rsplit('/').next().unwrap_or(path);
-                    register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes);
+                    register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes, go_pkg_index);
                 }
             } else {
                 worklist.push(child);
@@ -2112,25 +2161,21 @@ fn extract_go_import_specs(
 fn register_go_package_imports(
     pkg_name: &str,
     file_path: &str,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    _symbol_table: &HashMap<String, Vec<String>>,
+    _entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
-    for (name, target_ids) in symbol_table {
-        for target_id in target_ids {
-            if let Some(entity) = entity_map.get(target_id) {
-                let stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
-                let stem = stem.strip_suffix(".go").unwrap_or(stem);
-                if stem == pkg_name || entity.file_path.contains(&format!("{}/", pkg_name)) {
-                    import_table.insert(
-                        (file_path.to_string(), name.clone()),
-                        target_id.clone(),
-                    );
-                    if !scopes.is_empty() {
-                        scopes[0].defs.insert(name.clone(), target_id.clone());
-                    }
-                }
+    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan
+    if let Some(entries) = go_pkg_index.get(pkg_name) {
+        for (name, target_id) in entries {
+            import_table.insert(
+                (file_path.to_string(), name.clone()),
+                target_id.clone(),
+            );
+            if !scopes.is_empty() {
+                scopes[0].defs.insert(name.clone(), target_id.clone());
             }
         }
     }

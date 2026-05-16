@@ -224,10 +224,45 @@ impl EntityGraph {
             scope_entity_ranges.entry(entity.file_path.clone()).or_default()
                 .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
+        // Build owned Go package index for scope resolver
+        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> = if file_paths.iter().any(|f| f.ends_with(".go")) {
+            let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            for (name, target_ids) in symbol_table.iter() {
+                for target_id in target_ids {
+                    if let Some(entity) = entity_map.get(target_id) {
+                        let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
+                        let file_stem = strip_file_ext(file_stem);
+                        idx.entry(file_stem.to_string())
+                            .or_default()
+                            .push((name.clone(), target_id.clone()));
+                        if let Some(parent_start) = entity.file_path.rfind('/') {
+                            let parent_path = &entity.file_path[..parent_start];
+                            if let Some(dir_name_start) = parent_path.rfind('/') {
+                                let dir_name = &parent_path[dir_name_start + 1..];
+                                if dir_name != file_stem {
+                                    idx.entry(dir_name.to_string())
+                                        .or_default()
+                                        .push((name.clone(), target_id.clone()));
+                                }
+                            } else if !parent_path.is_empty() && parent_path != file_stem {
+                                idx.entry(parent_path.to_string())
+                                    .or_default()
+                                    .push((name.clone(), target_id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            idx
+        } else {
+            HashMap::new()
+        };
+
         let pre_built = scope_resolve::PreBuiltLookups {
             symbol_table: symbol_table.clone(),
             class_members: scope_class_members,
             entity_ranges: scope_entity_ranges,
+            go_pkg_index: owned_go_pkg_index,
         };
 
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
@@ -1275,48 +1310,18 @@ fn build_import_table(
         })
         .unwrap_or_default();
 
-    // Pre-build Go package index: package_name → [(entity_name, entity_id)]
-    // This avoids O(symbol_table) scan per Go import — the old code's main bottleneck.
-    let has_go = file_paths.iter().any(|f| f.ends_with(".go"));
-    let go_pkg_index: HashMap<&str, Vec<(&str, &str)>> = if has_go {
-        let mut idx: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-        for (name, target_ids) in symbol_table.iter() {
-            for target_id in target_ids {
-                if let Some(entity) = entity_map.get(target_id) {
-                    // Extract package name from file path: either the file stem or the parent dir
-                    let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
-                    let file_stem = strip_file_ext(file_stem);
-                    idx.entry(file_stem)
-                        .or_default()
-                        .push((name.as_str(), target_id.as_str()));
-                    // Also index by parent directory name (Go packages often use dir name)
-                    if let Some(parent_start) = entity.file_path.rfind('/') {
-                        let parent_path = &entity.file_path[..parent_start];
-                        if let Some(dir_name_start) = parent_path.rfind('/') {
-                            let dir_name = &parent_path[dir_name_start + 1..];
-                            if dir_name != file_stem {
-                                idx.entry(dir_name)
-                                    .or_default()
-                                    .push((name.as_str(), target_id.as_str()));
-                            }
-                        } else if !parent_path.is_empty() && parent_path != file_stem {
-                            idx.entry(parent_path)
-                                .or_default()
-                                .push((name.as_str(), target_id.as_str()));
-                        }
-                    }
-                }
-            }
-        }
-        idx
-    } else {
-        HashMap::new()
-    };
+    // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
+    // We no longer need a go_pkg_index here since Go files are skipped below.
 
     // Process files in parallel, each producing local import entries
     let per_file_imports: Vec<Vec<((String, String), String)>> = file_paths
         .par_iter()
         .filter_map(|file_path| {
+            // Go imports are handled entirely by the scope resolver — skip here
+            if file_path.ends_with(".go") {
+                return None;
+            }
+
             // Use pre-parsed content if available, otherwise read from disk
             let owned_content: Option<String>;
             let content: &str = if let Some(c) = content_map.get(file_path.as_str()) {
@@ -1582,31 +1587,8 @@ fn build_import_table(
                 }
             }
 
-            // Go imports: import "module/path" or import ( "module/path" )
-            // Go uses the last path component as the package name
-            let is_go = file_path.ends_with(".go");
-            if is_go {
-                static GO_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(r#"(?m)"([^"]+)""#).unwrap()
-                });
-
-                // Only look in import blocks
-                let import_section = extract_go_import_section(content);
-                for cap in GO_IMPORT_RE.captures_iter(&import_section) {
-                    let import_path = cap.get(1).unwrap().as_str();
-                    let pkg_name = import_path.rsplit('/').next().unwrap_or(import_path);
-
-                    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan
-                    if let Some(entries) = go_pkg_index.get(pkg_name) {
-                        for (name, target_id) in entries {
-                            local_imports.push((
-                                (file_path.clone(), name.to_string()),
-                                target_id.to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
+            // Go imports are handled by the scope resolver (avoids O(n²) import table explosion).
+            // Skip Go files here entirely.
 
             Some(local_imports)
         })
@@ -1648,33 +1630,6 @@ fn resolve_rust_import(
             );
         }
     }
-}
-
-/// Extract Go import section (everything inside import blocks).
-fn extract_go_import_section(content: &str) -> String {
-    let mut result = String::new();
-    let mut in_import_block = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("import (") {
-            in_import_block = true;
-            continue;
-        }
-        if trimmed.starts_with("import \"") || trimmed.starts_with("import `") {
-            result.push_str(trimmed);
-            result.push('\n');
-            continue;
-        }
-        if in_import_block {
-            if trimmed == ")" {
-                in_import_block = false;
-            } else {
-                result.push_str(trimmed);
-                result.push('\n');
-            }
-        }
-    }
-    result
 }
 
 /// Strip JS/TS extensions from a module name.
