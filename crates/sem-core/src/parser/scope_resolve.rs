@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -43,6 +44,8 @@ pub struct Scope {
 struct AstRef {
     /// Kind of reference
     kind: AstRefKind,
+    /// Row (0-indexed) where this reference appears in the source
+    row: usize,
 }
 
 enum AstRefKind {
@@ -77,7 +80,7 @@ pub struct ResolutionEntry {
 /// Pre-built lookup tables that can be shared between `EntityGraph::build()` and
 /// `resolve_with_scopes()` to avoid redundant O(E) passes.
 pub(crate) struct PreBuiltLookups {
-    pub(crate) symbol_table: HashMap<String, Vec<String>>,
+    pub(crate) symbol_table: Arc<HashMap<String, Vec<String>>>,
     pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
     pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
     /// Go package index: pkg_name → [(entity_name, entity_id)]
@@ -113,15 +116,15 @@ pub(crate) fn resolve_with_scopes_full(
         (pb.symbol_table, pb.class_members, pb.entity_ranges, pb.go_pkg_index)
     } else {
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
+        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+
         for entity in all_entities {
             symbol_table
                 .entry(entity.name.clone())
                 .or_default()
                 .push(entity.id.clone());
-        }
 
-        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for entity in all_entities {
             if let Some(ref pid) = entity.parent_id {
                 if let Some(parent) = entity_map.get(pid) {
                     if matches!(
@@ -135,9 +138,7 @@ pub(crate) fn resolve_with_scopes_full(
                     }
                 }
             }
-        }
 
-        for entity in all_entities {
             if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
                 if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
                     class_members
@@ -146,10 +147,7 @@ pub(crate) fn resolve_with_scopes_full(
                         .push((entity.name.clone(), entity.id.clone()));
                 }
             }
-        }
 
-        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
-        for entity in all_entities {
             entity_ranges
                 .entry(entity.file_path.clone())
                 .or_default()
@@ -159,7 +157,7 @@ pub(crate) fn resolve_with_scopes_full(
         // Build Go package index for O(1) import lookup
         let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
 
-        (symbol_table, class_members, entity_ranges, go_pkg_index)
+        (Arc::new(symbol_table), class_members, entity_ranges, go_pkg_index)
     };
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
@@ -372,6 +370,9 @@ pub(crate) fn resolve_with_scopes_full(
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
 
+            // Walk the AST once for the entire file, collecting all refs with row positions
+            let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
+
             for entity in &file_entities {
                 let scope_idx = entity_inner_scope
                     .get(&entity.id)
@@ -379,16 +380,22 @@ pub(crate) fn resolve_with_scopes_full(
                     .copied()
                     .unwrap_or(0);
 
-                let refs = extract_ast_refs(
-                    tree.root_node(),
-                    entity,
-                    source,
-                    config,
-                );
+                let start_row = entity.start_line.saturating_sub(1); // 1-indexed to 0-indexed
+                let end_row = entity.end_line; // exclusive
 
-                for ast_ref in refs {
+                // Filter pre-collected refs to this entity's line range
+                for ast_ref in all_file_refs.iter().filter(|r| r.row >= start_row && r.row < end_row) {
+                    // Skip self-name refs (was previously done during collection)
+                    let is_self_ref = match &ast_ref.kind {
+                        AstRefKind::Call(name) => name == &entity.name,
+                        AstRefKind::MethodCall { .. } => false,
+                    };
+                    if is_self_ref {
+                        continue;
+                    }
+
                     let resolution = resolve_ref(
-                        &ast_ref,
+                        ast_ref,
                         scope_idx,
                         &scopes,
                         &symbol_table,
@@ -415,7 +422,7 @@ pub(crate) fn resolve_with_scopes_full(
                                 ));
                                 file_log.push(ResolutionEntry {
                                     from_entity: entity.id.clone(),
-                                    reference: ref_description(&ast_ref),
+                                    reference: ref_description(ast_ref),
                                     resolved_to: Some(target_id),
                                     method,
                                 });
@@ -424,7 +431,7 @@ pub(crate) fn resolve_with_scopes_full(
                     } else {
                         file_log.push(ResolutionEntry {
                             from_entity: entity.id.clone(),
-                            reference: ref_description(&ast_ref),
+                            reference: ref_description(ast_ref),
                             resolved_to: None,
                             method: "unresolved",
                         });
@@ -2313,41 +2320,17 @@ fn extract_python_import(
     }
 }
 
-/// Extract AST references from an entity's line range.
-fn extract_ast_refs(
+/// Collect ALL AST references in a file with a single tree walk.
+/// Each ref records its row so callers can bucket refs into entities by line range.
+fn collect_all_file_refs(
     root: tree_sitter::Node,
-    entity: &SemanticEntity,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) -> Vec<AstRef> {
     let mut refs = Vec::new();
-    let start_row = entity.start_line.saturating_sub(1); // 1-indexed to 0-indexed
-    let end_row = entity.end_line; // exclusive
-
-    collect_refs_in_range(root, start_row, end_row, &entity.id, &entity.name, source, &mut refs, config);
-    refs
-}
-
-
-fn collect_refs_in_range(
-    root: tree_sitter::Node,
-    start_row: usize,
-    end_row: usize,
-    entity_id: &str,
-    entity_name: &str,
-    source: &[u8],
-    refs: &mut Vec<AstRef>,
-    config: &ScopeResolveConfig,
-) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
-        let node_start = node.start_position().row;
-        let node_end = node.end_position().row;
-
-        if node_end < start_row || node_start >= end_row {
-            continue;
-        }
-
+        let node_row = node.start_position().row;
         let kind = node.kind();
 
         // Call nodes (e.g. "call", "call_expression", "method_invocation")
@@ -2355,32 +2338,31 @@ fn collect_refs_in_range(
             match &config.call_style {
                 CallNodeStyle::FunctionField(field) => {
                     if let Some(func) = node.child_by_field_name(field) {
-                        extract_call_ref(func, entity_id, entity_name, source, refs, config);
+                        // Pass empty entity_name — self-ref filtering is done at resolution time
+                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
                     }
                 }
                 CallNodeStyle::DirectMethod { object_field, method_field } => {
                     let method_name = node.child_by_field_name(method_field)
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("");
-                    if !method_name.is_empty() && method_name != entity_name && !is_builtin(method_name, config) {
+                    if !method_name.is_empty() && !is_builtin(method_name, config) {
                         if let Some(obj_node) = node.child_by_field_name(object_field) {
                             let receiver = obj_node.utf8_text(source).unwrap_or("").to_string();
-                            // Strip trailing dots/operators
                             let receiver = receiver.trim_end_matches('.').to_string();
                             refs.push(AstRef {
                                 kind: AstRefKind::MethodCall { receiver, method: method_name.to_string() },
+                                row: node_row,
                             });
                         } else {
-                            // Bare call (no object)
                             refs.push(AstRef {
                                 kind: AstRefKind::Call(method_name.to_string()),
+                                row: node_row,
                             });
                         }
                     }
                 }
             }
-            // Recurse into ALL children (not just arguments) so chained calls
-            // like foo().bar().baz() and closures in receiver position are found.
             let mut cursor = node.walk();
             let children: Vec<_> = node.named_children(&mut cursor).collect();
             for child in children.into_iter().rev() {
@@ -2393,11 +2375,11 @@ fn collect_refs_in_range(
         if config.new_expr_nodes.contains(&kind) {
             if let Some(type_node) = node.child_by_field_name(config.new_expr_type_field) {
                 let name = type_node.utf8_text(source).unwrap_or("");
-                // For Java/C#, the type field might contain a full qualified name; take the last part
                 let name = name.rsplit('.').next().unwrap_or(name);
-                if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
+                if !name.is_empty() && !is_builtin(name, config) {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(name.to_string()),
+                        row: node_row,
                     });
                 }
             }
@@ -2414,11 +2396,11 @@ fn collect_refs_in_range(
             if let Some(type_node) = node.child_by_field_name("type") {
                 let name = type_node.utf8_text(source).unwrap_or("");
                 if name.chars().next().map_or(false, |c| c.is_uppercase())
-                    && name != entity_name
                     && !is_builtin(name, config)
                 {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(name.to_string()),
+                        row: node_row,
                     });
                 }
             }
@@ -2431,6 +2413,7 @@ fn collect_refs_in_range(
             worklist.push(child);
         }
     }
+    refs
 }
 
 /// Extract a call reference from a function/callee node (shared across languages)
@@ -2441,6 +2424,7 @@ fn extract_call_ref(
     source: &[u8],
     refs: &mut Vec<AstRef>,
     config: &ScopeResolveConfig,
+    row: usize,
 ) {
     let func_kind = func.kind();
 
@@ -2449,6 +2433,7 @@ fn extract_call_ref(
         if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
             refs.push(AstRef {
                 kind: AstRefKind::Call(name.to_string()),
+                row,
             });
         }
         return;
@@ -2457,7 +2442,7 @@ fn extract_call_ref(
     // Check config member_access patterns
     for ma in config.member_access {
         if func_kind == ma.node_kind {
-            extract_member_call_ref(func, ma.object_field, ma.property_field, source, refs);
+            extract_member_call_ref(func, ma.object_field, ma.property_field, source, refs, row);
             return;
         }
     }
@@ -2472,12 +2457,14 @@ fn extract_call_ref(
             if !type_name.is_empty() && !method_name.is_empty() {
                 refs.push(AstRef {
                     kind: AstRefKind::Call(method_name.to_string()),
+                    row,
                 });
                 if type_name.chars().next().map_or(false, |c| c.is_uppercase())
                     && !is_builtin(type_name, config)
                 {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(type_name.to_string()),
+                        row,
                     });
                 }
             }
@@ -2492,6 +2479,7 @@ fn extract_member_call_ref(
     attr_field: &str,
     source: &[u8],
     refs: &mut Vec<AstRef>,
+    row: usize,
 ) {
     let obj = node
         .child_by_field_name(object_field)
@@ -2502,16 +2490,17 @@ fn extract_member_call_ref(
         .and_then(|n| n.utf8_text(source).ok())
         .unwrap_or("");
     if !obj.is_empty() && !attr.is_empty() {
-        push_method_call_ref(obj, attr, refs);
+        push_method_call_ref(obj, attr, refs, row);
     }
 }
 
-fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>) {
+fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>, row: usize) {
     refs.push(AstRef {
         kind: AstRefKind::MethodCall {
             receiver: obj.to_string(),
             method: method.to_string(),
         },
+        row,
     });
 }
 

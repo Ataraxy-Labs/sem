@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use rayon::prelude::*;
 use regex::Regex;
@@ -123,9 +123,15 @@ impl EntityGraph {
             }
         }
 
-        // Build symbol table: name → entity IDs (can be multiple with same name)
+        // Pass A: Build all lookup structures in a single pass over all_entities.
+        // This merges what was previously 6 separate O(E) iterations.
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
         let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
+        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
+        let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
+        let mut class_entity_names: HashSet<&str> = HashSet::new();
+        let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
         for entity in &all_entities {
             symbol_table
@@ -145,42 +151,27 @@ impl EntityGraph {
                     end_line: entity.end_line,
                 },
             );
+
+            if let Some(ref pid) = entity.parent_id {
+                parent_child_pairs.insert((pid.as_str(), entity.id.as_str()));
+                class_child_names.insert((pid.as_str(), entity.name.as_str()));
+            }
+
+            if matches!(entity.entity_type.as_str(), "class" | "struct" | "interface" | "class_type") {
+                class_entity_names.insert(entity.name.as_str());
+            }
+
+            id_to_name.insert(entity.id.as_str(), entity.name.as_str());
+
+            scope_entity_ranges.entry(entity.file_path.clone()).or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
 
-        // Build parent-child set for skipping class→method self-edges
-        let parent_child_pairs: HashSet<(&str, &str)> = all_entities
-            .iter()
-            .filter_map(|e| {
-                e.parent_id.as_ref().map(|pid| (pid.as_str(), e.id.as_str()))
-            })
-            .collect();
-
-        // Build set of (class_id, child_method_name) so classes skip refs to their own methods
-        let class_child_names: HashSet<(&str, &str)> = all_entities
-            .iter()
-            .filter_map(|e| {
-                e.parent_id.as_ref().map(|pid| (pid.as_str(), e.name.as_str()))
-            })
-            .collect();
-
-        // Build class-related maps for dot-chain resolution
-        // class_entity_names: all class/struct/interface entity names
-        let class_entity_names: HashSet<&str> = all_entities
-            .iter()
-            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
-            .map(|e| e.name.as_str())
-            .collect();
-
-        // id_to_name: quick lookup for parent name resolution
-        let id_to_name: HashMap<&str, &str> = all_entities
-            .iter()
-            .map(|e| (e.id.as_str(), e.name.as_str()))
-            .collect();
-
-        // enclosing_class: entity_id → class_name (for self/this resolution)
-        // class_members: class_name → [(member_name, member_entity_id)]
+        // Pass B: Build enclosing_class, class_members, and scope_class_members
+        // (depends on id_to_name, class_entity_names, and entity_map from Pass A)
         let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
         let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
@@ -193,18 +184,8 @@ impl EntityGraph {
                             .push((entity.name.as_str(), entity.id.as_str()));
                     }
                 }
-            }
-        }
-
-        // Build import table: (file_path, imported_name) → target entity ID
-        // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
-        let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map, Some(&parsed_files));
-
-        // Build pre-built lookups to share with scope resolver (avoids 4 x O(E) redundant passes)
-        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for entity in &all_entities {
-            if let Some(ref pid) = entity.parent_id {
-                if let Some(parent) = entity_map.get(pid) {
+                // scope_class_members for scope resolver (checks entity_type of parent)
+                if let Some(parent) = entity_map.get(pid.as_str()) {
                     if matches!(parent.entity_type.as_str(), "class" | "struct" | "interface" | "impl") {
                         scope_class_members.entry(parent.name.clone()).or_default()
                             .push((entity.name.clone(), entity.id.clone()));
@@ -219,11 +200,10 @@ impl EntityGraph {
                 }
             }
         }
-        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
-        for entity in &all_entities {
-            scope_entity_ranges.entry(entity.file_path.clone()).or_default()
-                .push((entity.start_line, entity.end_line, entity.id.clone()));
-        }
+
+        // Build import table: (file_path, imported_name) → target entity ID
+        // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
+        let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map, Some(&parsed_files));
         // Build owned Go package index for scope resolver
         let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> = if file_paths.iter().any(|f| f.ends_with(".go")) {
             let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -258,8 +238,11 @@ impl EntityGraph {
             HashMap::new()
         };
 
+        // Wrap symbol_table in Arc to avoid expensive deep clone (621K entries)
+        let symbol_table = Arc::new(symbol_table);
+
         let pre_built = scope_resolve::PreBuiltLookups {
-            symbol_table: symbol_table.clone(),
+            symbol_table: Arc::clone(&symbol_table),
             class_members: scope_class_members,
             entity_ranges: scope_entity_ranges,
             go_pkg_index: owned_go_pkg_index,
@@ -286,11 +269,19 @@ impl EntityGraph {
         // Phase 1: Dot-chain resolution (precise self.X, this.X, ClassName.X)
         // Phase 2: Bag-of-words resolution (existing logic, skipping consumed words)
         // Skip entities already resolved by scope resolver (Python files)
+        // Skip entities from non-code file types (JSON, SQL, etc.) that can't produce edges
         let resolved_refs: Vec<(String, String, RefType)> = all_entities
             .par_iter()
             .flat_map(|entity| {
                 // Skip entities already resolved by scope resolver
                 if scope_resolved_entities.contains(&entity.id) {
+                    return vec![];
+                }
+
+                // Skip entities from file types that don't have language configs
+                // (JSON, SQL, YAML, etc. — they extract entities but never produce reference edges)
+                let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
+                if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
                     return vec![];
                 }
 
@@ -691,6 +682,12 @@ impl EntityGraph {
             .filter(|e| needs_resolution.contains(e.id.as_str()))
             .flat_map(|entity| {
                 if scope_resolved_entities.contains(&entity.id) {
+                    return vec![];
+                }
+
+                // Skip entities from non-code file types (JSON, SQL, etc.)
+                let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
+                if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
                     return vec![];
                 }
 
