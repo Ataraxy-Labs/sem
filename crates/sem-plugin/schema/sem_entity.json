@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-lix-key": "sem_entity",
+  "type": "object",
+  "properties": {
+    "entity_type": {
+      "type": "string",
+      "description": "Type of semantic entity: function, class, method, interface, etc."
+    },
+    "entity_name": {
+      "type": "string",
+      "description": "Name of the entity"
+    },
+    "file_path": {
+      "type": "string",
+      "description": "Relative file path where the entity resides"
+    },
+    "line": {
+      "type": "integer",
+      "description": "Start line of the entity (1-indexed)"
+    },
+    "content": {
+      "type": ["string", "null"],
+      "description": "Source content of the entity"
+    }
+  },
+  "required": ["entity_type", "entity_name", "file_path", "line"]
+}
