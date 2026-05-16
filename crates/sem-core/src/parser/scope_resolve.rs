@@ -76,16 +76,28 @@ pub struct ResolutionEntry {
 /// 4. Resolve each reference via scope chain + type tracking
 /// Pre-built lookup tables that can be shared between `EntityGraph::build()` and
 /// `resolve_with_scopes()` to avoid redundant O(E) passes.
-pub struct PreBuiltLookups {
-    pub symbol_table: HashMap<String, Vec<String>>,
-    pub class_members: HashMap<String, Vec<(String, String)>>,
-    pub entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
+pub(crate) struct PreBuiltLookups {
+    pub(crate) symbol_table: HashMap<String, Vec<String>>,
+    pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
+    pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
     /// Go package index: pkg_name → [(entity_name, entity_id)]
     /// Avoids O(symbol_table) scan per Go import.
-    pub go_pkg_index: HashMap<String, Vec<(String, String)>>,
+    pub(crate) go_pkg_index: HashMap<String, Vec<(String, String)>>,
 }
 
+/// Public API — preserves the original 5-parameter signature for semver compatibility.
 pub fn resolve_with_scopes(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+) -> ScopeResult {
+    resolve_with_scopes_full(root, file_paths, all_entities, entity_map, pre_parsed, None)
+}
+
+/// Internal version with pre-built lookups for performance.
+pub(crate) fn resolve_with_scopes_full(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],

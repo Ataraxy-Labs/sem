@@ -273,7 +273,7 @@ impl EntityGraph {
                 .is_some()
         });
         let (scope_edges, scope_resolved_entities) = if has_scope_lang {
-            let result = scope_resolve::resolve_with_scopes(root, file_paths, &all_entities, &entity_map, Some(parsed_files), Some(pre_built));
+            let result = scope_resolve::resolve_with_scopes_full(root, file_paths, &all_entities, &entity_map, Some(parsed_files), Some(pre_built));
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
@@ -676,7 +676,7 @@ impl EntityGraph {
                 .filter(|(fp, _, _)| resolve_set.contains(fp.as_str()))
                 .collect();
             let pre = if relevant_parsed.is_empty() { None } else { Some(relevant_parsed) };
-            let result = scope_resolve::resolve_with_scopes(root, &resolve_file_paths, &all_entities, &entity_map, pre, None);
+            let result = scope_resolve::resolve_with_scopes_full(root, &resolve_file_paths, &all_entities, &entity_map, pre, None);
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
