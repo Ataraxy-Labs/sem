@@ -423,8 +423,17 @@ pub fn resolve_with_scopes(
     }
 
     // Deduplicate edges
-    let mut seen = std::collections::HashSet::new();
-    all_edges.retain(|e| seen.insert((e.0.clone(), e.1.clone())));
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::with_capacity(all_edges.len());
+    let deduped_edges: Vec<(String, String, RefType)> = {
+        let mut result = Vec::with_capacity(all_edges.len());
+        for edge in all_edges {
+            if seen.insert((edge.0.clone(), edge.1.clone())) {
+                result.push(edge);
+            }
+        }
+        result
+    };
+    let all_edges = deduped_edges;
 
     ScopeResult {
         edges: all_edges,
@@ -2261,6 +2270,7 @@ fn extract_ast_refs(
     collect_refs_in_range(root, start_row, end_row, &entity.id, &entity.name, source, &mut refs, config);
     refs
 }
+
 
 fn collect_refs_in_range(
     root: tree_sitter::Node,

@@ -262,8 +262,10 @@ impl EntityGraph {
                 let mut entity_edges = Vec::new();
                 let mut consumed_words: HashSet<String> = HashSet::new();
 
-                // Phase 1: Dot-chain resolution
+                // Strip comments/strings once, reuse for both dot-chain and bag-of-words
                 let stripped = strip_comments_and_strings(&entity.content);
+
+                // Phase 1: Dot-chain resolution
                 let dot_chains = extract_dot_chains(&stripped);
 
                 for (receiver, member) in &dot_chains {
@@ -305,7 +307,8 @@ impl EntityGraph {
                 }
 
                 // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
-                let refs = extract_references_from_content(&entity.content, &entity.name);
+                // Reuse the stripped content to avoid stripping twice
+                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -367,10 +370,15 @@ impl EntityGraph {
             .collect();
 
         // Merge scope edges with bag-of-words edges, deduplicating
-        let mut all_resolved: Vec<(String, String, RefType)> = scope_edges;
-        all_resolved.extend(resolved_refs);
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        all_resolved.retain(|e| seen_edges.insert((e.0.clone(), e.1.clone())));
+        let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(resolved_refs);
+        let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
+        let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
+        for edge in combined {
+            if seen_edges.insert((edge.0.clone(), edge.1.clone())) {
+                all_resolved.push(edge);
+            }
+        }
 
         // Build edge indexes from resolved references
         let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
@@ -654,8 +662,10 @@ impl EntityGraph {
                 let mut entity_edges = Vec::new();
                 let mut consumed_words: HashSet<String> = HashSet::new();
 
-                // Phase 1: Dot-chain resolution
+                // Strip comments/strings once, reuse for both dot-chain and bag-of-words
                 let stripped = strip_comments_and_strings(&entity.content);
+
+                // Phase 1: Dot-chain resolution
                 let dot_chains = extract_dot_chains(&stripped);
 
                 for (receiver, member) in &dot_chains {
@@ -693,8 +703,8 @@ impl EntityGraph {
                     }
                 }
 
-                // Phase 2: Bag-of-words resolution
-                let refs = extract_references_from_content(&entity.content, &entity.name);
+                // Phase 2: Bag-of-words resolution (reuse stripped content)
+                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -749,10 +759,15 @@ impl EntityGraph {
             .collect();
 
         // Merge scope edges + bag-of-words edges + kept cached edges
-        let mut all_resolved: Vec<(String, String, RefType)> = scope_edges;
-        all_resolved.extend(resolved_refs);
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        all_resolved.retain(|e| seen_edges.insert((e.0.clone(), e.1.clone())));
+        let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(resolved_refs);
+        let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
+        let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
+        for edge in combined {
+            if seen_edges.insert((edge.0.clone(), edge.1.clone())) {
+                all_resolved.push(edge);
+            }
+        }
 
         // Build final edge list: kept edges + newly resolved edges
         let mut edges: Vec<EntityRef> = Vec::with_capacity(kept_edges.len() + all_resolved.len());
@@ -1260,6 +1275,44 @@ fn build_import_table(
         })
         .unwrap_or_default();
 
+    // Pre-build Go package index: package_name → [(entity_name, entity_id)]
+    // This avoids O(symbol_table) scan per Go import — the old code's main bottleneck.
+    let has_go = file_paths.iter().any(|f| f.ends_with(".go"));
+    let go_pkg_index: HashMap<&str, Vec<(&str, &str)>> = if has_go {
+        let mut idx: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for (name, target_ids) in symbol_table.iter() {
+            for target_id in target_ids {
+                if let Some(entity) = entity_map.get(target_id) {
+                    // Extract package name from file path: either the file stem or the parent dir
+                    let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
+                    let file_stem = strip_file_ext(file_stem);
+                    idx.entry(file_stem)
+                        .or_default()
+                        .push((name.as_str(), target_id.as_str()));
+                    // Also index by parent directory name (Go packages often use dir name)
+                    if let Some(parent_start) = entity.file_path.rfind('/') {
+                        let parent_path = &entity.file_path[..parent_start];
+                        if let Some(dir_name_start) = parent_path.rfind('/') {
+                            let dir_name = &parent_path[dir_name_start + 1..];
+                            if dir_name != file_stem {
+                                idx.entry(dir_name)
+                                    .or_default()
+                                    .push((name.as_str(), target_id.as_str()));
+                            }
+                        } else if !parent_path.is_empty() && parent_path != file_stem {
+                            idx.entry(parent_path)
+                                .or_default()
+                                .push((name.as_str(), target_id.as_str()));
+                        }
+                    }
+                }
+            }
+        }
+        idx
+    } else {
+        HashMap::new()
+    };
+
     // Process files in parallel, each producing local import entries
     let per_file_imports: Vec<Vec<((String, String), String)>> = file_paths
         .par_iter()
@@ -1543,20 +1596,13 @@ fn build_import_table(
                     let import_path = cap.get(1).unwrap().as_str();
                     let pkg_name = import_path.rsplit('/').next().unwrap_or(import_path);
 
-                    // Map all entities from files matching this package name
-                    for (name, target_ids) in symbol_table.iter() {
-                        for target_id in target_ids {
-                            if let Some(entity) = entity_map.get(target_id) {
-                                let stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
-                                let stem = strip_file_ext(stem);
-                                // Go: file stem or directory matches package name
-                                if stem == pkg_name || entity.file_path.contains(&format!("{}/", pkg_name)) {
-                                    local_imports.push((
-                                        (file_path.clone(), name.clone()),
-                                        target_id.clone(),
-                                    ));
-                                }
-                            }
+                    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan
+                    if let Some(entries) = go_pkg_index.get(pkg_name) {
+                        for (name, target_id) in entries {
+                            local_imports.push((
+                                (file_path.clone(), name.to_string()),
+                                target_id.to_string(),
+                            ));
                         }
                     }
                 }
@@ -1753,9 +1799,14 @@ fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
 /// Strips comments and strings first to avoid false positives from docstrings.
 /// Returns borrowed slices from the stripped content.
 fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<&'a str> {
-    // We need to figure out which words appear only in comments/strings vs real code.
-    // Strategy: strip comments/strings, then only accept words that appear in the stripped version.
     let stripped = strip_comments_and_strings(content);
+    extract_references_with_stripped(content, own_name, &stripped)
+}
+
+/// Extract references using a pre-stripped version of the content.
+/// Use this when you already have the stripped content (e.g. from dot-chain extraction)
+/// to avoid stripping comments/strings twice.
+fn extract_references_with_stripped<'a>(content: &'a str, own_name: &str, stripped: &str) -> Vec<&'a str> {
     let stripped_words: HashSet<&str> = stripped
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty())
