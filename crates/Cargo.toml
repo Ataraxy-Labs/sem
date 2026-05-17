@@ -7,3 +7,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Size-optimized profile for WASM builds
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+strip = "symbols"

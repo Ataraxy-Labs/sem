@@ -13,10 +13,19 @@ use exports::lix::plugin::api::{
     DetectStateContext, EntityChange, File, Guest, PluginError,
 };
 
+use std::sync::OnceLock;
+
 use sem_core::git::types::{FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::plugins::create_default_registry;
+use sem_core::parser::registry::ParserRegistry;
+
+/// Cached registry — initialized once, reused across all detect_changes calls.
+fn registry() -> &'static ParserRegistry {
+    static REGISTRY: OnceLock<ParserRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(create_default_registry)
+}
 
 struct SemPlugin;
 
@@ -59,8 +68,7 @@ impl Guest for SemPlugin {
             },
         };
 
-        let registry = create_default_registry();
-        let result = compute_semantic_diff(&[file_change], &registry, None, None);
+        let result = compute_semantic_diff(&[file_change], registry(), None, None);
 
         let changes = result
             .changes
