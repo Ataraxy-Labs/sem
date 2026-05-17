@@ -1,9 +1,11 @@
 pub mod code;
 pub mod csv_plugin;
+#[cfg(feature = "lang-erb")]
 pub mod erb;
 pub mod fallback;
 pub mod json;
 pub mod markdown;
+#[cfg(feature = "lang-svelte")]
 pub mod svelte;
 pub mod toml_plugin;
 pub mod vue;
@@ -16,12 +18,14 @@ pub fn create_default_registry() -> ParserRegistry {
 
     registry.register(Box::new(json::JsonParserPlugin));
     registry.register(Box::new(code::CodeParserPlugin));
+    #[cfg(feature = "lang-svelte")]
     registry.register(Box::new(svelte::SvelteParserPlugin));
     registry.register(Box::new(vue::VueParserPlugin));
     registry.register(Box::new(yaml::YamlParserPlugin));
     registry.register(Box::new(toml_plugin::TomlParserPlugin));
     registry.register(Box::new(csv_plugin::CsvParserPlugin));
     registry.register(Box::new(markdown::MarkdownParserPlugin));
+    #[cfg(feature = "lang-erb")]
     registry.register(Box::new(erb::ErbParserPlugin));
     // Fallback must be last
     registry.register(Box::new(fallback::FallbackParserPlugin));

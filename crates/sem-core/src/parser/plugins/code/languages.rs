@@ -184,106 +184,132 @@ pub struct ImportRule {
     pub extractor: ImportExtractorFn,
 }
 
+#[cfg(feature = "lang-typescript")]
 fn get_typescript() -> Option<Language> {
     Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
 }
 
+#[cfg(feature = "lang-typescript")]
 fn get_tsx() -> Option<Language> {
     Some(tree_sitter_typescript::LANGUAGE_TSX.into())
 }
 
+#[cfg(feature = "lang-javascript")]
 fn get_javascript() -> Option<Language> {
     Some(tree_sitter_javascript::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-python")]
 fn get_python() -> Option<Language> {
     Some(tree_sitter_python::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-go")]
 fn get_go() -> Option<Language> {
     Some(tree_sitter_go::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-rust")]
 fn get_rust() -> Option<Language> {
     Some(tree_sitter_rust::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-java")]
 fn get_java() -> Option<Language> {
     Some(tree_sitter_java::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-c")]
 fn get_c() -> Option<Language> {
     Some(tree_sitter_c::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-cpp")]
 fn get_cpp() -> Option<Language> {
     Some(tree_sitter_cpp::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-ruby")]
 fn get_ruby() -> Option<Language> {
     Some(tree_sitter_ruby::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-csharp")]
 fn get_csharp() -> Option<Language> {
     Some(tree_sitter_c_sharp::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-php")]
 fn get_php() -> Option<Language> {
     Some(tree_sitter_php::LANGUAGE_PHP.into())
 }
 
+#[cfg(feature = "lang-fortran")]
 fn get_fortran() -> Option<Language> {
     Some(tree_sitter_fortran::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-swift")]
 fn get_swift() -> Option<Language> {
     Some(tree_sitter_swift::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-elixir")]
 fn get_elixir() -> Option<Language> {
     Some(tree_sitter_elixir::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-bash")]
 fn get_bash() -> Option<Language> {
     Some(tree_sitter_bash::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-hcl")]
 fn get_hcl() -> Option<Language> {
     Some(tree_sitter_hcl::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-kotlin")]
 fn get_kotlin() -> Option<Language> {
     Some(tree_sitter_kotlin_ng::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-xml")]
 fn get_xml() -> Option<Language> {
     Some(tree_sitter_xml::LANGUAGE_XML.into())
 }
 
+#[cfg(feature = "lang-dart")]
 fn get_dart() -> Option<Language> {
     Some(tree_sitter_dart::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-perl")]
 fn get_perl() -> Option<Language> {
     Some(tree_sitter_perl_next::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-ocaml")]
 fn get_ocaml() -> Option<Language> {
     Some(tree_sitter_ocaml::LANGUAGE_OCAML.into())
 }
 
+#[cfg(feature = "lang-ocaml")]
 fn get_ocaml_interface() -> Option<Language> {
     Some(tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into())
 }
 
+#[cfg(feature = "lang-scala")]
 fn get_scala() -> Option<Language> {
     Some(tree_sitter_scala::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-zig")]
 fn get_zig() -> Option<Language> {
     Some(tree_sitter_zig::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-nix")]
 fn get_nix() -> Option<Language> {
     Some(tree_sitter_nix::LANGUAGE.into())
 }
@@ -351,6 +377,7 @@ const JS_TS_SCOPE_BOUNDARIES: &[&str] = &[
     "generator_function",
 ];
 
+#[cfg(feature = "lang-typescript")]
 static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "typescript",
     extensions: &[".ts", ".mts", ".cts"],
@@ -375,6 +402,7 @@ static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&TS_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-typescript")]
 static TSX_CONFIG: LanguageConfig = LanguageConfig {
     id: "tsx",
     extensions: &[".tsx"],
@@ -399,6 +427,7 @@ static TSX_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&TS_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-javascript")]
 static JAVASCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "javascript",
     extensions: &[".js", ".jsx", ".mjs", ".cjs", ".es6"],
@@ -420,6 +449,7 @@ static JAVASCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&TS_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-python")]
 static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
     id: "python",
     extensions: &[".py", ".pyi"],
@@ -436,6 +466,7 @@ static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&PYTHON_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-go")]
 static GO_CONFIG: LanguageConfig = LanguageConfig {
     id: "go",
     extensions: &[".go"],
@@ -454,6 +485,7 @@ static GO_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&GO_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-rust")]
 static RUST_CONFIG: LanguageConfig = LanguageConfig {
     id: "rust",
     extensions: &[".rs"],
@@ -477,6 +509,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&RUST_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-java")]
 static JAVA_CONFIG: LanguageConfig = LanguageConfig {
     id: "java",
     extensions: &[".java"],
@@ -497,6 +530,7 @@ static JAVA_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&JAVA_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-c")]
 static C_CONFIG: LanguageConfig = LanguageConfig {
     id: "c",
     extensions: &[".c", ".h"],
@@ -516,6 +550,7 @@ static C_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-cpp")]
 static CPP_CONFIG: LanguageConfig = LanguageConfig {
     id: "cpp",
     extensions: &[".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
@@ -537,6 +572,7 @@ static CPP_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&CPP_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-ruby")]
 static RUBY_CONFIG: LanguageConfig = LanguageConfig {
     id: "ruby",
     extensions: &[".rb"],
@@ -554,6 +590,7 @@ static RUBY_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&RUBY_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-csharp")]
 static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
     id: "csharp",
     extensions: &[".cs"],
@@ -576,6 +613,7 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&CSHARP_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-php")]
 static PHP_CONFIG: LanguageConfig = LanguageConfig {
     id: "php",
     extensions: &[".php", ".inc", ".phtml", ".module"],
@@ -596,6 +634,7 @@ static PHP_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&PHP_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-fortran")]
 static FORTRAN_CONFIG: LanguageConfig = LanguageConfig {
     id: "fortran",
     extensions: &[".f90", ".f95", ".f03", ".f08", ".f", ".for"],
@@ -615,6 +654,7 @@ static FORTRAN_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-swift")]
 static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
     id: "swift",
     extensions: &[".swift"],
@@ -638,6 +678,7 @@ static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&SWIFT_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-elixir")]
 static ELIXIR_CONFIG: LanguageConfig = LanguageConfig {
     id: "elixir",
     extensions: &[".ex", ".exs"],
@@ -654,6 +695,7 @@ static ELIXIR_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-bash")]
 static BASH_CONFIG: LanguageConfig = LanguageConfig {
     id: "bash",
     extensions: &[".sh"],
@@ -666,6 +708,7 @@ static BASH_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&BASH_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-hcl")]
 static HCL_CONFIG: LanguageConfig = LanguageConfig {
     id: "hcl",
     extensions: &[".hcl", ".tf", ".tfvars"],
@@ -681,6 +724,7 @@ static HCL_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-kotlin")]
 static KOTLIN_CONFIG: LanguageConfig = LanguageConfig {
     id: "kotlin",
     extensions: &[".kt", ".kts"],
@@ -701,6 +745,7 @@ static KOTLIN_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&KOTLIN_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-xml")]
 static XML_CONFIG: LanguageConfig = LanguageConfig {
     id: "xml",
     extensions: &[".xml", ".plist", ".svg", ".xhtml", ".csproj", ".fsproj", ".vbproj", ".props", ".targets", ".nuspec", ".resx", ".xaml", ".axml"],
@@ -713,6 +758,7 @@ static XML_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-dart")]
 static DART_CONFIG: LanguageConfig = LanguageConfig {
     id: "dart",
     extensions: &[".dart"],
@@ -736,6 +782,7 @@ static DART_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&DART_SCOPE_CONFIG),
 };
   
+#[cfg(feature = "lang-perl")]
 static PERL_CONFIG: LanguageConfig = LanguageConfig {
     id: "perl",
     extensions: &[".pl", ".pm", ".t"],
@@ -751,6 +798,7 @@ static PERL_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-ocaml")]
 static OCAML_CONFIG: LanguageConfig = LanguageConfig {
     id: "ocaml",
     extensions: &[".ml"],
@@ -772,6 +820,7 @@ static OCAML_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-ocaml")]
 static OCAML_INTERFACE_CONFIG: LanguageConfig = LanguageConfig {
     id: "ocaml_interface",
     extensions: &[".mli"],
@@ -793,6 +842,7 @@ static OCAML_INTERFACE_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+#[cfg(feature = "lang-scala")]
 static SCALA_CONFIG: LanguageConfig = LanguageConfig {
     id: "scala",
     extensions: &[".scala", ".sc", ".sbt", ".kojo", ".mill"],
@@ -817,6 +867,7 @@ static SCALA_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&SCALA_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-zig")]
 static ZIG_CONFIG: LanguageConfig = LanguageConfig {
     id: "zig",
     extensions: &[".zig"],
@@ -838,6 +889,7 @@ static ZIG_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: Some(&ZIG_SCOPE_CONFIG),
 };
 
+#[cfg(feature = "lang-nix")]
 static NIX_CONFIG: LanguageConfig = LanguageConfig {
     id: "nix",
     extensions: &[".nix"],
@@ -1485,34 +1537,66 @@ static BASH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     ],
 };
 
-static ALL_CONFIGS: &[&LanguageConfig] = &[
-    &TYPESCRIPT_CONFIG,
-    &TSX_CONFIG,
-    &JAVASCRIPT_CONFIG,
-    &PYTHON_CONFIG,
-    &GO_CONFIG,
-    &RUST_CONFIG,
-    &JAVA_CONFIG,
-    &C_CONFIG,
-    &CPP_CONFIG,
-    &RUBY_CONFIG,
-    &CSHARP_CONFIG,
-    &PHP_CONFIG,
-    &FORTRAN_CONFIG,
-    &SWIFT_CONFIG,
-    &ELIXIR_CONFIG,
-    &BASH_CONFIG,
-    &HCL_CONFIG,
-    &KOTLIN_CONFIG,
-    &XML_CONFIG,
-    &DART_CONFIG,
-    &PERL_CONFIG,
-    &OCAML_CONFIG,
-    &OCAML_INTERFACE_CONFIG,
-    &SCALA_CONFIG,
-    &ZIG_CONFIG,
-    &NIX_CONFIG,
-];
+macro_rules! all_configs {
+    () => {{
+        &[
+            #[cfg(feature = "lang-typescript")]
+            &TYPESCRIPT_CONFIG,
+            #[cfg(feature = "lang-typescript")]
+            &TSX_CONFIG,
+            #[cfg(feature = "lang-javascript")]
+            &JAVASCRIPT_CONFIG,
+            #[cfg(feature = "lang-python")]
+            &PYTHON_CONFIG,
+            #[cfg(feature = "lang-go")]
+            &GO_CONFIG,
+            #[cfg(feature = "lang-rust")]
+            &RUST_CONFIG,
+            #[cfg(feature = "lang-java")]
+            &JAVA_CONFIG,
+            #[cfg(feature = "lang-c")]
+            &C_CONFIG,
+            #[cfg(feature = "lang-cpp")]
+            &CPP_CONFIG,
+            #[cfg(feature = "lang-ruby")]
+            &RUBY_CONFIG,
+            #[cfg(feature = "lang-csharp")]
+            &CSHARP_CONFIG,
+            #[cfg(feature = "lang-php")]
+            &PHP_CONFIG,
+            #[cfg(feature = "lang-fortran")]
+            &FORTRAN_CONFIG,
+            #[cfg(feature = "lang-swift")]
+            &SWIFT_CONFIG,
+            #[cfg(feature = "lang-elixir")]
+            &ELIXIR_CONFIG,
+            #[cfg(feature = "lang-bash")]
+            &BASH_CONFIG,
+            #[cfg(feature = "lang-hcl")]
+            &HCL_CONFIG,
+            #[cfg(feature = "lang-kotlin")]
+            &KOTLIN_CONFIG,
+            #[cfg(feature = "lang-xml")]
+            &XML_CONFIG,
+            #[cfg(feature = "lang-dart")]
+            &DART_CONFIG,
+            #[cfg(feature = "lang-perl")]
+            &PERL_CONFIG,
+            #[cfg(feature = "lang-ocaml")]
+            &OCAML_CONFIG,
+            #[cfg(feature = "lang-ocaml")]
+            &OCAML_INTERFACE_CONFIG,
+            #[cfg(feature = "lang-scala")]
+            &SCALA_CONFIG,
+            #[cfg(feature = "lang-zig")]
+            &ZIG_CONFIG,
+            #[cfg(feature = "lang-nix")]
+            &NIX_CONFIG,
+        ]
+    }};
+}
+
+static ALL_CONFIGS: &[&LanguageConfig] = all_configs!();
 
 pub fn get_language_config(extension: &str) -> Option<&'static LanguageConfig> {
     ALL_CONFIGS

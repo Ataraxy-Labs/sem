@@ -10,7 +10,7 @@ repository = "https://github.com/Ataraxy-Labs/sem"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-sem-core = { path = "../sem-core", default-features = false, features = ["wasm"] }
+sem-core = { path = "../sem-core", default-features = false, features = ["wasm", "grammar-core"] }
 wit-bindgen = "0.40"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

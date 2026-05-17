@@ -11,38 +11,80 @@ categories = ["development-tools", "parser-implementations"]
 readme = "../../README.md"
 
 [features]
-default = ["git", "parallel"]
+default = ["git", "parallel", "grammar-all"]
 git = ["dep:git2"]
 parallel = ["dep:rayon"]
 wasm = []
 
+# Grammar groups
+grammar-core = [
+    "lang-typescript", "lang-javascript", "lang-python",
+    "lang-go", "lang-rust", "lang-java",
+]
+grammar-all = [
+    "grammar-core",
+    "lang-c", "lang-cpp", "lang-ruby", "lang-csharp", "lang-php",
+    "lang-fortran", "lang-swift", "lang-elixir", "lang-bash", "lang-hcl",
+    "lang-kotlin", "lang-xml", "lang-dart", "lang-perl", "lang-ocaml",
+    "lang-scala", "lang-zig", "lang-nix",
+    "lang-svelte", "lang-erb",
+]
+
+# Individual grammar features
+lang-typescript = ["dep:tree-sitter-typescript"]
+lang-javascript = ["dep:tree-sitter-javascript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter-go"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-java = ["dep:tree-sitter-java"]
+lang-c = ["dep:tree-sitter-c"]
+lang-cpp = ["dep:tree-sitter-cpp"]
+lang-ruby = ["dep:tree-sitter-ruby"]
+lang-csharp = ["dep:tree-sitter-c-sharp"]
+lang-php = ["dep:tree-sitter-php"]
+lang-fortran = ["dep:tree-sitter-fortran"]
+lang-swift = ["dep:tree-sitter-swift"]
+lang-elixir = ["dep:tree-sitter-elixir"]
+lang-bash = ["dep:tree-sitter-bash"]
+lang-hcl = ["dep:tree-sitter-hcl"]
+lang-kotlin = ["dep:tree-sitter-kotlin-ng"]
+lang-xml = ["dep:tree-sitter-xml"]
+lang-dart = ["dep:tree-sitter-dart"]
+lang-perl = ["dep:tree-sitter-perl-next"]
+lang-ocaml = ["dep:tree-sitter-ocaml"]
+lang-scala = ["dep:tree-sitter-scala"]
+lang-zig = ["dep:tree-sitter-zig"]
+lang-nix = ["dep:tree-sitter-nix"]
+lang-svelte = ["dep:tree-sitter-htmlx-svelte"]
+lang-erb = ["dep:tree-sitter-embedded-template"]
+
 [dependencies]
 git2 = { version = "0.20", optional = true }
 tree-sitter = "0.26"
-tree-sitter-typescript = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-go = "0.23"
-tree-sitter-rust = "0.23"
-tree-sitter-java = "0.23"
-tree-sitter-c = "0.23"
-tree-sitter-cpp = "0.23"
-tree-sitter-ruby = "0.23"
-tree-sitter-c-sharp = "0.23"
-tree-sitter-php = "0.23"
-tree-sitter-fortran = "0.5"
-tree-sitter-swift = "0.7"
-tree-sitter-elixir = "0.3"
-tree-sitter-bash = "0.23"
-tree-sitter-hcl = "1.1"
-tree-sitter-kotlin-ng = "1.1"
-tree-sitter-xml = "0.7"
-tree-sitter-embedded-template = "0.25"
-tree-sitter-ocaml = "0.24"
-tree-sitter-htmlx-svelte = "0.1.7"
-tree-sitter-dart = "0.2.0"
-tree-sitter-perl-next = "0.1"
-tree-sitter-scala = "0.26"
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-javascript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.23", optional = true }
+tree-sitter-rust = { version = "0.23", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.23", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.23", optional = true }
+tree-sitter-fortran = { version = "0.5", optional = true }
+tree-sitter-swift = { version = "0.7", optional = true }
+tree-sitter-elixir = { version = "0.3", optional = true }
+tree-sitter-bash = { version = "0.23", optional = true }
+tree-sitter-hcl = { version = "1.1", optional = true }
+tree-sitter-kotlin-ng = { version = "1.1", optional = true }
+tree-sitter-xml = { version = "0.7", optional = true }
+tree-sitter-embedded-template = { version = "0.25", optional = true }
+tree-sitter-ocaml = { version = "0.24", optional = true }
+tree-sitter-htmlx-svelte = { version = "0.1.7", optional = true }
+tree-sitter-dart = { version = "0.2.0", optional = true }
+tree-sitter-perl-next = { version = "0.1", optional = true }
+tree-sitter-scala = { version = "0.26", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -51,8 +93,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 regex = "1"
 thiserror = "2"
 rayon = { version = "1.10", optional = true }
-tree-sitter-zig = "1.1.2"
-tree-sitter-nix = "0.3"
+tree-sitter-zig = { version = "1.1.2", optional = true }
+tree-sitter-nix = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.24.0"
