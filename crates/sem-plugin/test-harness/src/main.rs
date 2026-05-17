@@ -362,12 +362,20 @@ async fn main() -> Result<()> {
 
     println!("=== Lix + sem-plugin integration test ===\n");
 
+    let total_start = std::time::Instant::now();
+    let mut timings: Vec<(&str, std::time::Duration)> = Vec::new();
+
     // 1. Build .lixplugin archive
-    println!("Step 1: Building .lixplugin archive...");
+    print!("1. Building .lixplugin archive... ");
+    let t = std::time::Instant::now();
     let archive = build_lixplugin_archive(&wasm_path)?;
+    let d = t.elapsed();
+    println!("{d:?}");
+    timings.push(("Build archive", d));
 
     // 2. Open Lix with wasmtime runtime
-    println!("\nStep 2: Opening Lix instance...");
+    print!("2. Opening Lix instance... ");
+    let t = std::time::Instant::now();
     let runtime = Arc::new(SemWasmtimeRuntime::new());
     let lix = open_lix(OpenLixOptions {
         backend: None,
@@ -375,21 +383,24 @@ async fn main() -> Result<()> {
     })
     .await
     .context("Failed to open Lix")?;
-    println!("Lix instance ready.");
+    let d = t.elapsed();
+    println!("{d:?}");
+    timings.push(("Open Lix", d));
 
-    // 3. Register sem plugin
-    println!("\nStep 3: Registering sem-plugin...");
-    let start = std::time::Instant::now();
+    // 3. Register sem plugin (includes WASM compilation)
+    print!("3. Registering sem-plugin... ");
+    let t = std::time::Instant::now();
     let receipt = lix
         .register_plugin(RegisterPluginOptions {
             bytes: archive,
         })
         .await
         .context("Failed to register plugin")?;
-    println!("Registered: {} ({:?})", receipt.plugin_key, start.elapsed());
+    let d = t.elapsed();
+    println!("{} ({d:?})", receipt.plugin_key);
+    timings.push(("Register plugin", d));
 
-    // 4. Write a TypeScript file (triggers detect-changes)
-    println!("\nStep 4: Writing TypeScript file...");
+    // 4. Write TypeScript file (cold start — first detect-changes call)
     let ts_code = r#"
 export function greet(name: string): string {
     return `Hello, ${name}!`;
@@ -415,76 +426,222 @@ interface User {
 }
 "#;
 
-    let start = std::time::Instant::now();
+    print!("4. Write TypeScript file (cold start)... ");
+    let t = std::time::Instant::now();
     lix.execute(
         "INSERT INTO lix_file (id, path, data) VALUES ('ts-file-1', '/src/services/user.ts', $1)",
         &[Value::Blob(ts_code.as_bytes().to_vec())],
     )
     .await
     .context("Failed to write file")?;
-    println!("File written and plugin invoked ({:?})", start.elapsed());
-
-    // 5. Query detected entities
-    println!("\nStep 5: Querying detected entities...");
+    let d = t.elapsed();
     let result = lix
         .execute(
-            "SELECT id, entity_type, entity_name, file_path, line, content, lixcol_file_id FROM sem_entity",
+            "SELECT id, entity_type, entity_name FROM sem_entity WHERE lixcol_file_id = 'ts-file-1'",
             &[],
         )
-        .await
-        .context("Failed to query entities")?;
-
-    println!("Found {} entities:\n", result.len());
+        .await?;
+    println!("{} entities ({d:?})", result.len());
     for row in result.rows() {
-        let vals = row.values();
-        println!("  id:          {:?}", vals[0]);
-        println!("  entity_type: {:?}", vals[1]);
-        println!("  entity_name: {:?}", vals[2]);
-        println!("  file_path:   {:?}", vals[3]);
-        println!("  line:        {:?}", vals[4]);
-        println!("  file_id:     {:?}", vals[6]);
-        println!();
+        let v = row.values();
+        println!("     {:?} {:?}", v[1], v[2]);
     }
+    timings.push(("TypeScript new file (cold)", d));
 
-    // 6. Write a Python file
-    println!("Step 6: Writing Python file...");
-    let py_code = r#"
+    // 5. Write Python file (warm — parser registry cached)
+    let py_code = b"\
 class Calculator:
+    def __init__(self):
+        self.history = []
+
     def add(self, a: float, b: float) -> float:
-        return a + b
+        result = a + b
+        self.history.append(result)
+        return result
 
     def multiply(self, a: float, b: float) -> float:
-        return a * b
+        result = a * b
+        self.history.append(result)
+        return result
 
 def fibonacci(n: int) -> int:
     if n <= 1:
         return n
     return fibonacci(n - 1) + fibonacci(n - 2)
-"#;
+";
 
-    let start = std::time::Instant::now();
+    print!("5. Write Python file (warm)... ");
+    let t = std::time::Instant::now();
     lix.execute(
         "INSERT INTO lix_file (id, path, data) VALUES ('py-file-1', '/src/calculator.py', $1)",
-        &[Value::Blob(py_code.as_bytes().to_vec())],
+        &[Value::Blob(py_code.to_vec())],
     )
-    .await
-    .context("Failed to write Python file")?;
-    println!("File written ({:?})", start.elapsed());
-
-    // Query all entities now
+    .await?;
+    let d = t.elapsed();
     let result = lix
-        .execute("SELECT id, entity_type, entity_name FROM sem_entity", &[])
-        .await
-        .context("Failed to query all entities")?;
-
-    println!("\nAll entities across both files ({} total):", result.len());
+        .execute(
+            "SELECT id, entity_type, entity_name FROM sem_entity WHERE lixcol_file_id = 'py-file-1'",
+            &[],
+        )
+        .await?;
+    println!("{} entities ({d:?})", result.len());
     for row in result.rows() {
-        let vals = row.values();
-        println!("  {:?}  {:?}  {:?}", vals[0], vals[1], vals[2]);
+        let v = row.values();
+        println!("     {:?} {:?}", v[1], v[2]);
+    }
+    timings.push(("Python new file (warm)", d));
+
+    // 6. Write Rust file
+    let rs_code = b"\
+pub struct Config {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Config {
+    pub fn new() -> Self {
+        Self {
+            host: \"localhost\".into(),
+            port: 8080,
+        }
     }
 
-    // 7. Modify the TypeScript file (update triggers diff)
-    println!("\nStep 7: Modifying TypeScript file...");
+    pub fn from_env() -> Self {
+        Self {
+            host: std::env::var(\"HOST\").unwrap_or_else(|_| \"0.0.0.0\".into()),
+            port: std::env::var(\"PORT\").ok().and_then(|p| p.parse().ok()).unwrap_or(3000),
+        }
+    }
+}
+
+pub trait Service {
+    fn name(&self) -> &str;
+    fn start(&self) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+pub fn start_server(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    println!(\"Starting on {}:{}\", config.host, config.port);
+    Ok(())
+}
+";
+
+    print!("6. Write Rust file (warm)... ");
+    let t = std::time::Instant::now();
+    lix.execute(
+        "INSERT INTO lix_file (id, path, data) VALUES ('rs-file-1', '/src/server.rs', $1)",
+        &[Value::Blob(rs_code.to_vec())],
+    )
+    .await?;
+    let d = t.elapsed();
+    let result = lix
+        .execute(
+            "SELECT id, entity_type, entity_name FROM sem_entity WHERE lixcol_file_id = 'rs-file-1'",
+            &[],
+        )
+        .await?;
+    println!("{} entities ({d:?})", result.len());
+    for row in result.rows() {
+        let v = row.values();
+        println!("     {:?} {:?}", v[1], v[2]);
+    }
+    timings.push(("Rust new file (warm)", d));
+
+    // 7. Write Go file
+    let go_code = b"\
+package main
+
+import (
+\t\"fmt\"
+\t\"net/http\"
+)
+
+type Server struct {
+\tHost string
+\tPort int
+}
+
+func NewServer(host string, port int) *Server {
+\treturn &Server{Host: host, Port: port}
+}
+
+func (s *Server) Start() error {
+\taddr := fmt.Sprintf(\"%s:%d\", s.Host, s.Port)
+\treturn http.ListenAndServe(addr, nil)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+\tw.WriteHeader(http.StatusOK)
+\tfmt.Fprintf(w, \"ok\")
+}
+";
+
+    print!("7. Write Go file (warm)... ");
+    let t = std::time::Instant::now();
+    lix.execute(
+        "INSERT INTO lix_file (id, path, data) VALUES ('go-file-1', '/cmd/server/main.go', $1)",
+        &[Value::Blob(go_code.to_vec())],
+    )
+    .await?;
+    let d = t.elapsed();
+    let result = lix
+        .execute(
+            "SELECT id, entity_type, entity_name FROM sem_entity WHERE lixcol_file_id = 'go-file-1'",
+            &[],
+        )
+        .await?;
+    println!("{} entities ({d:?})", result.len());
+    for row in result.rows() {
+        let v = row.values();
+        println!("     {:?} {:?}", v[1], v[2]);
+    }
+    timings.push(("Go new file (warm)", d));
+
+    // 8. Write Java file
+    let java_code = b"\
+public class UserRepository {
+    private final Map<String, User> users = new HashMap<>();
+
+    public User findById(String id) {
+        return users.get(id);
+    }
+
+    public List<User> findAll() {
+        return new ArrayList<>(users.values());
+    }
+
+    public User save(User user) {
+        users.put(user.getId(), user);
+        return user;
+    }
+
+    public void deleteById(String id) {
+        users.remove(id);
+    }
+}
+";
+
+    print!("8. Write Java file (warm)... ");
+    let t = std::time::Instant::now();
+    lix.execute(
+        "INSERT INTO lix_file (id, path, data) VALUES ('java-file-1', '/src/UserRepository.java', $1)",
+        &[Value::Blob(java_code.to_vec())],
+    )
+    .await?;
+    let d = t.elapsed();
+    let result = lix
+        .execute(
+            "SELECT id, entity_type, entity_name FROM sem_entity WHERE lixcol_file_id = 'java-file-1'",
+            &[],
+        )
+        .await?;
+    println!("{} entities ({d:?})", result.len());
+    for row in result.rows() {
+        let v = row.values();
+        println!("     {:?} {:?}", v[1], v[2]);
+    }
+    timings.push(("Java new file (warm)", d));
+
+    // 9. Modify TypeScript file (semantic diff)
     let ts_modified = r#"
 export function greet(name: string, greeting: string = "Hello"): string {
     return `${greeting}, ${name}!`;
@@ -515,32 +672,76 @@ interface User {
 }
 "#;
 
-    let start = std::time::Instant::now();
+    print!("9. Update TypeScript file (diff)... ");
+    let t = std::time::Instant::now();
     lix.execute(
         "UPDATE lix_file SET data = $1 WHERE id = 'ts-file-1'",
         &[Value::Blob(ts_modified.as_bytes().to_vec())],
     )
-    .await
-    .context("Failed to update file")?;
-    println!("File updated ({:?})", start.elapsed());
-
+    .await?;
+    let d = t.elapsed();
     let result = lix
         .execute(
             "SELECT id, entity_type, entity_name FROM sem_entity WHERE lixcol_file_id = 'ts-file-1'",
             &[],
         )
-        .await
-        .context("Failed to query updated entities")?;
+        .await?;
+    println!("{} entities ({d:?})", result.len());
+    timings.push(("TypeScript update (diff)", d));
 
-    println!("\nEntities after update ({} total):", result.len());
-    for row in result.rows() {
-        let vals = row.values();
-        println!("  {:?}  {:?}  {:?}", vals[0], vals[1], vals[2]);
+    // 10. Write a larger file (~200 lines)
+    let large_ts = generate_large_ts(50); // 50 functions ~200 lines
+    print!("10. Write large TS file (~{} bytes, 50 functions)... ", large_ts.len());
+    let t = std::time::Instant::now();
+    lix.execute(
+        "INSERT INTO lix_file (id, path, data) VALUES ('ts-large-1', '/src/large-module.ts', $1)",
+        &[Value::Blob(large_ts.into_bytes())],
+    )
+    .await?;
+    let d = t.elapsed();
+    let result = lix
+        .execute(
+            "SELECT count(*) FROM sem_entity WHERE lixcol_file_id = 'ts-large-1'",
+            &[],
+        )
+        .await?;
+    let count = result.rows()[0].values();
+    println!("{:?} entities ({d:?})", count[0]);
+    timings.push(("Large TS (50 fns)", d));
+
+    // 11. Query total entity count
+    let result = lix
+        .execute("SELECT count(*) FROM sem_entity", &[])
+        .await?;
+    let total = &result.rows()[0].values()[0];
+    println!("\nTotal entities in Lix: {:?}", total);
+
+    let total_time = total_start.elapsed();
+
+    // Summary
+    println!("\n========================================");
+    println!("  PERFORMANCE SUMMARY");
+    println!("========================================");
+    println!("{:<35} {:>12}", "Phase", "Duration");
+    println!("{:-<35} {:->12}", "", "");
+    for (label, duration) in &timings {
+        println!("{:<35} {:>12?}", label, duration);
     }
+    println!("{:-<35} {:->12}", "", "");
+    println!("{:<35} {:>12?}", "TOTAL", total_time);
+    println!("========================================");
 
-    // Cleanup
-    println!("\n=== Done ===");
     lix.close().await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
     Ok(())
+}
+
+fn generate_large_ts(num_functions: usize) -> String {
+    let mut code = String::new();
+    for i in 0..num_functions {
+        code.push_str(&format!(
+            "export function process_{i}(input: string): string {{\n    const trimmed = input.trim();\n    const result = trimmed.toUpperCase();\n    return result;\n}}\n\n"
+        ));
+    }
+    code
 }
