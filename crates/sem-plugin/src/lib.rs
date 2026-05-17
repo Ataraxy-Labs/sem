@@ -70,6 +70,7 @@ impl Guest for SemPlugin {
                     ChangeType::Deleted => None,
                     _ => {
                         let content = serde_json::json!({
+                            "id": c.entity_id,
                             "entity_type": c.entity_type,
                             "entity_name": c.entity_name,
                             "file_path": c.file_path,
