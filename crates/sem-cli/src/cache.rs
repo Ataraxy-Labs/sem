@@ -84,6 +84,7 @@ impl DiskCache {
             }
         }
 
+        // Insert entities with prepared statement (already in a transaction, so fast)
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -109,6 +110,7 @@ impl DiskCache {
             }
         }
 
+        // Insert edges with prepared statement
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
@@ -140,21 +142,30 @@ impl DiskCache {
             return None;
         }
 
+        // Load all cached mtimes in one query and validate against disk
         let mut stmt = self
             .conn
-            .prepare("SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1")
+            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
             .ok()?;
+        let cached_mtimes: HashMap<String, (i64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                ))
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+
         for file in files {
+            let (secs, nanos) = cached_mtimes.get(file.as_str()).copied()?;
             let full = root.join(file);
             let meta = std::fs::metadata(&full).ok()?;
             let mtime = meta.modified().ok()?;
             let dur = mtime
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-
-            let (secs, nanos): (i64, i64) = stmt
-                .query_row(params![file], |row| Ok((row.get(0)?, row.get(1)?)))
-                .ok()?;
             if secs != dur.as_secs() as i64 || nanos != dur.subsec_nanos() as i64 {
                 return None;
             }

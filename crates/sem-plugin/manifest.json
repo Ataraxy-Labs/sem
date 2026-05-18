@@ -1,0 +1,11 @@
+{
+  "key": "sem-semantic-diff",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {
+    "path_glob": "*.{ts,tsx,js,jsx,py,go,rs,java,rb,c,cpp,cs,php,kt,swift,ex,exs,sh,bash,tf,hcl,scala,zig,nix,dart,pl,ml,mli,svelte,vue}",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": ["schema/sem_entity.json"]
+}

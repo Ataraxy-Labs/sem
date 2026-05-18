@@ -1264,7 +1264,7 @@ set currentValue(int v) {
         );
         assert!(getter.unwrap().parent_id.is_none(), "Top-level getter should have no parent");
 
-        // tree-sitter-dart 0.1.0 parses top-level setters as function_signature
+        // tree-sitter-dart 0.2.0 parses top-level setters as function_signature
         // (treating `set` as a type_identifier). setter_signature is only
         // produced inside class_member → method_signature.
         let setter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "function");

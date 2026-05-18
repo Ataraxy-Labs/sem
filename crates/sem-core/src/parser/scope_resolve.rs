@@ -13,10 +13,21 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::model::entity::SemanticEntity;
+
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        { $slice.par_iter() }
+        #[cfg(not(feature = "parallel"))]
+        { $slice.iter() }
+    }};
+}
 use crate::parser::graph::{EntityInfo, RefType};
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
@@ -41,10 +52,10 @@ pub struct Scope {
 
 /// Reference found in the AST
 struct AstRef {
-    /// The entity this reference is inside of
-    from_entity_id: String,
     /// Kind of reference
     kind: AstRefKind,
+    /// Row (0-indexed) where this reference appears in the source
+    row: usize,
 }
 
 enum AstRefKind {
@@ -52,10 +63,6 @@ enum AstRefKind {
     Call(String),
     /// Attribute call: `x.method()`
     MethodCall { receiver: String, method: String },
-    /// Bare name reference: `Foo` (type annotation, class instantiation)
-    Name(String),
-    /// Attribute access: `x.field`
-    Attribute { receiver: String, attr: String },
 }
 
 /// Result of scope-aware resolution
@@ -80,6 +87,18 @@ pub struct ResolutionEntry {
 /// 2. Build a scope tree (module -> class -> function)
 /// 3. Walk entity AST subtrees to find reference nodes
 /// 4. Resolve each reference via scope chain + type tracking
+/// Pre-built lookup tables that can be shared between `EntityGraph::build()` and
+/// `resolve_with_scopes()` to avoid redundant O(E) passes.
+pub(crate) struct PreBuiltLookups {
+    pub(crate) symbol_table: Arc<HashMap<String, Vec<String>>>,
+    pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
+    pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
+    /// Go package index: pkg_name → [(entity_name, entity_id)]
+    /// Avoids O(symbol_table) scan per Go import.
+    pub(crate) go_pkg_index: HashMap<String, Vec<(String, String)>>,
+}
+
+/// Public API — preserves the original 5-parameter signature for semver compatibility.
 pub fn resolve_with_scopes(
     root: &Path,
     file_paths: &[String],
@@ -87,56 +106,88 @@ pub fn resolve_with_scopes(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
 ) -> ScopeResult {
+    resolve_with_scopes_full(root, file_paths, all_entities, entity_map, pre_parsed, None)
+}
+
+/// Internal version with pre-built lookups for performance.
+pub(crate) fn resolve_with_scopes_full(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+    pre_built: Option<PreBuiltLookups>,
+) -> ScopeResult {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
 
-    // Build global lookups
-    let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-    for entity in all_entities {
-        symbol_table
-            .entry(entity.name.clone())
-            .or_default()
-            .push(entity.id.clone());
-    }
+    // Use pre-built lookups if provided, otherwise build from scratch
+    let (symbol_table, class_members, entity_ranges, go_pkg_index) = if let Some(pb) = pre_built {
+        (pb.symbol_table, pb.class_members, pb.entity_ranges, pb.go_pkg_index)
+    } else {
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
+        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
-    // class_name -> [(member_name, member_entity_id)]
-    let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for entity in all_entities {
-        if let Some(ref pid) = entity.parent_id {
-            if let Some(parent) = entity_map.get(pid) {
-                if matches!(
-                    parent.entity_type.as_str(),
-                    "class" | "struct" | "interface" | "impl"
-                ) {
+        for entity in all_entities {
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+
+            if let Some(ref pid) = entity.parent_id {
+                if let Some(parent) = entity_map.get(pid) {
+                    if matches!(
+                        parent.entity_type.as_str(),
+                        "class" | "struct" | "interface" | "impl"
+                    ) {
+                        class_members
+                            .entry(parent.name.clone())
+                            .or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
                     class_members
-                        .entry(parent.name.clone())
+                        .entry(struct_name)
                         .or_default()
                         .push((entity.name.clone(), entity.id.clone()));
                 }
             }
-        }
-    }
 
-    // Go: methods are declared at file level with receiver syntax, not inside structs.
-    // Parse the receiver to populate class_members.
-    for entity in all_entities {
-        if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
-            if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
-                class_members
-                    .entry(struct_name)
-                    .or_default()
-                    .push((entity.name.clone(), entity.id.clone()));
-            }
+            entity_ranges
+                .entry(entity.file_path.clone())
+                .or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
-    }
 
-    // Entity line ranges for mapping AST nodes back to entities
-    let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        // Build Go package index for O(1) import lookup
+        let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
+
+        (Arc::new(symbol_table), class_members, entity_ranges, go_pkg_index)
+    };
+
+    // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
+    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
     for entity in all_entities {
-        entity_ranges
-            .entry(entity.file_path.clone())
+        entities_by_file
+            .entry(entity.file_path.as_str())
             .or_default()
-            .push((entity.start_line, entity.end_line, entity.id.clone()));
+            .push(entity);
+    }
+
+    // Build parent_id indexed entity lookup: parent_id -> Vec<&SemanticEntity>
+    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for entity in all_entities {
+        if let Some(ref pid) = entity.parent_id {
+            children_by_parent
+                .entry(pid.as_str())
+                .or_default()
+                .push(entity);
+        }
     }
 
     // Return type map: function_entity_id -> class_name (if function returns ClassName())
@@ -188,34 +239,54 @@ pub fn resolve_with_scopes(
 
     // Pass 1: Scan ALL files for return types and instance attr types first
     // This ensures cross-file return type info is available during resolution
-    for (file_path, content, tree) in parsed_files {
-        let source = content.as_bytes();
-        let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-        let config = match get_language_config(ext).and_then(|c| c.scope_resolve) {
-            Some(c) => c,
-            None => continue,
-        };
+    // Parallelized: each file produces local maps, then merged sequentially.
+    let pass1_results: Vec<(
+        HashMap<String, String>,
+        HashMap<(String, String), String>,
+        HashMap<String, Vec<String>>,
+        HashMap<(String, String), String>,
+    )> = maybe_par_iter!(parsed_files)
+        .filter_map(|(file_path, content, tree)| {
+            let source = content.as_bytes();
+            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+            let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
 
-        scan_return_types(
-            tree.root_node(),
-            file_path,
-            all_entities,
-            source,
-            &mut return_type_map,
-            config,
-        );
+            let file_entities = entities_by_file.get(file_path.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
 
-        scan_init_self_attrs(
-            tree.root_node(),
-            file_path,
-            all_entities,
-            entity_map,
-            source,
-            &mut instance_attr_types,
-            &mut init_params,
-            &mut attr_to_param,
-            config,
-        );
+            let mut local_return_type_map: HashMap<String, String> = HashMap::new();
+            scan_return_types(
+                tree.root_node(),
+                file_path,
+                file_entities,
+                source,
+                &mut local_return_type_map,
+                config,
+            );
+
+            let mut local_instance_attr_types: HashMap<(String, String), String> = HashMap::new();
+            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::new();
+            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::new();
+            scan_init_self_attrs(
+                tree.root_node(),
+                file_path,
+                file_entities,
+                entity_map,
+                source,
+                &mut local_instance_attr_types,
+                &mut local_init_params,
+                &mut local_attr_to_param,
+                config,
+            );
+
+            Some((local_return_type_map, local_instance_attr_types, local_init_params, local_attr_to_param))
+        })
+        .collect();
+
+    for (local_rtm, local_iat, local_ip, local_atp) in pass1_results {
+        return_type_map.extend(local_rtm);
+        instance_attr_types.extend(local_iat);
+        init_params.extend(local_ip);
+        attr_to_param.extend(local_atp);
     }
 
     // Pass 1b: Infer constructor parameter types from call sites
@@ -232,8 +303,7 @@ pub fn resolve_with_scopes(
     );
 
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
-    let per_file_results: Vec<(Vec<(String, String, RefType)>, Vec<ResolutionEntry>)> = parsed_files
-        .par_iter()
+    let per_file_results: Vec<(Vec<(String, String, RefType)>, Vec<ResolutionEntry>)> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
             let source = content.as_bytes();
             let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
@@ -262,13 +332,20 @@ pub fn resolve_with_scopes(
                 }
             }
 
+            let file_entities: Vec<&SemanticEntity> = entities_by_file
+                .get(file_path.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .to_vec();
+
             build_scopes_from_ast(
                 tree.root_node(),
                 0,
                 &mut scopes,
                 &mut entity_scope_map,
                 &mut entity_inner_scope,
-                all_entities,
+                &file_entities,
+                &children_by_parent,
                 entity_map,
                 file_path,
                 source,
@@ -285,6 +362,7 @@ pub fn resolve_with_scopes(
                 &mut local_import_table,
                 &mut scopes,
                 config,
+                &go_pkg_index,
             );
 
             // Resolve pending call types using the complete return type map
@@ -297,13 +375,11 @@ pub fn resolve_with_scopes(
                 entity_map,
             );
 
-            let file_entities: Vec<&SemanticEntity> = all_entities
-                .iter()
-                .filter(|e| e.file_path == *file_path)
-                .collect();
-
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
+
+            // Walk the AST once for the entire file, collecting all refs with row positions
+            let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
 
             for entity in &file_entities {
                 let scope_idx = entity_inner_scope
@@ -312,16 +388,22 @@ pub fn resolve_with_scopes(
                     .copied()
                     .unwrap_or(0);
 
-                let refs = extract_ast_refs(
-                    tree.root_node(),
-                    entity,
-                    source,
-                    config,
-                );
+                let start_row = entity.start_line.saturating_sub(1); // 1-indexed to 0-indexed
+                let end_row = entity.end_line; // exclusive
 
-                for ast_ref in refs {
+                // Filter pre-collected refs to this entity's line range
+                for ast_ref in all_file_refs.iter().filter(|r| r.row >= start_row && r.row < end_row) {
+                    // Skip self-name refs (was previously done during collection)
+                    let is_self_ref = match &ast_ref.kind {
+                        AstRefKind::Call(name) => name == &entity.name,
+                        AstRefKind::MethodCall { .. } => false,
+                    };
+                    if is_self_ref {
+                        continue;
+                    }
+
                     let resolution = resolve_ref(
-                        &ast_ref,
+                        ast_ref,
                         scope_idx,
                         &scopes,
                         &symbol_table,
@@ -348,7 +430,7 @@ pub fn resolve_with_scopes(
                                 ));
                                 file_log.push(ResolutionEntry {
                                     from_entity: entity.id.clone(),
-                                    reference: ref_description(&ast_ref),
+                                    reference: ref_description(ast_ref),
                                     resolved_to: Some(target_id),
                                     method,
                                 });
@@ -357,7 +439,7 @@ pub fn resolve_with_scopes(
                     } else {
                         file_log.push(ResolutionEntry {
                             from_entity: entity.id.clone(),
-                            reference: ref_description(&ast_ref),
+                            reference: ref_description(ast_ref),
                             resolved_to: None,
                             method: "unresolved",
                         });
@@ -375,8 +457,17 @@ pub fn resolve_with_scopes(
     }
 
     // Deduplicate edges
-    let mut seen = std::collections::HashSet::new();
-    all_edges.retain(|e| seen.insert((e.0.clone(), e.1.clone())));
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::with_capacity(all_edges.len());
+    let deduped_edges: Vec<(String, String, RefType)> = {
+        let mut result = Vec::with_capacity(all_edges.len());
+        for edge in all_edges {
+            if seen.insert((edge.0.clone(), edge.1.clone())) {
+                result.push(edge);
+            }
+        }
+        result
+    };
+    let all_edges = deduped_edges;
 
     ScopeResult {
         edges: all_edges,
@@ -388,8 +479,6 @@ fn ref_description(ast_ref: &AstRef) -> String {
     match &ast_ref.kind {
         AstRefKind::Call(name) => format!("{}()", name),
         AstRefKind::MethodCall { receiver, method } => format!("{}.{}()", receiver, method),
-        AstRefKind::Name(name) => name.clone(),
-        AstRefKind::Attribute { receiver, attr } => format!("{}.{}", receiver, attr),
     }
 }
 
@@ -403,9 +492,10 @@ fn build_scopes_from_ast(
     scopes: &mut Vec<Scope>,
     entity_scope_map: &mut HashMap<String, usize>,
     entity_inner_scope: &mut HashMap<String, usize>,
-    all_entities: &[SemanticEntity],
+    file_entities: &[&SemanticEntity],
+    children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
     entity_map: &HashMap<String, EntityInfo>,
-    file_path: &str,
+    _file_path: &str,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) {
@@ -455,11 +545,10 @@ fn build_scopes_from_ast(
                 }
             };
 
-            let class_entity = all_entities.iter().find(|e| {
-                e.file_path == file_path
-                    && e.name == class_name
+            let class_entity = file_entities.iter().find(|e| {
+                e.name == class_name
                     && matches!(e.entity_type.as_str(), "class" | "struct" | "interface")
-            });
+            }).copied();
 
             if let Some(ce) = class_entity {
                 let existing_scope = entity_inner_scope.get(&ce.id).copied();
@@ -481,8 +570,8 @@ fn build_scopes_from_ast(
                     idx
                 };
 
-                for entity in all_entities {
-                    if entity.parent_id.as_ref() == Some(&ce.id) {
+                if let Some(children) = children_by_parent.get(ce.id.as_str()) {
+                    for entity in children {
                         scopes[class_scope_idx]
                             .defs
                             .insert(entity.name.clone(), entity.id.clone());
@@ -550,12 +639,12 @@ fn build_scopes_from_ast(
                 kind: "function",
             });
 
-            let func_entity = all_entities.iter().find(|e| {
-                e.file_path == file_path && e.name == func_name && {
+            let func_entity = file_entities.iter().find(|e| {
+                e.name == func_name && {
                     let line = node.start_position().row + 1;
                     e.start_line <= line && line <= e.end_line
                 }
-            });
+            }).copied();
 
             if let Some(fe) = func_entity {
                 scopes[func_scope_idx].owner_id = Some(fe.id.clone());
@@ -1075,7 +1164,7 @@ fn extract_base_type(type_node: tree_sitter::Node, source: &[u8]) -> String {
 }
 
 /// Parse Go receiver type from method content: `func (r *ReceiverType) Name(...)`
-fn extract_go_receiver_type(content: &str) -> Option<String> {
+pub fn extract_go_receiver_type(content: &str) -> Option<String> {
     let after_func = content.strip_prefix("func")?.trim_start();
     let paren_start = after_func.find('(')?;
     let paren_end = after_func.find(')')?;
@@ -1091,11 +1180,50 @@ fn extract_go_receiver_type(content: &str) -> Option<String> {
     }
 }
 
+/// Build Go package index: pkg_name → [(entity_name, entity_id)]
+/// Maps file stems and parent directory names to entities for O(1) package import lookup.
+fn build_go_pkg_index(
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> HashMap<String, Vec<(String, String)>> {
+    let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (name, target_ids) in symbol_table.iter() {
+        for target_id in target_ids {
+            if let Some(entity) = entity_map.get(target_id) {
+                if !entity.file_path.ends_with(".go") {
+                    continue;
+                }
+                let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
+                let file_stem = file_stem.strip_suffix(".go").unwrap_or(file_stem);
+                idx.entry(file_stem.to_string())
+                    .or_default()
+                    .push((name.clone(), target_id.clone()));
+                if let Some(parent_start) = entity.file_path.rfind('/') {
+                    let parent_path = &entity.file_path[..parent_start];
+                    if let Some(dir_name_start) = parent_path.rfind('/') {
+                        let dir_name = &parent_path[dir_name_start + 1..];
+                        if dir_name != file_stem {
+                            idx.entry(dir_name.to_string())
+                                .or_default()
+                                .push((name.clone(), target_id.clone()));
+                        }
+                    } else if !parent_path.is_empty() && parent_path != file_stem {
+                        idx.entry(parent_path.to_string())
+                            .or_default()
+                            .push((name.clone(), target_id.clone()));
+                    }
+                }
+            }
+        }
+    }
+    idx
+}
+
 /// Scan function bodies/signatures for return types to build a return type map.
 fn scan_return_types(
     root: tree_sitter::Node,
-    file_path: &str,
-    all_entities: &[SemanticEntity],
+    _file_path: &str,
+    file_entities: &[&SemanticEntity],
     source: &[u8],
     return_type_map: &mut HashMap<String, String>,
     config: &ScopeResolveConfig,
@@ -1112,12 +1240,12 @@ fn scan_return_types(
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("");
 
-            let func_entity = all_entities.iter().find(|e| {
-                e.file_path == file_path && e.name == func_name && {
+            let func_entity = file_entities.iter().find(|e| {
+                e.name == func_name && {
                     let line = node.start_position().row + 1;
                     e.start_line <= line && line <= e.end_line
                 }
-            });
+            }).copied();
 
             if let Some(fe) = func_entity {
                 // Try explicit return type annotation first
@@ -1200,9 +1328,9 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
 /// struct field declarations (Rust/Go).
 fn scan_init_self_attrs(
     root: tree_sitter::Node,
-    file_path: &str,
-    all_entities: &[SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    _file_path: &str,
+    _file_entities: &[&SemanticEntity],
+    _entity_map: &HashMap<String, EntityInfo>,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
     init_params_map: &mut HashMap<String, Vec<String>>,
@@ -1648,7 +1776,7 @@ fn infer_constructor_param_types(
     return_type_map: &HashMap<String, String>,
     init_params: &HashMap<String, Vec<String>>,
     attr_to_param: &HashMap<(String, String), String>,
-    symbol_table: &HashMap<String, Vec<String>>,
+    _symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
@@ -1661,16 +1789,27 @@ fn infer_constructor_param_types(
     }
 
     // Scan all files for constructor call sites: ClassName(arg1, arg2, ...)
-    for (_file_path, content, tree) in parsed_files {
-        let source = content.as_bytes();
-        scan_constructor_calls(
-            tree.root_node(),
-            source,
-            &func_name_returns,
-            init_params,
-            attr_to_param,
-            instance_attr_types,
-        );
+    // Parallelized: each file produces local results, then merged.
+    let local_results: Vec<HashMap<(String, String), String>> = maybe_par_iter!(parsed_files)
+        .map(|(_file_path, content, tree)| {
+            let source = content.as_bytes();
+            let mut local_attr_types: HashMap<(String, String), String> = HashMap::new();
+            scan_constructor_calls(
+                tree.root_node(),
+                source,
+                &func_name_returns,
+                init_params,
+                attr_to_param,
+                &mut local_attr_types,
+            );
+            local_attr_types
+        })
+        .collect();
+
+    for local in local_results {
+        for (key, val) in local {
+            instance_attr_types.entry(key).or_insert(val);
+        }
     }
 }
 
@@ -1820,6 +1959,7 @@ fn extract_imports_from_ast(
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     config: &ScopeResolveConfig,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -1841,7 +1981,7 @@ fn extract_imports_from_ast(
                     true
                 }
                 "import_declaration" => {
-                    extract_go_import(child, file_path, source, symbol_table, entity_map, import_table, scopes);
+                    extract_go_import(child, file_path, source, symbol_table, entity_map, import_table, scopes, go_pkg_index);
                     true
                 }
                 _ => false,
@@ -1999,16 +2139,17 @@ fn extract_go_import(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "import_spec" || child.kind() == "import_spec_list" {
-            extract_go_import_specs(child, file_path, source, symbol_table, entity_map, import_table, scopes);
+            extract_go_import_specs(child, file_path, source, symbol_table, entity_map, import_table, scopes, go_pkg_index);
         } else if child.kind() == "interpreted_string_literal" || child.kind() == "raw_string_literal" {
             let path = child.utf8_text(source).unwrap_or("")
                 .trim_matches('"').trim_matches('`');
             let pkg_name = path.rsplit('/').next().unwrap_or(path);
-            register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes);
+            register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes, go_pkg_index);
         }
     }
 }
@@ -2021,6 +2162,7 @@ fn extract_go_import_specs(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -2033,7 +2175,7 @@ fn extract_go_import_specs(
                     let path = pn.utf8_text(source).unwrap_or("")
                         .trim_matches('"').trim_matches('`');
                     let pkg_name = path.rsplit('/').next().unwrap_or(path);
-                    register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes);
+                    register_go_package_imports(pkg_name, file_path, symbol_table, entity_map, import_table, scopes, go_pkg_index);
                 }
             } else {
                 worklist.push(child);
@@ -2045,25 +2187,21 @@ fn extract_go_import_specs(
 fn register_go_package_imports(
     pkg_name: &str,
     file_path: &str,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    _symbol_table: &HashMap<String, Vec<String>>,
+    _entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
 ) {
-    for (name, target_ids) in symbol_table {
-        for target_id in target_ids {
-            if let Some(entity) = entity_map.get(target_id) {
-                let stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
-                let stem = stem.strip_suffix(".go").unwrap_or(stem);
-                if stem == pkg_name || entity.file_path.contains(&format!("{}/", pkg_name)) {
-                    import_table.insert(
-                        (file_path.to_string(), name.clone()),
-                        target_id.clone(),
-                    );
-                    if !scopes.is_empty() {
-                        scopes[0].defs.insert(name.clone(), target_id.clone());
-                    }
-                }
+    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan
+    if let Some(entries) = go_pkg_index.get(pkg_name) {
+        for (name, target_id) in entries {
+            import_table.insert(
+                (file_path.to_string(), name.clone()),
+                target_id.clone(),
+            );
+            if !scopes.is_empty() {
+                scopes[0].defs.insert(name.clone(), target_id.clone());
             }
         }
     }
@@ -2189,40 +2327,17 @@ fn extract_python_import(
     }
 }
 
-/// Extract AST references from an entity's line range.
-fn extract_ast_refs(
+/// Collect ALL AST references in a file with a single tree walk.
+/// Each ref records its row so callers can bucket refs into entities by line range.
+fn collect_all_file_refs(
     root: tree_sitter::Node,
-    entity: &SemanticEntity,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) -> Vec<AstRef> {
     let mut refs = Vec::new();
-    let start_row = entity.start_line.saturating_sub(1); // 1-indexed to 0-indexed
-    let end_row = entity.end_line; // exclusive
-
-    collect_refs_in_range(root, start_row, end_row, &entity.id, &entity.name, source, &mut refs, config);
-    refs
-}
-
-fn collect_refs_in_range(
-    root: tree_sitter::Node,
-    start_row: usize,
-    end_row: usize,
-    entity_id: &str,
-    entity_name: &str,
-    source: &[u8],
-    refs: &mut Vec<AstRef>,
-    config: &ScopeResolveConfig,
-) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
-        let node_start = node.start_position().row;
-        let node_end = node.end_position().row;
-
-        if node_end < start_row || node_start >= end_row {
-            continue;
-        }
-
+        let node_row = node.start_position().row;
         let kind = node.kind();
 
         // Call nodes (e.g. "call", "call_expression", "method_invocation")
@@ -2230,34 +2345,31 @@ fn collect_refs_in_range(
             match &config.call_style {
                 CallNodeStyle::FunctionField(field) => {
                     if let Some(func) = node.child_by_field_name(field) {
-                        extract_call_ref(func, entity_id, entity_name, source, refs, config);
+                        // Pass empty entity_name — self-ref filtering is done at resolution time
+                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
                     }
                 }
                 CallNodeStyle::DirectMethod { object_field, method_field } => {
                     let method_name = node.child_by_field_name(method_field)
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("");
-                    if !method_name.is_empty() && method_name != entity_name && !is_builtin(method_name, config) {
+                    if !method_name.is_empty() && !is_builtin(method_name, config) {
                         if let Some(obj_node) = node.child_by_field_name(object_field) {
                             let receiver = obj_node.utf8_text(source).unwrap_or("").to_string();
-                            // Strip trailing dots/operators
                             let receiver = receiver.trim_end_matches('.').to_string();
                             refs.push(AstRef {
-                                from_entity_id: entity_id.to_string(),
                                 kind: AstRefKind::MethodCall { receiver, method: method_name.to_string() },
+                                row: node_row,
                             });
                         } else {
-                            // Bare call (no object)
                             refs.push(AstRef {
-                                from_entity_id: entity_id.to_string(),
                                 kind: AstRefKind::Call(method_name.to_string()),
+                                row: node_row,
                             });
                         }
                     }
                 }
             }
-            // Recurse into ALL children (not just arguments) so chained calls
-            // like foo().bar().baz() and closures in receiver position are found.
             let mut cursor = node.walk();
             let children: Vec<_> = node.named_children(&mut cursor).collect();
             for child in children.into_iter().rev() {
@@ -2270,12 +2382,11 @@ fn collect_refs_in_range(
         if config.new_expr_nodes.contains(&kind) {
             if let Some(type_node) = node.child_by_field_name(config.new_expr_type_field) {
                 let name = type_node.utf8_text(source).unwrap_or("");
-                // For Java/C#, the type field might contain a full qualified name; take the last part
                 let name = name.rsplit('.').next().unwrap_or(name);
-                if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
+                if !name.is_empty() && !is_builtin(name, config) {
                     refs.push(AstRef {
-                        from_entity_id: entity_id.to_string(),
                         kind: AstRefKind::Call(name.to_string()),
+                        row: node_row,
                     });
                 }
             }
@@ -2292,12 +2403,11 @@ fn collect_refs_in_range(
             if let Some(type_node) = node.child_by_field_name("type") {
                 let name = type_node.utf8_text(source).unwrap_or("");
                 if name.chars().next().map_or(false, |c| c.is_uppercase())
-                    && name != entity_name
                     && !is_builtin(name, config)
                 {
                     refs.push(AstRef {
-                        from_entity_id: entity_id.to_string(),
                         kind: AstRefKind::Call(name.to_string()),
+                        row: node_row,
                     });
                 }
             }
@@ -2310,16 +2420,18 @@ fn collect_refs_in_range(
             worklist.push(child);
         }
     }
+    refs
 }
 
 /// Extract a call reference from a function/callee node (shared across languages)
 fn extract_call_ref(
     func: tree_sitter::Node,
-    entity_id: &str,
+    _entity_id: &str,
     entity_name: &str,
     source: &[u8],
     refs: &mut Vec<AstRef>,
     config: &ScopeResolveConfig,
+    row: usize,
 ) {
     let func_kind = func.kind();
 
@@ -2327,8 +2439,8 @@ fn extract_call_ref(
         let name = func.utf8_text(source).unwrap_or("");
         if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
             refs.push(AstRef {
-                from_entity_id: entity_id.to_string(),
                 kind: AstRefKind::Call(name.to_string()),
+                row,
             });
         }
         return;
@@ -2337,7 +2449,7 @@ fn extract_call_ref(
     // Check config member_access patterns
     for ma in config.member_access {
         if func_kind == ma.node_kind {
-            extract_member_call_ref(func, ma.object_field, ma.property_field, entity_id, source, refs);
+            extract_member_call_ref(func, ma.object_field, ma.property_field, source, refs, row);
             return;
         }
     }
@@ -2351,15 +2463,15 @@ fn extract_call_ref(
             let method_name = parts[parts.len() - 1];
             if !type_name.is_empty() && !method_name.is_empty() {
                 refs.push(AstRef {
-                    from_entity_id: entity_id.to_string(),
                     kind: AstRefKind::Call(method_name.to_string()),
+                    row,
                 });
                 if type_name.chars().next().map_or(false, |c| c.is_uppercase())
                     && !is_builtin(type_name, config)
                 {
                     refs.push(AstRef {
-                        from_entity_id: entity_id.to_string(),
                         kind: AstRefKind::Call(type_name.to_string()),
+                        row,
                     });
                 }
             }
@@ -2372,9 +2484,9 @@ fn extract_member_call_ref(
     node: tree_sitter::Node,
     object_field: &str,
     attr_field: &str,
-    entity_id: &str,
     source: &[u8],
     refs: &mut Vec<AstRef>,
+    row: usize,
 ) {
     let obj = node
         .child_by_field_name(object_field)
@@ -2385,17 +2497,17 @@ fn extract_member_call_ref(
         .and_then(|n| n.utf8_text(source).ok())
         .unwrap_or("");
     if !obj.is_empty() && !attr.is_empty() {
-        push_method_call_ref(obj, attr, entity_id, refs);
+        push_method_call_ref(obj, attr, refs, row);
     }
 }
 
-fn push_method_call_ref(obj: &str, method: &str, entity_id: &str, refs: &mut Vec<AstRef>) {
+fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>, row: usize) {
     refs.push(AstRef {
-        from_entity_id: entity_id.to_string(),
         kind: AstRefKind::MethodCall {
             receiver: obj.to_string(),
             method: method.to_string(),
         },
+        row,
     });
 }
 
@@ -2548,29 +2660,6 @@ fn resolve_ref(
                 return Some((target_id.clone(), RefType::Calls, "import"));
             }
 
-            None
-        }
-
-        AstRefKind::Name(name) => {
-            if let Some(eid) = lookup_scope_chain(scope_idx, scopes, name) {
-                return Some((eid, RefType::TypeRef, "scope_chain"));
-            }
-            let key = (file_path.to_string(), name.clone());
-            if let Some(target_id) = import_table.get(&key) {
-                return Some((target_id.clone(), RefType::Imports, "import"));
-            }
-            None
-        }
-
-        AstRefKind::Attribute { receiver, attr } => {
-            let receiver_type = lookup_type_in_scopes(scope_idx, scopes, receiver);
-            if let Some(class_name) = receiver_type {
-                if let Some(members) = class_members.get(class_name.as_str()) {
-                    if let Some((_, mid)) = members.iter().find(|(n, _)| n == attr) {
-                        return Some((mid.clone(), RefType::Calls, "type_tracking"));
-                    }
-                }
-            }
             None
         }
     }

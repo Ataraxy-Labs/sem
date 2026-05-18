@@ -84,21 +84,6 @@ fn find_supported_files(root: &Path, registry: &ParserRegistry, ext_filter: &[St
     files
 }
 
-/// Extract all entities from the given files in parallel.
-pub fn extract_all_entities(root: &Path, file_paths: &[String], registry: &ParserRegistry) -> Vec<SemanticEntity> {
-    file_paths
-        .iter()
-        .flat_map(|fp| {
-            let full = root.join(fp);
-            let content = match std::fs::read_to_string(&full) {
-                Ok(c) => c,
-                Err(_) => return Vec::new(),
-            };
-            registry.extract_entities(fp, &content)
-        })
-        .collect()
-}
-
 /// Build the entity graph + entities, using the disk cache when possible.
 /// Tries: full cache hit → incremental rebuild (stale files only) → full rebuild.
 pub fn get_or_build_graph(

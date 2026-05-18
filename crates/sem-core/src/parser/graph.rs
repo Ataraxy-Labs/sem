@@ -9,11 +9,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// Helper macro to select parallel or sequential iteration based on feature flag.
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        { $slice.par_iter() }
+        #[cfg(not(feature = "parallel"))]
+        { $slice.iter() }
+    }};
+}
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
@@ -103,8 +114,7 @@ impl EntityGraph {
     ) -> (Self, Vec<SemanticEntity>) {
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Also collect (file_path, content, tree) for scope_resolve reuse
-        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = file_paths
-            .par_iter()
+        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = maybe_par_iter!(file_paths)
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
@@ -123,9 +133,15 @@ impl EntityGraph {
             }
         }
 
-        // Build symbol table: name → entity IDs (can be multiple with same name)
+        // Pass A: Build all lookup structures in a single pass over all_entities.
+        // This merges what was previously 6 separate O(E) iterations.
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
         let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
+        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
+        let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
+        let mut class_entity_names: HashSet<&str> = HashSet::new();
+        let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
         for entity in &all_entities {
             symbol_table
@@ -145,42 +161,27 @@ impl EntityGraph {
                     end_line: entity.end_line,
                 },
             );
+
+            if let Some(ref pid) = entity.parent_id {
+                parent_child_pairs.insert((pid.as_str(), entity.id.as_str()));
+                class_child_names.insert((pid.as_str(), entity.name.as_str()));
+            }
+
+            if matches!(entity.entity_type.as_str(), "class" | "struct" | "interface" | "class_type") {
+                class_entity_names.insert(entity.name.as_str());
+            }
+
+            id_to_name.insert(entity.id.as_str(), entity.name.as_str());
+
+            scope_entity_ranges.entry(entity.file_path.clone()).or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
 
-        // Build parent-child set for skipping class→method self-edges
-        let parent_child_pairs: HashSet<(&str, &str)> = all_entities
-            .iter()
-            .filter_map(|e| {
-                e.parent_id.as_ref().map(|pid| (pid.as_str(), e.id.as_str()))
-            })
-            .collect();
-
-        // Build set of (class_id, child_method_name) so classes skip refs to their own methods
-        let class_child_names: HashSet<(&str, &str)> = all_entities
-            .iter()
-            .filter_map(|e| {
-                e.parent_id.as_ref().map(|pid| (pid.as_str(), e.name.as_str()))
-            })
-            .collect();
-
-        // Build class-related maps for dot-chain resolution
-        // class_entity_names: all class/struct/interface entity names
-        let class_entity_names: HashSet<&str> = all_entities
-            .iter()
-            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
-            .map(|e| e.name.as_str())
-            .collect();
-
-        // id_to_name: quick lookup for parent name resolution
-        let id_to_name: HashMap<&str, &str> = all_entities
-            .iter()
-            .map(|e| (e.id.as_str(), e.name.as_str()))
-            .collect();
-
-        // enclosing_class: entity_id → class_name (for self/this resolution)
-        // class_members: class_name → [(member_name, member_entity_id)]
+        // Pass B: Build enclosing_class, class_members, and scope_class_members
+        // (depends on id_to_name, class_entity_names, and entity_map from Pass A)
         let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
         let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
@@ -193,12 +194,69 @@ impl EntityGraph {
                             .push((entity.name.as_str(), entity.id.as_str()));
                     }
                 }
+                // scope_class_members for scope resolver (checks entity_type of parent)
+                if let Some(parent) = entity_map.get(pid.as_str()) {
+                    if matches!(parent.entity_type.as_str(), "class" | "struct" | "interface" | "impl") {
+                        scope_class_members.entry(parent.name.clone()).or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+            // Go receiver-based methods
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content) {
+                    scope_class_members.entry(struct_name).or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                }
             }
         }
 
         // Build import table: (file_path, imported_name) → target entity ID
         // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
-        let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map);
+        let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map, Some(&parsed_files));
+        // Build owned Go package index for scope resolver
+        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> = if file_paths.iter().any(|f| f.ends_with(".go")) {
+            let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            for (name, target_ids) in symbol_table.iter() {
+                for target_id in target_ids {
+                    if let Some(entity) = entity_map.get(target_id) {
+                        let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
+                        let file_stem = strip_file_ext(file_stem);
+                        idx.entry(file_stem.to_string())
+                            .or_default()
+                            .push((name.clone(), target_id.clone()));
+                        if let Some(parent_start) = entity.file_path.rfind('/') {
+                            let parent_path = &entity.file_path[..parent_start];
+                            if let Some(dir_name_start) = parent_path.rfind('/') {
+                                let dir_name = &parent_path[dir_name_start + 1..];
+                                if dir_name != file_stem {
+                                    idx.entry(dir_name.to_string())
+                                        .or_default()
+                                        .push((name.clone(), target_id.clone()));
+                                }
+                            } else if !parent_path.is_empty() && parent_path != file_stem {
+                                idx.entry(parent_path.to_string())
+                                    .or_default()
+                                    .push((name.clone(), target_id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            idx
+        } else {
+            HashMap::new()
+        };
+
+        // Wrap symbol_table in Arc to avoid expensive deep clone (621K entries)
+        let symbol_table = Arc::new(symbol_table);
+
+        let pre_built = scope_resolve::PreBuiltLookups {
+            symbol_table: Arc::clone(&symbol_table),
+            class_members: scope_class_members,
+            entity_ranges: scope_entity_ranges,
+            go_pkg_index: owned_go_pkg_index,
+        };
 
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
@@ -208,7 +266,7 @@ impl EntityGraph {
                 .is_some()
         });
         let (scope_edges, scope_resolved_entities) = if has_scope_lang {
-            let result = scope_resolve::resolve_with_scopes(root, file_paths, &all_entities, &entity_map, Some(parsed_files));
+            let result = scope_resolve::resolve_with_scopes_full(root, file_paths, &all_entities, &entity_map, Some(parsed_files), Some(pre_built));
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
@@ -221,19 +279,28 @@ impl EntityGraph {
         // Phase 1: Dot-chain resolution (precise self.X, this.X, ClassName.X)
         // Phase 2: Bag-of-words resolution (existing logic, skipping consumed words)
         // Skip entities already resolved by scope resolver (Python files)
-        let resolved_refs: Vec<(String, String, RefType)> = all_entities
-            .par_iter()
+        // Skip entities from non-code file types (JSON, SQL, etc.) that can't produce edges
+        let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
             .flat_map(|entity| {
                 // Skip entities already resolved by scope resolver
                 if scope_resolved_entities.contains(&entity.id) {
                     return vec![];
                 }
 
+                // Skip entities from file types that don't have language configs
+                // (JSON, SQL, YAML, etc. — they extract entities but never produce reference edges)
+                let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
+                if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
+                    return vec![];
+                }
+
                 let mut entity_edges = Vec::new();
                 let mut consumed_words: HashSet<String> = HashSet::new();
 
-                // Phase 1: Dot-chain resolution
+                // Strip comments/strings once, reuse for both dot-chain and bag-of-words
                 let stripped = strip_comments_and_strings(&entity.content);
+
+                // Phase 1: Dot-chain resolution
                 let dot_chains = extract_dot_chains(&stripped);
 
                 for (receiver, member) in &dot_chains {
@@ -275,7 +342,8 @@ impl EntityGraph {
                 }
 
                 // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
-                let refs = extract_references_from_content(&entity.content, &entity.name);
+                // Reuse the stripped content to avoid stripping twice
+                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -337,10 +405,15 @@ impl EntityGraph {
             .collect();
 
         // Merge scope edges with bag-of-words edges, deduplicating
-        let mut all_resolved: Vec<(String, String, RefType)> = scope_edges;
-        all_resolved.extend(resolved_refs);
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        all_resolved.retain(|e| seen_edges.insert((e.0.clone(), e.1.clone())));
+        let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(resolved_refs);
+        let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
+        let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
+        for edge in combined {
+            if seen_edges.insert((edge.0.clone(), edge.1.clone())) {
+                all_resolved.push(edge);
+            }
+        }
 
         // Build edge indexes from resolved references
         let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
@@ -391,8 +464,7 @@ impl EntityGraph {
         let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
 
         // Parse stale files in parallel to get new entities + trees
-        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = stale_files
-            .par_iter()
+        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = maybe_par_iter!(stale_files)
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
@@ -575,7 +647,7 @@ impl EntityGraph {
         }
 
         // Build import table from ALL files (imports may reference stale entities)
-        let import_table = build_import_table(root, all_file_paths, &symbol_table, &entity_map);
+        let import_table = build_import_table(root, all_file_paths, &symbol_table, &entity_map, Some(&parsed_files));
 
         // Run scope-aware resolver only on files that need resolution
         let resolve_file_paths: Vec<String> = all_file_paths
@@ -603,7 +675,7 @@ impl EntityGraph {
                 .filter(|(fp, _, _)| resolve_set.contains(fp.as_str()))
                 .collect();
             let pre = if relevant_parsed.is_empty() { None } else { Some(relevant_parsed) };
-            let result = scope_resolve::resolve_with_scopes(root, &resolve_file_paths, &all_entities, &entity_map, pre);
+            let result = scope_resolve::resolve_with_scopes_full(root, &resolve_file_paths, &all_entities, &entity_map, pre, None);
             let resolved_entity_ids: HashSet<String> = result.edges.iter()
                 .map(|(from, _, _)| from.clone())
                 .collect();
@@ -613,19 +685,26 @@ impl EntityGraph {
         };
 
         // Resolve references only for entities in needs_resolution
-        let resolved_refs: Vec<(String, String, RefType)> = all_entities
-            .par_iter()
+        let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
             .filter(|e| needs_resolution.contains(e.id.as_str()))
             .flat_map(|entity| {
                 if scope_resolved_entities.contains(&entity.id) {
                     return vec![];
                 }
 
+                // Skip entities from non-code file types (JSON, SQL, etc.)
+                let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
+                if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
+                    return vec![];
+                }
+
                 let mut entity_edges = Vec::new();
                 let mut consumed_words: HashSet<String> = HashSet::new();
 
-                // Phase 1: Dot-chain resolution
+                // Strip comments/strings once, reuse for both dot-chain and bag-of-words
                 let stripped = strip_comments_and_strings(&entity.content);
+
+                // Phase 1: Dot-chain resolution
                 let dot_chains = extract_dot_chains(&stripped);
 
                 for (receiver, member) in &dot_chains {
@@ -663,8 +742,8 @@ impl EntityGraph {
                     }
                 }
 
-                // Phase 2: Bag-of-words resolution
-                let refs = extract_references_from_content(&entity.content, &entity.name);
+                // Phase 2: Bag-of-words resolution (reuse stripped content)
+                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -719,10 +798,15 @@ impl EntityGraph {
             .collect();
 
         // Merge scope edges + bag-of-words edges + kept cached edges
-        let mut all_resolved: Vec<(String, String, RefType)> = scope_edges;
-        all_resolved.extend(resolved_refs);
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        all_resolved.retain(|e| seen_edges.insert((e.0.clone(), e.1.clone())));
+        let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(resolved_refs);
+        let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
+        let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
+        for edge in combined {
+            if seen_edges.insert((edge.0.clone(), edge.1.clone())) {
+                all_resolved.push(edge);
+            }
+        }
 
         // Build final edge list: kept edges + newly resolved edges
         let mut edges: Vec<EntityRef> = Vec::with_capacity(kept_edges.len() + all_resolved.len());
@@ -1221,143 +1305,192 @@ fn build_import_table(
     file_paths: &[String],
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
 ) -> HashMap<(String, String), String> {
-    let mut import_table: HashMap<(String, String), String> = HashMap::new();
+    // Build a content lookup from pre-parsed files to avoid re-reading from disk
+    let content_map: HashMap<&str, &str> = pre_parsed_content
+        .map(|files| {
+            files.iter().map(|(fp, content, _)| (fp.as_str(), content.as_str())).collect()
+        })
+        .unwrap_or_default();
 
-    for file_path in file_paths {
-        let full_path = root.join(file_path);
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
+    // We no longer need a go_pkg_index here since Go files are skipped below.
 
-        // Join multi-line imports into single logical lines
-        // e.g. "from .cookies import (\n    foo,\n    bar,\n)" -> "from .cookies import foo, bar"
-        let mut logical_lines: Vec<String> = Vec::new();
-        let mut current_line = String::new();
-        let mut in_parens = false;
+    // Process files in parallel, each producing local import entries
+    let per_file_imports: Vec<Vec<((String, String), String)>> = maybe_par_iter!(file_paths)
+        .filter_map(|file_path| {
+            // Go imports are handled entirely by the scope resolver — skip here
+            if file_path.ends_with(".go") {
+                return None;
+            }
 
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if in_parens {
-                // Strip parentheses and comments
-                let clean = trimmed.trim_end_matches(|c: char| c == ')' || c == ',');
-                let clean = clean.split('#').next().unwrap_or(clean).trim();
-                if !clean.is_empty() && clean != "(" {
-                    current_line.push_str(", ");
-                    current_line.push_str(clean);
+            // Use pre-parsed content if available, otherwise read from disk
+            let owned_content: Option<String>;
+            let content: &str = if let Some(c) = content_map.get(file_path.as_str()) {
+                c
+            } else {
+                let full_path = root.join(file_path);
+                owned_content = std::fs::read_to_string(&full_path).ok();
+                match owned_content.as_deref() {
+                    Some(c) => c,
+                    None => return None,
                 }
-                if trimmed.contains(')') {
-                    in_parens = false;
-                    logical_lines.push(std::mem::take(&mut current_line));
-                }
-            } else if trimmed.starts_with("from ") && trimmed.contains(" import ") {
-                if trimmed.contains('(') && !trimmed.contains(')') {
-                    // Multi-line import starts
-                    in_parens = true;
-                    // Take everything before the paren
-                    let before_paren = trimmed.split('(').next().unwrap_or(trimmed);
-                    current_line = before_paren.trim().to_string();
-                    // Also grab anything after the paren on this line
-                    if let Some(after) = trimmed.split('(').nth(1) {
-                        let after = after.trim().trim_end_matches(')').trim();
-                        if !after.is_empty() {
-                            current_line.push(' ');
-                            current_line.push_str(after);
-                        }
+            };
+
+            let mut local_imports: Vec<((String, String), String)> = Vec::new();
+
+            // Join multi-line imports into single logical lines
+            // e.g. "from .cookies import (\n    foo,\n    bar,\n)" -> "from .cookies import foo, bar"
+            let mut logical_lines: Vec<String> = Vec::new();
+            let mut current_line = String::new();
+            let mut in_parens = false;
+
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if in_parens {
+                    // Strip parentheses and comments
+                    let clean = trimmed.trim_end_matches(|c: char| c == ')' || c == ',');
+                    let clean = clean.split('#').next().unwrap_or(clean).trim();
+                    if !clean.is_empty() && clean != "(" {
+                        current_line.push_str(", ");
+                        current_line.push_str(clean);
                     }
-                } else {
-                    logical_lines.push(trimmed.to_string());
+                    if trimmed.contains(')') {
+                        in_parens = false;
+                        logical_lines.push(std::mem::take(&mut current_line));
+                    }
+                } else if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+                    if trimmed.contains('(') && !trimmed.contains(')') {
+                        // Multi-line import starts
+                        in_parens = true;
+                        // Take everything before the paren
+                        let before_paren = trimmed.split('(').next().unwrap_or(trimmed);
+                        current_line = before_paren.trim().to_string();
+                        // Also grab anything after the paren on this line
+                        if let Some(after) = trimmed.split('(').nth(1) {
+                            let after = after.trim().trim_end_matches(')').trim();
+                            if !after.is_empty() {
+                                current_line.push(' ');
+                                current_line.push_str(after);
+                            }
+                        }
+                    } else {
+                        logical_lines.push(trimmed.to_string());
+                    }
                 }
             }
-        }
 
-        for logical_line in &logical_lines {
-            if let Some(rest) = logical_line.strip_prefix("from ") {
-                // Find " import " or " import," (multi-line imports join with comma)
-                let import_match = rest.find(" import ")
-                    .map(|pos| (pos, 8))
-                    .or_else(|| rest.find(" import,").map(|pos| (pos, 8)));
-                if let Some((import_pos, skip)) = import_match {
-                    let module_path = &rest[..import_pos];
-                    let names_str = &rest[import_pos + skip..];
+            for logical_line in &logical_lines {
+                if let Some(rest) = logical_line.strip_prefix("from ") {
+                    // Find " import " or " import," (multi-line imports join with comma)
+                    let import_match = rest.find(" import ")
+                        .map(|pos| (pos, 8))
+                        .or_else(|| rest.find(" import,").map(|pos| (pos, 8)));
+                    if let Some((import_pos, skip)) = import_match {
+                        let module_path = &rest[..import_pos];
+                        let names_str = &rest[import_pos + skip..];
 
-                    let source_module = module_path
-                        .trim_start_matches('.')
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(module_path.trim_start_matches('.'));
+                        let source_module = module_path
+                            .trim_start_matches('.')
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(module_path.trim_start_matches('.'));
 
-                    for name_part in names_str.split(',') {
-                        let name_part = name_part.trim();
-                        let imported_name = name_part.split_whitespace().next().unwrap_or(name_part);
-                        // Strip trailing parens/punctuation
-                        let imported_name = imported_name.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
-                        if imported_name.is_empty() {
-                            continue;
-                        }
+                        for name_part in names_str.split(',') {
+                            let name_part = name_part.trim();
+                            let imported_name = name_part.split_whitespace().next().unwrap_or(name_part);
+                            // Strip trailing parens/punctuation
+                            let imported_name = imported_name.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
+                            if imported_name.is_empty() {
+                                continue;
+                            }
 
-                        if let Some(target_ids) = symbol_table.get(imported_name) {
-                            let target = target_ids.iter().find(|id| {
-                                entity_map.get(*id).map_or(false, |e| {
-                                    let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                                    let stem = stem.strip_suffix(".py")
-                                        .or_else(|| stem.strip_suffix(".ts"))
-                                        .or_else(|| stem.strip_suffix(".js"))
-                                        .or_else(|| stem.strip_suffix(".rs"))
-                                        .unwrap_or(stem);
-                                    stem == source_module
-                                })
-                            });
-                            if let Some(target_id) = target {
-                                import_table.insert(
-                                    (file_path.clone(), imported_name.to_string()),
-                                    target_id.clone(),
-                                );
+                            if let Some(target_ids) = symbol_table.get(imported_name) {
+                                let target = target_ids.iter().find(|id| {
+                                    entity_map.get(*id).map_or(false, |e| {
+                                        let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
+                                        let stem = stem.strip_suffix(".py")
+                                            .or_else(|| stem.strip_suffix(".ts"))
+                                            .or_else(|| stem.strip_suffix(".js"))
+                                            .or_else(|| stem.strip_suffix(".rs"))
+                                            .unwrap_or(stem);
+                                        stem == source_module
+                                    })
+                                });
+                                if let Some(target_id) = target {
+                                    local_imports.push((
+                                        (file_path.clone(), imported_name.to_string()),
+                                        target_id.clone(),
+                                    ));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // JS/TS imports: import { foo, bar as baz } from './module'
-        //                import Foo from './module'
-        let is_js_ts = file_path.ends_with(".js") || file_path.ends_with(".ts")
-            || file_path.ends_with(".jsx") || file_path.ends_with(".tsx");
+            // JS/TS imports: import { foo, bar as baz } from './module'
+            //                import Foo from './module'
+            let is_js_ts = file_path.ends_with(".js") || file_path.ends_with(".ts")
+                || file_path.ends_with(".jsx") || file_path.ends_with(".tsx");
 
-        if is_js_ts {
-            static JS_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-                Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
-            });
-            static JS_DEFAULT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
-            });
+            if is_js_ts {
+                static JS_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+                });
+                static JS_DEFAULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+                });
 
-            for cap in JS_NAMED_RE.captures_iter(&content) {
-                let names_str = cap.get(1).unwrap().as_str();
-                let module_path = cap.get(2).unwrap().as_str();
-                let source_module = module_path.rsplit('/').next().unwrap_or(module_path);
-                let source_module = strip_js_ext(source_module);
+                for cap in JS_NAMED_RE.captures_iter(content) {
+                    let names_str = cap.get(1).unwrap().as_str();
+                    let module_path = cap.get(2).unwrap().as_str();
+                    let source_module = module_path.rsplit('/').next().unwrap_or(module_path);
+                    let source_module = strip_js_ext(source_module);
 
-                for name_part in names_str.split(',') {
-                    let name_part = name_part.trim();
-                    if name_part.is_empty() { continue; }
+                    for name_part in names_str.split(',') {
+                        let name_part = name_part.trim();
+                        if name_part.is_empty() { continue; }
 
-                    // Handle "foo as bar" aliases and "type foo" prefixes
-                    let (original_name, local_name) = if let Some(pos) = name_part.find(" as ") {
-                        let orig = name_part[..pos].trim();
-                        let local = name_part[pos + 4..].trim();
-                        let orig = orig.strip_prefix("type ").unwrap_or(orig);
-                        (orig, local)
-                    } else {
-                        let name = name_part.strip_prefix("type ").unwrap_or(name_part);
-                        (name, name)
-                    };
+                        // Handle "foo as bar" aliases and "type foo" prefixes
+                        let (original_name, local_name) = if let Some(pos) = name_part.find(" as ") {
+                            let orig = name_part[..pos].trim();
+                            let local = name_part[pos + 4..].trim();
+                            let orig = orig.strip_prefix("type ").unwrap_or(orig);
+                            (orig, local)
+                        } else {
+                            let name = name_part.strip_prefix("type ").unwrap_or(name_part);
+                            (name, name)
+                        };
 
-                    if original_name.is_empty() || local_name.is_empty() { continue; }
+                        if original_name.is_empty() || local_name.is_empty() { continue; }
 
-                    if let Some(target_ids) = symbol_table.get(original_name) {
+                        if let Some(target_ids) = symbol_table.get(original_name) {
+                            let target = target_ids.iter().find(|id| {
+                                entity_map.get(*id).map_or(false, |e| {
+                                    let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
+                                    let stem = strip_file_ext(stem);
+                                    stem == source_module
+                                })
+                            });
+                            if let Some(target_id) = target {
+                                local_imports.push((
+                                    (file_path.clone(), local_name.to_string()),
+                                    target_id.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                for cap in JS_DEFAULT_RE.captures_iter(content) {
+                    let local_name = cap.get(1).unwrap().as_str();
+                    let module_path = cap.get(2).unwrap().as_str();
+                    let source_module = module_path.rsplit('/').next().unwrap_or(module_path);
+                    let source_module = strip_js_ext(source_module);
+
+                    if let Some(target_ids) = symbol_table.get(local_name) {
                         let target = target_ids.iter().find(|id| {
                             entity_map.get(*id).map_or(false, |e| {
                                 let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
@@ -1366,144 +1499,109 @@ fn build_import_table(
                             })
                         });
                         if let Some(target_id) = target {
-                            import_table.insert(
+                            local_imports.push((
                                 (file_path.clone(), local_name.to_string()),
                                 target_id.clone(),
-                            );
+                            ));
                         }
                     }
                 }
             }
 
-            for cap in JS_DEFAULT_RE.captures_iter(&content) {
-                let local_name = cap.get(1).unwrap().as_str();
-                let module_path = cap.get(2).unwrap().as_str();
-                let source_module = module_path.rsplit('/').next().unwrap_or(module_path);
-                let source_module = strip_js_ext(source_module);
+            // Rust imports: use crate::module::Name; / use crate::module::{A, B};
+            // Also: use super::module::Name; / use self::module::Name;
+            let is_rust = file_path.ends_with(".rs");
+            if is_rust {
+                static RUST_USE_SIMPLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    // use crate::config::Config;
+                    // use super::types::Entity;
+                    // use config::Config;  (bare module path in binary crates)
+                    Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*;").unwrap()
+                });
+                static RUST_USE_GROUP_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    // use crate::types::{Entity, ParseError};
+                    // use types::{Entity, ParseError};  (bare module path)
+                    Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\{([^}]+)\}\s*;").unwrap()
+                });
 
-                if let Some(target_ids) = symbol_table.get(local_name) {
-                    let target = target_ids.iter().find(|id| {
-                        entity_map.get(*id).map_or(false, |e| {
-                            let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                            let stem = strip_file_ext(stem);
-                            stem == source_module
-                        })
-                    });
-                    if let Some(target_id) = target {
-                        import_table.insert(
-                            (file_path.clone(), local_name.to_string()),
-                            target_id.clone(),
-                        );
-                    }
-                }
-            }
-        }
+                // Use a local import table for Rust alias resolution
+                let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
 
-        // Rust imports: use crate::module::Name; / use crate::module::{A, B};
-        // Also: use super::module::Name; / use self::module::Name;
-        let is_rust = file_path.ends_with(".rs");
-        if is_rust {
-            static RUST_USE_SIMPLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-                // use crate::config::Config;
-                // use super::types::Entity;
-                // use config::Config;  (bare module path in binary crates)
-                Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*;").unwrap()
-            });
-            static RUST_USE_GROUP_RE: LazyLock<Regex> = LazyLock::new(|| {
-                // use crate::types::{Entity, ParseError};
-                // use types::{Entity, ParseError};  (bare module path)
-                Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\{([^}]+)\}\s*;").unwrap()
-            });
+                // Build a map: module_name -> list of file paths whose stem matches
+                // For "use crate::config::Config", module is "config", name is "Config"
+                for cap in RUST_USE_SIMPLE_RE.captures_iter(content) {
+                    let full_path_str = cap.get(1).unwrap().as_str();
+                    let parts: Vec<&str> = full_path_str.split("::").collect();
+                    if parts.is_empty() { continue; }
 
-            // Build a map: module_name -> list of file paths whose stem matches
-            // For "use crate::config::Config", module is "config", name is "Config"
-            for cap in RUST_USE_SIMPLE_RE.captures_iter(&content) {
-                let full_path_str = cap.get(1).unwrap().as_str();
-                let parts: Vec<&str> = full_path_str.split("::").collect();
-                if parts.is_empty() { continue; }
-
-                // Last part is the imported name, everything before is the module path
-                let imported_name = parts[parts.len() - 1];
-                // The module is the second-to-last part, or the first if only one part
-                let source_module = if parts.len() >= 2 {
-                    parts[parts.len() - 2]
-                } else {
-                    parts[0]
-                };
-
-                resolve_rust_import(
-                    file_path, imported_name, source_module,
-                    symbol_table, entity_map, &mut import_table,
-                );
-            }
-
-            for cap in RUST_USE_GROUP_RE.captures_iter(&content) {
-                let module_path = cap.get(1).unwrap().as_str();
-                let names_str = cap.get(2).unwrap().as_str();
-
-                // source_module is the last segment of the module path
-                let source_module = module_path.rsplit("::").next().unwrap_or(module_path);
-
-                for name_part in names_str.split(',') {
-                    let name_part = name_part.trim();
-                    // Handle "Name as Alias"
-                    let (original, local) = if let Some(pos) = name_part.find(" as ") {
-                        (&name_part[..pos], name_part[pos + 4..].trim())
+                    // Last part is the imported name, everything before is the module path
+                    let imported_name = parts[parts.len() - 1];
+                    // The module is the second-to-last part, or the first if only one part
+                    let source_module = if parts.len() >= 2 {
+                        parts[parts.len() - 2]
                     } else {
-                        (name_part, name_part)
+                        parts[0]
                     };
-                    let original = original.trim();
-                    let local = local.trim();
-                    if original.is_empty() || local.is_empty() { continue; }
 
                     resolve_rust_import(
-                        file_path, original, source_module,
-                        symbol_table, entity_map, &mut import_table,
+                        file_path, imported_name, source_module,
+                        symbol_table, entity_map, &mut local_import_table,
                     );
-                    // If aliased, also map the local name
-                    if local != original {
-                        if let Some(target) = import_table.get(&(file_path.clone(), original.to_string())).cloned() {
-                            import_table.insert(
-                                (file_path.clone(), local.to_string()),
-                                target,
-                            );
-                        }
-                    }
                 }
-            }
-        }
 
-        // Go imports: import "module/path" or import ( "module/path" )
-        // Go uses the last path component as the package name
-        let is_go = file_path.ends_with(".go");
-        if is_go {
-            static GO_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                Regex::new(r#"(?m)"([^"]+)""#).unwrap()
-            });
+                for cap in RUST_USE_GROUP_RE.captures_iter(content) {
+                    let module_path = cap.get(1).unwrap().as_str();
+                    let names_str = cap.get(2).unwrap().as_str();
 
-            // Only look in import blocks
-            let import_section = extract_go_import_section(&content);
-            for cap in GO_IMPORT_RE.captures_iter(&import_section) {
-                let import_path = cap.get(1).unwrap().as_str();
-                let pkg_name = import_path.rsplit('/').next().unwrap_or(import_path);
+                    // source_module is the last segment of the module path
+                    let source_module = module_path.rsplit("::").next().unwrap_or(module_path);
 
-                // Map all entities from files matching this package name
-                for (name, target_ids) in symbol_table.iter() {
-                    for target_id in target_ids {
-                        if let Some(entity) = entity_map.get(target_id) {
-                            let stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
-                            let stem = strip_file_ext(stem);
-                            // Go: file stem or directory matches package name
-                            if stem == pkg_name || entity.file_path.contains(&format!("{}/", pkg_name)) {
-                                import_table.insert(
-                                    (file_path.clone(), name.clone()),
-                                    target_id.clone(),
+                    for name_part in names_str.split(',') {
+                        let name_part = name_part.trim();
+                        // Handle "Name as Alias"
+                        let (original, local) = if let Some(pos) = name_part.find(" as ") {
+                            (&name_part[..pos], name_part[pos + 4..].trim())
+                        } else {
+                            (name_part, name_part)
+                        };
+                        let original = original.trim();
+                        let local = local.trim();
+                        if original.is_empty() || local.is_empty() { continue; }
+
+                        resolve_rust_import(
+                            file_path, original, source_module,
+                            symbol_table, entity_map, &mut local_import_table,
+                        );
+                        // If aliased, also map the local name
+                        if local != original {
+                            if let Some(target) = local_import_table.get(&(file_path.clone(), original.to_string())).cloned() {
+                                local_import_table.insert(
+                                    (file_path.clone(), local.to_string()),
+                                    target,
                                 );
                             }
                         }
                     }
                 }
+
+                // Collect all Rust imports into local_imports
+                for (key, val) in local_import_table {
+                    local_imports.push((key, val));
+                }
             }
+
+            // Go imports are handled by the scope resolver (avoids O(n²) import table explosion).
+            // Skip Go files here entirely.
+
+            Some(local_imports)
+        })
+        .collect();
+
+    // Merge all per-file imports into a single table
+    let mut import_table: HashMap<(String, String), String> = HashMap::new();
+    for local_imports in per_file_imports {
+        for (key, val) in local_imports {
+            import_table.insert(key, val);
         }
     }
 
@@ -1535,33 +1633,6 @@ fn resolve_rust_import(
             );
         }
     }
-}
-
-/// Extract Go import section (everything inside import blocks).
-fn extract_go_import_section(content: &str) -> String {
-    let mut result = String::new();
-    let mut in_import_block = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("import (") {
-            in_import_block = true;
-            continue;
-        }
-        if trimmed.starts_with("import \"") || trimmed.starts_with("import `") {
-            result.push_str(trimmed);
-            result.push('\n');
-            continue;
-        }
-        if in_import_block {
-            if trimmed == ")" {
-                in_import_block = false;
-            } else {
-                result.push_str(trimmed);
-                result.push('\n');
-            }
-        }
-    }
-    result
 }
 
 /// Strip JS/TS extensions from a module name.
@@ -1686,9 +1757,14 @@ fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
 /// Strips comments and strings first to avoid false positives from docstrings.
 /// Returns borrowed slices from the stripped content.
 fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<&'a str> {
-    // We need to figure out which words appear only in comments/strings vs real code.
-    // Strategy: strip comments/strings, then only accept words that appear in the stripped version.
     let stripped = strip_comments_and_strings(content);
+    extract_references_with_stripped(content, own_name, &stripped)
+}
+
+/// Extract references using a pre-stripped version of the content.
+/// Use this when you already have the stripped content (e.g. from dot-chain extraction)
+/// to avoid stripping comments/strings twice.
+fn extract_references_with_stripped<'a>(content: &'a str, own_name: &str, stripped: &str) -> Vec<&'a str> {
     let stripped_words: HashSet<&str> = stripped
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty())

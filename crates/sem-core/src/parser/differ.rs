@@ -1,7 +1,17 @@
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::git::types::FileChange;
+
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        { $slice.par_iter() }
+        #[cfg(not(feature = "parallel"))]
+        { $slice.iter() }
+    }};
+}
 use crate::model::change::{ChangeType, SemanticChange};
 use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
@@ -29,8 +39,8 @@ pub fn compute_semantic_diff(
     author: Option<&str>,
 ) -> DiffResult {
     // Process files in parallel: each file's entity extraction and matching is independent
-    let per_file_changes: Vec<(String, Vec<SemanticChange>)> = file_changes
-        .par_iter()
+    let per_file_changes: Vec<(String, Vec<SemanticChange>)> = maybe_par_iter!(file_changes)
+
         .filter_map(|file| {
             let content_hint = file.after_content.as_deref()
                 .or(file.before_content.as_deref())

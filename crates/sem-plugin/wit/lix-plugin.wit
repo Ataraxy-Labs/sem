@@ -1,0 +1,47 @@
+package lix:plugin@0.1.0;
+
+interface api {
+    type canonical-json = string;
+
+    record file {
+        id: string,
+        path: string,
+        data: list<u8>,
+    }
+
+    record entity-change {
+        entity-id: string,
+        schema-key: string,
+        snapshot-content: option<canonical-json>,
+    }
+
+    record active-state-row {
+        entity-id: string,
+        schema-key: option<string>,
+        snapshot-content: option<canonical-json>,
+        file-id: option<string>,
+        plugin-key: option<string>,
+        version-id: option<string>,
+        change-id: option<string>,
+        metadata: option<canonical-json>,
+        created-at: option<string>,
+        updated-at: option<string>,
+    }
+
+    record detect-state-context {
+        active-state: option<list<active-state-row>>,
+    }
+
+    variant plugin-error {
+        invalid-input(string),
+        internal(string),
+    }
+
+    detect-changes: func(before: option<file>, after: file, state-context: option<detect-state-context>) -> result<list<entity-change>, plugin-error>;
+
+    apply-changes: func(file: file, changes: list<entity-change>) -> result<list<u8>, plugin-error>;
+}
+
+world plugin {
+    export api;
+}

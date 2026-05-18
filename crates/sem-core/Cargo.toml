@@ -1,6 +1,6 @@
 [package]
 name = "sem-core"
-version = "0.5.3"
+version = "0.5.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 20 languages via tree-sitter and diffs at the entity level."
@@ -10,22 +10,61 @@ keywords = ["diff", "semantic", "tree-sitter", "ast", "code-analysis"]
 categories = ["development-tools", "parser-implementations"]
 readme = "../../README.md"
 
-[dependencies]
-git2 = "0.20"
-tree-sitter = "0.26"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-toml = "0.8"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-regex = "1"
-thiserror = "2"
-rayon = "1.10"
+[features]
+default = ["git", "parallel", "grammar-all"]
+git = ["dep:git2"]
+parallel = ["dep:rayon"]
+wasm = []
 
-# Tree-sitter language grammars are huge (~2 MB each in __const). Make
-# each one opt-in via a feature so downstream crates can shrink their
-# binaries. The `default` feature still enables every language so the
-# existing crates.io API is unchanged.
+# Grammar groups
+grammar-core = [
+    "lang-typescript", "lang-javascript", "lang-python",
+    "lang-go", "lang-rust", "lang-java",
+]
+grammar-all = [
+    "grammar-core",
+    "lang-c", "lang-cpp", "lang-ruby", "lang-csharp", "lang-php",
+    "lang-fortran", "lang-swift", "lang-elixir", "lang-bash", "lang-hcl",
+    "lang-kotlin", "lang-xml", "lang-dart", "lang-perl", "lang-ocaml",
+    "lang-scala", "lang-zig", "lang-nix",
+    "lang-svelte", "lang-erb",
+]
+
+# Backwards-compatible aliases for downstream users of the optional-grammar branch.
+lang-minimal = ["grammar-core"]
+lang-all = ["grammar-all"]
+
+# Individual grammar features
+lang-typescript = ["dep:tree-sitter-typescript"]
+lang-javascript = ["dep:tree-sitter-javascript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter-go"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-java = ["dep:tree-sitter-java"]
+lang-c = ["dep:tree-sitter-c"]
+lang-cpp = ["dep:tree-sitter-cpp"]
+lang-ruby = ["dep:tree-sitter-ruby"]
+lang-csharp = ["dep:tree-sitter-c-sharp"]
+lang-php = ["dep:tree-sitter-php"]
+lang-fortran = ["dep:tree-sitter-fortran"]
+lang-swift = ["dep:tree-sitter-swift"]
+lang-elixir = ["dep:tree-sitter-elixir"]
+lang-bash = ["dep:tree-sitter-bash"]
+lang-hcl = ["dep:tree-sitter-hcl"]
+lang-kotlin = ["dep:tree-sitter-kotlin-ng"]
+lang-xml = ["dep:tree-sitter-xml"]
+lang-dart = ["dep:tree-sitter-dart"]
+lang-perl = ["dep:tree-sitter-perl-next"]
+lang-ocaml = ["dep:tree-sitter-ocaml"]
+lang-scala = ["dep:tree-sitter-scala"]
+lang-zig = ["dep:tree-sitter-zig"]
+lang-nix = ["dep:tree-sitter-nix"]
+lang-svelte = ["dep:tree-sitter-htmlx-svelte"]
+lang-erb = ["dep:tree-sitter-embedded-template"]
+
+[dependencies]
+git2 = { version = "0.20", optional = true }
+tree-sitter = "0.26"
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-javascript = { version = "0.23", optional = true }
 tree-sitter-python = { version = "0.23", optional = true }
@@ -47,82 +86,19 @@ tree-sitter-xml = { version = "0.7", optional = true }
 tree-sitter-embedded-template = { version = "0.25", optional = true }
 tree-sitter-ocaml = { version = "0.24", optional = true }
 tree-sitter-htmlx-svelte = { version = "0.1.7", optional = true }
-tree-sitter-dart = { version = "0.1.0", optional = true }
+tree-sitter-dart = { version = "0.2.0", optional = true }
 tree-sitter-perl-next = { version = "0.1", optional = true }
 tree-sitter-scala = { version = "0.26", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+regex = "1"
+thiserror = "2"
+rayon = { version = "1.10", optional = true }
 tree-sitter-zig = { version = "1.1.2", optional = true }
 tree-sitter-nix = { version = "0.3", optional = true }
-
-[features]
-default = ["lang-all"]
-
-# Convenience: enable every shipped language grammar.
-lang-all = [
-    "lang-typescript",
-    "lang-javascript",
-    "lang-python",
-    "lang-go",
-    "lang-rust",
-    "lang-java",
-    "lang-c",
-    "lang-cpp",
-    "lang-ruby",
-    "lang-csharp",
-    "lang-php",
-    "lang-fortran",
-    "lang-swift",
-    "lang-elixir",
-    "lang-bash",
-    "lang-hcl",
-    "lang-kotlin",
-    "lang-xml",
-    "lang-erb",
-    "lang-ocaml",
-    "lang-svelte",
-    "lang-dart",
-    "lang-perl",
-    "lang-scala",
-    "lang-zig",
-    "lang-nix",
-]
-
-# Recommended minimal set for code-review tooling: covers the bulk of
-# real-world repositories without the ~50 MB of niche grammars.
-lang-minimal = [
-    "lang-typescript",
-    "lang-javascript",
-    "lang-python",
-    "lang-go",
-    "lang-rust",
-    "lang-java",
-]
-
-lang-typescript = ["dep:tree-sitter-typescript"]
-lang-javascript = ["dep:tree-sitter-javascript"]
-lang-python = ["dep:tree-sitter-python"]
-lang-go = ["dep:tree-sitter-go"]
-lang-rust = ["dep:tree-sitter-rust"]
-lang-java = ["dep:tree-sitter-java"]
-lang-c = ["dep:tree-sitter-c"]
-lang-cpp = ["dep:tree-sitter-cpp"]
-lang-ruby = ["dep:tree-sitter-ruby"]
-lang-csharp = ["dep:tree-sitter-c-sharp"]
-lang-php = ["dep:tree-sitter-php"]
-lang-fortran = ["dep:tree-sitter-fortran"]
-lang-swift = ["dep:tree-sitter-swift"]
-lang-elixir = ["dep:tree-sitter-elixir"]
-lang-bash = ["dep:tree-sitter-bash"]
-lang-hcl = ["dep:tree-sitter-hcl"]
-lang-kotlin = ["dep:tree-sitter-kotlin-ng"]
-lang-xml = ["dep:tree-sitter-xml"]
-lang-erb = ["dep:tree-sitter-embedded-template"]
-lang-ocaml = ["dep:tree-sitter-ocaml"]
-lang-svelte = ["dep:tree-sitter-htmlx-svelte"]
-lang-dart = ["dep:tree-sitter-dart"]
-lang-perl = ["dep:tree-sitter-perl-next"]
-lang-scala = ["dep:tree-sitter-scala"]
-lang-zig = ["dep:tree-sitter-zig"]
-lang-nix = ["dep:tree-sitter-nix"]
 
 [dev-dependencies]
 tempfile = "3.24.0"

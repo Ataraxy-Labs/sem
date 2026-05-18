@@ -1,5 +1,5 @@
 [workspace]
-members = ["sem-core", "sem-cli", "sem-mcp"]
+members = ["sem-core", "sem-cli", "sem-mcp", "sem-plugin"]
 resolver = "2"
 
 [profile.release]
@@ -7,3 +7,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Size-optimized profile for WASM builds
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+strip = "symbols"

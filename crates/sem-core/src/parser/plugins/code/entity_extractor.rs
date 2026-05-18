@@ -1089,6 +1089,21 @@ fn map_class_member_type(node: Node) -> &'static str {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
+            "method_declaration" => {
+                if let Some(sig) = child.child_by_field_name("signature") {
+                    let mut inner = sig.walk();
+                    for inner_sig in sig.named_children(&mut inner) {
+                        return match inner_sig.kind() {
+                            "function_signature" => "method",
+                            "getter_signature" => "getter",
+                            "setter_signature" => "setter",
+                            "constructor_signature" | "factory_constructor_signature" => "constructor",
+                            "operator_signature" => "method",
+                            _ => continue,
+                        };
+                    }
+                }
+            }
             "method_signature" => {
                 let mut inner = child.walk();
                 for sig in child.named_children(&mut inner) {
@@ -1220,6 +1235,22 @@ fn walk_dart_class_member<T>(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
+            "method_declaration" => {
+                if let Some(sig) = child.child_by_field_name("signature") {
+                    let mut inner = sig.walk();
+                    for inner_sig in sig.named_children(&mut inner) {
+                        if DART_CONSTRUCTOR_SIG_KINDS.contains(&inner_sig.kind()) {
+                            return resolve(inner_sig, source);
+                        }
+                        if let Some(name_node) = inner_sig.child_by_field_name("name") {
+                            return resolve(name_node, source);
+                        }
+                        if inner_sig.kind() == "operator_signature" {
+                            return resolve(inner_sig, source);
+                        }
+                    }
+                }
+            }
             "method_signature" | "declaration" => {
                 let mut inner = child.walk();
                 for sig in child.named_children(&mut inner) {

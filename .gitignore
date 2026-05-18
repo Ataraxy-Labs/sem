@@ -6,6 +6,24 @@ node_modules/
 .npm-cache/
 vendor/
 
+# Scratch / demo files
+*.cast
+*.gif
+*.mp4
+*.png
+*.svg
+attention_*.html
+attention_*.py
+feel.html
+sem_log_demo.html
+gen_*.py
+bench/
+bench_*.py
+bench_*.sh
+demo.*
+docs/*.html
+hero.svg
+
 # Nixos artifacts
 .envrc
 .direnv/
