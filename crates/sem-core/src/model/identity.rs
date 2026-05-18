@@ -79,6 +79,7 @@ fn make_change(
         entity_type: primary.entity_type.clone(),
         entity_name: primary.name.clone(),
         entity_line: primary.start_line,
+        entity_end_line: primary.end_line,
         parent_name: parent_name(primary, by_id),
         file_path: primary.file_path.clone(),
         old_entity_name: before_entity.and_then(|b| {
@@ -87,6 +88,8 @@ fn make_change(
         old_file_path: before_entity.and_then(|b| {
             (b.file_path != after_entity.file_path).then(|| b.file_path.clone())
         }),
+        old_entity_line: before_entity.map(|b| b.start_line),
+        old_entity_end_line: before_entity.map(|b| b.end_line),
         old_parent_id: before_entity.and_then(|b| {
             (b.parent_id != after_entity.parent_id).then(|| b.parent_id.clone()).flatten()
         }),
@@ -488,11 +491,21 @@ mod tests {
 
     #[test]
     fn test_exact_match_modified() {
-        let before = vec![make_entity("a::f::foo", "foo", "old content", "a.ts")];
-        let after = vec![make_entity("a::f::foo", "foo", "new content", "a.ts")];
+        let mut before_entity = make_entity("a::f::foo", "foo", "old content", "a.ts");
+        before_entity.start_line = 3;
+        before_entity.end_line = 5;
+        let mut after_entity = make_entity("a::f::foo", "foo", "new content", "a.ts");
+        after_entity.start_line = 7;
+        after_entity.end_line = 11;
+        let before = vec![before_entity];
+        let after = vec![after_entity];
         let result = match_entities(&before, &after, "a.ts", None, None, None);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].entity_line, 7);
+        assert_eq!(result.changes[0].entity_end_line, 11);
+        assert_eq!(result.changes[0].old_entity_line, Some(3));
+        assert_eq!(result.changes[0].old_entity_end_line, Some(5));
     }
 
     #[test]

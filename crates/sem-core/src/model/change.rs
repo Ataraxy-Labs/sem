@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeType {
@@ -35,6 +39,10 @@ pub struct SemanticChange {
     pub entity_name: String,
     #[serde(default)]
     pub entity_line: usize,
+    /// Inclusive end line for the primary entity side. For deleted changes this
+    /// is the before-side span; for all other changes it is the after-side span.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub entity_end_line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_name: Option<String>,
     pub file_path: String,
@@ -42,6 +50,12 @@ pub struct SemanticChange {
     pub old_entity_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_file_path: Option<String>,
+    /// Before-side start line when a corresponding before entity exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_entity_line: Option<usize>,
+    /// Inclusive before-side end line when a corresponding before entity exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_entity_end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
