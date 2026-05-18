@@ -24,7 +24,6 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct DiffResult {
     pub changes: Vec<SemanticChange>,
     pub file_count: usize,
