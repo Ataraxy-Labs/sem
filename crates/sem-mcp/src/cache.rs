@@ -6,6 +6,72 @@ use rusqlite::{params, Connection};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 
+pub const CACHE_SCHEMA_VERSION: i32 = 1;
+pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
+    ("idx_entities_file_path", "entities", "file_path"),
+    ("idx_entities_name", "entities", "name"),
+    ("idx_entities_parent_id", "entities", "parent_id"),
+    ("idx_edges_from_entity", "edges", "from_entity"),
+    ("idx_edges_to_entity", "edges", "to_entity"),
+];
+
+const CACHE_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    mtime_secs INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    structural_hash TEXT,
+    parent_id TEXT,
+    metadata_json TEXT
+);
+CREATE TABLE IF NOT EXISTS edges (
+    from_entity TEXT NOT NULL,
+    to_entity TEXT NOT NULL,
+    ref_type TEXT NOT NULL
+);
+";
+
+const CACHE_RESET_SQL: &str = "
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS entities;
+DROP TABLE IF EXISTS edges;
+";
+
+pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;",
+    )?;
+
+    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != CACHE_SCHEMA_VERSION {
+        conn.execute_batch(CACHE_RESET_SQL)?;
+    }
+
+    let index_sql = CACHE_INDEXES
+        .iter()
+        .map(|(name, table, column)| {
+            format!("CREATE INDEX IF NOT EXISTS {name} ON {table}({column});")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema_sql = format!(
+        "{} {} PRAGMA user_version = {};",
+        CACHE_SCHEMA_SQL, index_sql, CACHE_SCHEMA_VERSION
+    );
+    conn.execute_batch(&schema_sql)
+}
+
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
 pub struct PartialCache {
     pub stale_files: Vec<String>,
@@ -45,33 +111,7 @@ impl DiskCache {
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(db_path)?;
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS files (
-                 path TEXT PRIMARY KEY,
-                 mtime_secs INTEGER NOT NULL,
-                 mtime_nanos INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS entities (
-                 id TEXT PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 entity_type TEXT NOT NULL,
-                 file_path TEXT NOT NULL,
-                 start_line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL,
-                 content TEXT NOT NULL,
-                 content_hash TEXT NOT NULL,
-                 structural_hash TEXT,
-                 parent_id TEXT,
-                 metadata_json TEXT
-             );
-             CREATE TABLE IF NOT EXISTS edges (
-                 from_entity TEXT NOT NULL,
-                 to_entity TEXT NOT NULL,
-                 ref_type TEXT NOT NULL
-             );",
-        )?;
+        initialize_schema(&conn)?;
 
         Ok(Self { conn })
     }
@@ -89,9 +129,8 @@ impl DiskCache {
         tx.execute_batch("DELETE FROM files; DELETE FROM entities; DELETE FROM edges;")?;
 
         {
-            let mut stmt = tx.prepare(
-                "INSERT INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
-            )?;
+            let mut stmt = tx
+                .prepare("INSERT INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)")?;
             for file in files {
                 let full = root.join(file);
                 if let Ok(meta) = std::fs::metadata(&full) {
@@ -99,7 +138,11 @@ impl DiskCache {
                         let dur = mtime
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default();
-                        stmt.execute(params![file, dur.as_secs() as i64, dur.subsec_nanos() as i64])?;
+                        stmt.execute(params![
+                            file,
+                            dur.as_secs() as i64,
+                            dur.subsec_nanos() as i64
+                        ])?;
                     }
                 }
             }
@@ -259,11 +302,7 @@ impl DiskCache {
 
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
-    pub fn load_partial(
-        &self,
-        root: &Path,
-        files: &[String],
-    ) -> Option<PartialCache> {
+    pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
         let mut stmt = self
             .conn
             .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
@@ -446,7 +485,11 @@ impl DiskCache {
                         let dur = mtime
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default();
-                        ins.execute(params![file, dur.as_secs() as i64, dur.subsec_nanos() as i64])?;
+                        ins.execute(params![
+                            file,
+                            dur.as_secs() as i64,
+                            dur.subsec_nanos() as i64
+                        ])?;
                     }
                 }
             }
@@ -503,5 +546,133 @@ impl DiskCache {
 
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_repo_root(test_name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sem-mcp-cache-{test_name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn read_user_version(cache: &DiskCache) -> i32 {
+        cache
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn assert_lookup_indexes(cache: &DiskCache) {
+        let mut stmt = cache
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let indexes: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|result| result.unwrap())
+            .collect();
+
+        for (expected, _, _) in CACHE_INDEXES {
+            assert!(indexes.contains(*expected), "missing index {expected}");
+        }
+    }
+
+    fn assert_table_empty(cache: &DiskCache, table: &str) {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = cache.conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "{table} should be empty after schema rebuild");
+    }
+
+    fn seed_unsupported_cache(root: &Path, version: i32) {
+        let cache_dir = root.join(".sem");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let db_path = cache_dir.join("cache.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {version};
+             CREATE TABLE files (
+                 path TEXT PRIMARY KEY,
+                 mtime_secs INTEGER NOT NULL,
+                 mtime_nanos INTEGER NOT NULL
+             );
+             CREATE TABLE entities (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 entity_type TEXT NOT NULL,
+                 file_path TEXT NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 structural_hash TEXT,
+                 parent_id TEXT,
+                 metadata_json TEXT
+             );
+             CREATE TABLE edges (
+                 from_entity TEXT NOT NULL,
+                 to_entity TEXT NOT NULL,
+                 ref_type TEXT NOT NULL
+             );
+             INSERT INTO files (path, mtime_secs, mtime_nanos)
+             VALUES ('stale.rs', 1, 2);
+             INSERT INTO entities (
+                 id, name, entity_type, file_path, start_line, end_line,
+                 content, content_hash, structural_hash, parent_id, metadata_json
+             )
+             VALUES (
+                 'stale-id', 'stale', 'function', 'stale.rs', 1, 1,
+                 'fn stale() {{}}', 'old-content', NULL, NULL, NULL
+             );
+             INSERT INTO edges (from_entity, to_entity, ref_type)
+             VALUES ('stale-id', 'other-id', 'calls');"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn open_creates_schema_version_and_lookup_indexes() {
+        let root = temp_repo_root("schema");
+        let cache = DiskCache::open(&root).unwrap();
+
+        assert_eq!(read_user_version(&cache), CACHE_SCHEMA_VERSION);
+        assert_lookup_indexes(&cache);
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_rebuilds_cache_when_schema_version_is_unsupported() {
+        for version in [0, CACHE_SCHEMA_VERSION + 1] {
+            let root = temp_repo_root(&format!("unsupported-{version}"));
+            seed_unsupported_cache(&root, version);
+
+            let cache = DiskCache::open(&root).unwrap();
+
+            assert_eq!(read_user_version(&cache), CACHE_SCHEMA_VERSION);
+            assert_lookup_indexes(&cache);
+            for table in ["files", "entities", "edges"] {
+                assert_table_empty(&cache, table);
+            }
+
+            drop(cache);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
