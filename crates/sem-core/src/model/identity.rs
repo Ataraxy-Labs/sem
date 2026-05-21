@@ -52,6 +52,18 @@ fn classify_match(before: &SemanticEntity, after: &SemanticEntity) -> ChangeType
     }
 }
 
+fn same_signature_across_file_rename(
+    before: &SemanticEntity,
+    after: &SemanticEntity,
+    before_by_id: &HashMap<&str, &SemanticEntity>,
+    after_by_id: &HashMap<&str, &SemanticEntity>,
+) -> bool {
+    before.file_path != after.file_path
+        && before.entity_type == after.entity_type
+        && before.name == after.name
+        && parent_name(before, before_by_id) == parent_name(after, after_by_id)
+}
+
 fn make_change(
     after_entity: &SemanticEntity,
     change_type: ChangeType,
@@ -103,15 +115,16 @@ fn make_change(
     }
 }
 
-/// 3-phase entity matching algorithm:
+/// Entity matching algorithm:
 /// 1. Exact ID match — same entity ID in before/after → modified or unchanged
 /// 2. Content hash match — same hash, different ID → renamed or moved
-/// 3. Fuzzy similarity — >80% content similarity → probable rename
+/// 3. Same signature across file rename → moved, even if content changed
+/// 4. Fuzzy similarity — >80% content similarity → probable rename
 pub fn match_entities(
     before: &[SemanticEntity],
     after: &[SemanticEntity],
     _file_path: &str,
-    _similarity_fn: Option<&dyn Fn(&SemanticEntity, &SemanticEntity) -> f64>,
+    similarity_fn: Option<&dyn Fn(&SemanticEntity, &SemanticEntity) -> f64>,
     commit_sha: Option<&str>,
     author: Option<&str>,
 ) -> MatchResult {
@@ -213,7 +226,42 @@ pub fn match_entities(
         }
     }
 
-    // Phase 3: Fuzzy similarity (>80% threshold)
+    // Phase 3: Same logical signature across a file rename.
+    // A file path change changes entity IDs, so renamed files with edited
+    // entities need a signature fallback to avoid add/delete pairs.
+    for after_entity in &unmatched_after {
+        if matched_after.contains(after_entity.id.as_str()) {
+            continue;
+        }
+
+        let mut best_match: Option<&SemanticEntity> = None;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for before_entity in &unmatched_before {
+            if matched_before.contains(before_entity.id.as_str()) {
+                continue;
+            }
+            if !same_signature_across_file_rename(before_entity, after_entity, &before_by_id, &after_by_id) {
+                continue;
+            }
+
+            let score = similarity_fn
+                .map(|f| f(before_entity, after_entity))
+                .unwrap_or_else(|| default_similarity(before_entity, after_entity));
+            if score > best_score {
+                best_score = score;
+                best_match = Some(before_entity);
+            }
+        }
+
+        if let Some(before_entity) = best_match {
+            matched_before.insert(&before_entity.id);
+            matched_after.insert(&after_entity.id);
+            changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author, &combined_by_id));
+        }
+    }
+
+    // Phase 4: Fuzzy similarity (>80% threshold)
     // Optimized: pre-compute token sets once per entity, group by type
     let still_unmatched_before: Vec<&SemanticEntity> = unmatched_before
         .iter()
@@ -312,7 +360,7 @@ pub fn match_entities(
         }
     }
 
-    // Phase 4: Intra-file reorder detection
+    // Phase 5: Intra-file reorder detection
     // For entities that matched by exact ID with identical content (unchanged),
     // check if their relative ordering changed within the file.
     detect_reorders(before, after, &matched_before, &matched_after, &mut changes, commit_sha, author, &combined_by_id);
@@ -521,6 +569,28 @@ mod tests {
         let result = match_entities(&before, &after, "a.ts", None, None, None);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Renamed);
+    }
+
+    #[test]
+    fn test_same_signature_file_rename_with_content_change_is_moved() {
+        let before = vec![make_entity(
+            "old.ts::function::foo",
+            "foo",
+            "export function foo() { return alpha + beta + gamma; }",
+            "old.ts",
+        )];
+        let after = vec![make_entity(
+            "new.ts::function::foo",
+            "foo",
+            "export function foo() { return one + two + three; }",
+            "new.ts",
+        )];
+
+        let result = match_entities(&before, &after, "new.ts", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Moved);
+        assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.ts"));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use git2::{Blame, Delta, Diff, DiffOptions, ErrorCode, Oid, Repository};
+use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
 use thiserror::Error;
 
 use super::types::{CommitInfo, DiffScope, FileChange, FileStatus};
@@ -132,11 +132,12 @@ impl GitBridge {
         };
 
         let mut opts = Self::make_diff_opts(pathspecs);
-        let diff = self.repo.diff_tree_to_index(
+        let mut diff = self.repo.diff_tree_to_index(
             head_tree.as_ref(),
             Some(&self.repo.index()?),
             Some(&mut opts),
         )?;
+        Self::detect_renames(&mut diff)?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
@@ -145,7 +146,8 @@ impl GitBridge {
         let mut opts = Self::make_diff_opts(pathspecs);
         opts.include_untracked(false);
 
-        let diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
+        let mut diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
+        Self::detect_renames(&mut diff)?;
         Ok(self.diff_to_file_changes(&diff))
     }
 
@@ -161,11 +163,12 @@ impl GitBridge {
         };
 
         let mut opts = Self::make_diff_opts(pathspecs);
-        let diff = self.repo.diff_tree_to_tree(
+        let mut diff = self.repo.diff_tree_to_tree(
             parent_tree.as_ref(),
             Some(&tree),
             Some(&mut opts),
         )?;
+        Self::detect_renames(&mut diff)?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
@@ -178,11 +181,12 @@ impl GitBridge {
         let to_tree = to_obj.peel_to_commit()?.tree()?;
 
         let mut opts = Self::make_diff_opts(pathspecs);
-        let diff = self.repo.diff_tree_to_tree(
+        let mut diff = self.repo.diff_tree_to_tree(
             Some(&from_tree),
             Some(&to_tree),
             Some(&mut opts),
         )?;
+        Self::detect_renames(&mut diff)?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
@@ -190,11 +194,19 @@ impl GitBridge {
     fn get_ref_to_working_diff_files(&self, refspec: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let tree = self.resolve_tree(refspec)?;
         let mut opts = Self::make_diff_opts(pathspecs);
-        let diff = self.repo.diff_tree_to_workdir_with_index(
+        let mut diff = self.repo.diff_tree_to_workdir_with_index(
             Some(&tree),
             Some(&mut opts),
         )?;
+        Self::detect_renames(&mut diff)?;
         Ok(self.diff_to_file_changes(&diff))
+    }
+
+    fn detect_renames(diff: &mut Diff) -> Result<(), GitError> {
+        let mut opts = DiffFindOptions::new();
+        opts.renames(true);
+        diff.find_similar(Some(&mut opts))?;
+        Ok(())
     }
 
     fn diff_to_file_changes(&self, diff: &Diff) -> Vec<FileChange> {
@@ -275,9 +287,13 @@ impl GitBridge {
                         file.after_content = self.read_working_file(&file.file_path);
                     }
                     if file.status != FileStatus::Added {
+                        let path = file
+                            .old_file_path
+                            .as_deref()
+                            .unwrap_or(&file.file_path);
                         file.before_content = head_tree
                             .as_ref()
-                            .and_then(|t| self.read_blob_from_tree(t, &file.file_path));
+                            .and_then(|t| self.read_blob_from_tree(t, path));
                     }
                 }
             }
@@ -290,9 +306,13 @@ impl GitBridge {
                             .or_else(|| self.read_working_file(&file.file_path));
                     }
                     if file.status != FileStatus::Added {
+                        let path = file
+                            .old_file_path
+                            .as_deref()
+                            .unwrap_or(&file.file_path);
                         file.before_content = head_tree
                             .as_ref()
-                            .and_then(|t| self.read_blob_from_tree(t, &file.file_path));
+                            .and_then(|t| self.read_blob_from_tree(t, path));
                     }
                 }
             }
@@ -306,9 +326,13 @@ impl GitBridge {
                             self.read_blob_from_tree(&after_tree, &file.file_path);
                     }
                     if file.status != FileStatus::Added {
+                        let path = file
+                            .old_file_path
+                            .as_deref()
+                            .unwrap_or(&file.file_path);
                         file.before_content = before_tree
                             .as_ref()
-                            .and_then(|t| self.read_blob_from_tree(t, &file.file_path));
+                            .and_then(|t| self.read_blob_from_tree(t, path));
                     }
                 }
             }
@@ -337,8 +361,12 @@ impl GitBridge {
                         file.after_content = self.read_working_file(&file.file_path);
                     }
                     if file.status != FileStatus::Added {
+                        let path = file
+                            .old_file_path
+                            .as_deref()
+                            .unwrap_or(&file.file_path);
                         file.before_content =
-                            self.read_blob_from_tree(&before_tree, &file.file_path);
+                            self.read_blob_from_tree(&before_tree, path);
                     }
                 }
             }
@@ -594,6 +622,9 @@ impl Drop for OwnerValidationDisabled {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::change::ChangeType;
+    use crate::parser::differ::compute_semantic_diff;
+    use crate::parser::plugins::create_default_registry;
     use git2::{ErrorClass, Oid, Repository, Signature};
     use tempfile::TempDir;
 
@@ -700,6 +731,82 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_path, "sample.ts");
         assert_eq!(files[0].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn staged_file_rename_is_reported_as_single_rename_with_old_contents() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let contents = "export function foo() {\n  return 1;\n}\n";
+        commit_file(&repo, "old.ts", contents, "init");
+
+        fs::rename(temp.path().join("old.ts"), temp.path().join("new.ts")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.ts")).unwrap();
+        index.add_path(Path::new("new.ts")).unwrap();
+        index.write().unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge.get_changed_files(&DiffScope::Staged, &[]).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(files[0].file_path, "new.ts");
+        assert_eq!(files[0].old_file_path.as_deref(), Some("old.ts"));
+        assert_eq!(files[0].before_content.as_deref(), Some(contents));
+        assert_eq!(files[0].after_content.as_deref(), Some(contents));
+    }
+
+    #[test]
+    fn staged_file_rename_with_edit_reports_single_moved_entity() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let before = "\
+// shared header 01
+// shared header 02
+// shared header 03
+// shared header 04
+// shared header 05
+// shared header 06
+// shared header 07
+// shared header 08
+// shared header 09
+// shared header 10
+export function foo() {
+  return alpha + beta + gamma;
+}
+";
+        let after = before.replace(
+            "return alpha + beta + gamma;",
+            "return one + two + three;",
+        );
+
+        commit_file(&repo, "old.ts", before, "init");
+        fs::rename(temp.path().join("old.ts"), temp.path().join("new.ts")).unwrap();
+        fs::write(temp.path().join("new.ts"), &after).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.ts")).unwrap();
+        index.add_path(Path::new("new.ts")).unwrap();
+        index.write().unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge.get_changed_files(&DiffScope::Staged, &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Renamed);
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&files, &registry, None, None);
+
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.moved_count, 1);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Moved);
+        assert_eq!(result.changes[0].entity_name, "foo");
+        assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.ts"));
     }
 
     #[test]

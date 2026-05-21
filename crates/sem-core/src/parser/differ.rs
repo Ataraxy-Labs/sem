@@ -441,6 +441,16 @@ mod tests {
         }
     }
 
+    fn renamed_file(old_path: &str, new_path: &str, before: &str, after: &str) -> FileChange {
+        FileChange {
+            file_path: new_path.to_string(),
+            status: FileStatus::Renamed,
+            old_file_path: Some(old_path.to_string()),
+            before_content: Some(before.to_string()),
+            after_content: Some(after.to_string()),
+        }
+    }
+
     #[test]
     fn test_parent_suppressed_when_only_child_modified() {
         let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
@@ -501,5 +511,26 @@ mod tests {
                 .any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
             "class should remain Modified when its own declaration changed, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn renamed_file_with_edited_entity_reports_move_not_add_delete() {
+        let before = "def foo():\n    return alpha + beta + gamma\n";
+        let after = "def foo():\n    return one + two + three\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[renamed_file("old.py", "new.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.moved_count, 1);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].entity_name, "foo");
+        assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.py"));
     }
 }
