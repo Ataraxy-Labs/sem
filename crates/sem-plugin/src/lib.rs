@@ -4,35 +4,45 @@
 //! - `detect-changes`: extracts entities from before/after file content, diffs at entity level
 //! - `apply-changes`: reconstructs file bytes from entity snapshots
 
+#[cfg(any(target_arch = "wasm32", test))]
 wit_bindgen::generate!({
     path: "wit/lix-plugin.wit",
     world: "plugin",
 });
 
-use exports::lix::plugin::api::{
-    DetectStateContext, EntityChange, File, Guest, PluginError,
-};
+#[cfg(any(target_arch = "wasm32", test))]
+use exports::lix::plugin::api::{DetectStateContext, EntityChange, File, Guest, PluginError};
 
+#[cfg(any(target_arch = "wasm32", test))]
 use std::collections::HashMap;
+#[cfg(any(target_arch = "wasm32", test))]
 use std::sync::OnceLock;
 
+#[cfg(any(target_arch = "wasm32", test))]
 use sem_core::git::types::{FileChange, FileStatus};
+#[cfg(any(target_arch = "wasm32", test))]
 use sem_core::model::change::ChangeType;
+#[cfg(any(target_arch = "wasm32", test))]
 use sem_core::parser::differ::compute_semantic_diff;
+#[cfg(any(target_arch = "wasm32", test))]
 use sem_core::parser::plugins::create_default_registry;
+#[cfg(any(target_arch = "wasm32", test))]
 use sem_core::parser::registry::ParserRegistry;
 
 /// Cached registry — initialized once, reused across all detect_changes calls.
+#[cfg(any(target_arch = "wasm32", test))]
 fn registry() -> &'static ParserRegistry {
     static REGISTRY: OnceLock<ParserRegistry> = OnceLock::new();
     REGISTRY.get_or_init(create_default_registry)
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 struct SemPlugin;
 
-#[cfg(not(test))]
+#[cfg(target_arch = "wasm32")]
 export!(SemPlugin);
 
+#[cfg(any(target_arch = "wasm32", test))]
 impl Guest for SemPlugin {
     fn detect_changes(
         before: Option<File>,
@@ -42,13 +52,13 @@ impl Guest for SemPlugin {
         let after_str = String::from_utf8(after.data)
             .map_err(|e| PluginError::InvalidInput(format!("invalid UTF-8 in after: {e}")))?;
 
-        let before_str = match &before {
-            Some(f) => Some(
-                String::from_utf8(f.data.clone())
-                    .map_err(|e| PluginError::InvalidInput(format!("invalid UTF-8 in before: {e}")))?,
-            ),
-            None => None,
-        };
+        let before_str =
+            match &before {
+                Some(f) => Some(String::from_utf8(f.data.clone()).map_err(|e| {
+                    PluginError::InvalidInput(format!("invalid UTF-8 in before: {e}"))
+                })?),
+                None => None,
+            };
 
         let status = if before_str.is_none() {
             FileStatus::Added
