@@ -5,19 +5,36 @@ import fs from 'node:fs/promises';
  * Downloads checksums.txt from the release, verifies the archive matches.
  * Returns silently on success, throws on mismatch or missing checksum.
  */
-export async function verifyChecksum(archivePath, archiveName, releaseBaseUrl) {
+export async function verifyChecksum(
+  archivePath,
+  archiveName,
+  releaseBaseUrl,
+  { env = process.env, fetchFn = fetch } = {},
+) {
+  if (env.SEM_SKIP_CHECKSUM === '1') {
+    console.warn('Skipping checksum verification because SEM_SKIP_CHECKSUM=1.');
+    return;
+  }
+
   const checksumsUrl = `${releaseBaseUrl}/checksums.txt`;
 
-  const response = await fetch(checksumsUrl, {
-    headers: { 'user-agent': '@ataraxy-labs/sem npm installer' },
-    redirect: 'follow',
-  });
+  let response;
+  try {
+    response = await fetchFn(checksumsUrl, {
+      headers: { 'user-agent': '@ataraxy-labs/sem npm installer' },
+      redirect: 'follow',
+    });
+  } catch (error) {
+    throw new Error(
+      `Failed to fetch checksum metadata from ${checksumsUrl}: ${error.message}`,
+    );
+  }
 
   if (!response.ok) {
-    console.warn(
-      `Could not fetch checksums (${response.status}), skipping verification.`,
+    throw new Error(
+      `Failed to fetch checksum metadata from ${checksumsUrl}: ` +
+        `${response.status} ${response.statusText}`,
     );
-    return;
   }
 
   const checksumsText = await response.text();
@@ -33,10 +50,9 @@ export async function verifyChecksum(archivePath, archiveName, releaseBaseUrl) {
   }
 
   if (!expectedHash) {
-    console.warn(
-      `No checksum found for ${archiveName} in checksums.txt, skipping verification.`,
+    throw new Error(
+      `No checksum found for ${archiveName} in checksum metadata from ${checksumsUrl}.`,
     );
-    return;
   }
 
   const fileBuffer = await fs.readFile(archivePath);

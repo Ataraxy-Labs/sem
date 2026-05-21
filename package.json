@@ -42,6 +42,6 @@
   "scripts": {
     "postinstall": "node ./scripts/postinstall.mjs",
     "prepack": "node ./scripts/sync-package-version.mjs",
-    "test": "node ./scripts/package-meta.test.mjs"
+    "test": "node --test"
   }
 }
