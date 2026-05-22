@@ -17,6 +17,11 @@ pkgs.rustPlatform.buildRustPackage rec {
       # "dummy-0.14.0" = lib.fakeHash;
     };
   };
+  cargoBuildFlags = [
+    "--package"
+    "sem-cli"
+  ];
+  cargoTestFlags = cargoBuildFlags;
 
   # disable tests
   checkType = "debug";
