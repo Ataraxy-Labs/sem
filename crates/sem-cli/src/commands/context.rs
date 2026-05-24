@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use colored::Colorize;
+use sem_core::git::bridge::GitBridge;
 use sem_core::parser::context::build_context;
 use sem_core::parser::graph::EntityGraph;
 
@@ -16,8 +17,12 @@ pub struct ContextOptions {
 }
 
 pub fn context_command(opts: ContextOptions) {
-    let root = Path::new(&opts.cwd);
-    let registry = super::create_registry(&opts.cwd);
+    let root = match GitBridge::open(Path::new(&opts.cwd)) {
+        Ok(git) => git.repo_root().to_path_buf(),
+        Err(_) => Path::new(&opts.cwd).to_path_buf(),
+    };
+    let root = root.as_path();
+    let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
 
     let file_paths = super::graph::find_supported_files_public(root, &registry, &ext_filter);

@@ -124,7 +124,7 @@ fn extract_files_entities(
             Err(e) => {
                 eprintln!(
                     "{} Cannot read '{}': {}",
-                    "error:".red().bold(),
+                    "warning:".yellow().bold(),
                     file_path,
                     e
                 );

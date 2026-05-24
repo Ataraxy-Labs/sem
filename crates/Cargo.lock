@@ -1435,6 +1435,7 @@ name = "sem-mcp"
 version = "0.6.0"
 dependencies = [
  "git2",
+ "ignore",
  "lru",
  "openssl",
  "rmcp",

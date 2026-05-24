@@ -49,21 +49,27 @@ pub fn build_context(
     let mut entries = Vec::new();
     let mut tokens_used = 0usize;
 
-    // 1. Target entity (full)
+    // 1. Target entity (always included, truncated to signature if it exceeds budget)
     if let Some(entity) = entity_lookup.get(entity_id) {
-        let tokens = estimate_tokens(&entity.content);
-        if tokens_used + tokens <= token_budget {
-            entries.push(ContextEntry {
-                entity_id: entity.id.clone(),
-                entity_name: entity.name.clone(),
-                entity_type: entity.entity_type.clone(),
-                file_path: entity.file_path.clone(),
-                role: "target".to_string(),
-                content: entity.content.clone(),
-                estimated_tokens: tokens,
-            });
-            tokens_used += tokens;
-        }
+        let full_tokens = estimate_tokens(&entity.content);
+        let (content, tokens) = if full_tokens <= token_budget {
+            (entity.content.clone(), full_tokens)
+        } else {
+            // Truncate to signature so the target is always present (#145)
+            let sig = signature_only(&entity.content);
+            let sig_tokens = estimate_tokens(&sig);
+            (sig, sig_tokens)
+        };
+        entries.push(ContextEntry {
+            entity_id: entity.id.clone(),
+            entity_name: entity.name.clone(),
+            entity_type: entity.entity_type.clone(),
+            file_path: entity.file_path.clone(),
+            role: "target".to_string(),
+            content,
+            estimated_tokens: tokens,
+        });
+        tokens_used += tokens;
     }
 
     // 2. Direct dependents (full content)

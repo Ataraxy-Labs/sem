@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use colored::Colorize;
+use sem_core::git::bridge::GitBridge;
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::registry::ParserRegistry;
@@ -12,13 +13,18 @@ pub struct GraphOptions {
     pub json: bool,
     pub file_exts: Vec<String>,
     pub no_cache: bool,
+    pub no_default_excludes: bool,
 }
 
 pub fn graph_command(opts: GraphOptions) {
-    let root = Path::new(&opts.cwd);
-    let registry = super::create_registry(&opts.cwd);
+    let root = match GitBridge::open(Path::new(&opts.cwd)) {
+        Ok(git) => git.repo_root().to_path_buf(),
+        Err(_) => Path::new(&opts.cwd).to_path_buf(),
+    };
+    let root = root.as_path();
+    let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = normalize_exts(&opts.file_exts);
-    let file_paths = find_supported_files_public(root, &registry, &ext_filter);
+    let file_paths = find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
     let (graph, _entities) = get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     if opts.json {
@@ -50,7 +56,7 @@ pub fn normalize_exts(exts: &[String]) -> Vec<String> {
 
 /// Find all supported files in the repo (public for use by other commands).
 pub fn find_supported_files_public(root: &Path, registry: &ParserRegistry, ext_filter: &[String]) -> Vec<String> {
-    find_supported_files(root, registry, ext_filter)
+    find_supported_files_inner(root, registry, ext_filter, false)
 }
 
 /// File names that are always excluded from graph/index (lockfiles, generated content).
@@ -93,7 +99,7 @@ fn is_default_excluded(rel_path: &str) -> bool {
     false
 }
 
-fn find_supported_files(root: &Path, registry: &ParserRegistry, ext_filter: &[String]) -> Vec<String> {
+fn find_supported_files_inner(root: &Path, registry: &ParserRegistry, ext_filter: &[String], no_default_excludes: bool) -> Vec<String> {
     let mut files = Vec::new();
 
     // Use the `ignore` crate to walk the filesystem respecting .gitignore and .semignore
@@ -119,7 +125,7 @@ fn find_supported_files(root: &Path, registry: &ParserRegistry, ext_filter: &[St
         }
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
-            if is_default_excluded(&rel_str) {
+            if !no_default_excludes && is_default_excluded(&rel_str) {
                 continue;
             }
             if !ext_filter.is_empty() && !ext_filter.iter().any(|ext| rel_str.ends_with(ext.as_str())) {

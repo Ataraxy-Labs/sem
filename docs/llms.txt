@@ -70,7 +70,7 @@ sem impact validateToken --file-exts .py
 
 ## Key Features
 
-- 26 languages with full entity extraction via tree-sitter
+- 27 languages with full entity extraction via tree-sitter
 - Structural hashing: AST-normalized hashes that ignore whitespace, comments, formatting
 - Cosmetic vs structural change detection in diff
 - Entity-level blame (per function, not per line)
@@ -82,7 +82,7 @@ sem impact validateToken --file-exts .py
 
 ## Language Support
 
-26 programming languages:
+27 programming languages:
 
 | Language | Extensions | Entity Types |
 |----------|-----------|--------------|
@@ -111,6 +111,7 @@ sem impact validateToken --file-exts .py
 | Perl | .pl .pm .t | subroutines, packages |
 | OCaml | .ml .mli | values, modules, types, classes, externals |
 | Scala | .scala .sc .sbt | classes, objects, traits, enums, functions, vals, extensions |
+| Nix | .nix | bindings, inherit declarations |
 | Zig | .zig | functions, tests, variables |
 
 Plus structured data formats:

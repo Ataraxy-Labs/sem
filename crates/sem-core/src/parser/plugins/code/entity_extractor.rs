@@ -144,6 +144,102 @@ fn visit_node(
             if extracted { continue; }
         }
 
+        // TypeScript/JS multi-declarator: `const a = 1, b = 2` should produce
+        // one entity per declarator instead of collapsing to the first name (#149).
+        if (node_type == "lexical_declaration" || node_type == "variable_declaration")
+            && matches!(config.id, "typescript" | "tsx" | "javascript")
+            && config.entity_node_types.contains(&node_type)
+        {
+            let mut cursor = node.walk();
+            let declarators: Vec<_> = node
+                .named_children(&mut cursor)
+                .filter(|c| c.kind() == "variable_declarator")
+                .collect();
+            if declarators.len() > 1 {
+                let should_skip = should_skip_entity(config, suppression_context, node_type);
+                if !should_skip {
+                    for declarator in &declarators {
+                        if let Some(name_node) = declarator.child_by_field_name("name") {
+                            let name = node_text(name_node, source).to_string();
+                            let entity_type = map_entity_type(node, config);
+                            let content = node_text(*declarator, source).to_string();
+                            let struct_hash = compute_structural_hash(*declarator, source);
+                            let entity = SemanticEntity {
+                                id: build_entity_id(file_path, entity_type, &name, parent_id),
+                                file_path: file_path.to_string(),
+                                entity_type: entity_type.to_string(),
+                                name,
+                                parent_id: parent_id.map(String::from),
+                                content_hash: content_hash(&content),
+                                structural_hash: Some(struct_hash),
+                                content,
+                                start_line: declarator.start_position().row + 1,
+                                end_line: declarator.end_position().row + 1,
+                                metadata: None,
+                            };
+                            entities.push(entity);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Go grouped declarations: `var ( a = 1; b = 2 )` should produce
+        // one entity per spec instead of collapsing to the first (#149).
+        if (node_type == "var_declaration"
+            || node_type == "const_declaration"
+            || node_type == "type_declaration")
+            && config.id == "go"
+            && config.entity_node_types.contains(&node_type)
+        {
+            let spec_kinds = ["var_spec", "const_spec", "type_spec"];
+            let list_kinds = ["var_spec_list", "type_spec_list"];
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            let mut specs: Vec<Node> = Vec::new();
+            for child in &children {
+                if spec_kinds.contains(&child.kind()) {
+                    specs.push(*child);
+                } else if list_kinds.contains(&child.kind()) {
+                    let mut inner = child.walk();
+                    for spec in child.named_children(&mut inner) {
+                        if spec_kinds.contains(&spec.kind()) {
+                            specs.push(spec);
+                        }
+                    }
+                }
+            }
+            if specs.len() > 1 {
+                let should_skip = should_skip_entity(config, suppression_context, node_type);
+                if !should_skip {
+                    for spec in &specs {
+                        if let Some(name_node) = spec.child_by_field_name("name") {
+                            let name = node_text(name_node, source).to_string();
+                            let entity_type = map_entity_type(node, config);
+                            let content = node_text(*spec, source).to_string();
+                            let struct_hash = compute_structural_hash(*spec, source);
+                            let entity = SemanticEntity {
+                                id: build_entity_id(file_path, entity_type, &name, parent_id),
+                                file_path: file_path.to_string(),
+                                entity_type: entity_type.to_string(),
+                                name,
+                                parent_id: parent_id.map(String::from),
+                                content_hash: content_hash(&content),
+                                structural_hash: Some(struct_hash),
+                                content,
+                                start_line: spec.start_position().row + 1,
+                                end_line: spec.end_position().row + 1,
+                                metadata: None,
+                            };
+                            entities.push(entity);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         if config.entity_node_types.contains(&node_type) {
             if let Some(name) = extract_name(node, source) {
                 let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
@@ -922,20 +1018,28 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "function_item"
         | "function_signature"
         | "subroutine_declaration_statement" => "function",
-        "method_declaration" | "method_definition" | "method" | "singleton_method" => "method",
+        "method_declaration" | "method_definition" | "method" | "singleton_method"
+        | "method_signature" | "operator_signature" => "method",
         "class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
         "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
-        "enum_declaration" | "enum_item" | "enum_specifier" => "enum",
+        "enum_declaration" | "enum_item" | "enum_specifier" | "enum_definition" => "enum",
         "mixin_declaration" => "mixin",
         "extension_declaration" | "extension_type_declaration" => "extension",
         "getter_signature" => "getter",
         "setter_signature" => "setter",
+        "record_declaration" | "record_struct_declaration" => "record",
         "struct_item" | "struct_specifier" | "struct_declaration" => "struct",
         "union_specifier" => "union",
         "impl_item" => "impl",
         "trait_item" => "trait",
-        "mod_item" | "module" | "module_definition" | "namespace_definition" | "namespace_declaration" => "module",
+        "mod_item" | "module" | "module_definition" | "namespace_definition" | "namespace_declaration"
+        | "package_object" => "module",
+        "object_definition" => "object",
+        "trait_definition" => "trait",
+        "val_definition" => "val",
+        "given_definition" => "given",
+        "extension_definition" => "extension",
         "package_statement" => "package",
         "export_statement" => "export",
         "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
@@ -951,7 +1055,7 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "decorated_definition" => "decorated_definition",
         "constructor_declaration" => "constructor",
         "field_declaration" | "public_field_definition" | "field_definition" => "field",
-        "property_declaration" => "property",
+        "property_declaration" | "property_signature" => "property",
         "annotation_type_declaration" => "annotation",
         "template_declaration" => "template",
         other => other,
@@ -1146,10 +1250,34 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
     match node.kind() {
         "decorated_definition" => map_decorated_type(node),
         "class_member" => map_class_member_type(node),
+        // C/C++ declarations with a function_declarator are function prototypes,
+        // not variables (#152).
+        "declaration" if matches!(config.id, "c" | "cpp") && has_function_declarator(node) => {
+            "function"
+        }
         _ => promote_zig_variable(node, config)
             .or_else(|| promote_js_ts_const_function(node, config))
             .unwrap_or_else(|| map_node_type(node.kind())),
     }
+}
+
+/// Check whether a C/C++ `declaration` node contains a `function_declarator`
+/// descendant, indicating it is a function prototype rather than a variable.
+fn has_function_declarator(node: Node) -> bool {
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        let mut current = declarator;
+        loop {
+            if current.kind() == "function_declarator" {
+                return true;
+            }
+            if let Some(inner) = current.child_by_field_name("declarator") {
+                current = inner;
+            } else {
+                break;
+            }
+        }
+    }
+    false
 }
 
 /// In Zig, `const Point = struct { ... }` is a variable_declaration whose RHS

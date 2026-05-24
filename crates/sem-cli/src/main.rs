@@ -32,7 +32,7 @@ enum ColorMode {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show semantic diff of changes (supports git diff syntax)
+    /// Show semantic diff of changes (supports git diff syntax). Untracked files are excluded, matching git behavior.
     Diff {
         /// Git refs, files, or pathspecs (supports ref1..ref2, ref1...ref2, -- paths)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -161,6 +161,10 @@ enum Commands {
         /// Skip the SQLite entity cache (rebuild from scratch)
         #[arg(long)]
         no_cache: bool,
+
+        /// Include directories that are excluded by default (fixtures, vendor, node_modules, etc.)
+        #[arg(long)]
+        no_default_excludes: bool,
     },
     /// Show semantic blame — who last modified each entity
     Blame {
@@ -354,6 +358,7 @@ fn main() {
             json,
             file_exts,
             no_cache,
+            no_default_excludes,
         }) => {
             let cwd = if path == "." {
                 std::env::current_dir()
@@ -369,6 +374,7 @@ fn main() {
                 json: resolve_json(format, json),
                 file_exts,
                 no_cache,
+                no_default_excludes,
             });
         }
         Some(Commands::Blame { file, format, json }) => {

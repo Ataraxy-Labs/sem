@@ -122,48 +122,62 @@ impl SemServer {
     }
 
     fn find_supported_files(root: &Path, registry: &ParserRegistry) -> Result<Vec<String>, String> {
+        if !root.exists() {
+            return Err(format!(
+                "Failed to read directory {}: No such file or directory",
+                root.display()
+            ));
+        }
         let mut files = Vec::new();
-        Self::walk_dir(root, root, registry, &mut files)?;
-        files.sort();
-        Ok(files)
-    }
-
-    fn walk_dir(
-        dir: &Path,
-        root: &Path,
-        registry: &ParserRegistry,
-        files: &mut Vec<String>,
-    ) -> Result<(), String> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) => return Err(format!("Failed to read directory {}: {}", dir.display(), e)),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+        let walker = ignore::WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
+        for entry in walker.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.')
-                    || name == "node_modules"
-                    || name == "target"
-                    || name == "__pycache__"
-                    || name == "venv"
-                    || name == "vendor"
-                    || name == "dist"
-                    || name == "build"
-                {
-                    continue;
-                }
+            if !path.is_file() {
+                continue;
             }
-            if path.is_dir() {
-                Self::walk_dir(&path, root, registry, files)?;
-            } else if let Ok(rel) = path.strip_prefix(root) {
+            if let Ok(rel) = path.strip_prefix(root) {
                 let rel_str = rel.to_string_lossy().to_string();
                 if registry.get_plugin(&rel_str).is_some() {
                     files.push(rel_str);
                 }
             }
         }
-        Ok(())
+        files.sort();
+        Ok(files)
+    }
+
+    /// Walk a subdirectory, returning paths relative to `prefix_root` (e.g. the repo root).
+    fn walk_dir_files(
+        dir: &Path,
+        prefix_root: &Path,
+        registry: &ParserRegistry,
+    ) -> Result<Vec<String>, String> {
+        let mut files = Vec::new();
+        let walker = ignore::WalkBuilder::new(dir)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(prefix_root) {
+                let rel_str = rel.to_string_lossy().to_string();
+                if registry.get_plugin(&rel_str).is_some() {
+                    files.push(rel_str);
+                }
+            }
+        }
+        files.sort();
+        Ok(files)
     }
 
     fn read_file_at(abs_path: &Path, display_path: &str) -> Result<String, String> {
@@ -361,10 +375,8 @@ impl SemServer {
             }
             (entities, false)
         } else if abs_path.is_dir() {
-            let mut file_paths = Vec::new();
-            Self::walk_dir(&abs_path, &ctx.repo_root, &self.registry, &mut file_paths)
-                .map_err(internal_err)?;
-            file_paths.sort();
+            let file_paths =
+                Self::walk_dir_files(&abs_path, &ctx.repo_root, &self.registry).map_err(internal_err)?;
 
             let all_entities = self
                 .extract_entities_from_files(&ctx.repo_root, &file_paths)
@@ -410,11 +422,15 @@ impl SemServer {
             .await
             .map_err(internal_err)?;
 
-        let target_ref = params.target_ref.as_deref().unwrap_or("HEAD");
-
-        let scope = DiffScope::Range {
-            from: params.base_ref.clone(),
-            to: target_ref.to_string(),
+        let scope = if let Some(ref base) = params.base_ref {
+            let target_ref = params.target_ref.as_deref().unwrap_or("HEAD");
+            DiffScope::Range {
+                from: base.clone(),
+                to: target_ref.to_string(),
+            }
+        } else {
+            // Default: working-tree changes, same as CLI `sem diff` (#154)
+            DiffScope::Working
         };
 
         let pathspecs: Vec<String> = if let Some(ref fp) = params.file_path {
@@ -454,8 +470,8 @@ impl SemServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&serde_json::json!({
-                "base_ref": params.base_ref,
-                "target_ref": target_ref,
+                "base_ref": params.base_ref.as_deref().unwrap_or("working-tree"),
+                "target_ref": params.target_ref.as_deref().unwrap_or("HEAD"),
                 "files_analyzed": diff_result.file_count,
                 "total_changes": changes.len(),
                 "changes": changes,
@@ -518,9 +534,9 @@ impl SemServer {
                 "name": entity.name,
                 "type": entity.entity_type,
                 "lines": [entity.start_line, entity.end_line],
-                "author": latest_author,
+                "author": if latest_author.is_empty() { "uncommitted" } else { &latest_author },
                 "date": latest_date,
-                "commit": &latest_sha[..8.min(latest_sha.len())],
+                "commit": if latest_sha.is_empty() { "uncommitted" } else { &latest_sha },
                 "summary": latest_summary,
             }));
         }
@@ -555,6 +571,14 @@ impl SemServer {
         let entity_id = Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)?;
 
         let mode = params.mode.as_deref().unwrap_or("all");
+        let valid_modes = ["all", "deps", "dependents", "tests"];
+        if !valid_modes.contains(&mode) {
+            return Err(internal_err(format!(
+                "Invalid mode '{}'. Valid modes: {}",
+                mode,
+                valid_modes.join(", ")
+            )));
+        }
 
         let output = match mode {
             "deps" => {
@@ -721,7 +745,7 @@ impl SemServer {
                     if prev_entity_content.is_some() {
                         let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
                         entries.push(serde_json::json!({
-                            "commit": commit.short_sha,
+                            "commit": commit.sha,
                             "author": commit.author,
                             "date": date,
                             "message": commit.message.lines().next().unwrap_or(""),
@@ -748,7 +772,7 @@ impl SemServer {
                     if !found_at_least_once || prev_entity_content.is_none() {
                         found_at_least_once = true;
                         entries.push(serde_json::json!({
-                            "commit": commit.short_sha,
+                            "commit": commit.sha,
                             "author": commit.author,
                             "date": date,
                             "message": msg,
@@ -777,7 +801,7 @@ impl SemServer {
                             };
 
                             entries.push(serde_json::json!({
-                                "commit": commit.short_sha,
+                                "commit": commit.sha,
                                 "author": commit.author,
                                 "date": date,
                                 "message": msg,
@@ -792,7 +816,7 @@ impl SemServer {
                 None => {
                     if prev_entity_content.is_some() {
                         entries.push(serde_json::json!({
-                            "commit": commit.short_sha,
+                            "commit": commit.sha,
                             "author": commit.author,
                             "date": date,
                             "message": msg,

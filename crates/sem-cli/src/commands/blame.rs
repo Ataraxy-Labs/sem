@@ -118,9 +118,9 @@ pub fn blame_command(opts: BlameOptions) {
                     "name": r.name,
                     "type": r.entity_type,
                     "lines": [r.start_line, r.end_line],
-                    "author": r.author,
+                    "author": if r.author.is_empty() { "uncommitted" } else { &r.author },
                     "date": r.date,
-                    "commit": &r.commit_sha[..8.min(r.commit_sha.len())],
+                    "commit": if r.commit_sha.is_empty() { "uncommitted" } else { &r.commit_sha },
                     "summary": r.summary,
                 })
             })
@@ -138,7 +138,9 @@ pub fn blame_command(opts: BlameOptions) {
         let max_type_len = results.iter().map(|r| r.entity_type.len()).max().unwrap_or(8);
 
         for r in &results {
-            let sha_short = if r.commit_sha.len() >= 8 {
+            let sha_short = if r.commit_sha.is_empty() {
+                "uncommtd"
+            } else if r.commit_sha.len() >= 8 {
                 &r.commit_sha[..8]
             } else {
                 &r.commit_sha

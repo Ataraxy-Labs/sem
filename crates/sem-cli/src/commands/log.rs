@@ -51,6 +51,7 @@ impl EntityChangeType {
 }
 
 struct LogEntry {
+    sha: String,
     short_sha: String,
     author: String,
     date: String,
@@ -197,6 +198,7 @@ pub fn log_command(opts: LogOptions) {
                     if !found_at_least_once {
                         found_at_least_once = true;
                         entries.push(LogEntry {
+                            sha: commit.sha.clone(),
                             short_sha: commit.short_sha.clone(),
                             author: commit.author.clone(),
                             date,
@@ -209,6 +211,7 @@ pub fn log_command(opts: LogOptions) {
                         });
                     } else if prev_entity_content.is_none() {
                         entries.push(LogEntry {
+                            sha: commit.sha.clone(),
                             short_sha: commit.short_sha.clone(),
                             author: commit.author.clone(),
                             date,
@@ -238,6 +241,7 @@ pub fn log_command(opts: LogOptions) {
                                 EntityChangeType::ModifiedCosmetic
                             };
                             entries.push(LogEntry {
+                                sha: commit.sha.clone(),
                                 short_sha: commit.short_sha.clone(),
                                 author: commit.author.clone(),
                                 date,
@@ -270,6 +274,7 @@ pub fn log_command(opts: LogOptions) {
                             Some((new_file, ent)) => {
                                 let prev_file = current_git_file.clone();
                                 entries.push(LogEntry {
+                                    sha: commit.sha.clone(),
                                     short_sha: commit.short_sha.clone(),
                                     author: commit.author.clone(),
                                     date,
@@ -290,6 +295,7 @@ pub fn log_command(opts: LogOptions) {
                             }
                             None => {
                                 entries.push(LogEntry {
+                                    sha: commit.sha.clone(),
                                     short_sha: commit.short_sha.clone(),
                                     author: commit.author.clone(),
                                     date,
@@ -464,7 +470,7 @@ fn print_json(
         .map(|e| {
             let mut obj = serde_json::json!({
                 "commit": {
-                    "sha": e.short_sha,
+                    "sha": e.sha,
                     "author": e.author,
                     "date": e.date,
                     "message": e.message,

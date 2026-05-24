@@ -31,6 +31,41 @@ impl DiskCache {
         Ok(Self { conn })
     }
 
+    /// Check if `.semrc` has changed since the cache was last saved.
+    fn is_semrc_stale(&self, root: &Path) -> bool {
+        let semrc = root.join(".semrc");
+        let cached: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT mtime_secs, mtime_nanos FROM files WHERE path = '__semrc__'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        match (semrc.exists(), cached) {
+            // .semrc exists on disk but not in cache, or vice versa -> stale
+            (true, None) | (false, Some(_)) => true,
+            // Neither exists -> not stale
+            (false, None) => false,
+            // Both exist -> compare mtimes
+            (true, Some((secs, nanos))) => {
+                let meta = match std::fs::metadata(&semrc) {
+                    Ok(m) => m,
+                    Err(_) => return true,
+                };
+                let mtime = match meta.modified() {
+                    Ok(t) => t,
+                    Err(_) => return true,
+                };
+                let dur = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                secs != dur.as_secs() as i64 || nanos != dur.subsec_nanos() as i64
+            }
+        }
+    }
+
     pub fn save(
         &self,
         root: &Path,
@@ -58,6 +93,26 @@ impl DiskCache {
                             dur.subsec_nanos() as i64
                         ])?;
                     }
+                }
+            }
+        }
+
+        // Store .semrc mtime so cache is invalidated when parser mappings change (#144)
+        {
+            let semrc = root.join(".semrc");
+            if let Ok(meta) = std::fs::metadata(&semrc) {
+                if let Ok(mtime) = meta.modified() {
+                    let dur = mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let mut stmt = tx.prepare(
+                        "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
+                    )?;
+                    stmt.execute(params![
+                        "__semrc__",
+                        dur.as_secs() as i64,
+                        dur.subsec_nanos() as i64
+                    ])?;
                 }
             }
         }
@@ -112,11 +167,25 @@ impl DiskCache {
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        // Check if .semrc has changed since cache was stored (#144)
+        if self.is_semrc_stale(root) {
+            return None;
+        }
+
         let cached_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .ok()?;
-        if cached_count as usize != files.len() {
+        // Subtract 1 from cached count if __semrc__ entry is present
+        let semrc_entry: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = '__semrc__'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if (cached_count - semrc_entry) as usize != files.len() {
             return None;
         }
 
@@ -222,6 +291,11 @@ impl DiskCache {
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        // If .semrc changed, force full rebuild (#144)
+        if self.is_semrc_stale(root) {
+            return None;
+        }
+
         // Load all cached file paths + mtimes
         let mut stmt = self
             .conn
@@ -394,7 +468,7 @@ impl DiskCache {
                 .unwrap_or_default();
             let mut del_files = tx.prepare("DELETE FROM files WHERE path = ?1")?;
             for path in &cached_paths {
-                if !current_set.contains(path.as_str()) {
+                if path != "__semrc__" && !current_set.contains(path.as_str()) {
                     del_files.execute(params![path])?;
                 }
             }

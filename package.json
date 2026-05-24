@@ -1,6 +1,6 @@
 {
   "name": "@ataraxy-labs/sem",
-  "version": "0.3.22",
+  "version": "0.6.0",
   "description": "npm wrapper for the sem CLI. Downloads the matching release binary and exposes the sem command in node_modules/.bin.",
   "license": "MIT OR Apache-2.0",
   "type": "module",

@@ -579,7 +579,12 @@ fn run_diff_pipeline(
             .collect();
         file_changes
             .into_iter()
-            .filter(|fc| exts.iter().any(|ext| fc.file_path.ends_with(ext.as_str())))
+            .filter(|fc| {
+                exts.iter().any(|ext| {
+                    fc.file_path.ends_with(ext.as_str())
+                        || fc.old_file_path.as_ref().is_some_and(|old| old.ends_with(ext.as_str()))
+                })
+            })
             .collect()
     };
 
