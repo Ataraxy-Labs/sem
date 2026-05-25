@@ -25,6 +25,7 @@ pub struct DiffOptions {
     pub verbose: bool,
     pub profile: bool,
     pub file_exts: Vec<String>,
+    pub no_cosmetics: bool,
     pub args: Vec<String>,
 }
 
@@ -605,8 +606,18 @@ fn run_diff_pipeline(
     let registry_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
     let t3 = Instant::now();
-    let result = compute_semantic_diff(&file_changes, &registry, None, None);
+    let mut result = compute_semantic_diff(&file_changes, &registry, None, None);
     let parse_diff_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    // Filter out cosmetic-only changes when --no-cosmetics is set
+    if opts.no_cosmetics {
+        let before_count = result.changes.len();
+        result.changes.retain(|c| c.structural_change != Some(false));
+        let removed = before_count - result.changes.len();
+        if removed > 0 {
+            result.modified_count = result.modified_count.saturating_sub(removed);
+        }
+    }
 
     // Record lifetime stats (best-effort)
     let _ = SemLifetimeStats::load().record_diff(&result).save();

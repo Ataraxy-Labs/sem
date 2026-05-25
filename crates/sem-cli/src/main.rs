@@ -86,6 +86,10 @@ enum Commands {
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
+        /// Hide cosmetic changes (formatting, whitespace, comments only)
+        #[arg(long)]
+        no_cosmetics: bool,
+
         /// When to use colors
         #[arg(long, default_value = "auto")]
         color: ColorMode,
@@ -323,6 +327,7 @@ fn main() {
             json,
             profile,
             file_exts,
+            no_cosmetics,
             color,
             directory,
         }) => {
@@ -349,6 +354,7 @@ fn main() {
                 verbose,
                 profile,
                 file_exts,
+                no_cosmetics,
                 args,
             });
         }
@@ -536,6 +542,7 @@ fn main() {
                 verbose: false,
                 profile: false,
                 file_exts: vec![],
+                no_cosmetics: false,
                 args: vec![],
             });
         }
