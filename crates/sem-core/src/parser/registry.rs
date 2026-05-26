@@ -3,7 +3,7 @@ use std::path::Path;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::model::entity::SemanticEntity;
+use crate::model::entity::{build_entity_id, SemanticEntity};
 
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
@@ -249,7 +249,7 @@ impl ParserRegistry {
         root: &Path,
         file_paths: &[String],
     ) -> Vec<SemanticEntity> {
-        maybe_par_iter!(file_paths)
+        let mut entities: Vec<SemanticEntity> = maybe_par_iter!(file_paths)
             .flat_map(|fp| {
                 let full = root.join(fp);
                 let content = match std::fs::read_to_string(&full) {
@@ -258,8 +258,110 @@ impl ParserRegistry {
                 };
                 self.extract_entities(fp, &content)
             })
-            .collect()
+            .collect();
+        resolve_go_method_parent_ids(&mut entities);
+        entities
     }
+}
+
+pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) {
+    let mut types_by_package: HashMap<(String, String, String), String> = HashMap::new();
+
+    for entity in entities.iter() {
+        if !is_go_file(&entity.file_path) || !is_go_receiver_type_entity(entity) {
+            continue;
+        }
+
+        let package_name = go_package_name(entity).unwrap_or("");
+
+        types_by_package
+            .entry((
+                go_package_dir(&entity.file_path).to_string(),
+                package_name.to_string(),
+                entity.name.clone(),
+            ))
+            .or_insert_with(|| entity.id.clone());
+    }
+
+    for entity in entities.iter_mut() {
+        if !is_go_file(&entity.file_path) || entity.entity_type != "method" {
+            continue;
+        }
+
+        let package_name = go_package_name(entity).unwrap_or("");
+        let Some(receiver_name) = extract_go_receiver_type_name(&entity.content) else {
+            continue;
+        };
+
+        let key = (
+            go_package_dir(&entity.file_path).to_string(),
+            package_name.to_string(),
+            receiver_name,
+        );
+
+        let Some(parent_id) = types_by_package.get(&key) else {
+            continue;
+        };
+
+        if entity.parent_id.as_deref() == Some(parent_id.as_str()) {
+            continue;
+        }
+
+        entity.parent_id = Some(parent_id.clone());
+        entity.id = build_entity_id(
+            &entity.file_path,
+            &entity.entity_type,
+            &entity.name,
+            Some(parent_id),
+        );
+    }
+}
+
+fn is_go_file(file_path: &str) -> bool {
+    file_path.ends_with(".go")
+}
+
+fn is_go_receiver_type_entity(entity: &SemanticEntity) -> bool {
+    matches!(
+        entity.entity_type.as_str(),
+        "type" | "struct" | "class" | "interface"
+    )
+}
+
+fn go_package_name(entity: &SemanticEntity) -> Option<&str> {
+    entity
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("go.package"))
+        .map(String::as_str)
+}
+
+fn go_package_dir(file_path: &str) -> &str {
+    file_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+fn extract_go_receiver_type_name(content: &str) -> Option<String> {
+    let after_func = content.trim_start().strip_prefix("func")?.trim_start();
+    let receiver = after_func.strip_prefix('(')?;
+    let receiver_end = receiver.find(')')?;
+    let receiver = receiver[..receiver_end].trim();
+    if receiver.is_empty() {
+        return None;
+    }
+
+    let receiver_type = receiver.split_whitespace().last().unwrap_or(receiver);
+
+    let receiver_type = receiver_type.trim_start_matches('*').trim();
+    let receiver_type = receiver_type
+        .split_once('[')
+        .map_or(receiver_type, |(name, _)| name)
+        .trim();
+    let receiver_type = receiver_type
+        .rsplit_once('.')
+        .map_or(receiver_type, |(_, name)| name)
+        .trim();
+
+    (!receiver_type.is_empty()).then(|| receiver_type.to_string())
 }
 
 /// Restore original file path in entities when a custom extension mapping was used.
@@ -553,6 +655,15 @@ fn extract_vim_filetype(line: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use crate::parser::plugins::create_default_registry;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &TempDir, name: &str, content: &str) {
+        let path = dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
 
     #[test]
     fn test_registry_matches_compound_svelte_typescript_suffix() {
@@ -667,6 +778,84 @@ mod tests {
             .expect("should detect Rust");
         let entities = plugin.extract_entities(content, "lib");
         assert!(entities.iter().any(|e| e.name == "process"));
+    }
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_go_method_parent_resolves_across_files() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            &dir,
+            "methods.go",
+            "package demo\n\nfunc (s *Service) Run() {}\n",
+        );
+
+        let entities = registry.extract_all_entities(
+            dir.path(),
+            &["models.go".to_string(), "methods.go".to_string()],
+        );
+        let service = entities
+            .iter()
+            .find(|e| e.name == "Service" && e.file_path == "models.go")
+            .expect("Service type should be extracted");
+        let run = entities
+            .iter()
+            .find(|e| e.name == "Run" && e.file_path == "methods.go")
+            .expect("Run method should be extracted");
+
+        assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
+        assert_eq!(run.id, format!("{}::Run", service.id));
+    }
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_go_method_parent_resolution_is_package_directory_scoped() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "alpha/models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            &dir,
+            "alpha/methods.go",
+            "package demo\n\nfunc (s *Service) Run() {}\n",
+        );
+        write_file(&dir, "beta/models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            &dir,
+            "beta/methods.go",
+            "package demo\n\nfunc (s *Service) Run() {}\n",
+        );
+
+        let entities = registry.extract_all_entities(
+            dir.path(),
+            &[
+                "alpha/models.go".to_string(),
+                "alpha/methods.go".to_string(),
+                "beta/models.go".to_string(),
+                "beta/methods.go".to_string(),
+            ],
+        );
+
+        let alpha_service = entities
+            .iter()
+            .find(|e| e.name == "Service" && e.file_path == "alpha/models.go")
+            .expect("alpha Service type should be extracted");
+        let beta_service = entities
+            .iter()
+            .find(|e| e.name == "Service" && e.file_path == "beta/models.go")
+            .expect("beta Service type should be extracted");
+        let alpha_run = entities
+            .iter()
+            .find(|e| e.name == "Run" && e.file_path == "alpha/methods.go")
+            .expect("alpha Run method should be extracted");
+        let beta_run = entities
+            .iter()
+            .find(|e| e.name == "Run" && e.file_path == "beta/methods.go")
+            .expect("beta Run method should be extracted");
+
+        assert_eq!(alpha_run.parent_id.as_deref(), Some(alpha_service.id.as_str()));
+        assert_eq!(beta_run.parent_id.as_deref(), Some(beta_service.id.as_str()));
     }
 
     #[test]

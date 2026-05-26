@@ -28,7 +28,7 @@ macro_rules! maybe_par_iter {
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
-use crate::parser::registry::ParserRegistry;
+use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
 /// A reference from one entity to another.
@@ -132,6 +132,7 @@ impl EntityGraph {
                 parsed_files.push(p);
             }
         }
+        resolve_go_method_parent_ids(&mut all_entities);
 
         // Pass A: Build all lookup structures in a single pass over all_entities.
         // This merges what was previously 6 separate O(E) iterations.
@@ -483,7 +484,27 @@ impl EntityGraph {
             }
         }
 
-        // Entity-level diffing: compare new stale-file entities against cached versions
+        // Merge clean cached entities with newly parsed stale-file entities before
+        // repairing Go method parents; Go receiver types may live in clean files.
+        let mut all_entities: Vec<SemanticEntity> = cached_entities
+            .into_iter()
+            .chain(new_entities.into_iter())
+            .collect();
+        let entity_ids_before_parent_repair: HashSet<String> =
+            all_entities.iter().map(|e| e.id.clone()).collect();
+        resolve_go_method_parent_ids(&mut all_entities);
+        let parent_repaired_ids: HashSet<&str> = all_entities
+            .iter()
+            .filter(|e| !entity_ids_before_parent_repair.contains(&e.id))
+            .map(|e| e.id.as_str())
+            .collect();
+
+        // Entity-level diffing: compare repaired stale-file entities against cached versions.
+        let stale_cached_entity_ids: HashSet<&str> = stale_file_cached_entities
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+
         // Build content_hash lookup from cached stale-file entities
         let cached_hashes: HashMap<&str, &str> = stale_file_cached_entities
             .iter()
@@ -493,7 +514,10 @@ impl EntityGraph {
         // Classify new stale-file entities
         let mut truly_changed_ids: HashSet<String> = HashSet::new();
         let mut content_clean_ids: HashSet<String> = HashSet::new();
-        for entity in &new_entities {
+        for entity in all_entities
+            .iter()
+            .filter(|e| stale_set.contains(e.file_path.as_str()))
+        {
             match cached_hashes.get(entity.id.as_str()) {
                 Some(old_hash) if *old_hash == entity.content_hash.as_str() => {
                     content_clean_ids.insert(entity.id.clone());
@@ -506,17 +530,15 @@ impl EntityGraph {
         }
 
         // Detect deleted entities: in cached stale but not in new
-        let new_entity_ids: HashSet<&str> = new_entities.iter().map(|e| e.id.as_str()).collect();
+        let new_entity_ids: HashSet<&str> = all_entities
+            .iter()
+            .filter(|e| stale_set.contains(e.file_path.as_str()))
+            .map(|e| e.id.as_str())
+            .collect();
         let deleted_ids: HashSet<&str> = stale_file_cached_entities
             .iter()
             .filter(|e| !new_entity_ids.contains(e.id.as_str()))
             .map(|e| e.id.as_str())
-            .collect();
-
-        // Merge: cached (clean) entities + new (stale) entities
-        let all_entities: Vec<SemanticEntity> = cached_entities
-            .into_iter()
-            .chain(new_entities.into_iter())
             .collect();
 
         // Find affected clean entities: only care about edges pointing to truly_changed/deleted
@@ -540,6 +562,10 @@ impl EntityGraph {
             .filter(|e| stale_set.contains(e.file_path.as_str()))
             .map(|e| e.id.as_str())
             .collect();
+        let current_entity_ids: HashSet<&str> = all_entities
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
 
         // Keep edges where both endpoints are in clean (non-stale) files and from_entity
         // is not affected by target changes. Drop ALL cached edges from stale-file entities
@@ -548,8 +574,16 @@ impl EntityGraph {
         let kept_edges: Vec<EntityRef> = cached_edges
             .into_iter()
             .filter(|e| {
-                let from_stale = stale_entity_ids.contains(e.from_entity.as_str());
-                let to_stale = stale_entity_ids.contains(e.to_entity.as_str());
+                if !current_entity_ids.contains(e.from_entity.as_str())
+                    || !current_entity_ids.contains(e.to_entity.as_str())
+                {
+                    return false;
+                }
+
+                let from_stale = stale_entity_ids.contains(e.from_entity.as_str())
+                    || stale_cached_entity_ids.contains(e.from_entity.as_str());
+                let to_stale = stale_entity_ids.contains(e.to_entity.as_str())
+                    || stale_cached_entity_ids.contains(e.to_entity.as_str());
 
                 if !from_stale && !to_stale && !affected_clean_ids.contains(&e.from_entity) {
                     // Both endpoints in clean files, from not affected
@@ -567,6 +601,7 @@ impl EntityGraph {
             .filter(|e| {
                 truly_changed_ids.contains(&e.id)
                     || content_clean_ids.contains(&e.id)
+                    || parent_repaired_ids.contains(e.id.as_str())
                     || affected_clean_ids.contains(&e.id)
             })
             .map(|e| e.id.as_str())
@@ -2071,6 +2106,79 @@ mod tests {
         assert_eq!(graph.entities.len(), 2);
         let bar_deps = graph.get_dependencies("b.ts::function::bar");
         assert!(bar_deps.iter().any(|d| d.name == "foo"));
+    }
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_go_method_parent_resolves_across_files_in_graph() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            root,
+            "methods.go",
+            "package demo\n\nfunc (s *Service) Run() {}\n",
+        );
+
+        let (graph, entities) =
+            EntityGraph::build(root, &["models.go".into(), "methods.go".into()], &registry);
+        let service = graph
+            .entities
+            .get("models.go::type::Service")
+            .expect("Service type should be in the graph");
+        let run = entities
+            .iter()
+            .find(|e| e.name == "Run" && e.file_path == "methods.go")
+            .expect("Run method should be extracted");
+
+        assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
+        assert!(graph.entities.contains_key("models.go::type::Service::Run"));
+    }
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_incremental_go_parent_repair_handles_clean_cached_method() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+        let models = "package demo\n\ntype Service struct{}\n";
+        let methods = "package demo\n\nfunc (s *Service) Run() {}\n";
+
+        write_file(root, "models.go", models);
+        write_file(root, "methods.go", methods);
+
+        let cached_entities = registry.extract_entities("methods.go", methods);
+        let cached_run = cached_entities
+            .iter()
+            .find(|e| e.name == "Run")
+            .expect("cached Run method should be extracted");
+        assert_eq!(
+            cached_run.parent_id.as_deref(),
+            Some("methods.go::type::Service")
+        );
+
+        let stale_file_cached_entities = registry.extract_entities("models.go", models);
+        let (graph, entities) = EntityGraph::build_incremental(
+            root,
+            &["models.go".into()],
+            &["models.go".into(), "methods.go".into()],
+            cached_entities,
+            vec![],
+            stale_file_cached_entities,
+            &registry,
+        );
+        let service = graph
+            .entities
+            .get("models.go::type::Service")
+            .expect("Service type should be in the graph");
+        let run = entities
+            .iter()
+            .find(|e| e.name == "Run" && e.file_path == "methods.go")
+            .expect("Run method should be retained from clean cache");
+
+        assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
+        assert!(graph.entities.contains_key("models.go::type::Service::Run"));
+        assert!(!graph.entities.contains_key("methods.go::type::Service::Run"));
     }
 
     #[test]

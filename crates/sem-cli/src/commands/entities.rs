@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::registry::ParserRegistry;
+use sem_core::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 
 pub struct EntitiesOptions {
     pub cwd: String,
@@ -131,6 +131,7 @@ fn extract_files_entities(
             }
         }
     }
+    resolve_go_method_parent_ids(&mut entities);
     entities
 }
 

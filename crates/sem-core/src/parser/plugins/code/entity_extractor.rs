@@ -30,6 +30,10 @@ pub fn extract_entities(
         source_code.as_bytes(),
     );
 
+    if config.id == "go" {
+        attach_go_package_metadata(tree.root_node(), source_code.as_bytes(), &mut entities);
+    }
+
     // Post-pass: disambiguate colliding entity IDs by appending @L{line}.
     // Two overloads with the same name (e.g. function overloads in C++/TS)
     // get identical IDs; re-assign all colliding entries with line suffixes.
@@ -54,6 +58,41 @@ pub fn extract_entities(
     }
 
     entities
+}
+
+fn attach_go_package_metadata(root: Node, source: &[u8], entities: &mut [SemanticEntity]) {
+    let Some(package_name) = extract_go_package_name(root, source) else {
+        return;
+    };
+
+    for entity in entities {
+        entity
+            .metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("go.package".to_string(), package_name.clone());
+    }
+}
+
+fn extract_go_package_name(root: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "package_clause" {
+            continue;
+        }
+
+        if let Some(name) = child.child_by_field_name("name") {
+            return Some(node_text(name, source).to_string());
+        }
+
+        let mut package_cursor = child.walk();
+        for package_child in child.named_children(&mut package_cursor) {
+            if matches!(package_child.kind(), "package_identifier" | "identifier") {
+                return Some(node_text(package_child, source).to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn visit_node(
