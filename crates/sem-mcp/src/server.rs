@@ -9,6 +9,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use sem_core::format::json::format_diff_json;
 use sem_core::git::bridge::GitBridge;
 use sem_core::git::types::DiffScope;
 use sem_core::model::entity::SemanticEntity;
@@ -451,35 +452,8 @@ impl SemServer {
         let diff_result =
             compute_semantic_diff(&file_changes, &self.registry, None, None);
 
-        let changes: Vec<serde_json::Value> = diff_result
-            .changes
-            .iter()
-            .map(|c| {
-                let mut obj = serde_json::json!({
-                    "file": c.file_path,
-                    "entity_name": c.entity_name,
-                    "entity_type": c.entity_type,
-                    "change_type": c.change_type.to_string(),
-                });
-                if let Some(ref old_name) = c.old_entity_name {
-                    obj["old_entity_name"] = serde_json::json!(old_name);
-                }
-                if let Some(ref old_path) = c.old_file_path {
-                    obj["old_file_path"] = serde_json::json!(old_path);
-                }
-                obj
-            })
-            .collect();
-
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "base_ref": params.base_ref.as_deref().unwrap_or("working-tree"),
-                "target_ref": params.target_ref.as_deref().unwrap_or("HEAD"),
-                "files_analyzed": diff_result.file_count,
-                "total_changes": changes.len(),
-                "changes": changes,
-            }))
-            .unwrap_or_default(),
+            format_diff_json(&diff_result),
         )]))
     }
 
@@ -918,6 +892,7 @@ impl ServerHandler for SemServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn find_supported_files_returns_walk_errors() {
@@ -939,6 +914,69 @@ mod tests {
         assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
         assert!(MCP_INSTRUCTIONS.contains("sem_entities"));
         assert!(!MCP_INSTRUCTIONS.contains("tools: entities"));
+    }
+
+    #[tokio::test]
+    async fn sem_diff_returns_cli_json_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.name", "Sem Test"]);
+        run_git(temp.path(), &["config", "user.email", "sem@example.com"]);
+
+        let file_path = temp.path().join("a.py");
+        std::fs::write(&file_path, "def foo():\n    return 1\n").unwrap();
+        run_git(temp.path(), &["add", "a.py"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        std::fs::write(
+            &file_path,
+            "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n",
+        )
+        .unwrap();
+        let file_path = std::fs::canonicalize(file_path).unwrap();
+
+        let result = SemServer::new()
+            .sem_diff(Parameters(DiffParams {
+                base_ref: None,
+                target_ref: None,
+                file_path: Some(file_path.to_string_lossy().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        let text = match &result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(text) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        let changes = payload["changes"].as_array().unwrap();
+        let change = changes.first().unwrap();
+
+        assert!(payload.get("summary").is_some());
+        assert_eq!(payload["summary"]["fileCount"], 1);
+        assert_eq!(payload["summary"]["total"], changes.len());
+        assert!(payload.get("base_ref").is_none());
+        assert!(payload.get("files_analyzed").is_none());
+        assert!(change.get("entityId").is_some());
+        assert!(change.get("changeType").is_some());
+        assert!(change.get("filePath").is_some());
+        assert!(change.get("entity_name").is_none());
+        assert!(change.get("change_type").is_none());
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
