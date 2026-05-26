@@ -91,6 +91,10 @@ fn make_change(
         entity_type: primary.entity_type.clone(),
         entity_name: primary.name.clone(),
         entity_line: primary.start_line,
+        start_line: primary.start_line,
+        end_line: primary.end_line,
+        old_start_line: before_entity.map(|b| b.start_line),
+        old_end_line: before_entity.map(|b| b.end_line),
         parent_name: parent_name(primary, by_id),
         file_path: primary.file_path.clone(),
         old_entity_name: before_entity.and_then(|b| {
@@ -102,7 +106,11 @@ fn make_change(
         old_parent_id: before_entity.and_then(|b| {
             (b.parent_id != after_entity.parent_id).then(|| b.parent_id.clone()).flatten()
         }),
-        before_content: before_entity.map(|b| b.content.clone()),
+        before_content: if change_type == ChangeType::Reordered {
+            None
+        } else {
+            before_entity.map(|b| b.content.clone())
+        },
         after_content: if change_type == ChangeType::Deleted || change_type == ChangeType::Reordered {
             None
         } else {
@@ -466,11 +474,11 @@ fn detect_reorders(
         let lis_set = longest_increasing_subsequence_indices(&after_lines);
 
         // Entities NOT in LIS were reordered
-        for (i, (_before_entity, after_entity)) in pairs.iter().enumerate() {
+        for (i, (before_entity, after_entity)) in pairs.iter().enumerate() {
             if lis_set.contains(&i) {
                 continue;
             }
-            changes.push(make_change(after_entity, ChangeType::Reordered, None, commit_sha, author, by_id));
+            changes.push(make_change(after_entity, ChangeType::Reordered, Some(before_entity), commit_sha, author, by_id));
         }
     }
 }
@@ -541,6 +549,32 @@ mod tests {
         let result = match_entities(&before, &after, "a.ts", None, None, None);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+    }
+
+    #[test]
+    fn test_change_line_spans_track_current_and_previous_entities() {
+        let before = vec![make_entity_at(
+            "a::f::foo",
+            "foo",
+            "fn foo() { old }",
+            "a.rs",
+            3,
+        )];
+        let after = vec![make_entity_at(
+            "a::f::foo",
+            "foo",
+            "fn foo() { new }",
+            "a.rs",
+            7,
+        )];
+
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].start_line, 7);
+        assert_eq!(result.changes[0].end_line, 9);
+        assert_eq!(result.changes[0].old_start_line, Some(3));
+        assert_eq!(result.changes[0].old_end_line, Some(5));
     }
 
     #[test]
@@ -812,6 +846,10 @@ mod tests {
         let result = match_entities(&before, &after, "a.rs", None, None, None);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Reordered);
+        assert!(result.changes[0].before_content.is_none());
+        assert!(result.changes[0].old_start_line.is_some());
+        assert!(result.changes[0].old_end_line.is_some());
+        assert_ne!(result.changes[0].old_start_line, Some(result.changes[0].start_line));
         // Either beta or gamma is marked, LIS picks the minimum
         assert!(result.changes[0].entity_name == "beta" || result.changes[0].entity_name == "gamma");
     }
