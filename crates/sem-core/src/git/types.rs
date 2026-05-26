@@ -49,6 +49,15 @@ pub struct FileCommitInfo {
     pub file_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlameLineInfo {
+    pub line_number: usize,
+    pub commit_sha: Option<String>,
+    pub author: String,
+    pub author_time: Option<i64>,
+    pub summary: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FileChange, FileStatus};

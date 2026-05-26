@@ -1,12 +1,14 @@
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
 use thiserror::Error;
 
 use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus};
+use super::types::BlameLineInfo;
 
 #[derive(Error, Debug)]
 pub enum GitError {
@@ -54,6 +56,35 @@ impl GitBridge {
 
     pub fn blame_file(&self, file_path: &Path) -> Result<Blame<'_>, GitError> {
         Ok(self.repo.blame_file(file_path, None)?)
+    }
+
+    pub fn blame_file_porcelain(&self, file_path: &Path) -> Result<Vec<BlameLineInfo>, GitError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .arg("blame")
+            .arg("--line-porcelain")
+            .arg("--")
+            .arg(file_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(git_command_error(if stderr.is_empty() {
+                format!("git blame exited with {}", output.status)
+            } else {
+                stderr
+            }));
+        }
+
+        let parsed = parse_blame_porcelain(&String::from_utf8_lossy(&output.stdout));
+        if parsed.is_empty() && !output.stdout.is_empty() {
+            return Err(git_command_error(
+                "failed to parse git blame porcelain output".to_string(),
+            ));
+        }
+
+        Ok(parsed)
     }
 
     pub fn commit_summary(&self, oid: Oid) -> Option<String> {
@@ -463,7 +494,7 @@ impl GitBridge {
     pub fn get_file_commits(&self, file_path: &str, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TIME)?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
         let mut commits = Vec::new();
         let path = Path::new(file_path);
@@ -504,7 +535,7 @@ impl GitBridge {
                     message: commit.message().unwrap_or("").to_string(),
                 });
 
-                if commits.len() >= limit {
+                if limit != 0 && commits.len() >= limit {
                     break;
                 }
             }
@@ -522,9 +553,16 @@ impl GitBridge {
         file_path: &str,
         limit: usize,
     ) -> Result<Vec<FileCommitInfo>, GitError> {
+        match self.get_file_commits_follow_renames_cli(file_path, limit) {
+            Ok(commits) if !commits.is_empty() => return Ok(commits),
+            Ok(_) => {}
+            Err(GitError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TIME)?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
         let mut results = Vec::new();
         let mut tracked_path = file_path.to_string();
@@ -566,14 +604,16 @@ impl GitBridge {
                     file_path: tracked_path.clone(),
                 });
 
-                if results.len() >= limit {
+                if limit != 0 && results.len() >= limit {
                     break;
                 }
             }
 
-            // If the file is not in this commit's tree, check if it was renamed.
-            // Compute diff between parent and this commit with rename detection.
-            if file_in_commit.is_none() && parent_tree_opt.is_some() {
+            // When walking backward, the rename commit still contains the new
+            // path. Detect that parent-side old path before the next iteration.
+            let should_check_rename =
+                parent_tree_opt.is_some() && (file_in_parent.is_none() || file_in_commit.is_none());
+            if should_check_rename {
                 let mut diff = self.repo.diff_tree_to_tree(
                     parent_tree_opt.as_ref(),
                     Some(&tree),
@@ -608,7 +648,7 @@ impl GitBridge {
                     }
                 }
 
-                if !found_rename {
+                if !found_rename && file_in_commit.is_none() {
                     // File truly deleted, stop tracking
                     break;
                 }
@@ -616,6 +656,88 @@ impl GitBridge {
         }
 
         Ok(results)
+    }
+
+    fn get_file_commits_follow_renames_cli(
+        &self,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<FileCommitInfo>, GitError> {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&self.repo_root)
+            .arg("log")
+            .arg("--follow")
+            .arg("--format=\x1e%H\x1f%an\x1f%at\x1f%s")
+            .arg("--name-status");
+        if limit != 0 {
+            command.arg("-n").arg(limit.to_string());
+        }
+        command.arg("--").arg(file_path);
+
+        let output = command.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(git_command_error(if stderr.is_empty() {
+                format!("git log exited with {}", output.status)
+            } else {
+                stderr
+            }));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut tracked_path = file_path.to_string();
+        let mut commits = Vec::new();
+
+        for record in stdout.split('\x1e') {
+            let record = record.trim_start_matches('\n');
+            if record.trim().is_empty() {
+                continue;
+            }
+
+            let mut lines = record.lines();
+            let Some(meta) = lines.next() else {
+                continue;
+            };
+            let mut parts = meta.splitn(4, '\x1f');
+            let Some(sha) = parts.next() else {
+                continue;
+            };
+            let Some(author) = parts.next() else {
+                continue;
+            };
+            let Some(date) = parts.next() else {
+                continue;
+            };
+            let message = parts.next().unwrap_or_default();
+
+            let commit_path = tracked_path.clone();
+            let mut previous_path = None;
+            for line in lines {
+                let fields: Vec<&str> = line.split('\t').collect();
+                if fields.len() >= 3 && fields[0].starts_with('R') && fields[2] == tracked_path {
+                    previous_path = Some(fields[1].to_string());
+                }
+            }
+
+            commits.push(FileCommitInfo {
+                commit: CommitInfo {
+                    short_sha: sha[..7.min(sha.len())].to_string(),
+                    sha: sha.to_string(),
+                    author: author.to_string(),
+                    date: date.to_string(),
+                    message: message.to_string(),
+                },
+                file_path: commit_path,
+            });
+
+            if let Some(previous_path) = previous_path {
+                tracked_path = previous_path;
+            }
+        }
+
+        Ok(commits)
     }
 
     /// Get all file paths changed in a single commit (vs its parent).
@@ -651,7 +773,7 @@ impl GitBridge {
 
         let mut commits = Vec::new();
         for (i, oid_result) in revwalk.enumerate() {
-            if i >= limit {
+            if limit != 0 && i >= limit {
                 break;
             }
             let oid = oid_result?;
@@ -668,6 +790,85 @@ impl GitBridge {
 
         Ok(commits)
     }
+}
+
+fn parse_blame_porcelain(output: &str) -> Vec<BlameLineInfo> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut parsed = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let Some((raw_sha, line_number)) = parse_blame_header(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
+
+        let mut author = String::new();
+        let mut author_time = None;
+        let mut summary = String::new();
+
+        while index < lines.len() {
+            let line = lines[index];
+            index += 1;
+
+            if line.starts_with('\t') {
+                break;
+            } else if let Some(value) = line.strip_prefix("author ") {
+                author = value.to_string();
+            } else if let Some(value) = line.strip_prefix("author-time ") {
+                author_time = value.parse::<i64>().ok();
+            } else if let Some(value) = line.strip_prefix("summary ") {
+                summary = value.to_string();
+            }
+        }
+
+        let sha = raw_sha.trim_start_matches('^');
+        let commit_sha = if sha.chars().all(|c| c == '0') {
+            None
+        } else {
+            Some(sha.to_string())
+        };
+
+        if author.is_empty() {
+            author = if commit_sha.is_none() {
+                "Not Committed Yet".to_string()
+            } else {
+                "unknown".to_string()
+            };
+        }
+
+        parsed.push(BlameLineInfo {
+            line_number,
+            commit_sha,
+            author,
+            author_time,
+            summary,
+        });
+    }
+
+    parsed.sort_by_key(|line| line.line_number);
+    parsed
+}
+
+fn parse_blame_header(line: &str) -> Option<(&str, usize)> {
+    let mut parts = line.split_whitespace();
+    let sha = parts.next()?;
+    if !is_blame_oid(sha) {
+        return None;
+    }
+    parts.next()?;
+    let final_line = parts.next()?.parse().ok()?;
+    Some((sha, final_line))
+}
+
+fn is_blame_oid(value: &str) -> bool {
+    let value = value.strip_prefix('^').unwrap_or(value);
+    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn git_command_error(message: String) -> GitError {
+    GitError::Git2(git2::Error::from_str(&message))
 }
 
 fn map_git_error(error: git2::Error) -> GitError {
@@ -873,6 +1074,22 @@ mod tests {
                 .commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn porcelain_blame_reports_uncommitted_lines() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        commit_file(&repo, "a.py", "def foo():\n    return 1\n", "init");
+        fs::write(temp.path().join("a.py"), "def foo():\n    return 2\n").unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let blame = bridge.blame_file_porcelain(Path::new("a.py")).unwrap();
+
+        assert!(blame[0].commit_sha.is_some());
+        assert_eq!(blame[1].commit_sha, None);
+        assert_eq!(blame[1].author, "Not Committed Yet");
     }
 
     #[test]

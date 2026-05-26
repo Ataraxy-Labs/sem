@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use sem_core::format::json::format_diff_json;
 use sem_core::git::bridge::GitBridge;
-use sem_core::git::types::DiffScope;
+use sem_core::git::types::{BlameLineInfo, CommitInfo, DiffScope};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::graph::EntityGraph;
@@ -480,41 +480,60 @@ impl SemServer {
 
         let blame = ctx
             .git
-            .blame_file(Path::new(&rel_path))
+            .blame_file_porcelain(Path::new(&rel_path))
             .map_err(|e| internal_err(format!("Cannot blame {}: {}", rel_path, e)))?;
+        let blame_by_line: HashMap<usize, BlameLineInfo> = blame
+            .into_iter()
+            .map(|line| (line.line_number, line))
+            .collect();
 
         let mut results: Vec<serde_json::Value> = Vec::new();
 
         for entity in &entities {
-            let mut latest_time: i64 = 0;
-            let mut latest_author = String::new();
-            let mut latest_sha = String::new();
-            let mut latest_summary = String::new();
-            let mut latest_date = String::new();
+            let mut selected: Option<&BlameLineInfo> = None;
 
             for line in entity.start_line..=entity.end_line {
-                if let Some(hunk) = blame.get_line(line) {
-                    let sig = hunk.final_signature();
-                    let time = sig.when().seconds();
-                    if time > latest_time {
-                        latest_time = time;
-                        latest_author = sig.name().unwrap_or("unknown").to_string();
-                        let oid = hunk.final_commit_id();
-                        latest_sha = format!("{}", oid);
-                        latest_summary = ctx.git.commit_summary(oid).unwrap_or_default();
-                        latest_date = chrono_lite_format(sig.when().seconds());
+                if let Some(info) = blame_by_line.get(&line) {
+                    if info.commit_sha.is_none() {
+                        selected = Some(info);
+                        break;
+                    }
+
+                    let is_newer = match (info.author_time, selected.and_then(|s| s.author_time)) {
+                        (Some(current), Some(previous)) => current > previous,
+                        (Some(_), None) => true,
+                        _ => selected.is_none(),
+                    };
+                    if is_newer {
+                        selected = Some(info);
                     }
                 }
             }
+
+            let (author, date, commit_sha, summary) = match selected {
+                Some(info) => (
+                    if info.author.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        info.author.clone()
+                    },
+                    info.author_time
+                        .map(chrono_lite_format)
+                        .unwrap_or_default(),
+                    info.commit_sha.clone(),
+                    info.summary.clone(),
+                ),
+                None => (String::from("unknown"), String::new(), None, String::new()),
+            };
 
             results.push(serde_json::json!({
                 "name": entity.name,
                 "type": entity.entity_type,
                 "lines": [entity.start_line, entity.end_line],
-                "author": if latest_author.is_empty() { "uncommitted" } else { &latest_author },
-                "date": latest_date,
-                "commit": if latest_sha.is_empty() { "uncommitted" } else { &latest_sha },
-                "summary": latest_summary,
+                "author": author,
+                "date": date,
+                "commit": commit_sha,
+                "summary": summary,
             }));
         }
 
@@ -693,124 +712,68 @@ impl SemServer {
             }
         };
 
-        let plugin = self
-            .registry
-            .get_plugin(&file_path)
-            .ok_or_else(|| internal_err(format!("No parser for file: {}", file_path)))?;
-
         let limit = params.limit.unwrap_or(50);
-        let commits = ctx
+        let use_file_history = ctx
             .git
-            .get_file_commits(&file_path, limit)
-            .map_err(|e| internal_err(format!("Failed to get file history: {}", e)))?;
+            .get_head_sha()
+            .ok()
+            .and_then(|head| {
+                mcp_entity_by_name_at_ref(
+                    &ctx.git,
+                    &self.registry,
+                    &head,
+                    &file_path,
+                    &params.entity_name,
+                )
+            })
+            .is_some();
+
+        let mut commits = if use_file_history {
+            match ctx.git.get_file_commits_follow_renames(&file_path, 0) {
+                Ok(file_commits) if !file_commits.is_empty() => {
+                    file_commits.into_iter().map(|info| info.commit).collect()
+                }
+                Ok(_) => ctx
+                    .git
+                    .get_log(0)
+                    .map_err(|e| internal_err(format!("Failed to get history: {}", e)))?,
+                Err(e) => return Err(internal_err(format!("Failed to get file history: {}", e))),
+            }
+        } else {
+            ctx.git
+                .get_log(0)
+                .map_err(|e| internal_err(format!("Failed to get history: {}", e)))?
+        };
 
         if commits.is_empty() {
             return Err(internal_err(format!("No commits found for {}", file_path)));
         }
+        commits.reverse();
 
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        let mut prev_entity_content: Option<String> = None;
-        let mut prev_structural_hash: Option<String> = None;
-        let mut entity_type = String::new();
-        let mut found_at_least_once = false;
-
-        // Process oldest to newest
-        for commit in commits.iter().rev() {
-            let content = match ctx.git.read_file_at_ref(&commit.sha, &file_path) {
-                Ok(Some(c)) => c,
-                _ => {
-                    if prev_entity_content.is_some() {
-                        let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
-                        entries.push(serde_json::json!({
-                            "commit": commit.sha,
-                            "author": commit.author,
-                            "date": date,
-                            "message": commit.message.lines().next().unwrap_or(""),
-                            "change_type": "deleted",
-                        }));
-                        prev_entity_content = None;
-                        prev_structural_hash = None;
-                    }
-                    continue;
-                }
-            };
-
-            let file_entities = plugin.extract_entities(&content, &file_path);
-            let entity = file_entities.iter().find(|e| e.name == params.entity_name);
-            let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
-            let msg = commit.message.lines().next().unwrap_or("").to_string();
-
-            match entity {
-                Some(ent) => {
-                    if !found_at_least_once {
-                        entity_type = ent.entity_type.clone();
-                    }
-
-                    if !found_at_least_once || prev_entity_content.is_none() {
-                        found_at_least_once = true;
-                        entries.push(serde_json::json!({
-                            "commit": commit.sha,
-                            "author": commit.author,
-                            "date": date,
-                            "message": msg,
-                            "change_type": "added",
-                        }));
-                    } else {
-                        let prev_hash = prev_entity_content
-                            .as_ref()
-                            .map(|c| sem_core::utils::hash::content_hash(c));
-                        let content_changed =
-                            prev_hash.as_deref() != Some(ent.content_hash.as_str());
-
-                        if content_changed {
-                            let structural_changed = match (
-                                ent.structural_hash.as_deref(),
-                                prev_structural_hash.as_deref(),
-                            ) {
-                                (Some(cur), Some(prev)) => cur != prev,
-                                _ => true,
-                            };
-
-                            let change_type = if structural_changed {
-                                "modified (logic)"
-                            } else {
-                                "modified (cosmetic)"
-                            };
-
-                            entries.push(serde_json::json!({
-                                "commit": commit.sha,
-                                "author": commit.author,
-                                "date": date,
-                                "message": msg,
-                                "change_type": change_type,
-                            }));
-                        }
-                    }
-
-                    prev_entity_content = Some(ent.content.clone());
-                    prev_structural_hash = ent.structural_hash.clone();
-                }
-                None => {
-                    if prev_entity_content.is_some() {
-                        entries.push(serde_json::json!({
-                            "commit": commit.sha,
-                            "author": commit.author,
-                            "date": date,
-                            "message": msg,
-                            "change_type": "deleted",
-                        }));
-                        prev_entity_content = None;
-                        prev_structural_hash = None;
-                    }
-                }
-            }
-        }
-
-        if !found_at_least_once {
+        let Some(seed) = mcp_find_seed_occurrence(
+            &ctx.git,
+            &self.registry,
+            &commits,
+            &params.entity_name,
+            Some(&file_path),
+        ) else {
             return Err(internal_err(format!(
                 "Entity '{}' not found in any commit of {}",
                 params.entity_name, file_path
             )));
+        };
+
+        let entity_type = seed.entity.entity_type.clone();
+        let mut entries = mcp_trace_back_to_origin(&ctx.git, &self.registry, &commits, seed.clone());
+        entries.extend(mcp_trace_forward_from_seed(
+            &ctx.git,
+            &self.registry,
+            &commits,
+            seed,
+        ));
+        if limit != 0 && entries.len() > limit {
+            let drop_count = entries.len() - limit;
+            entries.drain(0..drop_count);
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -892,7 +855,76 @@ impl ServerHandler for SemServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sem_core::parser::plugins::create_default_registry;
+    use std::fs;
     use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(repo: &TempDir, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo.path())
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn commit_all(repo: &TempDir, message: &str, timestamp: i64) {
+        git(repo, &["add", "-A"]);
+        let status = Command::new("git")
+            .current_dir(repo.path())
+            .env("GIT_AUTHOR_DATE", format!("@{timestamp}"))
+            .env("GIT_COMMITTER_DATE", format!("@{timestamp}"))
+            .args(["commit", "-q", "-m", message])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit failed");
+    }
+
+    fn rename_history_repo() -> TempDir {
+        let repo = TempDir::new().unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@t.com"]);
+        git(&repo, &["config", "user.name", "test"]);
+        fs::write(repo.path().join("a.py"), "def original(): return 1\n").unwrap();
+        commit_all(&repo, "v1", 946684800);
+        fs::write(repo.path().join("a.py"), "def renamed_func(): return 1\n").unwrap();
+        commit_all(&repo, "v2: rename function", 946771200);
+        git(&repo, &["mv", "a.py", "b.py"]);
+        commit_all(&repo, "v3: move file", 946857600);
+        fs::write(repo.path().join("b.py"), "def renamed_func(): return 2\n").unwrap();
+        commit_all(&repo, "v4: modify body", 946944000);
+        repo
+    }
+
+    fn mcp_log_labels(repo: &TempDir, entity_name: &str, file_path: &str) -> Vec<String> {
+        let git = GitBridge::open(repo.path()).unwrap();
+        let registry = create_default_registry();
+        let mut commits = if git
+            .get_head_sha()
+            .ok()
+            .and_then(|head| mcp_entity_by_name_at_ref(&git, &registry, &head, file_path, entity_name))
+            .is_some()
+        {
+            git.get_file_commits_follow_renames(file_path, 0)
+                .unwrap()
+                .into_iter()
+                .map(|info| info.commit)
+                .collect()
+        } else {
+            git.get_log(0).unwrap()
+        };
+        commits.reverse();
+        let seed =
+            mcp_find_seed_occurrence(&git, &registry, &commits, entity_name, Some(file_path))
+                .unwrap();
+        let mut entries = mcp_trace_back_to_origin(&git, &registry, &commits, seed.clone());
+        entries.extend(mcp_trace_forward_from_seed(&git, &registry, &commits, seed));
+        entries
+            .iter()
+            .map(|entry| entry["change_type"].as_str().unwrap().to_string())
+            .collect()
+    }
 
     #[test]
     fn find_supported_files_returns_walk_errors() {
@@ -978,10 +1010,250 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    #[test]
+    fn mcp_log_helpers_trace_current_and_historical_names() {
+        let repo = rename_history_repo();
+        let expected = vec!["added", "renamed", "moved", "modified (logic)"];
+        assert_eq!(mcp_log_labels(&repo, "renamed_func", "b.py"), expected);
+        assert_eq!(mcp_log_labels(&repo, "original", "a.py"), expected);
+    }
 }
 
 fn internal_err(msg: impl ToString) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(msg.to_string(), None)
+}
+
+#[derive(Clone)]
+struct McpLogOccurrence {
+    commit_index: usize,
+    file_path: String,
+    entity: SemanticEntity,
+}
+
+fn mcp_find_seed_occurrence(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    commits: &[CommitInfo],
+    entity_name: &str,
+    file_path: Option<&str>,
+) -> Option<McpLogOccurrence> {
+    for (index, commit) in commits.iter().enumerate().rev() {
+        let paths = match file_path {
+            Some(path) => vec![path.to_string()],
+            None => git.get_commit_changed_files(&commit.sha).unwrap_or_default(),
+        };
+        for path in paths {
+            if let Some(entity) =
+                mcp_entity_by_name_at_ref(git, registry, &commit.sha, &path, entity_name)
+            {
+                return Some(McpLogOccurrence { commit_index: index, file_path: path, entity });
+            }
+        }
+    }
+    None
+}
+
+fn mcp_trace_back_to_origin(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    commits: &[CommitInfo],
+    seed: McpLogOccurrence,
+) -> Vec<serde_json::Value> {
+    let mut current = seed;
+    let mut entries = Vec::new();
+    for child_index in (1..=current.commit_index).rev() {
+        let child_commit = &commits[child_index];
+        let parent_commit = &commits[child_index - 1];
+        let changed_paths = git.get_commit_changed_files(&child_commit.sha).unwrap_or_default();
+        let previous = mcp_find_related_entity_at_ref(
+            git,
+            registry,
+            &parent_commit.sha,
+            &current.file_path,
+            &current.entity.name,
+            current.entity.structural_hash.as_deref(),
+            &changed_paths,
+        );
+        let Some(previous) = previous else {
+            entries.push(mcp_added_entry(child_commit, &current));
+            entries.reverse();
+            return entries;
+        };
+        if let Some(entry) = mcp_transition_entry(child_commit, &previous, &current) {
+            entries.push(entry);
+        }
+        current = McpLogOccurrence { commit_index: child_index - 1, ..previous };
+    }
+    entries.push(mcp_added_entry(&commits[current.commit_index], &current));
+    entries.reverse();
+    entries
+}
+
+fn mcp_trace_forward_from_seed(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    commits: &[CommitInfo],
+    seed: McpLogOccurrence,
+) -> Vec<serde_json::Value> {
+    let mut current = seed;
+    let mut entries = Vec::new();
+    for child_index in current.commit_index + 1..commits.len() {
+        let child_commit = &commits[child_index];
+        let changed_paths = git.get_commit_changed_files(&child_commit.sha).unwrap_or_default();
+        let next = mcp_find_related_entity_at_ref(
+            git,
+            registry,
+            &child_commit.sha,
+            &current.file_path,
+            &current.entity.name,
+            current.entity.structural_hash.as_deref(),
+            &changed_paths,
+        );
+        let Some(next) = next else {
+            entries.push(mcp_deleted_entry(child_commit, &current));
+            break;
+        };
+        if let Some(entry) = mcp_transition_entry(child_commit, &current, &next) {
+            entries.push(entry);
+        }
+        current = McpLogOccurrence { commit_index: child_index, ..next };
+    }
+    entries
+}
+
+fn mcp_find_related_entity_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    preferred_file: &str,
+    entity_name: &str,
+    structural_hash: Option<&str>,
+    changed_paths: &[String],
+) -> Option<McpLogOccurrence> {
+    let paths = mcp_candidate_paths(preferred_file, changed_paths);
+    for path in &paths {
+        if let Some(entity) = mcp_entity_by_name_at_ref(git, registry, sha, path, entity_name) {
+            return Some(McpLogOccurrence { commit_index: 0, file_path: path.clone(), entity });
+        }
+    }
+    let structural_hash = structural_hash?;
+    for path in &paths {
+        if let Some(entity) =
+            mcp_entity_by_structural_hash_at_ref(git, registry, sha, path, structural_hash)
+        {
+            return Some(McpLogOccurrence { commit_index: 0, file_path: path.clone(), entity });
+        }
+    }
+    None
+}
+
+fn mcp_candidate_paths(preferred_file: &str, changed_paths: &[String]) -> Vec<String> {
+    let mut paths = vec![preferred_file.to_string()];
+    for path in changed_paths {
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+fn mcp_entity_by_name_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    file_path: &str,
+    entity_name: &str,
+) -> Option<SemanticEntity> {
+    mcp_entities_at_ref(git, registry, sha, file_path)
+        .into_iter()
+        .find(|entity| entity.name == entity_name)
+}
+
+fn mcp_entity_by_structural_hash_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    file_path: &str,
+    structural_hash: &str,
+) -> Option<SemanticEntity> {
+    mcp_entities_at_ref(git, registry, sha, file_path)
+        .into_iter()
+        .find(|entity| entity.structural_hash.as_deref() == Some(structural_hash))
+}
+
+fn mcp_entities_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    file_path: &str,
+) -> Vec<SemanticEntity> {
+    git.read_file_at_ref(sha, file_path)
+        .ok()
+        .flatten()
+        .map(|content| registry.extract_entities(file_path, &content))
+        .unwrap_or_default()
+}
+
+fn mcp_transition_entry(
+    commit: &CommitInfo,
+    before: &McpLogOccurrence,
+    after: &McpLogOccurrence,
+) -> Option<serde_json::Value> {
+    let file_changed = before.file_path != after.file_path;
+    let name_changed = before.entity.name != after.entity.name;
+    let content_changed = before.entity.content_hash != after.entity.content_hash;
+    let change_type = if file_changed {
+        "moved"
+    } else if name_changed {
+        "renamed"
+    } else if content_changed {
+        if mcp_structural_changed(&before.entity, &after.entity) {
+            "modified (logic)"
+        } else {
+            "modified (cosmetic)"
+        }
+    } else {
+        return None;
+    };
+    let mut entry = mcp_base_entry(commit, change_type, Some(&after.file_path));
+    if file_changed {
+        entry["prev_file_path"] = serde_json::Value::String(before.file_path.clone());
+    }
+    Some(entry)
+}
+
+fn mcp_structural_changed(before: &SemanticEntity, after: &SemanticEntity) -> bool {
+    match (&before.structural_hash, &after.structural_hash) {
+        (Some(before), Some(after)) => before != after,
+        _ => true,
+    }
+}
+
+fn mcp_added_entry(commit: &CommitInfo, occurrence: &McpLogOccurrence) -> serde_json::Value {
+    mcp_base_entry(commit, "added", Some(&occurrence.file_path))
+}
+
+fn mcp_deleted_entry(commit: &CommitInfo, occurrence: &McpLogOccurrence) -> serde_json::Value {
+    mcp_base_entry(commit, "deleted", Some(&occurrence.file_path))
+}
+
+fn mcp_base_entry(
+    commit: &CommitInfo,
+    change_type: &str,
+    file_path: Option<&str>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "commit": commit.sha,
+        "author": commit.author,
+        "date": chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0)),
+        "message": commit.message.lines().next().unwrap_or(""),
+        "change_type": change_type,
+    });
+    if let Some(file_path) = file_path {
+        entry["file_path"] = serde_json::Value::String(file_path.to_string());
+    }
+    entry
 }
 
 /// Simple timestamp formatting without external deps.

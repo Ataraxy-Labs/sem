@@ -48,3 +48,6 @@ pkg-fmt = "zip"
 
 [features]
 vendored-openssl = ["openssl-sys/vendored"]
+
+[dev-dependencies]
+tempfile = "3.24.0"

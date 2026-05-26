@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
+use sem_core::git::types::BlameLineInfo;
 
 use super::truncate_str;
 
@@ -18,7 +20,7 @@ struct EntityBlame {
     end_line: usize,
     author: String,
     date: String,
-    commit_sha: String,
+    commit_sha: Option<String>,
     summary: String,
 }
 
@@ -31,7 +33,12 @@ pub fn blame_command(opts: BlameOptions) {
     let content = match std::fs::read_to_string(&full_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{} Cannot read {}: {}", "error:".red().bold(), opts.file_path, e);
+            eprintln!(
+                "{} Cannot read {}: {}",
+                "error:".red().bold(),
+                opts.file_path,
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -43,7 +50,11 @@ pub fn blame_command(opts: BlameOptions) {
             return;
         }
 
-        eprintln!("{} No entities found in {}", "warning:".yellow().bold(), opts.file_path);
+        eprintln!(
+            "{} No entities found in {}",
+            "warning:".yellow().bold(),
+            opts.file_path
+        );
         return;
     }
 
@@ -51,7 +62,11 @@ pub fn blame_command(opts: BlameOptions) {
     let git = match GitBridge::open(root) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{} Cannot open git repository: {}", "error:".red().bold(), e);
+            eprintln!(
+                "{} Cannot open git repository: {}",
+                "error:".red().bold(),
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -65,53 +80,67 @@ pub fn blame_command(opts: BlameOptions) {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| opts.file_path.clone());
 
-    let blame = match git.blame_file(Path::new(&relative_path)) {
+    let blame = match git.blame_file_porcelain(Path::new(&relative_path)) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("{} Cannot blame {}: {}", "error:".red().bold(), opts.file_path, e);
+            eprintln!(
+                "{} Cannot blame {}: {}",
+                "error:".red().bold(),
+                opts.file_path,
+                e
+            );
             std::process::exit(1);
         }
     };
+    let blame_by_line: HashMap<usize, BlameLineInfo> = blame
+        .into_iter()
+        .map(|line| (line.line_number, line))
+        .collect();
 
     // For each entity, find the most recent commit that touched its lines
     let mut results: Vec<EntityBlame> = Vec::new();
 
     for entity in &entities {
         // Find the latest commit across the entity's line range
-        let mut latest_time: i64 = 0;
-        let mut latest_author = String::new();
-        let mut latest_sha = String::new();
-        let mut latest_summary = String::new();
-        let mut latest_date = String::new();
+        let mut selected: Option<&BlameLineInfo> = None;
 
         for line in entity.start_line..=entity.end_line {
-            if let Some(hunk) = blame.get_line(line) {
-                let sig = hunk.final_signature();
-                let time = sig.when().seconds();
-                if time > latest_time {
-                    latest_time = time;
-                    latest_author = sig.name().unwrap_or("unknown").to_string();
-                    let oid = hunk.final_commit_id();
-                    latest_sha = format!("{}", oid);
-                    latest_summary = git.commit_summary(oid).unwrap_or_default();
+            if let Some(info) = blame_by_line.get(&line) {
+                if info.commit_sha.is_none() {
+                    selected = Some(info);
+                    break;
+                }
 
-                    // Format date
-                    let ts = sig.when().seconds();
-                    let naive = chrono_lite_format(ts);
-                    latest_date = naive;
+                let is_newer = match (info.author_time, selected.and_then(|s| s.author_time)) {
+                    (Some(current), Some(previous)) => current > previous,
+                    (Some(_), None) => true,
+                    _ => selected.is_none(),
+                };
+                if is_newer {
+                    selected = Some(info);
                 }
             }
         }
+
+        let (author, date, commit_sha, summary) = match selected {
+            Some(info) => (
+                info.author.clone(),
+                info.author_time.map(chrono_lite_format).unwrap_or_default(),
+                info.commit_sha.clone(),
+                info.summary.clone(),
+            ),
+            None => (String::new(), String::new(), None, String::new()),
+        };
 
         results.push(EntityBlame {
             name: entity.name.clone(),
             entity_type: entity.entity_type.clone(),
             start_line: entity.start_line,
             end_line: entity.end_line,
-            author: latest_author,
-            date: latest_date,
-            commit_sha: latest_sha,
-            summary: latest_summary,
+            author,
+            date,
+            commit_sha,
+            summary,
         });
     }
 
@@ -123,32 +152,33 @@ pub fn blame_command(opts: BlameOptions) {
                     "name": r.name,
                     "type": r.entity_type,
                     "lines": [r.start_line, r.end_line],
-                    "author": if r.author.is_empty() { "uncommitted" } else { &r.author },
+                    "author": if r.author.is_empty() { "unknown" } else { &r.author },
                     "date": r.date,
-                    "commit": if r.commit_sha.is_empty() { "uncommitted" } else { &r.commit_sha },
+                    "commit": r.commit_sha.clone(),
                     "summary": r.summary,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
-        println!(
-            "{}",
-            format!("┌─ {} ", opts.file_path).bold()
-        );
+        println!("{}", format!("┌─ {} ", opts.file_path).bold());
         println!("│");
 
         // Group by parent (top-level vs nested)
         let max_name_len = results.iter().map(|r| r.name.len()).max().unwrap_or(10);
-        let max_type_len = results.iter().map(|r| r.entity_type.len()).max().unwrap_or(8);
+        let max_type_len = results
+            .iter()
+            .map(|r| r.entity_type.len())
+            .max()
+            .unwrap_or(8);
 
         for r in &results {
-            let sha_short = if r.commit_sha.is_empty() {
+            let sha_short = if r.commit_sha.is_none() {
                 "uncommtd"
-            } else if r.commit_sha.len() >= 8 {
-                &r.commit_sha[..8]
+            } else if r.commit_sha.as_deref().unwrap_or_default().len() >= 8 {
+                &r.commit_sha.as_deref().unwrap_or_default()[..8]
             } else {
-                &r.commit_sha
+                r.commit_sha.as_deref().unwrap_or_default()
             };
 
             let is_nested = results.iter().any(|other| {
