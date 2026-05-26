@@ -2,7 +2,7 @@
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::git::types::FileChange;
+use crate::git::types::{FileChange, FileStatus};
 
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
@@ -38,6 +38,42 @@ pub struct DiffResult {
     pub total_entities_after: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinaryFileChange {
+    pub file_path: String,
+    pub status: FileStatus,
+    pub old_file_path: Option<String>,
+}
+
+impl From<&FileChange> for BinaryFileChange {
+    fn from(file: &FileChange) -> Self {
+        Self {
+            file_path: file.file_path.clone(),
+            status: file.status.clone(),
+            old_file_path: file.old_file_path.clone(),
+        }
+    }
+}
+
+pub fn collect_binary_file_changes(file_changes: &[FileChange]) -> Vec<BinaryFileChange> {
+    file_changes
+        .iter()
+        .filter(|file| lacks_diffable_content(file))
+        .map(BinaryFileChange::from)
+        .collect()
+}
+
+fn lacks_diffable_content(file: &FileChange) -> bool {
+    match &file.status {
+        FileStatus::Added => file.after_content.is_none(),
+        FileStatus::Deleted => file.before_content.is_none(),
+        FileStatus::Modified | FileStatus::Renamed => {
+            file.before_content.is_none() || file.after_content.is_none()
+        }
+    }
+}
+
 pub fn compute_semantic_diff(
     file_changes: &[FileChange],
     registry: &ParserRegistry,
@@ -47,6 +83,7 @@ pub fn compute_semantic_diff(
     // Process files in parallel: each file's entity extraction and matching is independent
     let per_file_changes: Vec<(String, Vec<SemanticChange>, usize, usize)> =
         maybe_par_iter!(file_changes)
+            .filter(|file| !lacks_diffable_content(file))
             .filter_map(|file| {
                 let content_hint = file
                     .after_content

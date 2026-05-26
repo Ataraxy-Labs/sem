@@ -1,29 +1,47 @@
 use super::orphan_summary_parts;
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
 
-pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
-    if result.changes.is_empty() {
+use super::{binary_display_name, file_count, has_reportable_changes};
+
+pub fn format_markdown(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    verbose: bool,
+) -> String {
+    if !has_reportable_changes(result, binary_changes) {
         return "No semantic changes detected.".to_string();
     }
 
     let mut lines: Vec<String> = Vec::new();
 
     // Group changes by file (BTreeMap for sorted output)
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, change) in result.changes.iter().enumerate() {
-        by_file.entry(&change.file_path).or_default().push(i);
+        by_file.entry(&change.file_path).or_default().0.push(i);
+    }
+    for (i, change) in binary_changes.iter().enumerate() {
+        by_file.entry(&change.file_path).or_default().1.push(i);
     }
 
-    for (file_path, indices) in &by_file {
+    for (file_path, (indices, binary_indices)) in &by_file {
         lines.push(format!("### {file_path}"));
         lines.push(String::new());
         lines.push("| Status | Type | Name |".to_string());
         lines.push("|--------|------|------|".to_string());
 
         let mut post_table: Vec<String> = Vec::new();
+
+        for &idx in binary_indices {
+            let change = &binary_changes[idx];
+            lines.push(format!(
+                "| B | file | {} `[binary {}]` |",
+                binary_display_name(change),
+                change.status,
+            ));
+        }
 
         for &idx in indices {
             let change = &result.changes[idx];
@@ -181,7 +199,12 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     if result.reordered_count > 0 {
         parts.push(format!("{} reordered", result.reordered_count));
     }
-    let files_label = if result.file_count == 1 {
+    if !binary_changes.is_empty() {
+        parts.push(format!("{} binary", binary_changes.len()));
+    }
+
+    let reported_file_count = file_count(result, binary_changes);
+    let files_label = if reported_file_count == 1 {
         "file"
     } else {
         "files"
@@ -196,7 +219,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     lines.push(format!(
         "**Summary:** {} across {} {files_label}{}",
         parts.join(", "),
-        result.file_count,
+        reported_file_count,
         orphan_suffix,
     ));
 

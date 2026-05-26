@@ -347,6 +347,7 @@ sem diff --format json
     "moved": 0,
     "renamed": 0,
     "reordered": 0,
+    "binary": 0,
     "orphan": 0,
     "total": 3
   },
@@ -362,7 +363,8 @@ sem diff --format json
       "oldEndLine": null,
       "filePath": "src/auth.ts"
     }
-  ]
+  ],
+  "binaryChanges": []
 }
 ```
 

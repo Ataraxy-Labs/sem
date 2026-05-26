@@ -1,9 +1,11 @@
 use super::orphan_summary_parts;
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
+
+use super::{binary_display_name, file_count, has_reportable_changes};
 
 /// Runs word-level diff on two lines and returns (delete_line, insert_line)
 /// with changed words highlighted (strikethrough+red / bold+green).
@@ -31,22 +33,30 @@ fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
     (del, ins)
 }
 
-pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
-    if result.changes.is_empty() {
+pub fn format_terminal(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    verbose: bool,
+) -> String {
+    if !has_reportable_changes(result, binary_changes) {
         return "No semantic changes detected.".dimmed().to_string();
     }
 
     let mut lines: Vec<String> = Vec::new();
 
     // Group changes by file (BTreeMap for sorted output)
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, change) in result.changes.iter().enumerate() {
-        by_file.entry(&change.file_path).or_default().push(i);
+        by_file.entry(&change.file_path).or_default().0.push(i);
+    }
+    for (i, change) in binary_changes.iter().enumerate() {
+        by_file.entry(&change.file_path).or_default().1.push(i);
     }
 
-    for (file_path, indices) in &by_file {
+    for (file_path, (indices, binary_indices)) in &by_file {
         // Skip files where all changes are orphans in non-verbose mode
         if !verbose
+            && binary_indices.is_empty()
             && indices
                 .iter()
                 .all(|&i| result.changes[i].entity_type == "orphan")
@@ -62,6 +72,23 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 .to_string(),
         );
         lines.push("│".dimmed().to_string());
+
+        for &idx in binary_indices {
+            let change = &binary_changes[idx];
+            let symbol = "■".yellow().to_string();
+            let tag = format!("[binary {}]", change.status).yellow().to_string();
+            let type_label = format!("{:<10}", "file");
+            let name_label = format!("{:<25}", binary_display_name(change));
+
+            lines.push(format!(
+                "{}  {} {} {} {}",
+                "│".dimmed(),
+                symbol,
+                type_label.dimmed(),
+                name_label.bold(),
+                tag,
+            ));
+        }
 
         for &idx in indices {
             let change = &result.changes[idx];
@@ -304,7 +331,12 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 .to_string(),
         );
     }
-    let files_label = if result.file_count == 1 {
+    if !binary_changes.is_empty() {
+        parts.push(format!("{} binary", binary_changes.len()).yellow().to_string());
+    }
+
+    let reported_file_count = file_count(result, binary_changes);
+    let files_label = if reported_file_count == 1 {
         "file"
     } else {
         "files"
@@ -321,7 +353,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     lines.push(format!(
         "Summary: {} across {} {files_label}{}",
         parts.join(", "),
-        result.file_count,
+        reported_file_count,
         orphan_suffix,
     ));
 
@@ -334,7 +366,8 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         + result.deleted_count
         + result.moved_count
         + result.renamed_count
-        + result.reordered_count;
+        + result.reordered_count
+        + binary_changes.len();
     if entities_analyzed > changes_detected {
         let noise = entities_analyzed - changes_detected;
         lines.push(

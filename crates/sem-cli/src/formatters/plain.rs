@@ -1,24 +1,43 @@
 use super::orphan_summary_parts;
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use std::collections::BTreeMap;
 
-pub fn format_plain(result: &DiffResult) -> String {
-    if result.changes.is_empty() {
+use super::{binary_display_name, file_count, has_reportable_changes};
+
+pub fn format_plain(result: &DiffResult, binary_changes: &[BinaryFileChange]) -> String {
+    if !has_reportable_changes(result, binary_changes) {
         return "No semantic changes detected.".to_string();
     }
 
     let mut lines: Vec<String> = Vec::new();
 
     // Group changes by file (BTreeMap for sorted output)
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, change) in result.changes.iter().enumerate() {
-        by_file.entry(&change.file_path).or_default().push(i);
+        by_file.entry(&change.file_path).or_default().0.push(i);
+    }
+    for (i, change) in binary_changes.iter().enumerate() {
+        by_file.entry(&change.file_path).or_default().1.push(i);
     }
 
-    for (file_path, indices) in &by_file {
+    for (file_path, (indices, binary_indices)) in &by_file {
         lines.push(file_path.bold().to_string());
+
+        for &idx in binary_indices {
+            let change = &binary_changes[idx];
+            let letter = "B".yellow().to_string();
+            let type_label = format!("{:<12}", "file");
+            let name_display = binary_display_name(change);
+            lines.push(format!(
+                "  {}  {}{} {}",
+                letter,
+                type_label.dimmed(),
+                name_display,
+                format!("[binary {}]", change.status).yellow(),
+            ));
+        }
 
         for &idx in indices {
             let change = &result.changes[idx];
@@ -99,7 +118,12 @@ pub fn format_plain(result: &DiffResult) -> String {
                 .to_string(),
         );
     }
-    let files_label = if result.file_count == 1 {
+    if !binary_changes.is_empty() {
+        parts.push(format!("{} binary", binary_changes.len()).yellow().to_string());
+    }
+
+    let reported_file_count = file_count(result, binary_changes);
+    let files_label = if reported_file_count == 1 {
         "file"
     } else {
         "files"
@@ -115,7 +139,7 @@ pub fn format_plain(result: &DiffResult) -> String {
     lines.push(format!(
         "{} across {} {files_label}{}",
         parts.join(", "),
-        result.file_count,
+        reported_file_count,
         orphan_suffix,
     ));
 

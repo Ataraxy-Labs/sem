@@ -1,7 +1,7 @@
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 
-pub fn format_json(result: &DiffResult) -> String {
-    sem_core::format::json::format_diff_json(result)
+pub fn format_json(result: &DiffResult, binary_changes: &[BinaryFileChange]) -> String {
+    sem_core::format::json::format_diff_json_with_binary_changes(result, binary_changes)
 }
 
 #[cfg(test)]
@@ -9,7 +9,7 @@ mod tests {
     use super::*;
     use sem_core::git::types::{FileChange, FileStatus};
     use sem_core::model::change::SemanticChange;
-    use sem_core::parser::differ::compute_semantic_diff;
+    use sem_core::parser::differ::{compute_semantic_diff, BinaryFileChange};
     use sem_core::parser::plugins::create_default_registry;
 
     fn modified_file(path: &str, before: &str, after: &str) -> FileChange {
@@ -36,7 +36,7 @@ mod tests {
             None,
         );
 
-        let output: serde_json::Value = serde_json::from_str(&format_json(&result)).unwrap();
+        let output: serde_json::Value = serde_json::from_str(&format_json(&result, &[])).unwrap();
         let summary = &output["summary"];
         let bucket_total = summary["added"].as_u64().unwrap()
             + summary["modified"].as_u64().unwrap()
@@ -83,12 +83,45 @@ mod tests {
             total_entities_after: 1,
         };
 
-        let output: serde_json::Value = serde_json::from_str(&format_json(&result)).unwrap();
+        let output: serde_json::Value = serde_json::from_str(&format_json(&result, &[])).unwrap();
         let change = &output["changes"][0];
 
         assert_eq!(change["startLine"], 7);
         assert_eq!(change["endLine"], 9);
         assert_eq!(change["oldStartLine"], 3);
         assert_eq!(change["oldEndLine"], 5);
+    }
+
+    #[test]
+    fn json_includes_binary_changes_in_summary_and_binary_changes() {
+        let result = DiffResult {
+            changes: Vec::new(),
+            file_count: 0,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            moved_count: 0,
+            renamed_count: 0,
+            reordered_count: 0,
+            orphan_count: 0,
+            total_entities_before: 0,
+            total_entities_after: 0,
+        };
+        let binary_changes = vec![BinaryFileChange {
+            file_path: "pic.png".to_string(),
+            status: FileStatus::Modified,
+            old_file_path: None,
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&format_json(&result, &binary_changes)).unwrap();
+
+        assert_eq!(value["summary"]["fileCount"], 1);
+        assert_eq!(value["summary"]["binary"], 1);
+        assert_eq!(value["summary"]["total"], 1);
+        assert_eq!(value["changes"].as_array().unwrap().len(), 0);
+        assert_eq!(value["binaryChanges"][0]["changeType"], "binary");
+        assert_eq!(value["binaryChanges"][0]["filePath"], "pic.png");
+        assert_eq!(value["binaryChanges"][0]["fileStatus"], "modified");
     }
 }
