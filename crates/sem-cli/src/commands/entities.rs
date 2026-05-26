@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
@@ -183,30 +183,54 @@ fn print_grouped_entities(path_label: &str, entities: &[SemanticEntity]) {
     println!("{} {}\n", "entities:".green().bold(), path_label.bold());
 
     let mut current_file: Option<&str> = None;
+    let entities_by_id = entities_by_id(entities);
     for entity in entities {
         if current_file != Some(entity.file_path.as_str()) {
             current_file = Some(entity.file_path.as_str());
             println!("  {}", entity.file_path.bold());
         }
 
-        let indent = if entity.parent_id.is_some() {
-            "      "
-        } else {
-            "    "
-        };
-        print_entity_row(entity, indent);
+        let indent = entity_indent(entity, &entities_by_id, "    ");
+        print_entity_row(entity, &indent);
     }
 }
 
 fn print_entity_rows(entities: &[SemanticEntity], base_indent: &str) {
+    let entities_by_id = entities_by_id(entities);
     for entity in entities {
-        let indent = if entity.parent_id.is_some() {
-            format!("{base_indent}  ")
-        } else {
-            base_indent.to_string()
-        };
+        let indent = entity_indent(entity, &entities_by_id, base_indent);
         print_entity_row(entity, &indent);
     }
+}
+
+fn entities_by_id(entities: &[SemanticEntity]) -> HashMap<&str, &SemanticEntity> {
+    entities.iter().map(|entity| (entity.id.as_str(), entity)).collect()
+}
+
+fn entity_indent(
+    entity: &SemanticEntity,
+    entities_by_id: &HashMap<&str, &SemanticEntity>,
+    base_indent: &str,
+) -> String {
+    format!("{base_indent}{}", "  ".repeat(entity_depth(entity, entities_by_id)))
+}
+
+fn entity_depth(entity: &SemanticEntity, entities_by_id: &HashMap<&str, &SemanticEntity>) -> usize {
+    let mut depth = 0;
+    let mut current_parent = entity.parent_id.as_deref();
+    let mut seen = HashSet::new();
+
+    while let Some(parent_id) = current_parent {
+        if !seen.insert(parent_id) {
+            break;
+        }
+        depth += 1;
+        current_parent = entities_by_id
+            .get(parent_id)
+            .and_then(|parent| parent.parent_id.as_deref());
+    }
+
+    depth
 }
 
 fn print_entity_row(entity: &SemanticEntity, indent: &str) {
@@ -218,4 +242,50 @@ fn print_entity_row(entity: &SemanticEntity, indent: &str) {
         entity.start_line,
         entity.end_line,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entity(id: &str, parent_id: Option<&str>) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: "a.ts".to_string(),
+            entity_type: "field".to_string(),
+            name: id.rsplit("::").next().unwrap_or(id).to_string(),
+            parent_id: parent_id.map(String::from),
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 1,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn entity_depth_follows_parent_chain() {
+        let root = entity("a.ts::class::L1", None);
+        let child = entity("a.ts::class::L1::L2", Some("a.ts::class::L1"));
+        let grandchild = entity("a.ts::class::L1::L2::L3", Some("a.ts::class::L1::L2"));
+        let entities = vec![root, child, grandchild];
+        let entities_by_id = entities_by_id(&entities);
+
+        assert_eq!(entity_depth(&entities[0], &entities_by_id), 0);
+        assert_eq!(entity_depth(&entities[1], &entities_by_id), 1);
+        assert_eq!(entity_depth(&entities[2], &entities_by_id), 2);
+        assert_eq!(entity_indent(&entities[2], &entities_by_id, "  "), "      ");
+    }
+
+    #[test]
+    fn entity_depth_handles_missing_or_cyclic_parents() {
+        let missing = entity("a.ts::field::missing", Some("a.ts::field::unknown"));
+        let cyclic = entity("a.ts::field::cyclic", Some("a.ts::field::cyclic"));
+        let entities = vec![missing, cyclic];
+        let entities_by_id = entities_by_id(&entities);
+
+        assert_eq!(entity_depth(&entities[0], &entities_by_id), 1);
+        assert_eq!(entity_depth(&entities[1], &entities_by_id), 1);
+    }
 }

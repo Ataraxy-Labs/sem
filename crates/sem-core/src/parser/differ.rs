@@ -197,6 +197,7 @@ fn suppress_redundant_parents(
         "namespace",
         "export",
         "package",
+        "field",
         "svelte_instance_script",
         "svelte_module_script",
         "object",
@@ -705,6 +706,55 @@ mod tests {
                 .iter()
                 .any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
             "class should remain Modified when its own declaration changed, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_nested_typescript_class_field_diff_reports_leaf_method() {
+        let before = r#"class L1 {
+  L2 = class {
+    L3 = class {
+      L4 = class {
+        method() { return 1; }
+      };
+    };
+  };
+}
+"#;
+        let after = r#"class L1 {
+  L2 = class {
+    L3 = class {
+      L4 = class {
+        method() { return 999; }
+      };
+    };
+  };
+}
+"#;
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("a.ts", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let changes: Vec<_> = result
+            .changes
+            .iter()
+            .map(|c| (c.entity_name.as_str(), c.entity_type.as_str()))
+            .collect();
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_id == "a.ts::class::L1::L2::L3::L4::method"),
+            "expected method leaf change, got: {changes:?}"
+        );
+        assert!(
+            !result.changes.iter().any(|c| c.entity_type == "field"),
+            "field containers should be suppressed when only a nested method changed, got: {changes:?}"
         );
     }
 

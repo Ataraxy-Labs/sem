@@ -597,6 +597,58 @@ function outer() {
     }
 
     #[test]
+    fn test_typescript_nested_anonymous_class_fields() {
+        let code = r#"
+class L1 {
+  L2 = class {
+    L3 = class {
+      L4 = class {
+        method() { return 1; }
+      };
+    };
+  };
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "a.ts");
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                        .collect::<Vec<_>>()
+                )
+            })
+        };
+
+        let l1 = find("L1");
+        assert_eq!(l1.entity_type, "class");
+        let l1_id = l1.id.clone();
+
+        let l2 = find("L2");
+        assert_eq!(l2.entity_type, "field");
+        assert_eq!(l2.parent_id.as_deref(), Some(l1_id.as_str()));
+        let l2_id = l2.id.clone();
+
+        let l3 = find("L3");
+        assert_eq!(l3.entity_type, "field");
+        assert_eq!(l3.parent_id.as_deref(), Some(l2_id.as_str()));
+        let l3_id = l3.id.clone();
+
+        let l4 = find("L4");
+        assert_eq!(l4.entity_type, "field");
+        assert_eq!(l4.parent_id.as_deref(), Some(l3_id.as_str()));
+        let l4_id = l4.id.clone();
+
+        let method = find("method");
+        assert_eq!(method.entity_type, "method");
+        assert_eq!(method.parent_id.as_deref(), Some(l4_id.as_str()));
+        assert_eq!(method.id, "a.ts::class::L1::L2::L3::L4::method");
+    }
+
+    #[test]
     fn test_nested_functions_python() {
         let code = "def outer():\n    def inner():\n        return 42\n    return inner()\n";
         let plugin = CodeParserPlugin;
@@ -1085,6 +1137,66 @@ const handler = () => {
         let handler = entities.iter().find(|e| e.name == "handler").unwrap();
 
         assert_eq!(handler.entity_type, "function");
+    }
+
+    #[test]
+    fn test_js_ts_multi_declarator_promotes_each_const_initializer() {
+        let code = r#"
+const value = 1, handler = () => value;
+const first = () => 1, second = 2;
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "sample.ts");
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>()
+                )
+            })
+        };
+
+        assert_eq!(find("value").entity_type, "variable");
+        assert_eq!(find("handler").entity_type, "function");
+        assert_eq!(find("first").entity_type, "function");
+        assert_eq!(find("second").entity_type, "variable");
+    }
+
+    #[test]
+    fn test_suppressed_multi_declarator_traverses_skipped_initializers() {
+        let code = r#"
+function wrapper() {
+  const holder = class {
+    run() { return 1; }
+  }, handler = () => {
+    class Inner {
+      go() { return 2; }
+    }
+  }, value = 1;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "sample.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                        .collect::<Vec<_>>()
+                )
+            })
+        };
+
+        assert_eq!(find("wrapper").entity_type, "function");
+        assert_eq!(find("handler").entity_type, "function");
+        assert!(names.contains(&"run"), "got: {:?}", names);
+        assert!(names.contains(&"Inner"), "got: {:?}", names);
+        assert!(names.contains(&"go"), "got: {:?}", names);
+        assert!(!names.contains(&"holder"), "got: {:?}", names);
+        assert!(!names.contains(&"value"), "got: {:?}", names);
     }
 
     #[test]

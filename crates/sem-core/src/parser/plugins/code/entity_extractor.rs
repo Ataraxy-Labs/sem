@@ -228,13 +228,16 @@ fn visit_node(
                 .filter(|c| c.kind() == "variable_declarator")
                 .collect();
             if declarators.len() > 1 {
-                let should_skip = should_skip_entity(config, suppression_context, node_type)
-                    && promote_js_ts_const_function(node, config).is_none();
-                if !should_skip {
-                    for declarator in &declarators {
-                        if let Some(name_node) = declarator.child_by_field_name("name") {
+                let skip_declaration = should_skip_entity(config, suppression_context, node_type);
+                let mut initializer_children = Vec::new();
+                for declarator in &declarators {
+                    let emitted_entity_id = if let Some(name_node) =
+                        declarator.child_by_field_name("name")
+                    {
+                        let entity_type =
+                            map_js_ts_declarator_entity_type(node, *declarator, config);
+                        if !skip_declaration || entity_type == "function" {
                             let name = node_text(name_node, source).to_string();
-                            let entity_type = map_entity_type(node, config);
                             let content = node_text(*declarator, source).to_string();
                             let struct_hash = compute_structural_hash(*declarator, source);
                             let entity = SemanticEntity {
@@ -250,10 +253,36 @@ fn visit_node(
                                 end_line: declarator.end_position().row + 1,
                                 metadata: None,
                             };
+
+                            let entity_id = entity.id.clone();
                             entities.push(entity);
+                            Some(entity_id)
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
+
+                    // Suppressed local declarators do not have an entity of
+                    // their own, so their initializer is traversed under the
+                    // surrounding parent, matching the single-declarator path.
+                    let initializer_parent = emitted_entity_id.as_deref().or(parent_id);
+                    if let Some(initializer_child) =
+                        js_ts_initializer_child(config, *declarator, initializer_parent)
+                    {
+                        initializer_children.push(initializer_child);
                     }
                 }
+                // The worklist is LIFO; push in reverse so initializers are
+                // visited in source order.
+                for initializer_child in initializer_children.into_iter().rev() {
+                    worklist.push(initializer_child);
+                }
+                // The multi-declarator branch has already emitted each
+                // declarator and queued initializer traversal. Continuing here
+                // prevents the declaration node from also emitting only the
+                // first declarator through the generic path below.
                 continue;
             }
         }
@@ -429,24 +458,24 @@ fn visit_node(
                         }
                     }
 
-                    // For variable declarations, also traverse into initializers
-                    // that are scope boundaries (arrow functions, function expressions)
-                    // so that inner class/function declarations are extracted.
+                    // For JS/TS variable declarations and class fields, traverse
+                    // initializers that can contain nested entity declarations.
                     if node_type == "lexical_declaration" || node_type == "variable_declaration" {
                         let mut vd_cursor = node.walk();
                         for child in node.named_children(&mut vd_cursor) {
                             if child.kind() == "variable_declarator" {
-                                if let Some(value) = child.child_by_field_name("value") {
-                                    if config.scope_boundary_types.contains(&value.kind()) {
-                                        worklist.push((
-                                            value,
-                                            Some(entity_id.clone()),
-                                            Some(value.kind().to_string()),
-                                        ));
-                                    }
-                                }
+                                push_js_ts_initializer_children(
+                                    &mut worklist,
+                                    config,
+                                    child,
+                                    &entity_id,
+                                );
                             }
                         }
+                    } else if node_type == "public_field_definition"
+                        || node_type == "field_definition"
+                    {
+                        push_js_ts_initializer_children(&mut worklist, config, node, &entity_id);
                     }
 
                     continue;
@@ -1771,6 +1800,15 @@ fn swift_class_declaration_type(node: Node) -> Option<&'static str> {
     swift_declaration_keyword_type(declaration_kind.kind())
 }
 
+fn map_js_ts_declarator_entity_type(
+    declaration: Node,
+    declarator: Node,
+    config: &LanguageConfig,
+) -> &'static str {
+    promote_js_ts_const_declarator_function(declaration, declarator, config)
+        .unwrap_or_else(|| map_node_type(declaration.kind()))
+}
+
 /// Check whether a C/C++ `declaration` node contains a `function_declarator`
 /// descendant, indicating it is a function prototype rather than a variable.
 fn has_function_declarator(node: Node) -> bool {
@@ -1825,12 +1863,84 @@ fn promote_js_ts_const_function(node: Node, config: &LanguageConfig) -> Option<&
 
     let mut cursor = node.walk();
     let declarator = node.named_children(&mut cursor).find(|child| child.kind() == "variable_declarator")?;
+    promote_js_ts_const_declarator_function(node, declarator, config)
+}
+
+fn promote_js_ts_const_declarator_function(
+    declaration: Node,
+    declarator: Node,
+    config: &LanguageConfig,
+) -> Option<&'static str> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript") {
+        return None;
+    }
+
+    if declaration.kind() != "lexical_declaration" {
+        return None;
+    }
+
+    let declaration_kind = declaration.child_by_field_name("kind")?;
+    if declaration_kind.kind() != "const" {
+        return None;
+    }
+
     let value = declarator.child_by_field_name("value")?;
 
     match value.kind() {
         "arrow_function" | "function_expression" | "generator_function" => Some("function"),
         _ => None,
     }
+}
+
+fn push_js_ts_initializer_children<'tree>(
+    worklist: &mut Vec<(Node<'tree>, Option<String>, Option<String>)>,
+    config: &LanguageConfig,
+    node: Node<'tree>,
+    entity_id: &str,
+) {
+    if let Some(initializer_child) = js_ts_initializer_child(config, node, Some(entity_id)) {
+        worklist.push(initializer_child);
+    }
+}
+
+fn js_ts_initializer_child<'tree>(
+    config: &LanguageConfig,
+    node: Node<'tree>,
+    parent_id: Option<&str>,
+) -> Option<(Node<'tree>, Option<String>, Option<String>)> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript") {
+        return None;
+    }
+
+    let value = js_ts_initializer_value(config, node)?;
+    Some((
+        value,
+        parent_id.map(String::from),
+        Some(value.kind().to_string()),
+    ))
+}
+
+fn js_ts_initializer_value<'tree>(
+    config: &LanguageConfig,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if let Some(value) = node.child_by_field_name("value") {
+        return is_js_ts_initializer_node(config, value).then_some(value);
+    }
+
+    if !matches!(node.kind(), "public_field_definition" | "field_definition") {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    let initializer = node
+        .named_children(&mut cursor)
+        .find(|child| is_js_ts_initializer_node(config, *child));
+    initializer
+}
+
+fn is_js_ts_initializer_node(config: &LanguageConfig, node: Node) -> bool {
+    config.scope_boundary_types.contains(&node.kind()) || node.kind() == "class"
 }
 
 /// Dart constructor signatures use `field("name", seq(identifier, optional(".", identifier)))`,
