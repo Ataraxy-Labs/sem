@@ -71,6 +71,15 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 continue;
             }
 
+            let content_suffix = if change.has_content_change() {
+                if change.structural_change == Some(false) {
+                    "+cosmetic"
+                } else {
+                    "+modified"
+                }
+            } else {
+                ""
+            };
             let (symbol, tag) = match change.change_type {
                 ChangeType::Added => ("⊕".green().to_string(), "[added]".green().to_string()),
                 ChangeType::Modified => {
@@ -82,11 +91,17 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     }
                 }
                 ChangeType::Deleted => ("⊖".red().to_string(), "[deleted]".red().to_string()),
-                ChangeType::Moved => ("→".blue().to_string(), "[moved]".blue().to_string()),
-                ChangeType::Renamed => ("↻".cyan().to_string(), "[renamed]".cyan().to_string()),
+                ChangeType::Moved => (
+                    "→".blue().to_string(),
+                    format!("[moved{content_suffix}]").blue().to_string(),
+                ),
+                ChangeType::Renamed => (
+                    "↻".cyan().to_string(),
+                    format!("[renamed{content_suffix}]").cyan().to_string(),
+                ),
                 ChangeType::Reordered => (
                     "↕".magenta().to_string(),
-                    "[reordered]".magenta().to_string(),
+                    format!("[reordered{content_suffix}]").magenta().to_string(),
                 ),
             };
 

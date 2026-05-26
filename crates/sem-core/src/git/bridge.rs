@@ -72,10 +72,10 @@ impl GitBridge {
     }
 
     /// Combined detect scope + get files in one call (fast path).
-    /// Matches `git diff` behavior: shows working tree changes by default.
+    /// Shows all changes from HEAD to the current working state by default.
     /// Use `--staged` for staged changes only.
     pub fn detect_and_get_files(&self, pathspecs: &[String]) -> Result<(DiffScope, Vec<FileChange>), GitError> {
-        // Show working tree changes (unstaged), matching git diff behavior
+        // Show the full current working state, including staged changes.
         let mut working_files = self.get_working_diff_files(pathspecs)?;
         if !working_files.is_empty() {
             self.populate_contents(&mut working_files, &DiffScope::Working)?;
@@ -102,6 +102,31 @@ impl GitBridge {
         files.retain(|f| !f.file_path.starts_with(".sem/"));
 
         self.populate_contents(&mut files, scope)?;
+        Ok(files)
+    }
+
+    pub fn get_staged_files_with_base_ref(
+        &self,
+        base: &str,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
+        let mut files = self.get_staged_diff_files_with_base(base, pathspecs)?;
+        files.retain(|f| !f.file_path.starts_with(".sem/"));
+
+        let base_tree = self.resolve_tree(base)?;
+        for file in files.iter_mut() {
+            if file.status != FileStatus::Deleted {
+                file.after_content = self.read_index_file(&file.file_path);
+            }
+            if file.status != FileStatus::Added {
+                let path = file
+                    .old_file_path
+                    .as_deref()
+                    .unwrap_or(&file.file_path);
+                file.before_content = self.read_blob_from_tree(&base_tree, path);
+            }
+        }
+
         Ok(files)
     }
 
@@ -170,9 +195,26 @@ impl GitBridge {
             Err(_) => None, // No commits yet
         };
 
+        self.get_index_diff_files(head_tree.as_ref(), pathspecs)
+    }
+
+    fn get_staged_diff_files_with_base(
+        &self,
+        base: &str,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
+        let base_tree = self.resolve_tree(base)?;
+        self.get_index_diff_files(Some(&base_tree), pathspecs)
+    }
+
+    fn get_index_diff_files(
+        &self,
+        base_tree: Option<&git2::Tree<'_>>,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
         let mut opts = self.make_diff_opts(pathspecs)?;
         let mut diff = self.repo.diff_tree_to_index(
-            head_tree.as_ref(),
+            base_tree,
             Some(&self.repo.index()?),
             Some(&mut opts),
         )?;
@@ -185,9 +227,111 @@ impl GitBridge {
         let mut opts = self.make_diff_opts(pathspecs)?;
         opts.include_untracked(false);
 
-        let mut diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
+        let head_tree = self.resolve_tree("HEAD").ok();
+        let mut diff = match head_tree.as_ref() {
+            Some(head_tree) => self
+                .repo
+                .diff_tree_to_workdir_with_index(Some(head_tree), Some(&mut opts))?,
+            None => self.repo.diff_index_to_workdir(None, Some(&mut opts))?,
+        };
         Self::detect_renames(&mut diff)?;
-        Ok(self.diff_to_file_changes(&diff))
+        self.apply_index_rename_map(
+            self.diff_to_file_changes(&diff),
+            head_tree.as_ref(),
+            pathspecs,
+        )
+    }
+
+    fn apply_index_rename_map(
+        &self,
+        mut files: Vec<FileChange>,
+        base_tree: Option<&git2::Tree<'_>>,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
+        let Some(base_tree) = base_tree else {
+            return Ok(files);
+        };
+
+        let index_renames: Vec<FileChange> = self
+            .get_index_diff_files(Some(base_tree), pathspecs)?
+            .into_iter()
+            .filter(|file| file.status == FileStatus::Renamed)
+            .collect();
+
+        for rename in index_renames {
+            let Some(old_path) = rename.old_file_path.clone() else {
+                continue;
+            };
+            let target_pos = files
+                .iter()
+                .position(|file| {
+                    matches!(file.status, FileStatus::Added | FileStatus::Renamed)
+                        && file.file_path == rename.file_path
+                });
+            let deleted_pos = files
+                .iter()
+                .position(|file| {
+                    file.status == FileStatus::Deleted && file.file_path == old_path
+                });
+
+            if let (Some(target_pos), Some(deleted_pos)) = (target_pos, deleted_pos) {
+                if files[target_pos].status == FileStatus::Renamed
+                    && files[target_pos].old_file_path.as_deref() == Some(old_path.as_str())
+                {
+                    continue;
+                }
+
+                let target_file = files[target_pos].clone();
+                let deleted_file = files[deleted_pos].clone();
+                let displaced_deleted_path =
+                    if target_file.status == FileStatus::Renamed {
+                        target_file
+                            .old_file_path
+                            .as_ref()
+                            .filter(|path| *path != &old_path)
+                            .cloned()
+                    } else {
+                        None
+                    };
+
+                files = files
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, file)| {
+                        if idx == target_pos || idx == deleted_pos {
+                            None
+                        } else {
+                            Some(file)
+                        }
+                    })
+                    .collect();
+                let before_content = deleted_file
+                    .before_content
+                    .or_else(|| self.read_blob_from_tree(base_tree, &old_path));
+                let after_content = target_file
+                    .after_content
+                    .or_else(|| self.read_working_file(&target_file.file_path));
+                files.push(FileChange {
+                    file_path: target_file.file_path,
+                    status: FileStatus::Renamed,
+                    old_file_path: Some(old_path),
+                    before_content,
+                    after_content,
+                });
+                if let Some(file_path) = displaced_deleted_path {
+                    let before_content = self.read_blob_from_tree(base_tree, &file_path);
+                    files.push(FileChange {
+                        file_path,
+                        status: FileStatus::Deleted,
+                        old_file_path: None,
+                        before_content,
+                        after_content: None,
+                    });
+                }
+            }
+        }
+
+        Ok(files)
     }
 
     fn get_commit_diff_files(&self, sha: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
@@ -238,7 +382,7 @@ impl GitBridge {
             Some(&mut opts),
         )?;
         Self::detect_renames(&mut diff)?;
-        Ok(self.diff_to_file_changes(&diff))
+        self.apply_index_rename_map(self.diff_to_file_changes(&diff), Some(&tree), pathspecs)
     }
 
     fn detect_renames(diff: &mut Diff) -> Result<(), GitError> {
@@ -1124,11 +1268,290 @@ export function foo() {
 
         assert_eq!(result.added_count, 0);
         assert_eq!(result.deleted_count, 0);
+        // `foo` is a compound Moved change whose body also changed, so it counts toward
+        // both moved_count and modified_count.
+        assert_eq!(result.modified_count, 1);
         assert_eq!(result.moved_count, 1);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Moved);
         assert_eq!(result.changes[0].entity_name, "foo");
         assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.ts"));
+        assert_eq!(result.changes[0].structural_change, Some(true));
+    }
+
+    #[test]
+    fn working_diff_preserves_staged_rename_with_unstaged_edit() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let before = "\
+export function foo(x: number) {
+  return x + 1;
+}
+
+export function bar(y: number) {
+  return y * 2;
+}
+";
+        let after = "\
+export function foo(x: number) {
+  return x + 42;
+}
+
+export function bar(y: number) {
+  return y * 99;
+}
+";
+
+        commit_file(&repo, "a.ts", before, "init");
+
+        fs::rename(temp.path().join("a.ts"), temp.path().join("b.ts")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("a.ts")).unwrap();
+        index.add_path(Path::new("b.ts")).unwrap();
+        index.write().unwrap();
+
+        fs::write(temp.path().join("b.ts"), after).unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let (scope, files) = bridge.detect_and_get_files(&[]).unwrap();
+
+        assert!(matches!(scope, DiffScope::Working));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(files[0].file_path, "b.ts");
+        assert_eq!(files[0].old_file_path.as_deref(), Some("a.ts"));
+        assert_eq!(files[0].before_content.as_deref(), Some(before));
+        assert_eq!(files[0].after_content.as_deref(), Some(after));
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&files, &registry, None, None);
+
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.modified_count, 2);
+        assert_eq!(result.moved_count, 2);
+        assert_eq!(result.changes.len(), 2);
+        assert!(result
+            .changes
+            .iter()
+            .all(|change| change.change_type == ChangeType::Moved));
+        assert!(result
+            .changes
+            .iter()
+            .all(|change| change.old_file_path.as_deref() == Some("a.ts")));
+        assert!(result
+            .changes
+            .iter()
+            .all(|change| change.structural_change == Some(true)));
+    }
+
+    #[test]
+    fn working_diff_uses_staged_rename_map_after_large_unstaged_rewrite() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let before_noise = (0..200)
+            .map(|i| format!("// old filler {i} alpha beta gamma"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after_noise = (0..200)
+            .map(|i| format!("// new filler {i} delta epsilon zeta"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = format!(
+            "{before_noise}\nexport function foo(x: number) {{\n  return x + 1;\n}}\n"
+        );
+        let after = format!(
+            "{after_noise}\nexport function foo(x: number) {{\n  return x + 42;\n}}\n"
+        );
+
+        commit_file(&repo, "a.ts", &before, "init");
+
+        fs::rename(temp.path().join("a.ts"), temp.path().join("b.ts")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("a.ts")).unwrap();
+        index.add_path(Path::new("b.ts")).unwrap();
+        index.write().unwrap();
+
+        fs::write(temp.path().join("b.ts"), &after).unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let (scope, files) = bridge.detect_and_get_files(&[]).unwrap();
+
+        assert!(matches!(scope, DiffScope::Working));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(files[0].file_path, "b.ts");
+        assert_eq!(files[0].old_file_path.as_deref(), Some("a.ts"));
+        assert_eq!(files[0].before_content.as_deref(), Some(before.as_str()));
+        assert_eq!(files[0].after_content.as_deref(), Some(after.as_str()));
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&files, &registry, None, None);
+
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.deleted_count, 0);
+        // Two changes: the rewritten comment block is a Modified orphan, and `foo` is a
+        // compound Moved change whose body also changed, so it counts toward both
+        // moved_count and modified_count.
+        assert_eq!(result.modified_count, 2);
+        assert_eq!(result.moved_count, 1);
+        assert!(result
+            .changes
+            .iter()
+            .any(|change| change.change_type == ChangeType::Moved && change.entity_name == "foo"));
+    }
+
+    #[test]
+    fn explicit_ref_to_working_uses_index_rename_map_after_large_unstaged_rewrite() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let before_noise = (0..200)
+            .map(|i| format!("// old filler {i} alpha beta gamma"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after_noise = (0..200)
+            .map(|i| format!("// new filler {i} delta epsilon zeta"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = format!(
+            "{before_noise}\nexport function foo(x: number) {{\n  return x + 1;\n}}\n"
+        );
+        let after = format!(
+            "{after_noise}\nexport function foo(x: number) {{\n  return x + 42;\n}}\n"
+        );
+
+        commit_file(&repo, "a.ts", &before, "init");
+
+        fs::rename(temp.path().join("a.ts"), temp.path().join("b.ts")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("a.ts")).unwrap();
+        index.add_path(Path::new("b.ts")).unwrap();
+        index.write().unwrap();
+
+        fs::write(temp.path().join("b.ts"), &after).unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge
+            .get_changed_files(
+                &DiffScope::RefToWorking {
+                    refspec: "HEAD".to_string(),
+                },
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(files[0].file_path, "b.ts");
+        assert_eq!(files[0].old_file_path.as_deref(), Some("a.ts"));
+        assert_eq!(files[0].before_content.as_deref(), Some(before.as_str()));
+        assert_eq!(files[0].after_content.as_deref(), Some(after.as_str()));
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&files, &registry, None, None);
+
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.deleted_count, 0);
+        // Two changes: the rewritten comment block is a Modified orphan, and `foo` is a
+        // compound Moved change whose body also changed, so it counts toward both
+        // moved_count and modified_count.
+        assert_eq!(result.modified_count, 2);
+        assert_eq!(result.moved_count, 1);
+        assert!(result
+            .changes
+            .iter()
+            .any(|change| change.change_type == ChangeType::Moved && change.entity_name == "foo"));
+    }
+
+    #[test]
+    fn staged_rename_map_overrides_wrong_worktree_rename_pairing() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let a_before = "export function foo(x: number) {\n  return x + 1;\n}\n";
+        let c_before = "export function foo(x: number) {\n  return x + 42;\n}\n";
+
+        commit_file(&repo, "a.ts", a_before, "init a");
+        commit_file(&repo, "c.ts", c_before, "init c");
+
+        fs::rename(temp.path().join("a.ts"), temp.path().join("b.ts")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("a.ts")).unwrap();
+        index.add_path(Path::new("b.ts")).unwrap();
+        index.write().unwrap();
+
+        fs::remove_file(temp.path().join("c.ts")).unwrap();
+        fs::write(temp.path().join("b.ts"), c_before).unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let (scope, files) = bridge.detect_and_get_files(&[]).unwrap();
+
+        assert!(matches!(scope, DiffScope::Working));
+        let renamed = files
+            .iter()
+            .find(|file| {
+                file.status == FileStatus::Renamed
+                    && file.file_path == "b.ts"
+                    && file.old_file_path.as_deref() == Some("a.ts")
+            })
+            .unwrap();
+        assert_eq!(renamed.before_content.as_deref(), Some(a_before));
+        assert_eq!(renamed.after_content.as_deref(), Some(c_before));
+
+        let deleted = files
+            .iter()
+            .find(|file| file.status == FileStatus::Deleted && file.file_path == "c.ts")
+            .unwrap();
+        assert_eq!(deleted.before_content.as_deref(), Some(c_before));
+        assert_eq!(deleted.after_content.as_deref(), None);
+        assert!(!files.iter().any(|file| {
+            file.status == FileStatus::Renamed
+                && file.file_path == "b.ts"
+                && file.old_file_path.as_deref() == Some("c.ts")
+        }));
+    }
+
+    #[test]
+    fn staged_diff_with_base_ref_compares_index_to_that_ref() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let v1 = "def foo():\n    return 1\n";
+        let v2 = "def foo():\n    return 2\n";
+        let v3 = "def foo():\n    return 3\n";
+        let v4 = "def foo():\n    return 4\n";
+
+        commit_file(&repo, "a.py", v1, "init");
+        commit_file(&repo, "a.py", v2, "second");
+        fs::write(temp.path().join("a.py"), v3).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.py")).unwrap();
+        index.write().unwrap();
+
+        fs::write(temp.path().join("a.py"), v4).unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge
+            .get_staged_files_with_base_ref("HEAD~1", &[])
+            .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].file_path, "a.py");
+        assert_eq!(files[0].before_content.as_deref(), Some(v1));
+        assert_eq!(files[0].after_content.as_deref(), Some(v3));
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&files, &registry, None, None);
+
+        assert_eq!(result.modified_count, 1);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].entity_name, "foo");
     }
 
     #[test]

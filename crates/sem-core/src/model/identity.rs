@@ -64,6 +64,17 @@ fn same_signature_across_file_rename(
         && parent_name(before, before_by_id) == parent_name(after, after_by_id)
 }
 
+fn structural_change_between(before: &SemanticEntity, after: &SemanticEntity) -> Option<bool> {
+    if before.content_hash == after.content_hash {
+        return None;
+    }
+
+    match (&before.structural_hash, &after.structural_hash) {
+        (Some(before_hash), Some(after_hash)) => Some(before_hash != after_hash),
+        _ => None,
+    }
+}
+
 fn make_change(
     after_entity: &SemanticEntity,
     change_type: ChangeType,
@@ -84,6 +95,13 @@ fn make_change(
     } else {
         after_entity
     };
+    let structural_change = before_entity.and_then(|before| {
+        if matches!(change_type, ChangeType::Deleted | ChangeType::Reordered) {
+            None
+        } else {
+            structural_change_between(before, after_entity)
+        }
+    });
     SemanticChange {
         id: format!("change::{prefix}{}", primary.id),
         entity_id: primary.id.clone(),
@@ -119,7 +137,7 @@ fn make_change(
         commit_sha: commit_sha.map(String::from),
         author: author.map(String::from),
         timestamp: None,
-        structural_change: None,
+        structural_change,
     }
 }
 
@@ -160,12 +178,14 @@ pub fn match_entities(
             matched_after.insert(id);
 
             if before_entity.content_hash != after_entity.content_hash {
-                let mut change = make_change(after_entity, ChangeType::Modified, Some(before_entity), commit_sha, author, &combined_by_id);
-                change.structural_change = match (&before_entity.structural_hash, &after_entity.structural_hash) {
-                    (Some(before_sh), Some(after_sh)) => Some(before_sh != after_sh),
-                    _ => None,
-                };
-                changes.push(change);
+                changes.push(make_change(
+                    after_entity,
+                    ChangeType::Modified,
+                    Some(before_entity),
+                    commit_sha,
+                    author,
+                    &combined_by_id,
+                ));
             }
         }
     }
@@ -607,6 +627,33 @@ mod tests {
 
     #[test]
     fn test_same_signature_file_rename_with_content_change_is_moved() {
+        let mut before_entity = make_entity(
+            "old.ts::function::foo",
+            "foo",
+            "export function foo() { return alpha + beta + gamma; }",
+            "old.ts",
+        );
+        before_entity.structural_hash = Some("before-structure".to_string());
+        let mut after_entity = make_entity(
+            "new.ts::function::foo",
+            "foo",
+            "export function foo() { return one + two + three; }",
+            "new.ts",
+        );
+        after_entity.structural_hash = Some("after-structure".to_string());
+        let before = vec![before_entity];
+        let after = vec![after_entity];
+
+        let result = match_entities(&before, &after, "new.ts", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Moved);
+        assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.ts"));
+        assert_eq!(result.changes[0].structural_change, Some(true));
+    }
+
+    #[test]
+    fn test_moved_content_change_without_structural_hash_is_unknown_structurally() {
         let before = vec![make_entity(
             "old.ts::function::foo",
             "foo",
@@ -625,6 +672,7 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Moved);
         assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.ts"));
+        assert_eq!(result.changes[0].structural_change, None);
     }
 
     #[test]

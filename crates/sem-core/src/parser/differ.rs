@@ -156,9 +156,24 @@ pub fn compute_semantic_diff(
             ChangeType::Added => added_count += 1,
             ChangeType::Modified => modified_count += 1,
             ChangeType::Deleted => deleted_count += 1,
-            ChangeType::Moved => moved_count += 1,
-            ChangeType::Renamed => renamed_count += 1,
-            ChangeType::Reordered => reordered_count += 1,
+            ChangeType::Moved => {
+                moved_count += 1;
+                if c.has_content_change() {
+                    modified_count += 1;
+                }
+            }
+            ChangeType::Renamed => {
+                renamed_count += 1;
+                if c.has_content_change() {
+                    modified_count += 1;
+                }
+            }
+            ChangeType::Reordered => {
+                reordered_count += 1;
+                if c.has_content_change() {
+                    modified_count += 1;
+                }
+            }
         }
     }
 
@@ -723,10 +738,12 @@ mod tests {
 
         assert_eq!(result.added_count, 0);
         assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.modified_count, 1);
         assert_eq!(result.moved_count, 1);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].entity_name, "foo");
         assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.py"));
+        assert_eq!(result.changes[0].structural_change, Some(true));
     }
 
     #[test]

@@ -67,3 +67,12 @@ pub struct SemanticChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structural_change: Option<bool>,
 }
+
+impl SemanticChange {
+    pub fn has_content_change(&self) -> bool {
+        match (&self.before_content, &self.after_content) {
+            (Some(before), Some(after)) => before != after,
+            _ => false,
+        }
+    }
+}

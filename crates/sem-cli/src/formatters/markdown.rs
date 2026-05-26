@@ -37,8 +37,11 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                         "Δ"
                     }
                 }
+                ChangeType::Moved if change.has_content_change() => "→ Δ",
                 ChangeType::Moved => "→",
+                ChangeType::Renamed if change.has_content_change() => "↻ Δ",
                 ChangeType::Renamed => "↻",
+                ChangeType::Reordered if change.has_content_change() => "↕ Δ",
                 ChangeType::Reordered => "↕",
             };
 
@@ -77,7 +80,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                             post_table.push("```".to_string());
                         }
                     }
-                    ChangeType::Modified | ChangeType::Moved => {
+                    ChangeType::Modified | ChangeType::Moved | ChangeType::Renamed => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {

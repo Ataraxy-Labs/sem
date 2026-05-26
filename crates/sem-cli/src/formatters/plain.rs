@@ -26,8 +26,11 @@ pub fn format_plain(result: &DiffResult) -> String {
                 ChangeType::Added => "A".green().to_string(),
                 ChangeType::Modified => "M".yellow().to_string(),
                 ChangeType::Deleted => "D".red().to_string(),
+                ChangeType::Renamed if change.has_content_change() => "RM".cyan().to_string(),
                 ChangeType::Renamed => "R".cyan().to_string(),
+                ChangeType::Moved if change.has_content_change() => ">M".blue().to_string(),
                 ChangeType::Moved => ">".blue().to_string(),
+                ChangeType::Reordered if change.has_content_change() => "OM".magenta().to_string(),
                 ChangeType::Reordered => "O".magenta().to_string(),
             };
 

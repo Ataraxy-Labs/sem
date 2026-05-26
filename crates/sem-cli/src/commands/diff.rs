@@ -696,10 +696,10 @@ pub fn diff_command(mut opts: DiffOptions) {
         };
 
         // Determine scope from explicit flags, parsed args, or auto-detect
-        let (_scope, file_changes) = if let Some(ref sha) = opts.commit {
+        let file_changes = if let Some(ref sha) = opts.commit {
             let scope = DiffScope::Commit { sha: sha.clone() };
             match git.get_changed_files(&scope, &parsed.pathspecs) {
-                Ok(files) => (scope, files),
+                Ok(files) => files,
                 Err(e) => {
                     eprintln!("\x1b[31mError: {e}\x1b[0m");
                     process::exit(1);
@@ -711,30 +711,38 @@ pub fn diff_command(mut opts: DiffOptions) {
                 to: to.clone(),
             };
             match git.get_changed_files(&scope, &parsed.pathspecs) {
-                Ok(files) => (scope, files),
+                Ok(files) => files,
                 Err(e) => {
                     eprintln!("\x1b[31mError: {e}\x1b[0m");
                     process::exit(1);
                 }
             }
+        } else if let Some(ParsedScope::RefToWorking(refspec)) = parsed.scope.as_ref() {
+            if opts.staged {
+                // git diff --cached <ref> = compare ref to index
+                match git.get_staged_files_with_base_ref(refspec, &parsed.pathspecs) {
+                    Ok(files) => files,
+                    Err(e) => {
+                        eprintln!("\x1b[31mError: {e}\x1b[0m");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                let scope = DiffScope::RefToWorking {
+                    refspec: refspec.clone(),
+                };
+                match git.get_changed_files(&scope, &parsed.pathspecs) {
+                    Ok(files) => files,
+                    Err(e) => {
+                        eprintln!("\x1b[31mError: {e}\x1b[0m");
+                        process::exit(1);
+                    }
+                }
+            }
         } else if let Some(ref parsed_scope) = parsed.scope {
             // Use scope from positional args
             let scope = match parsed_scope {
-                ParsedScope::RefToWorking(refspec) => {
-                    if opts.staged {
-                        // git diff --cached <ref> = compare ref to index
-                        // We approximate this as Range from ref to HEAD (staged view)
-                        // For now, just use the ref as a range base
-                        DiffScope::Range {
-                            from: refspec.clone(),
-                            to: "HEAD".to_string(),
-                        }
-                    } else {
-                        DiffScope::RefToWorking {
-                            refspec: refspec.clone(),
-                        }
-                    }
-                }
+                ParsedScope::RefToWorking(_) => unreachable!(),
                 ParsedScope::Range(from, to) => DiffScope::Range {
                     from: from.clone(),
                     to: to.clone(),
@@ -754,7 +762,7 @@ pub fn diff_command(mut opts: DiffOptions) {
                 ParsedScope::FileCompare { .. } => unreachable!(),
             };
             match git.get_changed_files(&scope, &parsed.pathspecs) {
-                Ok(files) => (scope, files),
+                Ok(files) => files,
                 Err(e) => {
                     eprintln!("\x1b[31mError: {e}\x1b[0m");
                     process::exit(1);
@@ -763,7 +771,7 @@ pub fn diff_command(mut opts: DiffOptions) {
         } else if opts.staged {
             let scope = DiffScope::Staged;
             match git.get_changed_files(&scope, &parsed.pathspecs) {
-                Ok(files) => (scope, files),
+                Ok(files) => files,
                 Err(e) => {
                     eprintln!("\x1b[31mError: {e}\x1b[0m");
                     process::exit(1);
@@ -771,7 +779,7 @@ pub fn diff_command(mut opts: DiffOptions) {
             }
         } else {
             match git.detect_and_get_files(&parsed.pathspecs) {
-                Ok((scope, files)) => (scope, files),
+                Ok((_scope, files)) => files,
                 Err(e) => {
                     eprintln!("\x1b[31mError: {e}\x1b[0m");
                     process::exit(1);
@@ -888,9 +896,23 @@ fn run_diff_pipeline(
 }
 
 fn retain_non_cosmetic_changes(result: &mut DiffResult) {
+    // A move/rename/reorder that also carries a content change is a compound change:
+    // keep it visible under --no-cosmetics, but drop the purely cosmetic content payload.
+    for change in &mut result.changes {
+        if matches!(
+            change.change_type,
+            ChangeType::Moved | ChangeType::Renamed | ChangeType::Reordered
+        ) && change.has_content_change()
+            && change.structural_change == Some(false)
+        {
+            change.before_content = None;
+            change.after_content = None;
+        }
+    }
+    // Drop only purely cosmetic modifications; compound changes are preserved above.
     result
         .changes
-        .retain(|c| c.structural_change != Some(false));
+        .retain(|c| c.change_type != ChangeType::Modified || c.structural_change != Some(false));
     recalculate_diff_summary(result);
 }
 
