@@ -346,6 +346,10 @@ sem diff --format json
       "changeType": "added",
       "entityType": "function",
       "entityName": "validateToken",
+      "startLine": 12,
+      "endLine": 18,
+      "oldStartLine": null,
+      "oldEndLine": null,
       "filePath": "src/auth.ts"
     }
   ]

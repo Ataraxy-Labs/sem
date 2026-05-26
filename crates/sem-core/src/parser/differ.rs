@@ -367,62 +367,220 @@ fn detect_orphan_changes(
         .flat_map(|e| e.start_line..=e.end_line)
         .collect();
 
-    // Extract uncovered lines, preserving line numbers for context
-    let before_orphan: String = before_text
-        .lines()
-        .enumerate()
-        .filter(|(i, _)| !before_covered.contains(&(i + 1)))
-        .map(|(_, l)| l)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let after_orphan: String = after_text
-        .lines()
-        .enumerate()
-        .filter(|(i, _)| !after_covered.contains(&(i + 1)))
-        .map(|(_, l)| l)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let before_orphans = orphan_segments(before_text, &before_covered);
+    let after_orphans = orphan_segments(after_text, &after_covered);
+    let mut changes = Vec::new();
 
-    // Skip if orphan content is unchanged
-    if before_orphan == after_orphan {
-        return Vec::new();
+    for (before_idx, after_idx) in orphan_segment_change_pairs(&before_orphans, &after_orphans) {
+        let before_orphan = before_idx.and_then(|idx| before_orphans.get(idx));
+        let after_orphan = after_idx.and_then(|idx| after_orphans.get(idx));
+        let before_content = orphan_content(before_orphan);
+        let after_content = orphan_content(after_orphan);
+
+        // Skip if orphan content is unchanged, including blank-only segments.
+        if before_content == after_content {
+            continue;
+        }
+
+        let change_type = if before_content.is_none() {
+            ChangeType::Added
+        } else if after_content.is_none() {
+            ChangeType::Deleted
+        } else {
+            ChangeType::Modified
+        };
+
+        let current_orphan = match change_type {
+            ChangeType::Deleted => before_orphan,
+            _ => after_orphan.or(before_orphan),
+        };
+        let Some(current_orphan) = current_orphan else {
+            continue;
+        };
+        let span_label = if change_type == ChangeType::Deleted {
+            "oldL"
+        } else {
+            "L"
+        };
+        let orphan_id = format!(
+            "{}::orphan::{}@{}{}-{}",
+            file.file_path,
+            change_type,
+            span_label,
+            current_orphan.start_line,
+            current_orphan.end_line
+        );
+
+        changes.push(SemanticChange {
+            id: format!("change::{orphan_id}"),
+            entity_id: orphan_id,
+            change_type,
+            entity_type: "orphan".to_string(),
+            entity_name: "module-level".to_string(),
+            entity_line: current_orphan.start_line,
+            start_line: current_orphan.start_line,
+            end_line: current_orphan.end_line,
+            old_start_line: before_orphan.map(|orphan| orphan.start_line),
+            old_end_line: before_orphan.map(|orphan| orphan.end_line),
+            parent_name: None,
+            file_path: file.file_path.clone(),
+            old_entity_name: None,
+            old_file_path: None,
+            old_parent_id: None,
+            before_content: before_content.map(str::to_string),
+            after_content: after_content.map(str::to_string),
+            commit_sha: commit_sha.map(String::from),
+            author: author.map(String::from),
+            timestamp: None,
+            structural_change: Some(true),
+        });
     }
 
-    let change_type = if before_orphan.trim().is_empty() {
-        ChangeType::Added
-    } else if after_orphan.trim().is_empty() {
-        ChangeType::Deleted
-    } else {
-        ChangeType::Modified
-    };
+    changes
+}
 
-    vec![SemanticChange {
-        id: format!("{}::orphan", file.file_path),
-        entity_id: format!("{}::orphan", file.file_path),
-        change_type,
-        entity_type: "orphan".to_string(),
-        entity_name: "module-level".to_string(),
-        entity_line: 0,
-        parent_name: None,
-        file_path: file.file_path.clone(),
-        old_entity_name: None,
-        old_file_path: None,
-        old_parent_id: None,
-        before_content: if before_orphan.is_empty() {
-            None
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrphanSegment {
+    start_line: usize,
+    end_line: usize,
+    content: String,
+}
+
+fn orphan_segments(text: &str, covered_lines: &HashSet<usize>) -> Vec<OrphanSegment> {
+    let mut segments = Vec::new();
+    let mut current_start: Option<usize> = None;
+    let mut current_lines: Vec<&str> = Vec::new();
+    let mut last_line_number = 0;
+
+    for (i, line) in text.lines().enumerate() {
+        let line_number = i + 1;
+        last_line_number = line_number;
+        if covered_lines.contains(&line_number) {
+            if let Some(start_line) = current_start.take() {
+                segments.push(OrphanSegment {
+                    start_line,
+                    end_line: line_number - 1,
+                    content: current_lines.join("\n"),
+                });
+                current_lines.clear();
+            }
+            continue;
+        }
+
+        current_start.get_or_insert(line_number);
+        current_lines.push(line);
+    }
+
+    if let Some(start_line) = current_start {
+        segments.push(OrphanSegment {
+            start_line,
+            end_line: last_line_number.max(start_line),
+            content: current_lines.join("\n"),
+        });
+    }
+
+    segments
+}
+
+fn orphan_content(segment: Option<&OrphanSegment>) -> Option<&str> {
+    segment
+        .map(|segment| segment.content.as_str())
+        .filter(|content| !content.trim().is_empty())
+}
+
+fn orphan_segment_change_pairs(
+    before: &[OrphanSegment],
+    after: &[OrphanSegment],
+) -> Vec<(Option<usize>, Option<usize>)> {
+    let anchors = orphan_segment_lcs(before, after);
+    let mut pairs = Vec::new();
+    let mut before_start = 0;
+    let mut after_start = 0;
+
+    for (before_anchor, after_anchor) in anchors {
+        append_orphan_gap_pairs(
+            &mut pairs,
+            before_start,
+            before_anchor,
+            after_start,
+            after_anchor,
+        );
+        before_start = before_anchor + 1;
+        after_start = after_anchor + 1;
+    }
+
+    append_orphan_gap_pairs(
+        &mut pairs,
+        before_start,
+        before.len(),
+        after_start,
+        after.len(),
+    );
+
+    pairs
+}
+
+fn append_orphan_gap_pairs(
+    pairs: &mut Vec<(Option<usize>, Option<usize>)>,
+    before_start: usize,
+    before_end: usize,
+    after_start: usize,
+    after_end: usize,
+) {
+    let before_len = before_end.saturating_sub(before_start);
+    let after_len = after_end.saturating_sub(after_start);
+
+    if before_len == after_len {
+        for i in 0..before_len {
+            pairs.push((Some(before_start + i), Some(after_start + i)));
+        }
+        return;
+    }
+
+    for i in 0..before_len {
+        pairs.push((Some(before_start + i), None));
+    }
+    for i in 0..after_len {
+        pairs.push((None, Some(after_start + i)));
+    }
+}
+
+fn orphan_segment_lcs(before: &[OrphanSegment], after: &[OrphanSegment]) -> Vec<(usize, usize)> {
+    let mut dp = vec![vec![0; after.len() + 1]; before.len() + 1];
+
+    for i in (0..before.len()).rev() {
+        for j in (0..after.len()).rev() {
+            dp[i][j] = if orphan_segments_equal(&before[i], &after[j]) {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut anchors = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    while i < before.len() && j < after.len() {
+        if orphan_segments_equal(&before[i], &after[j]) {
+            anchors.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
         } else {
-            Some(before_orphan)
-        },
-        after_content: if after_orphan.is_empty() {
-            None
-        } else {
-            Some(after_orphan)
-        },
-        commit_sha: commit_sha.map(String::from),
-        author: author.map(String::from),
-        timestamp: None,
-        structural_change: Some(true),
-    }]
+            j += 1;
+        }
+    }
+
+    anchors
+}
+
+fn orphan_segments_equal(before: &OrphanSegment, after: &OrphanSegment) -> bool {
+    match (orphan_content(Some(before)), orphan_content(Some(after))) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +609,22 @@ mod tests {
         }
     }
 
+    fn entity_span(id: &str, start_line: usize, end_line: usize) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: "a.rs".to_string(),
+            entity_type: "function".to_string(),
+            name: id.to_string(),
+            parent_id: None,
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line,
+            end_line,
+            metadata: None,
+        }
+    }
+
     #[test]
     fn orphan_only_change_counts_file_and_orphan() {
         let before = "# old module comment\n\ndef value():\n    return 1\n";
@@ -467,7 +641,10 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.file_count, 1);
         assert_eq!(result.orphan_count, 1);
-        assert_eq!(result.modified_count, 0);
+        // A changed comment is a Modified orphan, and orphan changes are counted
+        // in their change-type bucket as well as orphan_count.
+        assert_eq!(result.modified_count, 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
         assert_eq!(result.changes[0].entity_type, "orphan");
     }
 
@@ -615,5 +792,97 @@ mod tests {
             + result.renamed_count
             + result.reordered_count;
         assert_eq!(named_bucket_total, result.changes.len());
+    }
+
+    #[test]
+    fn orphan_changes_use_contiguous_line_spans() {
+        let file = modified_file(
+            "a.rs",
+            "use alpha;\nfn foo() {}\nuse beta;\nfn bar() {}\n",
+            "use gamma;\nfn foo() {}\nuse delta;\nfn bar() {}\n",
+        );
+        let entities = vec![entity_span("foo", 2, 2), entity_span("bar", 4, 4)];
+
+        let changes = detect_orphan_changes(&file, &entities, &entities, None, None);
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].start_line, 1);
+        assert_eq!(changes[0].end_line, 1);
+        assert_eq!(changes[0].old_start_line, Some(1));
+        assert_eq!(changes[0].old_end_line, Some(1));
+        assert_eq!(changes[0].before_content.as_deref(), Some("use alpha;"));
+        assert_eq!(changes[0].after_content.as_deref(), Some("use gamma;"));
+        assert_eq!(changes[1].start_line, 3);
+        assert_eq!(changes[1].end_line, 3);
+        assert_eq!(changes[1].old_start_line, Some(3));
+        assert_eq!(changes[1].old_end_line, Some(3));
+        assert_eq!(changes[1].before_content.as_deref(), Some("use beta;"));
+        assert_eq!(changes[1].after_content.as_deref(), Some("use delta;"));
+    }
+
+    #[test]
+    fn blank_only_orphan_segments_are_ignored() {
+        let file = modified_file("a.rs", "fn foo() {}\n", "\nfn foo() {}\n");
+        let before_entities = vec![entity_span("foo", 1, 1)];
+        let after_entities = vec![entity_span("foo", 2, 2)];
+
+        let changes =
+            detect_orphan_changes(&file, &before_entities, &after_entities, None, None);
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn inserted_orphan_segment_does_not_modify_unchanged_later_segment() {
+        let file = modified_file(
+            "a.rs",
+            "fn foo() {}\nuse a;\nfn bar() {}\n",
+            "use x;\nfn foo() {}\nuse a;\nfn bar() {}\n",
+        );
+        let before_entities = vec![entity_span("foo", 1, 1), entity_span("bar", 3, 3)];
+        let after_entities = vec![entity_span("foo", 2, 2), entity_span("bar", 4, 4)];
+
+        let changes =
+            detect_orphan_changes(&file, &before_entities, &after_entities, None, None);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, ChangeType::Added);
+        assert_eq!(changes[0].start_line, 1);
+        assert_eq!(changes[0].end_line, 1);
+        assert!(changes[0].old_start_line.is_none());
+        assert_eq!(changes[0].before_content, None);
+        assert_eq!(changes[0].after_content.as_deref(), Some("use x;"));
+    }
+
+    #[test]
+    fn uneven_orphan_gaps_are_not_forced_into_modifications() {
+        let file = modified_file(
+            "a.rs",
+            "use a;\nfn foo() {}\nuse old;\nfn mid() {}\nuse c;\nfn bar() {}\n",
+            "use a;\nfn foo() {}\nuse new1;\nfn mid() {}\nuse new2;\nfn baz() {}\nuse c;\nfn bar() {}\n",
+        );
+        let before_entities = vec![
+            entity_span("foo", 2, 2),
+            entity_span("mid", 4, 4),
+            entity_span("bar", 6, 6),
+        ];
+        let after_entities = vec![
+            entity_span("foo", 2, 2),
+            entity_span("mid", 4, 4),
+            entity_span("baz", 6, 6),
+            entity_span("bar", 8, 8),
+        ];
+
+        let changes =
+            detect_orphan_changes(&file, &before_entities, &after_entities, None, None);
+
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].change_type, ChangeType::Deleted);
+        assert!(changes[0].entity_id.contains("::deleted@oldL3-3"));
+        assert_eq!(changes[0].before_content.as_deref(), Some("use old;"));
+        assert_eq!(changes[1].change_type, ChangeType::Added);
+        assert_eq!(changes[1].after_content.as_deref(), Some("use new1;"));
+        assert_eq!(changes[2].change_type, ChangeType::Added);
+        assert_eq!(changes[2].after_content.as_deref(), Some("use new2;"));
     }
 }
