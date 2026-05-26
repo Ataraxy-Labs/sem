@@ -147,6 +147,10 @@ enum Commands {
         /// Skip the SQLite entity cache (rebuild from scratch)
         #[arg(long)]
         no_cache: bool,
+
+        /// Include directories and generated files that are excluded by default
+        #[arg(long)]
+        no_default_excludes: bool,
     },
     /// Show the full entity dependency graph
     Graph {
@@ -170,7 +174,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories that are excluded by default (fixtures, vendor, node_modules, etc.)
+        /// Include directories and generated files that are excluded by default
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -227,6 +231,10 @@ enum Commands {
         /// Output as JSON (shorthand for --format json)
         #[arg(long)]
         json: bool,
+
+        /// Include directories and generated files that are excluded by default
+        #[arg(long)]
+        no_default_excludes: bool,
     },
     /// Show token-budgeted context for an entity
     Context {
@@ -261,6 +269,10 @@ enum Commands {
         /// Skip the SQLite entity cache (rebuild from scratch)
         #[arg(long)]
         no_cache: bool,
+
+        /// Include directories and generated files that are excluded by default
+        #[arg(long)]
+        no_default_excludes: bool,
     },
     /// Verify function call arity across the codebase
     Verify {
@@ -279,6 +291,10 @@ enum Commands {
         /// Only include files with these extensions (e.g. --file-exts .py .rs)
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
+
+        /// Include directories and generated files that are excluded by default
+        #[arg(long)]
+        no_default_excludes: bool,
     },
     /// Show lifetime diff statistics
     Stats,
@@ -411,6 +427,7 @@ fn main() {
             file_exts,
             depth,
             no_cache,
+            no_default_excludes,
         }) => {
             let mode = if deps {
                 ImpactMode::Deps
@@ -435,6 +452,7 @@ fn main() {
                 mode,
                 depth,
                 no_cache,
+                no_default_excludes,
             });
         }
         Some(Commands::Log {
@@ -457,7 +475,12 @@ fn main() {
                 verbose,
             });
         }
-        Some(Commands::Entities { path, format, json }) => {
+        Some(Commands::Entities {
+            path,
+            format,
+            json,
+            no_default_excludes,
+        }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
                     .unwrap_or_default()
@@ -465,6 +488,7 @@ fn main() {
                     .to_string(),
                 path,
                 json: resolve_json(format, json),
+                no_default_excludes,
             });
         }
         Some(Commands::Context {
@@ -476,6 +500,7 @@ fn main() {
             json,
             file_exts,
             no_cache,
+            no_default_excludes,
         }) => {
             context_command(ContextOptions {
                 cwd: std::env::current_dir()
@@ -489,6 +514,7 @@ fn main() {
                 json: resolve_json(format, json),
                 file_exts,
                 no_cache,
+                no_default_excludes,
             });
         }
         Some(Commands::Verify {
@@ -496,6 +522,7 @@ fn main() {
             json,
             diff,
             file_exts,
+            no_default_excludes,
         }) => {
             verify_command(VerifyOptions {
                 cwd: std::env::current_dir()
@@ -505,6 +532,7 @@ fn main() {
                 json: resolve_json(format, json),
                 diff,
                 file_exts,
+                no_default_excludes,
             });
         }
         Some(Commands::Stats) => {

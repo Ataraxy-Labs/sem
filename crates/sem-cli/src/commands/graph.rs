@@ -24,7 +24,8 @@ pub fn graph_command(opts: GraphOptions) {
     let root = root.as_path();
     let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = normalize_exts(&opts.file_exts);
-    let file_paths = find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
+    let file_paths =
+        find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
     let (graph, _entities) = get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     if opts.json {
@@ -55,90 +56,36 @@ pub fn normalize_exts(exts: &[String]) -> Vec<String> {
 }
 
 /// Find all supported files in the repo (public for use by other commands).
-pub fn find_supported_files_public(root: &Path, registry: &ParserRegistry, ext_filter: &[String]) -> Vec<String> {
-    find_supported_files_inner(root, registry, ext_filter, false)
+pub fn find_supported_files_public(
+    root: &Path,
+    registry: &ParserRegistry,
+    ext_filter: &[String],
+) -> Vec<String> {
+    find_supported_files_with_options(root, registry, ext_filter, false)
 }
 
-/// File names that are always excluded from graph/index (lockfiles, generated content).
-const DEFAULT_EXCLUDED_FILES: &[&str] = &[
-    "Cargo.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "Gemfile.lock",
-    "Pipfile.lock",
-    "poetry.lock",
-    "composer.lock",
-    "go.sum",
-    "flake.lock",
-];
-
-/// Directory names that are always excluded from graph/index (fixtures, benchmarks, vendor).
-const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
-    "fixtures",
-    "fixture",
-    "benchmarks",
-    "vendor",
-    "node_modules",
-    "test-harness",
-];
-
-fn is_default_excluded(rel_path: &str) -> bool {
-    // Check file name
-    if let Some(file_name) = rel_path.rsplit('/').next() {
-        if DEFAULT_EXCLUDED_FILES.contains(&file_name) {
-            return true;
-        }
-    }
-    // Check directory components
-    for component in rel_path.split('/') {
-        if DEFAULT_EXCLUDED_DIRS.contains(&component) {
-            return true;
-        }
-    }
-    false
+pub fn find_supported_files_with_options(
+    root: &Path,
+    registry: &ParserRegistry,
+    ext_filter: &[String],
+    no_default_excludes: bool,
+) -> Vec<String> {
+    super::files::find_supported_files_in_path(
+        root,
+        root,
+        registry,
+        ext_filter,
+        no_default_excludes,
+    )
 }
 
-fn find_supported_files_inner(root: &Path, registry: &ParserRegistry, ext_filter: &[String], no_default_excludes: bool) -> Vec<String> {
-    let mut files = Vec::new();
-
-    // Use the `ignore` crate to walk the filesystem respecting .gitignore and .semignore
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(true)       // skip hidden files/dirs
-        .git_ignore(true)   // respect .gitignore
-        .git_global(true)   // respect global gitignore
-        .git_exclude(true); // respect .git/info/exclude
-
-    // Respect .semignore if present
-    let semignore = root.join(".semignore");
-    if semignore.exists() {
-        builder.add_ignore(semignore);
-    }
-
-    let walker = builder.build();
-
-    for entry in walker.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(rel) = path.strip_prefix(root) {
-            let rel_str = rel.to_string_lossy().to_string();
-            if !no_default_excludes && is_default_excluded(&rel_str) {
-                continue;
-            }
-            if !ext_filter.is_empty() && !ext_filter.iter().any(|ext| rel_str.ends_with(ext.as_str())) {
-                continue;
-            }
-            if registry.get_plugin(&rel_str).is_some() {
-                files.push(rel_str);
-            }
-        }
-    }
-
-    files.sort();
-    files
+fn find_supported_files_inner(
+    root: &Path,
+    registry: &ParserRegistry,
+    ext_filter: &[String],
+    no_default_excludes: bool,
+) -> Vec<String> {
+    find_supported_files_with_options(root, registry, ext_filter, no_default_excludes)
 }
 
 /// Build the entity graph + entities, using the disk cache when possible.

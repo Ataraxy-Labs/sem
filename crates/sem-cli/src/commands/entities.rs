@@ -9,6 +9,7 @@ pub struct EntitiesOptions {
     pub cwd: String,
     pub path: Option<String>,
     pub json: bool,
+    pub no_default_excludes: bool,
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
@@ -31,7 +32,13 @@ pub fn entities_command(opts: EntitiesOptions) {
             false,
         )
     } else if full_path.is_dir() {
-        let file_paths = find_supported_files_in_path(root, &full_path, &registry);
+        let file_paths = super::files::find_supported_files_in_path(
+            root,
+            &full_path,
+            &registry,
+            &[],
+            opts.no_default_excludes,
+        );
         (extract_files_entities(root, &file_paths, &registry), true)
     } else {
         eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
@@ -70,77 +77,25 @@ fn resolve_path(root: &Path, path_arg: &str) -> (String, PathBuf) {
     (label, full_path)
 }
 
-fn find_supported_files_in_path(
-    root: &Path,
-    scan_path: &Path,
-    registry: &ParserRegistry,
-) -> Vec<String> {
-    let mut files = Vec::new();
-    let walker = ignore::WalkBuilder::new(scan_path)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                eprintln!(
-                    "{} Cannot walk '{}': {}",
-                    "error:".red().bold(),
-                    scan_path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        };
-
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let file_path = file_path_for_entity(root, path);
-        if registry.get_plugin(&file_path).is_some() {
-            files.push(file_path);
-        }
-    }
-
-    files.sort();
-    files
-}
-
 fn extract_files_entities(
     root: &Path,
     file_paths: &[String],
     registry: &ParserRegistry,
 ) -> Vec<SemanticEntity> {
-    let mut entities = Vec::new();
-    for file_path in file_paths {
-        match extract_file_entities(&root.join(file_path), registry, file_path) {
-            Ok(new_ents) => entities.extend(new_ents),
-            Err(e) => {
-                eprintln!(
-                    "{} Cannot read '{}': {}",
-                    "warning:".yellow().bold(),
-                    file_path,
-                    e
-                );
-            }
-        }
-    }
+    let mut entities = registry.extract_all_entities(root, file_paths);
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.entity_type.cmp(&b.entity_type))
+            .then(a.name.cmp(&b.name))
+    });
     entities
 }
 
 fn file_path_for_entity(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .ok()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
+    super::files::file_path_for_entity(root, path)
 }
 
 fn extract_file_entities(

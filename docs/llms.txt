@@ -57,6 +57,7 @@ sem graph
 sem graph --entity validateToken
 sem graph --file-exts .py
 sem graph --format json
+sem graph --no-default-excludes
 ```
 
 ### sem impact
@@ -66,6 +67,7 @@ Transitive impact analysis. If this entity changes, what else is affected? BFS t
 sem impact validateToken
 sem impact validateToken --json
 sem impact validateToken --file-exts .py
+sem impact validateToken --no-default-excludes
 ```
 
 ## Key Features
