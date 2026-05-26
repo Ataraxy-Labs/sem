@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 use crate::cache;
 use crate::tools::*;
 
+const MCP_INSTRUCTIONS: &str = "sem MCP server for entity-level semantic code intelligence. \
+                                6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context.";
+
 /// Lazily-initialized repo context.
 struct RepoContext {
     git: GitBridge,
@@ -907,10 +910,8 @@ impl SemServer {
 #[tool_handler]
 impl ServerHandler for SemServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "sem MCP server for entity-level semantic code intelligence. \
-             6 tools: entities, diff, blame, impact, log, context.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(MCP_INSTRUCTIONS)
     }
 }
 
@@ -929,6 +930,15 @@ mod tests {
         let err = SemServer::find_supported_files(&missing_root, &registry).unwrap_err();
 
         assert!(err.contains("Failed to read directory"));
+    }
+
+    #[test]
+    fn get_info_instructions_reference_registered_tool_names() {
+        let info = SemServer::new().get_info();
+
+        assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
+        assert!(MCP_INSTRUCTIONS.contains("sem_entities"));
+        assert!(!MCP_INSTRUCTIONS.contains("tools: entities"));
     }
 }
 
