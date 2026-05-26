@@ -138,6 +138,25 @@ fn path_matches_spec(file_path: &str, spec: &str) -> bool {
     }
 }
 
+fn file_change_matches_spec(file_change: &FileChange, spec: &str) -> bool {
+    path_matches_spec(&file_change.file_path, spec)
+        || file_change
+            .old_file_path
+            .as_ref()
+            .is_some_and(|old_path| path_matches_spec(old_path, spec))
+}
+
+fn parse_patch_pathspecs(args: Vec<String>) -> Vec<String> {
+    let (before_separator, after_separator) = split_on_separator(args);
+    // In --patch mode stdin supplies the diff scope, so positional args are filters.
+    // If `--` is present, follow git-style pathspec separation and use the right side.
+    if after_separator.is_empty() {
+        before_separator
+    } else {
+        after_separator
+    }
+}
+
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
 
@@ -252,7 +271,84 @@ fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
 
 /// Parse a unified diff (e.g. from `git diff`) into FileChange entries.
 /// Uses blob SHAs from `index` lines to retrieve full file contents via `git show`.
-fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
+#[derive(Debug, PartialEq, Eq)]
+enum PatchParseError {
+    EmptyInput,
+    NoRecognizableHunks,
+}
+
+impl PatchParseError {
+    fn message(&self) -> &'static str {
+        match self {
+            PatchParseError::EmptyInput => "no input on stdin (use --patch < file.diff)",
+            PatchParseError::NoRecognizableHunks => {
+                "no recognizable diff hunks in stdin (expected 'diff --git' headers and '@@ ... @@' hunk markers)"
+            }
+        }
+    }
+}
+
+fn is_unified_hunk_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("@@ ") else {
+        return false;
+    };
+    let Some((ranges, _context)) = rest.split_once(" @@") else {
+        return false;
+    };
+
+    let mut parts = ranges.split_whitespace();
+    let old_range = parts.next();
+    let new_range = parts.next();
+
+    matches!(
+        (old_range, new_range, parts.next()),
+        (Some(old), Some(new), None)
+            if is_hunk_range(old, '-') && is_hunk_range(new, '+')
+    )
+}
+
+fn is_hunk_range(range: &str, prefix: char) -> bool {
+    let Some(rest) = range.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut parts = rest.split(',');
+    let Some(start) = parts.next() else {
+        return false;
+    };
+    let count = parts.next();
+
+    parts.next().is_none()
+        && !start.is_empty()
+        && start.chars().all(|c| c.is_ascii_digit())
+        && count.map_or(true, |c| {
+            !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit())
+        })
+}
+
+fn is_binary_files_marker(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Binary files ") else {
+        return false;
+    };
+    let Some(paths) = rest.strip_suffix(" differ") else {
+        return false;
+    };
+    let Some((old, new)) = paths.split_once(" and ") else {
+        return false;
+    };
+
+    (old == "/dev/null" || old.starts_with("a/")) && (new == "/dev/null" || new.starts_with("b/"))
+}
+
+fn is_git_binary_payload_line(line: &str) -> bool {
+    !line.trim().is_empty()
+        && !line.starts_with("@@")
+        && !line.starts_with("diff --git ")
+        && !line.starts_with("index ")
+        && !line.starts_with("--- ")
+        && !line.starts_with("+++ ")
+}
+
+fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchParseError> {
     use sem_core::git::types::FileStatus;
 
     struct PatchEntry {
@@ -261,16 +357,51 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
         status: FileStatus,
         old_sha: Option<String>,
         new_sha: Option<String>,
+        has_valid_hunk: bool,
+        has_malformed_hunk: bool,
+        has_index: bool,
+        has_new_file_mode: bool,
+        has_deleted_file_mode: bool,
+        has_old_mode: bool,
+        has_new_mode: bool,
+        has_rename_from: bool,
+        has_rename_to: bool,
+        has_binary_marker: bool,
+        has_git_binary_patch: bool,
+        awaiting_git_binary_payload: bool,
+        has_git_binary_payload: bool,
+        has_invalid_git_binary_patch: bool,
+    }
+
+    if patch.trim().is_empty() {
+        return Err(PatchParseError::EmptyInput);
     }
 
     let mut entries: Vec<PatchEntry> = Vec::new();
     let mut current: Option<PatchEntry> = None;
+    let mut valid_hunk_count = 0usize;
+    let mut malformed_hunk_count = 0usize;
+    let has_complete_hunkless_metadata = |entry: &PatchEntry| {
+        (entry.has_rename_from && entry.has_rename_to)
+            || (entry.has_old_mode && entry.has_new_mode)
+            || ((entry.has_new_file_mode || entry.has_deleted_file_mode) && entry.has_index)
+            || (entry.has_index
+                && (entry.has_binary_marker
+                    || (entry.has_git_binary_patch
+                        && entry.has_git_binary_payload
+                        && !entry.awaiting_git_binary_payload
+                        && !entry.has_invalid_git_binary_patch)))
+    };
 
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("diff --git a/") {
             // Flush previous entry
             if let Some(entry) = current.take() {
-                entries.push(entry);
+                if entry.has_valid_hunk
+                    || (!entry.has_malformed_hunk && has_complete_hunkless_metadata(&entry))
+                {
+                    entries.push(entry);
+                }
             }
             // Parse "a/path b/path" — the b-side path is after the last " b/"
             let file_path = if let Some(pos) = rest.rfind(" b/") {
@@ -284,19 +415,59 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
                 status: FileStatus::Modified,
                 old_sha: None,
                 new_sha: None,
+                has_valid_hunk: false,
+                has_malformed_hunk: false,
+                has_index: false,
+                has_new_file_mode: false,
+                has_deleted_file_mode: false,
+                has_old_mode: false,
+                has_new_mode: false,
+                has_rename_from: false,
+                has_rename_to: false,
+                has_binary_marker: false,
+                has_git_binary_patch: false,
+                awaiting_git_binary_payload: false,
+                has_git_binary_payload: false,
+                has_invalid_git_binary_patch: false,
             });
         } else if let Some(ref mut entry) = current {
-            if line.starts_with("new file mode") {
+            let is_git_binary_chunk_header =
+                line.starts_with("literal ") || line.starts_with("delta ");
+
+            if entry.awaiting_git_binary_payload {
+                if is_git_binary_payload_line(line) && !is_git_binary_chunk_header {
+                    entry.awaiting_git_binary_payload = false;
+                    entry.has_git_binary_payload = true;
+                } else if !line.trim().is_empty() {
+                    entry.awaiting_git_binary_payload = false;
+                    entry.has_invalid_git_binary_patch = true;
+                }
+            } else if line.starts_with("new file mode") {
                 entry.status = FileStatus::Added;
+                entry.has_new_file_mode = true;
             } else if line.starts_with("deleted file mode") {
                 entry.status = FileStatus::Deleted;
+                entry.has_deleted_file_mode = true;
+            } else if line.starts_with("old mode") {
+                entry.has_old_mode = true;
+            } else if line.starts_with("new mode") {
+                entry.has_new_mode = true;
+            } else if is_binary_files_marker(line) {
+                entry.has_binary_marker = true;
+            } else if line.starts_with("GIT binary patch") {
+                entry.has_git_binary_patch = true;
+            } else if entry.has_git_binary_patch && is_git_binary_chunk_header {
+                entry.awaiting_git_binary_payload = true;
             } else if let Some(rest) = line.strip_prefix("rename from ") {
                 entry.old_file_path = Some(rest.to_string());
                 entry.status = FileStatus::Renamed;
+                entry.has_rename_from = true;
             } else if let Some(rest) = line.strip_prefix("rename to ") {
                 entry.file_path = rest.to_string();
+                entry.has_rename_to = true;
             } else if let Some(rest) = line.strip_prefix("index ") {
                 // "index abc123..def456 100644" or "index abc123..def456"
+                entry.has_index = true;
                 let shas_part = rest.split_whitespace().next().unwrap_or("");
                 if let Some((old, new)) = shas_part.split_once("..") {
                     if old != "0000000" && !old.chars().all(|c| c == '0') {
@@ -306,11 +477,33 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
                         entry.new_sha = Some(new.to_string());
                     }
                 }
+            } else if line.starts_with("@@") {
+                if is_unified_hunk_header(line) {
+                    entry.has_valid_hunk = true;
+                    valid_hunk_count += 1;
+                } else {
+                    malformed_hunk_count += 1;
+                    entry.has_malformed_hunk = true;
+                    eprintln!(
+                        "warning: malformed hunk header in {}: '{}' (expected '@@ -N,M +N,M @@')",
+                        entry.file_path, line
+                    );
+                }
             }
         }
     }
     if let Some(entry) = current.take() {
-        entries.push(entry);
+        if entry.has_valid_hunk
+            || (!entry.has_malformed_hunk && has_complete_hunkless_metadata(&entry))
+        {
+            entries.push(entry);
+        }
+    }
+
+    // Malformed hunk headers are recognizable diff structure: warn above, then
+    // proceed with any other parsed entries. If none parsed, the empty diff is intentional.
+    if entries.is_empty() && valid_hunk_count == 0 && malformed_hunk_count == 0 {
+        return Err(PatchParseError::NoRecognizableHunks);
     }
 
     // Resolve blob contents via git show
@@ -327,7 +520,7 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
         }
     };
 
-    entries
+    Ok(entries
         .into_iter()
         .map(|e| {
             let before_content = e.old_sha.as_deref().and_then(&git_show);
@@ -356,14 +549,22 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
                 after_content,
             }
         })
-        .collect()
+        .collect())
 }
 
 pub fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
 
     let t0 = Instant::now();
-    let mut parsed = parse_args(std::mem::take(&mut opts.args), &opts.cwd);
+    let raw_args = std::mem::take(&mut opts.args);
+    let mut parsed = if opts.patch {
+        ParsedArgs {
+            scope: None,
+            pathspecs: parse_patch_pathspecs(raw_args),
+        }
+    } else {
+        parse_args(raw_args, &opts.cwd)
+    };
 
     // Resolve jj revsets to git SHAs if we're in a jj repo
     let root = Path::new(&opts.cwd);
@@ -468,7 +669,10 @@ pub fn diff_command(mut opts: DiffOptions) {
                 eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
                 process::exit(1);
             });
-        let changes = parse_unified_diff(&input, &opts.cwd);
+        let changes = parse_unified_diff(&input, &opts.cwd).unwrap_or_else(|e| {
+            eprintln!("error: {}", e.message());
+            process::exit(1);
+        });
         let changes = if parsed.pathspecs.is_empty() {
             changes
         } else {
@@ -476,7 +680,7 @@ pub fn diff_command(mut opts: DiffOptions) {
                 .into_iter()
                 .filter(|fc| {
                     parsed.pathspecs.iter().any(|spec| {
-                        path_matches_spec(&fc.file_path, spec)
+                        file_change_matches_spec(fc, spec)
                     })
                 })
                 .collect()
@@ -738,7 +942,7 @@ mod tests {
     use sem_core::model::change::{ChangeType, SemanticChange};
     use serde_json::json;
 
-    use super::{retain_non_cosmetic_changes, DiffResult};
+    use super::*;
 
     fn change(
         file_path: &str,
@@ -807,5 +1011,141 @@ mod tests {
         assert_eq!(result.renamed_count, 0);
         assert_eq!(result.reordered_count, 0);
         assert_eq!(result.orphan_count, 1);
+    }
+
+    #[test]
+    fn hunk_header_validation_accepts_git_forms() {
+        assert!(is_unified_hunk_header("@@ -1 +1 @@"));
+        assert!(is_unified_hunk_header("@@ -1,2 +3,4 @@"));
+        assert!(is_unified_hunk_header("@@ -0,0 +1,4 @@ function_name"));
+
+        assert!(!is_unified_hunk_header("@@ NOTAHUNK @@"));
+        assert!(!is_unified_hunk_header("@@ -1 +1@@"));
+        assert!(!is_unified_hunk_header("@@ -1, +1 @@"));
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_empty_input() {
+        assert_eq!(
+            parse_unified_diff("", ".").unwrap_err(),
+            PatchParseError::EmptyInput
+        );
+        assert_eq!(
+            parse_unified_diff("\n\t ", ".").unwrap_err(),
+            PatchParseError::EmptyInput
+        );
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_non_diff_input() {
+        assert_eq!(
+            parse_unified_diff("this is not a diff\n", ".").unwrap_err(),
+            PatchParseError::NoRecognizableHunks
+        );
+        assert_eq!(
+            parse_unified_diff("diff --git a/a.ts b/a.ts\n", ".").unwrap_err(),
+            PatchParseError::NoRecognizableHunks
+        );
+    }
+
+    #[test]
+    fn parse_unified_diff_drops_malformed_hunks_before_content_resolution() {
+        let patch = "diff --git a/a.ts b/a.ts\n\
+                     --- a/a.ts\n\
+                     +++ b/a.ts\n\
+                     @@ NOTAHUNK @@\n\
+                     -foo\n\
+                     +bar\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn parse_unified_diff_keeps_entries_with_valid_hunks() {
+        let patch = "diff --git a/a.ts b/a.ts\n\
+                     --- a/a.ts\n\
+                     +++ b/a.ts\n\
+                     @@ -1 +1 @@\n\
+                     -foo\n\
+                     +bar\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "a.ts");
+    }
+
+    #[test]
+    fn parse_unified_diff_accepts_hunkless_metadata_patches() {
+        let patch = "diff --git a/old.py b/new.py\n\
+                     similarity index 100%\n\
+                     rename from old.py\n\
+                     rename to new.py\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].old_file_path.as_deref(), Some("old.py"));
+        assert_eq!(changes[0].file_path, "new.py");
+        assert_eq!(changes[0].status, sem_core::git::types::FileStatus::Renamed);
+    }
+
+    #[test]
+    fn parse_unified_diff_accepts_complete_git_binary_patches() {
+        let patch = "diff --git a/blob.bin b/blob.bin\n\
+                     index 1111111..2222222 100644\n\
+                     GIT binary patch\n\
+                     literal 0\n\
+                     HcmV?d00001\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "blob.bin");
+    }
+
+    #[test]
+    fn parse_unified_diff_accepts_multiple_complete_git_binary_chunks() {
+        let patch = "diff --git a/blob.bin b/blob.bin\n\
+                     index 1111111..2222222 100644\n\
+                     GIT binary patch\n\
+                     literal 1\n\
+                     abc\n\
+                     delta 1\n\
+                     def\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "blob.bin");
+    }
+
+    #[test]
+    fn parse_unified_diff_accepts_complete_binary_files_markers() {
+        let patch = "diff --git a/blob.bin b/blob.bin\n\
+                     index 1111111..2222222 100644\n\
+                     Binary files a/blob.bin and b/blob.bin differ\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "blob.bin");
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_incomplete_metadata_patches() {
+        for patch in [
+            "diff --git a/a.ts b/a.ts\nnew file mode 100644\n",
+            "diff --git a/old.py b/new.py\nrename from old.py\n",
+            "diff --git a/a.ts b/a.ts\nindex 1111111..2222222 100644\n--- a/a.ts\n+++ b/a.ts\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nBinary files differ\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nBinary files  and  differ\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nBinary files old.bin and new.bin differ\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\n@@ -1 +1 @@\n",
+            "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\nabc\ndelta 1\n",
+        ] {
+            assert_eq!(
+                parse_unified_diff(patch, ".").unwrap_err(),
+                PatchParseError::NoRecognizableHunks
+            );
+        }
     }
 }
