@@ -452,6 +452,26 @@ mod tests {
     }
 
     #[test]
+    fn orphan_only_change_counts_file_and_orphan() {
+        let before = "# old module comment\n\ndef value():\n    return 1\n";
+        let after = "# new module comment\n\ndef value():\n    return 1\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("app.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.file_count, 1);
+        assert_eq!(result.orphan_count, 1);
+        assert_eq!(result.modified_count, 0);
+        assert_eq!(result.changes[0].entity_type, "orphan");
+    }
+
+    #[test]
     fn test_parent_suppressed_when_only_child_modified() {
         let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
         let after  = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
