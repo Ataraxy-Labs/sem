@@ -28,8 +28,36 @@ macro_rules! maybe_par_iter {
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
+use crate::parser::import_resolution::find_import_target;
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
+
+fn build_scope_consumed_words(
+    resolution_log: &[scope_resolve::ResolutionEntry],
+) -> HashMap<String, HashSet<String>> {
+    let mut consumed_by_entity: HashMap<String, HashSet<String>> = HashMap::new();
+    for entry in resolution_log {
+        let words = consumed_by_entity
+            .entry(entry.from_entity.clone())
+            .or_default();
+        add_scope_reference_words(words, &entry.reference);
+    }
+    consumed_by_entity
+}
+
+fn add_scope_reference_words(words: &mut HashSet<String>, reference: &str) {
+    let reference = reference.strip_suffix("()").unwrap_or(reference);
+    if let Some((receiver, member)) = reference.rsplit_once('.') {
+        if !receiver.is_empty() {
+            words.insert(receiver.to_string());
+        }
+        if !member.is_empty() {
+            words.insert(member.to_string());
+        }
+    } else if !reference.is_empty() {
+        words.insert(reference.to_string());
+    }
+}
 
 /// A reference from one entity to another.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +169,7 @@ impl EntityGraph {
         let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
         let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
         let mut class_entity_names: HashSet<&str> = HashSet::new();
+        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::new();
         let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
         let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
@@ -170,6 +199,7 @@ impl EntityGraph {
 
             if matches!(entity.entity_type.as_str(), "class" | "struct" | "interface" | "class_type") {
                 class_entity_names.insert(entity.name.as_str());
+                class_entity_files.insert((entity.name.as_str(), entity.file_path.as_str()));
             }
 
             id_to_name.insert(entity.id.as_str(), entity.name.as_str());
@@ -266,14 +296,12 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
-        let (scope_edges, scope_resolved_entities) = if has_scope_lang {
+        let (scope_edges, scope_consumed_words) = if has_scope_lang {
             let result = scope_resolve::resolve_with_scopes_full(root, file_paths, &all_entities, &entity_map, Some(parsed_files), Some(pre_built));
-            let resolved_entity_ids: HashSet<String> = result.edges.iter()
-                .map(|(from, _, _)| from.clone())
-                .collect();
-            (result.edges, resolved_entity_ids)
+            let consumed_words = build_scope_consumed_words(&result.resolution_log);
+            (result.edges, consumed_words)
         } else {
-            (vec![], HashSet::new())
+            (vec![], HashMap::new())
         };
 
         // Pass 2: Extract references in parallel, then resolve against symbol table
@@ -283,11 +311,6 @@ impl EntityGraph {
         // Skip entities from non-code file types (JSON, SQL, etc.) that can't produce edges
         let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
             .flat_map(|entity| {
-                // Skip entities already resolved by scope resolver
-                if scope_resolved_entities.contains(&entity.id) {
-                    return vec![];
-                }
-
                 // Skip entities from file types that don't have language configs
                 // (JSON, SQL, YAML, etc. — they extract entities but never produce reference edges)
                 let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
@@ -296,7 +319,10 @@ impl EntityGraph {
                 }
 
                 let mut entity_edges = Vec::new();
-                let mut consumed_words: HashSet<String> = HashSet::new();
+                let mut consumed_words = scope_consumed_words
+                    .get(&entity.id)
+                    .cloned()
+                    .unwrap_or_default();
 
                 // Strip comments/strings once, reuse for both dot-chain and bag-of-words
                 let stripped = strip_comments_and_strings(&entity.content);
@@ -305,6 +331,7 @@ impl EntityGraph {
                 let dot_chains = extract_dot_chains(&stripped);
 
                 for (receiver, member) in &dot_chains {
+                    let edge_count_before = entity_edges.len();
                     if *receiver == "self" || *receiver == "this" {
                         // self.B / this.B: resolve to sibling method in enclosing class
                         if let Some(class_name) = enclosing_class.get(entity.id.as_str()) {
@@ -322,7 +349,7 @@ impl EntityGraph {
                                 }
                             }
                         }
-                    } else if class_entity_names.contains(*receiver) {
+                    } else if class_entity_files.contains(&(*receiver, entity.file_path.as_str())) {
                         // ClassName.B: resolve to class member
                         if let Some(members) = class_members.get(*receiver) {
                             for (n, tid) in members {
@@ -339,7 +366,9 @@ impl EntityGraph {
                             }
                         }
                     }
-                    // Unresolved chains fall through to bag-of-words below
+                    if entity_edges.len() == edge_count_before {
+                        consumed_words.insert(member.to_string());
+                    }
                 }
 
                 // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
@@ -653,6 +682,11 @@ impl EntityGraph {
             .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
             .map(|e| e.name.as_str())
             .collect();
+        let class_entity_files: HashSet<(&str, &str)> = all_entities
+            .iter()
+            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
+            .map(|e| (e.name.as_str(), e.file_path.as_str()))
+            .collect();
 
         let id_to_name: HashMap<&str, &str> = all_entities
             .iter()
@@ -697,7 +731,7 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
-        let (scope_edges, scope_resolved_entities) = if has_scope_lang {
+        let (scope_edges, scope_consumed_words) = if has_scope_lang {
             // Pass pre-parsed stale-file trees; scope_resolve reads affected clean files from disk
             let resolve_set: HashSet<&str> = resolve_file_paths.iter().map(|s| s.as_str()).collect();
             let relevant_parsed: Vec<(String, String, tree_sitter::Tree)> = parsed_files
@@ -706,22 +740,16 @@ impl EntityGraph {
                 .collect();
             let pre = if relevant_parsed.is_empty() { None } else { Some(relevant_parsed) };
             let result = scope_resolve::resolve_with_scopes_full(root, &resolve_file_paths, &all_entities, &entity_map, pre, None);
-            let resolved_entity_ids: HashSet<String> = result.edges.iter()
-                .map(|(from, _, _)| from.clone())
-                .collect();
-            (result.edges, resolved_entity_ids)
+            let consumed_words = build_scope_consumed_words(&result.resolution_log);
+            (result.edges, consumed_words)
         } else {
-            (vec![], HashSet::new())
+            (vec![], HashMap::new())
         };
 
         // Resolve references only for entities in needs_resolution
         let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
             .filter(|e| needs_resolution.contains(e.id.as_str()))
             .flat_map(|entity| {
-                if scope_resolved_entities.contains(&entity.id) {
-                    return vec![];
-                }
-
                 // Skip entities from non-code file types (JSON, SQL, etc.)
                 let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
                 if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
@@ -729,7 +757,10 @@ impl EntityGraph {
                 }
 
                 let mut entity_edges = Vec::new();
-                let mut consumed_words: HashSet<String> = HashSet::new();
+                let mut consumed_words = scope_consumed_words
+                    .get(&entity.id)
+                    .cloned()
+                    .unwrap_or_default();
 
                 // Strip comments/strings once, reuse for both dot-chain and bag-of-words
                 let stripped = strip_comments_and_strings(&entity.content);
@@ -738,6 +769,7 @@ impl EntityGraph {
                 let dot_chains = extract_dot_chains(&stripped);
 
                 for (receiver, member) in &dot_chains {
+                    let edge_count_before = entity_edges.len();
                     if *receiver == "self" || *receiver == "this" {
                         if let Some(class_name) = enclosing_class.get(entity.id.as_str()) {
                             if let Some(members) = class_members.get(class_name) {
@@ -754,7 +786,7 @@ impl EntityGraph {
                                 }
                             }
                         }
-                    } else if class_entity_names.contains(*receiver) {
+                    } else if class_entity_files.contains(&(*receiver, entity.file_path.as_str())) {
                         if let Some(members) = class_members.get(*receiver) {
                             for (n, tid) in members {
                                 if *n == *member {
@@ -769,6 +801,9 @@ impl EntityGraph {
                                 }
                             }
                         }
+                    }
+                    if entity_edges.len() == edge_count_before {
+                        consumed_words.insert(member.to_string());
                     }
                 }
 
@@ -1421,12 +1456,6 @@ fn build_import_table(
                         let module_path = &rest[..import_pos];
                         let names_str = &rest[import_pos + skip..];
 
-                        let source_module = module_path
-                            .trim_start_matches('.')
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or(module_path.trim_start_matches('.'));
-
                         for name_part in names_str.split(',') {
                             let name_part = name_part.trim();
                             let imported_name = name_part.split_whitespace().next().unwrap_or(name_part);
@@ -1437,17 +1466,13 @@ fn build_import_table(
                             }
 
                             if let Some(target_ids) = symbol_table.get(imported_name) {
-                                let target = target_ids.iter().find(|id| {
-                                    entity_map.get(*id).map_or(false, |e| {
-                                        let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                                        let stem = stem.strip_suffix(".py")
-                                            .or_else(|| stem.strip_suffix(".ts"))
-                                            .or_else(|| stem.strip_suffix(".js"))
-                                            .or_else(|| stem.strip_suffix(".rs"))
-                                            .unwrap_or(stem);
-                                        stem == source_module
-                                    })
-                                });
+                                let target = find_import_target(
+                                    target_ids,
+                                    module_path,
+                                    file_path,
+                                    &[".py"],
+                                    entity_map,
+                                );
                                 if let Some(target_id) = target {
                                     local_imports.push((
                                         (file_path.clone(), imported_name.to_string()),
@@ -1476,8 +1501,6 @@ fn build_import_table(
                 for cap in JS_NAMED_RE.captures_iter(content) {
                     let names_str = cap.get(1).unwrap().as_str();
                     let module_path = cap.get(2).unwrap().as_str();
-                    let source_module = module_path.rsplit('/').next().unwrap_or(module_path);
-                    let source_module = strip_js_ext(source_module);
 
                     for name_part in names_str.split(',') {
                         let name_part = name_part.trim();
@@ -1497,13 +1520,13 @@ fn build_import_table(
                         if original_name.is_empty() || local_name.is_empty() { continue; }
 
                         if let Some(target_ids) = symbol_table.get(original_name) {
-                            let target = target_ids.iter().find(|id| {
-                                entity_map.get(*id).map_or(false, |e| {
-                                    let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                                    let stem = strip_file_ext(stem);
-                                    stem == source_module
-                                })
-                            });
+                            let target = find_import_target(
+                                target_ids,
+                                module_path,
+                                file_path,
+                                &[".ts", ".tsx", ".js", ".jsx"],
+                                entity_map,
+                            );
                             if let Some(target_id) = target {
                                 local_imports.push((
                                     (file_path.clone(), local_name.to_string()),
@@ -1517,17 +1540,15 @@ fn build_import_table(
                 for cap in JS_DEFAULT_RE.captures_iter(content) {
                     let local_name = cap.get(1).unwrap().as_str();
                     let module_path = cap.get(2).unwrap().as_str();
-                    let source_module = module_path.rsplit('/').next().unwrap_or(module_path);
-                    let source_module = strip_js_ext(source_module);
 
                     if let Some(target_ids) = symbol_table.get(local_name) {
-                        let target = target_ids.iter().find(|id| {
-                            entity_map.get(*id).map_or(false, |e| {
-                                let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                                let stem = strip_file_ext(stem);
-                                stem == source_module
-                            })
-                        });
+                        let target = find_import_target(
+                            target_ids,
+                            module_path,
+                            file_path,
+                            &[".ts", ".tsx", ".js", ".jsx"],
+                            entity_map,
+                        );
                         if let Some(target_id) = target {
                             local_imports.push((
                                 (file_path.clone(), local_name.to_string()),
@@ -1663,15 +1684,6 @@ fn resolve_rust_import(
             );
         }
     }
-}
-
-/// Strip JS/TS extensions from a module name.
-fn strip_js_ext(s: &str) -> &str {
-    s.strip_suffix(".js")
-        .or_else(|| s.strip_suffix(".ts"))
-        .or_else(|| s.strip_suffix(".jsx"))
-        .or_else(|| s.strip_suffix(".tsx"))
-        .unwrap_or(s)
 }
 
 /// Strip common file extensions from a filename.
@@ -2343,6 +2355,392 @@ export function main() { return helper(); }
             deps.iter().any(|d| d.name == "helper"),
             "main should depend on helper via JS import. Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_relative_import_resolution_uses_full_path() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "src/a/util.ts", "\
+export function helper() { return 1; }
+");
+        write_file(root, "src/b/util.ts", "\
+export function helper() { return 2; }
+");
+        write_file(root, "src/main.ts", "\
+import { helper } from './b/util';
+export function caller() { return helper(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["src/a/util.ts".into(), "src/b/util.ts".into(), "src/main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/b/util.ts"),
+            "caller should resolve helper to src/b/util.ts. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/a/util.ts"),
+            "caller should not resolve helper to src/a/util.ts. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_relative_import_with_extension_prefers_exact_file() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "src/util.js", "\
+export function helper() { return 1; }
+");
+        write_file(root, "src/util.ts", "\
+export function helper() { return 2; }
+");
+        write_file(root, "src/main.ts", "\
+import { helper } from './util.ts';
+export function caller() { return helper(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["src/util.js".into(), "src/util.ts".into(), "src/main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/util.ts"),
+            "caller should resolve helper to explicit src/util.ts. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/util.js"),
+            "caller should not resolve explicit ./util.ts to src/util.js. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_relative_import_resolution_uses_full_path() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "src/a/util.py", "\
+def helper():
+    return 1
+");
+        write_file(root, "src/b/util.py", "\
+def helper():
+    return 2
+");
+        write_file(root, "src/main.py", "\
+from .b.util import helper
+
+def caller():
+    return helper()
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["src/a/util.py".into(), "src/b/util.py".into(), "src/main.py".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/b/util.py"),
+            "caller should resolve helper to src/b/util.py. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/a/util.py"),
+            "caller should not resolve helper to src/a/util.py. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_absolute_import_resolution_uses_full_path() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "src/a/util.py", "\
+def helper():
+    return 1
+");
+        write_file(root, "src/b/util.py", "\
+def helper():
+    return 2
+");
+        write_file(root, "src/main.py", "\
+from src.b.util import helper
+
+def caller():
+    return helper()
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["src/a/util.py".into(), "src/b/util.py".into(), "src/main.py".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/b/util.py"),
+            "caller should resolve helper to src/b/util.py. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/a/util.py"),
+            "caller should not resolve helper to src/a/util.py. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_named_import_does_not_resolve_unrelated_method_receiver() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function foo() { return 1; }
+");
+        write_file(root, "main.ts", "\
+import { foo } from './lib';
+export function caller(other) { return other.foo(); }
+export function actual() { return foo(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let caller_deps = graph.get_dependencies(caller_id);
+        assert!(
+            !caller_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "other.foo() should not resolve through a bare named import. Deps: {:?}",
+            caller_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let actual_id = graph.entities.keys()
+            .find(|id| id.contains("actual"))
+            .expect("actual entity should exist");
+        let actual_deps = graph.get_dependencies(actual_id);
+        assert!(
+            actual_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "foo() should still resolve through the named import. Deps: {:?}",
+            actual_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_method_does_not_block_unrelated_fallback_import() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export const answer = 1;
+export function foo() { return 1; }
+");
+        write_file(root, "main.ts", "\
+import { answer, foo } from './lib';
+export function caller(other) {
+    other.foo();
+    return answer;
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter().any(|d| d.name == "answer" && d.file_path == "lib.ts"),
+            "unresolved other.foo() should not block bare answer import fallback. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "other.foo() should not resolve through the named import. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_namespace_import_respects_receiver_alias() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function foo() { return 1; }
+");
+        write_file(root, "other.ts", "\
+export function foo() { return 2; }
+");
+        write_file(root, "main.ts", "\
+import * as lib from './lib';
+export function caller(other) { return other.foo(); }
+export function actual() { return lib.foo(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "other.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let caller_deps = graph.get_dependencies(caller_id);
+        assert!(
+            !caller_deps.iter().any(|d| d.name == "foo"),
+            "other.foo() should not resolve via namespace import lib. Deps: {:?}",
+            caller_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let actual_id = graph.entities.keys()
+            .find(|id| id.contains("actual"))
+            .expect("actual entity should exist");
+        let actual_deps = graph.get_dependencies(actual_id);
+        assert!(
+            actual_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "lib.foo() should resolve to lib.ts. Deps: {:?}",
+            actual_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !actual_deps.iter().any(|d| d.name == "foo" && d.file_path == "other.ts"),
+            "lib.foo() should not resolve to other.ts. Deps: {:?}",
+            actual_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_local_binding_shadows_imported_class_receiver() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export class Service {
+    static run() { return 1; }
+}
+");
+        write_file(root, "main.ts", "\
+import { Service } from './lib';
+export function caller(Service) { return Service.run(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "run" && d.file_path == "lib.ts"),
+            "local parameter Service should shadow imported class receiver. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "Service" && d.file_path == "lib.ts"),
+            "local parameter Service should shadow imported class name. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_local_binding_shadows_namespace_receiver() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function foo() { return 1; }
+");
+        write_file(root, "main.ts", "\
+import * as lib from './lib';
+export function caller(lib) { return lib.foo(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "local parameter lib should shadow namespace import receiver. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_local_binding_shadows_named_import_call() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function foo() { return 1; }
+");
+        write_file(root, "main.ts", "\
+import { foo } from './lib';
+export function caller(foo) { return foo(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let caller_id = graph.entities.keys()
+            .find(|id| id.contains("caller"))
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "local parameter foo should shadow named import. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
         );
     }
 

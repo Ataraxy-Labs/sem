@@ -7,4 +7,5 @@ pub mod verify;
 pub mod context;
 #[cfg(feature = "git")]
 pub mod hotspot;
+mod import_resolution;
 pub mod scope_resolve;

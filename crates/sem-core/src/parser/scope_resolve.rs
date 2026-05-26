@@ -11,7 +11,7 @@
 //! - Tracks variable types through assignments (x = Foo() → x.method → Foo.method)
 //! - Uses AST structure, not string matching
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,6 +29,7 @@ macro_rules! maybe_par_iter {
     }};
 }
 use crate::parser::graph::{EntityInfo, RefType};
+use crate::parser::import_resolution::{find_import_target, import_source_matches_file};
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
     ParamNameField, ScopeResolveConfig,
@@ -39,6 +40,8 @@ pub struct Scope {
     parent: Option<usize>,
     /// Definitions visible in this scope: name -> entity_id
     defs: HashMap<String, String>,
+    /// Local bindings that shadow outer names but are not graph entities.
+    bindings: HashSet<String>,
     /// Variable type bindings: var_name -> class_name (from `x = Foo()`)
     types: HashMap<String, String>,
     /// Unresolved call assignments: var_name -> function_name (from `x = func()`)
@@ -312,6 +315,7 @@ pub(crate) fn resolve_with_scopes_full(
             let mut scopes: Vec<Scope> = vec![Scope {
                 parent: None,
                 defs: HashMap::new(),
+                bindings: HashSet::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
@@ -560,6 +564,7 @@ fn build_scopes_from_ast(
                     scopes.push(Scope {
                         parent: Some(current_scope),
                         defs: HashMap::new(),
+                        bindings: HashSet::new(),
                         types: HashMap::new(),
                         pending_call_types: HashMap::new(),
                         owner_id: Some(ce.id.clone()),
@@ -590,6 +595,7 @@ fn build_scopes_from_ast(
                 scopes.push(Scope {
                     parent: Some(current_scope),
                     defs: HashMap::new(),
+                    bindings: HashSet::new(),
                     types: HashMap::new(),
                     pending_call_types: HashMap::new(),
                     owner_id: None,
@@ -615,6 +621,7 @@ fn build_scopes_from_ast(
             scopes.push(Scope {
                 parent: Some(current_scope),
                 defs: HashMap::new(),
+                bindings: HashSet::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
@@ -684,6 +691,7 @@ fn build_scopes_from_ast(
             scopes.push(Scope {
                 parent: Some(parent_scope),
                 defs: HashMap::new(),
+                bindings: HashSet::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
@@ -854,6 +862,7 @@ fn scan_function_params(
             if param_name.is_empty() || rule.skip_names.contains(&param_name) {
                 continue;
             }
+            scopes[scope_idx].bindings.insert(param_name.to_string());
 
             if let Some(type_node) = child.child_by_field_name(rule.type_field) {
                 let type_text = extract_base_type(type_node, source);
@@ -903,6 +912,7 @@ fn scan_single_assignment(
         Ok(n) => n.to_string(),
         Err(_) => return,
     };
+    scopes[scope_idx].bindings.insert(var_name.clone());
 
     record_type_from_rhs(right, &var_name, scope_idx, scopes, source);
 }
@@ -925,6 +935,7 @@ fn scan_ts_var_declaration(
             if var_name.is_empty() {
                 continue;
             }
+            scopes[scope_idx].bindings.insert(var_name.clone());
 
             // Check for explicit type annotation: `const x: Foo = ...`
             if let Some(type_ann) = child.child_by_field_name("type") {
@@ -972,6 +983,7 @@ fn scan_rust_let_declaration(
     if var_name.is_empty() {
         return;
     }
+    scopes[scope_idx].bindings.insert(var_name.clone());
 
     // Check for explicit type annotation: `let x: Connection = ...`
     if let Some(type_node) = node.child_by_field_name("type") {
@@ -1021,6 +1033,7 @@ fn scan_go_short_var(
     if var_name.is_empty() {
         return;
     }
+    scopes[scope_idx].bindings.insert(var_name.clone());
 
     let rhs = if right.kind() == "expression_list" {
         match right.named_child(0) {
@@ -1055,6 +1068,7 @@ fn scan_go_var_declaration(
                     if first.kind() == "identifier" {
                         let name = first.utf8_text(source).unwrap_or("").to_string();
                         if !name.is_empty() {
+                            scopes[scope_idx].bindings.insert(name.clone());
                             // Check for type child
                             if let Some(type_node) = child.child_by_field_name("type") {
                                 let type_text = extract_base_type(type_node, source);
@@ -1069,6 +1083,7 @@ fn scan_go_var_declaration(
                 }
                 continue;
             }
+            scopes[scope_idx].bindings.insert(var_name.clone());
 
             // Check for explicit type
             if let Some(type_node) = child.child_by_field_name("type") {
@@ -2066,17 +2081,7 @@ fn extract_ts_import(
         .unwrap_or("")
         .trim_matches(|c: char| c == '\'' || c == '"');
 
-    let source_module = source_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(source_path);
-    // Strip extensions
-    let source_module = source_module
-        .strip_suffix(".ts").or_else(|| source_module.strip_suffix(".js"))
-        .or_else(|| source_module.strip_suffix(".tsx")).or_else(|| source_module.strip_suffix(".jsx"))
-        .unwrap_or(source_module);
-
-    if source_module.is_empty() {
+    if source_path.is_empty() {
         return;
     }
 
@@ -2101,7 +2106,7 @@ fn extract_ts_import(
                                 .unwrap_or(original);
 
                             if !original.is_empty() {
-                                resolve_import_name(original, local, source_module, file_path, symbol_table, entity_map, import_table, scopes);
+                                resolve_import_name(original, local, source_path, file_path, &[".ts", ".tsx", ".js", ".jsx"], symbol_table, entity_map, import_table, scopes);
                             }
                         }
                     }
@@ -2118,13 +2123,13 @@ fn extract_ts_import(
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("");
                     if !alias.is_empty() {
-                        register_namespace_import(alias, source_module, file_path, symbol_table, entity_map, import_table, scopes);
+                        register_namespace_import(alias, source_path, file_path, &[".ts", ".tsx", ".js", ".jsx"], symbol_table, entity_map, import_table, scopes);
                     }
                 } else if clause_child.kind() == "identifier" {
                     // Default import: import Foo from './module'
                     let name = clause_child.utf8_text(source).unwrap_or("");
                     if !name.is_empty() {
-                        resolve_import_name(name, name, source_module, file_path, symbol_table, entity_map, import_table, scopes);
+                        resolve_import_name(name, name, source_path, file_path, &[".ts", ".tsx", ".js", ".jsx"], symbol_table, entity_map, import_table, scopes);
                     }
                 }
             }
@@ -2175,7 +2180,7 @@ fn extract_rust_use(
                 (name_part, name_part)
             };
             if !original.is_empty() {
-                resolve_import_name(original, local, source_module, file_path, symbol_table, entity_map, import_table, scopes);
+                resolve_import_name(original, local, source_module, file_path, &[".rs"], symbol_table, entity_map, import_table, scopes);
             }
         }
     } else {
@@ -2196,7 +2201,7 @@ fn extract_rust_use(
             parts[0]
         };
         if !original.is_empty() && !source_module.is_empty() {
-            resolve_import_name(original, local, source_module, file_path, symbol_table, entity_map, import_table, scopes);
+            resolve_import_name(original, local, source_module, file_path, &[".rs"], symbol_table, entity_map, import_table, scopes);
         }
     }
 }
@@ -2282,29 +2287,22 @@ fn register_go_package_imports(
 fn resolve_import_name(
     original_name: &str,
     local_name: &str,
-    source_module: &str,
+    source_path: &str,
     file_path: &str,
+    extensions: &[&str],
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
 ) {
     if let Some(target_ids) = symbol_table.get(original_name) {
-        let target = target_ids.iter().find(|id| {
-            entity_map.get(*id).map_or(false, |e| {
-                let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                let stem = stem
-                    .strip_suffix(".py")
-                    .or_else(|| stem.strip_suffix(".rs"))
-                    .or_else(|| stem.strip_suffix(".ts"))
-                    .or_else(|| stem.strip_suffix(".tsx"))
-                    .or_else(|| stem.strip_suffix(".js"))
-                    .or_else(|| stem.strip_suffix(".jsx"))
-                    .or_else(|| stem.strip_suffix(".go"))
-                    .unwrap_or(stem);
-                stem == source_module
-            })
-        });
+        let target = find_import_target(
+            target_ids,
+            source_path,
+            file_path,
+            extensions,
+            entity_map,
+        );
 
         if let Some(target_id) = target {
             import_table.insert(
@@ -2325,43 +2323,29 @@ fn resolve_import_name(
 /// are registered so that `m.foo()` resolves via the method call path.
 fn register_namespace_import(
     alias: &str,
-    source_module: &str,
+    source_path: &str,
     file_path: &str,
+    extensions: &[&str],
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
-    scopes: &mut Vec<Scope>,
+    _scopes: &mut Vec<Scope>,
 ) {
-    // Find all entities whose file matches the source_module stem
+    // Find all top-level entities whose file matches the imported module.
     for (name, target_ids) in symbol_table {
         for target_id in target_ids {
             if let Some(info) = entity_map.get(target_id) {
-                let stem = info.file_path.rsplit('/').next().unwrap_or(&info.file_path);
-                let stem = stem
-                    .strip_suffix(".ts")
-                    .or_else(|| stem.strip_suffix(".js"))
-                    .or_else(|| stem.strip_suffix(".tsx"))
-                    .or_else(|| stem.strip_suffix(".jsx"))
-                    .or_else(|| stem.strip_suffix(".py"))
-                    .unwrap_or(stem);
-                if stem == source_module && info.parent_id.is_none() {
-                    // Register entity_name under the alias for method-call resolution
+                if import_source_matches_file(file_path, source_path, extensions, &info.file_path)
+                    && info.parent_id.is_none() {
+                    let qualified_name = format!("{alias}.{name}");
                     import_table.insert(
-                        (file_path.to_string(), name.clone()),
+                        (file_path.to_string(), qualified_name.clone()),
                         target_id.clone(),
                     );
-                    if !scopes.is_empty() {
-                        scopes[0].defs.insert(name.clone(), target_id.clone());
-                    }
                 }
             }
         }
     }
-    // Also register the alias itself so that type tracking for `alias.method()` works:
-    // the resolve_ref MethodCall path checks import_table for the receiver.
-    // We don't have a single entity for the module, so this is handled by the
-    // Go-style package-qualified call fallback (checking method name in import_table).
-    let _ = (alias, file_path); // used above
 }
 
 fn extract_python_import(
@@ -2380,12 +2364,6 @@ fn extract_python_import(
     let module_name = module_node
         .and_then(|n| n.utf8_text(source).ok())
         .unwrap_or("");
-
-    let source_module = module_name
-        .trim_start_matches('.')
-        .rsplit('.')
-        .next()
-        .unwrap_or(module_name.trim_start_matches('.'));
 
     // Walk children to find imported names
     let mut cursor = node.walk();
@@ -2410,34 +2388,7 @@ fn extract_python_import(
                 continue;
             }
 
-            // Resolve against symbol table, preferring entities from the source module
-            if let Some(target_ids) = symbol_table.get(original) {
-                let target = target_ids.iter().find(|id| {
-                    entity_map.get(*id).map_or(false, |e| {
-                        let stem = e.file_path.rsplit('/').next().unwrap_or(&e.file_path);
-                        let stem = stem
-                            .strip_suffix(".py")
-                            .or_else(|| stem.strip_suffix(".rs"))
-                            .or_else(|| stem.strip_suffix(".ts"))
-                            .or_else(|| stem.strip_suffix(".js"))
-                            .unwrap_or(stem);
-                        stem == source_module
-                    })
-                });
-
-                if let Some(target_id) = target {
-                    import_table.insert(
-                        (file_path.to_string(), local.to_string()),
-                        target_id.clone(),
-                    );
-                    // Also add to module scope definitions
-                    if !scopes.is_empty() {
-                        scopes[0]
-                            .defs
-                            .insert(local.to_string(), target_id.clone());
-                    }
-                }
-            }
+            resolve_import_name(original, local, module_name, file_path, &[".py"], symbol_table, entity_map, import_table, scopes);
         }
     }
 }
@@ -2478,14 +2429,12 @@ fn extract_python_module_import(
             continue;
         }
 
-        // The module stem is the last component of the dotted name
-        let source_module = module_name.rsplit('.').next().unwrap_or(module_name);
-
         // Register all entities from the source module
         register_namespace_import(
             _alias,
-            source_module,
+            module_name,
             file_path,
+            &[".py"],
             symbol_table,
             entity_map,
             import_table,
@@ -2725,6 +2674,10 @@ fn resolve_ref(
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
         AstRefKind::Call(name) => {
+            if is_local_binding_in_scopes(scope_idx, scopes, name) {
+                return None;
+            }
+
             // 1. Walk scope chain for the name
             if let Some(eid) = lookup_scope_chain(scope_idx, scopes, name) {
                 if eid != from_entity_id {
@@ -2832,31 +2785,59 @@ fn resolve_ref(
                 }
             }
 
-            // Fallback: check import table for the receiver
-            let key = (file_path.to_string(), receiver.clone());
-            if let Some(target_id) = import_table.get(&key) {
-                if let Some(info) = entity_map.get(target_id) {
-                    if matches!(info.entity_type.as_str(), "class" | "struct") {
-                        if let Some(members) = class_members.get(&info.name) {
-                            if let Some((_, mid)) =
-                                members.iter().find(|(n, _)| n == method)
-                            {
-                                return Some((
-                                    mid.clone(),
-                                    RefType::Calls,
-                                    "type_tracking",
-                                ));
+            // ClassName.method() static call, only when ClassName is visible and
+            // not shadowed by a local binding.
+            if !is_local_binding_in_scopes(scope_idx, scopes, receiver) {
+                if let Some(class_id) = lookup_scope_chain(scope_idx, scopes, receiver) {
+                    if let Some(info) = entity_map.get(&class_id) {
+                        if matches!(info.entity_type.as_str(), "class" | "struct" | "interface")
+                            && info.name == receiver.as_str()
+                        {
+                            if let Some(members) = class_members.get(&info.name) {
+                                if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
+                                    return Some((mid.clone(), RefType::Calls, "scope_chain"));
+                                }
                             }
                         }
                     }
                 }
             }
 
+            // Fallback: check import table for the receiver
+            if !is_local_binding_in_scopes(scope_idx, scopes, receiver) {
+                let key = (file_path.to_string(), receiver.clone());
+                if let Some(target_id) = import_table.get(&key) {
+                    if let Some(info) = entity_map.get(target_id) {
+                        if matches!(info.entity_type.as_str(), "class" | "struct") {
+                            if let Some(members) = class_members.get(&info.name) {
+                                if let Some((_, mid)) =
+                                    members.iter().find(|(n, _)| n == method)
+                                {
+                                    return Some((
+                                        mid.clone(),
+                                        RefType::Calls,
+                                        "type_tracking",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Namespace import: alias.method()
+                let key = (file_path.to_string(), format!("{receiver}.{method}"));
+                if let Some(target_id) = import_table.get(&key) {
+                    return Some((target_id.clone(), RefType::Calls, "import"));
+                }
+            }
+
             // Go package-qualified call: package.Function()
             // Try the method name directly in the import table
-            let key = (file_path.to_string(), method.clone());
-            if let Some(target_id) = import_table.get(&key) {
-                return Some((target_id.clone(), RefType::Calls, "import"));
+            if file_path.ends_with(".go") {
+                let key = (file_path.to_string(), method.clone());
+                if let Some(target_id) = import_table.get(&key) {
+                    return Some((target_id.clone(), RefType::Calls, "import"));
+                }
             }
 
             None
@@ -2898,6 +2879,24 @@ fn lookup_scope_chain(
         match scopes[idx].parent {
             Some(p) => idx = p,
             None => return None,
+        }
+    }
+}
+
+/// Walk up the scope chain looking for a local binding that shadows a definition.
+fn is_local_binding_in_scopes(
+    start_scope: usize,
+    scopes: &[Scope],
+    name: &str,
+) -> bool {
+    let mut idx = start_scope;
+    loop {
+        if scopes[idx].bindings.contains(name) {
+            return true;
+        }
+        match scopes[idx].parent {
+            Some(p) => idx = p,
+            None => return false,
         }
     }
 }
