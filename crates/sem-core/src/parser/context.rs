@@ -1,7 +1,8 @@
 //! Context budgeting: pack optimal entity context into a token budget.
-//! Priority: target entity (full) > direct dependents (full) > transitive (signature only).
+//! Priority: target entity > direct dependencies > direct dependents > transitive dependencies >
+//! transitive dependents.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::entity::SemanticEntity;
 use crate::parser::graph::EntityGraph;
@@ -12,9 +13,17 @@ pub struct ContextEntry {
     pub entity_name: String,
     pub entity_type: String,
     pub file_path: String,
-    pub role: String, // "target", "direct_dependent", "transitive_dependent"
+    pub role: String,
     pub content: String,
     pub estimated_tokens: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContextResult {
+    pub entries: Vec<ContextEntry>,
+    pub total_tokens: usize,
+    pub truncated: bool,
+    pub target_omitted: bool,
 }
 
 /// Estimate token count from content. Rough heuristic: ~1.3 tokens per whitespace-separated word.
@@ -32,106 +41,262 @@ fn signature_only(content: &str) -> String {
 ///
 /// Greedy knapsack by priority:
 /// 1. Target entity (full content)
-/// 2. Direct dependents (full content)
-/// 3. Transitive dependents (signature only)
+/// 2. Direct dependencies (full content, signature fallback)
+/// 3. Direct dependents (full content, signature fallback)
+/// 4. Transitive dependencies (signature only)
+/// 5. Transitive dependents (signature only)
 pub fn build_context(
     graph: &EntityGraph,
     entity_id: &str,
     all_entities: &[SemanticEntity],
     token_budget: usize,
 ) -> Vec<ContextEntry> {
+    build_context_result(graph, entity_id, all_entities, token_budget).entries
+}
+
+/// Build a context set plus budget metadata for a target entity.
+pub fn build_context_result(
+    graph: &EntityGraph,
+    entity_id: &str,
+    all_entities: &[SemanticEntity],
+    token_budget: usize,
+) -> ContextResult {
     // Build content lookup: entity_id -> SemanticEntity
-    let entity_lookup: HashMap<&str, &SemanticEntity> = all_entities
-        .iter()
-        .map(|e| (e.id.as_str(), e))
-        .collect();
+    let entity_lookup: HashMap<&str, &SemanticEntity> =
+        all_entities.iter().map(|e| (e.id.as_str(), e)).collect();
 
-    let mut entries = Vec::new();
-    let mut tokens_used = 0usize;
+    let mut result = ContextResult::default();
+    let mut included_ids = HashSet::new();
 
-    // 1. Target entity (always included, truncated to signature if it exceeds budget)
+    // 1. Target entity. Keep the budget strict: if even the signature does not fit,
+    // omit the target and return an empty result instead of overspending.
     if let Some(entity) = entity_lookup.get(entity_id) {
         let full_tokens = estimate_tokens(&entity.content);
-        let (content, tokens) = if full_tokens <= token_budget {
-            (entity.content.clone(), full_tokens)
+        if full_tokens <= token_budget {
+            push_entry(
+                &mut result,
+                entity,
+                "target",
+                entity.content.clone(),
+                full_tokens,
+                &mut included_ids,
+            );
         } else {
-            // Truncate to signature so the target is always present (#145)
+            result.truncated = true;
             let sig = signature_only(&entity.content);
             let sig_tokens = estimate_tokens(&sig);
-            (sig, sig_tokens)
-        };
-        entries.push(ContextEntry {
-            entity_id: entity.id.clone(),
-            entity_name: entity.name.clone(),
-            entity_type: entity.entity_type.clone(),
-            file_path: entity.file_path.clone(),
-            role: "target".to_string(),
-            content,
-            estimated_tokens: tokens,
-        });
-        tokens_used += tokens;
-    }
-
-    // 2. Direct dependents (full content)
-    let direct_deps = graph.get_dependents(entity_id);
-    for dep_info in &direct_deps {
-        if tokens_used >= token_budget {
-            break;
-        }
-        if let Some(entity) = entity_lookup.get(dep_info.id.as_str()) {
-            let tokens = estimate_tokens(&entity.content);
-            if tokens_used + tokens <= token_budget {
-                entries.push(ContextEntry {
-                    entity_id: entity.id.clone(),
-                    entity_name: entity.name.clone(),
-                    entity_type: entity.entity_type.clone(),
-                    file_path: entity.file_path.clone(),
-                    role: "direct_dependent".to_string(),
-                    content: entity.content.clone(),
-                    estimated_tokens: tokens,
-                });
-                tokens_used += tokens;
+            if sig_tokens <= token_budget {
+                push_entry(
+                    &mut result,
+                    entity,
+                    "target",
+                    sig,
+                    sig_tokens,
+                    &mut included_ids,
+                );
+            } else {
+                // Strict context budget contract: no related entries are useful if the
+                // requested target cannot be represented inside the budget.
+                result.target_omitted = true;
+                return result;
             }
-        }
+        };
     }
 
-    // 3. Transitive dependents (signature only)
-    let all_impact = graph.impact_analysis(entity_id);
-    let direct_ids: std::collections::HashSet<&str> =
-        direct_deps.iter().map(|d| d.id.as_str()).collect();
+    let direct_dependencies = graph.get_dependencies(entity_id);
+    for dep_info in &direct_dependencies {
+        add_full_or_signature(
+            &mut result,
+            &entity_lookup,
+            dep_info.id.as_str(),
+            "direct_dependency",
+            token_budget,
+            &mut included_ids,
+        );
+    }
 
-    for dep_info in &all_impact {
-        if tokens_used >= token_budget {
-            break;
-        }
-        // Skip direct deps (already included with full content)
-        if direct_ids.contains(dep_info.id.as_str()) {
+    let direct_dependents = graph.get_dependents(entity_id);
+    for dep_info in &direct_dependents {
+        add_full_or_signature(
+            &mut result,
+            &entity_lookup,
+            dep_info.id.as_str(),
+            "direct_dependent",
+            token_budget,
+            &mut included_ids,
+        );
+    }
+
+    let direct_dependency_ids: HashSet<&str> =
+        direct_dependencies.iter().map(|d| d.id.as_str()).collect();
+    let direct_dependent_ids: HashSet<&str> =
+        direct_dependents.iter().map(|d| d.id.as_str()).collect();
+
+    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependencies) {
+        if direct_dependency_ids.contains(dep_info.id.as_str()) {
             continue;
         }
-        if let Some(entity) = entity_lookup.get(dep_info.id.as_str()) {
-            let sig = signature_only(&entity.content);
-            let tokens = estimate_tokens(&sig);
-            if tokens_used + tokens <= token_budget {
-                entries.push(ContextEntry {
-                    entity_id: entity.id.clone(),
-                    entity_name: entity.name.clone(),
-                    entity_type: entity.entity_type.clone(),
-                    file_path: entity.file_path.clone(),
-                    role: "transitive_dependent".to_string(),
-                    content: sig,
-                    estimated_tokens: tokens,
-                });
-                tokens_used += tokens;
+        add_signature(
+            &mut result,
+            &entity_lookup,
+            dep_info.id.as_str(),
+            "transitive_dependency",
+            token_budget,
+            &mut included_ids,
+        );
+    }
+
+    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependents) {
+        if direct_dependent_ids.contains(dep_info.id.as_str()) {
+            continue;
+        }
+        add_signature(
+            &mut result,
+            &entity_lookup,
+            dep_info.id.as_str(),
+            "transitive_dependent",
+            token_budget,
+            &mut included_ids,
+        );
+    }
+
+    result
+}
+
+fn push_entry(
+    result: &mut ContextResult,
+    entity: &SemanticEntity,
+    role: &str,
+    content: String,
+    tokens: usize,
+    included_ids: &mut HashSet<String>,
+) {
+    result.entries.push(ContextEntry {
+        entity_id: entity.id.clone(),
+        entity_name: entity.name.clone(),
+        entity_type: entity.entity_type.clone(),
+        file_path: entity.file_path.clone(),
+        role: role.to_string(),
+        content,
+        estimated_tokens: tokens,
+    });
+    result.total_tokens += tokens;
+    included_ids.insert(entity.id.clone());
+}
+
+fn add_full_or_signature(
+    result: &mut ContextResult,
+    entity_lookup: &HashMap<&str, &SemanticEntity>,
+    entity_id: &str,
+    role: &str,
+    token_budget: usize,
+    included_ids: &mut HashSet<String>,
+) {
+    if included_ids.contains(entity_id) {
+        return;
+    }
+
+    let Some(entity) = entity_lookup.get(entity_id) else {
+        return;
+    };
+
+    let full_tokens = estimate_tokens(&entity.content);
+    if result.total_tokens + full_tokens <= token_budget {
+        push_entry(
+            result,
+            entity,
+            role,
+            entity.content.clone(),
+            full_tokens,
+            included_ids,
+        );
+        return;
+    }
+
+    result.truncated = true;
+    add_signature(
+        result,
+        entity_lookup,
+        entity_id,
+        role,
+        token_budget,
+        included_ids,
+    );
+}
+
+fn add_signature(
+    result: &mut ContextResult,
+    entity_lookup: &HashMap<&str, &SemanticEntity>,
+    entity_id: &str,
+    role: &str,
+    token_budget: usize,
+    included_ids: &mut HashSet<String>,
+) {
+    if included_ids.contains(entity_id) {
+        return;
+    }
+
+    let Some(entity) = entity_lookup.get(entity_id) else {
+        return;
+    };
+
+    let sig = signature_only(&entity.content);
+    let tokens = estimate_tokens(&sig);
+    if result.total_tokens + tokens <= token_budget {
+        push_entry(result, entity, role, sig, tokens, included_ids);
+    } else {
+        result.truncated = true;
+    }
+}
+
+/// Collect related entities reachable from `entity_id`, excluding the starting entity.
+fn collect_reachable_related<'a>(
+    graph: &'a EntityGraph,
+    entity_id: &str,
+    relationships: &'a HashMap<String, Vec<String>>,
+) -> Vec<&'a crate::parser::graph::EntityInfo> {
+    const MAX_VISITED: usize = 10_000;
+
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    let mut result = Vec::new();
+
+    let start_key = match graph.entities.get_key_value(entity_id) {
+        Some((key, _)) => key.as_str(),
+        None => return result,
+    };
+
+    queue.push_back(start_key);
+    visited.insert(start_key);
+
+    while let Some(current) = queue.pop_front() {
+        if result.len() >= MAX_VISITED {
+            break;
+        }
+
+        if let Some(next_ids) = relationships.get(current) {
+            for next_id in next_ids {
+                if visited.insert(next_id.as_str()) {
+                    if let Some(info) = graph.entities.get(next_id.as_str()) {
+                        result.push(info);
+                        if result.len() >= MAX_VISITED {
+                            return result;
+                        }
+                    }
+                    queue.push_back(next_id.as_str());
+                }
             }
         }
     }
 
-    entries
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+    use std::collections::HashMap;
 
     #[test]
     fn test_estimate_tokens() {
@@ -145,5 +310,178 @@ mod tests {
             signature_only("fn foo(a: i32) {\n    a + 1\n}"),
             "fn foo(a: i32) {"
         );
+    }
+
+    #[test]
+    fn test_target_omitted_when_signature_exceeds_budget() {
+        let entities = vec![entity(
+            "a.py::function::helper_b",
+            "helper_b",
+            "def helper_b():\n    return 1",
+        )];
+        let graph = graph_from_entities(&entities, vec![]);
+
+        let result = build_context_result(&graph, "a.py::function::helper_b", &entities, 1);
+
+        assert!(result.entries.is_empty());
+        assert_eq!(result.total_tokens, 0);
+        assert!(result.truncated);
+        assert!(result.target_omitted);
+    }
+
+    #[test]
+    fn test_target_signature_respects_budget() {
+        let entities = vec![entity(
+            "a.py::function::helper_b",
+            "helper_b",
+            "def helper_b():\n    return expensive_value()",
+        )];
+        let graph = graph_from_entities(&entities, vec![]);
+
+        let result = build_context_result(&graph, "a.py::function::helper_b", &entities, 2);
+
+        assert_eq!(result.total_tokens, 2);
+        assert!(result.truncated);
+        assert!(!result.target_omitted);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].role, "target");
+        assert_eq!(result.entries[0].content, "def helper_b():");
+    }
+
+    #[test]
+    fn test_context_includes_dependencies_before_dependents() {
+        let entities = vec![
+            entity(
+                "a.py::function::main",
+                "main",
+                "def main():\n    return helper_a() + helper_b()",
+            ),
+            entity(
+                "a.py::function::helper_a",
+                "helper_a",
+                "def helper_a():\n    return leaf()",
+            ),
+            entity(
+                "a.py::function::helper_b",
+                "helper_b",
+                "def helper_b():\n    return 2",
+            ),
+            entity("a.py::function::leaf", "leaf", "def leaf():\n    return 1"),
+            entity(
+                "a.py::class::Caller",
+                "Caller",
+                "class Caller:\n    def go(self):\n        return main()",
+            ),
+            entity(
+                "a.py::class::Outer",
+                "Outer",
+                "class Outer:\n    def go(self):\n        return Caller().go()",
+            ),
+        ];
+        let graph = graph_from_entities(
+            &entities,
+            vec![
+                edge("a.py::function::main", "a.py::function::helper_a"),
+                edge("a.py::function::main", "a.py::function::helper_b"),
+                edge("a.py::function::helper_a", "a.py::function::leaf"),
+                edge("a.py::class::Caller", "a.py::function::main"),
+                edge("a.py::class::Outer", "a.py::class::Caller"),
+            ],
+        );
+
+        let result = build_context_result(&graph, "a.py::function::main", &entities, 999);
+        let roles_and_names: Vec<(&str, &str)> = result
+            .entries
+            .iter()
+            .map(|entry| (entry.role.as_str(), entry.entity_name.as_str()))
+            .collect();
+
+        assert_eq!(
+            roles_and_names,
+            vec![
+                ("target", "main"),
+                ("direct_dependency", "helper_a"),
+                ("direct_dependency", "helper_b"),
+                ("direct_dependent", "Caller"),
+                ("transitive_dependency", "leaf"),
+                ("transitive_dependent", "Outer"),
+            ]
+        );
+        assert!(!result.truncated);
+        assert!(!result.target_omitted);
+        assert!(result.total_tokens <= 999);
+    }
+
+    #[test]
+    fn test_collect_transitive_caps_results() {
+        let mut entities = Vec::new();
+        let mut edges = Vec::new();
+
+        for index in 0..=10_001 {
+            let id = format!("a.py::function::helper_{index}");
+            entities.push(entity(
+                &id,
+                &format!("helper_{index}"),
+                "def helper():\n    return 1",
+            ));
+            if index > 0 {
+                edges.push(edge(&format!("a.py::function::helper_{}", index - 1), &id));
+            }
+        }
+
+        let graph = graph_from_entities(&entities, edges);
+        let result = collect_reachable_related(
+            &graph,
+            "a.py::function::helper_0",
+            &graph.dependencies,
+        );
+
+        assert_eq!(result.len(), 10_000);
+    }
+
+    fn entity(id: &str, name: &str, content: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: "a.py".to_string(),
+            entity_type: id.split("::").nth(1).unwrap_or("function").to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            content: content.to_string(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 1,
+            end_line: content.lines().count(),
+            metadata: None,
+        }
+    }
+
+    fn edge(from_entity: &str, to_entity: &str) -> EntityRef {
+        EntityRef {
+            from_entity: from_entity.to_string(),
+            to_entity: to_entity.to_string(),
+            ref_type: RefType::Calls,
+        }
+    }
+
+    fn graph_from_entities(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
+        let entity_infos: HashMap<String, EntityInfo> = entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    EntityInfo {
+                        id: entity.id.clone(),
+                        name: entity.name.clone(),
+                        entity_type: entity.entity_type.clone(),
+                        file_path: entity.file_path.clone(),
+                        parent_id: entity.parent_id.clone(),
+                        start_line: entity.start_line,
+                        end_line: entity.end_line,
+                    },
+                )
+            })
+            .collect();
+
+        EntityGraph::from_parts(entity_infos, edges)
     }
 }

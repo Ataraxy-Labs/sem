@@ -202,7 +202,8 @@ sem entities src/auth.ts --json
 
 ### sem context
 
-Token-budgeted context for LLMs: the entity, its dependencies, and its dependents, fitted to a token budget.
+Token-budgeted context for LLMs: the entity, its dependencies, and its dependents, fitted to a strict content token budget.
+When the target signature itself does not fit, JSON output reports `target_omitted: true`.
 
 ```bash
 sem context authenticateUser

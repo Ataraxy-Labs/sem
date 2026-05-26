@@ -827,7 +827,7 @@ impl SemServer {
 
     // ── Tool 6: Context ──
 
-    #[tool(description = "Pack optimal entity context into a token budget. Priority: target entity (full) > direct dependents (full) > transitive (signature only).")]
+    #[tool(description = "Pack optimal entity context into a token budget. Priority: target entity > direct dependencies > direct dependents > transitive dependencies > transitive dependents.")]
     async fn sem_context(
         &self,
         Parameters(params): Parameters<ContextParams>,
@@ -845,15 +845,14 @@ impl SemServer {
         let entity_id = Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)?;
 
         let budget = params.token_budget.unwrap_or(8000);
-        let entries = sem_core::parser::context::build_context(
+        let context_result = sem_core::parser::context::build_context_result(
             &graph,
             entity_id,
             &all_entities,
             budget,
         );
 
-        let total_tokens: usize = entries.iter().map(|e| e.estimated_tokens).sum();
-        let result: Vec<serde_json::Value> = entries
+        let result: Vec<serde_json::Value> = context_result.entries
             .iter()
             .map(|e| {
                 serde_json::json!({
@@ -872,7 +871,9 @@ impl SemServer {
                 "entity": params.entity_name,
                 "file": rel_path,
                 "token_budget": budget,
-                "tokens_used": total_tokens,
+                "tokens_used": context_result.total_tokens,
+                "truncated": context_result.truncated,
+                "target_omitted": context_result.target_omitted,
                 "entries": result.len(),
                 "context": result,
             }))

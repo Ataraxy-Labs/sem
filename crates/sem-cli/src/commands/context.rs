@@ -2,7 +2,7 @@ use std::path::Path;
 
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
-use sem_core::parser::context::build_context;
+use sem_core::parser::context::build_context_result;
 use sem_core::parser::graph::EntityGraph;
 
 pub struct ContextOptions {
@@ -29,17 +29,17 @@ pub fn context_command(opts: ContextOptions) {
     let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     let entity = find_entity(&graph, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_path.as_deref());
-    let entries = build_context(&graph, &entity.id, &all_entities, opts.budget);
-
-    let total_tokens: usize = entries.iter().map(|e| e.estimated_tokens).sum();
+    let context_result = build_context_result(&graph, &entity.id, &all_entities, opts.budget);
 
     if opts.json {
         let output = serde_json::json!({
             "entity": entity.name,
             "entityId": entity.id,
             "budget": opts.budget,
-            "total_tokens": total_tokens,
-            "entries": entries.iter().map(|e| serde_json::json!({
+            "total_tokens": context_result.total_tokens,
+            "truncated": context_result.truncated,
+            "target_omitted": context_result.target_omitted,
+            "entries": context_result.entries.iter().map(|e| serde_json::json!({
                 "entityId": e.entity_id,
                 "name": e.entity_name,
                 "type": e.entity_type,
@@ -57,16 +57,22 @@ pub fn context_command(opts: ContextOptions) {
             entity.entity_type.dimmed(),
             entity.name.bold(),
             opts.budget,
-            total_tokens,
+            context_result.total_tokens,
         );
 
+        if context_result.target_omitted {
+            println!("  {}", "target omitted: signature exceeds token budget".dimmed());
+        }
+
         let mut current_role = String::new();
-        for entry in &entries {
+        for entry in &context_result.entries {
             if entry.role != current_role {
                 current_role = entry.role.clone();
                 let role_label = match current_role.as_str() {
                     "target" => "target".green().bold(),
+                    "direct_dependency" => "direct dependencies".cyan().bold(),
                     "direct_dependent" => "direct dependents".yellow().bold(),
+                    "transitive_dependency" => "transitive dependencies".blue().bold(),
                     "transitive_dependent" => "transitive dependents".dimmed().bold(),
                     _ => current_role.normal().bold(),
                 };
