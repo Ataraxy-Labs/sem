@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
@@ -21,10 +21,12 @@ pub enum GitError {
 pub struct GitBridge {
     repo: Repository,
     repo_root: PathBuf,
+    cwd: PathBuf,
 }
 
 impl GitBridge {
     pub fn open(path: &Path) -> Result<Self, GitError> {
+        let cwd = normalize_open_path(path)?;
         let repo = match Repository::discover(path) {
             Ok(repo) => repo,
             Err(error) if should_retry_with_command_line_safe_directory(&error, path) => {
@@ -37,11 +39,13 @@ impl GitBridge {
             }
             Err(error) => return Err(map_git_error(error)),
         };
-        let repo_root = repo
-            .workdir()
-            .ok_or(GitError::NotARepo)?
-            .to_path_buf();
-        Ok(Self { repo, repo_root })
+        let repo_root = repo.workdir().ok_or(GitError::NotARepo)?;
+        let repo_root = fs::canonicalize(repo_root)?;
+        Ok(Self {
+            repo,
+            repo_root,
+            cwd,
+        })
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -114,12 +118,47 @@ impl GitBridge {
         self.repo.revparse_single(refspec).is_ok()
     }
 
-    fn make_diff_opts(pathspecs: &[String]) -> DiffOptions {
+    fn make_diff_opts(&self, pathspecs: &[String]) -> Result<DiffOptions, GitError> {
         let mut opts = DiffOptions::new();
-        for spec in pathspecs {
+        for spec in self.normalize_pathspecs(pathspecs)? {
             opts.pathspec(spec.as_str());
         }
-        opts
+        Ok(opts)
+    }
+
+    fn normalize_pathspecs(&self, pathspecs: &[String]) -> Result<Vec<String>, GitError> {
+        pathspecs
+            .iter()
+            .map(|spec| self.normalize_pathspec(spec))
+            .collect()
+    }
+
+    fn normalize_pathspec(&self, spec: &str) -> Result<String, GitError> {
+        if spec.is_empty() || spec.starts_with(':') {
+            return Ok(spec.to_string());
+        }
+
+        let spec_path = Path::new(spec);
+        let absolute = if spec_path.is_absolute() {
+            normalize_absolute_pathspec(spec_path)
+        } else {
+            normalize_lexical(&self.cwd.join(spec_path))
+        };
+
+        let repo_root = normalize_lexical(&self.repo_root);
+        let relative =
+            absolute
+                .strip_prefix(&repo_root)
+                .map_err(|_| pathspec_outside_repo_error(spec, &self.repo_root))?;
+
+        if relative.as_os_str().is_empty() {
+            Ok(".".to_string())
+        } else {
+            relative
+                .to_str()
+                .map(|path| path.replace('\\', "/"))
+                .ok_or_else(|| non_utf8_pathspec_error(spec))
+        }
     }
 
     fn get_staged_diff_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
@@ -131,7 +170,7 @@ impl GitBridge {
             Err(_) => None, // No commits yet
         };
 
-        let mut opts = Self::make_diff_opts(pathspecs);
+        let mut opts = self.make_diff_opts(pathspecs)?;
         let mut diff = self.repo.diff_tree_to_index(
             head_tree.as_ref(),
             Some(&self.repo.index()?),
@@ -143,7 +182,7 @@ impl GitBridge {
     }
 
     fn get_working_diff_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
-        let mut opts = Self::make_diff_opts(pathspecs);
+        let mut opts = self.make_diff_opts(pathspecs)?;
         opts.include_untracked(false);
 
         let mut diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
@@ -162,7 +201,7 @@ impl GitBridge {
             None
         };
 
-        let mut opts = Self::make_diff_opts(pathspecs);
+        let mut opts = self.make_diff_opts(pathspecs)?;
         let mut diff = self.repo.diff_tree_to_tree(
             parent_tree.as_ref(),
             Some(&tree),
@@ -180,7 +219,7 @@ impl GitBridge {
         let from_tree = from_obj.peel_to_commit()?.tree()?;
         let to_tree = to_obj.peel_to_commit()?.tree()?;
 
-        let mut opts = Self::make_diff_opts(pathspecs);
+        let mut opts = self.make_diff_opts(pathspecs)?;
         let mut diff = self.repo.diff_tree_to_tree(
             Some(&from_tree),
             Some(&to_tree),
@@ -193,7 +232,7 @@ impl GitBridge {
 
     fn get_ref_to_working_diff_files(&self, refspec: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
         let tree = self.resolve_tree(refspec)?;
-        let mut opts = Self::make_diff_opts(pathspecs);
+        let mut opts = self.make_diff_opts(pathspecs)?;
         let mut diff = self.repo.diff_tree_to_workdir_with_index(
             Some(&tree),
             Some(&mut opts),
@@ -724,6 +763,86 @@ impl Drop for OwnerValidationDisabled {
     }
 }
 
+fn normalize_open_path(path: &Path) -> Result<PathBuf, GitError> {
+    let canonical = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) if path.is_absolute() => normalize_lexical(path),
+        Err(_) => normalize_lexical(&env::current_dir()?.join(path)),
+    };
+
+    Ok(if canonical.is_file() {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(canonical)
+    } else {
+        canonical
+    })
+}
+
+fn normalize_absolute_pathspec(path: &Path) -> PathBuf {
+    let path = normalize_lexical(path);
+    let Some(leaf) = path.file_name() else {
+        return fs::canonicalize(&path).unwrap_or(path);
+    };
+    let mut trailing_components = vec![leaf.to_os_string()];
+
+    let Some(parent) = path.parent() else {
+        return path;
+    };
+
+    for ancestor in parent.ancestors() {
+        if ancestor.exists() {
+            let mut normalized =
+                fs::canonicalize(ancestor).unwrap_or_else(|_| normalize_lexical(ancestor));
+            for component in trailing_components.iter().rev() {
+                normalized.push(component);
+            }
+            return normalized;
+        }
+
+        let Some(name) = ancestor.file_name() else {
+            return path;
+        };
+        trailing_components.push(name.to_os_string());
+    }
+
+    path
+}
+
+fn pathspec_outside_repo_error(pathspec: &str, repo_root: &Path) -> GitError {
+    GitError::Git2(git2::Error::from_str(&format!(
+        "pathspec '{pathspec}' is outside repository '{}'",
+        repo_root.display()
+    )))
+}
+
+fn non_utf8_pathspec_error(pathspec: &str) -> GitError {
+    GitError::Git2(git2::Error::from_str(&format!(
+        "pathspec '{pathspec}' is not valid UTF-8 after normalization"
+    )))
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+        }
+    }
+
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +955,104 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_path, "sample.ts");
         assert_eq!(files[0].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn pathspecs_are_normalized_from_open_directory() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        fs::create_dir_all(temp.path().join("pkg")).unwrap();
+
+        commit_file(&repo, "pkg/a.py", "def foo():\n    return 1\n", "init");
+        fs::write(temp.path().join("pkg/a.py"), "def foo():\n    return 2\n").unwrap();
+
+        let bridge = GitBridge::open(&temp.path().join("pkg")).unwrap();
+        let relative_files = bridge
+            .get_changed_files(&DiffScope::Working, &["a.py".to_string()])
+            .unwrap();
+
+        assert_eq!(relative_files.len(), 1);
+        assert_eq!(relative_files[0].file_path, "pkg/a.py");
+
+        let absolute_path = temp.path().join("pkg/a.py").to_string_lossy().to_string();
+        let absolute_files = bridge
+            .get_changed_files(&DiffScope::Working, &[absolute_path])
+            .unwrap();
+
+        assert_eq!(absolute_files.len(), 1);
+        assert_eq!(absolute_files[0].file_path, "pkg/a.py");
+    }
+
+    #[test]
+    fn absolute_deleted_pathspecs_are_normalized_from_existing_parent() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        fs::create_dir_all(temp.path().join("pkg")).unwrap();
+
+        commit_file(
+            &repo,
+            "pkg/deleted.py",
+            "def foo():\n    return 1\n",
+            "init",
+        );
+        let absolute_path = temp
+            .path()
+            .join("pkg/deleted.py")
+            .to_string_lossy()
+            .to_string();
+        fs::remove_file(temp.path().join("pkg/deleted.py")).unwrap();
+
+        let bridge = GitBridge::open(&temp.path().join("pkg")).unwrap();
+        let files = bridge
+            .get_changed_files(&DiffScope::Working, &[absolute_path])
+            .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path, "pkg/deleted.py");
+        assert_eq!(files[0].status, FileStatus::Deleted);
+    }
+
+    #[test]
+    fn absolute_missing_pathspecs_preserve_trailing_component_order() {
+        let temp = TempDir::new().unwrap();
+        let existing_parent = temp.path().join("existing");
+        fs::create_dir(&existing_parent).unwrap();
+
+        let pathspec = existing_parent.join("missing").join("leaf.py");
+        let normalized = normalize_absolute_pathspec(&pathspec);
+
+        let mut expected = fs::canonicalize(&existing_parent).unwrap();
+        expected.push("missing");
+        expected.push("leaf.py");
+        assert_eq!(normalized, expected);
+    }
+
+    #[test]
+    fn absolute_pathspecs_outside_repo_are_rejected() {
+        let repo_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let repo = Repository::init(repo_dir.path()).unwrap();
+
+        commit_file(&repo, "sample.py", "def foo():\n    return 1\n", "init");
+        fs::write(
+            repo_dir.path().join("sample.py"),
+            "def foo():\n    return 2\n",
+        )
+        .unwrap();
+        let outside_path = outside_dir.path().join("outside.py");
+        fs::write(&outside_path, "def outside():\n    return 1\n").unwrap();
+
+        let bridge = GitBridge::open(repo_dir.path()).unwrap();
+        let err = bridge
+            .get_changed_files(
+                &DiffScope::Working,
+                &[outside_path.to_string_lossy().to_string()],
+            )
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("pathspec"));
+        assert!(message.contains("is outside repository"));
     }
 
     #[test]

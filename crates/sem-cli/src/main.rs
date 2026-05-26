@@ -39,7 +39,7 @@ enum Commands {
         label: Option<String>,
 
         /// Git refs, files, or pathspecs (supports ref1..ref2, ref1...ref2, -- paths)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(num_args = 0.., value_name = "ARG")]
         args: Vec<String>,
 
         /// Show only staged changes (alias: --cached)
@@ -101,6 +101,10 @@ enum Commands {
         /// Run as if started in this directory (like git -C)
         #[arg(short = 'C', long = "cwd")]
         directory: Option<String>,
+
+        /// Pathspecs for filtering, passed after --
+        #[arg(last = true, allow_hyphen_values = true, value_name = "PATHSPEC")]
+        pathspecs: Vec<String>,
     },
     /// Show impact of changing an entity (deps, dependents, transitive impact, tests)
     Impact {
@@ -305,6 +309,14 @@ fn resolve_json(format: Option<String>, json: bool) -> bool {
     }
 }
 
+fn combine_diff_positionals(mut args: Vec<String>, pathspecs: Vec<String>) -> Vec<String> {
+    if !pathspecs.is_empty() {
+        args.push("--".to_string());
+        args.extend(pathspecs);
+    }
+    args
+}
+
 fn apply_color_mode(mode: ColorMode) {
     match mode {
         ColorMode::Always => control::set_override(true),
@@ -335,6 +347,7 @@ fn main() {
             no_cosmetics,
             color,
             directory,
+            pathspecs,
         }) => {
             apply_color_mode(color);
 
@@ -346,6 +359,7 @@ fn main() {
             });
 
             let effective_format = if json { OutputFormat::Json } else { format };
+            let args = combine_diff_positionals(args, pathspecs);
 
             diff_command(DiffOptions {
                 cwd,
@@ -552,6 +566,91 @@ fn main() {
                 label: None,
                 args: vec![],
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_command(argv: &[&str]) -> Commands {
+        Cli::try_parse_from(argv).unwrap().command.unwrap()
+    }
+
+    #[test]
+    fn diff_accepts_flags_after_ref_positionals() {
+        match parse_command(&[
+            "sem",
+            "diff",
+            "HEAD",
+            "--json",
+            "--staged",
+            "--no-cosmetics",
+            "--verbose",
+        ]) {
+            Commands::Diff {
+                args,
+                pathspecs,
+                json,
+                staged,
+                no_cosmetics,
+                verbose,
+                ..
+            } => {
+                assert_eq!(args, ["HEAD"]);
+                assert!(pathspecs.is_empty());
+                assert!(json);
+                assert!(staged);
+                assert!(no_cosmetics);
+                assert!(verbose);
+            }
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn diff_accepts_format_after_file_positionals() {
+        match parse_command(&["sem", "diff", "a.ts", "b.ts", "--format", "json"]) {
+            Commands::Diff {
+                args,
+                pathspecs,
+                format,
+                ..
+            } => {
+                assert_eq!(args, ["a.ts", "b.ts"]);
+                assert!(pathspecs.is_empty());
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn diff_keeps_pathspecs_after_separator_distinct() {
+        match parse_command(&[
+            "sem",
+            "diff",
+            "HEAD",
+            "--json",
+            "--",
+            "pkg/a.py",
+            "--literal",
+        ]) {
+            Commands::Diff {
+                args,
+                pathspecs,
+                json,
+                ..
+            } => {
+                assert_eq!(args, ["HEAD"]);
+                assert_eq!(pathspecs, ["pkg/a.py", "--literal"]);
+                assert!(json);
+
+                let combined = combine_diff_positionals(args, pathspecs);
+                assert_eq!(combined, ["HEAD", "--", "pkg/a.py", "--literal"]);
+            }
+            _ => panic!("expected diff command"),
         }
     }
 }
