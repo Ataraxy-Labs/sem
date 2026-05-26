@@ -1,3 +1,4 @@
+use super::orphan_summary_parts;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::DiffResult;
 use similar::{ChangeTag, TextDiff};
@@ -95,7 +96,9 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                                         match diff_change.tag() {
                                             ChangeTag::Delete => deletes.push(line.to_string()),
                                             ChangeTag::Insert => inserts.push(line.to_string()),
-                                            ChangeTag::Equal => post_table.push(format!("  {line}")),
+                                            ChangeTag::Equal => {
+                                                post_table.push(format!("  {line}"))
+                                            }
                                         }
                                     }
 
@@ -118,8 +121,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                     _ => {}
                 }
             } else if change.change_type == ChangeType::Modified {
-                if let (Some(before), Some(after)) =
-                    (&change.before_content, &change.after_content)
+                if let (Some(before), Some(after)) = (&change.before_content, &change.after_content)
                 {
                     let before_lines: Vec<&str> = before.lines().collect();
                     let after_lines: Vec<&str> = after.lines().collect();
@@ -140,10 +142,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
             }
 
             // Show rename/move details
-            if matches!(
-                change.change_type,
-                ChangeType::Renamed | ChangeType::Moved
-            ) {
+            if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
                     post_table.push(String::new());
                     post_table.push(format!("> from {old_path}"));
@@ -179,20 +178,23 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     if result.reordered_count > 0 {
         parts.push(format!("{} reordered", result.reordered_count));
     }
-    if result.orphan_count > 0 {
-        parts.push(format!("{} orphan", result.orphan_count));
-    }
-
     let files_label = if result.file_count == 1 {
         "file"
     } else {
         "files"
     };
+    let orphan_parts = orphan_summary_parts(result);
+    let orphan_suffix = if orphan_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", orphan_parts.join(", "))
+    };
 
     lines.push(format!(
-        "**Summary:** {} across {} {files_label}",
+        "**Summary:** {} across {} {files_label}{}",
         parts.join(", "),
         result.file_count,
+        orphan_suffix,
     ));
 
     lines.join("\n")

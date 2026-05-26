@@ -135,7 +135,7 @@ sem diff --format json
 Returns:
 ```json
 {
-  "summary": { "fileCount": 2, "added": 1, "modified": 1, "deleted": 1, "total": 3 },
+  "summary": { "fileCount": 2, "added": 1, "modified": 1, "deleted": 1, "moved": 0, "renamed": 0, "reordered": 0, "orphan": 0, "total": 3 },
   "changes": [
     {
       "entityId": "src/auth.ts::function::validateToken",
@@ -147,6 +147,8 @@ Returns:
   ]
 }
 ```
+
+The named change-type buckets (added, modified, deleted, moved, renamed, reordered) always sum to total. Orphan is metadata for module-level changes already included in those buckets.
 
 ## Architecture
 

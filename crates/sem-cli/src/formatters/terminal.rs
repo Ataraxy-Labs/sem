@@ -1,3 +1,4 @@
+use super::orphan_summary_parts;
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::DiffResult;
@@ -288,20 +289,25 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 .to_string(),
         );
     }
-    if result.orphan_count > 0 {
-        parts.push(format!("{} orphan", result.orphan_count).dimmed().to_string());
-    }
-
     let files_label = if result.file_count == 1 {
         "file"
     } else {
         "files"
     };
+    let orphan_parts = orphan_summary_parts(result);
+    let orphan_suffix = if orphan_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", orphan_parts.join(", "))
+            .dimmed()
+            .to_string()
+    };
 
     lines.push(format!(
-        "Summary: {} across {} {files_label}",
+        "Summary: {} across {} {files_label}{}",
         parts.join(", "),
         result.file_count,
+        orphan_suffix,
     ));
 
     // Show noise-filtered line when entities were analyzed

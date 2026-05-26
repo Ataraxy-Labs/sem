@@ -138,7 +138,8 @@ pub fn compute_semantic_diff(
         total_entities_after += after_count;
     }
 
-    // Single-pass counting (exclude orphan changes from entity counts)
+    // Single-pass counting. Orphans are first-class changes for the
+    // change-type buckets, and orphan_count is cross-cutting metadata.
     let mut added_count = 0;
     let mut modified_count = 0;
     let mut deleted_count = 0;
@@ -150,7 +151,6 @@ pub fn compute_semantic_diff(
     for c in &all_changes {
         if c.entity_type == "orphan" {
             orphan_count += 1;
-            continue;
         }
         match c.change_type {
             ChangeType::Added => added_count += 1,
@@ -564,5 +564,36 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("MODIFIED content of section A"));
+    }
+
+    #[test]
+    fn orphan_changes_count_toward_change_type_buckets() {
+        let before = "def foo():\n    return 1\n\ndef bar():\n    return 2\n";
+        let after = "# just a comment\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("svc.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.added_count, 1);
+        assert_eq!(result.deleted_count, 2);
+        assert_eq!(result.modified_count, 0);
+        assert_eq!(result.orphan_count, 1);
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.entity_type == "orphan" && c.change_type == ChangeType::Added));
+
+        let named_bucket_total = result.added_count
+            + result.modified_count
+            + result.deleted_count
+            + result.moved_count
+            + result.renamed_count
+            + result.reordered_count;
+        assert_eq!(named_bucket_total, result.changes.len());
     }
 }

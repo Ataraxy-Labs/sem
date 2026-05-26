@@ -1,3 +1,4 @@
+use super::orphan_summary_parts;
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::DiffResult;
@@ -48,7 +49,10 @@ pub fn format_plain(result: &DiffResult) -> String {
                     lines.push(format!("       {}", format!("from {old_path}").dimmed()));
                 } else if let Some(ref old_parent) = change.old_parent_id {
                     let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
-                    lines.push(format!("       {}", format!("moved from {parent_name}").dimmed()));
+                    lines.push(format!(
+                        "       {}",
+                        format!("moved from {parent_name}").dimmed()
+                    ));
                 }
             }
         }
@@ -62,29 +66,54 @@ pub fn format_plain(result: &DiffResult) -> String {
         parts.push(format!("{} added", result.added_count).green().to_string());
     }
     if result.modified_count > 0 {
-        parts.push(format!("{} modified", result.modified_count).yellow().to_string());
+        parts.push(
+            format!("{} modified", result.modified_count)
+                .yellow()
+                .to_string(),
+        );
     }
     if result.deleted_count > 0 {
-        parts.push(format!("{} deleted", result.deleted_count).red().to_string());
+        parts.push(
+            format!("{} deleted", result.deleted_count)
+                .red()
+                .to_string(),
+        );
     }
     if result.moved_count > 0 {
         parts.push(format!("{} moved", result.moved_count).blue().to_string());
     }
     if result.renamed_count > 0 {
-        parts.push(format!("{} renamed", result.renamed_count).cyan().to_string());
+        parts.push(
+            format!("{} renamed", result.renamed_count)
+                .cyan()
+                .to_string(),
+        );
     }
     if result.reordered_count > 0 {
-        parts.push(format!("{} reordered", result.reordered_count).magenta().to_string());
+        parts.push(
+            format!("{} reordered", result.reordered_count)
+                .magenta()
+                .to_string(),
+        );
     }
-    if result.orphan_count > 0 {
-        parts.push(format!("{} orphan", result.orphan_count).dimmed().to_string());
-    }
-
-    let files_label = if result.file_count == 1 { "file" } else { "files" };
+    let files_label = if result.file_count == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let orphan_parts = orphan_summary_parts(result);
+    let orphan_suffix = if orphan_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", orphan_parts.join(", "))
+            .dimmed()
+            .to_string()
+    };
     lines.push(format!(
-        "{} across {} {files_label}",
+        "{} across {} {files_label}{}",
         parts.join(", "),
         result.file_count,
+        orphan_suffix,
     ));
 
     lines.join("\n")

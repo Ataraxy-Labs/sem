@@ -334,6 +334,10 @@ sem diff --format json
     "added": 1,
     "modified": 1,
     "deleted": 1,
+    "moved": 0,
+    "renamed": 0,
+    "reordered": 0,
+    "orphan": 0,
     "total": 3
   },
   "changes": [
@@ -347,6 +351,8 @@ sem diff --format json
   ]
 }
 ```
+
+The named change-type buckets (`added`, `modified`, `deleted`, `moved`, `renamed`, `reordered`) always sum to `total`. `orphan` is a cross-cutting metadata count for module-level changes, and those changes are already included in the named change-type buckets.
 
 ## As a library
 
