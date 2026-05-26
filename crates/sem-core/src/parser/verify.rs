@@ -40,6 +40,12 @@ pub struct ArityMismatch {
     pub is_variadic: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallArgCount {
+    actual_args: usize,
+    line_offset: usize,
+}
+
 /// Verify function call contracts across the codebase.
 pub fn verify_contracts(
     root: &Path,
@@ -106,7 +112,7 @@ pub fn verify_contracts(
             continue;
         }
 
-        if let Some(actual) = count_call_args(caller_content, &callee.name) {
+        for actual in count_all_call_args(caller_content, &callee.name) {
             if actual != expected {
                 violations.push(ContractViolation {
                     entity_name: callee.name.clone(),
@@ -179,7 +185,7 @@ pub fn verify_contracts_with_graph(
             continue;
         }
 
-        if let Some(actual) = count_call_args(caller_content, &callee.name) {
+        for actual in count_all_call_args(caller_content, &callee.name) {
             if actual != expected {
                 violations.push(ContractViolation {
                     entity_name: callee.name.clone(),
@@ -202,7 +208,7 @@ fn lang_from_ext(ext: &str) -> &'static str {
     match ext {
         ".py" | ".pyi" => "python",
         ".ts" | ".tsx" | ".mts" | ".cts" => "typescript",
-        ".js" | ".jsx" | ".mjs" | ".cjs" => "typescript",
+        ".js" | ".jsx" | ".mjs" | ".cjs" => "javascript",
         ".rs" => "rust",
         ".go" => "go",
         _ => "unknown",
@@ -270,12 +276,24 @@ fn extract_param_info_from_node(
             }
             "typescript" => {
                 if kind == "required_parameter" {
-                    min_params += 1;
                     max_params += 1;
+                    if !has_js_ts_default_value(child) {
+                        min_params += 1;
+                    }
                 } else if kind == "optional_parameter" {
                     max_params += 1;
                 } else if kind == "rest_pattern" {
                     is_variadic = true;
+                }
+            }
+            "javascript" => {
+                if kind == "rest_pattern" {
+                    is_variadic = true;
+                } else if matches!(kind, "identifier" | "formal_parameter" | "assignment_pattern") {
+                    max_params += 1;
+                    if !has_js_ts_default_value(child) {
+                        min_params += 1;
+                    }
                 }
             }
             "rust" => {
@@ -298,16 +316,15 @@ fn extract_param_info_from_node(
             }
             "go" => {
                 if kind == "parameter_declaration" {
-                    // Check for variadic: ...Type
-                    let type_text = child
-                        .child_by_field_name("type")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .unwrap_or("");
-                    if type_text.starts_with("...") {
+                    let type_node = child.child_by_field_name("type");
+                    let type_text = type_node.and_then(|n| n.utf8_text(source).ok()).unwrap_or("");
+                    let param_text = child.utf8_text(source).unwrap_or("");
+                    if type_text.starts_with("...") || param_text.contains("...") {
                         is_variadic = true;
                     } else {
-                        min_params += 1;
-                        max_params += 1;
+                        let count = count_go_parameter_declaration_arity(child);
+                        min_params += count;
+                        max_params += count;
                     }
                 }
             }
@@ -320,6 +337,43 @@ fn extract_param_info_from_node(
         max_params,
         is_variadic,
     })
+}
+
+fn has_js_ts_default_value(node: tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    let has_assignment_child = node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "assignment_pattern");
+    node.kind() == "assignment_pattern"
+        || node.child_by_field_name("value").is_some()
+        || has_assignment_child
+}
+
+fn count_go_parameter_declaration_arity(node: tree_sitter::Node) -> usize {
+    let mut name_cursor = node.walk();
+    let field_names = node
+        .children_by_field_name("name", &mut name_cursor)
+        .count();
+    if field_names > 0 {
+        return field_names;
+    }
+
+    let type_range = match node.child_by_field_name("type") {
+        Some(type_node) => (type_node.start_byte(), type_node.end_byte()),
+        None => return 1,
+    };
+    let mut cursor = node.walk();
+    let identifier_names = node
+        .named_children(&mut cursor)
+        .filter(|child| {
+            child.kind() == "identifier" && type_range != (child.start_byte(), child.end_byte())
+        })
+        .count();
+    if identifier_names > 0 {
+        identifier_names
+    } else {
+        1
+    }
 }
 
 fn find_first_function(root: tree_sitter::Node) -> Option<tree_sitter::Node> {
@@ -352,22 +406,46 @@ pub fn count_call_args_ts(
     callee_name: &str,
     file_path: &str,
 ) -> Option<usize> {
-    let ext = file_path.rfind('.').map(|i| &file_path[i..])?;
-    let config = get_language_config(ext)?;
-    let language = (config.get_language)()?;
+    count_call_arg_sites_ts(caller_content, callee_name, file_path)
+        .into_iter()
+        .next()
+        .map(|site| site.actual_args)
+}
+
+fn count_call_arg_sites_ts(
+    caller_content: &str,
+    callee_name: &str,
+    file_path: &str,
+) -> Vec<CallArgCount> {
+    let ext = match file_path.rfind('.').map(|i| &file_path[i..]) {
+        Some(ext) => ext,
+        None => return Vec::new(),
+    };
+    let config = match get_language_config(ext) {
+        Some(config) => config,
+        None => return Vec::new(),
+    };
+    let language = match (config.get_language)() {
+        Some(language) => language,
+        None => return Vec::new(),
+    };
 
     let mut parser = tree_sitter::Parser::new();
     let _ = parser.set_language(&language);
-    let tree = parser.parse(caller_content.as_bytes(), None)?;
+    let tree = match parser.parse(caller_content.as_bytes(), None) {
+        Some(tree) => tree,
+        None => return Vec::new(),
+    };
 
-    find_call_arg_count(tree.root_node(), caller_content.as_bytes(), callee_name)
+    find_call_arg_counts(tree.root_node(), caller_content.as_bytes(), callee_name)
 }
 
-fn find_call_arg_count(
+fn find_call_arg_counts(
     root: tree_sitter::Node,
     source: &[u8],
     callee_name: &str,
-) -> Option<usize> {
+) -> Vec<CallArgCount> {
+    let mut sites = Vec::new();
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         let kind = node.kind();
@@ -395,15 +473,18 @@ fn find_call_arg_count(
 
                 if func_name == callee_name {
                     if let Some(args) = node.child_by_field_name("arguments") {
-                        let mut count = 0;
+                        let mut actual_args = 0;
                         let mut cursor = args.walk();
                         for child in args.named_children(&mut cursor) {
                             // Skip comment nodes
                             if !child.kind().contains("comment") {
-                                count += 1;
+                                actual_args += 1;
                             }
                         }
-                        return Some(count);
+                        sites.push(CallArgCount {
+                            actual_args,
+                            line_offset: node.start_position().row,
+                        });
                     }
                 }
             }
@@ -415,7 +496,7 @@ fn find_call_arg_count(
             worklist.push(child);
         }
     }
-    None
+    sites
 }
 
 /// Names too common/ambiguous for reliable arity checking (constructors, builtins).
@@ -520,27 +601,21 @@ pub fn find_arity_mismatches(
             continue;
         }
 
-        // Count call args using tree-sitter
-        let actual = match count_call_args_ts(
-            &caller.content,
-            &callee.name,
-            &caller.file_path,
-        ) {
-            Some(a) => a,
-            None => continue,
-        };
-
-        if actual < param_info.min_params || actual > param_info.max_params {
-            mismatches.push(ArityMismatch {
-                caller_entity: caller.name.clone(),
-                callee_entity: callee.name.clone(),
-                expected_min: param_info.min_params,
-                expected_max: param_info.max_params,
-                actual_args: actual,
-                file_path: caller.file_path.clone(),
-                line: caller.start_line,
-                is_variadic: false,
-            });
+        for call_site in count_call_arg_sites_ts(&caller.content, &callee.name, &caller.file_path) {
+            if call_site.actual_args < param_info.min_params
+                || call_site.actual_args > param_info.max_params
+            {
+                mismatches.push(ArityMismatch {
+                    caller_entity: caller.name.clone(),
+                    callee_entity: callee.name.clone(),
+                    expected_min: param_info.min_params,
+                    expected_max: param_info.max_params,
+                    actual_args: call_site.actual_args,
+                    file_path: caller.file_path.clone(),
+                    line: caller.start_line + call_site.line_offset,
+                    is_variadic: false,
+                });
+            }
         }
     }
 
@@ -620,22 +695,21 @@ pub fn find_broken_callers(
             continue;
         }
 
-        let actual = match count_call_args_ts(&caller.content, &callee.name, &caller.file_path) {
-            Some(a) => a,
-            None => continue,
-        };
-
-        if actual < new_info.min_params || actual > new_info.max_params {
-            mismatches.push(ArityMismatch {
-                caller_entity: caller.name.clone(),
-                callee_entity: callee.name.clone(),
-                expected_min: new_info.min_params,
-                expected_max: new_info.max_params,
-                actual_args: actual,
-                file_path: caller.file_path.clone(),
-                line: caller.start_line,
-                is_variadic: false,
-            });
+        for call_site in count_call_arg_sites_ts(&caller.content, &callee.name, &caller.file_path) {
+            if call_site.actual_args < new_info.min_params
+                || call_site.actual_args > new_info.max_params
+            {
+                mismatches.push(ArityMismatch {
+                    caller_entity: caller.name.clone(),
+                    callee_entity: callee.name.clone(),
+                    expected_min: new_info.min_params,
+                    expected_max: new_info.max_params,
+                    actual_args: call_site.actual_args,
+                    file_path: caller.file_path.clone(),
+                    line: caller.start_line + call_site.line_offset,
+                    is_variadic: false,
+                });
+            }
         }
     }
 
@@ -668,10 +742,16 @@ fn extract_param_count(content: &str) -> usize {
 }
 
 /// Count arguments at a call site: find `callee_name(...)` in content and count args.
+#[cfg(test)]
 fn count_call_args(content: &str, callee_name: &str) -> Option<usize> {
+    count_all_call_args(content, callee_name).into_iter().next()
+}
+
+fn count_all_call_args(content: &str, callee_name: &str) -> Vec<usize> {
     let bytes = content.as_bytes();
     let name_bytes = callee_name.as_bytes();
     let mut search_start = 0;
+    let mut counts = Vec::new();
 
     while let Some(rel_pos) = content[search_start..].find(callee_name) {
         let pos = search_start + rel_pos;
@@ -682,24 +762,30 @@ fn count_call_args(content: &str, callee_name: &str) -> Option<usize> {
             !prev.is_ascii_alphanumeric() && prev != b'_'
         };
 
+        let mut next_search_start = pos + 1;
         if is_boundary && after < bytes.len() && bytes[after] == b'(' {
-            let args_start = &content[after + 1..];
+            let args_start_index = after + 1;
+            let args_start = &content[args_start_index..];
             if let Some(close) = find_matching_paren(args_start) {
                 let args_str = args_start[..close].trim();
                 if args_str.is_empty() {
-                    return Some(0);
+                    counts.push(0);
+                } else {
+                    counts.push(count_top_level_commas(args_str) + 1);
                 }
-                return Some(count_top_level_commas(args_str) + 1);
+                next_search_start = args_start_index + close + 1;
+            } else {
+                next_search_start = after;
             }
         }
 
-        search_start = pos + 1;
+        search_start = next_search_start;
         while search_start < content.len() && !content.is_char_boundary(search_start) {
             search_start += 1;
         }
     }
 
-    None
+    counts
 }
 
 fn find_matching_paren(s: &str) -> Option<usize> {
@@ -759,6 +845,16 @@ mod tests {
     }
 
     #[test]
+    fn test_count_all_call_args() {
+        assert_eq!(count_all_call_args("foo(1, 2); foo(1);", "foo"), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_count_all_call_args_resumes_after_unclosed_candidate() {
+        assert_eq!(count_all_call_args("foo(\nfoo(1, 2)", "foo"), vec![2]);
+    }
+
+    #[test]
     fn test_count_call_args_multibyte_utf8() {
         assert_eq!(count_call_args("let café = foo(1, 2);", "foo"), Some(2));
         assert_eq!(count_call_args("let É = 1; bar(x)", "bar"), Some(1));
@@ -811,6 +907,48 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_param_info_typescript_default_parameter() {
+        let info = extract_param_info_ts(
+            "function foo(a: number, b = 1): number { return a + b; }",
+            "test.ts",
+        )
+        .unwrap();
+        assert_eq!(info.min_params, 1);
+        assert_eq!(info.max_params, 2);
+        assert!(!info.is_variadic);
+    }
+
+    #[test]
+    fn test_extract_param_info_javascript_default_parameter() {
+        let info =
+            extract_param_info_ts("function foo(a, b = 1) { return a + b; }", "test.js").unwrap();
+        assert_eq!(info.min_params, 1);
+        assert_eq!(info.max_params, 2);
+        assert!(!info.is_variadic);
+    }
+
+    #[test]
+    fn test_extract_param_info_javascript_required_parameters() {
+        let info = extract_param_info_ts("function foo(a, b) { return a + b; }", "test.js")
+            .unwrap();
+        assert_eq!(info.min_params, 2);
+        assert_eq!(info.max_params, 2);
+        assert!(!info.is_variadic);
+    }
+
+    #[test]
+    fn test_extract_param_info_typescript_arrow_default_parameter() {
+        let info = extract_param_info_ts(
+            "const foo = (a: number, b = 1): number => a + b;",
+            "test.ts",
+        )
+        .unwrap();
+        assert_eq!(info.min_params, 1);
+        assert_eq!(info.max_params, 2);
+        assert!(!info.is_variadic);
+    }
+
+    #[test]
     fn test_extract_param_info_rust() {
         let info = extract_param_info_ts(
             "fn foo(&self, a: i32, b: String) -> bool { true }",
@@ -825,6 +963,28 @@ mod tests {
     fn test_extract_param_info_go() {
         let info = extract_param_info_ts(
             "func foo(a string, b int) error { return nil }",
+            "test.go",
+        )
+        .unwrap();
+        assert_eq!(info.min_params, 2);
+        assert_eq!(info.max_params, 2);
+    }
+
+    #[test]
+    fn test_extract_param_info_go_grouped_params() {
+        let info = extract_param_info_ts(
+            "func foo(a, b int, c string) int { return a + b }",
+            "test.go",
+        )
+        .unwrap();
+        assert_eq!(info.min_params, 3);
+        assert_eq!(info.max_params, 3);
+    }
+
+    #[test]
+    fn test_extract_param_info_go_unnamed_params() {
+        let info = extract_param_info_ts(
+            "func foo(int, string) bool { return true }",
             "test.go",
         )
         .unwrap();
@@ -850,5 +1010,24 @@ mod tests {
             "test.ts",
         );
         assert_eq!(count, Some(2));
+    }
+
+    #[test]
+    fn test_count_call_arg_sites_ts_repeated_calls() {
+        let sites =
+            count_call_arg_sites_ts("def bar():\n    foo(1, 2)\n    foo(1)\n", "foo", "test.py");
+        assert_eq!(
+            sites,
+            vec![
+                CallArgCount {
+                    actual_args: 2,
+                    line_offset: 1,
+                },
+                CallArgCount {
+                    actual_args: 1,
+                    line_offset: 2,
+                },
+            ]
+        );
     }
 }

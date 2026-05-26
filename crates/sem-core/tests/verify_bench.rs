@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef};
+use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::scope_resolve;
 use sem_core::parser::verify::{
@@ -78,6 +78,23 @@ fn build_graph_from_entities(
         dependents,
         dependencies,
     }
+}
+
+fn has_call_edge(graph: &EntityGraph, from_name: &str, to_name: &str) -> bool {
+    graph.edges.iter().any(|edge| {
+        if edge.ref_type != RefType::Calls {
+            return false;
+        }
+        let from = graph
+            .entities
+            .get(&edge.from_entity)
+            .map(|entity| entity.name.as_str());
+        let to = graph
+            .entities
+            .get(&edge.to_entity)
+            .map(|entity| entity.name.as_str());
+        from == Some(from_name) && to == Some(to_name)
+    })
 }
 
 #[test]
@@ -219,5 +236,96 @@ fn verify_broken_callers_from_signature_change() {
                 m.caller_entity, m.callee_entity, m.actual_args, m.expected_min
             ))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn verify_typescript_default_params_are_optional() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("app.ts"),
+        "function foo(a: number, b = 1): number { return a + b; }\nfunction bar(): number { return foo(1); }\n",
+    )
+    .unwrap();
+
+    let files = &["app.ts"];
+    let entities = extract_all_entities(root, files);
+    let graph = build_graph_from_entities(root, files, &entities);
+    assert!(
+        has_call_edge(&graph, "bar", "foo"),
+        "graph should contain bar -> foo call edge"
+    );
+    let mismatches = find_arity_mismatches(&graph, &entities);
+
+    assert!(
+        mismatches.is_empty(),
+        "default-valued TS params should not be required: {:?}",
+        mismatches
+    );
+}
+
+#[test]
+fn verify_go_grouped_params_count_each_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.go"),
+        "package main\n\nfunc foo(a, b int) int { return a + b }\nfunc bar() int { return foo(1) }\n",
+    )
+    .unwrap();
+
+    let files = &["main.go"];
+    let entities = extract_all_entities(root, files);
+    let graph = build_graph_from_entities(root, files, &entities);
+    assert!(
+        has_call_edge(&graph, "bar", "foo"),
+        "graph should contain bar -> foo call edge"
+    );
+    let mismatches = find_arity_mismatches(&graph, &entities);
+
+    assert!(
+        mismatches.iter().any(|m| {
+            m.caller_entity == "bar"
+                && m.callee_entity == "foo"
+                && m.expected_min == 2
+                && m.expected_max == 2
+                && m.actual_args == 1
+        }),
+        "should flag a one-arg call to a two-param grouped Go function: {:?}",
+        mismatches
+    );
+}
+
+#[test]
+fn verify_repeated_call_sites_checks_later_mismatches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("app.py"),
+        "def foo(a, b):\n    return a + b\n\n\ndef bar():\n    foo(1, 2)\n    foo(1)\n",
+    )
+    .unwrap();
+
+    let files = &["app.py"];
+    let entities = extract_all_entities(root, files);
+    let graph = build_graph_from_entities(root, files, &entities);
+    assert!(
+        has_call_edge(&graph, "bar", "foo"),
+        "graph should contain bar -> foo call edge"
+    );
+    let mismatches = find_arity_mismatches(&graph, &entities);
+
+    assert!(
+        mismatches.iter().any(|m| {
+            m.caller_entity == "bar"
+                && m.callee_entity == "foo"
+                && m.expected_min == 2
+                && m.expected_max == 2
+                && m.actual_args == 1
+                && m.line == 7
+        }),
+        "should flag the bad second call site with its own line: {:?}",
+        mismatches
     );
 }
