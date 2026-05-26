@@ -6,9 +6,11 @@ use std::time::Instant;
 
 use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
-use sem_core::git::types::{DiffScope, FileChange};
+use sem_core::git::types::{DiffScope, FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::{compute_semantic_diff, DiffResult};
+use sem_core::parser::plugins::code::languages::get_language_config;
+use sem_core::parser::registry::{detect_ext_from_content, ParserRegistry};
 
 use crate::formatters::{
     json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal,
@@ -138,6 +140,79 @@ fn path_matches_spec(file_path: &str, spec: &str) -> bool {
     }
 }
 
+fn parse_output_format(value: &str) -> OutputFormat {
+    match value {
+        "terminal" => OutputFormat::Terminal,
+        "plain" => OutputFormat::Plain,
+        "json" => OutputFormat::Json,
+        "markdown" | "md" => OutputFormat::Markdown,
+        _ => {
+            eprintln!(
+                "\x1b[31mError: invalid output format '{value}'. Expected terminal, plain, json, markdown, or md.\x1b[0m"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn normalize_trailing_output_format(opts: &mut DiffOptions) {
+    let original_args = std::mem::take(&mut opts.args);
+    let mut args = Vec::new();
+    let mut after_separator = false;
+    let mut idx = 0;
+
+    while idx < original_args.len() {
+        let arg = &original_args[idx];
+        if after_separator {
+            args.push(arg.clone());
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            after_separator = true;
+            args.push(arg.clone());
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--json" {
+            opts.format = OutputFormat::Json;
+            idx += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--format=") {
+            opts.format = parse_output_format(value);
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--format" {
+            match original_args.get(idx + 1) {
+                Some(value) if !value.starts_with("--") => {
+                    opts.format = parse_output_format(value);
+                    idx += 2;
+                    continue;
+                }
+                Some(value) => {
+                    eprintln!("\x1b[31mError: --format requires a value before '{value}'.\x1b[0m");
+                    process::exit(1);
+                }
+                None => {
+                    eprintln!("\x1b[31mError: --format requires a value.\x1b[0m");
+                    process::exit(1);
+                }
+            }
+        }
+
+        args.push(arg.clone());
+        idx += 1;
+    }
+
+    opts.args = args;
+}
+
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
 
@@ -253,8 +328,6 @@ fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
 /// Parse a unified diff (e.g. from `git diff`) into FileChange entries.
 /// Uses blob SHAs from `index` lines to retrieve full file contents via `git show`.
 fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
-    use sem_core::git::types::FileStatus;
-
     struct PatchEntry {
         file_path: String,
         old_file_path: Option<String>,
@@ -359,10 +432,122 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Vec<FileChange> {
         .collect()
 }
 
+fn file_language_id(file_path: &str, content: &str, registry: &ParserRegistry) -> Option<String> {
+    let resolved = registry.resolve_file_path(file_path);
+    let detection_path = resolved.as_deref().unwrap_or(file_path);
+    let plugin = registry.get_plugin_with_content(detection_path, content)?;
+
+    if plugin.id() != "code" {
+        return Some(plugin.id().to_string());
+    }
+
+    if let Some(ext) = Path::new(detection_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{}", ext.to_lowercase()))
+    {
+        if let Some(config) = get_language_config(&ext) {
+            return Some(config.id.to_string());
+        }
+    }
+
+    detect_ext_from_content(content)
+        .and_then(|ext| get_language_config(&ext).map(|config| config.id.to_string()))
+        .or_else(|| Some(plugin.id().to_string()))
+}
+
+fn display_language(language_id: &str) -> String {
+    match language_id {
+        "bash" => "Bash".to_string(),
+        "c" => "C".to_string(),
+        "cpp" => "C++".to_string(),
+        "csharp" => "C#".to_string(),
+        "csv" => "CSV".to_string(),
+        "erb" => "ERB".to_string(),
+        "hcl" => "HCL".to_string(),
+        "html" => "HTML".to_string(),
+        "javascript" => "JavaScript".to_string(),
+        "json" => "JSON".to_string(),
+        "markdown" => "Markdown".to_string(),
+        "nix" => "Nix".to_string(),
+        "ocaml" => "OCaml".to_string(),
+        "php" => "PHP".to_string(),
+        "python" => "Python".to_string(),
+        "ruby" => "Ruby".to_string(),
+        "rust" => "Rust".to_string(),
+        "svelte" => "Svelte".to_string(),
+        "toml" => "TOML".to_string(),
+        "tsx" => "TSX".to_string(),
+        "typescript" => "TypeScript".to_string(),
+        "vue" => "Vue".to_string(),
+        "xml" => "XML".to_string(),
+        "yaml" => "YAML".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+fn file_compare_changes(
+    source_path: &str,
+    target_path: &str,
+    source_content: String,
+    target_content: String,
+    registry: &ParserRegistry,
+) -> (Vec<FileChange>, Option<(String, String)>) {
+    let source_language = file_language_id(source_path, &source_content, registry);
+    let target_language = file_language_id(target_path, &target_content, registry);
+
+    if let (Some(source_language), Some(target_language)) = (&source_language, &target_language) {
+        if source_language != target_language {
+            // Cross-language inputs cannot share one parser namespace without
+            // misattributing one side, so represent them as independent sides.
+            return (
+                vec![
+                    FileChange {
+                        file_path: source_path.to_string(),
+                        old_file_path: None,
+                        status: FileStatus::Deleted,
+                        before_content: Some(source_content),
+                        after_content: None,
+                    },
+                    FileChange {
+                        file_path: target_path.to_string(),
+                        old_file_path: None,
+                        status: FileStatus::Added,
+                        before_content: None,
+                        after_content: Some(target_content),
+                    },
+                ],
+                Some((
+                    display_language(source_language),
+                    display_language(target_language),
+                )),
+            );
+        }
+    }
+
+    (
+        vec![FileChange {
+            file_path: target_path.to_string(),
+            old_file_path: None,
+            status: FileStatus::Modified,
+            before_content: Some(source_content),
+            after_content: Some(target_content),
+        }],
+        None,
+    )
+}
+
 pub fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
 
     let t0 = Instant::now();
+    normalize_trailing_output_format(&mut opts);
     let mut parsed = parse_args(std::mem::take(&mut opts.args), &opts.cwd);
 
     // Resolve jj revsets to git SHAs if we're in a jj repo
@@ -447,18 +632,21 @@ pub fn diff_command(mut opts: DiffOptions) {
             process::exit(1);
         });
 
-        let change = FileChange {
-            file_path: opts
-                .label
-                .clone()
-                .or_else(|| label.clone())
-                .unwrap_or_else(|| after.clone()),
-            old_file_path: None,
-            status: sem_core::git::types::FileStatus::Modified,
-            before_content: Some(content_a),
-            after_content: Some(content_b),
-        };
-        (vec![change], false)
+        let target_label = opts
+            .label
+            .clone()
+            .or_else(|| label.clone())
+            .unwrap_or_else(|| after.clone());
+        let registry = super::create_registry(&opts.cwd);
+        let (changes, language_mismatch) =
+            file_compare_changes(before, &target_label, content_a, content_b, &registry);
+        if let Some((language_a, language_b)) = language_mismatch {
+            eprintln!(
+                "warning: comparing files with different languages: {} ({}) and {} ({}); rendering as delete/add",
+                before, language_a, after, language_b
+            );
+        }
+        (changes, false)
     } else if opts.patch {
         // Read unified diff from stdin and parse it
         let mut input = String::new();
@@ -475,9 +663,10 @@ pub fn diff_command(mut opts: DiffOptions) {
             changes
                 .into_iter()
                 .filter(|fc| {
-                    parsed.pathspecs.iter().any(|spec| {
-                        path_matches_spec(&fc.file_path, spec)
-                    })
+                    parsed
+                        .pathspecs
+                        .iter()
+                        .any(|spec| path_matches_spec(&fc.file_path, spec))
                 })
                 .collect()
         };
@@ -610,7 +799,10 @@ fn run_diff_pipeline(
             .filter(|fc| {
                 exts.iter().any(|ext| {
                     fc.file_path.ends_with(ext.as_str())
-                        || fc.old_file_path.as_ref().is_some_and(|old| old.ends_with(ext.as_str()))
+                        || fc
+                            .old_file_path
+                            .as_ref()
+                            .is_some_and(|old| old.ends_with(ext.as_str()))
                 })
             })
             .collect()
