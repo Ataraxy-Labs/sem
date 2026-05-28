@@ -334,6 +334,86 @@ func helper(x: Int) -> Int {
         assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
         assert!(names.contains(&"Repository"), "Should find protocol Repository, got: {:?}", names);
         assert!(names.contains(&"helper"), "Should find function helper, got: {:?}", names);
+
+        let point = entities.iter().find(|e| e.name == "Point").unwrap();
+        assert_eq!(point.entity_type, "struct");
+
+        let status = entities.iter().find(|e| e.name == "Status").unwrap();
+        assert_eq!(status.entity_type, "enum");
+    }
+
+    #[test]
+    fn test_swift_conditional_compilation_inside_struct() {
+        let code = r#"
+import ArgumentParser
+
+public struct TuistCommand: AsyncParsableCommand {
+    public init() {}
+
+    public static var configuration: CommandConfiguration {
+        let comment = "brace in string }"
+        let multiline = """
+        brace in multiline }
+        escaped \"""
+        """
+        /* brace in comment } */
+        CommandConfiguration(commandName: "tuist")
+    }
+
+    #if os(macOS)
+        public static var groupedSubcommands: [ParsableCommand.Type] {
+            [InstallCommand.self]
+        }
+    #else
+        public static var groupedSubcommands: [ParsableCommand.Type] {
+            []
+        }
+    #endif
+
+    public func run() async throws {}
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "TuistCommand.swift");
+        eprintln!(
+            "Swift conditional entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let command = entities
+            .iter()
+            .find(|e| e.name == "TuistCommand")
+            .expect("Should recover TuistCommand struct");
+        assert_eq!(command.entity_type, "struct");
+        assert!(command.parent_id.is_none());
+
+        let renamed_code = code.replace("TuistCommand", "RenamedCommand");
+        let renamed_entities = plugin.extract_entities(&renamed_code, "TuistCommand.swift");
+        let renamed_command = renamed_entities
+            .iter()
+            .find(|e| e.name == "RenamedCommand")
+            .expect("Should recover renamed command struct");
+        assert_eq!(command.structural_hash, renamed_command.structural_hash);
+
+        for member in ["init", "configuration", "run"] {
+            let entity = entities
+                .iter()
+                .find(|e| e.name == member)
+                .unwrap_or_else(|| panic!("Should find {member}"));
+            assert_eq!(entity.parent_id.as_deref(), Some(command.id.as_str()));
+        }
+
+        let grouped_subcommands: Vec<_> = entities
+            .iter()
+            .filter(|e| e.name == "groupedSubcommands")
+            .collect();
+        assert_eq!(grouped_subcommands.len(), 2);
+        assert!(grouped_subcommands
+            .iter()
+            .all(|entity| entity.parent_id.as_deref() == Some(command.id.as_str())));
     }
 
     #[test]

@@ -22,6 +22,14 @@ pub fn extract_entities(
         None,
     );
 
+    recover_swift_conditional_compilation_containers(
+        tree.root_node(),
+        file_path,
+        config,
+        &mut entities,
+        source_code.as_bytes(),
+    );
+
     // Post-pass: disambiguate colliding entity IDs by appending @L{line}.
     // Two overloads with the same name (e.g. function overloads in C++/TS)
     // get identical IDs; re-assign all colliding entries with line suffixes.
@@ -433,6 +441,394 @@ fn visit_node(
             worklist.push((child, pid_owned.clone(), child_enclosing));
         }
     }
+}
+
+#[derive(Clone)]
+struct RecoveredSwiftContainer {
+    name: String,
+    entity_type: &'static str,
+    start_byte: usize,
+    name_start_byte: usize,
+    name_end_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
+// tree-sitter-swift 0.7 fails to keep class-like declarations intact when a
+// body contains #if/#else/#endif. Recover that container from the ERROR node
+// and reparent declarations that the normal walk extracted as file-scope.
+fn recover_swift_conditional_compilation_containers(
+    root: Node,
+    file_path: &str,
+    config: &LanguageConfig,
+    entities: &mut Vec<SemanticEntity>,
+    source: &[u8],
+) {
+    if config.id != "swift" {
+        return;
+    }
+
+    let mut recovered = Vec::new();
+    let mut worklist = vec![root];
+    while let Some(node) = worklist.pop() {
+        if node.kind() == "ERROR" {
+            if let Some(container) = parse_swift_recovered_container(node, source) {
+                if !recovered
+                    .iter()
+                    .any(|existing: &RecoveredSwiftContainer| existing.start_byte == container.start_byte)
+                {
+                    recovered.push(container);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            worklist.push(child);
+        }
+    }
+
+    if recovered.is_empty() {
+        return;
+    }
+
+    for entity in entities.iter_mut() {
+        if entity.parent_id.is_some() {
+            continue;
+        }
+
+        let Some(container) = recovered
+            .iter()
+            .filter(|container| {
+                entity.start_line > container.start_line && entity.end_line <= container.end_line
+            })
+            .min_by_key(|container| container.end_line - container.start_line)
+        else {
+            continue;
+        };
+
+        let parent_id = build_entity_id(file_path, container.entity_type, &container.name, None);
+        entity.parent_id = Some(parent_id.clone());
+        entity.id = build_entity_id(
+            &entity.file_path,
+            &entity.entity_type,
+            &entity.name,
+            Some(&parent_id),
+        );
+    }
+
+    for container in recovered {
+        let already_extracted = entities.iter().any(|entity| {
+            entity.name == container.name
+                && entity.entity_type == container.entity_type
+                && entity.start_line == container.start_line
+        });
+        if already_extracted {
+            continue;
+        }
+
+        let content = std::str::from_utf8(&source[container.start_byte..container.end_byte])
+            .unwrap_or("")
+            .to_string();
+        let name_range = container
+            .name_start_byte
+            .checked_sub(container.start_byte)
+            .zip(container.name_end_byte.checked_sub(container.start_byte));
+        let struct_hash = match name_range {
+            Some((name_start, name_end)) => {
+                recovered_swift_structural_hash(&content, name_start, name_end)
+            }
+            None => recovered_swift_structural_hash(&content, 0, 0),
+        };
+        entities.push(SemanticEntity {
+            id: build_entity_id(file_path, container.entity_type, &container.name, None),
+            file_path: file_path.to_string(),
+            entity_type: container.entity_type.to_string(),
+            name: container.name,
+            parent_id: None,
+            content_hash: content_hash(&content),
+            structural_hash: Some(struct_hash),
+            content,
+            start_line: container.start_line,
+            end_line: container.end_line,
+            metadata: None,
+        });
+    }
+
+    entities.sort_by(|a, b| {
+        a.start_line
+            .cmp(&b.start_line)
+            .then_with(|| b.end_line.cmp(&a.end_line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn parse_swift_recovered_container(node: Node, source: &[u8]) -> Option<RecoveredSwiftContainer> {
+    let start_byte = node.start_byte();
+    let source_from_node = std::str::from_utf8(&source[start_byte..]).ok()?;
+    let open_brace_offset = source_from_node.find('{')?;
+    let header = &source_from_node[..open_brace_offset];
+    let (entity_type, name, name_start, name_end) = parse_swift_type_header(header)?;
+
+    let open_brace = start_byte + open_brace_offset;
+    let end_byte = find_matching_brace(source, open_brace)?;
+    let closing_brace_byte = end_byte.checked_sub(1)?;
+    let content = std::str::from_utf8(&source[start_byte..end_byte]).ok()?;
+    if !swift_contains_conditional_directive(content) {
+        return None;
+    }
+
+    Some(RecoveredSwiftContainer {
+        name,
+        entity_type,
+        start_byte,
+        name_start_byte: start_byte + name_start,
+        name_end_byte: start_byte + name_end,
+        end_byte,
+        start_line: node.start_position().row + 1,
+        end_line: line_number_for_byte(source, closing_brace_byte),
+    })
+}
+
+fn parse_swift_type_header(header: &str) -> Option<(&'static str, String, usize, usize)> {
+    let mut offset = 0;
+    while let Some((word, _, end)) = next_swift_word(header, offset) {
+        if let Some(entity_type) = swift_declaration_keyword_type(word) {
+            let (name, name_start, name_end) =
+                swift_name_after_declaration_keyword(header, word, end)?;
+            return Some((entity_type, name.to_string(), name_start, name_end));
+        }
+        offset = end;
+    }
+    None
+}
+
+fn swift_name_after_declaration_keyword<'a>(
+    header: &'a str,
+    keyword: &str,
+    offset: usize,
+) -> Option<(&'a str, usize, usize)> {
+    if keyword != "extension" {
+        return next_swift_word(header, offset);
+    }
+
+    let mut start = offset;
+    while start < header.len() {
+        let ch = header[start..].chars().next()?;
+        if !ch.is_whitespace() {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+
+    let mut angle_depth = 0usize;
+    let mut end = start;
+    while end < header.len() {
+        let ch = header[end..].chars().next()?;
+        if ch == '<' {
+            angle_depth += 1;
+        } else if ch == '>' {
+            angle_depth = angle_depth.saturating_sub(1);
+        } else if angle_depth == 0 && (ch.is_whitespace() || ch == ':' || ch == '{') {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+
+    let trimmed = header[start..end].trim_end();
+    let trimmed_end = start + trimmed.len();
+    (start < trimmed_end).then_some((&header[start..trimmed_end], start, trimmed_end))
+}
+
+fn next_swift_word(input: &str, mut offset: usize) -> Option<(&str, usize, usize)> {
+    while offset < input.len() {
+        let ch = input[offset..].chars().next()?;
+        if is_swift_identifier_start(ch) {
+            break;
+        }
+        offset += ch.len_utf8();
+    }
+
+    let start = offset;
+    while offset < input.len() {
+        let ch = input[offset..].chars().next()?;
+        if !is_swift_identifier_continue(ch) {
+            break;
+        }
+        offset += ch.len_utf8();
+    }
+
+    (start < offset).then_some((&input[start..offset], start, offset))
+}
+
+fn is_swift_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_swift_identifier_continue(ch: char) -> bool {
+    is_swift_identifier_start(ch) || ch.is_ascii_digit()
+}
+
+fn swift_declaration_keyword_type(keyword: &str) -> Option<&'static str> {
+    match keyword {
+        "actor" => Some("actor"),
+        "class" => Some("class"),
+        "enum" => Some("enum"),
+        "extension" => Some("extension"),
+        "protocol" => Some("protocol_declaration"),
+        "struct" => Some("struct"),
+        _ => None,
+    }
+}
+
+fn swift_contains_conditional_directive(content: &str) -> bool {
+    content.lines().any(|line| {
+        let line = line.trim_start();
+        line == "#if"
+            || line.starts_with("#if ")
+            || line.starts_with("#if\t")
+            || line.starts_with("#if(")
+            || line == "#else"
+            || line.starts_with("#elseif ")
+            || line.starts_with("#elseif\t")
+            || line == "#endif"
+    })
+}
+
+fn find_matching_brace(source: &[u8], open_brace: usize) -> Option<usize> {
+    if source.get(open_brace) != Some(&b'{') {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    let mut i = open_brace + 1;
+    while i < source.len() {
+        if source[i] == b'/' && source.get(i + 1) == Some(&b'/') {
+            i = skip_swift_line_comment(source, i + 2);
+            continue;
+        }
+
+        if source[i] == b'/' && source.get(i + 1) == Some(&b'*') {
+            i = skip_swift_block_comment(source, i + 2);
+            continue;
+        }
+
+        if is_swift_multiline_string_start(source, i) {
+            i = skip_swift_multiline_string(source, i + 3);
+            continue;
+        }
+
+        if source[i] == b'"' {
+            i = skip_swift_string(source, i + 1);
+            continue;
+        }
+
+        match source[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    // Return the byte after the closing brace for use as a slice end.
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
+}
+
+fn skip_swift_line_comment(source: &[u8], mut i: usize) -> usize {
+    while i < source.len() && source[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+fn skip_swift_block_comment(source: &[u8], mut i: usize) -> usize {
+    while i + 1 < source.len() {
+        if source[i] == b'*' && source[i + 1] == b'/' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    source.len()
+}
+
+fn is_swift_multiline_string_start(source: &[u8], quote: usize) -> bool {
+    source.get(quote) == Some(&b'"')
+        && source.get(quote + 1) == Some(&b'"')
+        && source.get(quote + 2) == Some(&b'"')
+}
+
+fn skip_swift_multiline_string(source: &[u8], mut i: usize) -> usize {
+    while i + 2 < source.len() {
+        if i + 3 < source.len()
+            && source[i] == b'\\'
+            && source.get(i + 1) == Some(&b'"')
+            && source.get(i + 2) == Some(&b'"')
+            && source.get(i + 3) == Some(&b'"')
+        {
+            i = (i + 4).min(source.len());
+            continue;
+        }
+
+        if source[i] == b'"' && source[i + 1] == b'"' && source[i + 2] == b'"' {
+            return i + 3;
+        }
+
+        i += 1;
+    }
+    source.len()
+}
+
+fn skip_swift_string(source: &[u8], mut i: usize) -> usize {
+    while i < source.len() {
+        if source[i] == b'\\' {
+            i = (i + 2).min(source.len());
+        } else if source[i] == b'"' {
+            return i + 1;
+        } else {
+            i += 1;
+        }
+    }
+    source.len()
+}
+
+fn line_number_for_byte(source: &[u8], byte: usize) -> usize {
+    source[..byte.min(source.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+fn recovered_swift_structural_hash(
+    content: &str,
+    exclude_start: usize,
+    exclude_end: usize,
+) -> String {
+    let (before, after) = if exclude_start <= exclude_end
+        && exclude_end <= content.len()
+        && content.is_char_boundary(exclude_start)
+        && content.is_char_boundary(exclude_end)
+    {
+        (&content[..exclude_start], &content[exclude_end..])
+    } else {
+        (content, "")
+    };
+
+    let mut words = before.split_whitespace().collect::<Vec<_>>();
+    words.extend(after.split_whitespace());
+    let normalized = words.join(" ");
+    content_hash(&normalized)
 }
 
 /// For languages with outer attributes/annotations that are sibling nodes
@@ -1318,6 +1714,8 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
     match node.kind() {
         "decorated_definition" => map_decorated_type(node),
         "class_member" => map_class_member_type(node),
+        "class_declaration" if config.id == "swift" => swift_class_declaration_type(node)
+            .unwrap_or_else(|| map_node_type(node.kind())),
         // C/C++ declarations with a function_declarator are function prototypes,
         // not variables (#152).
         "declaration" if matches!(config.id, "c" | "cpp") && has_function_declarator(node) => {
@@ -1327,6 +1725,11 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
             .or_else(|| promote_js_ts_const_function(node, config))
             .unwrap_or_else(|| map_node_type(node.kind())),
     }
+}
+
+fn swift_class_declaration_type(node: Node) -> Option<&'static str> {
+    let declaration_kind = node.child_by_field_name("declaration_kind")?;
+    swift_declaration_keyword_type(declaration_kind.kind())
 }
 
 /// Check whether a C/C++ `declaration` node contains a `function_declarator`
