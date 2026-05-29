@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::process;
@@ -6,7 +7,8 @@ use std::time::Instant;
 use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange};
-use sem_core::parser::differ::compute_semantic_diff;
+use sem_core::model::change::ChangeType;
+use sem_core::parser::differ::{compute_semantic_diff, DiffResult};
 
 use crate::formatters::{
     json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal,
@@ -636,12 +638,7 @@ fn run_diff_pipeline(
 
     // Filter out cosmetic-only changes when --no-cosmetics is set
     if opts.no_cosmetics {
-        let before_count = result.changes.len();
-        result.changes.retain(|c| c.structural_change != Some(false));
-        let removed = before_count - result.changes.len();
-        if removed > 0 {
-            result.modified_count = result.modified_count.saturating_sub(removed);
-        }
+        retain_non_cosmetic_changes(&mut result);
     }
 
     // Record lifetime stats (best-effort)
@@ -683,5 +680,132 @@ fn run_diff_pipeline(
                 + result.reordered_count
         );
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
+    }
+}
+
+fn retain_non_cosmetic_changes(result: &mut DiffResult) {
+    result
+        .changes
+        .retain(|c| c.structural_change != Some(false));
+    recalculate_diff_summary(result);
+}
+
+fn recalculate_diff_summary(result: &mut DiffResult) {
+    // Mirrors compute_semantic_diff: any retained change, including an orphan,
+    // marks its file as changed. Orphans only skip the entity change-type buckets.
+    result.file_count = result
+        .changes
+        .iter()
+        .map(|change| change.file_path.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut added_count = 0;
+    let mut modified_count = 0;
+    let mut deleted_count = 0;
+    let mut moved_count = 0;
+    let mut renamed_count = 0;
+    let mut reordered_count = 0;
+    let mut orphan_count = 0;
+
+    for change in &result.changes {
+        if change.entity_type == "orphan" {
+            orphan_count += 1;
+            continue;
+        }
+
+        match change.change_type {
+            ChangeType::Added => added_count += 1,
+            ChangeType::Modified => modified_count += 1,
+            ChangeType::Deleted => deleted_count += 1,
+            ChangeType::Moved => moved_count += 1,
+            ChangeType::Renamed => renamed_count += 1,
+            ChangeType::Reordered => reordered_count += 1,
+        }
+    }
+
+    result.added_count = added_count;
+    result.modified_count = modified_count;
+    result.deleted_count = deleted_count;
+    result.moved_count = moved_count;
+    result.renamed_count = renamed_count;
+    result.reordered_count = reordered_count;
+    result.orphan_count = orphan_count;
+}
+
+#[cfg(test)]
+mod tests {
+    use sem_core::model::change::{ChangeType, SemanticChange};
+    use serde_json::json;
+
+    use super::{retain_non_cosmetic_changes, DiffResult};
+
+    fn change(
+        file_path: &str,
+        change_type: ChangeType,
+        structural_change: Option<bool>,
+    ) -> SemanticChange {
+        serde_json::from_value(json!({
+            "id": format!("{file_path}::{change_type:?}"),
+            "entityId": format!("{file_path}::entity"),
+            "changeType": change_type,
+            "entityType": "function",
+            "entityName": "value",
+            "entityLine": 1,
+            "filePath": file_path,
+            "structuralChange": structural_change,
+        }))
+        .expect("valid SemanticChange fixture")
+    }
+
+    fn diff_result(changes: Vec<SemanticChange>) -> DiffResult {
+        DiffResult {
+            changes,
+            file_count: 99,
+            added_count: 99,
+            modified_count: 99,
+            deleted_count: 99,
+            moved_count: 99,
+            renamed_count: 99,
+            reordered_count: 99,
+            orphan_count: 99,
+            total_entities_before: 0,
+            total_entities_after: 0,
+        }
+    }
+
+    #[test]
+    fn no_cosmetics_filter_recomputes_file_count_to_zero() {
+        let mut result = diff_result(vec![change("app.py", ChangeType::Modified, Some(false))]);
+
+        retain_non_cosmetic_changes(&mut result);
+
+        assert!(result.changes.is_empty());
+        assert_eq!(result.file_count, 0);
+        assert_eq!(result.modified_count, 0);
+    }
+
+    #[test]
+    fn no_cosmetics_filter_recomputes_summary_from_remaining_changes() {
+        let mut structural = change("src/lib.rs", ChangeType::Modified, Some(true));
+        structural.entity_name = "kept".to_string();
+        let cosmetic = change("src/cosmetic.rs", ChangeType::Modified, Some(false));
+        let unknown = change("src/lib.rs", ChangeType::Added, None);
+        let mut orphan = change("src/orphan.rs", ChangeType::Modified, Some(true));
+        orphan.entity_type = "orphan".to_string();
+
+        let mut result = diff_result(vec![structural, cosmetic, unknown, orphan]);
+
+        retain_non_cosmetic_changes(&mut result);
+
+        assert_eq!(result.changes.len(), 3);
+        assert_eq!(result.file_count, 2);
+        assert_eq!(result.added_count, 1);
+        assert_eq!(result.modified_count, 1);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.moved_count, 0);
+        assert_eq!(result.renamed_count, 0);
+        assert_eq!(result.reordered_count, 0);
+        assert_eq!(result.orphan_count, 1);
     }
 }
