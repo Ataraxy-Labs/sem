@@ -1,45 +1,7 @@
 use sem_core::parser::differ::DiffResult;
-use serde_json::json;
 
 pub fn format_json(result: &DiffResult) -> String {
-    let changes: Vec<serde_json::Value> = result
-        .changes
-        .iter()
-        .map(|c| {
-            json!({
-                "entityId": c.entity_id,
-                "changeType": c.change_type,
-                "entityType": c.entity_type,
-                "entityName": c.entity_name,
-                "oldEntityName": c.old_entity_name,
-                "filePath": c.file_path,
-                "oldFilePath": c.old_file_path,
-                "oldParentId": c.old_parent_id,
-                "beforeContent": c.before_content,
-                "afterContent": c.after_content,
-                "commitSha": c.commit_sha,
-                "author": c.author,
-                "structuralChange": c.structural_change,
-            })
-        })
-        .collect();
-
-    let output = json!({
-        "summary": {
-            "fileCount": result.file_count,
-            "added": result.added_count,
-            "modified": result.modified_count,
-            "deleted": result.deleted_count,
-            "moved": result.moved_count,
-            "renamed": result.renamed_count,
-            "reordered": result.reordered_count,
-            "orphan": result.orphan_count,
-            "total": result.changes.len(),
-        },
-        "changes": changes,
-    });
-
-    serde_json::to_string(&output).unwrap_or_default()
+    sem_core::format::json::format_diff_json(result)
 }
 
 #[cfg(test)]

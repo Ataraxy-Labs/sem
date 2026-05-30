@@ -29,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
+[dev-dependencies]
+tempfile = "3.24.0"
+
 [features]
 default = []
 vendored-openssl = ["openssl"]
