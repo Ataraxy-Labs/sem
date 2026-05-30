@@ -38,9 +38,21 @@ async function downloadFile(url, destinationPath) {
 }
 
 function extractArchive(archivePath, outputDirectory) {
-  const result = spawnSync('tar', ['-xzf', archivePath, '-C', outputDirectory], {
-    stdio: 'pipe',
-  });
+  const args = ['-xzf', archivePath, '-C', outputDirectory];
+  let result = spawnSync('tar', args, { stdio: 'pipe' });
+
+  // On Windows, GNU tar (from Git for Windows / MSYS2) interprets colons in
+  // paths as remote host separators (host:path). If extraction fails with a
+  // colon-related error, retry with --force-local which disables this behavior.
+  // We don't add it unconditionally because the Windows built-in bsdtar doesn't
+  // recognize the flag.
+  if (
+    process.platform === 'win32' &&
+    result.status !== 0 &&
+    result.stderr?.toString('utf8').includes('Cannot connect to')
+  ) {
+    result = spawnSync('tar', [...args, '--force-local'], { stdio: 'pipe' });
+  }
 
   if (result.error) {
     throw new Error(`Failed to extract archive: ${result.error.message}`);
