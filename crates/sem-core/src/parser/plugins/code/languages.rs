@@ -90,6 +90,10 @@ pub enum CallNodeStyle {
     /// The call node directly has object (optional) + method name fields.
     /// Java: method_invocation(object, name). Ruby: call(receiver, method).
     DirectMethod { object_field: &'static str, method_field: &'static str },
+    /// The callee is the first named child of the call node (no field name).
+    /// Swift: call_expression(simple_identifier|navigation_expression, call_suffix)
+    /// Kotlin: call_expression(identifier|navigation_expression, value_arguments)
+    FirstChild,
 }
 
 /// How to extract the class/struct name from a scope node.
@@ -993,9 +997,9 @@ static PYTHON_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 };
 
 static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
-    class_scope_nodes: &["class_declaration"],
+    class_scope_nodes: &["class_declaration", "abstract_class_declaration"],
     impl_scope_nodes: &[],
-    function_scope_nodes: &["function_declaration", "method_definition"],
+    function_scope_nodes: &["function_declaration", "method_definition", "arrow_function"],
     class_name_field: ClassNameField::Simple("name"),
 
     assignment_rules: &[
@@ -1023,7 +1027,7 @@ static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     self_keywords: &["this"],
 
     init_strategy: InitStrategy::ConstructorBody {
-        class_nodes: &["class_declaration"],
+        class_nodes: &["class_declaration", "abstract_class_declaration"],
         init_names: &["constructor"],
         init_node_kind: "method_definition",
         self_keyword: "this",
@@ -1045,6 +1049,14 @@ static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         "require", "module", "exports", "process",
         "Buffer", "global", "window", "document",
         "fetch", "Response", "Request", "Headers", "URL",
+        "undefined", "encodeURIComponent", "decodeURIComponent",
+        "encodeURI", "decodeURI", "AbortController", "TextEncoder",
+        "TextDecoder", "Uint8Array", "Int8Array", "Float32Array",
+        "ArrayBuffer", "DataView", "ReadableStream", "WritableStream",
+        "Blob", "File", "FormData", "URLSearchParams",
+        "Event", "EventTarget", "CustomEvent",
+        "queueMicrotask", "structuredClone", "atob", "btoa",
+        "crypto", "performance", "navigator",
     ],
 };
 
@@ -1311,7 +1323,7 @@ static RUBY_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 };
 
 static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
-    class_scope_nodes: &["class_declaration", "object_declaration"],
+    class_scope_nodes: &["class_declaration", "object_declaration", "companion_object"],
     impl_scope_nodes: &[],
     function_scope_nodes: &["function_declaration", "secondary_constructor"],
     class_name_field: ClassNameField::Simple("name"),
@@ -1319,7 +1331,7 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     assignment_rules: &[
         AssignmentRule { node_kind: "property_declaration", strategy: AssignmentStrategy::Declarators },
     ],
-    assignment_recurse_into: &["statements"],
+    assignment_recurse_into: &["statements", "block", "function_body"],
 
     param_rules: &[
         ParamRule { node_kind: "parameter", name_field: ParamNameField::Simple("name"), type_field: "type", skip_names: &[] },
@@ -1328,7 +1340,7 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     return_type_field: Some("type"),
 
     call_nodes: &["call_expression"],
-    call_style: CallNodeStyle::FunctionField("function"),
+    call_style: CallNodeStyle::FirstChild,
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
     composite_literal_nodes: &[],
@@ -1337,7 +1349,15 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     self_keywords: &["this"],
 
-    init_strategy: InitStrategy::None,
+    init_strategy: InitStrategy::ConstructorBody {
+        class_nodes: &["class_declaration"],
+        init_names: &["init"],
+        init_node_kind: "anonymous_initializer",
+        self_keyword: "this",
+        access_kind: "navigation_expression",
+        obj_field: "expression",
+        prop_field: "navigation_suffix",
+    },
     import_extractor: None,
     external_method: false,
 
@@ -1347,6 +1367,15 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         "String", "Int", "Long", "Double", "Float", "Boolean",
         "Any", "Unit", "Nothing", "Pair", "Triple",
         "require", "check", "error", "TODO",
+        "emptyList", "emptyMap", "emptySet",
+        "lazy", "run", "let", "also", "apply", "with", "takeIf", "takeUnless",
+        "Throwable", "Exception", "RuntimeException", "IllegalArgumentException",
+        "IllegalStateException", "UnsupportedOperationException",
+        "Regex", "Sequence", "Iterable", "Iterator",
+        "coroutineScope", "launch", "async", "withContext", "runBlocking",
+        "Flow", "StateFlow", "SharedFlow",
+        "Dispatchers", "Job", "SupervisorJob", "CoroutineScope",
+        "suspend", "Channel",
     ],
 };
 
@@ -1390,15 +1419,15 @@ static PHP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 };
 
 static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
-    class_scope_nodes: &["class_declaration", "protocol_declaration"],
-    impl_scope_nodes: &[],
+    class_scope_nodes: &["class_declaration", "protocol_declaration", "struct_declaration", "enum_declaration"],
+    impl_scope_nodes: &["extension_declaration"],
     function_scope_nodes: &["function_declaration", "init_declaration"],
     class_name_field: ClassNameField::Simple("name"),
 
     assignment_rules: &[
         AssignmentRule { node_kind: "property_declaration", strategy: AssignmentStrategy::Declarators },
     ],
-    assignment_recurse_into: &["function_body"],
+    assignment_recurse_into: &["function_body", "code_block", "statements"],
 
     param_rules: &[
         ParamRule { node_kind: "parameter", name_field: ParamNameField::Simple("name"), type_field: "type", skip_names: &[] },
@@ -1407,7 +1436,7 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     return_type_field: Some("return_type"),
 
     call_nodes: &["call_expression"],
-    call_style: CallNodeStyle::FunctionField("function"),
+    call_style: CallNodeStyle::FirstChild,
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
     composite_literal_nodes: &[],
@@ -1416,7 +1445,15 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     self_keywords: &["self"],
 
-    init_strategy: InitStrategy::None,
+    init_strategy: InitStrategy::ConstructorBody {
+        class_nodes: &["class_declaration", "struct_declaration"],
+        init_names: &["init"],
+        init_node_kind: "init_declaration",
+        self_keyword: "self",
+        access_kind: "navigation_expression",
+        obj_field: "target",
+        prop_field: "suffix",
+    },
     import_extractor: None,
     external_method: false,
 
@@ -1424,6 +1461,14 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         "print", "debugPrint", "fatalError", "precondition", "assert",
         "String", "Int", "Double", "Float", "Bool", "Array", "Dictionary", "Set",
         "Optional", "Result", "Error", "NSError",
+        "nil", "Any", "AnyObject", "Void", "Never",
+        "Data", "URL", "URLRequest", "URLSession",
+        "Codable", "Hashable", "Equatable", "Comparable", "Identifiable",
+        "Task", "MainActor", "Sendable",
+        "min", "max", "abs", "zip", "stride", "type",
+        "DispatchQueue", "NotificationCenter", "UserDefaults",
+        "NSObject", "Bundle", "FileManager",
+        "true", "false",
     ],
 };
 

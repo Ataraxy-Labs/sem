@@ -1092,3 +1092,107 @@ fn scope_resolve_ruby() {
     let fp = get_ruby_false_positive_edges();
     run_scope_resolve_for_lang("ruby", &expected, &fp);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Swift and Kotlin benchmarks
+// ═══════════════════════════════════════════════════════════════════
+
+fn get_swift_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        // service.swift -> models.swift
+        ("createDog", "Dog", "service creates Dog"),
+        ("createDog", "validate", "service calls dog.validate()"),
+        ("createDog", "getConnection", "service calls getConnection()"),
+        ("createCat", "Cat", "service creates Cat"),
+        ("createCat", "validate", "service calls cat.validate()"),
+        ("createCat", "getConnection", "service calls getConnection()"),
+        ("transferAnimal", "Transaction", "service creates Transaction"),
+        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        ("transferAnimal", "execute", "txn.execute() on Transaction"),
+        ("transferAnimal", "commit", "txn.commit() on Transaction"),
+        ("transferAnimal", "add", "shelter.add() on Shelter"),
+        ("listAnimals", "getConnection", "service calls getConnection()"),
+        ("listAnimals", "execute", "conn.execute() on Connection"),
+
+        // handlers.swift -> service.swift
+        ("handleCreateDog", "createDog", "handler calls service"),
+        ("handleCreateCat", "createCat", "handler calls service"),
+        ("handleTransfer", "transferAnimal", "handler calls service"),
+        ("handleTransfer", "Shelter", "handler creates Shelter"),
+        ("handleTransfer", "Dog", "handler creates Dog"),
+        ("handleTransfer", "count", "shelter.count() on Shelter"),
+        ("handleList", "listAnimals", "handler calls service"),
+
+        // database.swift internal
+        ("Transaction::execute", "execute", "Transaction.execute calls conn.execute"),
+        ("Transaction::commit", "commit", "Transaction.commit calls conn.commit"),
+    ]
+}
+
+fn get_swift_false_positive_edges() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("createDog", "Cat", "createDog shouldn't reference Cat"),
+        ("createCat", "Dog", "createCat shouldn't reference Dog"),
+        ("validate", "Dog", "standalone validate != Dog.validate"),
+        ("validate", "Cat", "standalone validate != Cat.validate"),
+        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
+        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+    ]
+}
+
+#[test]
+fn scope_resolve_swift() {
+    let expected = get_swift_expected_edges();
+    let fp = get_swift_false_positive_edges();
+    run_scope_resolve_for_lang("swift", &expected, &fp);
+}
+
+fn get_kotlin_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        // Service.kt -> Models.kt
+        ("createDog", "Dog", "service creates Dog"),
+        ("createDog", "validate", "service calls dog.validate()"),
+        ("createDog", "getConnection", "service calls getConnection()"),
+        ("createCat", "Cat", "service creates Cat"),
+        ("createCat", "validate", "service calls cat.validate()"),
+        ("createCat", "getConnection", "service calls getConnection()"),
+        ("transferAnimal", "Transaction", "service creates Transaction"),
+        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        ("transferAnimal", "execute", "txn.execute() on Transaction"),
+        ("transferAnimal", "commit", "txn.commit() on Transaction"),
+        ("transferAnimal", "add", "shelter.add() on Shelter"),
+        ("listAnimals", "getConnection", "service calls getConnection()"),
+        ("listAnimals", "execute", "conn.execute() on Connection"),
+
+        // Handlers.kt -> Service.kt
+        ("handleCreateDog", "createDog", "handler calls service"),
+        ("handleCreateCat", "createCat", "handler calls service"),
+        ("handleTransfer", "transferAnimal", "handler calls service"),
+        ("handleTransfer", "Shelter", "handler creates Shelter"),
+        ("handleTransfer", "Dog", "handler creates Dog"),
+        ("handleTransfer", "count", "shelter.count() on Shelter"),
+        ("handleList", "listAnimals", "handler calls service"),
+
+        // Database.kt internal
+        ("Transaction::execute", "execute", "Transaction.execute calls conn.execute"),
+        ("Transaction::commit", "commit", "Transaction.commit calls conn.commit"),
+    ]
+}
+
+fn get_kotlin_false_positive_edges() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("createDog", "Cat", "createDog shouldn't reference Cat"),
+        ("createCat", "Dog", "createCat shouldn't reference Dog"),
+        ("validate", "Dog", "standalone validate != Dog.validate"),
+        ("validate", "Cat", "standalone validate != Cat.validate"),
+        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
+        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+    ]
+}
+
+#[test]
+fn scope_resolve_kotlin() {
+    let expected = get_kotlin_expected_edges();
+    let fp = get_kotlin_false_positive_edges();
+    run_scope_resolve_for_lang("kotlin", &expected, &fp);
+}

@@ -140,6 +140,8 @@ pub(crate) fn resolve_with_scopes_full(
                     if matches!(
                         parent.entity_type.as_str(),
                         "class" | "struct" | "interface" | "impl"
+                            | "enum" | "protocol_declaration"
+                            | "object_declaration" | "companion_object"
                     ) {
                         class_members
                             .entry(parent.name.clone())
@@ -402,6 +404,9 @@ pub(crate) fn resolve_with_scopes_full(
                         continue;
                     }
 
+                    // Languages without per-symbol imports (e.g. Swift, Kotlin)
+                    // allow cross-file resolution for lowercase function names.
+                    let allow_cross_file = config.import_extractor.is_none();
                     let resolution = resolve_ref(
                         ast_ref,
                         scope_idx,
@@ -413,6 +418,7 @@ pub(crate) fn resolve_with_scopes_full(
                         entity_map,
                         file_path,
                         &entity.id,
+                        allow_cross_file,
                     );
 
                     if let Some((target_id, ref_type, method)) = resolution {
@@ -547,7 +553,12 @@ fn build_scopes_from_ast(
 
             let class_entity = file_entities.iter().find(|e| {
                 e.name == class_name
-                    && matches!(e.entity_type.as_str(), "class" | "struct" | "interface")
+                    && matches!(
+                        e.entity_type.as_str(),
+                        "class" | "struct" | "interface"
+                            | "enum" | "protocol_declaration"
+                            | "object_declaration" | "companion_object"
+                    )
             }).copied();
 
             if let Some(ce) = class_entity {
@@ -802,13 +813,37 @@ fn scan_function_params(
     source: &[u8],
     config: &ScopeResolveConfig,
 ) {
-    let params_node = match node.child_by_field_name("parameters") {
-        Some(p) => p,
-        None => return,
+    // Try "parameters" field first (Python, TS, Rust, Go, etc.)
+    // Fallback to direct children for languages like Swift where
+    // params are direct children of function_declaration.
+    let mut params_node = node.child_by_field_name("parameters");
+    if params_node.is_none() {
+        // Kotlin: function_value_parameters
+        let mut c = node.walk();
+        for ch in node.named_children(&mut c) {
+            if ch.kind() == "function_value_parameters" {
+                params_node = Some(ch);
+                break;
+            }
+        }
+    }
+
+    // If we have a params container, iterate its children.
+    // Otherwise, iterate direct children of the function node (Swift).
+    let (iter_node, use_direct) = match params_node {
+        Some(p) => (p, false),
+        None => (node, true),
     };
 
-    let mut cursor = params_node.walk();
-    for child in params_node.named_children(&mut cursor) {
+    let mut cursor = iter_node.walk();
+    for child in iter_node.named_children(&mut cursor) {
+        // When using direct children, only process param-like nodes
+        if use_direct {
+            let is_param = config.param_rules.iter().any(|r| child.kind() == r.node_kind);
+            if !is_param {
+                continue;
+            }
+        }
         for rule in config.param_rules {
             if child.kind() != rule.node_kind {
                 continue;
@@ -855,8 +890,20 @@ fn scan_function_params(
                 continue;
             }
 
-            if let Some(type_node) = child.child_by_field_name(rule.type_field) {
-                let type_text = extract_base_type(type_node, source);
+            // Try the configured type field first, then fall back to child type nodes
+            // (Swift parameters have user_type children instead of a "type" field)
+            let mut type_node = child.child_by_field_name(rule.type_field);
+            if type_node.is_none() {
+                let mut tc = child.walk();
+                for ch in child.named_children(&mut tc) {
+                    if matches!(ch.kind(), "user_type" | "type_annotation" | "type_identifier") {
+                        type_node = Some(ch);
+                        break;
+                    }
+                }
+            }
+            if let Some(tn) = type_node {
+                let type_text = extract_base_type(tn, source);
                 if !type_text.is_empty()
                     && type_text.chars().next().map_or(false, |c| c.is_uppercase())
                 {
@@ -908,6 +955,7 @@ fn scan_single_assignment(
 }
 
 /// TS: `const x = new Foo()` or `const x: Type = ...` or `const x = func()`
+/// Also handles Swift `let x = Foo(...)` and Kotlin `val x = Foo(...)`
 fn scan_ts_var_declaration(
     node: tree_sitter::Node,
     scope_idx: usize,
@@ -942,6 +990,98 @@ fn scan_ts_var_declaration(
             // Check RHS value
             if let Some(value) = child.child_by_field_name("value") {
                 record_type_from_rhs(value, &var_name, scope_idx, scopes, source);
+            }
+        }
+    }
+
+    // Swift: property_declaration has "name" and "value" fields directly,
+    // or "pattern" child with simple_identifier for the name
+    // e.g. `let dog = Dog(name: name)`
+    if node.kind() == "property_declaration" {
+        // Try "name" field first (Swift uses this), then pattern > simple_identifier
+        let var_name_opt = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok());
+        let var_name = if let Some(name) = var_name_opt {
+            name.to_string()
+        } else {
+            // Look for pattern > simple_identifier (Swift)
+            let mut c = node.walk();
+            let mut found = String::new();
+            for ch in node.named_children(&mut c) {
+                if ch.kind() == "pattern" {
+                    if let Some(id) = ch.named_child(0) {
+                        if id.kind() == "simple_identifier" || id.kind() == "identifier" {
+                            if let Ok(name) = id.utf8_text(source) {
+                                found = name.to_string();
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            found
+        };
+
+        if !var_name.is_empty() {
+            // Check for type annotation
+            if let Some(type_ann) = node.child_by_field_name("type") {
+                let type_text = extract_base_type(type_ann, source);
+                if !type_text.is_empty()
+                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                {
+                    scopes[scope_idx].types.insert(var_name.clone(), type_text);
+                    return;
+                }
+            }
+            // Check RHS value
+            if let Some(value) = node.child_by_field_name("value") {
+                record_type_from_rhs(value, &var_name, scope_idx, scopes, source);
+            } else {
+                // Swift/Kotlin: value might be a sibling call_expression, not a field
+                let mut c = node.walk();
+                for ch in node.named_children(&mut c) {
+                    if ch.kind() == "call_expression" || ch.kind() == "new_expression" {
+                        record_type_from_rhs(ch, &var_name, scope_idx, scopes, source);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Kotlin: property_declaration > variable_declaration > identifier, then sibling call_expression
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            if child.kind() == "variable_declaration" {
+                let var_name_kt = child
+                    .child_by_field_name("name")
+                    .or_else(|| child.named_child(0).filter(|n| n.kind() == "identifier"))
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                if !var_name_kt.is_empty() {
+                    // Check for type annotation on the property_declaration
+                    if let Some(type_ann) = node.child_by_field_name("type") {
+                        let type_text = extract_base_type(type_ann, source);
+                        if !type_text.is_empty()
+                            && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                        {
+                            scopes[scope_idx].types.insert(var_name_kt.clone(), type_text);
+                            return;
+                        }
+                    }
+                    // Find the value (sibling call_expression or other expression)
+                    let mut c2 = node.walk();
+                    for sibling in node.named_children(&mut c2) {
+                        if sibling.kind() == "call_expression" || sibling.kind() == "new_expression" {
+                            record_type_from_rhs(sibling, &var_name_kt, scope_idx, scopes, source);
+                            break;
+                        }
+                    }
+                }
+                break;
             }
         }
     }
@@ -1112,7 +1252,7 @@ fn record_type_from_rhs(
                 .child_by_field_name("function")
                 .or_else(|| rhs.named_child(0));
             if let Some(func) = func_node {
-                if func.kind() == "identifier" {
+                if func.kind() == "identifier" || func.kind() == "simple_identifier" || func.kind() == "type_identifier" {
                     let name = func.utf8_text(source).unwrap_or("");
                     if name.chars().next().map_or(false, |c| c.is_uppercase()) {
                         scopes[scope_idx]
@@ -1393,7 +1533,7 @@ fn scan_init_self_attrs(
         let kind = node.kind();
 
         match &config.init_strategy {
-            InitStrategy::ConstructorBody { class_nodes, self_keyword, .. } => {
+            InitStrategy::ConstructorBody { class_nodes, init_node_kind, self_keyword: _, .. } => {
                 if class_nodes.contains(&kind) {
                     let class_name = node
                         .child_by_field_name("name")
@@ -1402,8 +1542,14 @@ fn scan_init_self_attrs(
                         .to_string();
 
                     if !class_name.is_empty() {
-                        // Determine lang for scan_class_for_init (it still needs it for TS field scanning)
-                        let lang = if *self_keyword == "this" { "typescript" } else { "python" };
+                        // Determine lang for scan_class_for_init using init_node_kind as discriminator
+                        let lang = match *init_node_kind {
+                            "function_definition" => "python",
+                            "method_definition" => "typescript",
+                            "init_declaration" => "swift",
+                            "anonymous_initializer" => "kotlin",
+                            _ => "typescript",
+                        };
                         scan_class_for_init(node, &class_name, source, instance_attr_types, init_params_map, attr_to_param_map, lang);
                     }
                 }
@@ -1542,6 +1688,11 @@ fn scan_class_for_init(
     attr_to_param_map: &mut HashMap<(String, String), String>,
     lang: &str,
 ) {
+    // Kotlin: extract primary constructor params (class_parameter nodes with val/var)
+    if lang == "kotlin" {
+        scan_kotlin_primary_constructor(root, class_name, source, instance_attr_types);
+    }
+
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
@@ -1549,7 +1700,7 @@ fn scan_class_for_init(
             let ck = child.kind();
 
             // Python __init__
-            if ck == "function_definition" {
+            if ck == "function_definition" && lang == "python" {
                 let name = child
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
@@ -1574,6 +1725,16 @@ fn scan_class_for_init(
                 }
             }
 
+            // Swift init_declaration
+            if ck == "init_declaration" && lang == "swift" {
+                scan_swift_init_body(child, class_name, source, instance_attr_types, init_params_map, attr_to_param_map);
+            }
+
+            // Kotlin anonymous_initializer (init { ... } block)
+            if ck == "anonymous_initializer" && lang == "kotlin" {
+                scan_kotlin_init_body(child, class_name, source, instance_attr_types, attr_to_param_map);
+            }
+
             // TS: typed class field declarations `private conn: Connection`
             if (ck == "public_field_definition" || ck == "property_declaration" || ck == "field_definition") && lang == "typescript" {
                 let field_name = child
@@ -1594,7 +1755,235 @@ fn scan_class_for_init(
                 }
             }
 
-            if ck == "block" || ck == "class_body" || ck == "statement_block" {
+            // Swift: typed property declarations `var conn: Connection`
+            if ck == "property_declaration" && lang == "swift" {
+                scan_swift_property_declaration(child, class_name, source, instance_attr_types);
+            }
+
+            // Kotlin: typed property declarations `val conn: Connection`
+            if ck == "property_declaration" && lang == "kotlin" {
+                scan_kotlin_property_declaration(child, class_name, source, instance_attr_types);
+            }
+
+            if ck == "block" || ck == "class_body" || ck == "statement_block"
+                || ck == "struct_body" || ck == "function_body" || ck == "code_block"
+                || ck == "statements" || ck == "enum_class_body"
+            {
+                worklist.push(child);
+            }
+        }
+    }
+}
+
+/// Swift: scan init body for `self.attr = param` patterns
+fn scan_swift_init_body(
+    node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+    init_params_map: &mut HashMap<String, Vec<String>>,
+    attr_to_param_map: &mut HashMap<(String, String), String>,
+) {
+    let params = extract_init_params(node, source);
+    let ordered_params = extract_init_param_names_ordered(node, source);
+    init_params_map.insert(class_name.to_string(), ordered_params);
+
+    // Walk body looking for self.X = Y
+    let mut worklist = vec![node];
+    while let Some(wnode) = worklist.pop() {
+        let mut cursor = wnode.walk();
+        for child in wnode.named_children(&mut cursor) {
+            let ck = child.kind();
+            // Look for assignment: self.X = Y via directly_assigned_expression or assignment
+            if ck == "directly_assigned_expression" || ck == "assignment" {
+                if let Some(left) = child.child_by_field_name("left").or_else(|| child.named_child(0)) {
+                    if left.kind() == "navigation_expression" {
+                        let obj = left.child_by_field_name("target")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        let prop = left.child_by_field_name("suffix")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        if obj == "self" && !prop.is_empty() {
+                            if let Some(right) = child.child_by_field_name("right").or_else(|| child.named_child(1)) {
+                                if right.kind() == "simple_identifier" || right.kind() == "identifier" {
+                                    let rhs_name = right.utf8_text(source).unwrap_or("");
+                                    if params.contains_key(rhs_name) {
+                                        attr_to_param_map.insert(
+                                            (class_name.to_string(), prop.to_string()),
+                                            rhs_name.to_string(),
+                                        );
+                                        if let Some(Some(type_hint)) = params.get(rhs_name) {
+                                            instance_attr_types.insert(
+                                                (class_name.to_string(), prop.to_string()),
+                                                type_hint.clone(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ck == "function_body" || ck == "code_block" || ck == "statements"
+                || ck == "expression_statement" || ck == "block"
+            {
+                worklist.push(child);
+            }
+        }
+    }
+}
+
+/// Swift: extract typed property declarations `var conn: Connection`
+fn scan_swift_property_declaration(
+    node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    // Swift property_declaration has a "name" (via pattern binding) and type annotation
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "pattern" || child.kind() == "simple_identifier" || child.kind() == "identifier" {
+            let field_name = child.utf8_text(source).unwrap_or("");
+            if let Some(type_ann) = node.child_by_field_name("type") {
+                let type_text = extract_base_type(type_ann, source);
+                if !field_name.is_empty()
+                    && !type_text.is_empty()
+                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                {
+                    instance_attr_types.insert(
+                        (class_name.to_string(), field_name.to_string()),
+                        type_text,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Kotlin: extract typed property declarations `val conn: Connection`
+fn scan_kotlin_property_declaration(
+    node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    let field_name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("");
+    let field_type = node
+        .child_by_field_name("type")
+        .map(|n| extract_base_type(n, source))
+        .unwrap_or_default();
+
+    if !field_name.is_empty()
+        && !field_type.is_empty()
+        && field_type.chars().next().map_or(false, |c| c.is_uppercase())
+    {
+        instance_attr_types.insert(
+            (class_name.to_string(), field_name.to_string()),
+            field_type,
+        );
+    }
+}
+
+/// Kotlin: extract primary constructor params with val/var as instance attributes
+fn scan_kotlin_primary_constructor(
+    class_node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    // Look for primary_constructor child, then class_parameter nodes
+    let mut cursor = class_node.walk();
+    for child in class_node.named_children(&mut cursor) {
+        if child.kind() == "primary_constructor" {
+            let mut pc_cursor = child.walk();
+            for param in child.named_children(&mut pc_cursor) {
+                if param.kind() == "class_parameter" {
+                    // Check if this has val/var modifier (makes it a property)
+                    let text = param.utf8_text(source).unwrap_or("");
+                    let has_val_var = text.starts_with("val ") || text.starts_with("var ")
+                        || text.contains("val ") || text.contains("var ");
+                    if has_val_var {
+                        let param_name = param
+                            .child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        let param_type = param
+                            .child_by_field_name("type")
+                            .map(|n| extract_base_type(n, source))
+                            .unwrap_or_default();
+                        if !param_name.is_empty()
+                            && !param_type.is_empty()
+                            && param_type.chars().next().map_or(false, |c| c.is_uppercase())
+                        {
+                            instance_attr_types.insert(
+                                (class_name.to_string(), param_name.to_string()),
+                                param_type,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Kotlin: scan init { ... } body for this.attr = expr patterns
+fn scan_kotlin_init_body(
+    node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+    attr_to_param_map: &mut HashMap<(String, String), String>,
+) {
+    let mut worklist = vec![node];
+    while let Some(wnode) = worklist.pop() {
+        let mut cursor = wnode.walk();
+        for child in wnode.named_children(&mut cursor) {
+            let ck = child.kind();
+            if ck == "assignment" || ck == "directly_assigned_expression" {
+                if let Some(left) = child.child_by_field_name("left").or_else(|| child.named_child(0)) {
+                    if left.kind() == "navigation_expression" {
+                        let obj = left.child_by_field_name("expression")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        let prop = left.child_by_field_name("navigation_suffix")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        if obj == "this" && !prop.is_empty() {
+                            if let Some(right) = child.child_by_field_name("right").or_else(|| child.named_child(1)) {
+                                if right.kind() == "simple_identifier" || right.kind() == "identifier" {
+                                    let rhs_name = right.utf8_text(source).unwrap_or("");
+                                    attr_to_param_map.insert(
+                                        (class_name.to_string(), prop.to_string()),
+                                        rhs_name.to_string(),
+                                    );
+                                }
+                                // If RHS is a constructor call, record type directly
+                                if right.kind() == "call_expression" {
+                                    let callee = right.child_by_field_name("function")
+                                        .and_then(|n| n.utf8_text(source).ok())
+                                        .unwrap_or("");
+                                    if !callee.is_empty()
+                                        && callee.chars().next().map_or(false, |c| c.is_uppercase())
+                                    {
+                                        instance_attr_types.insert(
+                                            (class_name.to_string(), prop.to_string()),
+                                            callee.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ck == "statements" || ck == "block" || ck == "expression_statement" {
                 worklist.push(child);
             }
         }
@@ -2516,6 +2905,12 @@ fn collect_all_file_refs(
                         extract_call_ref(func, "", "", source, &mut refs, config, node_row);
                     }
                 }
+                CallNodeStyle::FirstChild => {
+                    // Swift/Kotlin: callee is the first named child (identifier or navigation_expression)
+                    if let Some(func) = node.named_child(0) {
+                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
+                    }
+                }
                 CallNodeStyle::DirectMethod { object_field, method_field } => {
                     let method_name = node.child_by_field_name(method_field)
                         .and_then(|n| n.utf8_text(source).ok())
@@ -2621,7 +3016,7 @@ fn extract_call_ref(
 ) {
     let func_kind = func.kind();
 
-    if func_kind == "identifier" {
+    if func_kind == "identifier" || func_kind == "simple_identifier" || func_kind == "type_identifier" {
         let name = func.utf8_text(source).unwrap_or("");
         if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
             refs.push(AstRef {
@@ -2678,7 +3073,9 @@ fn extract_call_ref(
     }
 }
 
-/// Extract a member/method call from a node with object+property fields
+/// Extract a member/method call from a node with object+property fields.
+/// Falls back to positional children for languages like Kotlin where
+/// navigation_expression children don't have field names.
 fn extract_member_call_ref(
     node: tree_sitter::Node,
     object_field: &str,
@@ -2687,16 +3084,38 @@ fn extract_member_call_ref(
     refs: &mut Vec<AstRef>,
     row: usize,
 ) {
-    let obj = node
+    let obj_text = node
         .child_by_field_name(object_field)
         .and_then(|n| n.utf8_text(source).ok())
         .unwrap_or("");
-    let attr = node
+
+    let attr_text = node
         .child_by_field_name(attr_field)
-        .and_then(|n| n.utf8_text(source).ok())
+        .and_then(|n| {
+            let text = n.utf8_text(source).ok()?;
+            // Swift navigation_suffix includes the dot prefix (.validate → validate)
+            Some(text.trim_start_matches('.'))
+        })
         .unwrap_or("");
-    if !obj.is_empty() && !attr.is_empty() {
-        push_method_call_ref(obj, attr, refs, row);
+
+    if !obj_text.is_empty() && !attr_text.is_empty() {
+        push_method_call_ref(obj_text, attr_text, refs, row);
+        return;
+    }
+
+    // Fallback: positional children (Kotlin navigation_expression has no field names)
+    let child_count = node.named_child_count();
+    if child_count >= 2 {
+        let obj = node.named_child(0)
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("");
+        let last_idx = (child_count - 1) as u32;
+        let attr = node.named_child(last_idx)
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("");
+        if !obj.is_empty() && !attr.is_empty() {
+            push_method_call_ref(obj, attr, refs, row);
+        }
     }
 }
 
@@ -2722,6 +3141,7 @@ fn resolve_ref(
     entity_map: &HashMap<String, EntityInfo>,
     file_path: &str,
     from_entity_id: &str,
+    allow_cross_file_calls: bool,
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
         AstRefKind::Call(name) => {
@@ -2751,9 +3171,10 @@ fn resolve_ref(
                             .map_or(false, |e| e.file_path == file_path)
                     })
                     .or_else(|| {
-                        // Only fall back to cross-file global for constructor calls.
-                        // Lowercase calls require explicit imports to avoid false positives.
-                        if is_constructor {
+                        // Fall back to cross-file global for constructor calls.
+                        // For lowercase calls, require explicit imports to avoid false positives,
+                        // unless the language allows implicit cross-file visibility (Swift, Kotlin).
+                        if is_constructor || allow_cross_file_calls {
                             target_ids.first()
                         } else {
                             None
@@ -2767,7 +3188,9 @@ fn resolve_ref(
             None
         }
 
-        AstRefKind::MethodCall { receiver, method } => {
+        AstRefKind::MethodCall { receiver: raw_receiver, method } => {
+            // Strip prefix operators like ! (Swift: `!dog.validate()`)
+            let receiver = raw_receiver.trim_start_matches('!').trim_start_matches('~');
             if receiver == "self" || receiver == "this" {
                 // self.method() -> find in enclosing class
                 let mut idx = scope_idx;
@@ -2833,7 +3256,7 @@ fn resolve_ref(
             }
 
             // Fallback: check import table for the receiver
-            let key = (file_path.to_string(), receiver.clone());
+            let key = (file_path.to_string(), receiver.to_string());
             if let Some(target_id) = import_table.get(&key) {
                 if let Some(info) = entity_map.get(target_id) {
                     if matches!(info.entity_type.as_str(), "class" | "struct") {
