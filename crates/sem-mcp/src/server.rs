@@ -107,13 +107,20 @@ impl SemServer {
     fn resolve_file_path(repo_root: &Path, file_path: &str) -> (String, PathBuf) {
         let p = Path::new(file_path);
         if p.is_absolute() {
-            let relative = p
+            let relative_path = p
                 .strip_prefix(repo_root)
+                .ok()
+                .map(Path::to_path_buf)
+                .or_else(|| canonical_relative_path(repo_root, p))
+                .map(|path| normalize_relative_path(&path));
+            let relative = relative_path
                 .map(|r| r.to_string_lossy().to_string())
-                .unwrap_or_else(|_| file_path.to_string());
+                .unwrap_or_else(|| file_path.to_string());
             (relative, p.to_path_buf())
         } else {
-            (file_path.to_string(), repo_root.join(file_path))
+            let abs_path = repo_root.join(file_path);
+            let relative_path = normalize_relative_path(p);
+            (relative_path.to_string_lossy().to_string(), abs_path)
         }
     }
 
@@ -271,19 +278,18 @@ impl SemServer {
         entities
     }
 
-    /// Find entity by name in graph, preferring match in the target file.
+    /// Find entity by name in the target file.
     fn find_entity_in_graph<'a>(
         graph: &'a EntityGraph,
         entity_name: &str,
         rel_path: &str,
-    ) -> Result<&'a str, rmcp::ErrorData> {
+    ) -> Result<&'a str, String> {
         graph
             .entities
             .values()
             .find(|e| e.name == entity_name && e.file_path == rel_path)
-            .or_else(|| graph.entities.values().find(|e| e.name == entity_name))
             .map(|e| e.id.as_str())
-            .ok_or_else(|| internal_err(format!("Entity '{}' not found in graph", entity_name)))
+            .ok_or_else(|| format!("Entity '{}' not found in graph", entity_name))
     }
 
     /// Get cached graph or build a new one. Checks: memory cache -> SQLite cache -> fresh build.
@@ -397,33 +403,41 @@ impl SemServer {
         Parameters(params): Parameters<EntitiesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let path = params.path().unwrap_or(".");
-        let ctx = self
-            .get_context(Some(path))
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(Some(path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
         let (entities, include_file) = if abs_path.is_file() {
-            let content = Self::read_file_at(&abs_path, &rel_path).map_err(internal_err)?;
+            let content = match Self::read_file_at(&abs_path, &rel_path) {
+                Ok(content) => content,
+                Err(err) => return Ok(tool_error(err)),
+            };
 
             let entities = self.cached_extract_entities(&content, &rel_path).await;
             if entities.is_empty() {
                 if self.registry.get_plugin(&rel_path).is_none() {
-                    return Err(internal_err(format!("No parser for file: {}", rel_path)));
+                    return Ok(tool_error(format!("No parser for file: {}", rel_path)));
                 }
             }
             (entities, false)
         } else if abs_path.is_dir() {
-            let file_paths =
-                Self::walk_dir_files(&abs_path, &ctx.repo_root, &self.registry).map_err(internal_err)?;
+            let file_paths = match Self::walk_dir_files(&abs_path, &ctx.repo_root, &self.registry) {
+                Ok(file_paths) => file_paths,
+                Err(err) => return Ok(tool_error(err)),
+            };
 
-            let all_entities = self
+            let all_entities = match self
                 .extract_entities_from_files(&ctx.repo_root, &file_paths)
                 .await
-                .map_err(internal_err)?;
+            {
+                Ok(entities) => entities,
+                Err(err) => return Ok(tool_error(err)),
+            };
             (all_entities, true)
         } else {
-            return Err(internal_err(format!("Path not found: {}", path)));
+            return Ok(tool_error(format!("Path not found: {}", path)));
         };
 
         let result: Vec<serde_json::Value> = entities
@@ -456,10 +470,10 @@ impl SemServer {
         &self,
         Parameters(params): Parameters<DiffParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(params.file_path.as_deref())
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         let scope = if let Some(ref base) = params.base_ref {
             let target_ref = params.target_ref.as_deref().unwrap_or("HEAD");
@@ -473,16 +487,19 @@ impl SemServer {
         };
 
         let pathspecs: Vec<String> = if let Some(ref fp) = params.file_path {
-            let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
+            let (rel, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+            if let Some(err) = pathspec_error(&ctx.git, &scope, &rel, fp, &abs_path) {
+                return Ok(tool_error(err));
+            }
             vec![rel]
         } else {
             vec![]
         };
 
-        let file_changes = ctx
-            .git
-            .get_changed_files(&scope, &pathspecs)
-            .map_err(|e| internal_err(e.to_string()))?;
+        let file_changes = match ctx.git.get_changed_files(&scope, &pathspecs) {
+            Ok(file_changes) => file_changes,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
 
         let diff_result =
             compute_semantic_diff(&file_changes, &self.registry, None, None);
@@ -499,24 +516,30 @@ impl SemServer {
         &self,
         Parameters(params): Parameters<BlameParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(Some(&params.file_path))
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(Some(&params.file_path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
-        let content = Self::read_file_at(&abs_path, &rel_path).map_err(internal_err)?;
+        let content = match Self::read_file_at(&abs_path, &rel_path) {
+            Ok(content) => content,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         let entities = self.cached_extract_entities(&content, &rel_path).await;
         if entities.is_empty() {
             if self.registry.get_plugin(&rel_path).is_none() {
-                return Err(internal_err(format!("No parser for file: {}", rel_path)));
+                return Ok(tool_error(format!("No parser for file: {}", rel_path)));
             }
         }
 
-        let blame = ctx
+        let blame = match ctx
             .git
             .blame_file_porcelain(Path::new(&rel_path))
-            .map_err(|e| internal_err(format!("Cannot blame {}: {}", rel_path, e)))?;
+        {
+            Ok(blame) => blame,
+            Err(err) => return Ok(tool_error(format!("Cannot blame {}: {}", rel_path, err))),
+        };
         let blame_by_line: HashMap<usize, BlameLineInfo> = blame
             .into_iter()
             .map(|line| (line.line_number, line))
@@ -589,22 +612,33 @@ impl SemServer {
         &self,
         Parameters(params): Parameters<ImpactAnalysisParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(Some(&params.file_path))
-            .await
-            .map_err(internal_err)?;
-        let (rel_path, _) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
+        let ctx = match self.get_context(Some(&params.file_path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
+        if let Some(err) = file_path_error(&params.file_path, &abs_path) {
+            return Ok(tool_error(err));
+        }
+        if self.registry.get_plugin(&rel_path).is_none() {
+            return Ok(tool_error(format!("No parser for file: {}", rel_path)));
+        }
 
-        let file_paths =
-            Self::find_supported_files(&ctx.repo_root, &self.registry).map_err(internal_err)?;
+        let file_paths = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
+            Ok(file_paths) => file_paths,
+            Err(err) => return Ok(tool_error(err)),
+        };
         let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
 
-        let entity_id = Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)?;
+        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
+            Ok(entity_id) => entity_id,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         let mode = params.mode.as_deref().unwrap_or("all");
         let valid_modes = ["all", "deps", "dependents", "tests"];
         if !valid_modes.contains(&mode) {
-            return Err(internal_err(format!(
+            return Ok(tool_error(format!(
                 "Invalid mode '{}'. Valid modes: {}",
                 mode,
                 valid_modes.join(", ")
@@ -702,10 +736,10 @@ impl SemServer {
         &self,
         Parameters(params): Parameters<LogParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(params.file_path.as_deref())
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         // Resolve file path: use provided or auto-detect
         let file_path = match params.file_path {
@@ -714,8 +748,10 @@ impl SemServer {
                 rel
             }
             None => {
-                let files = Self::find_supported_files(&ctx.repo_root, &self.registry)
-                    .map_err(internal_err)?;
+                let files = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
+                    Ok(files) => files,
+                    Err(err) => return Ok(tool_error(err)),
+                };
                 let mut found_in: Vec<String> = Vec::new();
                 for fp in &files {
                     let full = ctx.repo_root.join(fp);
@@ -730,14 +766,14 @@ impl SemServer {
                 }
                 match found_in.len() {
                     0 => {
-                        return Err(internal_err(format!(
+                        return Ok(tool_error(format!(
                             "Entity '{}' not found in any file",
                             params.entity_name
                         )))
                     }
                     1 => found_in.into_iter().next().unwrap(),
                     _ => {
-                        return Err(internal_err(format!(
+                        return Ok(tool_error(format!(
                             "Entity '{}' found in multiple files: {}. Specify file_path to disambiguate.",
                             params.entity_name,
                             found_in.join(", ")
@@ -768,20 +804,21 @@ impl SemServer {
                 Ok(file_commits) if !file_commits.is_empty() => {
                     file_commits.into_iter().map(|info| info.commit).collect()
                 }
-                Ok(_) => ctx
-                    .git
-                    .get_log(0)
-                    .map_err(|e| internal_err(format!("Failed to get history: {}", e)))?,
-                Err(e) => return Err(internal_err(format!("Failed to get file history: {}", e))),
+                Ok(_) => match ctx.git.get_log(0) {
+                    Ok(log) => log,
+                    Err(e) => return Ok(tool_error(format!("Failed to get history: {}", e))),
+                },
+                Err(e) => return Ok(tool_error(format!("Failed to get file history: {}", e))),
             }
         } else {
-            ctx.git
-                .get_log(0)
-                .map_err(|e| internal_err(format!("Failed to get history: {}", e)))?
+            match ctx.git.get_log(0) {
+                Ok(log) => log,
+                Err(e) => return Ok(tool_error(format!("Failed to get history: {}", e))),
+            }
         };
 
         if commits.is_empty() {
-            return Err(internal_err(format!("No commits found for {}", file_path)));
+            return Ok(tool_error(format!("No commits found for {}", file_path)));
         }
         commits.reverse();
 
@@ -792,7 +829,7 @@ impl SemServer {
             &params.entity_name,
             Some(&file_path),
         ) else {
-            return Err(internal_err(format!(
+            return Ok(tool_error(format!(
                 "Entity '{}' not found in any commit of {}",
                 params.entity_name, file_path
             )));
@@ -830,17 +867,28 @@ impl SemServer {
         &self,
         Parameters(params): Parameters<ContextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(Some(&params.file_path))
-            .await
-            .map_err(internal_err)?;
-        let (rel_path, _) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
+        let ctx = match self.get_context(Some(&params.file_path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
+        if let Some(err) = file_path_error(&params.file_path, &abs_path) {
+            return Ok(tool_error(err));
+        }
+        if self.registry.get_plugin(&rel_path).is_none() {
+            return Ok(tool_error(format!("No parser for file: {}", rel_path)));
+        }
 
-        let file_paths =
-            Self::find_supported_files(&ctx.repo_root, &self.registry).map_err(internal_err)?;
+        let file_paths = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
+            Ok(file_paths) => file_paths,
+            Err(err) => return Ok(tool_error(err)),
+        };
         let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
 
-        let entity_id = Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)?;
+        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
+            Ok(entity_id) => entity_id,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         let budget = params.token_budget.unwrap_or(8000);
         let context_result = sem_core::parser::context::build_context_result(
@@ -906,7 +954,7 @@ mod tests {
         assert!(status.success(), "git {:?} failed", args);
     }
 
-    fn commit_all(repo: &TempDir, message: &str, timestamp: i64) {
+    fn commit_all_tempdir(repo: &TempDir, message: &str, timestamp: i64) {
         git(repo, &["add", "-A"]);
         let status = Command::new("git")
             .current_dir(repo.path())
@@ -924,13 +972,13 @@ mod tests {
         git(&repo, &["config", "user.email", "t@t.com"]);
         git(&repo, &["config", "user.name", "test"]);
         fs::write(repo.path().join("a.py"), "def original(): return 1\n").unwrap();
-        commit_all(&repo, "v1", 946684800);
+        commit_all_tempdir(&repo, "v1", 946684800);
         fs::write(repo.path().join("a.py"), "def renamed_func(): return 1\n").unwrap();
-        commit_all(&repo, "v2: rename function", 946771200);
+        commit_all_tempdir(&repo, "v2: rename function", 946771200);
         git(&repo, &["mv", "a.py", "b.py"]);
-        commit_all(&repo, "v3: move file", 946857600);
+        commit_all_tempdir(&repo, "v3: move file", 946857600);
         fs::write(repo.path().join("b.py"), "def renamed_func(): return 2\n").unwrap();
-        commit_all(&repo, "v4: modify body", 946944000);
+        commit_all_tempdir(&repo, "v4: modify body", 946944000);
         repo
     }
 
@@ -975,6 +1023,74 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn temp_git_repo(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sem-mcp-{}-{}-{}",
+            name,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git2::Repository::init(&root).unwrap();
+        root
+    }
+
+    fn commit_all(root: &Path, message: &str, removals: &[&str]) {
+        let repo = git2::Repository::open(root).unwrap();
+        let sig = git2::Signature::now("sem test", "sem@example.com").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        for path in removals {
+            index.remove_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .unwrap();
+    }
+
+    fn assert_tool_error(result: CallToolResult, expected_text: &str) {
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["isError"], true);
+        assert_eq!(value["content"][0]["type"], "text");
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected_text),
+            "expected tool error to contain {expected_text:?}, got {value}"
+        );
+    }
+
+    fn assert_tool_success(result: CallToolResult) {
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["isError"], false);
+    }
+
+    async fn server_for_repo(root: &Path) -> SemServer {
+        let server = SemServer::new();
+        let git = GitBridge::open(root).unwrap();
+        let repo_root = git.repo_root().to_path_buf();
+        *server.context.lock().await = Some(RepoContext { git, repo_root });
+        server
     }
 
     #[test]
@@ -1087,10 +1203,364 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn normalize_relative_path_returns_dot_for_empty_paths() {
+        assert_eq!(normalize_relative_path(Path::new("")), PathBuf::from("."));
+        assert_eq!(normalize_relative_path(Path::new("./")), PathBuf::from("."));
+        assert_eq!(
+            normalize_relative_path(Path::new("src/../sample.py")),
+            PathBuf::from("sample.py")
+        );
+        assert_eq!(
+            normalize_relative_path(Path::new("a/../b")),
+            PathBuf::from("b")
+        );
+        assert_eq!(
+            normalize_relative_path(Path::new("a/b/../../c")),
+            PathBuf::from("c")
+        );
+        assert_eq!(
+            normalize_relative_path(Path::new("a/../../b")),
+            PathBuf::from("../b")
+        );
+    }
+
+    #[test]
+    fn resolve_file_path_normalizes_missing_relative_paths_lexically() {
+        let root = temp_git_repo("missing-relative-normalize");
+
+        let (rel_path, abs_path) = SemServer::resolve_file_path(&root, "./missing.py");
+
+        assert_eq!(rel_path, "missing.py");
+        assert_eq!(abs_path, root.join("./missing.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_entities_returns_tool_error_for_missing_path() {
+        let root = temp_git_repo("missing-path");
+        let missing_path = root.join("nonexistent_path.py");
+        let server = SemServer::new();
+
+        let result = server
+            .sem_entities(Parameters(EntitiesParams {
+                path: Some(missing_path.display().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_diff_returns_tool_error_for_missing_file_path() {
+        let root = temp_git_repo("missing-diff-file");
+        let file_path = root.join("missing.py");
+        let server = SemServer::new();
+
+        let result = server
+            .sem_diff(Parameters(DiffParams {
+                base_ref: None,
+                target_ref: None,
+                file_path: Some(file_path.display().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_diff_allows_ref_range_file_absent_from_working_tree() {
+        let root = temp_git_repo("range-diff-historical-file");
+        std::fs::write(root.join("base.py"), "def base():\n    return 1\n").unwrap();
+        commit_all(&root, "base", &[]);
+        let base_sha = git2::Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+
+        let range_file = root.join("branch_only.py");
+        std::fs::write(&range_file, "def branch_only():\n    return 1\n").unwrap();
+        commit_all(&root, "add branch-only file", &[]);
+        let add_sha = git2::Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+
+        std::fs::remove_file(&range_file).unwrap();
+        commit_all(&root, "delete branch-only file", &["branch_only.py"]);
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_diff(Parameters(DiffParams {
+                base_ref: Some(base_sha),
+                target_ref: Some(add_sha),
+                file_path: Some("branch_only.py".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_diff_preserves_invalid_ref_errors_with_file_path() {
+        let root = temp_git_repo("range-diff-invalid-ref");
+        std::fs::write(root.join("sample.py"), "def sample():\n    return 1\n").unwrap();
+        commit_all(&root, "initial", &[]);
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_diff(Parameters(DiffParams {
+                base_ref: Some("missing-ref".to_string()),
+                target_ref: Some("HEAD".to_string()),
+                file_path: Some("sample.py".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "git error:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_for_unknown_entity() {
+        let root = temp_git_repo("unknown-entity");
+        let file_path = root.join("sample.py");
+        std::fs::write(&file_path, "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "nonexistent_zzz".to_string(),
+                mode: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Entity 'nonexistent_zzz' not found in graph");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_for_missing_file_path() {
+        let root = temp_git_repo("missing-impact-file");
+        let file_path = root.join("missing.py");
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "anything".to_string(),
+                mode: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_when_entity_is_not_in_file_path() {
+        let root = temp_git_repo("wrong-impact-file");
+        let file_path = root.join("notes.txt");
+        std::fs::write(&file_path, "known_entity\n").unwrap();
+        std::fs::write(root.join("sample.py"), "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "known_entity".to_string(),
+                mode: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Entity 'known_entity' not found in graph");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_normalizes_relative_file_path_before_entity_lookup() {
+        let root = temp_git_repo("normalized-impact-file");
+        std::fs::write(root.join("sample.py"), "def known_entity():\n    return 1\n").unwrap();
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: "./sample.py".to_string(),
+                entity_name: "known_entity".to_string(),
+                mode: Some("deps".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_context_returns_tool_error_when_entity_is_not_in_file_path() {
+        let root = temp_git_repo("wrong-context-file");
+        let file_path = root.join("notes.txt");
+        std::fs::write(&file_path, "known_entity\n").unwrap();
+        std::fs::write(root.join("sample.py"), "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_context(Parameters(ContextParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "known_entity".to_string(),
+                token_budget: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Entity 'known_entity' not found in graph");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_log_allows_deleted_file_path_from_history() {
+        let root = temp_git_repo("deleted-log-file");
+        let file_path = root.join("old.py");
+        std::fs::write(&file_path, "def old_entity():\n    return 1\n").unwrap();
+        commit_all(&root, "add old file", &[]);
+        std::fs::remove_file(&file_path).unwrap();
+        commit_all(&root, "delete old file", &["old.py"]);
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_log(Parameters(LogParams {
+                entity_name: "old_entity".to_string(),
+                file_path: Some("old.py".to_string()),
+                limit: Some(10),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_for_invalid_mode() {
+        let root = temp_git_repo("invalid-mode");
+        let file_path = root.join("sample.py");
+        std::fs::write(&file_path, "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "known_entity".to_string(),
+                mode: Some("invalid".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Invalid mode 'invalid'");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
-fn internal_err(msg: impl ToString) -> rmcp::ErrorData {
-    rmcp::ErrorData::internal_error(msg.to_string(), None)
+fn tool_error(msg: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(msg.into())])
+}
+
+fn file_path_error(path: &str, abs_path: &Path) -> Option<String> {
+    if abs_path.is_file() {
+        None
+    } else if abs_path.exists() {
+        Some(format!("Expected file path: {}", path))
+    } else {
+        Some(format!("Path not found: {}", path))
+    }
+}
+
+fn pathspec_error(
+    git: &GitBridge,
+    scope: &DiffScope,
+    rel_path: &str,
+    display_path: &str,
+    abs_path: &Path,
+) -> Option<String> {
+    let found = match scope {
+        DiffScope::Working => abs_path.exists(),
+        DiffScope::Range { from, to } => match (
+            path_exists_at_ref(git, from, rel_path),
+            path_exists_at_ref(git, to, rel_path),
+        ) {
+            (Some(from_found), Some(to_found)) => from_found || to_found,
+            _ => return None,
+        },
+        _ => true,
+    };
+
+    if found {
+        return None;
+    }
+
+    Some(format!("Path not found: {}", display_path))
+}
+
+fn path_exists_at_ref(git: &GitBridge, refspec: &str, rel_path: &str) -> Option<bool> {
+    git.read_file_at_ref(refspec, rel_path)
+        .ok()
+        .map(|content| content.is_some())
+}
+
+fn canonical_relative_path(repo_root: &Path, abs_path: &Path) -> Option<PathBuf> {
+    let canonical_path = abs_path.canonicalize().ok()?;
+    let canonical_root = repo_root.canonicalize().ok()?;
+    canonical_path
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+fn normalize_relative_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                match normalized.components().next_back() {
+                    Some(std::path::Component::Normal(_)) => {
+                        normalized.pop();
+                    }
+                    Some(std::path::Component::ParentDir) | None => normalized.push(".."),
+                    Some(std::path::Component::RootDir)
+                    | Some(std::path::Component::Prefix(_))
+                    | Some(std::path::Component::CurDir) => {}
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str())
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
 }
 
 #[derive(Clone)]
