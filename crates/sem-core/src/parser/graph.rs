@@ -2303,6 +2303,281 @@ class UserService {
         );
     }
 
+    #[cfg(feature = "lang-swift")]
+    #[test]
+    fn test_swift_bare_instance_property_receiver_resolution() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "Example.swift", "\
+class Connection {
+    func execute(query: String) {}
+    func commit() {}
+}
+
+class Transaction {
+    let conn: Connection
+    init(conn: Connection) { self.conn = conn }
+
+    func execute(query: String) {
+        conn.execute(query: query)
+    }
+
+    func commit() {
+        conn.commit()
+    }
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["Example.swift".into()], &registry);
+
+        let transaction_execute_id = graph
+            .entities
+            .iter()
+            .find(|(id, info)| info.name == "execute" && id.contains("Transaction"))
+            .map(|(id, _)| id.clone())
+            .expect("Transaction.execute entity should exist");
+        let execute_deps = graph.get_dependencies(&transaction_execute_id);
+        assert!(
+            execute_deps.iter().any(|d| {
+                d.name == "execute"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Connection"))
+            }),
+            "Transaction.execute should depend on Connection.execute. Deps: {:?}",
+            execute_deps
+                .iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let transaction_commit_id = graph
+            .entities
+            .iter()
+            .find(|(id, info)| info.name == "commit" && id.contains("Transaction"))
+            .map(|(id, _)| id.clone())
+            .expect("Transaction.commit entity should exist");
+        let commit_deps = graph.get_dependencies(&transaction_commit_id);
+        assert!(
+            commit_deps.iter().any(|d| {
+                d.name == "commit"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Connection"))
+            }),
+            "Transaction.commit should depend on Connection.commit. Deps: {:?}",
+            commit_deps
+                .iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-swift")]
+    #[test]
+    fn test_swift_static_method_does_not_resolve_instance_property_receiver() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "Example.swift", "\
+class Connection {
+    func execute(query: String) {}
+}
+
+class Transaction {
+    let conn: Connection
+
+    static func run() {
+        conn.execute(query: \"SELECT 1\")
+    }
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["Example.swift".into()], &registry);
+
+        let run_id = graph.entities.keys()
+            .find(|id| id.contains("Transaction") && id.contains("run"))
+            .expect("Transaction.run entity should exist");
+        let deps = graph.get_dependencies(run_id);
+        assert!(
+            !deps.iter().any(|d| {
+                d.name == "execute"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Connection"))
+            }),
+            "static Transaction.run should not depend on Connection.execute via instance property. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-swift")]
+    #[test]
+    fn test_swift_multi_binding_property_receivers_resolve() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "Example.swift", "\
+class PrimaryConnection {
+    func execute(query: String) {}
+}
+
+class BackupConnection {
+    func flush() {}
+}
+
+class Transaction {
+    let conn: PrimaryConnection, backup: BackupConnection
+
+    func run(query: String) {
+        conn.execute(query: query)
+        backup.flush()
+    }
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["Example.swift".into()], &registry);
+
+        let run_id = graph.entities.keys()
+            .find(|id| id.contains("Transaction") && id.contains("run"))
+            .expect("Transaction.run entity should exist");
+        let deps = graph.get_dependencies(run_id);
+        assert!(
+            deps.iter().any(|d| {
+                d.name == "execute"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("PrimaryConnection"))
+            }),
+            "conn.execute should resolve to PrimaryConnection.execute. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            deps.iter().any(|d| {
+                d.name == "flush"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("BackupConnection"))
+            }),
+            "backup.flush should resolve to BackupConnection.flush. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-swift")]
+    #[test]
+    fn test_swift_nested_local_binding_shadows_instance_property_receiver() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "Example.swift", "\
+class Connection {
+    func execute(query: String) {}
+}
+
+class MockConnection {
+    func execute(query: String) {}
+}
+
+class Transaction {
+    let conn: Connection
+    init(conn: Connection) { self.conn = conn }
+
+    func execute(query: String, useMock: Bool) {
+        if useMock {
+            let conn = MockConnection()
+            conn.execute(query: query)
+        }
+    }
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["Example.swift".into()], &registry);
+
+        let transaction_execute_id = graph
+            .entities
+            .iter()
+            .find(|(id, info)| info.name == "execute" && id.contains("Transaction"))
+            .map(|(id, _)| id.clone())
+            .expect("Transaction.execute entity should exist");
+        let deps = graph.get_dependencies(&transaction_execute_id);
+        assert!(
+            deps.iter().any(|d| {
+                d.name == "execute"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("MockConnection"))
+            }),
+            "nested local conn should resolve to MockConnection.execute. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| {
+                d.name == "execute"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Connection") && !parent.contains("MockConnection"))
+            }),
+            "nested local conn should shadow Transaction.conn. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_bare_identifier_does_not_resolve_instance_property() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "service.ts", "\
+class Connection {
+    execute() {
+        return true;
+    }
+}
+
+class Transaction {
+    conn: Connection;
+    constructor(conn: Connection) {
+        this.conn = conn;
+    }
+
+    run() {
+        return conn.execute();
+    }
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["service.ts".into()], &registry);
+
+        let run_id = graph.entities.keys()
+            .find(|id| id.contains("Transaction") && id.contains("run"))
+            .expect("Transaction.run entity should exist");
+        let deps = graph.get_dependencies(run_id);
+        assert!(
+            !deps.iter().any(|d| {
+                d.name == "execute"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Connection"))
+            }),
+            "bare conn.execute() should not resolve through a TypeScript instance property. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_dot_chain_class_static() {
         let (dir, registry) = create_test_repo();

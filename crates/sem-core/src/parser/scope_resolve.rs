@@ -411,6 +411,12 @@ pub(crate) fn resolve_with_scopes_full(
                     // Languages without per-symbol imports (e.g. Swift, Kotlin)
                     // allow cross-file resolution for lowercase function names.
                     let allow_cross_file = config.import_extractor.is_none();
+                    let allow_implicit_instance_member_receiver =
+                        allows_implicit_instance_member_receiver(
+                            file_path,
+                            &entity.entity_type,
+                            &entity.content,
+                        );
                     let resolution = resolve_ref(
                         ast_ref,
                         scope_idx,
@@ -423,6 +429,7 @@ pub(crate) fn resolve_with_scopes_full(
                         file_path,
                         &entity.id,
                         allow_cross_file,
+                        allow_implicit_instance_member_receiver,
                     );
 
                     if let Some((target_id, ref_type, method)) = resolution {
@@ -1818,6 +1825,7 @@ fn scan_swift_init_body(
                             .unwrap_or("");
                         let prop = left.child_by_field_name("suffix")
                             .and_then(|n| n.utf8_text(source).ok())
+                            .map(|text| text.strip_prefix('.').unwrap_or(text))
                             .unwrap_or("");
                         if obj == "self" && !prop.is_empty() {
                             if let Some(right) = child.child_by_field_name("right").or_else(|| child.named_child(1)) {
@@ -1857,25 +1865,123 @@ fn scan_swift_property_declaration(
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    // Swift property_declaration has a "name" (via pattern binding) and type annotation
+    let mut processed_pattern_binding = false;
+
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "pattern" || child.kind() == "simple_identifier" || child.kind() == "identifier" {
-            let field_name = child.utf8_text(source).unwrap_or("");
-            if let Some(type_ann) = node.child_by_field_name("type") {
-                let type_text = extract_base_type(type_ann, source);
-                if !field_name.is_empty()
-                    && !type_text.is_empty()
-                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                {
-                    instance_attr_types.insert(
-                        (class_name.to_string(), field_name.to_string()),
-                        type_text,
-                    );
-                }
-            }
+        if child.kind() == "pattern_binding" {
+            processed_pattern_binding = true;
+            scan_swift_property_binding(
+                child,
+                class_name,
+                source,
+                instance_attr_types,
+            );
         }
     }
+    if processed_pattern_binding {
+        return;
+    }
+
+    // Swift property_declaration nodes vary by grammar version. Some expose
+    // pattern/type_annotation pairs directly instead of pattern_binding nodes.
+    let mut pending_names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "pattern" | "simple_identifier" | "identifier" => {
+                if let Some(name) = extract_swift_property_pattern_name(child, source) {
+                    pending_names.push(name);
+                }
+            }
+            "type_annotation" => {
+                let type_text = extract_base_type(child, source);
+                if type_text.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    for name in pending_names.drain(..) {
+                        instance_attr_types.insert(
+                            (class_name.to_string(), name),
+                            type_text.clone(),
+                        );
+                    }
+                }
+            }
+            "call_expression" | "new_expression" | "value_argument" => pending_names.clear(),
+            _ => {}
+        }
+    }
+}
+
+fn scan_swift_property_binding(
+    node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    let mut field_names = Vec::new();
+    let mut field_type = node
+        .child_by_field_name("type")
+        .and_then(|type_node| {
+            let type_text = extract_base_type(type_node, source);
+            if type_text.is_empty() {
+                None
+            } else {
+                Some(type_text)
+            }
+        });
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "pattern" | "simple_identifier" | "identifier" => {
+                if let Some(name) = extract_swift_property_pattern_name(child, source) {
+                    field_names.push(name);
+                }
+            }
+            "type_annotation" => {
+                if field_type.is_none() {
+                    let type_text = extract_base_type(child, source);
+                    if !type_text.is_empty() {
+                        field_type = Some(type_text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(type_text) = field_type else {
+        return;
+    };
+    if !type_text.chars().next().map_or(false, |c| c.is_uppercase()) {
+        return;
+    }
+
+    for field_name in field_names {
+        instance_attr_types.insert((class_name.to_string(), field_name), type_text.clone());
+    }
+}
+
+fn extract_swift_property_pattern_name(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    if matches!(node.kind(), "simple_identifier" | "identifier") {
+        let name = node.utf8_text(source).ok()?.trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+
+    if let Some(name_node) = node.child_by_field_name("name") {
+        return extract_swift_property_pattern_name(name_node, source);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "simple_identifier" | "identifier") {
+            return extract_swift_property_pattern_name(child, source);
+        }
+    }
+
+    None
 }
 
 /// Kotlin: extract typed property declarations `val conn: Connection`
@@ -3091,6 +3197,7 @@ fn resolve_ref(
     file_path: &str,
     from_entity_id: &str,
     allow_cross_file_calls: bool,
+    allow_implicit_instance_member_receiver: bool,
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
         AstRefKind::Call(name) => {
@@ -3198,7 +3305,23 @@ fn resolve_ref(
             }
 
             // receiver.method() -> look up receiver type, then resolve method
-            let receiver_type = lookup_type_in_scopes(scope_idx, scopes, receiver);
+            let receiver_type = if let Some(receiver_type) =
+                lookup_type_in_scopes(scope_idx, scopes, receiver)
+            {
+                Some(receiver_type)
+            } else if allow_implicit_instance_member_receiver
+                && is_simple_identifier_name(receiver)
+                && !is_local_binding_in_scopes(scope_idx, scopes, receiver)
+            {
+                match find_enclosing_class(scope_idx, scopes, entity_map) {
+                    Some(class_name) => instance_attr_types
+                        .get(&(class_name, receiver.to_string()))
+                        .cloned(),
+                    None => None,
+                }
+            } else {
+                None
+            };
 
             if let Some(class_name) = receiver_type {
                 if let Some(members) = class_members.get(class_name.as_str()) {
@@ -3266,6 +3389,111 @@ fn resolve_ref(
             None
         }
     }
+}
+
+fn allows_implicit_instance_member_receiver(
+    file_path: &str,
+    entity_type: &str,
+    entity_content: &str,
+) -> bool {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    let supports_implicit_receiver = matches!(
+        ext,
+        "swift"
+            | "kt"
+            | "kts"
+            | "java"
+            | "cs"
+            | "cpp"
+            | "cc"
+            | "cxx"
+            | "hpp"
+            | "hh"
+            | "hxx"
+            | "h"
+            | "scala"
+            | "dart"
+    );
+
+    supports_implicit_receiver
+        && matches!(
+            entity_type,
+            "function" | "method" | "init_declaration" | "constructor_declaration"
+        )
+        && !has_static_member_modifier(ext, entity_content)
+}
+
+fn has_static_member_modifier(ext: &str, entity_content: &str) -> bool {
+    let header = entity_content
+        .split(|ch| ch == '{' || ch == '=')
+        .next()
+        .unwrap_or(entity_content);
+    let header_without_comments = strip_member_header_comments(header);
+    let tokens = header_without_comments
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let declaration_start = tokens
+        .iter()
+        .position(|token| {
+            matches!(
+                *token,
+                "func" | "function" | "fn" | "constructor" | "init" | "var" | "let" | "subscript"
+            )
+        })
+        .unwrap_or(tokens.len());
+
+    tokens[..declaration_start]
+        .iter()
+        .any(|token| *token == "static" || (ext == "swift" && *token == "class"))
+}
+
+fn strip_member_header_comments(header: &str) -> String {
+    let mut output = String::with_capacity(header.len());
+    let mut chars = header.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '/' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('/') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        output.push(' ');
+                        break;
+                    }
+                }
+            }
+            Some('*') => {
+                chars.next();
+                let mut previous = '\0';
+                for next in chars.by_ref() {
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+                output.push(' ');
+            }
+            _ => output.push(ch),
+        }
+    }
+
+    output
+}
+
+fn is_simple_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first.is_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
 }
 
 /// Find the class name for the enclosing class scope.

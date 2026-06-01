@@ -1427,7 +1427,17 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     assignment_rules: &[
         AssignmentRule { node_kind: "property_declaration", strategy: AssignmentStrategy::Declarators },
     ],
-    assignment_recurse_into: &["function_body", "code_block", "statements"],
+    assignment_recurse_into: &[
+        "function_body",
+        "code_block",
+        "statements",
+        "if_statement",
+        "guard_statement",
+        "for_statement",
+        "while_statement",
+        "repeat_while_statement",
+        "switch_statement",
+    ],
 
     param_rules: &[
         ParamRule { node_kind: "parameter", name_field: ParamNameField::Simple("name"), type_field: "type", skip_names: &[] },
