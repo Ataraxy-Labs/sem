@@ -343,6 +343,126 @@ func helper(x: Int) -> Int {
     }
 
     #[test]
+    fn test_swift_multi_binding_property_extraction() {
+        let code = r#"
+struct Point {
+    var x, y: Int
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Point.swift");
+        let point = entities.iter().find(|e| e.name == "Point").unwrap();
+        let properties: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+
+        assert_eq!(
+            properties.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        assert!(properties
+            .iter()
+            .all(|property| property.parent_id.as_deref() == Some(point.id.as_str())));
+        assert_eq!(properties[0].content, "var x: Int");
+        assert_eq!(properties[1].content, "var y: Int");
+    }
+
+    #[test]
+    fn test_swift_multi_binding_property_content_is_per_binding() {
+        let typed_code = r#"
+struct Types {
+    var x: Int, y: String
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let typed_entities = plugin.extract_entities(typed_code, "Types.swift");
+        let typed_properties: Vec<_> = typed_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(typed_properties[0].content, "var x: Int");
+        assert_eq!(typed_properties[1].content, "var y: String");
+
+        let mixed_code = r#"
+struct Mixed {
+    var x, y: Int, z: String
+}
+"#;
+        let mixed_entities = plugin.extract_entities(mixed_code, "Mixed.swift");
+        let mixed_properties: Vec<_> = mixed_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(mixed_properties[0].content, "var x: Int");
+        assert_eq!(mixed_properties[1].content, "var y: Int");
+        assert_eq!(mixed_properties[2].content, "var z: String");
+
+        let generic_code = r#"
+struct GenericTypes {
+    var lookup: Dictionary<String, Int>, count: Int
+}
+"#;
+        let generic_entities = plugin.extract_entities(generic_code, "GenericTypes.swift");
+        let generic_properties: Vec<_> = generic_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(
+            generic_properties[0].content,
+            "var lookup: Dictionary<String, Int>"
+        );
+        assert_eq!(generic_properties[1].content, "var count: Int");
+
+        let initializer_code = r#"
+struct Initializers {
+    var a = Foo(), b = Bar()
+}
+"#;
+        let initializer_entities = plugin.extract_entities(initializer_code, "Initializers.swift");
+        let initializer_properties: Vec<_> = initializer_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert!(initializer_properties[0].content.contains("Foo()"));
+        assert!(!initializer_properties[0].content.contains("Bar()"));
+        assert!(initializer_properties[1].content.contains("Bar()"));
+        assert!(!initializer_properties[1].content.contains("Foo()"));
+
+        let constants_code = r#"
+struct Constants {
+    let first, second, third: Int
+}
+"#;
+        let constants_entities = plugin.extract_entities(constants_code, "Constants.swift");
+        let constants_properties: Vec<_> = constants_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(
+            constants_properties.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(constants_properties[0].content, "let first: Int");
+        assert_eq!(constants_properties[1].content, "let second: Int");
+        assert_eq!(constants_properties[2].content, "let third: Int");
+
+        let semicolon_code = r#"
+struct Semicolons {
+    var left, right: Int; var next: Int
+}
+"#;
+        let semicolon_entities = plugin.extract_entities(semicolon_code, "Semicolons.swift");
+        let semicolon_properties: Vec<_> = semicolon_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(semicolon_properties[0].content, "var left: Int");
+        assert_eq!(semicolon_properties[1].content, "var right: Int");
+        assert_eq!(semicolon_properties[2].content, "var next: Int");
+    }
+
+    #[test]
     fn test_swift_conditional_compilation_inside_struct() {
         let code = r#"
 import ArgumentParser

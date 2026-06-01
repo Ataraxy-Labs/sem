@@ -452,10 +452,21 @@ fn detect_reorders(
     // Collect unchanged entities: matched by ID with same content_hash
     let before_by_id: HashMap<&str, &SemanticEntity> =
         before.iter().map(|e| (e.id.as_str(), e)).collect();
+    let before_positions: HashMap<&str, usize> = before
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.as_str(), i))
+        .collect();
+    let after_positions: HashMap<&str, usize> = after
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.as_str(), i))
+        .collect();
 
     // Group by file. For each file, collect unchanged entities in their
     // before-order, then look up their after-positions.
-    let mut by_file: HashMap<&str, Vec<(&SemanticEntity, &SemanticEntity)>> = HashMap::new();
+    let mut by_file: HashMap<&str, Vec<(usize, usize, &SemanticEntity, &SemanticEntity)>> =
+        HashMap::new();
     for after_entity in after {
         if !matched_after.contains(after_entity.id.as_str()) {
             continue;
@@ -472,10 +483,16 @@ fn detect_reorders(
             if before_entity.file_path != after_entity.file_path {
                 continue;
             }
+            let Some(before_position) = before_positions.get(before_entity.id.as_str()) else {
+                continue;
+            };
+            let Some(after_position) = after_positions.get(after_entity.id.as_str()) else {
+                continue;
+            };
             by_file
                 .entry(after_entity.file_path.as_str())
                 .or_default()
-                .push((before_entity, after_entity));
+                .push((*before_position, *after_position, before_entity, after_entity));
         }
     }
 
@@ -484,21 +501,32 @@ fn detect_reorders(
             continue;
         }
 
-        // Sort by before start_line to get the "before" ordering
-        pairs.sort_by_key(|(b, _)| b.start_line);
+        // Line numbers alone are not enough because a file can contain
+        // multiple entities on one line.
+        pairs.sort_by_key(|(before_position, _, _, _)| *before_position);
 
-        // Map to after start_lines in before-order
-        let after_lines: Vec<usize> = pairs.iter().map(|(_, a)| a.start_line).collect();
+        // Map to after positions in before-order
+        let after_positions: Vec<usize> = pairs
+            .iter()
+            .map(|(_, after_position, _, _)| *after_position)
+            .collect();
 
         // Find LIS indices (entities that stayed in relative order)
-        let lis_set = longest_increasing_subsequence_indices(&after_lines);
+        let lis_set = longest_increasing_subsequence_indices(&after_positions);
 
         // Entities NOT in LIS were reordered
-        for (i, (before_entity, after_entity)) in pairs.iter().enumerate() {
+        for (i, (_, _, before_entity, after_entity)) in pairs.iter().enumerate() {
             if lis_set.contains(&i) {
                 continue;
             }
-            changes.push(make_change(after_entity, ChangeType::Reordered, Some(before_entity), commit_sha, author, by_id));
+            changes.push(make_change(
+                after_entity,
+                ChangeType::Reordered,
+                Some(before_entity),
+                commit_sha,
+                author,
+                by_id,
+            ));
         }
     }
 }
@@ -915,6 +943,43 @@ mod tests {
         let result = match_entities(&before, &after, "a.rs", None, None, None);
         // Lines shifted but relative order is same, no reorder
         assert_eq!(result.changes.len(), 0);
+    }
+
+    #[test]
+    fn test_no_reorder_for_same_line_entities_when_order_preserved() {
+        let before = vec![
+            make_entity_at("a::f::alpha", "alpha", "let alpha = 1", "a.rs", 1),
+            make_entity_at("a::f::beta", "beta", "let beta = 2", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "let gamma = 3", "a.rs", 2),
+        ];
+        let after = vec![
+            make_entity_at("a::f::alpha", "alpha", "let alpha = 1", "a.rs", 1),
+            make_entity_at("a::f::beta", "beta", "let beta = 2", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "let gamma = 3", "a.rs", 2),
+        ];
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+        assert_eq!(result.changes.len(), 0);
+    }
+
+    #[test]
+    fn test_reorder_for_same_line_entities_when_order_changes() {
+        let before = vec![
+            make_entity_at("a::f::alpha", "alpha", "let alpha = 1", "a.rs", 1),
+            make_entity_at("a::f::beta", "beta", "let beta = 2", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "let gamma = 3", "a.rs", 2),
+        ];
+        let after = vec![
+            make_entity_at("a::f::beta", "beta", "let beta = 2", "a.rs", 1),
+            make_entity_at("a::f::alpha", "alpha", "let alpha = 1", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "let gamma = 3", "a.rs", 2),
+        ];
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Reordered);
+        assert!(
+            result.changes[0].entity_name == "alpha"
+                || result.changes[0].entity_name == "beta"
+        );
     }
 
     #[test]
