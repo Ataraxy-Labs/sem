@@ -2304,6 +2304,59 @@ class UserService {
     }
 
     #[test]
+    fn test_swift_local_bindings_do_not_become_graph_nodes() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "Mini.swift", "\
+func connect() -> Int { return 0 }
+func conn() -> Int { return 1 }
+
+func build() -> Int {
+    let conn = { 2 }
+    return conn() + connect()
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["Mini.swift".into()], &registry);
+        let names: Vec<&str> = graph.entities.values().map(|entity| entity.name.as_str()).collect();
+
+        assert!(names.contains(&"connect"), "got: {:?}", names);
+        assert!(names.contains(&"conn"), "got: {:?}", names);
+        assert!(names.contains(&"build"), "got: {:?}", names);
+
+        let connect_id = graph
+            .entities
+            .values()
+            .find(|entity| entity.name == "connect")
+            .map(|entity| entity.id.clone())
+            .expect("connect entity should exist");
+        let dependents = graph.get_dependents(&connect_id);
+        let dependent_names: Vec<&str> = dependents.iter().map(|entity| entity.name.as_str()).collect();
+
+        assert!(dependent_names.contains(&"build"), "got: {:?}", dependent_names);
+        assert!(!dependent_names.contains(&"conn"), "got: {:?}", dependent_names);
+        assert!(
+            graph.edges.iter().all(|edge| !edge.from_entity.ends_with("::conn")),
+            "local binding should not create edges. Edges: {:?}",
+            graph.edges
+        );
+
+        let conn_id = graph
+            .entities
+            .values()
+            .find(|entity| entity.name == "conn")
+            .map(|entity| entity.id.clone())
+            .expect("conn entity should exist");
+        let conn_dependents = graph.get_dependents(&conn_id);
+        assert!(
+            conn_dependents.is_empty(),
+            "local binding should not depend on same-named function. Dependents: {:?}",
+            conn_dependents.iter().map(|entity| &entity.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_dot_chain_class_static() {
         let (dir, registry) = create_test_repo();
         let root = dir.path();

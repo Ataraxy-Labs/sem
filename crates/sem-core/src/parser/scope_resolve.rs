@@ -80,7 +80,7 @@ pub struct ResolutionEntry {
     pub from_entity: String,
     pub reference: String,
     pub resolved_to: Option<String>,
-    pub method: &'static str, // "scope_chain", "type_tracking", "import", "unresolved"
+    pub method: &'static str, // "scope_chain", "type_tracking", "import", "unresolved", "local_binding"
 }
 
 /// Resolve references using tree-sitter scope analysis.
@@ -397,6 +397,15 @@ pub(crate) fn resolve_with_scopes_full(
                 let start_row = entity.start_line.saturating_sub(1); // 1-indexed to 0-indexed
                 let end_row = entity.end_line; // exclusive
 
+                for binding in local_bindings_in_scope_chain(scope_idx, &scopes) {
+                    file_log.push(ResolutionEntry {
+                        from_entity: entity.id.clone(),
+                        reference: binding,
+                        resolved_to: None,
+                        method: "local_binding",
+                    });
+                }
+
                 // Filter pre-collected refs to this entity's line range
                 for ast_ref in all_file_refs.iter().filter(|r| r.row >= start_row && r.row < end_row) {
                     // Skip self-name refs (was previously done during collection)
@@ -677,9 +686,7 @@ fn build_scopes_from_ast(
         let is_function_like = config.function_scope_nodes.contains(&kind);
 
         if is_function_like {
-            let func_name = node.child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
+            let func_name = scope_entity_name(node, source);
 
             let parent_scope = if config.external_method && kind == "method_declaration" {
                 let receiver_type = node.utf8_text(source).ok()
@@ -765,6 +772,30 @@ fn build_scopes_from_ast(
             worklist.push((child, current_scope));
         }
     }
+}
+
+fn scope_entity_name(node: tree_sitter::Node, source: &[u8]) -> String {
+    match node.kind() {
+        "deinit_declaration" => "deinit".to_string(),
+        "subscript_declaration" => "subscript".to_string(),
+        _ => node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn local_bindings_in_scope_chain(start_scope: usize, scopes: &[Scope]) -> Vec<String> {
+    let mut bindings = HashSet::new();
+    let mut idx = Some(start_scope);
+    while let Some(scope_idx) = idx {
+        bindings.extend(scopes[scope_idx].bindings.iter().cloned());
+        idx = scopes[scope_idx].parent;
+    }
+
+    let mut bindings: Vec<_> = bindings.into_iter().collect();
+    bindings.sort();
+    bindings
 }
 
 /// Scan for variable assignments and record type bindings.
@@ -1035,6 +1066,8 @@ fn scan_ts_var_declaration(
         };
 
         if !var_name.is_empty() {
+            scopes[scope_idx].bindings.insert(var_name.clone());
+
             // Check for type annotation
             if let Some(type_ann) = node.child_by_field_name("type") {
                 let type_text = extract_base_type(type_ann, source);

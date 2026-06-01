@@ -1172,14 +1172,22 @@ fn find_declarator_name_range(mut node: Node) -> Option<(usize, usize)> {
 }
 
 fn extract_name(node: Node, source: &[u8]) -> Option<String> {
+    let node_type = node.kind();
+
+    if node_type == "deinit_declaration" {
+        return Some("deinit".to_string());
+    }
+
+    if node_type == "subscript_declaration" {
+        return Some("subscript".to_string());
+    }
+
     // Try 'name' field first (works for most languages)
     if let Some(name_node) = node.child_by_field_name("name") {
         return Some(node_text(name_node, source).to_string());
     }
 
     // For variable/lexical declarations, try to get the declarator name
-    let node_type = node.kind();
-
     // For Rust impl blocks, construct unique name from trait + type
     // e.g. "impl Display for Foo" -> "Display for Foo", "impl Foo" -> "Foo"
     if node_type == "impl_item" {

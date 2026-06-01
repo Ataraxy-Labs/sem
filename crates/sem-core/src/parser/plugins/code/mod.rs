@@ -343,6 +343,91 @@ func helper(x: Int) -> Int {
     }
 
     #[test]
+    fn test_swift_body_locals_not_extracted_as_properties() {
+        let code = r#"
+class Cache {
+    var stored: Int
+
+    var computed: Int {
+        let computedLocal = stored + 1
+        func computedNested() -> Int {
+            return computedLocal
+        }
+        return computedNested()
+    }
+
+    var explicit: Int {
+        get {
+            let getterLocal = stored
+            func getterNested() -> Int {
+                return getterLocal
+            }
+            return getterNested()
+        }
+    }
+
+    init(seed: Int) {
+        let initial = seed
+        self.stored = initial
+    }
+
+    func value() -> Int {
+        let doubled = stored * 2
+        var offset = doubled + 1
+        func nested() -> Int {
+            let insideNested = offset
+            return insideNested
+        }
+        return nested()
+    }
+
+    subscript(index: Int) -> Int {
+        let shifted = index + stored
+        func subscriptNested() -> Int {
+            return shifted
+        }
+        return subscriptNested()
+    }
+
+    deinit {
+        let closing = stored
+        _ = closing
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Cache.swift");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"Cache"), "got: {:?}", names);
+        assert!(names.contains(&"stored"), "got: {:?}", names);
+        assert!(names.contains(&"computed"), "got: {:?}", names);
+        assert!(names.contains(&"explicit"), "got: {:?}", names);
+        assert!(names.contains(&"init"), "got: {:?}", names);
+        assert!(names.contains(&"value"), "got: {:?}", names);
+        assert!(names.contains(&"computedNested"), "got: {:?}", names);
+        assert!(names.contains(&"getterNested"), "got: {:?}", names);
+        assert!(names.contains(&"nested"), "got: {:?}", names);
+        assert!(names.contains(&"subscriptNested"), "got: {:?}", names);
+        assert!(names.contains(&"subscript"), "got: {:?}", names);
+        assert!(names.contains(&"deinit"), "got: {:?}", names);
+        assert!(!names.contains(&"Int"), "got: {:?}", names);
+
+        for local in [
+            "computedLocal",
+            "getterLocal",
+            "initial",
+            "doubled",
+            "offset",
+            "insideNested",
+            "shifted",
+            "closing",
+        ] {
+            assert!(!names.contains(&local), "{local} should not be an entity. Got: {:?}", names);
+        }
+    }
+
+    #[test]
     fn test_swift_conditional_compilation_inside_struct() {
         let code = r#"
 import ArgumentParser
