@@ -78,12 +78,84 @@ fn split_on_separator(args: Vec<String>) -> (Vec<String>, Vec<String>) {
     }
 }
 
-/// Simple glob matching for pathspecs. Supports `*` (any chars except `/`),
-/// `**` (any chars including `/`), and `?` (one non-`/` char).
+/// Simple glob matching for pathspecs. Supports `*`, `**`, `?`, and bracket classes.
 fn glob_match(pattern: &str, path: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = path.chars().collect();
     glob_match_inner(&pat, &text)
+}
+
+fn posix_bracket_class_matches(name: &str, ch: char) -> Option<bool> {
+    match name {
+        "alnum" => Some(ch.is_ascii_alphanumeric()),
+        "alpha" => Some(ch.is_ascii_alphabetic()),
+        "blank" => Some(ch == ' ' || ch == '\t'),
+        "cntrl" => Some(ch.is_ascii_control()),
+        "digit" => Some(ch.is_ascii_digit()),
+        "graph" => Some(ch.is_ascii_graphic()),
+        "lower" => Some(ch.is_ascii_lowercase()),
+        "print" => Some(ch.is_ascii_graphic() || ch == ' '),
+        "punct" => Some(ch.is_ascii_punctuation()),
+        "space" => Some(ch.is_ascii_whitespace()),
+        "upper" => Some(ch.is_ascii_uppercase()),
+        "xdigit" => Some(ch.is_ascii_hexdigit()),
+        _ => None,
+    }
+}
+
+fn match_posix_bracket_class(pat: &[char], ch: char) -> Option<(bool, usize)> {
+    if !matches!((pat.first(), pat.get(1)), (Some(&'['), Some(&':'))) {
+        return None;
+    }
+
+    for idx in 2..pat.len().saturating_sub(1) {
+        if pat[idx] == ':' && pat[idx + 1] == ']' {
+            let name: String = pat[2..idx].iter().collect();
+            return posix_bracket_class_matches(&name, ch).map(|matched| (matched, idx + 2));
+        }
+    }
+
+    None
+}
+
+fn match_bracket_class(pat: &[char], ch: char) -> Option<(bool, usize)> {
+    if pat.first() != Some(&'[') {
+        return None;
+    }
+
+    let mut idx = 1;
+    let negated = matches!(pat.get(idx), Some('!' | '^'));
+    if negated {
+        idx += 1;
+    }
+
+    let class_start = idx;
+    let mut matched = false;
+
+    while idx < pat.len() {
+        if pat[idx] == ']' && idx > class_start {
+            return Some((matched != negated, idx + 1));
+        }
+
+        if let Some((posix_matched, consumed)) = match_posix_bracket_class(&pat[idx..], ch) {
+            matched |= posix_matched;
+            idx += consumed;
+        } else if idx + 2 < pat.len() && pat[idx + 1] == '-' && pat[idx + 2] != ']' {
+            let start = pat[idx];
+            let end = pat[idx + 2];
+            if start <= ch && ch <= end {
+                matched = true;
+            }
+            idx += 3;
+        } else {
+            if pat[idx] == ch {
+                matched = true;
+            }
+            idx += 1;
+        }
+    }
+
+    None
 }
 
 fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
@@ -91,14 +163,22 @@ fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
         return text.is_empty();
     }
 
-    // Handle ** (matches any chars including /)
+    // Handle ** (matches any chars, with **/ advancing on path boundaries)
     if pat.len() >= 2 && pat[0] == '*' && pat[1] == '*' {
-        let rest = if pat.len() > 2 && pat[2] == '/' {
-            &pat[3..]
-        } else {
-            &pat[2..]
-        };
-        // Try matching ** against 0..n chars
+        if pat.len() > 2 && pat[2] == '/' {
+            let rest = &pat[3..];
+            if glob_match_inner(rest, text) {
+                return true;
+            }
+            for i in 0..text.len() {
+                if text[i] == '/' && glob_match_inner(rest, &text[i + 1..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        let rest = &pat[2..];
         for i in 0..=text.len() {
             if glob_match_inner(rest, &text[i..]) {
                 return true;
@@ -107,12 +187,9 @@ fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
         return false;
     }
 
-    // Handle * (matches any chars except /)
+    // Handle * (matches any chars)
     if pat[0] == '*' {
         for i in 0..=text.len() {
-            if i > 0 && text[i - 1] == '/' {
-                break;
-            }
             if glob_match_inner(&pat[1..], &text[i..]) {
                 return true;
             }
@@ -120,23 +197,42 @@ fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
         return false;
     }
 
-    // Handle ? (matches one non-/ char)
+    // Handle ? (matches one char)
     if pat[0] == '?' {
-        return !text.is_empty() && text[0] != '/' && glob_match_inner(&pat[1..], &text[1..]);
+        return !text.is_empty() && glob_match_inner(&pat[1..], &text[1..]);
+    }
+
+    // Handle bracket character classes.
+    if pat[0] == '[' {
+        if let Some((class_matches, consumed)) = text
+            .first()
+            .and_then(|ch| match_bracket_class(pat, *ch))
+        {
+            return class_matches && glob_match_inner(&pat[consumed..], &text[1..]);
+        }
     }
 
     // Literal character
     !text.is_empty() && pat[0] == text[0] && glob_match_inner(&pat[1..], &text[1..])
 }
 
-/// Check if a file path matches a pathspec (supports prefix matching and basic globs).
-fn path_matches_spec(file_path: &str, spec: &str) -> bool {
-    if spec.contains('*') || spec.contains('?') || spec.contains('[') {
-        glob_match(spec, file_path)
-    } else if spec.ends_with('/') {
-        file_path.starts_with(spec.trim_end_matches('/'))
+fn literal_pathspec_matches(file_path: &str, spec: &str) -> bool {
+    if spec.ends_with('/') {
+        let dir = spec.trim_end_matches('/');
+        file_path.starts_with(&format!("{dir}/"))
     } else {
         file_path == spec || file_path.starts_with(&format!("{spec}/"))
+    }
+}
+
+/// Check if a file path matches a pathspec (supports prefix matching and basic globs).
+fn path_matches_spec(file_path: &str, spec: &str) -> bool {
+    if literal_pathspec_matches(file_path, spec) {
+        true
+    } else if spec.contains('*') || spec.contains('?') || spec.contains('[') {
+        glob_match(spec, file_path)
+    } else {
+        false
     }
 }
 
@@ -1239,6 +1335,39 @@ mod tests {
         assert!(!is_unified_hunk_header("@@ NOTAHUNK @@"));
         assert!(!is_unified_hunk_header("@@ -1 +1@@"));
         assert!(!is_unified_hunk_header("@@ -1, +1 @@"));
+    }
+
+    #[test]
+    fn pathspec_matching_respects_directory_boundaries() {
+        assert!(!path_matches_spec("src", "src/"));
+        assert!(path_matches_spec("src/a.py", "src/"));
+        assert!(path_matches_spec("src/nested/a.py", "src/"));
+        assert!(!path_matches_spec("src2/a.py", "src/"));
+        assert!(path_matches_spec("a[12].py", "a[12].py"));
+        assert!(path_matches_spec("a[12].py/nested.py", "a[12].py"));
+    }
+
+    #[test]
+    fn glob_matching_supports_bracket_classes() {
+        assert!(glob_match("a[12].py", "a1.py"));
+        assert!(glob_match("a[12].py", "a2.py"));
+        assert!(!glob_match("a[12].py", "a3.py"));
+        assert!(glob_match("a[1-3].py", "a2.py"));
+        assert!(glob_match("a[!3].py", "a2.py"));
+        assert!(!glob_match("a[!3].py", "a3.py"));
+        assert!(glob_match("a[^3].py", "a2.py"));
+        assert!(glob_match("a[[:digit:]].py", "a2.py"));
+        assert!(!glob_match("a[[:digit:]].py", "aa.py"));
+        assert!(glob_match("a[![:digit:]].py", "aa.py"));
+        assert!(!glob_match("a[![:digit:]].py", "a2.py"));
+        assert!(glob_match("a[ab].py", "aa.py"));
+        assert!(glob_match("a?b.py", "a/b.py"));
+        assert!(glob_match("a[/]b.py", "a/b.py"));
+        assert!(glob_match("*.py", "src/nested/a.py"));
+        assert!(glob_match("**/a.py", "src/nested/a.py"));
+        assert!(glob_match("**/a.py", "a.py"));
+        assert!(!glob_match("**/a.py", "nested-a.py"));
+        assert!(glob_match("a[12.py", "a[12.py"));
     }
 
     #[test]

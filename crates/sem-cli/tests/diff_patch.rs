@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -72,6 +73,24 @@ fn run_sem(args: &[&str], input: &[u8], cwd: Option<&Path>) -> Output {
 
 fn run_diff_patch(input: &str) -> Output {
     run_sem(&["diff", "--patch"], input.as_bytes(), None)
+}
+
+fn json_file_paths(output: &Output) -> BTreeSet<String> {
+    assert!(
+        output.status.success(),
+        "sem failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be json");
+    json["changes"]
+        .as_array()
+        .expect("changes should be an array")
+        .iter()
+        .filter_map(|change| change["filePath"].as_str().map(str::to_owned))
+        .collect()
 }
 
 fn changed_app_patch() -> (TempRepo, Vec<u8>) {
@@ -248,4 +267,135 @@ fn patch_mode_pathspec_matches_renamed_old_path() {
     assert!(output.status.success());
     assert!(stdout.contains("greet"));
     assert!(!stdout.contains("No semantic changes detected."));
+}
+
+#[test]
+fn patch_mode_directory_pathspec_does_not_match_sibling_prefixes() {
+    let repo = TempRepo::new();
+    std::fs::create_dir(repo.path.join("src")).expect("create src");
+    std::fs::create_dir(repo.path.join("src2")).expect("create src2");
+    std::fs::write(repo.path.join("src/a.py"), "def a():\n    return 1\n").expect("write src file");
+    std::fs::write(repo.path.join("src2/a.py"), "def b():\n    return 1\n")
+        .expect("write src2 file");
+    run_git(&repo.path, &["add", "."]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+
+    std::fs::write(repo.path.join("src/a.py"), "def a():\n    return 2\n")
+        .expect("change src file");
+    std::fs::write(repo.path.join("src2/a.py"), "def b():\n    return 2\n")
+        .expect("change src2 file");
+
+    let patch = run_git(&repo.path, &["diff"]).stdout;
+    let output = run_sem(
+        &["diff", "--patch", "--json", "--", "src/"],
+        &patch,
+        Some(&repo.path),
+    );
+
+    let paths = json_file_paths(&output);
+    assert_eq!(paths, BTreeSet::from(["src/a.py".to_string()]));
+}
+
+#[test]
+fn patch_mode_pathspec_matches_bracket_character_classes() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.path.join("a1.py"), "def f():\n    return 1\n").expect("write a1");
+    std::fs::write(repo.path.join("a2.py"), "def g():\n    return 1\n").expect("write a2");
+    std::fs::write(repo.path.join("a3.py"), "def h():\n    return 1\n").expect("write a3");
+    std::fs::write(repo.path.join("a[12].py"), "def literal():\n    return 1\n")
+        .expect("write literal bracket path");
+    run_git(&repo.path, &["add", "."]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+
+    std::fs::write(repo.path.join("a1.py"), "def f():\n    return 2\n").expect("change a1");
+    std::fs::write(repo.path.join("a2.py"), "def g():\n    return 2\n").expect("change a2");
+    std::fs::write(repo.path.join("a3.py"), "def h():\n    return 2\n").expect("change a3");
+    std::fs::write(repo.path.join("a[12].py"), "def literal():\n    return 2\n")
+        .expect("change literal bracket path");
+    run_git(&repo.path, &["add", "."]);
+
+    let patch = run_git(&repo.path, &["diff", "--cached"]).stdout;
+    let output = run_sem(
+        &["diff", "--patch", "--json", "--", "a[12].py"],
+        &patch,
+        Some(&repo.path),
+    );
+
+    let paths = json_file_paths(&output);
+    assert_eq!(
+        paths,
+        BTreeSet::from([
+            "a1.py".to_string(),
+            "a2.py".to_string(),
+            "a[12].py".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn patch_mode_pathspec_matches_posix_bracket_classes() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.path.join("a1.py"), "def f():\n    return 1\n").expect("write a1");
+    std::fs::write(repo.path.join("a2.py"), "def g():\n    return 1\n").expect("write a2");
+    std::fs::write(repo.path.join("aa.py"), "def h():\n    return 1\n").expect("write aa");
+    run_git(&repo.path, &["add", "."]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+
+    std::fs::write(repo.path.join("a1.py"), "def f():\n    return 2\n").expect("change a1");
+    std::fs::write(repo.path.join("a2.py"), "def g():\n    return 2\n").expect("change a2");
+    std::fs::write(repo.path.join("aa.py"), "def h():\n    return 2\n").expect("change aa");
+    run_git(&repo.path, &["add", "."]);
+
+    let patch = run_git(&repo.path, &["diff", "--cached"]).stdout;
+    let output = run_sem(
+        &["diff", "--patch", "--json", "--", "a[[:digit:]].py"],
+        &patch,
+        Some(&repo.path),
+    );
+
+    let paths = json_file_paths(&output);
+    assert_eq!(
+        paths,
+        BTreeSet::from(["a1.py".to_string(), "a2.py".to_string()])
+    );
+}
+
+#[test]
+fn patch_mode_pathspec_wildcards_match_nested_paths_like_git() {
+    let repo = TempRepo::new();
+    std::fs::create_dir_all(repo.path.join("src/nested")).expect("create nested dir");
+    std::fs::write(repo.path.join("root.py"), "def root():\n    return 1\n")
+        .expect("write root");
+    std::fs::write(
+        repo.path.join("src/nested/child.py"),
+        "def child():\n    return 1\n",
+    )
+    .expect("write child");
+    run_git(&repo.path, &["add", "."]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+
+    std::fs::write(repo.path.join("root.py"), "def root():\n    return 2\n")
+        .expect("change root");
+    std::fs::write(
+        repo.path.join("src/nested/child.py"),
+        "def child():\n    return 2\n",
+    )
+    .expect("change child");
+    run_git(&repo.path, &["add", "."]);
+
+    let patch = run_git(&repo.path, &["diff", "--cached"]).stdout;
+    let output = run_sem(
+        &["diff", "--patch", "--json", "--", "*.py"],
+        &patch,
+        Some(&repo.path),
+    );
+
+    let paths = json_file_paths(&output);
+    assert_eq!(
+        paths,
+        BTreeSet::from([
+            "root.py".to_string(),
+            "src/nested/child.py".to_string(),
+        ])
+    );
 }
