@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, Transaction};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 
-pub const CACHE_SCHEMA_VERSION: i32 = 1;
+pub const CACHE_SCHEMA_VERSION: i32 = 2;
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
     ("idx_entities_file_path", "entities", "file_path"),
     ("idx_entities_name", "entities", "name"),
@@ -898,7 +898,7 @@ mod tests {
 
     #[test]
     fn open_rebuilds_cache_when_schema_version_is_unsupported() {
-        for version in [0, CACHE_SCHEMA_VERSION + 1] {
+        for version in [0, CACHE_SCHEMA_VERSION - 1, CACHE_SCHEMA_VERSION + 1] {
             let root = temp_repo_root(&format!("unsupported-{version}"));
             seed_unsupported_cache(&root, version);
 

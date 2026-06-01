@@ -59,6 +59,107 @@ fn add_scope_reference_words(words: &mut HashSet<String>, reference: &str) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ChildRange<'a> {
+    file_path: &'a str,
+    start_line: usize,
+    end_line: usize,
+    start_byte: Option<usize>,
+    end_byte: Option<usize>,
+}
+
+fn build_child_ranges_by_parent<'a>(
+    entities: &'a [SemanticEntity],
+) -> HashMap<&'a str, Vec<ChildRange<'a>>> {
+    let entity_by_id: HashMap<&str, &SemanticEntity> =
+        entities.iter().map(|entity| (entity.id.as_str(), entity)).collect();
+    let mut child_ranges_by_parent: HashMap<&'a str, Vec<ChildRange<'a>>> = HashMap::new();
+
+    for child in entities {
+        let Some(parent_id) = child.parent_id.as_deref() else {
+            continue;
+        };
+        let (start_byte, end_byte) = entity_by_id
+            .get(parent_id)
+            .and_then(|parent| child_content_span_in_parent(parent, child))
+            .map_or((None, None), |(start, end)| (Some(start), Some(end)));
+
+        child_ranges_by_parent
+            .entry(parent_id)
+            .or_default()
+            .push(ChildRange {
+                file_path: child.file_path.as_str(),
+                start_line: child.start_line,
+                end_line: child.end_line,
+                start_byte,
+                end_byte,
+            });
+    }
+
+    child_ranges_by_parent
+}
+
+fn child_content_span_in_parent(
+    parent: &SemanticEntity,
+    child: &SemanticEntity,
+) -> Option<(usize, usize)> {
+    if parent.file_path != child.file_path || child.content.is_empty() {
+        return None;
+    }
+
+    let expected_local_line = child.start_line.checked_sub(parent.start_line)? + 1;
+    for (offset, _) in parent.content.match_indices(&child.content) {
+        let local_line = line_for_byte(&parent.content, offset);
+        if local_line == expected_local_line {
+            return Some((offset, offset + child.content.len()));
+        }
+    }
+
+    None
+}
+
+fn entity_owns_content_span(
+    entity_id: &str,
+    file_path: &str,
+    source_line: usize,
+    local_start_byte: Option<usize>,
+    local_end_byte: Option<usize>,
+    child_ranges_by_parent: &HashMap<&str, Vec<ChildRange<'_>>>,
+) -> bool {
+    child_ranges_by_parent
+        .get(entity_id)
+        .map_or(true, |child_ranges| {
+            child_ranges
+                .iter()
+                .all(|child| {
+                    if child.file_path != file_path
+                        || source_line < child.start_line
+                        || source_line > child.end_line
+                    {
+                        return true;
+                    }
+
+                    match (local_start_byte, local_end_byte, child.start_byte, child.end_byte) {
+                        (Some(start), Some(end), Some(child_start), Some(child_end)) => {
+                            end <= child_start || start >= child_end
+                        }
+                        _ => false,
+                    }
+                })
+        })
+}
+
+fn source_line_for_entity_content(entity: &SemanticEntity, local_line: usize) -> usize {
+    entity.start_line + local_line.saturating_sub(1)
+}
+
+fn line_for_byte(content: &str, byte: usize) -> usize {
+    1 + content[..byte]
+        .bytes()
+        .filter(|current| *current == b'\n')
+        .count()
+}
+
 /// A reference from one entity to another.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +269,7 @@ impl EntityGraph {
         let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
         let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
         let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
+        let child_ranges_by_parent = build_child_ranges_by_parent(&all_entities);
         let mut class_entity_names: HashSet<&str> = HashSet::new();
         let mut class_entity_files: HashSet<(&str, &str)> = HashSet::new();
         let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
@@ -328,9 +430,19 @@ impl EntityGraph {
                 let stripped = strip_comments_and_strings(&entity.content);
 
                 // Phase 1: Dot-chain resolution
-                let dot_chains = extract_dot_chains(&stripped);
+                let dot_chains = extract_dot_chains_with_positions(&stripped);
 
-                for (receiver, member) in &dot_chains {
+                for (receiver, member, local_line, local_start_byte, local_end_byte) in &dot_chains {
+                    if !entity_owns_content_span(
+                        entity.id.as_str(),
+                        entity.file_path.as_str(),
+                        source_line_for_entity_content(entity, *local_line),
+                        Some(*local_start_byte),
+                        Some(*local_end_byte),
+                        &child_ranges_by_parent,
+                    ) {
+                        continue;
+                    }
                     let edge_count_before = entity_edges.len();
                     if *receiver == "self" || *receiver == "this" {
                         // self.B / this.B: resolve to sibling method in enclosing class
@@ -373,7 +485,21 @@ impl EntityGraph {
 
                 // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
                 // Reuse the stripped content to avoid stripping twice
-                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
+                let refs = extract_references_with_stripped_filtered(
+                    &entity.content,
+                    &entity.name,
+                    &stripped,
+                    |local_line, local_start_byte, local_end_byte| {
+                        entity_owns_content_span(
+                            entity.id.as_str(),
+                            entity.file_path.as_str(),
+                            source_line_for_entity_content(entity, local_line),
+                            Some(local_start_byte),
+                            Some(local_end_byte),
+                            &child_ranges_by_parent,
+                        )
+                    },
+                );
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -677,6 +803,8 @@ impl EntityGraph {
             })
             .collect();
 
+        let child_ranges_by_parent = build_child_ranges_by_parent(&all_entities);
+
         let class_entity_names: HashSet<&str> = all_entities
             .iter()
             .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
@@ -766,9 +894,19 @@ impl EntityGraph {
                 let stripped = strip_comments_and_strings(&entity.content);
 
                 // Phase 1: Dot-chain resolution
-                let dot_chains = extract_dot_chains(&stripped);
+                let dot_chains = extract_dot_chains_with_positions(&stripped);
 
-                for (receiver, member) in &dot_chains {
+                for (receiver, member, local_line, local_start_byte, local_end_byte) in &dot_chains {
+                    if !entity_owns_content_span(
+                        entity.id.as_str(),
+                        entity.file_path.as_str(),
+                        source_line_for_entity_content(entity, *local_line),
+                        Some(*local_start_byte),
+                        Some(*local_end_byte),
+                        &child_ranges_by_parent,
+                    ) {
+                        continue;
+                    }
                     let edge_count_before = entity_edges.len();
                     if *receiver == "self" || *receiver == "this" {
                         if let Some(class_name) = enclosing_class.get(entity.id.as_str()) {
@@ -808,7 +946,21 @@ impl EntityGraph {
                 }
 
                 // Phase 2: Bag-of-words resolution (reuse stripped content)
-                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
+                let refs = extract_references_with_stripped_filtered(
+                    &entity.content,
+                    &entity.name,
+                    &stripped,
+                    |local_line, local_start_byte, local_end_byte| {
+                        entity_owns_content_span(
+                            entity.id.as_str(),
+                            entity.file_path.as_str(),
+                            source_line_for_entity_content(entity, local_line),
+                            Some(local_start_byte),
+                            Some(local_end_byte),
+                            &child_ranges_by_parent,
+                        )
+                    },
+                );
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -1168,10 +1320,11 @@ impl EntityGraph {
 
         // Rebuild the global symbol table from all current entities
         let symbol_table = self.build_symbol_table();
+        let child_ranges_by_parent = build_child_ranges_by_parent(&new_entities);
 
         // Re-resolve references for new entities
         for entity in &new_entities {
-            self.resolve_entity_references(entity, &symbol_table);
+            self.resolve_entity_references(entity, &symbol_table, &child_ranges_by_parent);
         }
 
         // Also re-resolve references for entities in OTHER files that might
@@ -1287,8 +1440,24 @@ impl EntityGraph {
         &mut self,
         entity: &SemanticEntity,
         symbol_table: &HashMap<String, Vec<String>>,
+        child_ranges_by_parent: &HashMap<&str, Vec<ChildRange<'_>>>,
     ) {
-        let refs = extract_references_from_content(&entity.content, &entity.name);
+        let stripped = strip_comments_and_strings(&entity.content);
+        let refs = extract_references_with_stripped_filtered(
+            &entity.content,
+            &entity.name,
+            &stripped,
+            |local_line, local_start_byte, local_end_byte| {
+                entity_owns_content_span(
+                    entity.id.as_str(),
+                    entity.file_path.as_str(),
+                    source_line_for_entity_content(entity, local_line),
+                    Some(local_start_byte),
+                    Some(local_end_byte),
+                    child_ranges_by_parent,
+                )
+            },
+        );
 
         for ref_name in refs {
             if let Some(target_ids) = symbol_table.get(ref_name) {
@@ -1777,19 +1946,23 @@ fn strip_comments_and_strings(content: &str) -> String {
 }
 
 /// Extract dot-chains (receiver.member) from content for precise resolution.
-/// Returns unique (receiver, member) pairs found in the content.
-fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
+/// Returns unique receiver/member pairs with one-based content lines and byte offsets.
+fn extract_dot_chains_with_positions<'a>(
+    content: &'a str,
+) -> Vec<(&'a str, &'a str, usize, usize, usize)> {
     static DOT_CHAIN_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)").unwrap()
     });
 
     let mut chains = Vec::new();
-    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut seen: HashSet<(&str, &str, usize, usize)> = HashSet::new();
     for cap in DOT_CHAIN_RE.captures_iter(content) {
+        let matched = cap.get(0).unwrap();
+        let line = line_for_byte(content, matched.start());
         let receiver = cap.get(1).unwrap().as_str();
         let member = cap.get(2).unwrap().as_str();
-        if seen.insert((receiver, member)) {
-            chains.push((receiver, member));
+        if seen.insert((receiver, member, line, matched.start())) {
+            chains.push((receiver, member, line, matched.start(), matched.end()));
         }
     }
     chains
@@ -1798,6 +1971,7 @@ fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
 /// Extract identifier references from entity content using simple token analysis.
 /// Strips comments and strings first to avoid false positives from docstrings.
 /// Returns borrowed slices from the stripped content.
+#[cfg(test)]
 fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<&'a str> {
     let stripped = strip_comments_and_strings(content);
     extract_references_with_stripped(content, own_name, &stripped)
@@ -1806,43 +1980,110 @@ fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<
 /// Extract references using a pre-stripped version of the content.
 /// Use this when you already have the stripped content (e.g. from dot-chain extraction)
 /// to avoid stripping comments/strings twice.
+#[cfg(test)]
 fn extract_references_with_stripped<'a>(content: &'a str, own_name: &str, stripped: &str) -> Vec<&'a str> {
-    let stripped_words: HashSet<&str> = stripped
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-        .collect();
+    extract_references_with_stripped_filtered(content, own_name, stripped, |_, _, _| true)
+}
 
+fn extract_references_with_stripped_filtered<'a, F>(
+    content: &'a str,
+    own_name: &str,
+    stripped: &str,
+    mut include_token: F,
+) -> Vec<&'a str>
+where
+    F: FnMut(usize, usize, usize) -> bool,
+{
     let mut refs = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
+    let mut token_start: Option<usize> = None;
+    let mut line = 1;
 
-    for word in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if word.is_empty() || word == own_name {
+    for (idx, ch) in content.char_indices() {
+        if ch.is_alphanumeric() || ch == '_' {
+            if token_start.is_none() {
+                token_start = Some(idx);
+            }
             continue;
         }
-        if is_keyword(word) || word.len() < 2 {
-            continue;
+
+        if let Some(start) = token_start.take() {
+            maybe_push_reference_token(
+                content,
+                stripped,
+                start,
+                idx,
+                line,
+                own_name,
+                &mut seen,
+                &mut refs,
+                &mut include_token,
+            );
         }
-        // Skip very short lowercase identifiers (likely local vars: i, x, a, ok, id, etc.)
-        if word.starts_with(|c: char| c.is_lowercase()) && word.len() < 3 {
-            continue;
-        }
-        if !word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
-            continue;
-        }
-        // Skip common local variable names that create false graph edges
-        if is_common_local_name(word) {
-            continue;
-        }
-        // Skip words that only appear in comments/strings
-        if !stripped_words.contains(word) {
-            continue;
-        }
-        if seen.insert(word) {
-            refs.push(word);
+
+        if ch == '\n' {
+            line += 1;
         }
     }
 
+    if let Some(start) = token_start {
+        maybe_push_reference_token(
+            content,
+            stripped,
+            start,
+            content.len(),
+            line,
+            own_name,
+            &mut seen,
+            &mut refs,
+            &mut include_token,
+        );
+    }
+
     refs
+}
+
+fn maybe_push_reference_token<'a, F>(
+    content: &'a str,
+    stripped: &str,
+    start: usize,
+    end: usize,
+    line: usize,
+    own_name: &str,
+    seen: &mut HashSet<&'a str>,
+    refs: &mut Vec<&'a str>,
+    include_token: &mut F,
+) where
+    F: FnMut(usize, usize, usize) -> bool,
+{
+    let word = &content[start..end];
+    if word.is_empty() || word == own_name {
+        return;
+    }
+    if is_keyword(word) || word.len() < 2 {
+        return;
+    }
+    // Skip very short lowercase identifiers (likely local vars: i, x, a, ok, id, etc.)
+    if word.starts_with(|c: char| c.is_lowercase()) && word.len() < 3 {
+        return;
+    }
+    if !word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+        return;
+    }
+    // Skip common local variable names that create false graph edges
+    if is_common_local_name(word) {
+        return;
+    }
+    // Skip words that only appear in comments/strings
+    if stripped.get(start..end) != Some(word) {
+        return;
+    }
+    if !include_token(line, start, end) {
+        return;
+    }
+    if seen.insert(word) {
+        refs.push(word);
+    }
 }
 
 static COMMON_LOCAL_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
@@ -2193,6 +2434,42 @@ mod tests {
         assert!(!graph.entities.contains_key("methods.go::type::Service::Run"));
     }
 
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_go_receiver_child_range_does_not_hide_parent_file_edges() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "models.go",
+            "package demo\n\
+             type Dependency struct{}\n\
+             type Service struct { Dependency }\n",
+        );
+        write_file(
+            root,
+            "methods.go",
+            "package demo\n\n\
+             func (s *Service) Run() {}\n",
+        );
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.go".into(), "methods.go".into()],
+            &registry,
+        );
+
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.from_entity == "models.go::type::Service"
+                    && edge.to_entity == "models.go::type::Dependency"
+            }),
+            "Service should keep its Dependency edge. Edges: {:?}",
+            graph.edges
+        );
+    }
+
     #[test]
     fn test_extract_references() {
         let content = "function processData(input) {\n  const result = validateInput(input);\n  return transform(result);\n}";
@@ -2200,6 +2477,167 @@ mod tests {
         assert!(refs.contains(&"validateInput"));
         assert!(refs.contains(&"transform"));
         assert!(!refs.contains(&"processData")); // self excluded
+    }
+
+    #[test]
+    fn test_container_does_not_inherit_child_call_edges() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "app.ts",
+            "export function helper() { return 1; }\n\
+             export class Service {\n\
+               method() { return helper(); }\n\
+             }\n\
+             export class InlineService { method() { return helper(); } }\n",
+        );
+
+        let (graph, _) = EntityGraph::build(root, &["app.ts".into()], &registry);
+        let helper_id = "app.ts::function::helper";
+
+        for (class_id, method_id) in [
+            (
+                "app.ts::class::Service",
+                "app.ts::class::Service::method",
+            ),
+            (
+                "app.ts::class::InlineService",
+                "app.ts::class::InlineService::method",
+            ),
+        ] {
+            assert!(
+                graph.edges.iter().any(|edge| {
+                    edge.from_entity == method_id
+                        && edge.to_entity == helper_id
+                        && edge.ref_type == RefType::Calls
+                }),
+                "{method_id} should call helper. Edges: {:?}",
+                graph.edges
+            );
+            assert!(
+                !graph
+                    .edges
+                    .iter()
+                    .any(|edge| edge.from_entity == class_id && edge.to_entity == helper_id),
+                "{class_id} should not call helper. Edges: {:?}",
+                graph.edges
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_container_does_not_inherit_child_call_edges() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "app.ts",
+            "export function helper() { return 1; }\n\
+             export class Service {\n\
+               method() { return helper(); }\n\
+             }\n",
+        );
+        let (initial_graph, initial_entities) =
+            EntityGraph::build(root, &["app.ts".into()], &registry);
+
+        write_file(
+            root,
+            "app.ts",
+            "export function helper() { return 2; }\n\
+             export function extra() { return 3; }\n\
+             export class Service {\n\
+               method() { return helper(); }\n\
+             }\n",
+        );
+
+        let (graph, _) = EntityGraph::build_incremental(
+            root,
+            &["app.ts".into()],
+            &["app.ts".into()],
+            vec![],
+            initial_graph.edges,
+            initial_entities,
+            &registry,
+        );
+
+        let class_id = "app.ts::class::Service";
+        let method_id = "app.ts::class::Service::method";
+        let helper_id = "app.ts::function::helper";
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.from_entity == method_id
+                    && edge.to_entity == helper_id
+                    && edge.ref_type == RefType::Calls
+            }),
+            "{method_id} should call helper. Edges: {:?}",
+            graph.edges
+        );
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.from_entity == class_id && edge.to_entity == helper_id),
+            "{class_id} should not call helper. Edges: {:?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn test_same_line_container_and_child_refs_use_byte_spans() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "app.ts",
+            "export function helper() { return 1; }\n\
+             export function other() { return 2; }\n\
+             export class Service { static { helper(); } method() { return other(); } }\n",
+        );
+
+        let (graph, _) = EntityGraph::build(root, &["app.ts".into()], &registry);
+        let class_id = "app.ts::class::Service";
+        let method_id = "app.ts::class::Service::method";
+        let helper_id = "app.ts::function::helper";
+        let other_id = "app.ts::function::other";
+
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.from_entity == class_id
+                    && edge.to_entity == helper_id
+                    && edge.ref_type == RefType::Calls
+            }),
+            "{class_id} should own the static-block helper call. Edges: {:?}",
+            graph.edges
+        );
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.from_entity == method_id
+                    && edge.to_entity == other_id
+                    && edge.ref_type == RefType::Calls
+            }),
+            "{method_id} should own the method-body other call. Edges: {:?}",
+            graph.edges
+        );
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.from_entity == method_id && edge.to_entity == helper_id),
+            "{method_id} should not inherit the static-block helper call. Edges: {:?}",
+            graph.edges
+        );
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.from_entity == class_id && edge.to_entity == other_id),
+            "{class_id} should not inherit the method-body other call. Edges: {:?}",
+            graph.edges
+        );
     }
 
     #[test]

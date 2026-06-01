@@ -59,6 +59,9 @@ struct AstRef {
     kind: AstRefKind,
     /// Row (0-indexed) where this reference appears in the source
     row: usize,
+    /// Byte range for the referenced syntax node in the file.
+    start_byte: usize,
+    end_byte: usize,
 }
 
 enum AstRefKind {
@@ -66,6 +69,79 @@ enum AstRefKind {
     Call(String),
     /// Attribute call: `x.method()`
     MethodCall { receiver: String, method: String },
+}
+
+#[derive(Clone, Copy)]
+struct SourceSpan {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn entity_owns_ref(
+    entity: &SemanticEntity,
+    ast_ref: &AstRef,
+    children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
+    entity_spans: &HashMap<&str, SourceSpan>,
+) -> bool {
+    let source_line = ast_ref.row + 1;
+    if let Some(entity_span) = entity_spans.get(entity.id.as_str()) {
+        if ast_ref.end_byte <= entity_span.start_byte || ast_ref.start_byte >= entity_span.end_byte {
+            return false;
+        }
+    }
+
+    children_by_parent
+        .get(entity.id.as_str())
+        .map_or(true, |children| {
+            children
+                .iter()
+                .all(|child| {
+                    if child.file_path != entity.file_path
+                        || source_line < child.start_line
+                        || source_line > child.end_line
+                    {
+                        return true;
+                    }
+
+                    if let Some(child_span) = entity_spans.get(child.id.as_str()) {
+                        ast_ref.end_byte <= child_span.start_byte
+                            || ast_ref.start_byte >= child_span.end_byte
+                    } else {
+                        false
+                    }
+                })
+        })
+}
+
+fn find_entity_source_spans<'a>(
+    entities: &[&'a SemanticEntity],
+    source: &str,
+) -> HashMap<&'a str, SourceSpan> {
+    let mut spans = HashMap::new();
+    for entity in entities {
+        if entity.content.is_empty() {
+            continue;
+        }
+
+        let expected_line = entity.start_line;
+        for (offset, _) in source.match_indices(&entity.content) {
+            let line = 1 + source[..offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            if line == expected_line {
+                spans.insert(
+                    entity.id.as_str(),
+                    SourceSpan {
+                        start_byte: offset,
+                        end_byte: offset + entity.content.len(),
+                    },
+                );
+                break;
+            }
+        }
+    }
+    spans
 }
 
 /// Result of scope-aware resolution
@@ -343,6 +419,7 @@ pub(crate) fn resolve_with_scopes_full(
                 .map(|v| v.as_slice())
                 .unwrap_or(&[])
                 .to_vec();
+            let entity_spans = find_entity_source_spans(&file_entities, content);
 
             build_scopes_from_ast(
                 tree.root_node(),
@@ -398,7 +475,11 @@ pub(crate) fn resolve_with_scopes_full(
                 let end_row = entity.end_line; // exclusive
 
                 // Filter pre-collected refs to this entity's line range
-                for ast_ref in all_file_refs.iter().filter(|r| r.row >= start_row && r.row < end_row) {
+                for ast_ref in all_file_refs.iter().filter(|r| {
+                    r.row >= start_row
+                        && r.row < end_row
+                        && entity_owns_ref(entity, r, &children_by_parent, &entity_spans)
+                }) {
                     // Skip self-name refs (was previously done during collection)
                     let is_self_ref = match &ast_ref.kind {
                         AstRefKind::Call(name) => name == &entity.name,
@@ -2851,13 +2932,13 @@ fn collect_all_file_refs(
                 CallNodeStyle::FunctionField(field) => {
                     if let Some(func) = node.child_by_field_name(field) {
                         // Pass empty entity_name — self-ref filtering is done at resolution time
-                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
+                        extract_call_ref(func, node, "", "", source, &mut refs, config);
                     }
                 }
                 CallNodeStyle::FirstChild => {
                     // Swift/Kotlin: callee is the first named child (identifier or navigation_expression)
                     if let Some(func) = node.named_child(0) {
-                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
+                        extract_call_ref(func, node, "", "", source, &mut refs, config);
                     }
                 }
                 CallNodeStyle::DirectMethod { object_field, method_field } => {
@@ -2871,11 +2952,15 @@ fn collect_all_file_refs(
                             refs.push(AstRef {
                                 kind: AstRefKind::MethodCall { receiver, method: method_name.to_string() },
                                 row: node_row,
+                                start_byte: node.start_byte(),
+                                end_byte: node.end_byte(),
                             });
                         } else {
                             refs.push(AstRef {
                                 kind: AstRefKind::Call(method_name.to_string()),
                                 row: node_row,
+                                start_byte: node.start_byte(),
+                                end_byte: node.end_byte(),
                             });
                         }
                     }
@@ -2896,7 +2981,9 @@ fn collect_all_file_refs(
                 if !macro_name.is_empty() && !is_builtin(macro_name, config) {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(macro_name.to_string()),
-                        row: node_row,
+                        row: macro_node.start_position().row,
+                        start_byte: macro_node.start_byte(),
+                        end_byte: macro_node.end_byte(),
                     });
                 }
             }
@@ -2916,7 +3003,9 @@ fn collect_all_file_refs(
                 if !name.is_empty() && !is_builtin(name, config) {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(name.to_string()),
-                        row: node_row,
+                        row: type_node.start_position().row,
+                        start_byte: type_node.start_byte(),
+                        end_byte: type_node.end_byte(),
                     });
                 }
             }
@@ -2937,7 +3026,9 @@ fn collect_all_file_refs(
                 {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(name.to_string()),
-                        row: node_row,
+                        row: type_node.start_position().row,
+                        start_byte: type_node.start_byte(),
+                        end_byte: type_node.end_byte(),
                     });
                 }
             }
@@ -2956,12 +3047,12 @@ fn collect_all_file_refs(
 /// Extract a call reference from a function/callee node (shared across languages)
 fn extract_call_ref(
     func: tree_sitter::Node,
+    ref_node: tree_sitter::Node,
     _entity_id: &str,
     entity_name: &str,
     source: &[u8],
     refs: &mut Vec<AstRef>,
     config: &ScopeResolveConfig,
-    row: usize,
 ) {
     let func_kind = func.kind();
 
@@ -2970,7 +3061,9 @@ fn extract_call_ref(
         if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
             refs.push(AstRef {
                 kind: AstRefKind::Call(name.to_string()),
-                row,
+                row: ref_node.start_position().row,
+                start_byte: ref_node.start_byte(),
+                end_byte: ref_node.end_byte(),
             });
         }
         return;
@@ -2979,7 +3072,7 @@ fn extract_call_ref(
     // Check config member_access patterns
     for ma in config.member_access {
         if func_kind == ma.node_kind {
-            extract_member_call_ref(func, ma.object_field, ma.property_field, source, refs, row);
+            extract_member_call_ref(func, ref_node, ma.object_field, ma.property_field, source, refs);
             return;
         }
     }
@@ -2998,7 +3091,9 @@ fn extract_call_ref(
                 if !method_name.is_empty() && !is_builtin(method_name, config) {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(method_name.to_string()),
-                        row,
+                        row: ref_node.start_position().row,
+                        start_byte: ref_node.start_byte(),
+                        end_byte: ref_node.end_byte(),
                     });
                 }
             } else {
@@ -3006,14 +3101,18 @@ fn extract_call_ref(
                 if !type_name.is_empty() && !method_name.is_empty() {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(method_name.to_string()),
-                        row,
+                        row: ref_node.start_position().row,
+                        start_byte: ref_node.start_byte(),
+                        end_byte: ref_node.end_byte(),
                     });
                     if type_name.chars().next().map_or(false, |c| c.is_uppercase())
                         && !is_builtin(type_name, config)
                     {
                         refs.push(AstRef {
                             kind: AstRefKind::Call(type_name.to_string()),
-                            row,
+                            row: ref_node.start_position().row,
+                            start_byte: ref_node.start_byte(),
+                            end_byte: ref_node.end_byte(),
                         });
                     }
                 }
@@ -3027,11 +3126,11 @@ fn extract_call_ref(
 /// navigation_expression children don't have field names.
 fn extract_member_call_ref(
     node: tree_sitter::Node,
+    ref_node: tree_sitter::Node,
     object_field: &str,
     attr_field: &str,
     source: &[u8],
     refs: &mut Vec<AstRef>,
-    row: usize,
 ) {
     let obj_text = node
         .child_by_field_name(object_field)
@@ -3048,7 +3147,7 @@ fn extract_member_call_ref(
         .unwrap_or("");
 
     if !obj_text.is_empty() && !attr_text.is_empty() {
-        push_method_call_ref(obj_text, attr_text, refs, row);
+        push_method_call_ref(obj_text, attr_text, refs, ref_node);
         return;
     }
 
@@ -3063,18 +3162,25 @@ fn extract_member_call_ref(
             .and_then(|n| n.utf8_text(source).ok())
             .unwrap_or("");
         if !obj.is_empty() && !attr.is_empty() {
-            push_method_call_ref(obj, attr, refs, row);
+            push_method_call_ref(obj, attr, refs, ref_node);
         }
     }
 }
 
-fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>, row: usize) {
+fn push_method_call_ref(
+    obj: &str,
+    method: &str,
+    refs: &mut Vec<AstRef>,
+    node: tree_sitter::Node,
+) {
     refs.push(AstRef {
         kind: AstRefKind::MethodCall {
             receiver: obj.to_string(),
             method: method.to_string(),
         },
-        row,
+        row: node.start_position().row,
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
     });
 }
 
