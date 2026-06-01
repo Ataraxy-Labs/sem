@@ -213,9 +213,12 @@ impl EntityGraph {
         let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
         let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
         let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
+                scope_owner_members.entry(pid.clone()).or_default()
+                    .push((entity.name.clone(), entity.id.clone()));
                 if let Some(&parent_name) = id_to_name.get(pid.as_str()) {
                     if class_entity_names.contains(parent_name) {
                         enclosing_class.insert(entity.id.as_str(), parent_name);
@@ -285,6 +288,7 @@ impl EntityGraph {
         let pre_built = scope_resolve::PreBuiltLookups {
             symbol_table: Arc::clone(&symbol_table),
             class_members: scope_class_members,
+            owner_members: scope_owner_members,
             entity_ranges: scope_entity_ranges,
             go_pkg_index: owned_go_pkg_index,
         };
@@ -2325,6 +2329,167 @@ function caller() { return MathUtils.compute(); }
             deps.iter().any(|d| d.name == "compute"),
             "caller should depend on compute via MathUtils.compute(). Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_ts_namespace_members_are_parented_and_qualified_calls_resolve() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "namespace.ts", "\
+export namespace Utils {
+    export function parse(input: string): string {
+        return input.trim();
+    }
+    export class Parser {
+        run(input: string): string { return parse(input); }
+    }
+}
+
+export function useNamespace(input: string): string {
+    return Utils.parse(input);
+}
+
+module LegacyModule {
+    export function helper(): void {}
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["namespace.ts".into()], &registry);
+
+        let utils = graph.entities.values()
+            .find(|entity| entity.name == "Utils" && entity.entity_type == "module")
+            .expect("Utils namespace entity should exist");
+        let utils_id = utils.id.clone();
+
+        let legacy = graph.entities.values()
+            .find(|entity| entity.name == "LegacyModule" && entity.entity_type == "module")
+            .expect("LegacyModule entity should exist");
+        let legacy_id = legacy.id.clone();
+
+        let parse = graph.entities.values()
+            .find(|entity| {
+                entity.name == "parse" && entity.parent_id.as_deref() == Some(utils_id.as_str())
+            })
+            .expect("parse should be nested under Utils");
+        let parse_id = parse.id.clone();
+
+        let parser = graph.entities.values()
+            .find(|entity| {
+                entity.name == "Parser" && entity.parent_id.as_deref() == Some(utils_id.as_str())
+            })
+            .expect("Parser should be nested under Utils");
+        let parser_id = parser.id.clone();
+
+        assert!(
+            graph.entities.values().any(|entity| {
+                entity.name == "run" && entity.parent_id.as_deref() == Some(parser_id.as_str())
+            }),
+            "run should be nested under Parser"
+        );
+        assert!(
+            graph.entities.values().any(|entity| {
+                entity.name == "helper" && entity.parent_id.as_deref() == Some(legacy_id.as_str())
+            }),
+            "helper should be nested under LegacyModule"
+        );
+        assert!(
+            !graph.entities.values().any(|entity| {
+                matches!(entity.name.as_str(), "parse" | "Parser" | "helper")
+                    && entity.parent_id.is_none()
+            }),
+            "namespace members should not be emitted as top-level entities"
+        );
+
+        let use_namespace = graph.entities.values()
+            .find(|entity| entity.name == "useNamespace")
+            .expect("useNamespace entity should exist");
+        let deps = graph.get_dependencies(&use_namespace.id);
+        assert!(
+            deps.iter().any(|dep| dep.id == parse_id),
+            "useNamespace should depend on Utils.parse(). Deps: {:?}",
+            deps.iter().map(|dep| (&dep.name, &dep.parent_id)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_ts_imported_namespace_member_call_resolves_to_owned_member() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "utils.ts", "\
+export namespace Utils {
+    export function parse(input: string): string {
+        return input.trim();
+    }
+}
+");
+        write_file(root, "main.ts", "\
+import { Utils } from './utils';
+
+export function useImportedNamespace(input: string): string {
+    return Utils.parse(input);
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["utils.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let parse = graph.entities.values()
+            .find(|entity| entity.id == "utils.ts::module::Utils::parse")
+            .expect("parse should be nested under the imported Utils namespace");
+        let parse_id = parse.id.clone();
+
+        let caller = graph.entities.values()
+            .find(|entity| entity.name == "useImportedNamespace")
+            .expect("useImportedNamespace entity should exist");
+        let deps = graph.get_dependencies(&caller.id);
+        assert!(
+            deps.iter().any(|dep| dep.id == parse_id),
+            "useImportedNamespace should depend on imported Utils.parse(). Deps: {:?}",
+            deps.iter().map(|dep| (&dep.name, &dep.id)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_ts_declare_module_string_name_is_unquoted() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "ambient.d.ts", "\
+declare module \"legacy-lib\" {
+    export class Client {}
+    export function helper(): void;
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["ambient.d.ts".into()], &registry);
+
+        let module = graph.entities.values()
+            .find(|entity| entity.name == "legacy-lib" && entity.entity_type == "module")
+            .expect("ambient module entity should use the string literal content as its name");
+        assert_eq!(module.parent_id, None);
+        assert!(
+            !graph.entities.values().any(|entity| entity.name == "\"legacy-lib\""),
+            "ambient module names should not retain quote delimiters"
+        );
+        assert!(
+            graph.entities.values().any(|entity| {
+                entity.name == "Client" && entity.parent_id.as_deref() == Some(module.id.as_str())
+            }),
+            "Client should be nested under the ambient module"
+        );
+        assert!(
+            graph.entities.values().any(|entity| {
+                entity.name == "helper"
+                    && entity.entity_type == "function"
+                    && entity.parent_id.as_deref() == Some(module.id.as_str())
+            }),
+            "helper function signature should be nested under the ambient module"
         );
     }
 

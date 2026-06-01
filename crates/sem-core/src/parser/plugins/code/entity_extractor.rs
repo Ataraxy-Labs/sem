@@ -1172,13 +1172,20 @@ fn find_declarator_name_range(mut node: Node) -> Option<(usize, usize)> {
 }
 
 fn extract_name(node: Node, source: &[u8]) -> Option<String> {
+    let node_type = node.kind();
+
+    if node_type == "internal_module" || node_type == "module" {
+        if let Some(name) = extract_module_name(node, source) {
+            return Some(name);
+        }
+    }
+
     // Try 'name' field first (works for most languages)
     if let Some(name_node) = node.child_by_field_name("name") {
         return Some(node_text(name_node, source).to_string());
     }
 
     // For variable/lexical declarations, try to get the declarator name
-    let node_type = node.kind();
 
     // For Rust impl blocks, construct unique name from trait + type
     // e.g. "impl Display for Foo" -> "Display for Foo", "impl Foo" -> "Foo"
@@ -1542,6 +1549,16 @@ fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
+fn extract_module_name(node: Node, source: &[u8]) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let text = node_text(name_node, source);
+    if name_node.kind() == "string" {
+        Some(text.trim_matches(&['"', '\'', '`'][..]).to_string())
+    } else {
+        Some(text.to_string())
+    }
+}
+
 fn map_node_type(tree_sitter_type: &str) -> &str {
     match tree_sitter_type {
         "function_declaration"
@@ -1565,8 +1582,8 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "union_specifier" => "union",
         "impl_item" => "impl",
         "trait_item" => "trait",
-        "mod_item" | "module" | "module_definition" | "namespace_definition" | "namespace_declaration"
-        | "package_object" => "module",
+        "mod_item" | "module" | "internal_module" | "module_definition" | "namespace_definition"
+        | "namespace_declaration" | "package_object" => "module",
         "object_definition" => "object",
         "trait_definition" => "trait",
         "val_definition" => "val",

@@ -95,6 +95,7 @@ pub struct ResolutionEntry {
 pub(crate) struct PreBuiltLookups {
     pub(crate) symbol_table: Arc<HashMap<String, Vec<String>>>,
     pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
+    pub(crate) owner_members: HashMap<String, Vec<(String, String)>>,
     pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
     /// Go package index: pkg_name → [(entity_name, entity_id)]
     /// Avoids O(symbol_table) scan per Go import.
@@ -125,11 +126,18 @@ pub(crate) fn resolve_with_scopes_full(
     let mut log: Vec<ResolutionEntry> = Vec::new();
 
     // Use pre-built lookups if provided, otherwise build from scratch
-    let (symbol_table, class_members, entity_ranges, go_pkg_index) = if let Some(pb) = pre_built {
-        (pb.symbol_table, pb.class_members, pb.entity_ranges, pb.go_pkg_index)
+    let (symbol_table, class_members, owner_members, entity_ranges, go_pkg_index) = if let Some(pb) = pre_built {
+        (
+            pb.symbol_table,
+            pb.class_members,
+            pb.owner_members,
+            pb.entity_ranges,
+            pb.go_pkg_index,
+        )
     } else {
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
         let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
         for entity in all_entities {
@@ -139,6 +147,10 @@ pub(crate) fn resolve_with_scopes_full(
                 .push(entity.id.clone());
 
             if let Some(ref pid) = entity.parent_id {
+                owner_members
+                    .entry(pid.clone())
+                    .or_default()
+                    .push((entity.name.clone(), entity.id.clone()));
                 if let Some(parent) = entity_map.get(pid) {
                     if matches!(
                         parent.entity_type.as_str(),
@@ -172,7 +184,13 @@ pub(crate) fn resolve_with_scopes_full(
         // Build Go package index for O(1) import lookup
         let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
 
-        (Arc::new(symbol_table), class_members, entity_ranges, go_pkg_index)
+        (
+            Arc::new(symbol_table),
+            class_members,
+            owner_members,
+            entity_ranges,
+            go_pkg_index,
+        )
     };
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
@@ -417,6 +435,7 @@ pub(crate) fn resolve_with_scopes_full(
                         &scopes,
                         &symbol_table,
                         &class_members,
+                        &owner_members,
                         &local_import_table,
                         &instance_attr_types,
                         entity_map,
@@ -621,13 +640,7 @@ fn build_scopes_from_ast(
             }
         }
 
-        // Rust mod_item: create a module scope so nested functions resolve
-        // names from the parent scope (e.g. super::target() walks up correctly).
-        if kind == "mod_item" {
-            let mod_name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
+        if let Some(mod_name) = module_scope_name(node, source) {
             let mod_scope_idx = scopes.len();
             scopes.push(Scope {
                 parent: Some(current_scope),
@@ -639,9 +652,8 @@ fn build_scopes_from_ast(
                 kind: "module",
             });
 
-            // Register any entities that are children of this module
             let mod_entity = file_entities.iter().find(|e| {
-                e.name == mod_name
+                e.name == mod_name.as_str()
                     && e.entity_type == "module"
                     && {
                         let line = node.start_position().row + 1;
@@ -654,7 +666,6 @@ fn build_scopes_from_ast(
                 entity_scope_map.entry(me.id.clone()).or_insert(current_scope);
                 entity_inner_scope.insert(me.id.clone(), mod_scope_idx);
 
-                // Register child entities in the module scope
                 if let Some(children) = children_by_parent.get(me.id.as_str()) {
                     for child_entity in children {
                         scopes[mod_scope_idx]
@@ -3085,6 +3096,7 @@ fn resolve_ref(
     scopes: &[Scope],
     symbol_table: &HashMap<String, Vec<String>>,
     class_members: &HashMap<String, Vec<(String, String)>>,
+    owner_members: &HashMap<String, Vec<(String, String)>>,
     import_table: &HashMap<(String, String), String>,
     instance_attr_types: &HashMap<(String, String), String>,
     entity_map: &HashMap<String, EntityInfo>,
@@ -3213,7 +3225,13 @@ fn resolve_ref(
             if !is_local_binding_in_scopes(scope_idx, scopes, receiver) {
                 if let Some(class_id) = lookup_scope_chain(scope_idx, scopes, receiver) {
                     if let Some(info) = entity_map.get(&class_id) {
-                        if matches!(info.entity_type.as_str(), "class" | "struct" | "interface")
+                        if info.entity_type == "module" && info.name == receiver {
+                            if let Some(mid) = lookup_entity_member(owner_members, &class_id, method)
+                                .or_else(|| lookup_owned_scope_member(scopes, &class_id, method))
+                            {
+                                return Some((mid, RefType::Calls, "scope_chain"));
+                            }
+                        } else if matches!(info.entity_type.as_str(), "class" | "struct" | "interface")
                             && info.name == receiver
                         {
                             if let Some(members) = class_members.get(&info.name) {
@@ -3266,6 +3284,39 @@ fn resolve_ref(
             None
         }
     }
+}
+
+fn module_scope_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "mod_item" | "internal_module" | "module" => {}
+        _ => return None,
+    }
+
+    let name_node = node.child_by_field_name("name")?;
+    let text = name_node.utf8_text(source).ok()?;
+    if name_node.kind() == "string" {
+        Some(text.trim_matches(&['"', '\'', '`'][..]).to_string())
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> Option<String> {
+    scopes
+        .iter()
+        .find(|scope| scope.owner_id.as_deref() == Some(owner_id))
+        .and_then(|scope| scope.defs.get(member).cloned())
+}
+
+fn lookup_entity_member(
+    owner_members: &HashMap<String, Vec<(String, String)>>,
+    owner_id: &str,
+    member: &str,
+) -> Option<String> {
+    owner_members
+        .get(owner_id)
+        .and_then(|members| members.iter().find(|(name, _)| name == member))
+        .map(|(_, id)| id.clone())
 }
 
 /// Find the class name for the enclosing class scope.
