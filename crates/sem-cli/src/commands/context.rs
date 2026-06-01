@@ -120,7 +120,11 @@ fn find_entity<'a>(
         std::process::exit(1);
     });
 
-    let mut matching: Vec<_> = graph.entities.values().filter(|e| e.name == name).collect();
+    let mut matching: Vec<_> = graph
+        .entities
+        .values()
+        .filter(|e| super::entity_matches_query(e, name))
+        .collect();
 
     if matching.is_empty() {
         eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
@@ -146,7 +150,10 @@ fn find_entity<'a>(
     matching.sort_by_key(|e| (&e.file_path, e.start_line));
     eprintln!("{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:", "error:".red().bold(), name, matching.len());
     for m in &matching {
-        eprintln!("  {} ({}:L{})", m.id, m.file_path, m.start_line);
+        eprintln!(
+            "  {} {} ({}:L{})",
+            m.entity_type, m.id, m.file_path, m.start_line
+        );
     }
     std::process::exit(1);
 }

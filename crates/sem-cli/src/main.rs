@@ -108,7 +108,7 @@ enum Commands {
     },
     /// Show impact of changing an entity (deps, dependents, transitive impact, tests)
     Impact {
-        /// Name of the entity to analyze
+        /// Name of the entity to analyze, optionally as "type name"
         #[arg(required_unless_present = "entity_id")]
         entity: Option<String>,
 
@@ -242,7 +242,7 @@ enum Commands {
     },
     /// Show token-budgeted context for an entity
     Context {
-        /// Name of the entity
+        /// Name of the entity, optionally as "type name"
         #[arg(required_unless_present = "entity_id")]
         entity: Option<String>,
 

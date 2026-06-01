@@ -1782,6 +1782,8 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
     match node.kind() {
         "decorated_definition" => map_decorated_type(node),
         "class_member" => map_class_member_type(node),
+        "method_definition" => map_js_ts_accessor_method_type(node, config)
+            .unwrap_or_else(|| map_node_type(node.kind())),
         "class_declaration" if config.id == "swift" => swift_class_declaration_type(node)
             .unwrap_or_else(|| map_node_type(node.kind())),
         // C/C++ declarations with a function_declarator are function prototypes,
@@ -1793,6 +1795,34 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
             .or_else(|| promote_js_ts_const_function(node, config))
             .unwrap_or_else(|| map_node_type(node.kind())),
     }
+}
+
+fn map_js_ts_accessor_method_type(
+    node: Node,
+    config: &LanguageConfig,
+) -> Option<&'static str> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript") {
+        return None;
+    }
+
+    let name = node.child_by_field_name("name")?;
+    let mut accessor_type = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_byte() >= name.start_byte() {
+            break;
+        }
+        if child.is_extra() {
+            continue;
+        }
+        match child.kind() {
+            "get" => accessor_type = Some("getter"),
+            "set" => accessor_type = Some("setter"),
+            _ => {}
+        }
+    }
+
+    accessor_type
 }
 
 fn swift_class_declaration_type(node: Node) -> Option<&'static str> {

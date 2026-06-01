@@ -559,6 +559,160 @@ export async function* streamUsers(): AsyncGenerator<string> {
     }
 
     #[test]
+    fn test_typescript_accessor_entity_types() {
+        let code = r#"
+export class Box {
+    private _v = 0;
+
+    get value(): number {
+        return this._v;
+    }
+
+    set value(n: number) {
+        this._v = n;
+    }
+
+    get(): number {
+        return 1;
+    }
+
+    set(n: number): void {
+        this._v = n;
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "box.ts");
+        let find = |name: &str, entity_type: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name && e.entity_type == entity_type)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {entity_type} {name}; got: {:?}",
+                        entities
+                            .iter()
+                            .map(|e| (&e.name, &e.entity_type, e.start_line))
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        assert!(find("value", "getter")
+            .content
+            .trim_start()
+            .starts_with("get value(): number {"));
+        assert!(find("value", "setter")
+            .content
+            .trim_start()
+            .starts_with("set value(n: number) {"));
+        assert!(find("get", "method")
+            .content
+            .trim_start()
+            .starts_with("get(): number {"));
+        assert!(find("set", "method")
+            .content
+            .trim_start()
+            .starts_with("set(n: number): void {"));
+    }
+
+    #[test]
+    fn test_tsx_accessor_entity_types() {
+        let code = r#"
+export class Widget {
+    get label(): string {
+        return "x";
+    }
+
+    set label(value: string) {
+        console.log(value);
+    }
+
+    render() {
+        return <div>{this.label}</div>;
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "widget.tsx");
+        let find = |name: &str, entity_type: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name && e.entity_type == entity_type)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {entity_type} {name}; got: {:?}",
+                        entities
+                            .iter()
+                            .map(|e| (&e.name, &e.entity_type, e.start_line))
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        assert!(find("label", "getter")
+            .content
+            .trim_start()
+            .starts_with("get label(): string {"));
+        assert!(find("label", "setter")
+            .content
+            .trim_start()
+            .starts_with("set label(value: string) {"));
+        assert!(find("render", "method")
+            .content
+            .trim_start()
+            .starts_with("render() {"));
+    }
+
+    #[test]
+    fn test_javascript_accessor_entity_types() {
+        let code = r#"
+class Box {
+    get value() {
+        return 1;
+    }
+
+    set value(n) {
+        this._v = n;
+    }
+
+    get() {
+        return 2;
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "box.js");
+        let find = |name: &str, entity_type: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name && e.entity_type == entity_type)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {entity_type} {name}; got: {:?}",
+                        entities
+                            .iter()
+                            .map(|e| (&e.name, &e.entity_type, e.start_line))
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        assert!(find("value", "getter")
+            .content
+            .trim_start()
+            .starts_with("get value() {"));
+        assert!(find("value", "setter")
+            .content
+            .trim_start()
+            .starts_with("set value(n) {"));
+        assert!(find("get", "method")
+            .content
+            .trim_start()
+            .starts_with("get() {"));
+    }
+
+    #[test]
     fn test_javascript_generator_function_entity_extraction() {
         let code = r#"
 export function* ids() {
