@@ -585,6 +585,51 @@ impl EntityGraph {
             }
         }
 
+        let mut affected_target_names: HashSet<&str> = all_entities
+            .iter()
+            .filter(|entity| {
+                truly_changed_ids.contains(&entity.id)
+                    || parent_repaired_ids.contains(entity.id.as_str())
+            })
+            .map(|entity| entity.name.as_str())
+            .collect();
+        affected_target_names.extend(
+            stale_file_cached_entities
+                .iter()
+                .filter(|entity| deleted_ids.contains(entity.id.as_str()))
+                .map(|entity| entity.name.as_str()),
+        );
+
+        // Clean entities can gain edges to names introduced by stale files even when
+        // no cached edge existed.
+        if !affected_target_names.is_empty() {
+            for entity in &all_entities {
+                if stale_set.contains(entity.file_path.as_str())
+                    || affected_clean_ids.contains(&entity.id)
+                {
+                    continue;
+                }
+
+                let ext = entity
+                    .file_path
+                    .rfind('.')
+                    .map(|i| &entity.file_path[i..])
+                    .unwrap_or("");
+                if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
+                    continue;
+                }
+
+                if !text_mentions_any_name(&entity.content, &affected_target_names) {
+                    continue;
+                }
+
+                let stripped = strip_comments_and_strings(&entity.content);
+                if text_mentions_any_name(&stripped, &affected_target_names) {
+                    affected_clean_ids.insert(entity.id.clone());
+                }
+            }
+        }
+
         // Collect all stale entity IDs (for edge filtering)
         let stale_entity_ids: HashSet<&str> = all_entities
             .iter()
@@ -1801,6 +1846,12 @@ fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
 fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<&'a str> {
     let stripped = strip_comments_and_strings(content);
     extract_references_with_stripped(content, own_name, &stripped)
+}
+
+fn text_mentions_any_name(text: &str, names: &HashSet<&str>) -> bool {
+    text
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| names.contains(word))
 }
 
 /// Extract references using a pre-stripped version of the content.

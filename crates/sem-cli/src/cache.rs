@@ -386,13 +386,8 @@ impl DiskCache {
             .iter()
             .filter(|file| !shared_cache::is_manifest_file_name(file))
             .collect();
-        let stale_set: HashSet<&str> = source_stale_files
-            .iter()
-            .map(|file| file.as_str())
-            .collect();
 
         let tx = self.conn.unchecked_transaction()?;
-        let mut deleted_cached_files = Vec::new();
 
         // Delete stale file entries
         {
@@ -420,7 +415,6 @@ impl DiskCache {
                     && !current_set.contains(path.as_str())
                 {
                     del_files.execute(params![path])?;
-                    deleted_cached_files.push(path.clone());
                 }
             }
         }
@@ -440,42 +434,31 @@ impl DiskCache {
 
         shared_cache::refresh_manifest_entries(&tx, root)?;
 
-        // Delete entities for stale files
-        {
-            let mut del = tx.prepare("DELETE FROM entities WHERE file_path = ?1")?;
-            for f in &source_stale_files {
-                del.execute(params![f])?;
-            }
-            for f in &deleted_cached_files {
-                del.execute(params![f])?;
-            }
-        }
-
-        // Insert new entities for stale files
+        // Rewrite entity rows as a complete snapshot; graph repair can change
+        // entity IDs in files whose source bytes are still cached.
+        tx.execute("DELETE FROM entities", [])?;
         {
             let mut ins = tx.prepare(
                 "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for e in entities {
-                if stale_set.contains(e.file_path.as_str()) {
-                    let metadata_json = e
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| serde_json::to_string(m).ok());
-                    ins.execute(params![
-                        e.id,
-                        e.name,
-                        e.entity_type,
-                        e.file_path,
-                        e.start_line as i64,
-                        e.end_line as i64,
-                        e.content,
-                        e.content_hash,
-                        e.structural_hash,
-                        e.parent_id,
-                        metadata_json,
-                    ])?;
-                }
+                let metadata_json = e
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::to_string(m).ok());
+                ins.execute(params![
+                    e.id,
+                    e.name,
+                    e.entity_type,
+                    e.file_path,
+                    e.start_line as i64,
+                    e.end_line as i64,
+                    e.content,
+                    e.content_hash,
+                    e.structural_hash,
+                    e.parent_id,
+                    metadata_json,
+                ])?;
             }
         }
 
@@ -737,7 +720,11 @@ mod tests {
 
     #[test]
     fn open_rebuilds_cache_when_schema_version_is_unsupported() {
-        for version in [0, shared_cache::CACHE_SCHEMA_VERSION + 1] {
+        for version in [
+            0,
+            shared_cache::CACHE_SCHEMA_VERSION - 1,
+            shared_cache::CACHE_SCHEMA_VERSION + 1,
+        ] {
             let root = temp_repo_root(&format!("unsupported-{version}"));
             seed_unsupported_cache(&root, version);
 
