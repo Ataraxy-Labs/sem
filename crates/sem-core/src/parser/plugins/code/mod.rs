@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::model::entity::SemanticEntity;
 use crate::parser::plugin::SemanticParserPlugin;
+use crate::utils::hash::{content_hash, structural_hash};
 use languages::{get_all_code_extensions, get_language_config};
 use entity_extractor::extract_entities;
 
@@ -15,6 +16,81 @@ pub struct CodeParserPlugin;
 // Avoids creating a new Parser for every file during parallel graph builds.
 thread_local! {
     static PARSER_CACHE: RefCell<HashMap<&'static str, tree_sitter::Parser>> = RefCell::new(HashMap::new());
+}
+
+fn language_config_for_content(
+    content: &str,
+    file_path: &str,
+) -> Option<&'static languages::LanguageConfig> {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_lowercase()))
+        .unwrap_or_default();
+
+    get_language_config(&ext).or_else(|| {
+        detect_ext_from_content(content).and_then(|shebang_ext| get_language_config(&shebang_ext))
+    })
+}
+
+fn parse_tree(
+    config: &'static languages::LanguageConfig,
+    content: &str,
+) -> Option<tree_sitter::Tree> {
+    let language = (config.get_language)()?;
+
+    PARSER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let parser = cache.entry(config.id).or_insert_with(|| {
+            let mut p = tree_sitter::Parser::new();
+            let _ = p.set_language(&language);
+            p
+        });
+
+        parser.parse(content.as_bytes(), None)
+    })
+}
+
+fn has_non_comment_content(node: tree_sitter::Node, source: &[u8]) -> bool {
+    let mut worklist = Vec::new();
+    let mut cursor = node.walk();
+    worklist.extend(node.children(&mut cursor));
+
+    while let Some(node) = worklist.pop() {
+        if is_comment_node(node.kind()) {
+            continue;
+        }
+
+        if node.child_count() == 0 {
+            let start = node.start_byte();
+            let end = node.end_byte();
+            if start < end
+                && end <= source.len()
+                && source[start..end].iter().any(|b| !b.is_ascii_whitespace())
+            {
+                return true;
+            }
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        worklist.extend(node.children(&mut cursor));
+    }
+
+    false
+}
+
+fn is_comment_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "doc_comment" | "tag_comment"
+    )
+}
+
+fn shebang_line(content: &str) -> Option<&str> {
+    content
+        .strip_prefix("#!")
+        .map(|rest| rest.lines().next().unwrap_or(""))
 }
 
 impl SemanticParserPlugin for CodeParserPlugin {
@@ -35,46 +111,30 @@ impl SemanticParserPlugin for CodeParserPlugin {
         content: &str,
         file_path: &str,
     ) -> (Vec<SemanticEntity>, Option<tree_sitter::Tree>) {
-        let ext = std::path::Path::new(file_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e.to_lowercase()))
-            .unwrap_or_default();
-
-        let config = match get_language_config(&ext) {
-            Some(c) => c,
-            None => {
-                // Try shebang detection for extensionless files
-                match detect_ext_from_content(content)
-                    .and_then(|se| get_language_config(&se))
-                {
-                    Some(c) => c,
-                    None => return (Vec::new(), None),
-                }
-            }
+        let Some(config) = language_config_for_content(content, file_path) else {
+            return (Vec::new(), None);
         };
 
-        let language = match (config.get_language)() {
-            Some(lang) => lang,
-            None => return (Vec::new(), None),
+        let Some(tree) = parse_tree(config, content) else {
+            return (Vec::new(), None);
         };
 
-        PARSER_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let parser = cache.entry(config.id).or_insert_with(|| {
-                let mut p = tree_sitter::Parser::new();
-                let _ = p.set_language(&language);
-                p
-            });
+        let entities = extract_entities(&tree, file_path, config, content);
+        (entities, Some(tree))
+    }
 
-            let tree = match parser.parse(content.as_bytes(), None) {
-                Some(t) => t,
-                None => return (Vec::new(), None),
-            };
-
-            let entities = extract_entities(&tree, file_path, config, content);
-            (entities, Some(tree))
-        })
+    fn structural_hash_content(&self, content: &str, file_path: &str) -> Option<String> {
+        let config = language_config_for_content(content, file_path)?;
+        let tree = parse_tree(config, content)?;
+        let shebang = shebang_line(content);
+        if shebang.is_none() && !has_non_comment_content(tree.root_node(), content.as_bytes()) {
+            return Some(String::new());
+        }
+        let structural = structural_hash(tree.root_node(), content.as_bytes());
+        match shebang {
+            Some(shebang) => Some(content_hash(&format!("shebang:{shebang}\n{structural}"))),
+            None => Some(structural),
+        }
     }
 }
 

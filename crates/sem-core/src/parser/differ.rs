@@ -19,6 +19,7 @@ macro_rules! maybe_par_iter {
 use crate::model::change::{ChangeType, SemanticChange};
 use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
+use crate::parser::plugin::SemanticParserPlugin;
 use crate::parser::registry::ParserRegistry;
 use std::collections::{HashMap, HashSet};
 
@@ -107,6 +108,8 @@ pub fn compute_semantic_diff(
                     file,
                     &before_entities,
                     &after_entities,
+                    Some(plugin),
+                    detection_path,
                     commit_sha,
                     author,
                 );
@@ -367,6 +370,8 @@ fn detect_orphan_changes(
     file: &FileChange,
     before_entities: &[SemanticEntity],
     after_entities: &[SemanticEntity],
+    plugin: Option<&dyn SemanticParserPlugin>,
+    detection_path: &str,
     commit_sha: Option<&str>,
     author: Option<&str>,
 ) -> Vec<SemanticChange> {
@@ -448,11 +453,31 @@ fn detect_orphan_changes(
             commit_sha: commit_sha.map(String::from),
             author: author.map(String::from),
             timestamp: None,
-            structural_change: Some(true),
+            structural_change: orphan_structural_change(
+                before_content,
+                after_content,
+                plugin,
+                detection_path,
+            ),
         });
     }
 
     changes
+}
+
+fn orphan_structural_change(
+    before_content: Option<&str>,
+    after_content: Option<&str>,
+    plugin: Option<&dyn SemanticParserPlugin>,
+    detection_path: &str,
+) -> Option<bool> {
+    let plugin = plugin?;
+    let before_hash =
+        plugin.structural_hash_content(before_content.unwrap_or_default(), detection_path)?;
+    let after_hash =
+        plugin.structural_hash_content(after_content.unwrap_or_default(), detection_path)?;
+
+    Some(before_hash != after_hash)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,6 +685,45 @@ mod tests {
         assert_eq!(result.modified_count, 1);
         assert_eq!(result.changes[0].entity_type, "orphan");
         assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].structural_change, Some(false));
+    }
+
+    #[test]
+    fn orphan_code_change_is_structural() {
+        let before = "import os\n\ndef value():\n    return 1\n";
+        let after = "import sys\n\ndef value():\n    return 1\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("app.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].entity_type, "orphan");
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].structural_change, Some(true));
+    }
+
+    #[test]
+    fn orphan_shebang_change_is_structural() {
+        let before = "#!/usr/bin/env python3\ndef value():\n    return 1\n";
+        let after = "#!/usr/bin/env python\ndef value():\n    return 1\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("script", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].entity_type, "orphan");
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].structural_change, Some(true));
     }
 
     #[test]
@@ -849,6 +913,11 @@ mod tests {
             .changes
             .iter()
             .any(|c| c.entity_type == "orphan" && c.change_type == ChangeType::Added));
+        assert!(result.changes.iter().any(|c| {
+            c.entity_type == "orphan"
+                && c.change_type == ChangeType::Added
+                && c.structural_change == Some(false)
+        }));
 
         let named_bucket_total = result.added_count
             + result.modified_count
@@ -868,7 +937,7 @@ mod tests {
         );
         let entities = vec![entity_span("foo", 2, 2), entity_span("bar", 4, 4)];
 
-        let changes = detect_orphan_changes(&file, &entities, &entities, None, None);
+        let changes = detect_orphan_changes(&file, &entities, &entities, None, "a.rs", None, None);
 
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].start_line, 1);
@@ -891,8 +960,15 @@ mod tests {
         let before_entities = vec![entity_span("foo", 1, 1)];
         let after_entities = vec![entity_span("foo", 2, 2)];
 
-        let changes =
-            detect_orphan_changes(&file, &before_entities, &after_entities, None, None);
+        let changes = detect_orphan_changes(
+            &file,
+            &before_entities,
+            &after_entities,
+            None,
+            "a.rs",
+            None,
+            None,
+        );
 
         assert!(changes.is_empty());
     }
@@ -907,8 +983,15 @@ mod tests {
         let before_entities = vec![entity_span("foo", 1, 1), entity_span("bar", 3, 3)];
         let after_entities = vec![entity_span("foo", 2, 2), entity_span("bar", 4, 4)];
 
-        let changes =
-            detect_orphan_changes(&file, &before_entities, &after_entities, None, None);
+        let changes = detect_orphan_changes(
+            &file,
+            &before_entities,
+            &after_entities,
+            None,
+            "a.rs",
+            None,
+            None,
+        );
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].change_type, ChangeType::Added);
@@ -938,8 +1021,15 @@ mod tests {
             entity_span("bar", 8, 8),
         ];
 
-        let changes =
-            detect_orphan_changes(&file, &before_entities, &after_entities, None, None);
+        let changes = detect_orphan_changes(
+            &file,
+            &before_entities,
+            &after_entities,
+            None,
+            "a.rs",
+            None,
+            None,
+        );
 
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].change_type, ChangeType::Deleted);

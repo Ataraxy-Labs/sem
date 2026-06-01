@@ -1104,16 +1104,20 @@ fn retain_non_cosmetic_changes(result: &mut DiffResult) {
             change.after_content = None;
         }
     }
-    // Drop only purely cosmetic modifications; compound changes are preserved above.
-    result
-        .changes
-        .retain(|c| c.change_type != ChangeType::Modified || c.structural_change != Some(false));
+    // Drop purely cosmetic changes; compound moves/renames/reorders are preserved above.
+    result.changes.retain(|c| {
+        c.structural_change != Some(false)
+            || matches!(
+                c.change_type,
+                ChangeType::Moved | ChangeType::Renamed | ChangeType::Reordered
+            )
+    });
     recalculate_diff_summary(result);
 }
 
 fn recalculate_diff_summary(result: &mut DiffResult) {
-    // Mirrors compute_semantic_diff: any retained change, including an orphan,
-    // marks its file as changed. Orphans only skip the entity change-type buckets.
+    // Mirrors compute_semantic_diff: orphan_count is cross-cutting metadata,
+    // while retained orphans still contribute to change-type buckets.
     result.file_count = result
         .changes
         .iter()
@@ -1132,16 +1136,30 @@ fn recalculate_diff_summary(result: &mut DiffResult) {
     for change in &result.changes {
         if change.entity_type == "orphan" {
             orphan_count += 1;
-            continue;
         }
 
         match change.change_type {
             ChangeType::Added => added_count += 1,
             ChangeType::Modified => modified_count += 1,
             ChangeType::Deleted => deleted_count += 1,
-            ChangeType::Moved => moved_count += 1,
-            ChangeType::Renamed => renamed_count += 1,
-            ChangeType::Reordered => reordered_count += 1,
+            ChangeType::Moved => {
+                moved_count += 1;
+                if change.has_content_change() {
+                    modified_count += 1;
+                }
+            }
+            ChangeType::Renamed => {
+                renamed_count += 1;
+                if change.has_content_change() {
+                    modified_count += 1;
+                }
+            }
+            ChangeType::Reordered => {
+                reordered_count += 1;
+                if change.has_content_change() {
+                    modified_count += 1;
+                }
+            }
         }
     }
 
@@ -1222,12 +1240,27 @@ mod tests {
         assert_eq!(result.changes.len(), 3);
         assert_eq!(result.file_count, 2);
         assert_eq!(result.added_count, 1);
-        assert_eq!(result.modified_count, 1);
+        assert_eq!(result.modified_count, 2);
         assert_eq!(result.deleted_count, 0);
         assert_eq!(result.moved_count, 0);
         assert_eq!(result.renamed_count, 0);
         assert_eq!(result.reordered_count, 0);
         assert_eq!(result.orphan_count, 1);
+    }
+
+    #[test]
+    fn no_cosmetics_filter_drops_cosmetic_orphan_addition() {
+        let mut orphan = change("src/orphan.rs", ChangeType::Added, Some(false));
+        orphan.entity_type = "orphan".to_string();
+
+        let mut result = diff_result(vec![orphan]);
+
+        retain_non_cosmetic_changes(&mut result);
+
+        assert!(result.changes.is_empty());
+        assert_eq!(result.file_count, 0);
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.orphan_count, 0);
     }
 
     #[test]
