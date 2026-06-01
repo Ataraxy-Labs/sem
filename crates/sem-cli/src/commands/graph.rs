@@ -3,7 +3,7 @@ use std::path::Path;
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::EntityGraph;
+use sem_core::parser::graph::{EntityGraph, EntityRef, RefType};
 use sem_core::parser::registry::ParserRegistry;
 
 use crate::cache::DiskCache;
@@ -29,9 +29,15 @@ pub fn graph_command(opts: GraphOptions) {
     let (graph, _entities) = get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     if opts.json {
+        let mut entities = graph.entities.values().collect::<Vec<_>>();
+        entities.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut edges = graph.edges.iter().collect::<Vec<_>>();
+        edges.sort_by(compare_entity_refs);
+
         let output = serde_json::json!({
-            "entities": graph.entities.values().collect::<Vec<_>>(),
-            "edges": &graph.edges,
+            "entities": entities,
+            "edges": edges,
             "stats": {
                 "entityCount": graph.entities.len(),
                 "edgeCount": graph.edges.len()
@@ -48,11 +54,32 @@ pub fn graph_command(opts: GraphOptions) {
     }
 }
 
+fn compare_entity_refs(a: &&EntityRef, b: &&EntityRef) -> std::cmp::Ordering {
+    a.from_entity
+        .cmp(&b.from_entity)
+        .then_with(|| a.to_entity.cmp(&b.to_entity))
+        .then_with(|| ref_type_sort_key(&a.ref_type).cmp(&ref_type_sort_key(&b.ref_type)))
+}
+
+fn ref_type_sort_key(ref_type: &RefType) -> u8 {
+    match ref_type {
+        RefType::Calls => 0,
+        RefType::Imports => 1,
+        RefType::TypeRef => 2,
+    }
+}
+
 /// Normalize extension strings: ensure each starts with '.'
 pub fn normalize_exts(exts: &[String]) -> Vec<String> {
-    exts.iter().map(|e| {
-        if e.starts_with('.') { e.clone() } else { format!(".{}", e) }
-    }).collect()
+    exts.iter()
+        .map(|e| {
+            if e.starts_with('.') {
+                e.clone()
+            } else {
+                format!(".{}", e)
+            }
+        })
+        .collect()
 }
 
 /// Find all supported files in the repo (public for use by other commands).
