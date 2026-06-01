@@ -47,6 +47,9 @@ fn build_scope_consumed_words(
 
 fn add_scope_reference_words(words: &mut HashSet<String>, reference: &str) {
     let reference = reference.strip_suffix("()").unwrap_or(reference);
+    let reference = reference
+        .split_once('(')
+        .map_or(reference, |(name, _)| name);
     if let Some((receiver, member)) = reference.rsplit_once('.') {
         if !receiver.is_empty() {
             words.insert(receiver.to_string());
@@ -2091,6 +2094,73 @@ mod tests {
         let dep_names: Vec<&str> = foo_deps.iter().map(|d| d.name.as_str()).collect();
         assert!(dep_names.contains(&"baz"), "foo should depend on baz after modification. Deps: {:?}", dep_names);
         assert!(!dep_names.contains(&"bar"), "foo should no longer depend on bar. Deps: {:?}", dep_names);
+    }
+
+    #[test]
+    fn test_incremental_swift_overload_uses_clean_callee_signatures() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "Callee.swift",
+            r#"func load(id: Int) -> String { return "id" }
+
+func load(name: String) -> String { return "name" }
+"#,
+        );
+        write_file(
+            root,
+            "Caller.swift",
+            r#"func call() -> String { return load(id: 1) }
+"#,
+        );
+
+        let file_paths = vec!["Caller.swift".to_string(), "Callee.swift".to_string()];
+        let (initial_graph, initial_entities) =
+            EntityGraph::build(root, &file_paths, &registry);
+
+        write_file(
+            root,
+            "Caller.swift",
+            r#"func call() -> String { return load(name: "x") }
+"#,
+        );
+
+        let stale_file_cached_entities: Vec<SemanticEntity> = initial_entities
+            .iter()
+            .filter(|entity| entity.file_path == "Caller.swift")
+            .cloned()
+            .collect();
+        let cached_entities: Vec<SemanticEntity> = initial_entities
+            .into_iter()
+            .filter(|entity| entity.file_path != "Caller.swift")
+            .collect();
+
+        let (graph, _) = EntityGraph::build_incremental(
+            root,
+            &["Caller.swift".to_string()],
+            &file_paths,
+            cached_entities,
+            initial_graph.edges,
+            stale_file_cached_entities,
+            &registry,
+        );
+
+        let has_edge = |from: &str, to: &str| {
+            graph.edges.iter().any(|edge| {
+                edge.from_entity == from && edge.to_entity == to && edge.ref_type == RefType::Calls
+            })
+        };
+
+        assert!(
+            has_edge("Caller.swift::function::call", "Callee.swift::function::load@L3"),
+            "incremental caller should resolve load(name:) using clean callee signatures"
+        );
+        assert!(
+            !has_edge("Caller.swift::function::call", "Callee.swift::function::load@L1"),
+            "incremental caller should not fall back to load(id:)"
+        );
     }
 
     #[test]

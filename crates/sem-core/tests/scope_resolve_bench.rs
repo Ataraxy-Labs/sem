@@ -126,8 +126,148 @@ fn edge_matches(
             to_name == to_pat
         };
 
-        from_match && to_match
+    from_match && to_match
     })
+}
+
+#[test]
+fn swift_overloaded_calls_resolve_by_argument_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Example.swift"),
+        r#"func load(id: Int) -> String { return "id" }
+
+func load(name: String) -> String { return "name" }
+
+func byId() -> String { return load(id: 1) }
+
+func byName() -> String { return load(name: "x") }
+
+func byAge() -> String { return load(age: 1) }
+"#,
+    )
+    .unwrap();
+    init_git(root);
+
+    let registry = create_default_registry();
+    let file_refs = vec!["Example.swift".to_string()];
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
+
+    let entity_id = |name: &str, start_line: usize| {
+        graph
+            .entities
+            .values()
+            .find(|entity| entity.name == name && entity.start_line == start_line)
+            .unwrap_or_else(|| panic!("missing entity {name} at line {start_line}"))
+            .id
+            .clone()
+    };
+
+    let load_id = entity_id("load", 1);
+    let load_name = entity_id("load", 3);
+    let by_id = entity_id("byId", 5);
+    let by_name = entity_id("byName", 7);
+    let by_age = entity_id("byAge", 9);
+
+    let has_edge = |from: &str, to: &str| {
+        graph.edges.iter().any(|edge| {
+            edge.from_entity == from && edge.to_entity == to && edge.ref_type == RefType::Calls
+        })
+    };
+
+    assert!(has_edge(&by_id, &load_id), "byId should call load(id:)");
+    assert!(
+        !has_edge(&by_id, &load_name),
+        "byId should not call load(name:)"
+    );
+    assert!(
+        has_edge(&by_name, &load_name),
+        "byName should call load(name:)"
+    );
+    assert!(
+        !has_edge(&by_name, &load_id),
+        "byName should not call load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_id),
+        "byAge should not fall back to load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_name),
+        "byAge should not fall back to load(name:)"
+    );
+}
+
+#[test]
+fn swift_overloaded_method_calls_resolve_by_argument_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Example.swift"),
+        r#"struct Loader {
+    func load(id: Int) -> String { return "id" }
+
+    func load(name: String) -> String { return "name" }
+}
+
+func byId(loader: Loader) -> String { return loader.load(id: 1) }
+
+func byName(loader: Loader) -> String { return loader.load(name: "x") }
+
+func byAge(loader: Loader) -> String { return loader.load(age: 1) }
+"#,
+    )
+    .unwrap();
+    init_git(root);
+
+    let registry = create_default_registry();
+    let file_refs = vec!["Example.swift".to_string()];
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
+
+    let entity_id = |name: &str, start_line: usize| {
+        graph
+            .entities
+            .values()
+            .find(|entity| entity.name == name && entity.start_line == start_line)
+            .unwrap_or_else(|| panic!("missing entity {name} at line {start_line}"))
+            .id
+            .clone()
+    };
+
+    let load_id = entity_id("load", 2);
+    let load_name = entity_id("load", 4);
+    let by_id = entity_id("byId", 7);
+    let by_name = entity_id("byName", 9);
+    let by_age = entity_id("byAge", 11);
+
+    let has_edge = |from: &str, to: &str| {
+        graph.edges.iter().any(|edge| {
+            edge.from_entity == from && edge.to_entity == to && edge.ref_type == RefType::Calls
+        })
+    };
+
+    assert!(has_edge(&by_id, &load_id), "byId should call load(id:)");
+    assert!(
+        !has_edge(&by_id, &load_name),
+        "byId should not call load(name:)"
+    );
+    assert!(
+        has_edge(&by_name, &load_name),
+        "byName should call load(name:)"
+    );
+    assert!(
+        !has_edge(&by_name, &load_id),
+        "byName should not call load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_id),
+        "byAge should not fall back to load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_name),
+        "byAge should not fall back to load(name:)"
+    );
 }
 
 #[test]

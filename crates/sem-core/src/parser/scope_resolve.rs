@@ -63,9 +63,26 @@ struct AstRef {
 
 enum AstRefKind {
     /// Bare name call: `foo()`
-    Call(String),
+    Call {
+        name: String,
+        argument_labels: Option<Vec<Option<String>>>,
+    },
     /// Attribute call: `x.method()`
-    MethodCall { receiver: String, method: String },
+    MethodCall {
+        receiver: String,
+        method: String,
+        argument_labels: Option<Vec<Option<String>>>,
+    },
+}
+
+struct SwiftCallSignature {
+    argument_labels: Vec<Option<String>>,
+}
+
+enum SwiftOverloadSelection {
+    Matched(String),
+    NoMatch,
+    NotApplicable,
 }
 
 /// Result of scope-aware resolution
@@ -307,6 +324,9 @@ pub(crate) fn resolve_with_scopes_full(
         &mut instance_attr_types,
     );
 
+    let swift_call_signatures =
+        build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map);
+
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
     let per_file_results: Vec<(Vec<(String, String, RefType)>, Vec<ResolutionEntry>)> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
@@ -401,7 +421,7 @@ pub(crate) fn resolve_with_scopes_full(
                 for ast_ref in all_file_refs.iter().filter(|r| r.row >= start_row && r.row < end_row) {
                     // Skip self-name refs (was previously done during collection)
                     let is_self_ref = match &ast_ref.kind {
-                        AstRefKind::Call(name) => name == &entity.name,
+                        AstRefKind::Call { name, .. } => name == &entity.name,
                         AstRefKind::MethodCall { .. } => false,
                     };
                     if is_self_ref {
@@ -420,6 +440,7 @@ pub(crate) fn resolve_with_scopes_full(
                         &local_import_table,
                         &instance_attr_types,
                         entity_map,
+                        &swift_call_signatures,
                         file_path,
                         &entity.id,
                         allow_cross_file,
@@ -487,9 +508,36 @@ pub(crate) fn resolve_with_scopes_full(
 
 fn ref_description(ast_ref: &AstRef) -> String {
     match &ast_ref.kind {
-        AstRefKind::Call(name) => format!("{}()", name),
-        AstRefKind::MethodCall { receiver, method } => format!("{}.{}()", receiver, method),
+        AstRefKind::Call { name, argument_labels } => {
+            format!("{}({})", name, format_argument_labels(argument_labels.as_deref()))
+        }
+        AstRefKind::MethodCall {
+            receiver,
+            method,
+            argument_labels,
+        } => format!(
+            "{}.{}({})",
+            receiver,
+            method,
+            format_argument_labels(argument_labels.as_deref())
+        ),
     }
+}
+
+fn format_argument_labels(argument_labels: Option<&[Option<String>]>) -> String {
+    argument_labels
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|label| {
+                    label
+                        .as_deref()
+                        .map_or("_:".to_string(), |label| format!("{label}:"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
 }
 
 /// Build scope tree by walking the AST.
@@ -2832,6 +2880,282 @@ fn extract_python_module_import(
     }
 }
 
+fn build_swift_call_signatures(
+    parsed_files: &[(String, String, tree_sitter::Tree)],
+    all_entities: &[SemanticEntity],
+    entity_ranges: &HashMap<String, Vec<(usize, usize, String)>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> HashMap<String, SwiftCallSignature> {
+    let mut signatures = HashMap::new();
+
+    for (file_path, content, tree) in parsed_files {
+        if !file_path.ends_with(".swift") {
+            continue;
+        }
+
+        let Some(ranges) = entity_ranges.get(file_path.as_str()) else {
+            continue;
+        };
+
+        let source = content.as_bytes();
+        let mut worklist = vec![tree.root_node()];
+        while let Some(node) = worklist.pop() {
+            if matches!(node.kind(), "function_declaration" | "init_declaration") {
+                if let Some(entity_id) =
+                    find_entity_id_for_swift_declaration(node, ranges, entity_map)
+                {
+                    let argument_labels = extract_swift_declaration_argument_labels(node, source);
+                    signatures.insert(entity_id, SwiftCallSignature { argument_labels });
+                }
+            }
+
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                worklist.push(child);
+            }
+        }
+    }
+
+    for entity in all_entities {
+        if signatures.contains_key(&entity.id) || !is_swift_callable_entity_info(entity) {
+            continue;
+        }
+
+        if let Some(argument_labels) = extract_swift_signature_from_entity_content(entity) {
+            signatures.insert(entity.id.clone(), SwiftCallSignature { argument_labels });
+        }
+    }
+
+    signatures
+}
+
+fn find_entity_id_for_swift_declaration(
+    node: tree_sitter::Node,
+    ranges: &[(usize, usize, String)],
+    entity_map: &HashMap<String, EntityInfo>,
+) -> Option<String> {
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
+
+    ranges
+        .iter()
+        .filter(|(start, end, id)| {
+            *start <= start_line
+                && *end >= end_line
+                && entity_map.get(id).map_or(false, is_swift_callable_entity)
+        })
+        .min_by_key(|(start, end, _)| end.saturating_sub(*start))
+        .map(|(_, _, id)| id.clone())
+}
+
+fn is_swift_callable_entity(info: &EntityInfo) -> bool {
+    info.file_path.ends_with(".swift")
+        && matches!(
+            info.entity_type.as_str(),
+            "function" | "method" | "init_declaration"
+        )
+}
+
+fn is_swift_callable_entity_info(entity: &SemanticEntity) -> bool {
+    entity.file_path.ends_with(".swift")
+        && matches!(
+            entity.entity_type.as_str(),
+            "function" | "method" | "init_declaration"
+        )
+}
+
+fn extract_swift_signature_from_entity_content(
+    entity: &SemanticEntity,
+) -> Option<Vec<Option<String>>> {
+    let language = get_language_config(".swift").and_then(|config| (config.get_language)())?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+
+    parse_swift_signature_source(&mut parser, &entity.content).or_else(|| {
+        if entity.entity_type == "init_declaration" {
+            let wrapped = format!("struct __SemSignature {{\n{}\n}}\n", entity.content);
+            parse_swift_signature_source(&mut parser, &wrapped)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_swift_signature_source(
+    parser: &mut tree_sitter::Parser,
+    source_text: &str,
+) -> Option<Vec<Option<String>>> {
+    let tree = parser.parse(source_text.as_bytes(), None)?;
+    let source = source_text.as_bytes();
+    find_first_swift_callable_declaration(tree.root_node())
+        .map(|node| extract_swift_declaration_argument_labels(node, source))
+}
+
+fn find_first_swift_callable_declaration<'a>(
+    root: tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut worklist = vec![root];
+    while let Some(node) = worklist.pop() {
+        if matches!(node.kind(), "function_declaration" | "init_declaration") {
+            return Some(node);
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            worklist.push(child);
+        }
+    }
+
+    None
+}
+
+fn extract_swift_declaration_argument_labels(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Vec<Option<String>> {
+    let mut labels = Vec::new();
+    let mut worklist = vec![node];
+
+    while let Some(current) = worklist.pop() {
+        if current.kind() == "function_body" {
+            continue;
+        }
+
+        if current.kind() == "parameter" {
+            labels.push(swift_parameter_argument_label(current, source));
+            continue;
+        }
+
+        let mut cursor = current.walk();
+        let children: Vec<_> = current.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            worklist.push(child);
+        }
+    }
+
+    labels
+}
+
+fn swift_parameter_argument_label(parameter: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    parameter
+        .child_by_field_name("external_name")
+        .or_else(|| parameter.child_by_field_name("name"))
+        .and_then(|label| normalize_swift_label(label.utf8_text(source).ok()?))
+}
+
+fn extract_swift_call_argument_labels(
+    call: tree_sitter::Node,
+    source: &[u8],
+) -> Option<Vec<Option<String>>> {
+    let mut cursor = call.walk();
+    let call_suffix = call
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "call_suffix")?;
+
+    let mut suffix_cursor = call_suffix.walk();
+    let value_arguments = call_suffix
+        .named_children(&mut suffix_cursor)
+        .find(|child| child.kind() == "value_arguments")?;
+
+    let mut labels = Vec::new();
+    let mut arg_cursor = value_arguments.walk();
+    for argument in value_arguments
+        .named_children(&mut arg_cursor)
+        .filter(|child| child.kind() == "value_argument")
+    {
+        let label = argument
+            .child_by_field_name("name")
+            .and_then(|label| normalize_swift_label(label.utf8_text(source).ok()?));
+        labels.push(label);
+    }
+
+    Some(labels)
+}
+
+fn normalize_swift_label(label: &str) -> Option<String> {
+    let label = label.trim().trim_end_matches(':').trim();
+    if label.is_empty() || label == "_" {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+fn select_member_candidate(
+    members: &[(String, String)],
+    method: &str,
+    argument_labels: Option<&[Option<String>]>,
+    swift_call_signatures: &HashMap<String, SwiftCallSignature>,
+) -> SwiftOverloadSelection {
+    let candidates: Vec<&String> = members
+        .iter()
+        .filter_map(|(name, id)| (name == method).then_some(id))
+        .collect();
+
+    match select_swift_overload_candidate(&candidates, argument_labels, swift_call_signatures) {
+        SwiftOverloadSelection::NotApplicable => candidates
+            .first()
+            .map(|id| SwiftOverloadSelection::Matched((*id).clone()))
+            .unwrap_or(SwiftOverloadSelection::NotApplicable),
+        selection => selection,
+    }
+}
+
+fn select_swift_overload_candidate(
+    candidates: &[&String],
+    argument_labels: Option<&[Option<String>]>,
+    swift_call_signatures: &HashMap<String, SwiftCallSignature>,
+) -> SwiftOverloadSelection {
+    let Some(argument_labels) = argument_labels else {
+        return SwiftOverloadSelection::NotApplicable;
+    };
+
+    let signature_candidates: Vec<(&String, &SwiftCallSignature)> = candidates
+        .iter()
+        .copied()
+        .filter_map(|candidate| {
+            swift_call_signatures
+                .get(candidate.as_str())
+                .map(|signature| (candidate, signature))
+        })
+        .collect();
+    if signature_candidates.is_empty() {
+        return SwiftOverloadSelection::NotApplicable;
+    }
+
+    let exact_matches: Vec<&String> = signature_candidates
+        .iter()
+        .filter_map(|(candidate, signature)| {
+            (signature.argument_labels.as_slice() == argument_labels).then_some(*candidate)
+        })
+        .collect();
+    if exact_matches.len() == 1 {
+        return SwiftOverloadSelection::Matched(exact_matches[0].clone());
+    }
+    if exact_matches.len() > 1 {
+        return SwiftOverloadSelection::NoMatch;
+    }
+
+    if argument_labels.iter().all(Option::is_none) {
+        let same_arity_matches: Vec<&String> = signature_candidates
+            .iter()
+            .filter_map(|(candidate, signature)| {
+                (signature.argument_labels.len() == argument_labels.len()).then_some(*candidate)
+            })
+            .collect();
+        if same_arity_matches.len() == 1 {
+            return SwiftOverloadSelection::Matched(same_arity_matches[0].clone());
+        }
+        if same_arity_matches.len() > 1 {
+            return SwiftOverloadSelection::NoMatch;
+        }
+    }
+
+    SwiftOverloadSelection::NoMatch
+}
+
 /// Collect ALL AST references in a file with a single tree walk.
 /// Each ref records its row so callers can bucket refs into entities by line range.
 fn collect_all_file_refs(
@@ -2851,13 +3175,23 @@ fn collect_all_file_refs(
                 CallNodeStyle::FunctionField(field) => {
                     if let Some(func) = node.child_by_field_name(field) {
                         // Pass empty entity_name — self-ref filtering is done at resolution time
-                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
+                        extract_call_ref(func, "", "", source, &mut refs, config, node_row, None);
                     }
                 }
                 CallNodeStyle::FirstChild => {
                     // Swift/Kotlin: callee is the first named child (identifier or navigation_expression)
                     if let Some(func) = node.named_child(0) {
-                        extract_call_ref(func, "", "", source, &mut refs, config, node_row);
+                        let argument_labels = extract_swift_call_argument_labels(node, source);
+                        extract_call_ref(
+                            func,
+                            "",
+                            "",
+                            source,
+                            &mut refs,
+                            config,
+                            node_row,
+                            argument_labels,
+                        );
                     }
                 }
                 CallNodeStyle::DirectMethod { object_field, method_field } => {
@@ -2869,12 +3203,19 @@ fn collect_all_file_refs(
                             let receiver = obj_node.utf8_text(source).unwrap_or("").to_string();
                             let receiver = receiver.trim_end_matches('.').to_string();
                             refs.push(AstRef {
-                                kind: AstRefKind::MethodCall { receiver, method: method_name.to_string() },
+                                kind: AstRefKind::MethodCall {
+                                    receiver,
+                                    method: method_name.to_string(),
+                                    argument_labels: None,
+                                },
                                 row: node_row,
                             });
                         } else {
                             refs.push(AstRef {
-                                kind: AstRefKind::Call(method_name.to_string()),
+                                kind: AstRefKind::Call {
+                                    name: method_name.to_string(),
+                                    argument_labels: None,
+                                },
                                 row: node_row,
                             });
                         }
@@ -2895,7 +3236,10 @@ fn collect_all_file_refs(
                 let macro_name = macro_node.utf8_text(source).unwrap_or("");
                 if !macro_name.is_empty() && !is_builtin(macro_name, config) {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call(macro_name.to_string()),
+                        kind: AstRefKind::Call {
+                            name: macro_name.to_string(),
+                            argument_labels: None,
+                        },
                         row: node_row,
                     });
                 }
@@ -2915,7 +3259,10 @@ fn collect_all_file_refs(
                 let name = name.rsplit('.').next().unwrap_or(name);
                 if !name.is_empty() && !is_builtin(name, config) {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call(name.to_string()),
+                        kind: AstRefKind::Call {
+                            name: name.to_string(),
+                            argument_labels: None,
+                        },
                         row: node_row,
                     });
                 }
@@ -2936,7 +3283,10 @@ fn collect_all_file_refs(
                     && !is_builtin(name, config)
                 {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call(name.to_string()),
+                        kind: AstRefKind::Call {
+                            name: name.to_string(),
+                            argument_labels: None,
+                        },
                         row: node_row,
                     });
                 }
@@ -2962,6 +3312,7 @@ fn extract_call_ref(
     refs: &mut Vec<AstRef>,
     config: &ScopeResolveConfig,
     row: usize,
+    argument_labels: Option<Vec<Option<String>>>,
 ) {
     let func_kind = func.kind();
 
@@ -2969,7 +3320,10 @@ fn extract_call_ref(
         let name = func.utf8_text(source).unwrap_or("");
         if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
             refs.push(AstRef {
-                kind: AstRefKind::Call(name.to_string()),
+                kind: AstRefKind::Call {
+                    name: name.to_string(),
+                    argument_labels,
+                },
                 row,
             });
         }
@@ -2979,7 +3333,15 @@ fn extract_call_ref(
     // Check config member_access patterns
     for ma in config.member_access {
         if func_kind == ma.node_kind {
-            extract_member_call_ref(func, ma.object_field, ma.property_field, source, refs, row);
+            extract_member_call_ref(
+                func,
+                ma.object_field,
+                ma.property_field,
+                source,
+                refs,
+                row,
+                argument_labels,
+            );
             return;
         }
     }
@@ -2997,7 +3359,10 @@ fn extract_call_ref(
             if is_path_prefix {
                 if !method_name.is_empty() && !is_builtin(method_name, config) {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call(method_name.to_string()),
+                        kind: AstRefKind::Call {
+                            name: method_name.to_string(),
+                            argument_labels: None,
+                        },
                         row,
                     });
                 }
@@ -3005,14 +3370,20 @@ fn extract_call_ref(
                 let type_name = parts[parts.len() - 2];
                 if !type_name.is_empty() && !method_name.is_empty() {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call(method_name.to_string()),
+                        kind: AstRefKind::Call {
+                            name: method_name.to_string(),
+                            argument_labels: None,
+                        },
                         row,
                     });
                     if type_name.chars().next().map_or(false, |c| c.is_uppercase())
                         && !is_builtin(type_name, config)
                     {
                         refs.push(AstRef {
-                            kind: AstRefKind::Call(type_name.to_string()),
+                            kind: AstRefKind::Call {
+                                name: type_name.to_string(),
+                                argument_labels: None,
+                            },
                             row,
                         });
                     }
@@ -3032,6 +3403,7 @@ fn extract_member_call_ref(
     source: &[u8],
     refs: &mut Vec<AstRef>,
     row: usize,
+    argument_labels: Option<Vec<Option<String>>>,
 ) {
     let obj_text = node
         .child_by_field_name(object_field)
@@ -3048,7 +3420,7 @@ fn extract_member_call_ref(
         .unwrap_or("");
 
     if !obj_text.is_empty() && !attr_text.is_empty() {
-        push_method_call_ref(obj_text, attr_text, refs, row);
+        push_method_call_ref(obj_text, attr_text, refs, row, argument_labels);
         return;
     }
 
@@ -3063,16 +3435,23 @@ fn extract_member_call_ref(
             .and_then(|n| n.utf8_text(source).ok())
             .unwrap_or("");
         if !obj.is_empty() && !attr.is_empty() {
-            push_method_call_ref(obj, attr, refs, row);
+            push_method_call_ref(obj, attr, refs, row, argument_labels);
         }
     }
 }
 
-fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>, row: usize) {
+fn push_method_call_ref(
+    obj: &str,
+    method: &str,
+    refs: &mut Vec<AstRef>,
+    row: usize,
+    argument_labels: Option<Vec<Option<String>>>,
+) {
     refs.push(AstRef {
         kind: AstRefKind::MethodCall {
             receiver: obj.to_string(),
             method: method.to_string(),
+            argument_labels,
         },
         row,
     });
@@ -3088,14 +3467,52 @@ fn resolve_ref(
     import_table: &HashMap<(String, String), String>,
     instance_attr_types: &HashMap<(String, String), String>,
     entity_map: &HashMap<String, EntityInfo>,
+    swift_call_signatures: &HashMap<String, SwiftCallSignature>,
     file_path: &str,
     from_entity_id: &str,
     allow_cross_file_calls: bool,
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
-        AstRefKind::Call(name) => {
+        AstRefKind::Call {
+            name,
+            argument_labels,
+        } => {
             if is_local_binding_in_scopes(scope_idx, scopes, name) {
                 return None;
+            }
+
+            if argument_labels.is_some() {
+                if let Some(target_ids) = symbol_table.get(name.as_str()) {
+                    let same_file_targets: Vec<&String> = target_ids
+                        .iter()
+                        .filter(|id| {
+                            entity_map
+                                .get(*id)
+                                .map_or(false, |e| e.file_path == file_path)
+                        })
+                        .collect();
+                    let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
+                        same_file_targets
+                    } else if allow_cross_file_calls {
+                        target_ids.iter().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    match select_swift_overload_candidate(
+                        &visible_targets,
+                        argument_labels.as_deref(),
+                        swift_call_signatures,
+                    ) {
+                        SwiftOverloadSelection::Matched(target_id) => {
+                            let is_constructor =
+                                name.chars().next().map_or(false, |c| c.is_uppercase());
+                            let ref_type = if is_constructor { RefType::TypeRef } else { RefType::Calls };
+                            return Some((target_id, ref_type, "scope_chain"));
+                        }
+                        SwiftOverloadSelection::NoMatch => return None,
+                        SwiftOverloadSelection::NotApplicable => {}
+                    }
+                }
             }
 
             // 1. Walk scope chain for the name
@@ -3115,33 +3532,45 @@ fn resolve_ref(
             if let Some(target_ids) = symbol_table.get(name.as_str()) {
                 let is_constructor = name.chars().next().map_or(false, |c| c.is_uppercase());
                 let ref_type = if is_constructor { RefType::TypeRef } else { RefType::Calls };
-                // Prefer same-file, then any
-                let target = target_ids
+                let same_file_targets: Vec<&String> = target_ids
                     .iter()
-                    .find(|id| {
+                    .filter(|id| {
                         entity_map
                             .get(*id)
                             .map_or(false, |e| e.file_path == file_path)
                     })
-                    .or_else(|| {
-                        // Fall back to cross-file global for constructor calls.
-                        // For lowercase calls, require explicit imports to avoid false positives,
-                        // unless the language allows implicit cross-file visibility (Swift, Kotlin).
-                        if is_constructor || allow_cross_file_calls {
-                            target_ids.first()
-                        } else {
-                            None
-                        }
-                    });
+                    .collect();
+                let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
+                    same_file_targets
+                } else if is_constructor || allow_cross_file_calls {
+                    target_ids.iter().collect()
+                } else {
+                    Vec::new()
+                };
+                let target = match select_swift_overload_candidate(
+                    &visible_targets,
+                    argument_labels.as_deref(),
+                    swift_call_signatures,
+                ) {
+                    SwiftOverloadSelection::Matched(target_id) => Some(target_id),
+                    SwiftOverloadSelection::NoMatch => return None,
+                    SwiftOverloadSelection::NotApplicable => {
+                        visible_targets.first().map(|id| (*id).clone())
+                    }
+                };
                 if let Some(tid) = target {
-                    return Some((tid.clone(), ref_type, "scope_chain"));
+                    return Some((tid, ref_type, "scope_chain"));
                 }
             }
 
             None
         }
 
-        AstRefKind::MethodCall { receiver: raw_receiver, method } => {
+        AstRefKind::MethodCall {
+            receiver: raw_receiver,
+            method,
+            argument_labels,
+        } => {
             // Strip prefix operators like ! (Swift: `!dog.validate()`)
             let receiver = raw_receiver.trim_start_matches('!').trim_start_matches('~');
             if receiver == "self" || receiver == "this" {
@@ -3149,6 +3578,27 @@ fn resolve_ref(
                 let mut idx = scope_idx;
                 loop {
                     if scopes[idx].kind == "class" {
+                        if let Some(class_name) = scopes[idx]
+                            .owner_id
+                            .as_ref()
+                            .and_then(|owner_id| entity_map.get(owner_id))
+                            .map(|owner| owner.name.as_str())
+                        {
+                            if let Some(members) = class_members.get(class_name) {
+                                match select_member_candidate(
+                                    members,
+                                    method,
+                                    argument_labels.as_deref(),
+                                    swift_call_signatures,
+                                ) {
+                                    SwiftOverloadSelection::Matched(eid) => {
+                                        return Some((eid, RefType::Calls, "scope_chain"));
+                                    }
+                                    SwiftOverloadSelection::NoMatch => return None,
+                                    SwiftOverloadSelection::NotApplicable => {}
+                                }
+                            }
+                        }
                         if let Some(eid) = scopes[idx].defs.get(method.as_str()) {
                             return Some((eid.clone(), RefType::Calls, "scope_chain"));
                         }
@@ -3172,8 +3622,17 @@ fn resolve_ref(
                     // Look up instance attribute type
                     if let Some(attr_type) = instance_attr_types.get(&(cn, attr_name.to_string())) {
                         if let Some(members) = class_members.get(attr_type.as_str()) {
-                            if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
-                                return Some((mid.clone(), RefType::Calls, "type_tracking"));
+                            match select_member_candidate(
+                                members,
+                                method,
+                                argument_labels.as_deref(),
+                                swift_call_signatures,
+                            ) {
+                                SwiftOverloadSelection::Matched(mid) => {
+                                    return Some((mid, RefType::Calls, "type_tracking"));
+                                }
+                                SwiftOverloadSelection::NoMatch => return None,
+                                SwiftOverloadSelection::NotApplicable => {}
                             }
                         }
                     }
@@ -3188,8 +3647,17 @@ fn resolve_ref(
                     if let Some(var_type) = lookup_type_in_scopes(scope_idx, scopes, var_part) {
                         if let Some(attr_type) = instance_attr_types.get(&(var_type, field_part.to_string())) {
                             if let Some(members) = class_members.get(attr_type.as_str()) {
-                                if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
-                                    return Some((mid.clone(), RefType::Calls, "type_tracking"));
+                                match select_member_candidate(
+                                    members,
+                                    method,
+                                    argument_labels.as_deref(),
+                                    swift_call_signatures,
+                                ) {
+                                    SwiftOverloadSelection::Matched(mid) => {
+                                        return Some((mid, RefType::Calls, "type_tracking"));
+                                    }
+                                    SwiftOverloadSelection::NoMatch => return None,
+                                    SwiftOverloadSelection::NotApplicable => {}
                                 }
                             }
                         }
@@ -3202,8 +3670,17 @@ fn resolve_ref(
 
             if let Some(class_name) = receiver_type {
                 if let Some(members) = class_members.get(class_name.as_str()) {
-                    if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
-                        return Some((mid.clone(), RefType::Calls, "type_tracking"));
+                    match select_member_candidate(
+                        members,
+                        method,
+                        argument_labels.as_deref(),
+                        swift_call_signatures,
+                    ) {
+                        SwiftOverloadSelection::Matched(mid) => {
+                            return Some((mid, RefType::Calls, "type_tracking"));
+                        }
+                        SwiftOverloadSelection::NoMatch => return None,
+                        SwiftOverloadSelection::NotApplicable => {}
                     }
                 }
             }
@@ -3217,8 +3694,17 @@ fn resolve_ref(
                             && info.name == receiver
                         {
                             if let Some(members) = class_members.get(&info.name) {
-                                if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
-                                    return Some((mid.clone(), RefType::Calls, "scope_chain"));
+                                match select_member_candidate(
+                                    members,
+                                    method,
+                                    argument_labels.as_deref(),
+                                    swift_call_signatures,
+                                ) {
+                                    SwiftOverloadSelection::Matched(mid) => {
+                                        return Some((mid, RefType::Calls, "scope_chain"));
+                                    }
+                                    SwiftOverloadSelection::NoMatch => return None,
+                                    SwiftOverloadSelection::NotApplicable => {}
                                 }
                             }
                         }
@@ -3233,14 +3719,21 @@ fn resolve_ref(
                     if let Some(info) = entity_map.get(target_id) {
                         if matches!(info.entity_type.as_str(), "class" | "struct") {
                             if let Some(members) = class_members.get(&info.name) {
-                                if let Some((_, mid)) =
-                                    members.iter().find(|(n, _)| n == method)
-                                {
-                                    return Some((
-                                        mid.clone(),
-                                        RefType::Calls,
-                                        "type_tracking",
-                                    ));
+                                match select_member_candidate(
+                                    members,
+                                    method,
+                                    argument_labels.as_deref(),
+                                    swift_call_signatures,
+                                ) {
+                                    SwiftOverloadSelection::Matched(mid) => {
+                                        return Some((
+                                            mid,
+                                            RefType::Calls,
+                                            "type_tracking",
+                                        ));
+                                    }
+                                    SwiftOverloadSelection::NoMatch => return None,
+                                    SwiftOverloadSelection::NotApplicable => {}
                                 }
                             }
                         }
