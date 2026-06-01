@@ -137,6 +137,24 @@ fn patch_mode_rejects_truncated_git_binary_patch() {
 }
 
 #[test]
+fn json_empty_result_shape_matches_when_clean_or_filtered_empty() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.path.join("app.py"), "def foo():\n    return 1\n").expect("write app");
+    run_git(&repo.path, &["add", "app.py"]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+
+    let clean = run_sem(&["diff", "--json"], &[], Some(&repo.path));
+    assert!(clean.status.success());
+
+    std::fs::write(repo.path.join("app.py"), "def foo():\n        return 1\n").expect("edit app");
+
+    let filtered = run_sem(&["diff", "--json", "--no-cosmetics"], &[], Some(&repo.path));
+    assert!(filtered.status.success());
+
+    assert_eq!(clean.stdout, filtered.stdout);
+}
+
+#[test]
 fn patch_mode_warns_for_malformed_hunk_without_content_resolution_warning() {
     let output = run_diff_patch(
         "diff --git a/a.ts b/a.ts\n\
