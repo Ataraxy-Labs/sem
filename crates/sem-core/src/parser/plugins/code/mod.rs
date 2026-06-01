@@ -513,6 +513,45 @@ export class Greeter {
     }
 
     #[test]
+    fn test_same_line_typescript_overload_ids_are_unique() {
+        let code = "function f(a: number): void {}; function f(a: string): void {}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "over.ts");
+        let overloads: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|entity| entity.name == "f" && entity.entity_type == "function")
+            .collect();
+        let ids: Vec<&str> = overloads.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(overloads.len(), 2, "expected both overloads, got: {entities:?}");
+        assert_eq!(ids, vec!["over.ts::function::f@L1#1", "over.ts::function::f@L1#2"]);
+    }
+
+    #[test]
+    fn test_same_line_duplicate_parent_ids_are_propagated_to_children() {
+        let code = "class C { m(){ return 1 } } class C { m(){ return 2 } }\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "c.ts");
+        let classes: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|entity| entity.name == "C" && entity.entity_type == "class")
+            .collect();
+        let methods: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|entity| entity.name == "m" && entity.entity_type == "method")
+            .collect();
+
+        assert_eq!(classes.len(), 2, "expected both classes, got: {entities:?}");
+        assert_eq!(methods.len(), 2, "expected both methods, got: {entities:?}");
+        assert_eq!(classes[0].id, "c.ts::class::C@L1#1");
+        assert_eq!(classes[1].id, "c.ts::class::C@L1#2");
+        assert_eq!(methods[0].parent_id.as_deref(), Some("c.ts::class::C@L1#1"));
+        assert_eq!(methods[1].parent_id.as_deref(), Some("c.ts::class::C@L1#2"));
+        assert_eq!(methods[0].id, "c.ts::class::C@L1#1::m");
+        assert_eq!(methods[1].id, "c.ts::class::C@L1#2::m");
+    }
+
+    #[test]
     fn test_module_typescript_entity_extraction() {
         let code = r#"
 export function hello(): string {

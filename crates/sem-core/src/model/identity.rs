@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::change::{ChangeType, SemanticChange};
@@ -47,8 +48,10 @@ fn classify_match(before: &SemanticEntity, after: &SemanticEntity) -> ChangeType
         ChangeType::Moved
     } else if before.parent_id != after.parent_id {
         ChangeType::Moved // intra-file scope move (e.g. method moved between classes)
-    } else {
+    } else if before.entity_type != after.entity_type || before.name != after.name {
         ChangeType::Renamed
+    } else {
+        ChangeType::Modified
     }
 }
 
@@ -59,6 +62,18 @@ fn same_signature_across_file_rename(
     after_by_id: &HashMap<&str, &SemanticEntity>,
 ) -> bool {
     before.file_path != after.file_path
+        && before.entity_type == after.entity_type
+        && before.name == after.name
+        && parent_name(before, before_by_id) == parent_name(after, after_by_id)
+}
+
+fn same_signature_within_file(
+    before: &SemanticEntity,
+    after: &SemanticEntity,
+    before_by_id: &HashMap<&str, &SemanticEntity>,
+    after_by_id: &HashMap<&str, &SemanticEntity>,
+) -> bool {
+    before.file_path == after.file_path
         && before.entity_type == after.entity_type
         && before.name == after.name
         && parent_name(before, before_by_id) == parent_name(after, after_by_id)
@@ -254,7 +269,63 @@ pub fn match_entities(
         }
     }
 
-    // Phase 3: Same logical signature across a file rename.
+    // Phase 3: Same logical signature within a file.
+    // Collision groups can shrink or grow, changing only the disambiguator
+    // portion of an ID. Match those entities before the generic fuzzy pass.
+    let mut same_file_candidates: Vec<(f64, usize, usize, usize)> = Vec::new();
+    for (after_idx, after_entity) in unmatched_after.iter().enumerate() {
+        if matched_after.contains(after_entity.id.as_str()) {
+            continue;
+        }
+
+        for (before_idx, before_entity) in unmatched_before.iter().enumerate() {
+            if matched_before.contains(before_entity.id.as_str()) {
+                continue;
+            }
+            if !same_signature_within_file(before_entity, after_entity, &before_by_id, &after_by_id) {
+                continue;
+            }
+
+            let score = similarity_fn
+                .map(|f| f(before_entity, after_entity))
+                .unwrap_or_else(|| default_similarity(before_entity, after_entity));
+            same_file_candidates.push((
+                score,
+                before_entity.start_line.abs_diff(after_entity.start_line),
+                before_idx,
+                after_idx,
+            ));
+        }
+    }
+
+    same_file_candidates.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    for (_score, _line_distance, before_idx, after_idx) in same_file_candidates {
+        let before_entity = unmatched_before[before_idx];
+        let after_entity = unmatched_after[after_idx];
+        if matched_before.contains(before_entity.id.as_str())
+            || matched_after.contains(after_entity.id.as_str())
+        {
+            continue;
+        }
+
+        matched_before.insert(&before_entity.id);
+        matched_after.insert(&after_entity.id);
+
+        if before_entity.content_hash == after_entity.content_hash {
+            continue;
+        }
+
+        changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author, &combined_by_id));
+    }
+
+    // Phase 4: Same logical signature across a file rename.
     // A file path change changes entity IDs, so renamed files with edited
     // entities need a signature fallback to avoid add/delete pairs.
     for after_entity in &unmatched_after {
@@ -289,7 +360,7 @@ pub fn match_entities(
         }
     }
 
-    // Phase 4: Fuzzy similarity (>80% threshold)
+    // Phase 5: Fuzzy similarity (>80% threshold)
     // Optimized: pre-compute token sets once per entity, group by type
     let still_unmatched_before: Vec<&SemanticEntity> = unmatched_before
         .iter()
@@ -388,7 +459,7 @@ pub fn match_entities(
         }
     }
 
-    // Phase 5: Intra-file reorder detection
+    // Phase 6: Intra-file reorder detection
     // For entities that matched by exact ID with identical content (unchanged),
     // check if their relative ordering changed within the file.
     detect_reorders(before, after, &matched_before, &matched_after, &mut changes, commit_sha, author, &combined_by_id);
@@ -437,8 +508,8 @@ pub fn default_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
 /// Detect intra-file reordering of unchanged entities.
 ///
 /// Takes entities that matched by exact ID with identical content and checks
-/// if their relative ordering changed. Uses longest increasing subsequence
-/// (LIS) on the "after" positions to find the minimum set of moved entities.
+/// if their relative ordering changed. Uses a longest non-decreasing
+/// subsequence on the "after" positions to find the minimum set of moved entities.
 fn detect_reorders(
     before: &[SemanticEntity],
     after: &[SemanticEntity],
@@ -452,10 +523,21 @@ fn detect_reorders(
     // Collect unchanged entities: matched by ID with same content_hash
     let before_by_id: HashMap<&str, &SemanticEntity> =
         before.iter().map(|e| (e.id.as_str(), e)).collect();
+    let before_index_by_id: HashMap<&str, usize> = before
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.as_str(), i))
+        .collect();
+    let after_index_by_id: HashMap<&str, usize> = after
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.as_str(), i))
+        .collect();
 
     // Group by file. For each file, collect unchanged entities in their
     // before-order, then look up their after-positions.
-    let mut by_file: HashMap<&str, Vec<(&SemanticEntity, &SemanticEntity)>> = HashMap::new();
+    let mut by_file: HashMap<&str, Vec<(&SemanticEntity, &SemanticEntity, usize, usize)>> =
+        HashMap::new();
     for after_entity in after {
         if !matched_after.contains(after_entity.id.as_str()) {
             continue;
@@ -472,10 +554,16 @@ fn detect_reorders(
             if before_entity.file_path != after_entity.file_path {
                 continue;
             }
+            let (Some(&before_index), Some(&after_index)) = (
+                before_index_by_id.get(before_entity.id.as_str()),
+                after_index_by_id.get(after_entity.id.as_str()),
+            ) else {
+                continue;
+            };
             by_file
                 .entry(after_entity.file_path.as_str())
                 .or_default()
-                .push((before_entity, after_entity));
+                .push((before_entity, after_entity, before_index, after_index));
         }
     }
 
@@ -484,18 +572,22 @@ fn detect_reorders(
             continue;
         }
 
-        // Sort by before start_line to get the "before" ordering
-        pairs.sort_by_key(|(b, _)| b.start_line);
+        // Sort by before position to get the "before" ordering.
+        pairs.sort_by_key(|(b, _, before_index, _)| (b.start_line, *before_index));
 
-        // Map to after start_lines in before-order
-        let after_lines: Vec<usize> = pairs.iter().map(|(_, a)| a.start_line).collect();
+        // Map to after positions in before-order. The extraction index gives
+        // same-line entities a stable secondary ordering.
+        let after_positions: Vec<(usize, usize)> = pairs
+            .iter()
+            .map(|(_, a, _, after_index)| (a.start_line, *after_index))
+            .collect();
 
-        // Find LIS indices (entities that stayed in relative order)
-        let lis_set = longest_increasing_subsequence_indices(&after_lines);
+        // Find LNDS indices (entities that stayed in relative order).
+        let lnds_set = longest_non_decreasing_subsequence_indices(&after_positions);
 
-        // Entities NOT in LIS were reordered
-        for (i, (before_entity, after_entity)) in pairs.iter().enumerate() {
-            if lis_set.contains(&i) {
+        // Entities outside the LNDS were reordered.
+        for (i, (before_entity, after_entity, _, _)) in pairs.iter().enumerate() {
+            if lnds_set.contains(&i) {
                 continue;
             }
             changes.push(make_change(after_entity, ChangeType::Reordered, Some(before_entity), commit_sha, author, by_id));
@@ -503,23 +595,25 @@ fn detect_reorders(
     }
 }
 
-/// Find indices that form the longest increasing subsequence.
-/// Returns a HashSet of indices in the original array that are part of the LIS.
-fn longest_increasing_subsequence_indices(seq: &[usize]) -> HashSet<usize> {
+/// Find indices that form the longest non-decreasing subsequence.
+/// Returns a HashSet of indices in the original array that are part of the subsequence.
+fn longest_non_decreasing_subsequence_indices(seq: &[(usize, usize)]) -> HashSet<usize> {
     let n = seq.len();
     if n == 0 {
         return HashSet::new();
     }
 
-    // tails[i] = index in seq of the smallest tail element for IS of length i+1
-    let mut tails: Vec<usize> = Vec::new();
-    // parent[i] = index of previous element in the LIS ending at seq[i]
+    // tails[i] = smallest tail position for a non-decreasing subsequence of length i+1
+    let mut tails: Vec<(usize, usize)> = Vec::new();
+    // parent[i] = index of previous element in the subsequence ending at seq[i]
     let mut parent: Vec<Option<usize>> = vec![None; n];
     // tail_idx[i] = index in seq that tails[i] points to
     let mut tail_idx: Vec<usize> = Vec::new();
 
     for i in 0..n {
-        let pos = tails.partition_point(|&t| t < seq[i]);
+        // Non-decreasing subsequences use the first tail greater than the
+        // current position, allowing equal positions to extend the sequence.
+        let pos = tails.partition_point(|&t| t <= seq[i]);
         if pos == tails.len() {
             tails.push(seq[i]);
             tail_idx.push(i);
@@ -915,6 +1009,131 @@ mod tests {
         let result = match_entities(&before, &after, "a.rs", None, None, None);
         // Lines shifted but relative order is same, no reorder
         assert_eq!(result.changes.len(), 0);
+    }
+
+    #[test]
+    fn test_no_reorder_for_unchanged_entities_on_same_line() {
+        let before = vec![
+            make_entity_at("a::f::alpha", "alpha", "fn alpha() {}", "a.rs", 1),
+            make_entity_at("a::f::beta", "beta", "fn beta() {}", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "fn gamma() {}", "a.rs", 1),
+            make_entity_at("a::f::delta", "delta", "fn delta() {}", "a.rs", 1),
+        ];
+        let after = vec![
+            make_entity_at("a::f::alpha", "alpha", "fn alpha() {}", "a.rs", 1),
+            make_entity_at("a::f::beta", "beta", "fn beta() {}", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "fn gamma() { 999 }", "a.rs", 1),
+            make_entity_at("a::f::delta", "delta", "fn delta() {}", "a.rs", 1),
+        ];
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].entity_name, "gamma");
+    }
+
+    #[test]
+    fn test_collision_group_shrink_with_survivor_edit() {
+        let before = vec![
+            make_entity_at(
+                "a::f::f@L1#1",
+                "f",
+                "function f(a: number): void {}",
+                "a.ts",
+                1,
+            ),
+            make_entity_at(
+                "a::f::f@L1#2",
+                "f",
+                "function f(a: string): void {}",
+                "a.ts",
+                1,
+            ),
+        ];
+        let after = vec![make_entity_at(
+            "a::f::f",
+            "f",
+            "function f(a: number): void { console.log(a) }",
+            "a.ts",
+            1,
+        )];
+        let result = match_entities(&before, &after, "a.ts", None, None, None);
+        let modified = result
+            .changes
+            .iter()
+            .filter(|change| change.change_type == ChangeType::Modified)
+            .count();
+        let deleted = result
+            .changes
+            .iter()
+            .filter(|change| change.change_type == ChangeType::Deleted)
+            .count();
+
+        assert_eq!(modified, 1, "{:?}", result.changes);
+        assert_eq!(deleted, 1, "{:?}", result.changes);
+    }
+
+    #[test]
+    fn test_collision_group_growth_matches_edited_survivor() {
+        let before = vec![make_entity_at(
+            "a::f::f",
+            "f",
+            "function f(): void { return oldValue + stableThing; }",
+            "a.ts",
+            1,
+        )];
+        let after = vec![
+            make_entity_at(
+                "a::f::f@L1#1",
+                "f",
+                "function f(): void { totallyDifferentAlphaBetaGamma(); }",
+                "a.ts",
+                1,
+            ),
+            make_entity_at(
+                "a::f::f@L1#2",
+                "f",
+                "function f(): void { return oldValue + stableThing + changedThing; }",
+                "a.ts",
+                1,
+            ),
+        ];
+        let result = match_entities(&before, &after, "a.ts", None, None, None);
+        let modified = result
+            .changes
+            .iter()
+            .find(|change| change.change_type == ChangeType::Modified)
+            .expect("edited survivor should be modified");
+        let added = result
+            .changes
+            .iter()
+            .find(|change| change.change_type == ChangeType::Added)
+            .expect("new duplicate should be added");
+
+        assert_eq!(result.changes.len(), 2, "{:?}", result.changes);
+        assert_eq!(modified.entity_id, "a::f::f@L1#2");
+        assert_eq!(added.entity_id, "a::f::f@L1#1");
+    }
+
+    #[test]
+    fn test_reorder_detection_uses_same_line_extraction_order() {
+        let before = vec![
+            make_entity_at("a::f::alpha", "alpha", "fn alpha() {}", "a.rs", 1),
+            make_entity_at("a::f::beta", "beta", "fn beta() {}", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "fn gamma() {}", "a.rs", 1),
+        ];
+        let after = vec![
+            make_entity_at("a::f::beta", "beta", "fn beta() {}", "a.rs", 1),
+            make_entity_at("a::f::alpha", "alpha", "fn alpha() {}", "a.rs", 1),
+            make_entity_at("a::f::gamma", "gamma", "fn gamma() {}", "a.rs", 1),
+        ];
+        let result = match_entities(&before, &after, "a.rs", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Reordered);
+        assert!(
+            result.changes[0].entity_name == "alpha" || result.changes[0].entity_name == "beta"
+        );
     }
 
     #[test]

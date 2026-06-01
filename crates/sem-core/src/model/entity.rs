@@ -47,6 +47,19 @@ pub fn build_entity_id_disambiguated(
     format!("{base}@L{line}")
 }
 
+/// Build an entity ID with a line-number and same-line ordinal disambiguator.
+pub fn build_entity_id_disambiguated_with_ordinal(
+    file_path: &str,
+    entity_type: &str,
+    name: &str,
+    parent_id: Option<&str>,
+    line: usize,
+    ordinal: usize,
+) -> String {
+    let base = build_entity_id_disambiguated(file_path, entity_type, name, parent_id, line);
+    format!("{base}#{ordinal}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
