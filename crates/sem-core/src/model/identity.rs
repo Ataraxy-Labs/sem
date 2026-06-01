@@ -47,6 +47,8 @@ fn classify_match(before: &SemanticEntity, after: &SemanticEntity) -> ChangeType
         ChangeType::Moved
     } else if before.parent_id != after.parent_id {
         ChangeType::Moved // intra-file scope move (e.g. method moved between classes)
+    } else if before.name == after.name {
+        ChangeType::Modified
     } else {
         ChangeType::Renamed
     }
@@ -143,9 +145,9 @@ fn make_change(
 
 /// Entity matching algorithm:
 /// 1. Exact ID match — same entity ID in before/after → modified or unchanged
-/// 2. Content hash match — same hash, different ID → renamed or moved
+/// 2. Content hash match — same hash, different ID → modified, renamed, or moved
 /// 3. Same signature across file rename → moved, even if content changed
-/// 4. Fuzzy similarity — >80% content similarity → probable rename
+/// 4. Fuzzy similarity — >80% content similarity → modified, renamed, or moved
 pub fn match_entities(
     before: &[SemanticEntity],
     after: &[SemanticEntity],
@@ -623,6 +625,55 @@ mod tests {
         let result = match_entities(&before, &after, "a.ts", None, None, None);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Renamed);
+    }
+
+    #[test]
+    fn test_same_name_fuzzy_match_is_modified() {
+        let before = vec![make_entity(
+            "a.ts::function::foo@L1",
+            "foo",
+            "function foo() { const value = input + 1; return process(value); }",
+            "a.ts",
+        )];
+        let after = vec![make_entity(
+            "a.ts::function::foo@L2",
+            "foo",
+            "function foo() { const value = input + 2; return process(value); }",
+            "a.ts",
+        )];
+
+        let result = match_entities(&before, &after, "a.ts", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].entity_name, "foo");
+        assert!(result.changes[0].old_entity_name.is_none());
+    }
+
+    #[test]
+    fn test_different_name_fuzzy_match_is_renamed() {
+        let before = vec![make_entity(
+            "a.ts::function::old_name@L1",
+            "old_name",
+            "function old_name(input: number) { const first = input + 1; const second = first * 2; const third = second - 3; return compute(third, first, second); }",
+            "a.ts",
+        )];
+        let after = vec![make_entity(
+            "a.ts::function::new_name@L2",
+            "new_name",
+            "function new_name(input: number) { const first = input + 1; const second = first * 2; const third = second - 3; return compute(third, first, second); }",
+            "a.ts",
+        )];
+
+        let result = match_entities(&before, &after, "a.ts", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Renamed);
+        assert_eq!(result.changes[0].entity_name, "new_name");
+        assert_eq!(
+            result.changes[0].old_entity_name.as_deref(),
+            Some("old_name")
+        );
     }
 
     #[test]
