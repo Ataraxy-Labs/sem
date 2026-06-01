@@ -23,7 +23,7 @@ use crate::parser::plugin::SemanticParserPlugin;
 use crate::parser::registry::ParserRegistry;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffResult {
     pub changes: Vec<SemanticChange>,
