@@ -28,7 +28,7 @@ macro_rules! maybe_par_iter {
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
-use crate::parser::import_resolution::find_import_target;
+use crate::parser::import_resolution::{find_import_target, import_source_matches_file};
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
@@ -570,18 +570,146 @@ impl EntityGraph {
             .map(|e| e.id.as_str())
             .collect();
 
-        // Find affected clean entities: only care about edges pointing to truly_changed/deleted
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
+        let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
+
+        for entity in &all_entities {
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+            entity_map.insert(
+                entity.id.clone(),
+                EntityInfo {
+                    id: entity.id.clone(),
+                    name: entity.name.clone(),
+                    entity_type: entity.entity_type.clone(),
+                    file_path: entity.file_path.clone(),
+                    parent_id: entity.parent_id.clone(),
+                    start_line: entity.start_line,
+                    end_line: entity.end_line,
+                },
+            );
+        }
+
+        let import_table = build_import_table(root, all_file_paths, &symbol_table, &entity_map, Some(&parsed_files));
+
+        let entity_file_paths: HashMap<&str, &str> = all_entities
+            .iter()
+            .map(|e| (e.id.as_str(), e.file_path.as_str()))
+            .collect();
+
+        // Find clean entities whose cached outgoing edges are invalidated by stale targets.
         let mut affected_clean_ids: HashSet<String> = HashSet::new();
         for edge in &cached_edges {
             let to_truly_changed = truly_changed_ids.contains(&edge.to_entity)
                 || deleted_ids.contains(edge.to_entity.as_str());
-            if to_truly_changed && !stale_set.contains(
-                all_entities.iter()
-                    .find(|e| e.id == edge.from_entity)
-                    .map(|e| e.file_path.as_str())
-                    .unwrap_or("")
-            ) {
+            let to_stale_file = stale_cached_entity_ids.contains(edge.to_entity.as_str())
+                || entity_file_paths
+                    .get(edge.to_entity.as_str())
+                    .is_some_and(|file_path| stale_set.contains(*file_path));
+
+            let from_clean_file = entity_file_paths
+                .get(edge.from_entity.as_str())
+                .is_some_and(|file_path| !stale_set.contains(*file_path));
+
+            if (to_truly_changed || to_stale_file) && from_clean_file {
                 affected_clean_ids.insert(edge.from_entity.clone());
+            }
+        }
+
+        let new_stale_names: HashSet<&str> = all_entities
+            .iter()
+            .filter(|entity| {
+                stale_set.contains(entity.file_path.as_str())
+                    && !cached_hashes.contains_key(entity.id.as_str())
+            })
+            .map(|entity| entity.name.as_str())
+            .collect();
+        if !new_stale_names.is_empty() {
+            let new_stale_entity_ids: HashSet<&str> = all_entities
+                .iter()
+                .filter(|entity| {
+                    stale_set.contains(entity.file_path.as_str())
+                        && !cached_hashes.contains_key(entity.id.as_str())
+                })
+                .map(|entity| entity.id.as_str())
+                .collect();
+            let new_stale_import_refs: HashSet<(&str, &str)> = import_table
+                .iter()
+                .filter(|(_, target_id)| new_stale_entity_ids.contains(target_id.as_str()))
+                .map(|((file_path, local_name), _)| (file_path.as_str(), local_name.as_str()))
+                .collect();
+            let new_stale_file_paths: HashSet<&str> = all_entities
+                .iter()
+                .filter(|entity| new_stale_entity_ids.contains(entity.id.as_str()))
+                .map(|entity| entity.file_path.as_str())
+                .collect();
+            let clean_file_import_tokens: HashMap<&str, Vec<String>> = all_file_paths
+                .iter()
+                .filter(|file_path| !stale_set.contains(file_path.as_str()))
+                .filter_map(|file_path| {
+                    let Ok(content) = std::fs::read_to_string(root.join(file_path)) else {
+                        return None;
+                    };
+                    let mut tokens: Vec<String> = new_stale_file_paths
+                        .iter()
+                        .flat_map(|stale_file_path| {
+                            content_import_tokens_for_file(file_path, &content, stale_file_path)
+                        })
+                        .collect();
+                    if tokens.is_empty() {
+                        return None;
+                    }
+                    tokens.sort_unstable();
+                    tokens.dedup();
+                    Some((file_path.as_str(), tokens))
+                })
+                .collect();
+            let mut new_stale_import_refs_by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (file_path, local_name) in &new_stale_import_refs {
+                new_stale_import_refs_by_file
+                    .entry(*file_path)
+                    .or_default()
+                    .push(*local_name);
+            }
+
+            for entity in all_entities
+                .iter()
+                .filter(|entity| !stale_set.contains(entity.file_path.as_str()))
+            {
+                if affected_clean_ids.contains(&entity.id) {
+                    continue;
+                }
+
+                let import_tokens = clean_file_import_tokens.get(entity.file_path.as_str());
+                let mentions_new_stale_name = import_tokens.is_some()
+                    && new_stale_names
+                        .iter()
+                        .any(|name| content_contains_identifier(&entity.content, name));
+                let mentions_new_stale_import_token = import_tokens.map_or(false, |tokens| {
+                    tokens
+                        .iter()
+                        .any(|token| content_contains_identifier(&entity.content, token))
+                });
+                let imported_new_stale_ref = new_stale_import_refs_by_file
+                    .get(entity.file_path.as_str())
+                    .map_or(false, |local_names| {
+                        local_names
+                            .iter()
+                            .any(|local_name| content_contains_identifier(&entity.content, local_name))
+                    });
+                let refs = extract_references_from_content(&entity.content, &entity.name);
+                if mentions_new_stale_name
+                    || mentions_new_stale_import_token
+                    || imported_new_stale_ref
+                    || refs.iter().any(|ref_name| {
+                        new_stale_names.contains(*ref_name)
+                            || new_stale_import_refs.contains(&(entity.file_path.as_str(), *ref_name))
+                    })
+                {
+                    affected_clean_ids.insert(entity.id.clone());
+                }
             }
         }
 
@@ -637,30 +765,7 @@ impl EntityGraph {
             .collect();
 
         // Now run the same resolution logic as build() but only for entities in needs_resolution.
-        // We still need the full context (symbol table, import table, etc.) from ALL entities.
-
-        // Build symbol table from all entities
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
-        let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
-
-        for entity in &all_entities {
-            symbol_table
-                .entry(entity.name.clone())
-                .or_default()
-                .push(entity.id.clone());
-            entity_map.insert(
-                entity.id.clone(),
-                EntityInfo {
-                    id: entity.id.clone(),
-                    name: entity.name.clone(),
-                    entity_type: entity.entity_type.clone(),
-                    file_path: entity.file_path.clone(),
-                    parent_id: entity.parent_id.clone(),
-                    start_line: entity.start_line,
-                    end_line: entity.end_line,
-                },
-            );
-        }
+        // The lookup structures still include ALL entities.
 
         // Build parent-child set
         let parent_child_pairs: HashSet<(&str, &str)> = all_entities
@@ -709,9 +814,6 @@ impl EntityGraph {
                 }
             }
         }
-
-        // Build import table from ALL files (imports may reference stale entities)
-        let import_table = build_import_table(root, all_file_paths, &symbol_table, &entity_map, Some(&parsed_files));
 
         // Run scope-aware resolver only on files that need resolution
         let resolve_file_paths: Vec<String> = all_file_paths
@@ -1803,6 +1905,157 @@ fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<
     extract_references_with_stripped(content, own_name, &stripped)
 }
 
+fn content_contains_identifier(content: &str, identifier: &str) -> bool {
+    content
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == identifier)
+}
+
+fn content_import_tokens_for_file(
+    importing_file_path: &str,
+    content: &str,
+    candidate_file_path: &str,
+) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    if importing_file_path.ends_with(".py") {
+        for line in content.lines() {
+            let trimmed = line.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = trimmed.strip_prefix("from ") {
+                let Some(import_pos) = rest.find(" import ") else {
+                    continue;
+                };
+                let source_path = rest[..import_pos].trim();
+                if !import_source_matches_file(
+                    importing_file_path,
+                    source_path,
+                    &[".py"],
+                    candidate_file_path,
+                ) {
+                    continue;
+                }
+
+                let names = rest[import_pos + " import ".len()..].trim();
+                for import_part in names.split(',') {
+                    let import_part = import_part
+                        .trim()
+                        .trim_matches(|c: char| c == '(' || c == ')' || c == ',');
+                    if import_part.is_empty() {
+                        continue;
+                    }
+                    let (original, local) = split_import_alias(import_part);
+                    push_import_token(&mut tokens, original);
+                    push_import_token(&mut tokens, local);
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("import ") {
+                for import_part in rest.split(',') {
+                    let import_part = import_part.trim();
+                    let (source_path, alias) = split_import_alias(import_part);
+                    let source_path = source_path.split_whitespace().next().unwrap_or("").trim();
+                    if source_path.is_empty()
+                        || !import_source_matches_file(
+                            importing_file_path,
+                            source_path,
+                            &[".py"],
+                            candidate_file_path,
+                        )
+                    {
+                        continue;
+                    }
+
+                    let default_local = source_path.split('.').next().unwrap_or(source_path);
+                    push_import_token(&mut tokens, alias);
+                    push_import_token(&mut tokens, default_local);
+                }
+            }
+        }
+    }
+
+    if importing_file_path.ends_with(".js")
+        || importing_file_path.ends_with(".ts")
+        || importing_file_path.ends_with(".jsx")
+        || importing_file_path.ends_with(".tsx")
+    {
+        static JS_NAMED_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+        });
+        static JS_NAMESPACE_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s+\*\s+as\s+([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#)
+                .unwrap()
+        });
+        static JS_DEFAULT_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#)
+                .unwrap()
+        });
+
+        for cap in JS_NAMED_IMPORT_RE.captures_iter(content) {
+            let names = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if !import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                continue;
+            }
+            for name_part in names.split(',') {
+                let name_part = name_part.trim();
+                let name_part = name_part.strip_prefix("type ").unwrap_or(name_part);
+                let (original, local) = split_import_alias(name_part);
+                push_import_token(&mut tokens, original);
+                push_import_token(&mut tokens, local);
+            }
+        }
+
+        for cap in JS_NAMESPACE_IMPORT_RE.captures_iter(content) {
+            let alias = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                push_import_token(&mut tokens, alias);
+            }
+        }
+
+        for cap in JS_DEFAULT_IMPORT_RE.captures_iter(content) {
+            let local = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                push_import_token(&mut tokens, local);
+            }
+        }
+    }
+
+    tokens
+}
+
+fn split_import_alias(import_part: &str) -> (&str, &str) {
+    if let Some(pos) = import_part.find(" as ") {
+        let original = import_part[..pos].trim();
+        let local = import_part[pos + 4..].trim();
+        (original, local)
+    } else {
+        let name = import_part.split_whitespace().next().unwrap_or("").trim();
+        (name, name)
+    }
+}
+
+fn push_import_token(tokens: &mut Vec<String>, token: &str) {
+    let token = token.trim();
+    if !token.is_empty() && token != "*" {
+        tokens.push(token.to_string());
+    }
+}
+
 /// Extract references using a pre-stripped version of the content.
 /// Use this when you already have the stripped content (e.g. from dot-chain extraction)
 /// to avoid stripping comments/strings twice.
@@ -2091,6 +2344,364 @@ mod tests {
         let dep_names: Vec<&str> = foo_deps.iter().map(|d| d.name.as_str()).collect();
         assert!(dep_names.contains(&"baz"), "foo should depend on baz after modification. Deps: {:?}", dep_names);
         assert!(!dep_names.contains(&"bar"), "foo should no longer depend on bar. Deps: {:?}", dep_names);
+    }
+
+    #[test]
+    fn test_incremental_stale_target_file_re_resolves_clean_caller() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "a.py", "def use_it():\n    return helper()\n");
+        write_file(root, "b.py", "def helper():\n    return 1\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+        assert!(
+            cached_graph
+                .get_dependents("b.py::function::helper")
+                .iter()
+                .any(|entity| entity.id == "a.py::function::use_it"),
+            "initial graph should include use_it -> helper"
+        );
+
+        write_file(
+            root,
+            "b.py",
+            "def helper():\n    return 1\n\n\ndef unrelated():\n    return 42\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.py")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.py")
+            .collect();
+
+        let (graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.py".into()],
+            &["a.py".into(), "b.py".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let mut helper_dependents = graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        helper_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            helper_dependents, fresh_dependents,
+            "incremental graph should match fresh resolution"
+        );
+        assert!(
+            helper_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.py::function::use_it"),
+            "clean caller should still depend on content-clean helper. Dependents: {:?}",
+            helper_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_clean_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "a.py", "def use_it():\n    return helper()\n");
+        write_file(root, "b.py", "def other():\n    return 1\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.py::function::use_it")
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "initial graph should not resolve helper"
+        );
+
+        write_file(
+            root,
+            "b.py",
+            "def other():\n    return 1\n\n\ndef helper():\n    return 42\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.py")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.py")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.py".into()],
+            &["a.py".into(), "b.py".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.py::function::use_it"),
+            "clean caller should resolve to added helper. Dependents: {:?}",
+            incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_aliased_clean_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.ts",
+            "import { helper as h } from './b';\n\nexport function useIt() { return h(); }\n",
+        );
+        write_file(root, "b.ts", "export function other() { return 1; }\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.ts::function::useIt")
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "initial graph should not resolve aliased helper"
+        );
+
+        write_file(
+            root,
+            "b.ts",
+            "export function other() { return 1; }\n\nexport function helper() { return 42; }\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.ts")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.ts")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.ts".into()],
+            &["a.ts".into(), "b.ts".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.ts::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.ts::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh alias resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.ts::function::useIt"),
+            "aliased clean caller should resolve to added helper. Dependents: {:?}",
+            incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_python_alias() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "a.py", "from b import helper as h\n\ndef use_it():\n    return h()\n");
+        write_file(root, "b.py", "def other():\n    return 1\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.py::function::use_it")
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "initial graph should not resolve aliased helper"
+        );
+
+        write_file(
+            root,
+            "b.py",
+            "def other():\n    return 1\n\n\ndef helper():\n    return 42\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.py")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.py")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.py".into()],
+            &["a.py".into(), "b.py".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh Python alias resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.py::function::use_it"),
+            "aliased clean caller should resolve to added helper. Dependents: {:?}",
+            incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_namespace_short_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.ts",
+            "import * as b from './b';\n\nexport function useIt() { return b.go(); }\n",
+        );
+        write_file(root, "b.ts", "export function other() { return 1; }\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.ts::function::useIt")
+                .iter()
+                .any(|entity| entity.name == "go"),
+            "initial graph should not resolve namespace go"
+        );
+
+        write_file(
+            root,
+            "b.ts",
+            "export function other() { return 1; }\n\nexport function go() { return 42; }\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.ts")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.ts")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.ts".into()],
+            &["a.ts".into(), "b.ts".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.ts::function::go")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.ts::function::go")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh namespace resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.ts::function::useIt"),
+            "namespace clean caller should resolve to added go. Dependents: {:?}",
+            incremental_dependents
+        );
     }
 
     #[test]
