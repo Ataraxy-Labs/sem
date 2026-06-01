@@ -78,6 +78,22 @@ fn split_on_separator(args: Vec<String>) -> (Vec<String>, Vec<String>) {
     }
 }
 
+fn looks_like_pathspec(arg: &str) -> bool {
+    arg.starts_with(':') || arg.contains('*') || arg.contains('?') || arg.contains('[')
+}
+
+fn get_git_bridge<'a>(git: &'a mut Option<Option<GitBridge>>, cwd: &str) -> Option<&'a GitBridge> {
+    if git.is_none() {
+        *git = Some(GitBridge::open(Path::new(cwd)).ok());
+    }
+
+    git.as_ref().and_then(|git| git.as_ref())
+}
+
+fn is_valid_git_rev(git: &mut Option<Option<GitBridge>>, cwd: &str, arg: &str) -> bool {
+    get_git_bridge(git, cwd).is_some_and(|git| git.is_valid_rev(arg))
+}
+
 /// Simple glob matching for pathspecs. Supports `*` (any chars except `/`),
 /// `**` (any chars including `/`), and `?` (one non-`/` char).
 fn glob_match(pattern: &str, path: &str) -> bool {
@@ -232,9 +248,9 @@ fn normalize_trailing_output_format(opts: &mut DiffOptions) {
     opts.args = args;
 }
 
-
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
+    let mut git = None;
 
     if refs.is_empty() {
         return ParsedArgs {
@@ -275,6 +291,11 @@ fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
 
         // If it exists as a file or directory on disk, treat as pathspec
         if Path::new(cwd).join(arg).exists() {
+            if is_valid_git_rev(&mut git, cwd, arg) {
+                eprintln!(
+                    "warning: '{arg}' is both a git revision and a path; treating it as a pathspec"
+                );
+            }
             let mut pathspecs = pathspecs;
             pathspecs.push(arg.clone());
             return ParsedArgs {
@@ -284,7 +305,7 @@ fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
         }
 
         // If the arg contains glob meta-characters, treat as pathspec
-        if arg.contains('*') || arg.contains('?') || arg.contains('[') {
+        if looks_like_pathspec(arg) {
             let mut pathspecs = pathspecs;
             pathspecs.push(arg.clone());
             return ParsedArgs {
@@ -303,6 +324,23 @@ fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     if refs.len() == 2 {
         let a = &refs[0];
         let b = &refs[1];
+        let b_exists = Path::new(cwd).join(b).exists();
+        let b_looks_like_pathspec = b_exists || looks_like_pathspec(b);
+
+        // git diff <ref> <path> treats the second positional argument as a
+        // pathspec when only the first argument resolves as a revision.
+        if pathspecs.is_empty() && b_looks_like_pathspec {
+            let a_is_rev = is_valid_git_rev(&mut git, cwd, a);
+            let b_is_rev = is_valid_git_rev(&mut git, cwd, b);
+            if a_is_rev && !b_is_rev {
+                let mut pathspecs = pathspecs;
+                pathspecs.push(b.clone());
+                return ParsedArgs {
+                    scope: Some(ParsedScope::RefToWorking(a.clone())),
+                    pathspecs,
+                };
+            }
+        }
 
         // If both exist as files on disk and no pathspecs, treat as file comparison
         if pathspecs.is_empty()
@@ -426,7 +464,6 @@ fn is_git_binary_payload_line(line: &str) -> bool {
 
 fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchParseError> {
     use sem_core::git::types::FileStatus;
-
 
     struct PatchEntry {
         file_path: String,
@@ -871,9 +908,10 @@ pub fn diff_command(mut opts: DiffOptions) {
             changes
                 .into_iter()
                 .filter(|fc| {
-                    parsed.pathspecs.iter().any(|spec| {
-                        file_change_matches_spec(fc, spec)
-                    })
+                    parsed
+                        .pathspecs
+                        .iter()
+                        .any(|spec| file_change_matches_spec(fc, spec))
                 })
                 .collect()
         };

@@ -22,6 +22,193 @@ fn run_sem_json(dir: &PathBuf, home: &PathBuf, args: &[&str]) -> std::process::O
         .expect("sem should run")
 }
 
+fn run_git(dir: &PathBuf, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git {} failed\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_repo(dir: &PathBuf) {
+    run_git(dir, &["init", "-q"]);
+    run_git(dir, &["config", "user.email", "a@b.co"]);
+    run_git(dir, &["config", "user.name", "a"]);
+}
+
+#[test]
+fn ref_plus_path_positional_arg_filters_to_pathspec() {
+    let dir = temp_dir("ref-plus-path-positional");
+    let home = temp_dir("ref-plus-path-positional-home");
+    init_git_repo(&dir);
+    fs::write(dir.join("app.py"), "def foo():\n    return 1\n")
+        .expect("source file should be written");
+    fs::write(dir.join("other.py"), "def bar():\n    return 1\n")
+        .expect("source file should be written");
+    run_git(&dir, &["add", "."]);
+    run_git(&dir, &["commit", "-qm", "c1"]);
+
+    fs::write(dir.join("app.py"), "def foo():\n    return 2\n")
+        .expect("source file should be written");
+    fs::write(dir.join("other.py"), "def bar():\n    return 2\n")
+        .expect("source file should be written");
+
+    let output = run_sem_json(&dir, &home, &["diff", "HEAD", "app.py", "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "sem failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be json");
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert!(!changes.is_empty(), "{json:?}");
+    assert!(
+        changes
+            .iter()
+            .all(|change| change["filePath"].as_str() == Some("app.py")),
+        "{changes:?}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn ref_plus_missing_path_reports_an_error() {
+    let dir = temp_dir("ref-plus-missing-path");
+    let home = temp_dir("ref-plus-missing-path-home");
+    init_git_repo(&dir);
+    fs::write(dir.join("app.py"), "def foo():\n    return 1\n")
+        .expect("source file should be written");
+    run_git(&dir, &["add", "."]);
+    run_git(&dir, &["commit", "-qm", "c1"]);
+
+    let output = run_sem_json(
+        &dir,
+        &home,
+        &["diff", "HEAD", "missing.py", "--format", "json"],
+    );
+    assert!(
+        !output.status.success(),
+        "sem unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing.py"), "{stderr}");
+
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn two_ref_positional_args_remain_range() {
+    let dir = temp_dir("two-ref-positional-range");
+    let home = temp_dir("two-ref-positional-range-home");
+    init_git_repo(&dir);
+    fs::write(dir.join("app.py"), "def foo():\n    return 1\n")
+        .expect("source file should be written");
+    run_git(&dir, &["add", "."]);
+    run_git(&dir, &["commit", "-qm", "c1"]);
+    fs::write(dir.join("app.py"), "def foo():\n    return 2\n")
+        .expect("source file should be written");
+    run_git(&dir, &["commit", "-qam", "c2"]);
+    fs::write(dir.join("app.py"), "def foo():\n    return 3\n")
+        .expect("source file should be written");
+
+    let output = run_sem_json(&dir, &home, &["diff", "HEAD~1", "HEAD", "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "sem failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be json");
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    let change = changes
+        .iter()
+        .find(|change| change["filePath"].as_str() == Some("app.py"))
+        .expect("app.py change should be present");
+    assert!(
+        change["afterContent"]
+            .as_str()
+            .is_some_and(|content| content.contains("return 2")),
+        "{change:?}"
+    );
+    assert!(
+        !change["afterContent"]
+            .as_str()
+            .is_some_and(|content| content.contains("return 3")),
+        "{change:?}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn ambiguous_single_name_warns_and_uses_pathspec() {
+    let dir = temp_dir("ambiguous-single-name");
+    let home = temp_dir("ambiguous-single-name-home");
+    init_git_repo(&dir);
+    fs::write(dir.join("app.py"), "def foo():\n    return 1\n")
+        .expect("source file should be written");
+    run_git(&dir, &["add", "."]);
+    run_git(&dir, &["commit", "-qm", "c1"]);
+    fs::write(dir.join("app.py"), "def foo():\n    return 2\n")
+        .expect("source file should be written");
+    run_git(&dir, &["commit", "-qam", "c2"]);
+    run_git(&dir, &["branch", "app.py", "HEAD~1"]);
+    fs::write(dir.join("app.py"), "def foo():\n    return 3\n")
+        .expect("source file should be written");
+
+    let output = run_sem_json(&dir, &home, &["diff", "app.py", "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "sem failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("both a git revision and a path")
+            && stderr.contains("treating it as a pathspec"),
+        "{stderr}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be json");
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert!(!changes.is_empty(), "{json:?}");
+    assert!(
+        changes
+            .iter()
+            .all(|change| change["filePath"].as_str() == Some("app.py")),
+        "{changes:?}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(home);
+}
+
 #[test]
 fn cross_language_file_compare_uses_each_side_path() {
     let dir = temp_dir("cross-language-file-compare");
