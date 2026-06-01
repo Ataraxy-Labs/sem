@@ -12,7 +12,9 @@ pub mod verify;
 
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+use sem_core::git::bridge::GitBridge;
 
 /// Create a parser registry with extension mappings loaded from `cwd`.
 /// Loads `.semrc` first (takes priority), then `.gitattributes` as fallback.
@@ -22,6 +24,84 @@ pub fn create_registry(cwd: &str) -> ParserRegistry {
     registry.load_semrc(root);
     registry.load_gitattributes(root);
     registry
+}
+
+pub fn repo_root_or_cwd(cwd: &str) -> PathBuf {
+    GitBridge::open(Path::new(cwd))
+        .map(|git| git.repo_root().to_path_buf())
+        .unwrap_or_else(|_| Path::new(cwd).to_path_buf())
+}
+
+pub fn normalize_repo_relative_path(cwd: &Path, repo_root: &Path, path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    if path.starts_with(':') {
+        return path.to_string();
+    }
+
+    let path = Path::new(path);
+    let cwd_base = normalize_existing_prefix(cwd).unwrap_or_else(|| normalize_lexical(cwd));
+    let repo_root_base =
+        normalize_existing_prefix(repo_root).unwrap_or_else(|| normalize_lexical(repo_root));
+    let absolute = if path.is_absolute() {
+        normalize_lexical(path)
+    } else {
+        normalize_lexical(&cwd_base.join(path))
+    };
+
+    let repo_root = normalize_lexical(&repo_root_base);
+    let Ok(relative) = absolute.strip_prefix(&repo_root) else {
+        return absolute.to_string_lossy().replace('\\', "/");
+    };
+
+    if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.to_string_lossy().replace('\\', "/")
+    }
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn normalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(canonical);
+    }
+
+    let mut missing = Vec::new();
+    let mut current = path;
+
+    while let Some(parent) = current.parent() {
+        if let Some(name) = current.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(mut canonical) = std::fs::canonicalize(parent) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(normalize_lexical(&canonical));
+        }
+        current = parent;
+    }
+
+    None
 }
 
 /// Truncate a string to `max_chars` Unicode scalar values (codepoints), appending "..." if
@@ -61,7 +141,8 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_str;
+    use super::{normalize_existing_prefix, normalize_lexical, normalize_repo_relative_path, truncate_str};
+    use std::path::Path;
 
     #[test]
     fn ascii_short_string_unchanged() {
@@ -140,5 +221,141 @@ mod tests {
     fn max_chars_four_triggers_ellipsis() {
         // max_chars == 4, string is longer → take 1 char + "..."
         assert_eq!(truncate_str("hello", 4), "h...");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_handles_absolute_paths() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, "/repo/sub/foo.py");
+
+        assert_eq!(normalized, "sub/foo.py");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_handles_parent_components() {
+        let cwd = Path::new("/repo/sub/nested");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, "../foo.py");
+
+        assert_eq!(normalized, "sub/foo.py");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_keeps_repo_root_dot_as_all_paths() {
+        let cwd = Path::new("/repo");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, ".");
+
+        assert_eq!(normalized, ".");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_treats_empty_path_as_dot() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, "");
+
+        assert_eq!(normalized, ".");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_converts_subdir_dot_to_subdir() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, ".");
+
+        assert_eq!(normalized, "sub");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_leaves_magic_pathspecs_unchanged() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, ":(glob)**/*.py");
+
+        assert_eq!(normalized, ":(glob)**/*.py");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_returns_normalized_absolute_path_outside_repo() {
+        use std::fs;
+
+        let repo_root = std::env::temp_dir().join(format!(
+            "sem-normalize-outside-test-{}",
+            std::process::id()
+        ));
+        let cwd = repo_root.join("sub");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        let outside_path = cwd.join("../../outside.py");
+        let expected = normalize_existing_prefix(&outside_path)
+            .unwrap_or_else(|| normalize_lexical(&outside_path))
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let normalized = normalize_repo_relative_path(&cwd, &repo_root, "../../outside.py");
+
+        assert_eq!(normalized, expected);
+        fs::remove_dir_all(repo_root).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_repo_relative_path_handles_symlinked_cwd() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "sem-normalize-repo-relative-test-{}-{id}",
+            std::process::id()
+        ));
+        let repo_root = temp.join("repo");
+        let real_subdir = repo_root.join("sub");
+        let symlinked_cwd = temp.join("linked-sub");
+        fs::create_dir_all(&real_subdir).expect("create real cwd");
+        symlink(&real_subdir, &symlinked_cwd).expect("create symlinked cwd");
+
+        let normalized = normalize_repo_relative_path(&symlinked_cwd, &repo_root, "foo.py");
+
+        assert_eq!(normalized, "sub/foo.py");
+        fs::remove_dir_all(temp).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_repo_relative_path_resolves_missing_cwd_through_symlinked_repo_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "sem-normalize-missing-cwd-test-{}-{id}",
+            std::process::id()
+        ));
+        let repo_root = temp.join("repo");
+        let symlinked_repo_root = temp.join("linked-repo");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        symlink(&repo_root, &symlinked_repo_root).expect("create symlinked repo root");
+        let missing_cwd = symlinked_repo_root.join("missing");
+
+        let normalized = normalize_repo_relative_path(&missing_cwd, &repo_root, "foo.py");
+
+        assert_eq!(normalized, "missing/foo.py");
+        fs::remove_dir_all(temp).expect("remove temp dir");
     }
 }

@@ -131,7 +131,9 @@ fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
 
 /// Check if a file path matches a pathspec (supports prefix matching and basic globs).
 fn path_matches_spec(file_path: &str, spec: &str) -> bool {
-    if spec.contains('*') || spec.contains('?') || spec.contains('[') {
+    if spec == "." {
+        true
+    } else if spec.contains('*') || spec.contains('?') || spec.contains('[') {
         glob_match(spec, file_path)
     } else if spec.ends_with('/') {
         file_path.starts_with(spec.trim_end_matches('/'))
@@ -231,7 +233,6 @@ fn normalize_trailing_output_format(opts: &mut DiffOptions) {
 
     opts.args = args;
 }
-
 
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
@@ -424,9 +425,11 @@ fn is_git_binary_payload_line(line: &str) -> bool {
         && !line.starts_with("+++ ")
 }
 
-fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchParseError> {
+fn parse_unified_diff(
+    patch: &str,
+    worktree_root: &Path,
+) -> Result<Vec<FileChange>, PatchParseError> {
     use sem_core::git::types::FileStatus;
-
 
     struct PatchEntry {
         file_path: String,
@@ -587,7 +590,7 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
     let git_show = |sha: &str| -> Option<String> {
         let output = process::Command::new("git")
             .args(["show", sha])
-            .current_dir(cwd)
+            .current_dir(worktree_root)
             .output()
             .ok()?;
         if output.status.success() {
@@ -606,7 +609,7 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
             // Fallback: if git show fails for the new SHA (e.g. unstaged working
             // tree changes where the blob doesn't exist yet), read from disk.
             if after_content.is_none() && e.new_sha.is_some() {
-                let file = Path::new(cwd).join(&e.file_path);
+                let file = worktree_root.join(&e.file_path);
                 after_content = std::fs::read_to_string(&file).ok();
             }
 
@@ -754,6 +757,18 @@ pub fn diff_command(mut opts: DiffOptions) {
     } else {
         parse_args(raw_args, &opts.cwd)
     };
+    let patch_worktree_root = if opts.patch {
+        Some(super::repo_root_or_cwd(&opts.cwd))
+    } else {
+        None
+    };
+    if let Some(root) = patch_worktree_root.as_deref() {
+        parsed.pathspecs = parsed
+            .pathspecs
+            .iter()
+            .map(|spec| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, spec))
+            .collect();
+    }
 
     // Resolve jj revsets to git SHAs if we're in a jj repo
     let root = Path::new(&opts.cwd);
@@ -861,7 +876,10 @@ pub fn diff_command(mut opts: DiffOptions) {
                 eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
                 process::exit(1);
             });
-        let changes = parse_unified_diff(&input, &opts.cwd).unwrap_or_else(|e| {
+        let worktree_root = patch_worktree_root
+            .as_deref()
+            .expect("patch worktree root is initialized when --patch is set");
+        let changes = parse_unified_diff(&input, worktree_root).unwrap_or_else(|e| {
             eprintln!("error: {}", e.message());
             process::exit(1);
         });
@@ -871,9 +889,10 @@ pub fn diff_command(mut opts: DiffOptions) {
             changes
                 .into_iter()
                 .filter(|fc| {
-                    parsed.pathspecs.iter().any(|spec| {
-                        file_change_matches_spec(fc, spec)
-                    })
+                    parsed
+                        .pathspecs
+                        .iter()
+                        .any(|spec| file_change_matches_spec(fc, spec))
                 })
                 .collect()
         };
@@ -1244,23 +1263,29 @@ mod tests {
     #[test]
     fn parse_unified_diff_rejects_empty_input() {
         assert_eq!(
-            parse_unified_diff("", ".").unwrap_err(),
+            parse_unified_diff("", Path::new(".")).unwrap_err(),
             PatchParseError::EmptyInput
         );
         assert_eq!(
-            parse_unified_diff("\n\t ", ".").unwrap_err(),
+            parse_unified_diff("\n\t ", Path::new(".")).unwrap_err(),
             PatchParseError::EmptyInput
         );
     }
 
     #[test]
+    fn path_matches_spec_requires_normalized_dot_for_whole_repo() {
+        assert!(path_matches_spec("src/lib.rs", "."));
+        assert!(!path_matches_spec("src/lib.rs", ""));
+    }
+
+    #[test]
     fn parse_unified_diff_rejects_non_diff_input() {
         assert_eq!(
-            parse_unified_diff("this is not a diff\n", ".").unwrap_err(),
+            parse_unified_diff("this is not a diff\n", Path::new(".")).unwrap_err(),
             PatchParseError::NoRecognizableHunks
         );
         assert_eq!(
-            parse_unified_diff("diff --git a/a.ts b/a.ts\n", ".").unwrap_err(),
+            parse_unified_diff("diff --git a/a.ts b/a.ts\n", Path::new(".")).unwrap_err(),
             PatchParseError::NoRecognizableHunks
         );
     }
@@ -1274,7 +1299,7 @@ mod tests {
                      -foo\n\
                      +bar\n";
 
-        let changes = parse_unified_diff(patch, ".").unwrap();
+        let changes = parse_unified_diff(patch, Path::new(".")).unwrap();
         assert!(changes.is_empty());
     }
 
@@ -1287,7 +1312,7 @@ mod tests {
                      -foo\n\
                      +bar\n";
 
-        let changes = parse_unified_diff(patch, ".").unwrap();
+        let changes = parse_unified_diff(patch, Path::new(".")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].file_path, "a.ts");
     }
@@ -1299,7 +1324,7 @@ mod tests {
                      rename from old.py\n\
                      rename to new.py\n";
 
-        let changes = parse_unified_diff(patch, ".").unwrap();
+        let changes = parse_unified_diff(patch, Path::new(".")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old_file_path.as_deref(), Some("old.py"));
         assert_eq!(changes[0].file_path, "new.py");
@@ -1314,7 +1339,7 @@ mod tests {
                      literal 0\n\
                      HcmV?d00001\n";
 
-        let changes = parse_unified_diff(patch, ".").unwrap();
+        let changes = parse_unified_diff(patch, Path::new(".")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].file_path, "blob.bin");
     }
@@ -1329,7 +1354,7 @@ mod tests {
                      delta 1\n\
                      def\n";
 
-        let changes = parse_unified_diff(patch, ".").unwrap();
+        let changes = parse_unified_diff(patch, Path::new(".")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].file_path, "blob.bin");
     }
@@ -1340,7 +1365,7 @@ mod tests {
                      index 1111111..2222222 100644\n\
                      Binary files a/blob.bin and b/blob.bin differ\n";
 
-        let changes = parse_unified_diff(patch, ".").unwrap();
+        let changes = parse_unified_diff(patch, Path::new(".")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].file_path, "blob.bin");
     }
@@ -1360,7 +1385,7 @@ mod tests {
             "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\nabc\ndelta 1\n",
         ] {
             assert_eq!(
-                parse_unified_diff(patch, ".").unwrap_err(),
+                parse_unified_diff(patch, Path::new(".")).unwrap_err(),
                 PatchParseError::NoRecognizableHunks
             );
         }

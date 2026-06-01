@@ -34,7 +34,16 @@ pub fn context_command(opts: ContextOptions) {
     );
     let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
-    let entity = find_entity(&graph, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_path.as_deref());
+    let file_path = opts
+        .file_path
+        .as_deref()
+        .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+    let entity = find_entity(
+        &graph,
+        opts.entity_name.as_deref(),
+        opts.entity_id.as_deref(),
+        file_path.as_deref(),
+    );
     let context_result = build_context_result(&graph, &entity.id, &all_entities, opts.budget);
 
     if opts.json {

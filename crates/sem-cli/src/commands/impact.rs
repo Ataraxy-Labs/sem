@@ -41,7 +41,16 @@ pub fn impact_command(opts: ImpactOptions) {
     );
     let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
-    let entity = find_entity(&graph, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_hint.as_deref());
+    let file_hint = opts
+        .file_hint
+        .as_deref()
+        .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+    let entity = find_entity(
+        &graph,
+        opts.entity_name.as_deref(),
+        opts.entity_id.as_deref(),
+        file_hint.as_deref(),
+    );
 
     match opts.mode {
         ImpactMode::Deps => print_deps(&graph, entity, opts.json),

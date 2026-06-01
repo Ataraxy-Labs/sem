@@ -12,8 +12,9 @@ pub struct VerifyOptions {
 }
 
 pub fn verify_command(opts: VerifyOptions) {
-    let root = Path::new(&opts.cwd);
-    let registry = super::create_registry(&opts.cwd);
+    let root = super::repo_root_or_cwd(&opts.cwd);
+    let root = root.as_path();
+    let registry = super::create_registry(&root.to_string_lossy());
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
     let file_paths = super::graph::find_supported_files_with_options(
