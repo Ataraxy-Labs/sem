@@ -296,6 +296,10 @@ enum Commands {
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
+        /// Skip the SQLite entity cache (rebuild from scratch)
+        #[arg(long)]
+        no_cache: bool,
+
         /// Include directories and generated files that are excluded by default
         #[arg(long)]
         no_default_excludes: bool,
@@ -536,6 +540,7 @@ fn main() {
             json,
             diff,
             file_exts,
+            no_cache,
             no_default_excludes,
         }) => {
             verify_command(VerifyOptions {
@@ -546,6 +551,7 @@ fn main() {
                 json: resolve_json(format, json),
                 diff,
                 file_exts,
+                no_cache,
                 no_default_excludes,
             });
         }

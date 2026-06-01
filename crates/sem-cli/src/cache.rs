@@ -21,8 +21,9 @@ pub struct DiskCache {
 
 impl DiskCache {
     pub fn open(repo_root: &Path) -> Result<Self, rusqlite::Error> {
-        let cache_dir = repo_root.join(".sem");
-        std::fs::create_dir_all(&cache_dir).ok();
+        let cache_dir = shared_cache::cache_dir_for_repo(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        shared_cache::create_cache_dir(&cache_dir)?;
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(db_path)?;
 
@@ -373,26 +374,26 @@ impl DiskCache {
         })
     }
 
-    /// Incrementally update the cache: only rewrite stale file entries.
-    pub fn save_incremental(
+    /// Incrementally update the cache with graph-repair metadata.
+    pub fn save_incremental_with_repair_metadata(
         &self,
         root: &Path,
         all_files: &[String],
         stale_files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        repair_changed_clean_entity_ids: bool,
     ) -> Result<(), rusqlite::Error> {
         let source_stale_files: Vec<&String> = stale_files
             .iter()
             .filter(|file| !shared_cache::is_manifest_file_name(file))
             .collect();
-        let stale_set: HashSet<&str> = source_stale_files
+        let source_stale_set: HashSet<&str> = source_stale_files
             .iter()
             .map(|file| file.as_str())
             .collect();
 
         let tx = self.conn.unchecked_transaction()?;
-        let mut deleted_cached_files = Vec::new();
 
         // Delete stale file entries
         {
@@ -402,26 +403,32 @@ impl DiskCache {
             }
         }
 
-        // Delete files that are no longer in the file list (deleted from disk)
-        {
-            let current_set: HashSet<&str> = all_files
-                .iter()
-                .map(|s| s.as_str())
-                .filter(|path| !shared_cache::is_manifest_file_name(path))
-                .collect();
+        let current_set: HashSet<&str> = all_files
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|path| !shared_cache::is_manifest_file_name(path))
+            .collect();
+        let cached_paths: Vec<String> = {
             let mut cached_stmt = tx.prepare("SELECT path FROM files")?;
-            let cached_paths: Vec<String> = cached_stmt
+            cached_stmt
                 .query_map([], |row| row.get(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            let mut del_files = tx.prepare("DELETE FROM files WHERE path = ?1")?;
-            for path in &cached_paths {
-                if !shared_cache::is_cache_manifest_key(path)
+                .unwrap_or_default()
+        };
+        let deleted_cached_files: Vec<String> = cached_paths
+            .into_iter()
+            .filter(|path| {
+                !shared_cache::is_cache_manifest_key(path)
+                    && !shared_cache::is_manifest_file_name(path)
                     && !current_set.contains(path.as_str())
-                {
-                    del_files.execute(params![path])?;
-                    deleted_cached_files.push(path.clone());
-                }
+            })
+            .collect();
+
+        // Delete files that are no longer in the file list (deleted from disk)
+        {
+            let mut del_files = tx.prepare("DELETE FROM files WHERE path = ?1")?;
+            for path in &deleted_cached_files {
+                del_files.execute(params![path])?;
             }
         }
 
@@ -440,8 +447,9 @@ impl DiskCache {
 
         shared_cache::refresh_manifest_entries(&tx, root)?;
 
-        // Delete entities for stale files
-        {
+        if repair_changed_clean_entity_ids {
+            tx.execute("DELETE FROM entities", [])?;
+        } else {
             let mut del = tx.prepare("DELETE FROM entities WHERE file_path = ?1")?;
             for f in &source_stale_files {
                 del.execute(params![f])?;
@@ -451,31 +459,34 @@ impl DiskCache {
             }
         }
 
-        // Insert new entities for stale files
         {
             let mut ins = tx.prepare(
                 "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for e in entities {
-                if stale_set.contains(e.file_path.as_str()) {
-                    let metadata_json = e
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| serde_json::to_string(m).ok());
-                    ins.execute(params![
-                        e.id,
-                        e.name,
-                        e.entity_type,
-                        e.file_path,
-                        e.start_line as i64,
-                        e.end_line as i64,
-                        e.content,
-                        e.content_hash,
-                        e.structural_hash,
-                        e.parent_id,
-                        metadata_json,
-                    ])?;
+                if !repair_changed_clean_entity_ids
+                    && !source_stale_set.contains(e.file_path.as_str())
+                {
+                    continue;
                 }
+
+                let metadata_json = e
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::to_string(m).ok());
+                ins.execute(params![
+                    e.id,
+                    e.name,
+                    e.entity_type,
+                    e.file_path,
+                    e.start_line as i64,
+                    e.end_line as i64,
+                    e.content,
+                    e.content_hash,
+                    e.structural_hash,
+                    e.parent_id,
+                    metadata_json,
+                ])?;
             }
         }
 
@@ -506,7 +517,29 @@ impl DiskCache {
 mod tests {
     use super::*;
 
+    fn test_cache_root() -> &'static Path {
+        static CACHE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+        CACHE_ROOT
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir()
+                    .join(format!("sem-cli-test-cache-{}-{nanos}", std::process::id()));
+                std::fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .as_path()
+    }
+
+    fn configure_test_cache_root() {
+        std::env::set_var("SEM_CACHE_DIR", test_cache_root());
+    }
+
     fn temp_repo_root(test_name: &str) -> std::path::PathBuf {
+        configure_test_cache_root();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -527,9 +560,41 @@ mod tests {
         EntityGraph::from_parts(HashMap::new(), Vec::new())
     }
 
+    fn entity(id: &str, file_path: &str, name: &str, content: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            entity_type: "function".to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            content: content.to_string(),
+            content_hash: format!("hash:{content}"),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 1,
+            metadata: None,
+        }
+    }
+
+    fn entity_content(cache: &DiskCache, id: &str) -> Option<String> {
+        let mut stmt = cache
+            .conn
+            .prepare("SELECT content FROM entities WHERE id = ?1")
+            .unwrap();
+        let mut rows = stmt.query(rusqlite::params![id]).unwrap();
+        rows.next().unwrap().map(|row| row.get(0).unwrap())
+    }
+
     fn sample_files(root: &Path) -> Vec<String> {
         write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
         vec!["sample.foo".to_string()]
+    }
+
+    fn cleanup(root: std::path::PathBuf) {
+        let _ = std::fs::remove_dir_all(&root);
+        if let Some(cache_dir) = shared_cache::cache_dir_for_repo(&root) {
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
     }
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
@@ -594,7 +659,7 @@ mod tests {
     }
 
     fn seed_unsupported_cache(root: &Path, version: i32) {
-        let cache_dir = root.join(".sem");
+        let cache_dir = shared_cache::cache_dir_for_repo(root).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -654,7 +719,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -671,7 +736,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -688,7 +753,102 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_incremental_keeps_clean_entity_rows_without_clean_id_repair() {
+        let root = temp_repo_root("incremental-entities");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        write_file(&root.join("clean.rs"), "fn clean() {}\n");
+        let files = vec!["stale.rs".to_string(), "clean.rs".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[
+                    entity("stale-id", "stale.rs", "stale", "stale old"),
+                    entity("clean-id", "clean.rs", "clean", "clean old"),
+                ],
+            )
+            .unwrap();
+
+        let entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale new"),
+            entity("clean-id", "clean.rs", "clean", "clean should stay cached"),
+        ];
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["stale.rs".to_string()],
+                &empty_graph(),
+                &entities,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            entity_content(&cache, "stale-id"),
+            Some("stale new".to_string())
+        );
+        assert_eq!(
+            entity_content(&cache, "clean-id"),
+            Some("clean old".to_string())
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_incremental_rewrites_entities_after_clean_id_repair() {
+        let root = temp_repo_root("incremental-clean-repair");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        write_file(&root.join("clean.rs"), "fn clean() {}\n");
+        let files = vec!["stale.rs".to_string(), "clean.rs".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[
+                    entity("stale-id", "stale.rs", "stale", "stale old"),
+                    entity("clean-old-id", "clean.rs", "clean", "clean old"),
+                ],
+            )
+            .unwrap();
+
+        let entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale new"),
+            entity("clean-new-id", "clean.rs", "clean", "clean repaired"),
+        ];
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["stale.rs".to_string()],
+                &empty_graph(),
+                &entities,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(entity_content(&cache, "clean-old-id"), None);
+        assert_eq!(
+            entity_content(&cache, "clean-new-id"),
+            Some("clean repaired".to_string())
+        );
+        assert_eq!(
+            entity_content(&cache, "stale-id"),
+            Some("stale new".to_string())
+        );
+
+        drop(cache);
+        cleanup(root);
     }
 
     #[test]
@@ -704,7 +864,7 @@ mod tests {
         assert!(mcp_cache.load(&cli_to_mcp, &cli_to_mcp_files).is_some());
         drop(mcp_cache);
         drop(cli_cache);
-        let _ = std::fs::remove_dir_all(cli_to_mcp);
+        cleanup(cli_to_mcp);
 
         let mcp_to_cli = temp_repo_root("mcp-to-cli");
         let mcp_to_cli_files = sample_files(&mcp_to_cli);
@@ -717,7 +877,7 @@ mod tests {
         assert!(cli_cache.load(&mcp_to_cli, &mcp_to_cli_files).is_some());
         drop(cli_cache);
         drop(mcp_cache);
-        let _ = std::fs::remove_dir_all(mcp_to_cli);
+        cleanup(mcp_to_cli);
     }
 
     #[test]
@@ -730,14 +890,32 @@ mod tests {
             shared_cache::CACHE_SCHEMA_VERSION
         );
         assert_lookup_indexes(&cache);
+        assert!(shared_cache::cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_uses_shared_external_cache_path() {
+        let root = temp_repo_root("external-path");
+        let cache = DiskCache::open(&root).unwrap();
+
+        assert!(shared_cache::cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
+
+        drop(cache);
+        cleanup(root);
     }
 
     #[test]
     fn open_rebuilds_cache_when_schema_version_is_unsupported() {
-        for version in [0, shared_cache::CACHE_SCHEMA_VERSION + 1] {
+        for version in [
+            0,
+            shared_cache::CACHE_SCHEMA_VERSION - 1,
+            shared_cache::CACHE_SCHEMA_VERSION + 1,
+        ] {
             let root = temp_repo_root(&format!("unsupported-{version}"));
             seed_unsupported_cache(&root, version);
 
@@ -753,7 +931,7 @@ mod tests {
             }
 
             drop(cache);
-            let _ = std::fs::remove_dir_all(root);
+            cleanup(root);
         }
     }
 }

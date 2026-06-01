@@ -8,6 +8,7 @@ pub struct VerifyOptions {
     pub json: bool,
     pub diff: bool,
     pub file_exts: Vec<String>,
+    pub no_cache: bool,
     pub no_default_excludes: bool,
 }
 
@@ -24,7 +25,7 @@ pub fn verify_command(opts: VerifyOptions) {
         opts.no_default_excludes,
     );
     let (graph, all_entities) =
-        super::graph::get_or_build_graph(root, &file_paths, &registry, false);
+        super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
     if opts.diff {
         verify_diff(

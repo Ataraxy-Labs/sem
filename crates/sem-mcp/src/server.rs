@@ -353,7 +353,7 @@ impl SemServer {
 
             // Incremental: load clean cached data, rebuild only stale files
             if let Some(partial) = disk.load_partial(repo_root, file_paths) {
-                let (graph, entities) = EntityGraph::build_incremental(
+                let (graph, entities, metadata) = EntityGraph::build_incremental_with_metadata(
                     repo_root,
                     &partial.stale_files,
                     file_paths,
@@ -362,12 +362,13 @@ impl SemServer {
                     partial.stale_file_entities,
                     &self.registry,
                 );
-                let _ = disk.save_incremental(
+                let _ = disk.save_incremental_with_repair_metadata(
                     repo_root,
                     file_paths,
                     &partial.stale_files,
                     &graph,
                     &entities,
+                    metadata.repaired_clean_entity_ids,
                 );
 
                 let graph = Arc::new(graph);

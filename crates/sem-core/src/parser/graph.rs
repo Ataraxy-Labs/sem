@@ -8,6 +8,7 @@
 //! This enables impact analysis: "if I change entity X, what else is affected?"
 
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
@@ -20,15 +21,19 @@ use serde::{Deserialize, Serialize};
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
         #[cfg(feature = "parallel")]
-        { $slice.par_iter() }
+        {
+            $slice.par_iter()
+        }
         #[cfg(not(feature = "parallel"))]
-        { $slice.iter() }
+        {
+            $slice.iter()
+        }
     }};
 }
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
-use crate::parser::import_resolution::find_import_target;
+use crate::parser::import_resolution::{find_import_target, import_source_matches_file};
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
@@ -93,6 +98,12 @@ pub struct EntityGraph {
     pub dependencies: HashMap<String, Vec<String>>,
 }
 
+/// Metadata describing repairs made during an incremental graph build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncrementalBuildMetadata {
+    pub repaired_clean_entity_ids: bool,
+}
+
 /// Minimal entity info stored in the graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,7 +153,10 @@ impl EntityGraph {
     ) -> (Self, Vec<SemanticEntity>) {
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Also collect (file_path, content, tree) for scope_resolve reuse
-        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = maybe_par_iter!(file_paths)
+        let per_file: Vec<(
+            Vec<SemanticEntity>,
+            Option<(String, String, tree_sitter::Tree)>,
+        )> = maybe_par_iter!(file_paths)
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
@@ -164,8 +178,10 @@ impl EntityGraph {
 
         // Pass A: Build all lookup structures in a single pass over all_entities.
         // This merges what was previously 6 separate O(E) iterations.
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
-        let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
+        let mut symbol_table: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(all_entities.len());
+        let mut entity_map: HashMap<String, EntityInfo> =
+            HashMap::with_capacity(all_entities.len());
         let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
         let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
         let mut class_entity_names: HashSet<&str> = HashSet::new();
@@ -197,14 +213,19 @@ impl EntityGraph {
                 class_child_names.insert((pid.as_str(), entity.name.as_str()));
             }
 
-            if matches!(entity.entity_type.as_str(), "class" | "struct" | "interface" | "class_type") {
+            if matches!(
+                entity.entity_type.as_str(),
+                "class" | "struct" | "interface" | "class_type"
+            ) {
                 class_entity_names.insert(entity.name.as_str());
                 class_entity_files.insert((entity.name.as_str(), entity.file_path.as_str()));
             }
 
             id_to_name.insert(entity.id.as_str(), entity.name.as_str());
 
-            scope_entity_ranges.entry(entity.file_path.clone()).or_default()
+            scope_entity_ranges
+                .entry(entity.file_path.clone())
+                .or_default()
                 .push((entity.start_line, entity.end_line, entity.id.clone()));
         }
 
@@ -227,16 +248,24 @@ impl EntityGraph {
                 }
                 // scope_class_members for scope resolver (checks entity_type of parent)
                 if let Some(parent) = entity_map.get(pid.as_str()) {
-                    if matches!(parent.entity_type.as_str(), "class" | "struct" | "interface" | "impl") {
-                        scope_class_members.entry(parent.name.clone()).or_default()
+                    if matches!(
+                        parent.entity_type.as_str(),
+                        "class" | "struct" | "interface" | "impl"
+                    ) {
+                        scope_class_members
+                            .entry(parent.name.clone())
+                            .or_default()
                             .push((entity.name.clone(), entity.id.clone()));
                     }
                 }
             }
             // Go receiver-based methods
             if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
-                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content) {
-                    scope_class_members.entry(struct_name).or_default()
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content)
+                {
+                    scope_class_members
+                        .entry(struct_name)
+                        .or_default()
                         .push((entity.name.clone(), entity.id.clone()));
                 }
             }
@@ -244,40 +273,51 @@ impl EntityGraph {
 
         // Build import table: (file_path, imported_name) → target entity ID
         // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
-        let import_table = build_import_table(root, file_paths, &symbol_table, &entity_map, Some(&parsed_files));
+        let import_table = build_import_table(
+            root,
+            file_paths,
+            &symbol_table,
+            &entity_map,
+            Some(&parsed_files),
+        );
         // Build owned Go package index for scope resolver
-        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> = if file_paths.iter().any(|f| f.ends_with(".go")) {
-            let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            for (name, target_ids) in symbol_table.iter() {
-                for target_id in target_ids {
-                    if let Some(entity) = entity_map.get(target_id) {
-                        let file_stem = entity.file_path.rsplit('/').next().unwrap_or(&entity.file_path);
-                        let file_stem = strip_file_ext(file_stem);
-                        idx.entry(file_stem.to_string())
-                            .or_default()
-                            .push((name.clone(), target_id.clone()));
-                        if let Some(parent_start) = entity.file_path.rfind('/') {
-                            let parent_path = &entity.file_path[..parent_start];
-                            if let Some(dir_name_start) = parent_path.rfind('/') {
-                                let dir_name = &parent_path[dir_name_start + 1..];
-                                if dir_name != file_stem {
-                                    idx.entry(dir_name.to_string())
+        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
+            if file_paths.iter().any(|f| f.ends_with(".go")) {
+                let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for (name, target_ids) in symbol_table.iter() {
+                    for target_id in target_ids {
+                        if let Some(entity) = entity_map.get(target_id) {
+                            let file_stem = entity
+                                .file_path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&entity.file_path);
+                            let file_stem = strip_file_ext(file_stem);
+                            idx.entry(file_stem.to_string())
+                                .or_default()
+                                .push((name.clone(), target_id.clone()));
+                            if let Some(parent_start) = entity.file_path.rfind('/') {
+                                let parent_path = &entity.file_path[..parent_start];
+                                if let Some(dir_name_start) = parent_path.rfind('/') {
+                                    let dir_name = &parent_path[dir_name_start + 1..];
+                                    if dir_name != file_stem {
+                                        idx.entry(dir_name.to_string())
+                                            .or_default()
+                                            .push((name.clone(), target_id.clone()));
+                                    }
+                                } else if !parent_path.is_empty() && parent_path != file_stem {
+                                    idx.entry(parent_path.to_string())
                                         .or_default()
                                         .push((name.clone(), target_id.clone()));
                                 }
-                            } else if !parent_path.is_empty() && parent_path != file_stem {
-                                idx.entry(parent_path.to_string())
-                                    .or_default()
-                                    .push((name.clone(), target_id.clone()));
                             }
                         }
                     }
                 }
-            }
-            idx
-        } else {
-            HashMap::new()
-        };
+                idx
+            } else {
+                HashMap::new()
+            };
 
         // Wrap symbol_table in Arc to avoid expensive deep clone (621K entries)
         let symbol_table = Arc::new(symbol_table);
@@ -297,7 +337,14 @@ impl EntityGraph {
                 .is_some()
         });
         let (scope_edges, scope_consumed_words) = if has_scope_lang {
-            let result = scope_resolve::resolve_with_scopes_full(root, file_paths, &all_entities, &entity_map, Some(parsed_files), Some(pre_built));
+            let result = scope_resolve::resolve_with_scopes_full(
+                root,
+                file_paths,
+                &all_entities,
+                &entity_map,
+                Some(parsed_files),
+                Some(pre_built),
+            );
             let consumed_words = build_scope_consumed_words(&result.resolution_log);
             (result.edges, consumed_words)
         } else {
@@ -313,7 +360,11 @@ impl EntityGraph {
             .flat_map(|entity| {
                 // Skip entities from file types that don't have language configs
                 // (JSON, SQL, YAML, etc. — they extract entities but never produce reference edges)
-                let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
+                let ext = entity
+                    .file_path
+                    .rfind('.')
+                    .map(|i| &entity.file_path[i..])
+                    .unwrap_or("");
                 if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
                     return vec![];
                 }
@@ -373,7 +424,8 @@ impl EntityGraph {
 
                 // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
                 // Reuse the stripped content to avoid stripping twice
-                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
+                let refs =
+                    extract_references_with_stripped(&entity.content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -389,8 +441,10 @@ impl EntityGraph {
                     let import_key = (entity.file_path.clone(), ref_name.to_string());
                     if let Some(import_target_id) = import_table.get(&import_key) {
                         if import_target_id != &entity.id
-                            && !parent_child_pairs.contains(&(entity.id.as_str(), import_target_id.as_str()))
-                            && !parent_child_pairs.contains(&(import_target_id.as_str(), entity.id.as_str()))
+                            && !parent_child_pairs
+                                .contains(&(entity.id.as_str(), import_target_id.as_str()))
+                            && !parent_child_pairs
+                                .contains(&(import_target_id.as_str(), entity.id.as_str()))
                         {
                             let ref_type = infer_ref_type(&entity.content, &ref_name);
                             entity_edges.push((
@@ -405,28 +459,24 @@ impl EntityGraph {
                     if let Some(target_ids) = symbol_table.get(ref_name) {
                         // Without an import, only resolve to entities in the same file.
                         // Cross-file resolution is handled by the import table above.
-                        let target = target_ids
-                            .iter()
-                            .find(|id| {
-                                *id != &entity.id
-                                    && entity_map
-                                        .get(*id)
-                                        .map_or(false, |e| e.file_path == entity.file_path)
-                            });
+                        let target = target_ids.iter().find(|id| {
+                            *id != &entity.id
+                                && entity_map
+                                    .get(*id)
+                                    .map_or(false, |e| e.file_path == entity.file_path)
+                        });
 
                         if let Some(target_id) = target {
                             // Skip parent-child edges (class -> own method)
-                            if parent_child_pairs.contains(&(entity.id.as_str(), target_id.as_str()))
-                                || parent_child_pairs.contains(&(target_id.as_str(), entity.id.as_str()))
+                            if parent_child_pairs
+                                .contains(&(entity.id.as_str(), target_id.as_str()))
+                                || parent_child_pairs
+                                    .contains(&(target_id.as_str(), entity.id.as_str()))
                             {
                                 continue;
                             }
                             let ref_type = infer_ref_type(&entity.content, &ref_name);
-                            entity_edges.push((
-                                entity.id.clone(),
-                                target_id.clone(),
-                                ref_type,
-                            ));
+                            entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
                         }
                     }
                 }
@@ -490,11 +540,35 @@ impl EntityGraph {
         stale_file_cached_entities: Vec<SemanticEntity>,
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
+        let (graph, entities, _) = Self::build_incremental_with_metadata(
+            root,
+            stale_files,
+            all_file_paths,
+            cached_entities,
+            cached_edges,
+            stale_file_cached_entities,
+            registry,
+        );
+        (graph, entities)
+    }
+
+    pub fn build_incremental_with_metadata(
+        root: &Path,
+        stale_files: &[String],
+        all_file_paths: &[String],
+        cached_entities: Vec<SemanticEntity>,
+        cached_edges: Vec<EntityRef>,
+        stale_file_cached_entities: Vec<SemanticEntity>,
+        registry: &ParserRegistry,
+    ) -> (Self, Vec<SemanticEntity>, IncrementalBuildMetadata) {
         // Build set of stale file paths for quick lookup
         let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
 
         // Parse stale files in parallel to get new entities + trees
-        let per_file: Vec<(Vec<SemanticEntity>, Option<(String, String, tree_sitter::Tree)>)> = maybe_par_iter!(stale_files)
+        let per_file: Vec<(
+            Vec<SemanticEntity>,
+            Option<(String, String, tree_sitter::Tree)>,
+        )> = maybe_par_iter!(stale_files)
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
@@ -527,6 +601,9 @@ impl EntityGraph {
             .filter(|e| !entity_ids_before_parent_repair.contains(&e.id))
             .map(|e| e.id.as_str())
             .collect();
+        let repaired_clean_entity_ids = all_entities.iter().any(|e| {
+            parent_repaired_ids.contains(e.id.as_str()) && !stale_set.contains(e.file_path.as_str())
+        });
 
         // Entity-level diffing: compare repaired stale-file entities against cached versions.
         let stale_cached_entity_ids: HashSet<&str> = stale_file_cached_entities
@@ -570,31 +647,244 @@ impl EntityGraph {
             .map(|e| e.id.as_str())
             .collect();
 
-        // Find affected clean entities: only care about edges pointing to truly_changed/deleted
-        let mut affected_clean_ids: HashSet<String> = HashSet::new();
-        for edge in &cached_edges {
-            let to_truly_changed = truly_changed_ids.contains(&edge.to_entity)
-                || deleted_ids.contains(edge.to_entity.as_str());
-            if to_truly_changed && !stale_set.contains(
-                all_entities.iter()
-                    .find(|e| e.id == edge.from_entity)
-                    .map(|e| e.file_path.as_str())
-                    .unwrap_or("")
-            ) {
-                affected_clean_ids.insert(edge.from_entity.clone());
-            }
+        let mut symbol_table: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(all_entities.len());
+        let mut entity_map: HashMap<String, EntityInfo> =
+            HashMap::with_capacity(all_entities.len());
+
+        for entity in &all_entities {
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+            entity_map.insert(
+                entity.id.clone(),
+                EntityInfo {
+                    id: entity.id.clone(),
+                    name: entity.name.clone(),
+                    entity_type: entity.entity_type.clone(),
+                    file_path: entity.file_path.clone(),
+                    parent_id: entity.parent_id.clone(),
+                    start_line: entity.start_line,
+                    end_line: entity.end_line,
+                },
+            );
         }
 
-        // Collect all stale entity IDs (for edge filtering)
+        let import_table = build_import_table(
+            root,
+            all_file_paths,
+            &symbol_table,
+            &entity_map,
+            Some(&parsed_files),
+        );
+
+        let entity_file_paths: HashMap<&str, &str> = all_entities
+            .iter()
+            .map(|e| (e.id.as_str(), e.file_path.as_str()))
+            .collect();
         let stale_entity_ids: HashSet<&str> = all_entities
             .iter()
             .filter(|e| stale_set.contains(e.file_path.as_str()))
             .map(|e| e.id.as_str())
             .collect();
-        let current_entity_ids: HashSet<&str> = all_entities
+        let current_entity_ids: HashSet<&str> =
+            all_entities.iter().map(|e| e.id.as_str()).collect();
+        let mut stale_or_cached_stale_entity_ids: HashSet<&str> =
+            HashSet::with_capacity(stale_entity_ids.len() + stale_cached_entity_ids.len());
+        stale_or_cached_stale_entity_ids.extend(stale_entity_ids.iter().copied());
+        stale_or_cached_stale_entity_ids.extend(stale_cached_entity_ids.iter().copied());
+
+        // Find clean entities whose cached outgoing edges are invalidated by stale targets.
+        let mut affected_clean_ids: HashSet<String> = HashSet::new();
+        let mut affected_clean_file_paths: HashSet<&str> = HashSet::new();
+        for edge in &cached_edges {
+            let to_truly_changed = truly_changed_ids.contains(&edge.to_entity)
+                || deleted_ids.contains(edge.to_entity.as_str());
+            let to_stale_file = stale_or_cached_stale_entity_ids.contains(edge.to_entity.as_str());
+            let from_file_path = entity_file_paths.get(edge.from_entity.as_str()).copied();
+            let from_clean_file =
+                from_file_path.is_some_and(|file_path| !stale_set.contains(file_path));
+
+            if (to_truly_changed || to_stale_file) && from_clean_file {
+                affected_clean_ids.insert(edge.from_entity.clone());
+                if let Some(file_path) = from_file_path {
+                    affected_clean_file_paths.insert(file_path);
+                }
+            }
+        }
+
+        let mut affected_target_names: HashSet<&str> = all_entities
             .iter()
-            .map(|e| e.id.as_str())
+            .filter(|entity| {
+                truly_changed_ids.contains(&entity.id)
+                    || parent_repaired_ids.contains(entity.id.as_str())
+            })
+            .map(|entity| entity.name.as_str())
             .collect();
+        affected_target_names.extend(
+            stale_file_cached_entities
+                .iter()
+                .filter(|entity| deleted_ids.contains(entity.id.as_str()))
+                .map(|entity| entity.name.as_str()),
+        );
+
+        // Clean entities can gain edges to names introduced by stale files even when
+        // no cached edge existed.
+        if !affected_target_names.is_empty() {
+            let affected_target_candidate_files: HashSet<&str> = affected_target_names
+                .iter()
+                .filter_map(|name| symbol_table.get(*name))
+                .flatten()
+                .filter_map(|entity_id| entity_file_paths.get(entity_id.as_str()).copied())
+                .filter(|file_path| !stale_set.contains(*file_path))
+                .collect();
+
+            for entity in all_entities.iter().filter(|entity| {
+                affected_target_candidate_files.contains(entity.file_path.as_str())
+            }) {
+                if stale_set.contains(entity.file_path.as_str())
+                    || affected_clean_ids.contains(&entity.id)
+                {
+                    continue;
+                }
+
+                let ext = entity
+                    .file_path
+                    .rfind('.')
+                    .map(|i| &entity.file_path[i..])
+                    .unwrap_or("");
+                if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
+                    continue;
+                }
+
+                if !text_mentions_any_name(&entity.content, &affected_target_names) {
+                    continue;
+                }
+
+                let stripped = strip_comments_and_strings(&entity.content);
+                if text_mentions_any_name(&stripped, &affected_target_names) {
+                    affected_clean_ids.insert(entity.id.clone());
+                    affected_clean_file_paths.insert(entity.file_path.as_str());
+                }
+            }
+        }
+
+        let mut new_stale_entity_ids: HashSet<&str> = HashSet::new();
+        let mut new_stale_names: HashSet<&str> = HashSet::new();
+        for entity in &all_entities {
+            if stale_set.contains(entity.file_path.as_str())
+                && !cached_hashes.contains_key(entity.id.as_str())
+            {
+                new_stale_entity_ids.insert(entity.id.as_str());
+                new_stale_names.insert(entity.name.as_str());
+            }
+        }
+        if !new_stale_names.is_empty() {
+            let new_stale_import_refs: HashSet<(&str, &str)> = import_table
+                .iter()
+                .filter(|(_, target_id)| new_stale_entity_ids.contains(target_id.as_str()))
+                .map(|((file_path, local_name), _)| (file_path.as_str(), local_name.as_str()))
+                .collect();
+            let new_stale_file_paths: HashSet<&str> = new_stale_entity_ids
+                .iter()
+                .filter_map(|entity_id| entity_file_paths.get(*entity_id).copied())
+                .collect();
+            let mut clean_import_candidate_files: HashSet<&str> = new_stale_import_refs
+                .iter()
+                .map(|(file_path, _)| *file_path)
+                .collect();
+            let mut clean_entities_mentioning_new_stale_names: HashSet<&str> = HashSet::new();
+            for entity in all_entities
+                .iter()
+                .filter(|entity| !stale_set.contains(entity.file_path.as_str()))
+            {
+                if !new_stale_names
+                    .iter()
+                    .any(|name| content_contains_identifier(&entity.content, name))
+                {
+                    continue;
+                }
+
+                let stripped = strip_comments_and_strings(&entity.content);
+                if text_mentions_any_name(&stripped, &new_stale_names) {
+                    clean_entities_mentioning_new_stale_names.insert(entity.id.as_str());
+                    clean_import_candidate_files.insert(entity.file_path.as_str());
+                }
+            }
+
+            let clean_file_import_tokens: HashMap<&str, Vec<String>> = clean_import_candidate_files
+                .into_iter()
+                .filter_map(|file_path| {
+                    let content = read_import_scan_prefix(&root.join(file_path))?;
+                    let mut tokens: Vec<String> = new_stale_file_paths
+                        .iter()
+                        .flat_map(|stale_file_path| {
+                            content_import_tokens_for_file(file_path, &content, stale_file_path)
+                        })
+                        .collect();
+                    if tokens.is_empty() {
+                        return None;
+                    }
+                    tokens.sort_unstable();
+                    tokens.dedup();
+                    Some((file_path, tokens))
+                })
+                .collect();
+            let mut new_stale_import_refs_by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (file_path, local_name) in &new_stale_import_refs {
+                new_stale_import_refs_by_file
+                    .entry(*file_path)
+                    .or_default()
+                    .push(*local_name);
+            }
+
+            for entity in all_entities
+                .iter()
+                .filter(|entity| !stale_set.contains(entity.file_path.as_str()))
+            {
+                if affected_clean_ids.contains(&entity.id) {
+                    continue;
+                }
+
+                let entity_mentions_new_stale_name =
+                    clean_entities_mentioning_new_stale_names.contains(entity.id.as_str());
+                if !entity_mentions_new_stale_name
+                    && !clean_file_import_tokens.contains_key(entity.file_path.as_str())
+                    && !new_stale_import_refs_by_file.contains_key(entity.file_path.as_str())
+                {
+                    continue;
+                }
+
+                let import_tokens = clean_file_import_tokens.get(entity.file_path.as_str());
+                let mentions_new_stale_name = entity_mentions_new_stale_name;
+                let mentions_new_stale_import_token = import_tokens.map_or(false, |tokens| {
+                    tokens
+                        .iter()
+                        .any(|token| content_contains_identifier(&entity.content, token))
+                });
+                let imported_new_stale_ref = new_stale_import_refs_by_file
+                    .get(entity.file_path.as_str())
+                    .map_or(false, |local_names| {
+                        local_names.iter().any(|local_name| {
+                            content_contains_identifier(&entity.content, local_name)
+                        })
+                    });
+                let refs = extract_references_from_content(&entity.content, &entity.name);
+                if mentions_new_stale_name
+                    || mentions_new_stale_import_token
+                    || imported_new_stale_ref
+                    || refs.iter().any(|ref_name| {
+                        new_stale_names.contains(*ref_name)
+                            || new_stale_import_refs
+                                .contains(&(entity.file_path.as_str(), *ref_name))
+                    })
+                {
+                    affected_clean_ids.insert(entity.id.clone());
+                    affected_clean_file_paths.insert(entity.file_path.as_str());
+                }
+            }
+        }
 
         // Keep edges where both endpoints are in clean (non-stale) files and from_entity
         // is not affected by target changes. Drop ALL cached edges from stale-file entities
@@ -609,10 +899,8 @@ impl EntityGraph {
                     return false;
                 }
 
-                let from_stale = stale_entity_ids.contains(e.from_entity.as_str())
-                    || stale_cached_entity_ids.contains(e.from_entity.as_str());
-                let to_stale = stale_entity_ids.contains(e.to_entity.as_str())
-                    || stale_cached_entity_ids.contains(e.to_entity.as_str());
+                let from_stale = stale_or_cached_stale_entity_ids.contains(e.from_entity.as_str());
+                let to_stale = stale_or_cached_stale_entity_ids.contains(e.to_entity.as_str());
 
                 if !from_stale && !to_stale && !affected_clean_ids.contains(&e.from_entity) {
                     // Both endpoints in clean files, from not affected
@@ -637,54 +925,45 @@ impl EntityGraph {
             .collect();
 
         // Now run the same resolution logic as build() but only for entities in needs_resolution.
-        // We still need the full context (symbol table, import table, etc.) from ALL entities.
-
-        // Build symbol table from all entities
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::with_capacity(all_entities.len());
-        let mut entity_map: HashMap<String, EntityInfo> = HashMap::with_capacity(all_entities.len());
-
-        for entity in &all_entities {
-            symbol_table
-                .entry(entity.name.clone())
-                .or_default()
-                .push(entity.id.clone());
-            entity_map.insert(
-                entity.id.clone(),
-                EntityInfo {
-                    id: entity.id.clone(),
-                    name: entity.name.clone(),
-                    entity_type: entity.entity_type.clone(),
-                    file_path: entity.file_path.clone(),
-                    parent_id: entity.parent_id.clone(),
-                    start_line: entity.start_line,
-                    end_line: entity.end_line,
-                },
-            );
-        }
+        // The lookup structures still include ALL entities.
 
         // Build parent-child set
         let parent_child_pairs: HashSet<(&str, &str)> = all_entities
             .iter()
             .filter_map(|e| {
-                e.parent_id.as_ref().map(|pid| (pid.as_str(), e.id.as_str()))
+                e.parent_id
+                    .as_ref()
+                    .map(|pid| (pid.as_str(), e.id.as_str()))
             })
             .collect();
 
         let class_child_names: HashSet<(&str, &str)> = all_entities
             .iter()
             .filter_map(|e| {
-                e.parent_id.as_ref().map(|pid| (pid.as_str(), e.name.as_str()))
+                e.parent_id
+                    .as_ref()
+                    .map(|pid| (pid.as_str(), e.name.as_str()))
             })
             .collect();
 
         let class_entity_names: HashSet<&str> = all_entities
             .iter()
-            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
+            .filter(|e| {
+                matches!(
+                    e.entity_type.as_str(),
+                    "class" | "struct" | "interface" | "class_type"
+                )
+            })
             .map(|e| e.name.as_str())
             .collect();
         let class_entity_files: HashSet<(&str, &str)> = all_entities
             .iter()
-            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
+            .filter(|e| {
+                matches!(
+                    e.entity_type.as_str(),
+                    "class" | "struct" | "interface" | "class_type"
+                )
+            })
             .map(|e| (e.name.as_str(), e.file_path.as_str()))
             .collect();
 
@@ -710,17 +989,11 @@ impl EntityGraph {
             }
         }
 
-        // Build import table from ALL files (imports may reference stale entities)
-        let import_table = build_import_table(root, all_file_paths, &symbol_table, &entity_map, Some(&parsed_files));
-
         // Run scope-aware resolver only on files that need resolution
         let resolve_file_paths: Vec<String> = all_file_paths
             .iter()
             .filter(|f| {
-                // Include file if any entity in needs_resolution belongs to it
-                stale_set.contains(f.as_str()) || all_entities.iter().any(|e| {
-                    e.file_path == **f && affected_clean_ids.contains(&e.id)
-                })
+                stale_set.contains(f.as_str()) || affected_clean_file_paths.contains(f.as_str())
             })
             .cloned()
             .collect();
@@ -733,13 +1006,25 @@ impl EntityGraph {
         });
         let (scope_edges, scope_consumed_words) = if has_scope_lang {
             // Pass pre-parsed stale-file trees; scope_resolve reads affected clean files from disk
-            let resolve_set: HashSet<&str> = resolve_file_paths.iter().map(|s| s.as_str()).collect();
+            let resolve_set: HashSet<&str> =
+                resolve_file_paths.iter().map(|s| s.as_str()).collect();
             let relevant_parsed: Vec<(String, String, tree_sitter::Tree)> = parsed_files
                 .into_iter()
                 .filter(|(fp, _, _)| resolve_set.contains(fp.as_str()))
                 .collect();
-            let pre = if relevant_parsed.is_empty() { None } else { Some(relevant_parsed) };
-            let result = scope_resolve::resolve_with_scopes_full(root, &resolve_file_paths, &all_entities, &entity_map, pre, None);
+            let pre = if relevant_parsed.is_empty() {
+                None
+            } else {
+                Some(relevant_parsed)
+            };
+            let result = scope_resolve::resolve_with_scopes_full(
+                root,
+                &resolve_file_paths,
+                &all_entities,
+                &entity_map,
+                pre,
+                None,
+            );
             let consumed_words = build_scope_consumed_words(&result.resolution_log);
             (result.edges, consumed_words)
         } else {
@@ -751,7 +1036,11 @@ impl EntityGraph {
             .filter(|e| needs_resolution.contains(e.id.as_str()))
             .flat_map(|entity| {
                 // Skip entities from non-code file types (JSON, SQL, etc.)
-                let ext = entity.file_path.rfind('.').map(|i| &entity.file_path[i..]).unwrap_or("");
+                let ext = entity
+                    .file_path
+                    .rfind('.')
+                    .map(|i| &entity.file_path[i..])
+                    .unwrap_or("");
                 if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
                     return vec![];
                 }
@@ -808,7 +1097,8 @@ impl EntityGraph {
                 }
 
                 // Phase 2: Bag-of-words resolution (reuse stripped content)
-                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
+                let refs =
+                    extract_references_with_stripped(&entity.content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -820,8 +1110,10 @@ impl EntityGraph {
                     let import_key = (entity.file_path.clone(), ref_name.to_string());
                     if let Some(import_target_id) = import_table.get(&import_key) {
                         if import_target_id != &entity.id
-                            && !parent_child_pairs.contains(&(entity.id.as_str(), import_target_id.as_str()))
-                            && !parent_child_pairs.contains(&(import_target_id.as_str(), entity.id.as_str()))
+                            && !parent_child_pairs
+                                .contains(&(entity.id.as_str(), import_target_id.as_str()))
+                            && !parent_child_pairs
+                                .contains(&(import_target_id.as_str(), entity.id.as_str()))
                         {
                             let ref_type = infer_ref_type(&entity.content, &ref_name);
                             entity_edges.push((
@@ -834,27 +1126,23 @@ impl EntityGraph {
                     }
 
                     if let Some(target_ids) = symbol_table.get(ref_name) {
-                        let target = target_ids
-                            .iter()
-                            .find(|id| {
-                                *id != &entity.id
-                                    && entity_map
-                                        .get(*id)
-                                        .map_or(false, |e| e.file_path == entity.file_path)
-                            });
+                        let target = target_ids.iter().find(|id| {
+                            *id != &entity.id
+                                && entity_map
+                                    .get(*id)
+                                    .map_or(false, |e| e.file_path == entity.file_path)
+                        });
 
                         if let Some(target_id) = target {
-                            if parent_child_pairs.contains(&(entity.id.as_str(), target_id.as_str()))
-                                || parent_child_pairs.contains(&(target_id.as_str(), entity.id.as_str()))
+                            if parent_child_pairs
+                                .contains(&(entity.id.as_str(), target_id.as_str()))
+                                || parent_child_pairs
+                                    .contains(&(target_id.as_str(), entity.id.as_str()))
                             {
                                 continue;
                             }
                             let ref_type = infer_ref_type(&entity.content, &ref_name);
-                            entity_edges.push((
-                                entity.id.clone(),
-                                target_id.clone(),
-                                ref_type,
-                            ));
+                            entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
                         }
                     }
                 }
@@ -922,18 +1210,20 @@ impl EntityGraph {
             dependencies,
         };
 
-        (graph, all_entities)
+        (
+            graph,
+            all_entities,
+            IncrementalBuildMetadata {
+                repaired_clean_entity_ids,
+            },
+        )
     }
 
     /// Get entities that depend on the given entity (reverse deps).
     pub fn get_dependents(&self, entity_id: &str) -> Vec<&EntityInfo> {
         self.dependents
             .get(entity_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.entities.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -941,11 +1231,7 @@ impl EntityGraph {
     pub fn get_dependencies(&self, entity_id: &str) -> Vec<&EntityInfo> {
         self.dependencies
             .get(entity_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.entities.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -957,9 +1243,14 @@ impl EntityGraph {
 
     /// Depth-limited impact analysis. Returns transitive dependents with their BFS depth.
     /// `max_depth == 0` means unlimited. Default depth of 2 covers direct + one transitive level.
-    pub fn impact_analysis_bounded(&self, entity_id: &str, max_depth: usize) -> Vec<(&EntityInfo, usize)> {
+    pub fn impact_analysis_bounded(
+        &self,
+        entity_id: &str,
+        max_depth: usize,
+    ) -> Vec<(&EntityInfo, usize)> {
         let mut visited: HashSet<&str> = HashSet::new();
-        let mut queue: std::collections::VecDeque<(&str, usize)> = std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<(&str, usize)> =
+            std::collections::VecDeque::new();
         let mut result = Vec::new();
 
         let start_key = match self.entities.get_key_value(entity_id) {
@@ -1065,7 +1356,10 @@ impl EntityGraph {
 
     /// Filter entities to those that look like tests.
     /// Uses name heuristics, file path patterns, and content patterns.
-    pub fn filter_test_entities(&self, entities: &[crate::model::entity::SemanticEntity]) -> HashSet<String> {
+    pub fn filter_test_entities(
+        &self,
+        entities: &[crate::model::entity::SemanticEntity],
+    ) -> HashSet<String> {
         let mut test_ids = HashSet::new();
         for entity in entities {
             if is_test_entity(entity) {
@@ -1176,10 +1470,8 @@ impl EntityGraph {
 
         // Also re-resolve references for entities in OTHER files that might
         // reference entities in changed files (their targets may have changed)
-        let changed_entity_names: HashSet<String> = new_entities
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
+        let changed_entity_names: HashSet<String> =
+            new_entities.iter().map(|e| e.name.clone()).collect();
 
         // Find entities in unchanged files that reference any changed entity name
         let entities_to_recheck: Vec<String> = self
@@ -1187,15 +1479,13 @@ impl EntityGraph {
             .values()
             .filter(|e| !affected_files.contains(&e.file_path))
             .filter(|e| {
-                self.dependencies
-                    .get(&e.id)
-                    .map_or(false, |deps| {
-                        deps.iter().any(|dep_id| {
-                            self.entities
-                                .get(dep_id)
-                                .map_or(false, |dep| changed_entity_names.contains(&dep.name))
-                        })
+                self.dependencies.get(&e.id).map_or(false, |deps| {
+                    deps.iter().any(|dep_id| {
+                        self.entities
+                            .get(dep_id)
+                            .map_or(false, |dep| changed_entity_names.contains(&dep.name))
                     })
+                })
             })
             .map(|e| e.id.clone())
             .collect();
@@ -1244,8 +1534,9 @@ impl EntityGraph {
         }
 
         // Remove edges involving these entities
-        self.edges
-            .retain(|e| !id_set.contains(e.from_entity.as_str()) && !id_set.contains(e.to_entity.as_str()));
+        self.edges.retain(|e| {
+            !id_set.contains(e.from_entity.as_str()) && !id_set.contains(e.to_entity.as_str())
+        });
 
         // Clean up dependency/dependent indexes
         for id in &ids_to_remove {
@@ -1331,7 +1622,11 @@ fn is_test_entity(entity: &crate::model::entity::SemanticEntity) -> bool {
     let content = &entity.content;
 
     // Name patterns
-    if name.starts_with("test_") || name.starts_with("Test") || name.ends_with("_test") || name.ends_with("Test") {
+    if name.starts_with("test_")
+        || name.starts_with("Test")
+        || name.ends_with("_test")
+        || name.ends_with("Test")
+    {
         return true;
     }
     if name.starts_with("it_") || name.starts_with("describe_") || name.starts_with("spec_") {
@@ -1375,7 +1670,10 @@ fn build_import_table(
     // Build a content lookup from pre-parsed files to avoid re-reading from disk
     let content_map: HashMap<&str, &str> = pre_parsed_content
         .map(|files| {
-            files.iter().map(|(fp, content, _)| (fp.as_str(), content.as_str())).collect()
+            files
+                .iter()
+                .map(|(fp, content, _)| (fp.as_str(), content.as_str()))
+                .collect()
         })
         .unwrap_or_default();
 
@@ -1733,8 +2031,14 @@ fn strip_comments_and_strings(content: &str) -> String {
         if bytes[i] == b'"' {
             i += 1;
             while i < len {
-                if bytes[i] == b'\\' { i += 2; continue; }
-                if bytes[i] == b'"' { i += 1; break; }
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
                 i += 1;
             }
             continue;
@@ -1743,27 +2047,40 @@ fn strip_comments_and_strings(content: &str) -> String {
         if bytes[i] == b'\'' {
             i += 1;
             while i < len {
-                if bytes[i] == b'\\' { i += 2; continue; }
-                if bytes[i] == b'\'' { i += 1; break; }
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\'' {
+                    i += 1;
+                    break;
+                }
                 i += 1;
             }
             continue;
         }
         // Python/Ruby single-line comments
         if bytes[i] == b'#' {
-            while i < len && bytes[i] != b'\n' { i += 1; }
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
             continue;
         }
         // C-style single-line comments
         if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            while i < len && bytes[i] != b'\n' { i += 1; }
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
             continue;
         }
         // C-style block comments
         if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             i += 2;
             while i + 1 < len {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' { i += 2; break; }
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
                 i += 1;
             }
             continue;
@@ -1779,9 +2096,8 @@ fn strip_comments_and_strings(content: &str) -> String {
 /// Extract dot-chains (receiver.member) from content for precise resolution.
 /// Returns unique (receiver, member) pairs found in the content.
 fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
-    static DOT_CHAIN_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)").unwrap()
-    });
+    static DOT_CHAIN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)").unwrap());
 
     let mut chains = Vec::new();
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
@@ -1803,10 +2119,183 @@ fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<
     extract_references_with_stripped(content, own_name, &stripped)
 }
 
+fn text_mentions_any_name(text: &str, names: &HashSet<&str>) -> bool {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| names.contains(word))
+}
+
+fn content_contains_identifier(content: &str, identifier: &str) -> bool {
+    content
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == identifier)
+}
+
+const IMPORT_SCAN_PREFIX_LINES: usize = 80;
+
+fn read_import_scan_prefix(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut content = String::new();
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .take(IMPORT_SCAN_PREFIX_LINES)
+    {
+        content.push_str(&line.ok()?);
+        content.push('\n');
+    }
+    Some(content)
+}
+
+fn content_import_tokens_for_file(
+    importing_file_path: &str,
+    content: &str,
+    candidate_file_path: &str,
+) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    if importing_file_path.ends_with(".py") {
+        for line in content.lines() {
+            let trimmed = line.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = trimmed.strip_prefix("from ") {
+                let Some(import_pos) = rest.find(" import ") else {
+                    continue;
+                };
+                let source_path = rest[..import_pos].trim();
+                if !import_source_matches_file(
+                    importing_file_path,
+                    source_path,
+                    &[".py"],
+                    candidate_file_path,
+                ) {
+                    continue;
+                }
+
+                let names = rest[import_pos + " import ".len()..].trim();
+                for import_part in names.split(',') {
+                    let import_part = import_part
+                        .trim()
+                        .trim_matches(|c: char| c == '(' || c == ')' || c == ',');
+                    if import_part.is_empty() {
+                        continue;
+                    }
+                    let (original, local) = split_import_alias(import_part);
+                    push_import_token(&mut tokens, original);
+                    push_import_token(&mut tokens, local);
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("import ") {
+                for import_part in rest.split(',') {
+                    let import_part = import_part.trim();
+                    let (source_path, alias) = split_import_alias(import_part);
+                    let source_path = source_path.split_whitespace().next().unwrap_or("").trim();
+                    if source_path.is_empty()
+                        || !import_source_matches_file(
+                            importing_file_path,
+                            source_path,
+                            &[".py"],
+                            candidate_file_path,
+                        )
+                    {
+                        continue;
+                    }
+
+                    let default_local = source_path.split('.').next().unwrap_or(source_path);
+                    push_import_token(&mut tokens, alias);
+                    push_import_token(&mut tokens, default_local);
+                }
+            }
+        }
+    }
+
+    if importing_file_path.ends_with(".js")
+        || importing_file_path.ends_with(".ts")
+        || importing_file_path.ends_with(".jsx")
+        || importing_file_path.ends_with(".tsx")
+    {
+        static JS_NAMED_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+        });
+        static JS_NAMESPACE_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s+\*\s+as\s+([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+        });
+        static JS_DEFAULT_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+        });
+
+        for cap in JS_NAMED_IMPORT_RE.captures_iter(content) {
+            let names = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if !import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                continue;
+            }
+            for name_part in names.split(',') {
+                let name_part = name_part.trim();
+                let name_part = name_part.strip_prefix("type ").unwrap_or(name_part);
+                let (original, local) = split_import_alias(name_part);
+                push_import_token(&mut tokens, original);
+                push_import_token(&mut tokens, local);
+            }
+        }
+
+        for cap in JS_NAMESPACE_IMPORT_RE.captures_iter(content) {
+            let alias = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                push_import_token(&mut tokens, alias);
+            }
+        }
+
+        for cap in JS_DEFAULT_IMPORT_RE.captures_iter(content) {
+            let local = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                push_import_token(&mut tokens, local);
+            }
+        }
+    }
+
+    tokens
+}
+
+fn split_import_alias(import_part: &str) -> (&str, &str) {
+    if let Some(pos) = import_part.find(" as ") {
+        let original = import_part[..pos].trim();
+        let local = import_part[pos + 4..].trim();
+        (original, local)
+    } else {
+        let name = import_part.split_whitespace().next().unwrap_or("").trim();
+        (name, name)
+    }
+}
+
+fn push_import_token(tokens: &mut Vec<String>, token: &str) {
+    let token = token.trim();
+    if !token.is_empty() && token != "*" {
+        tokens.push(token.to_string());
+    }
+}
+
 /// Extract references using a pre-stripped version of the content.
 /// Use this when you already have the stripped content (e.g. from dot-chain extraction)
 /// to avoid stripping comments/strings twice.
-fn extract_references_with_stripped<'a>(content: &'a str, own_name: &str, stripped: &str) -> Vec<&'a str> {
+fn extract_references_with_stripped<'a>(
+    content: &'a str,
+    own_name: &str,
+    stripped: &str,
+) -> Vec<&'a str> {
     let stripped_words: HashSet<&str> = stripped
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty())
@@ -1847,19 +2336,16 @@ fn extract_references_with_stripped<'a>(content: &'a str, own_name: &str, stripp
 
 static COMMON_LOCAL_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
-        "result", "results", "data", "config", "value", "values",
-        "item", "items", "input", "output", "args", "opts",
-        "name", "path", "file", "line", "count", "index",
-        "temp", "prev", "next", "curr", "current", "node",
-        "left", "right", "root", "head", "tail", "body",
-        "text", "content", "source", "target", "entry",
-        "error", "errors", "message", "response", "request",
-        "context", "state", "props", "event", "handler",
-        "callback", "options", "params", "query", "list",
-        "base", "info", "meta", "kind", "mode", "flag",
-        "size", "length", "width", "height", "start", "stop",
-        "begin", "done", "found", "status", "code",
-    ].into_iter().collect()
+        "result", "results", "data", "config", "value", "values", "item", "items", "input",
+        "output", "args", "opts", "name", "path", "file", "line", "count", "index", "temp", "prev",
+        "next", "curr", "current", "node", "left", "right", "root", "head", "tail", "body", "text",
+        "content", "source", "target", "entry", "error", "errors", "message", "response",
+        "request", "context", "state", "props", "event", "handler", "callback", "options",
+        "params", "query", "list", "base", "info", "meta", "kind", "mode", "flag", "size",
+        "length", "width", "height", "start", "stop", "begin", "done", "found", "status", "code",
+    ]
+    .into_iter()
+    .collect()
 });
 
 /// Names that are overwhelmingly local variables, not entity references.
@@ -1899,8 +2385,10 @@ fn infer_ref_type(content: &str, ref_name: &str) -> RefType {
     // Check if it's in an import/use statement (line-level, not substring)
     for line in content.lines() {
         let trimmed = line.trim();
-        if (trimmed.starts_with("import ") || trimmed.starts_with("use ")
-            || trimmed.starts_with("from ") || trimmed.starts_with("require("))
+        if (trimmed.starts_with("import ")
+            || trimmed.starts_with("use ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("require("))
             && trimmed.contains(ref_name)
         {
             return RefType::Imports;
@@ -1914,52 +2402,220 @@ fn infer_ref_type(content: &str, ref_name: &str) -> RefType {
 static KEYWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         // Common across languages
-        "if", "else", "for", "while", "do", "switch", "case", "break",
-        "continue", "return", "try", "catch", "finally", "throw",
-        "new", "delete", "typeof", "instanceof", "in", "of",
-        "true", "false", "null", "undefined", "void", "this",
-        "super", "class", "extends", "implements", "interface",
-        "enum", "const", "let", "var", "function", "async",
-        "await", "yield", "import", "export", "default", "from",
-        "as", "static", "public", "private", "protected",
-        "abstract", "final", "override",
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "break",
+        "continue",
+        "return",
+        "try",
+        "catch",
+        "finally",
+        "throw",
+        "new",
+        "delete",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "void",
+        "this",
+        "super",
+        "class",
+        "extends",
+        "implements",
+        "interface",
+        "enum",
+        "const",
+        "let",
+        "var",
+        "function",
+        "async",
+        "await",
+        "yield",
+        "import",
+        "export",
+        "default",
+        "from",
+        "as",
+        "static",
+        "public",
+        "private",
+        "protected",
+        "abstract",
+        "final",
+        "override",
         // Rust
-        "fn", "pub", "mod", "use", "struct", "impl", "trait",
-        "where", "type", "self", "Self", "mut", "ref", "match",
-        "loop", "move", "unsafe", "extern", "crate", "dyn",
+        "fn",
+        "pub",
+        "mod",
+        "use",
+        "struct",
+        "impl",
+        "trait",
+        "where",
+        "type",
+        "self",
+        "Self",
+        "mut",
+        "ref",
+        "match",
+        "loop",
+        "move",
+        "unsafe",
+        "extern",
+        "crate",
+        "dyn",
         // Python
-        "def", "elif", "except", "raise", "with",
-        "pass", "lambda", "nonlocal", "global", "assert",
-        "True", "False", "and", "or", "not", "is",
+        "def",
+        "elif",
+        "except",
+        "raise",
+        "with",
+        "pass",
+        "lambda",
+        "nonlocal",
+        "global",
+        "assert",
+        "True",
+        "False",
+        "and",
+        "or",
+        "not",
+        "is",
         // Go
-        "func", "package", "range", "select", "chan", "go",
-        "defer", "map", "make", "append", "len", "cap",
+        "func",
+        "package",
+        "range",
+        "select",
+        "chan",
+        "go",
+        "defer",
+        "map",
+        "make",
+        "append",
+        "len",
+        "cap",
         // C/C++
-        "auto", "register", "volatile", "sizeof", "typedef",
-        "template", "typename", "namespace", "virtual", "inline",
-        "constexpr", "nullptr", "noexcept", "explicit", "friend",
-        "operator", "using", "cout", "endl", "cerr", "cin",
-        "printf", "scanf", "malloc", "free", "NULL", "include",
-        "ifdef", "ifndef", "endif", "define", "pragma",
+        "auto",
+        "register",
+        "volatile",
+        "sizeof",
+        "typedef",
+        "template",
+        "typename",
+        "namespace",
+        "virtual",
+        "inline",
+        "constexpr",
+        "nullptr",
+        "noexcept",
+        "explicit",
+        "friend",
+        "operator",
+        "using",
+        "cout",
+        "endl",
+        "cerr",
+        "cin",
+        "printf",
+        "scanf",
+        "malloc",
+        "free",
+        "NULL",
+        "include",
+        "ifdef",
+        "ifndef",
+        "endif",
+        "define",
+        "pragma",
         // Ruby
-        "end", "then", "elsif", "unless", "until",
-        "begin", "rescue", "ensure", "when", "require",
-        "attr_accessor", "attr_reader", "attr_writer",
-        "puts", "nil", "module", "defined",
+        "end",
+        "then",
+        "elsif",
+        "unless",
+        "until",
+        "begin",
+        "rescue",
+        "ensure",
+        "when",
+        "require",
+        "attr_accessor",
+        "attr_reader",
+        "attr_writer",
+        "puts",
+        "nil",
+        "module",
+        "defined",
         // C#
-        "internal", "sealed", "readonly",
-        "partial", "delegate", "event", "params", "out",
-        "object", "decimal", "sbyte", "ushort", "uint",
-        "ulong", "nint", "nuint", "dynamic",
-        "get", "set", "value", "init", "record",
+        "internal",
+        "sealed",
+        "readonly",
+        "partial",
+        "delegate",
+        "event",
+        "params",
+        "out",
+        "object",
+        "decimal",
+        "sbyte",
+        "ushort",
+        "uint",
+        "ulong",
+        "nint",
+        "nuint",
+        "dynamic",
+        "get",
+        "set",
+        "value",
+        "init",
+        "record",
         // Types (primitives)
-        "string", "number", "boolean", "int", "float", "double",
-        "bool", "char", "byte", "i8", "i16", "i32", "i64",
-        "u8", "u16", "u32", "u64", "f32", "f64", "usize",
-        "isize", "str", "String", "Vec", "Option", "Result",
-        "Box", "Arc", "Rc", "HashMap", "HashSet", "Some",
-        "Ok", "Err",
-    ].into_iter().collect()
+        "string",
+        "number",
+        "boolean",
+        "int",
+        "float",
+        "double",
+        "bool",
+        "char",
+        "byte",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "f32",
+        "f64",
+        "usize",
+        "isize",
+        "str",
+        "String",
+        "Vec",
+        "Option",
+        "Result",
+        "Box",
+        "Arc",
+        "Rc",
+        "HashMap",
+        "HashSet",
+        "Some",
+        "Ok",
+        "Err",
+    ]
+    .into_iter()
+    .collect()
 });
 
 fn is_keyword(word: &str) -> bool {
@@ -2066,7 +2722,11 @@ mod tests {
         let root = dir.path();
 
         write_file(root, "a.ts", "export function foo() { return bar(); }\n");
-        write_file(root, "b.ts", "export function bar() { return 1; }\nexport function baz() { return 2; }\n");
+        write_file(
+            root,
+            "b.ts",
+            "export function bar() { return 1; }\nexport function baz() { return 2; }\n",
+        );
 
         let (mut graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
         assert_eq!(graph.entities.len(), 3);
@@ -2089,8 +2749,378 @@ mod tests {
         // foo should now depend on baz, not bar
         let foo_deps = graph.get_dependencies("a.ts::function::foo");
         let dep_names: Vec<&str> = foo_deps.iter().map(|d| d.name.as_str()).collect();
-        assert!(dep_names.contains(&"baz"), "foo should depend on baz after modification. Deps: {:?}", dep_names);
-        assert!(!dep_names.contains(&"bar"), "foo should no longer depend on bar. Deps: {:?}", dep_names);
+        assert!(
+            dep_names.contains(&"baz"),
+            "foo should depend on baz after modification. Deps: {:?}",
+            dep_names
+        );
+        assert!(
+            !dep_names.contains(&"bar"),
+            "foo should no longer depend on bar. Deps: {:?}",
+            dep_names
+        );
+    }
+
+    #[test]
+    fn test_incremental_stale_target_file_re_resolves_clean_caller() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "a.py", "def use_it():\n    return helper()\n");
+        write_file(root, "b.py", "def helper():\n    return 1\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+        assert!(
+            cached_graph
+                .get_dependents("b.py::function::helper")
+                .iter()
+                .any(|entity| entity.id == "a.py::function::use_it"),
+            "initial graph should include use_it -> helper"
+        );
+
+        write_file(
+            root,
+            "b.py",
+            "def helper():\n    return 1\n\n\ndef unrelated():\n    return 42\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.py")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.py")
+            .collect();
+
+        let (graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.py".into()],
+            &["a.py".into(), "b.py".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let mut helper_dependents = graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        helper_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            helper_dependents, fresh_dependents,
+            "incremental graph should match fresh resolution"
+        );
+        assert!(
+            helper_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.py::function::use_it"),
+            "clean caller should still depend on content-clean helper. Dependents: {:?}",
+            helper_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_clean_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "a.py", "def use_it():\n    return helper()\n");
+        write_file(root, "b.py", "def other():\n    return 1\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.py::function::use_it")
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "initial graph should not resolve helper"
+        );
+
+        write_file(
+            root,
+            "b.py",
+            "def other():\n    return 1\n\n\ndef helper():\n    return 42\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.py")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.py")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.py".into()],
+            &["a.py".into(), "b.py".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.py::function::use_it"),
+            "clean caller should resolve to added helper. Dependents: {:?}",
+            incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_aliased_clean_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.ts",
+            "import { helper as h } from './b';\n\nexport function useIt() { return h(); }\n",
+        );
+        write_file(root, "b.ts", "export function other() { return 1; }\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.ts::function::useIt")
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "initial graph should not resolve aliased helper"
+        );
+
+        write_file(
+            root,
+            "b.ts",
+            "export function other() { return 1; }\n\nexport function helper() { return 42; }\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.ts")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.ts")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.ts".into()],
+            &["a.ts".into(), "b.ts".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.ts::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.ts::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh alias resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.ts::function::useIt"),
+            "aliased clean caller should resolve to added helper. Dependents: {:?}",
+            incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_python_alias() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.py",
+            "from b import helper as h\n\ndef use_it():\n    return h()\n",
+        );
+        write_file(root, "b.py", "def other():\n    return 1\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.py::function::use_it")
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "initial graph should not resolve aliased helper"
+        );
+
+        write_file(
+            root,
+            "b.py",
+            "def other():\n    return 1\n\n\ndef helper():\n    return 42\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.py")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.py")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.py".into()],
+            &["a.py".into(), "b.py".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.py::function::helper")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh Python alias resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.py::function::use_it"),
+            "aliased clean caller should resolve to added helper. Dependents: {:?}",
+            incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_added_stale_target_re_resolves_namespace_short_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.ts",
+            "import * as b from './b';\n\nexport function useIt() { return b.go(); }\n",
+        );
+        write_file(root, "b.ts", "export function other() { return 1; }\n");
+
+        let (cached_graph, cached_entities) =
+            EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+        assert!(
+            !cached_graph
+                .get_dependencies("a.ts::function::useIt")
+                .iter()
+                .any(|entity| entity.name == "go"),
+            "initial graph should not resolve namespace go"
+        );
+
+        write_file(
+            root,
+            "b.ts",
+            "export function other() { return 1; }\n\nexport function go() { return 42; }\n",
+        );
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "b.ts")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "b.ts")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["b.ts".into()],
+            &["a.ts".into(), "b.ts".into()],
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &["a.ts".into(), "b.ts".into()], &registry);
+
+        let mut incremental_dependents = incremental_graph
+            .get_dependents("b.ts::function::go")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        incremental_dependents.sort_unstable();
+        let mut fresh_dependents = fresh_graph
+            .get_dependents("b.ts::function::go")
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>();
+        fresh_dependents.sort_unstable();
+        assert_eq!(
+            incremental_dependents, fresh_dependents,
+            "incremental graph should match fresh namespace resolution"
+        );
+        assert!(
+            incremental_dependents
+                .iter()
+                .any(|entity_id| *entity_id == "a.ts::function::useIt"),
+            "namespace clean caller should resolve to added go. Dependents: {:?}",
+            incremental_dependents
+        );
     }
 
     #[test]
@@ -2170,7 +3200,7 @@ mod tests {
         );
 
         let stale_file_cached_entities = registry.extract_entities("models.go", models);
-        let (graph, entities) = EntityGraph::build_incremental(
+        let (graph, entities, metadata) = EntityGraph::build_incremental_with_metadata(
             root,
             &["models.go".into()],
             &["models.go".into(), "methods.go".into()],
@@ -2190,7 +3220,10 @@ mod tests {
 
         assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
         assert!(graph.entities.contains_key("models.go::type::Service::Run"));
-        assert!(!graph.entities.contains_key("methods.go::type::Service::Run"));
+        assert!(!graph
+            .entities
+            .contains_key("methods.go::type::Service::Run"));
+        assert!(metadata.repaired_clean_entity_ids);
     }
 
     #[test]
@@ -2231,12 +3264,12 @@ mod tests {
     #[test]
     fn test_infer_ref_type_multibyte_utf8() {
         // Ensure no panic when content contains multi-byte UTF-8 characters
+        assert_eq!(infer_ref_type("let café = foo(x)", "foo"), RefType::Calls,);
         assert_eq!(
-            infer_ref_type("let café = foo(x)", "foo"),
-            RefType::Calls,
-        );
-        assert_eq!(
-            infer_ref_type("class HandicapfrPublicationFieldsEnum:\n    É = 1\n    bar()", "bar"),
+            infer_ref_type(
+                "class HandicapfrPublicationFieldsEnum:\n    É = 1\n    bar()",
+                "bar"
+            ),
             RefType::Calls,
         );
         // No match should not panic either
@@ -2251,19 +3284,25 @@ mod tests {
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "service.py", "\
+        write_file(
+            root,
+            "service.py",
+            "\
 class MyService:
     def process(self):
         return self.validate()
 
     def validate(self):
         return True
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(root, &["service.py".into()], &registry);
 
         // process should have an edge to validate via self.validate()
-        let process_id = graph.entities.keys()
+        let process_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("process"))
             .expect("process entity should exist");
         let deps = graph.get_dependencies(process_id);
@@ -2279,7 +3318,10 @@ class MyService:
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "service.ts", "\
+        write_file(
+            root,
+            "service.ts",
+            "\
 class UserService {
     process() {
         return this.validate();
@@ -2288,11 +3330,14 @@ class UserService {
         return true;
     }
 }
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(root, &["service.ts".into()], &registry);
 
-        let process_id = graph.entities.keys()
+        let process_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("process"))
             .expect("process entity should exist");
         let deps = graph.get_dependencies(process_id);
@@ -2308,16 +3353,22 @@ class UserService {
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "utils.ts", "\
+        write_file(
+            root,
+            "utils.ts",
+            "\
 class MathUtils {
     static compute() { return 1; }
 }
 function caller() { return MathUtils.compute(); }
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(root, &["utils.ts".into()], &registry);
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
@@ -2333,21 +3384,28 @@ function caller() { return MathUtils.compute(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "helper.ts", "\
+        write_file(
+            root,
+            "helper.ts",
+            "\
 export function helper() { return 1; }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import { helper } from './helper';
 export function main() { return helper(); }
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["helper.ts".into(), "main.ts".into()],
-            &registry,
+",
         );
 
-        let main_id = graph.entities.keys()
+        let (graph, _) =
+            EntityGraph::build(root, &["helper.ts".into(), "main.ts".into()], &registry);
+
+        let main_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("main"))
             .expect("main entity should exist");
         let deps = graph.get_dependencies(main_id);
@@ -2363,36 +3421,61 @@ export function main() { return helper(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "src/a/util.ts", "\
+        write_file(
+            root,
+            "src/a/util.ts",
+            "\
 export function helper() { return 1; }
-");
-        write_file(root, "src/b/util.ts", "\
+",
+        );
+        write_file(
+            root,
+            "src/b/util.ts",
+            "\
 export function helper() { return 2; }
-");
-        write_file(root, "src/main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "src/main.ts",
+            "\
 import { helper } from './b/util';
 export function caller() { return helper(); }
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(
             root,
-            &["src/a/util.ts".into(), "src/b/util.ts".into(), "src/main.ts".into()],
+            &[
+                "src/a/util.ts".into(),
+                "src/b/util.ts".into(),
+                "src/main.ts".into(),
+            ],
             &registry,
         );
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/b/util.ts"),
+            deps.iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/b/util.ts"),
             "caller should resolve helper to src/b/util.ts. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/a/util.ts"),
+            !deps
+                .iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/a/util.ts"),
             "caller should not resolve helper to src/a/util.ts. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2401,36 +3484,61 @@ export function caller() { return helper(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "src/util.js", "\
+        write_file(
+            root,
+            "src/util.js",
+            "\
 export function helper() { return 1; }
-");
-        write_file(root, "src/util.ts", "\
+",
+        );
+        write_file(
+            root,
+            "src/util.ts",
+            "\
 export function helper() { return 2; }
-");
-        write_file(root, "src/main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "src/main.ts",
+            "\
 import { helper } from './util.ts';
 export function caller() { return helper(); }
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(
             root,
-            &["src/util.js".into(), "src/util.ts".into(), "src/main.ts".into()],
+            &[
+                "src/util.js".into(),
+                "src/util.ts".into(),
+                "src/main.ts".into(),
+            ],
             &registry,
         );
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/util.ts"),
+            deps.iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/util.ts"),
             "caller should resolve helper to explicit src/util.ts. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/util.js"),
+            !deps
+                .iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/util.js"),
             "caller should not resolve explicit ./util.ts to src/util.js. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2439,40 +3547,65 @@ export function caller() { return helper(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "src/a/util.py", "\
+        write_file(
+            root,
+            "src/a/util.py",
+            "\
 def helper():
     return 1
-");
-        write_file(root, "src/b/util.py", "\
+",
+        );
+        write_file(
+            root,
+            "src/b/util.py",
+            "\
 def helper():
     return 2
-");
-        write_file(root, "src/main.py", "\
+",
+        );
+        write_file(
+            root,
+            "src/main.py",
+            "\
 from .b.util import helper
 
 def caller():
     return helper()
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(
             root,
-            &["src/a/util.py".into(), "src/b/util.py".into(), "src/main.py".into()],
+            &[
+                "src/a/util.py".into(),
+                "src/b/util.py".into(),
+                "src/main.py".into(),
+            ],
             &registry,
         );
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/b/util.py"),
+            deps.iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/b/util.py"),
             "caller should resolve helper to src/b/util.py. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/a/util.py"),
+            !deps
+                .iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/a/util.py"),
             "caller should not resolve helper to src/a/util.py. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2481,40 +3614,65 @@ def caller():
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "src/a/util.py", "\
+        write_file(
+            root,
+            "src/a/util.py",
+            "\
 def helper():
     return 1
-");
-        write_file(root, "src/b/util.py", "\
+",
+        );
+        write_file(
+            root,
+            "src/b/util.py",
+            "\
 def helper():
     return 2
-");
-        write_file(root, "src/main.py", "\
+",
+        );
+        write_file(
+            root,
+            "src/main.py",
+            "\
 from src.b.util import helper
 
 def caller():
     return helper()
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(
             root,
-            &["src/a/util.py".into(), "src/b/util.py".into(), "src/main.py".into()],
+            &[
+                "src/a/util.py".into(),
+                "src/b/util.py".into(),
+                "src/main.py".into(),
+            ],
             &registry,
         );
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            deps.iter().any(|d| d.name == "helper" && d.file_path == "src/b/util.py"),
+            deps.iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/b/util.py"),
             "caller should resolve helper to src/b/util.py. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !deps.iter().any(|d| d.name == "helper" && d.file_path == "src/a/util.py"),
+            !deps
+                .iter()
+                .any(|d| d.name == "helper" && d.file_path == "src/a/util.py"),
             "caller should not resolve helper to src/a/util.py. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2523,39 +3681,57 @@ def caller():
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "lib.ts", "\
+        write_file(
+            root,
+            "lib.ts",
+            "\
 export function foo() { return 1; }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import { foo } from './lib';
 export function caller(other) { return other.foo(); }
 export function actual() { return foo(); }
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["lib.ts".into(), "main.ts".into()],
-            &registry,
+",
         );
 
-        let caller_id = graph.entities.keys()
+        let (graph, _) = EntityGraph::build(root, &["lib.ts".into(), "main.ts".into()], &registry);
+
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let caller_deps = graph.get_dependencies(caller_id);
         assert!(
-            !caller_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            !caller_deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "other.foo() should not resolve through a bare named import. Deps: {:?}",
-            caller_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            caller_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
 
-        let actual_id = graph.entities.keys()
+        let actual_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("actual"))
             .expect("actual entity should exist");
         let actual_deps = graph.get_dependencies(actual_id);
         assert!(
-            actual_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            actual_deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "foo() should still resolve through the named import. Deps: {:?}",
-            actual_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            actual_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2564,37 +3740,50 @@ export function actual() { return foo(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "lib.ts", "\
+        write_file(
+            root,
+            "lib.ts",
+            "\
 export const answer = 1;
 export function foo() { return 1; }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import { answer, foo } from './lib';
 export function caller(other) {
     other.foo();
     return answer;
 }
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["lib.ts".into(), "main.ts".into()],
-            &registry,
+",
         );
 
-        let caller_id = graph.entities.keys()
+        let (graph, _) = EntityGraph::build(root, &["lib.ts".into(), "main.ts".into()], &registry);
+
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            deps.iter().any(|d| d.name == "answer" && d.file_path == "lib.ts"),
+            deps.iter()
+                .any(|d| d.name == "answer" && d.file_path == "lib.ts"),
             "unresolved other.foo() should not block bare answer import fallback. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            !deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "other.foo() should not resolve through the named import. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2603,17 +3792,29 @@ export function caller(other) {
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "lib.ts", "\
+        write_file(
+            root,
+            "lib.ts",
+            "\
 export function foo() { return 1; }
-");
-        write_file(root, "other.ts", "\
+",
+        );
+        write_file(
+            root,
+            "other.ts",
+            "\
 export function foo() { return 2; }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import * as lib from './lib';
 export function caller(other) { return other.foo(); }
 export function actual() { return lib.foo(); }
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(
             root,
@@ -2621,29 +3822,46 @@ export function actual() { return lib.foo(); }
             &registry,
         );
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let caller_deps = graph.get_dependencies(caller_id);
         assert!(
             !caller_deps.iter().any(|d| d.name == "foo"),
             "other.foo() should not resolve via namespace import lib. Deps: {:?}",
-            caller_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            caller_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
 
-        let actual_id = graph.entities.keys()
+        let actual_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("actual"))
             .expect("actual entity should exist");
         let actual_deps = graph.get_dependencies(actual_id);
         assert!(
-            actual_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            actual_deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "lib.foo() should resolve to lib.ts. Deps: {:?}",
-            actual_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            actual_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !actual_deps.iter().any(|d| d.name == "foo" && d.file_path == "other.ts"),
+            !actual_deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "other.ts"),
             "lib.foo() should not resolve to other.ts. Deps: {:?}",
-            actual_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            actual_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2652,35 +3870,49 @@ export function actual() { return lib.foo(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "lib.ts", "\
+        write_file(
+            root,
+            "lib.ts",
+            "\
 export class Service {
     static run() { return 1; }
 }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import { Service } from './lib';
 export function caller(Service) { return Service.run(); }
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["lib.ts".into(), "main.ts".into()],
-            &registry,
+",
         );
 
-        let caller_id = graph.entities.keys()
+        let (graph, _) = EntityGraph::build(root, &["lib.ts".into(), "main.ts".into()], &registry);
+
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            !deps.iter().any(|d| d.name == "run" && d.file_path == "lib.ts"),
+            !deps
+                .iter()
+                .any(|d| d.name == "run" && d.file_path == "lib.ts"),
             "local parameter Service should shadow imported class receiver. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
         assert!(
-            !deps.iter().any(|d| d.name == "Service" && d.file_path == "lib.ts"),
+            !deps
+                .iter()
+                .any(|d| d.name == "Service" && d.file_path == "lib.ts"),
             "local parameter Service should shadow imported class name. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2689,28 +3921,38 @@ export function caller(Service) { return Service.run(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "lib.ts", "\
+        write_file(
+            root,
+            "lib.ts",
+            "\
 export function foo() { return 1; }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import * as lib from './lib';
 export function caller(lib) { return lib.foo(); }
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["lib.ts".into(), "main.ts".into()],
-            &registry,
+",
         );
 
-        let caller_id = graph.entities.keys()
+        let (graph, _) = EntityGraph::build(root, &["lib.ts".into(), "main.ts".into()], &registry);
+
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            !deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "local parameter lib should shadow namespace import receiver. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2719,28 +3961,38 @@ export function caller(lib) { return lib.foo(); }
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "lib.ts", "\
+        write_file(
+            root,
+            "lib.ts",
+            "\
 export function foo() { return 1; }
-");
-        write_file(root, "main.ts", "\
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
 import { foo } from './lib';
 export function caller(foo) { return foo(); }
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["lib.ts".into(), "main.ts".into()],
-            &registry,
+",
         );
 
-        let caller_id = graph.entities.keys()
+        let (graph, _) = EntityGraph::build(root, &["lib.ts".into(), "main.ts".into()], &registry);
+
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
         assert!(
-            !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            !deps
+                .iter()
+                .any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "local parameter foo should shadow named import. Deps: {:?}",
-            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2751,27 +4003,33 @@ export function caller(foo) { return foo(); }
 
         // Two classes with same method name "process".
         // self.process() in ClassA should NOT create edge to ClassB::process.
-        write_file(root, "a.py", "\
+        write_file(
+            root,
+            "a.py",
+            "\
 class ClassA:
     def run(self):
         return self.process()
 
     def process(self):
         return 1
-");
-        write_file(root, "b.py", "\
+",
+        );
+        write_file(
+            root,
+            "b.py",
+            "\
 class ClassB:
     def process(self):
         return 2
-");
-
-        let (graph, _) = EntityGraph::build(
-            root,
-            &["a.py".into(), "b.py".into()],
-            &registry,
+",
         );
 
-        let run_id = graph.entities.keys()
+        let (graph, _) = EntityGraph::build(root, &["a.py".into(), "b.py".into()], &registry);
+
+        let run_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("run"))
             .expect("run entity should exist");
         let deps = graph.get_dependencies(run_id);
@@ -2795,17 +4053,23 @@ class ClassB:
         // someVar.unknownMethod() - "someVar" is not a class,
         // so the chain is unresolved and words fall through to bag-of-words.
         // "helper" should still resolve via bag-of-words.
-        write_file(root, "app.ts", "\
+        write_file(
+            root,
+            "app.ts",
+            "\
 export function helper() { return 1; }
 export function caller() {
     const val = helper();
     return val;
 }
-");
+",
+        );
 
         let (graph, _) = EntityGraph::build(root, &["app.ts".into()], &registry);
 
-        let caller_id = graph.entities.keys()
+        let caller_id = graph
+            .entities
+            .keys()
             .find(|id| id.contains("caller"))
             .expect("caller entity should exist");
         let deps = graph.get_dependencies(caller_id);
@@ -2815,5 +4079,4 @@ export function caller() {
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
     }
-
 }

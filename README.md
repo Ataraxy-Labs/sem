@@ -92,6 +92,8 @@ If you installed via npm/bun, the binary lives in `node_modules/.bin/sem` and is
 
 Works in any Git repo. No setup required. Also works outside Git for arbitrary file comparison.
 
+sem stores its SQLite entity cache outside the repository, under the OS cache directory by default. Set `SEM_CACHE_DIR=/path/to/cache` to override the cache root; repo-local overrides are ignored so cache files do not dirty the working tree.
+
 ### sem diff
 
 Entity-level diff with rename detection, structural hashing, and word-level inline highlights.
