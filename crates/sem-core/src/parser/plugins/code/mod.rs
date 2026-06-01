@@ -351,11 +351,19 @@ int main() {
         let code = r#"
 import Foundation
 
+typealias Handler = (Int) -> Void
+
+prefix operator ~~~
+
 class UserService {
     var name: String
 
     init(name: String) {
         self.name = name
+    }
+
+    deinit {
+        print("freed")
     }
 
     func getUsers() -> [User] {
@@ -366,6 +374,10 @@ class UserService {
 struct Point {
     var x: Double
     var y: Double
+
+    subscript(index: Int) -> Double {
+        return x + y + Double(index)
+    }
 }
 
 enum Status {
@@ -375,9 +387,9 @@ enum Status {
 }
 
 protocol Repository {
-    associatedtype Item
-    func findById(id: String) -> Item?
-    func findAll() -> [Item]
+    associatedtype Canvas
+    func findById(id: String) -> Canvas?
+    func findAll() -> [Canvas]
 }
 
 func helper(x: Int) -> Int {
@@ -393,13 +405,63 @@ func helper(x: Int) -> Int {
         assert!(names.contains(&"Point"), "Should find struct Point, got: {:?}", names);
         assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
         assert!(names.contains(&"Repository"), "Should find protocol Repository, got: {:?}", names);
+        assert!(names.contains(&"Canvas"), "Should find associatedtype Canvas, got: {:?}", names);
+        assert!(names.contains(&"Handler"), "Should find typealias Handler, got: {:?}", names);
+        assert!(names.contains(&"~~~"), "Should find custom operator ~~~, got: {:?}", names);
+        assert!(names.contains(&"init"), "Should find initializer init, got: {:?}", names);
+        assert!(names.contains(&"deinit"), "Should find deinitializer deinit, got: {:?}", names);
+        assert!(names.contains(&"subscript"), "Should find subscript, got: {:?}", names);
         assert!(names.contains(&"helper"), "Should find function helper, got: {:?}", names);
+
+        let handler = entities.iter().find(|e| e.name == "Handler").unwrap();
+        assert_eq!(handler.entity_type, "type");
+        assert!(handler.parent_id.is_none());
+
+        let operator = entities.iter().find(|e| e.name == "~~~").unwrap();
+        assert_eq!(operator.entity_type, "operator");
+        assert!(operator.parent_id.is_none());
+
+        let user_service = entities.iter().find(|e| e.name == "UserService").unwrap();
+        assert_eq!(user_service.entity_type, "class");
+
+        let initializer = entities.iter().find(|e| e.name == "init").unwrap();
+        assert_eq!(initializer.entity_type, "init");
+        assert_eq!(initializer.parent_id.as_deref(), Some(user_service.id.as_str()));
+        assert_eq!(initializer.id, "UserService.swift::class::UserService::init");
+
+        let deinitializer = entities.iter().find(|e| e.name == "deinit").unwrap();
+        assert_eq!(deinitializer.entity_type, "deinit");
+        assert_eq!(deinitializer.parent_id.as_deref(), Some(user_service.id.as_str()));
+        assert_eq!(
+            deinitializer.id,
+            "UserService.swift::class::UserService::deinit"
+        );
 
         let point = entities.iter().find(|e| e.name == "Point").unwrap();
         assert_eq!(point.entity_type, "struct");
 
+        let subscript = entities.iter().find(|e| e.name == "subscript").unwrap();
+        assert_eq!(subscript.entity_type, "subscript");
+        assert_eq!(subscript.parent_id.as_deref(), Some(point.id.as_str()));
+        assert_eq!(
+            subscript.id,
+            "UserService.swift::struct::Point::subscript"
+        );
+
         let status = entities.iter().find(|e| e.name == "Status").unwrap();
         assert_eq!(status.entity_type, "enum");
+
+        let repository = entities.iter().find(|e| e.name == "Repository").unwrap();
+        assert_eq!(repository.entity_type, "protocol");
+        assert_eq!(repository.id, "UserService.swift::protocol::Repository");
+
+        let canvas = entities.iter().find(|e| e.name == "Canvas").unwrap();
+        assert_eq!(canvas.entity_type, "associatedtype");
+        assert_eq!(canvas.parent_id.as_deref(), Some(repository.id.as_str()));
+        assert_eq!(
+            canvas.id,
+            "UserService.swift::protocol::Repository::Canvas"
+        );
     }
 
     #[test]
@@ -847,6 +909,69 @@ impl Greeting for Cat {
             entities_a[0].content_hash, entities_b[0].content_hash,
             "Content hash should differ since raw content includes the name"
         );
+    }
+
+    #[test]
+    fn test_swift_renamed_operator_same_structural_hash() {
+        let plugin = CodeParserPlugin;
+        let entities_a = plugin.extract_entities("prefix operator ~~~\n", "a.swift");
+        let entities_b = plugin.extract_entities("prefix operator !!!\n", "b.swift");
+
+        assert_eq!(entities_a.len(), 1, "Should find one entity in a");
+        assert_eq!(entities_b.len(), 1, "Should find one entity in b");
+        assert_eq!(entities_a[0].name, "~~~");
+        assert_eq!(entities_b[0].name, "!!!");
+        assert_eq!(entities_a[0].entity_type, "operator");
+        assert_eq!(entities_b[0].entity_type, "operator");
+        assert_eq!(
+            entities_a[0].structural_hash, entities_b[0].structural_hash,
+            "Renamed operator with otherwise identical declaration should have same structural_hash"
+        );
+        assert_ne!(
+            entities_a[0].content_hash, entities_b[0].content_hash,
+            "Content hash should differ since raw content includes the operator token"
+        );
+    }
+
+    #[test]
+    fn test_swift_synthesized_names_disambiguate_overloads() {
+        let plugin = CodeParserPlugin;
+        let code = r#"
+struct Matrix {
+    subscript(row: Int) -> Double {
+        return Double(row)
+    }
+
+    subscript(row: Int, column: Int) -> Double {
+        return Double(row + column)
+    }
+}
+
+class Builder {
+    init(value: Int) {}
+    init(text: String) {}
+}
+"#;
+
+        let entities = plugin.extract_entities(code, "Overloads.swift");
+
+        let subscript_ids: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type == "subscript")
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(subscript_ids.len(), 2);
+        assert_ne!(subscript_ids[0], subscript_ids[1]);
+        assert!(subscript_ids.iter().all(|id| id.contains("@L")));
+
+        let init_ids: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type == "init")
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(init_ids.len(), 2);
+        assert_ne!(init_ids[0], init_ids[1]);
+        assert!(init_ids.iter().all(|id| id.contains("@L")));
     }
 
     #[test]

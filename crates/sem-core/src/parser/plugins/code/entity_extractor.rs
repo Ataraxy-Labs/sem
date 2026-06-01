@@ -898,7 +898,7 @@ fn swift_declaration_keyword_type(keyword: &str) -> Option<&'static str> {
         "class" => Some("class"),
         "enum" => Some("enum"),
         "extension" => Some("extension"),
-        "protocol" => Some("protocol_declaration"),
+        "protocol" => Some("protocol"),
         "struct" => Some("struct"),
         _ => None,
     }
@@ -1105,12 +1105,25 @@ fn compute_structural_hash(node: Node, source: &[u8]) -> String {
 /// Find the byte range of the name node, mirroring extract_name() logic.
 /// Returns (start_byte, end_byte) of the name token to exclude from hashing.
 fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
+    let node_type = node.kind();
+
+    if node_type == "operator_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "custom_operator" || child.kind() == "simple_identifier" {
+                return Some((child.start_byte(), child.end_byte()));
+            }
+        }
+    }
+
+    if node_type == "subscript_declaration" || node_type == "deinit_declaration" {
+        return None;
+    }
+
     // Try 'name' field first (works for most languages)
     if let Some(name_node) = node.child_by_field_name("name") {
         return Some((name_node.start_byte(), name_node.end_byte()));
     }
-
-    let node_type = node.kind();
 
     // Variable/lexical declarations: name is inside variable_declarator
     if node_type == "lexical_declaration" || node_type == "variable_declaration" {
@@ -1325,14 +1338,31 @@ fn find_declarator_name_range(mut node: Node) -> Option<(usize, usize)> {
 }
 
 fn extract_name(node: Node, source: &[u8]) -> Option<String> {
+    let node_type = node.kind();
+
+    if node_type == "subscript_declaration" {
+        return Some("subscript".to_string());
+    }
+
+    if node_type == "deinit_declaration" {
+        return Some("deinit".to_string());
+    }
+
+    if node_type == "operator_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "custom_operator" || child.kind() == "simple_identifier" {
+                return Some(node_text(child, source).to_string());
+            }
+        }
+    }
+
     // Try 'name' field first (works for most languages)
     if let Some(name_node) = node.child_by_field_name("name") {
         return Some(node_text(name_node, source).to_string());
     }
 
     // For variable/lexical declarations, try to get the declarator name
-    let node_type = node.kind();
-
     // For Rust impl blocks, construct unique name from trait + type
     // e.g. "impl Display for Foo" -> "Display for Foo", "impl Foo" -> "Foo"
     if node_type == "impl_item" {
@@ -1707,7 +1737,13 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "method_signature" | "operator_signature" => "method",
         "class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
-        "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
+        "protocol_declaration" => "protocol",
+        "init_declaration" => "init",
+        "deinit_declaration" => "deinit",
+        "subscript_declaration" => "subscript",
+        "type_alias_declaration" | "typealias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
+        "associatedtype_declaration" => "associatedtype",
+        "operator_declaration" => "operator",
         "enum_declaration" | "enum_item" | "enum_specifier" | "enum_definition" => "enum",
         "mixin_declaration" => "mixin",
         "extension_declaration" | "extension_type_declaration" => "extension",

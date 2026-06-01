@@ -53,30 +53,60 @@ fn get_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         // service.py → models.py
         ("create_dog", "Dog", "service calls Dog constructor"),
         ("create_dog", "validate", "service calls dog.validate()"),
-        ("create_dog", "get_connection", "service calls get_connection()"),
+        (
+            "create_dog",
+            "get_connection",
+            "service calls get_connection()",
+        ),
         ("create_cat", "Cat", "service calls Cat constructor"),
         ("create_cat", "validate", "service calls cat.validate()"),
-        ("create_cat", "get_connection", "service calls get_connection()"),
-        ("transfer_animal", "Transaction", "service calls Transaction constructor"),
-        ("transfer_animal", "get_connection", "service calls get_connection()"),
+        (
+            "create_cat",
+            "get_connection",
+            "service calls get_connection()",
+        ),
+        (
+            "transfer_animal",
+            "Transaction",
+            "service calls Transaction constructor",
+        ),
+        (
+            "transfer_animal",
+            "get_connection",
+            "service calls get_connection()",
+        ),
         ("transfer_animal", "execute", "txn.execute() on Transaction"),
         ("transfer_animal", "commit", "txn.commit() on Transaction"),
         ("transfer_animal", "add", "shelter.add() on Shelter"),
-        ("list_animals", "get_connection", "service calls get_connection()"),
+        (
+            "list_animals",
+            "get_connection",
+            "service calls get_connection()",
+        ),
         ("list_animals", "execute", "conn.execute() on Connection"),
-
         // handlers.py → service.py
         ("handle_create_dog", "create_dog", "handler calls service"),
         ("handle_create_cat", "create_cat", "handler calls service"),
-        ("handle_transfer", "transfer_animal", "handler calls service"),
+        (
+            "handle_transfer",
+            "transfer_animal",
+            "handler calls service",
+        ),
         ("handle_transfer", "Shelter", "handler creates Shelter"),
         ("handle_transfer", "Dog", "handler creates Dog"),
         ("handle_transfer", "count", "shelter.count() on Shelter"),
         ("handle_list", "list_animals", "handler calls service"),
-
         // database.py internal
-        ("Transaction::execute", "execute", "Transaction.execute calls self.conn.execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls self.conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls self.conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls self.conn.commit",
+        ),
     ]
 }
 
@@ -87,16 +117,22 @@ fn get_false_positive_edges() -> Vec<(&'static str, &'static str, &'static str)>
         // to Cat.validate, that's a false positive.
         ("create_dog", "Cat", "create_dog shouldn't reference Cat"),
         ("create_cat", "Dog", "create_cat shouldn't reference Dog"),
-
         // validate() in handlers.py is a standalone function, not Dog.validate or Cat.validate
         // bag-of-words might link them
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-
         // Transaction.execute and Connection.execute are different.
         // transfer_animal calls txn.execute() not conn.execute() directly
-        ("handle_create_dog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handle_create_cat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handle_create_dog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handle_create_cat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -107,10 +143,7 @@ fn edge_matches(
     to_pat: &str,
 ) -> bool {
     edges.iter().any(|(from, to)| {
-        let from_name = entity_map
-            .get(from)
-            .map(|e| e.name.as_str())
-            .unwrap_or("");
+        let from_name = entity_map.get(from).map(|e| e.name.as_str()).unwrap_or("");
         let to_name = entity_map.get(to).map(|e| e.name.as_str()).unwrap_or("");
 
         // Handle qualified patterns like "Transaction::execute"
@@ -131,8 +164,220 @@ fn edge_matches(
 }
 
 #[test]
+fn swift_overloaded_calls_resolve_by_argument_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Example.swift"),
+        r#"func load(id: Int) -> String { return "id" }
+
+func load(name: String) -> String { return "name" }
+
+func byId() -> String { return load(id: 1) }
+
+func byName() -> String { return load(name: "x") }
+
+func byAge() -> String { return load(age: 1) }
+"#,
+    )
+    .unwrap();
+    init_git(root);
+
+    let registry = create_default_registry();
+    let file_refs = vec!["Example.swift".to_string()];
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
+
+    let entity_id = |name: &str, start_line: usize| {
+        graph
+            .entities
+            .values()
+            .find(|entity| entity.name == name && entity.start_line == start_line)
+            .unwrap_or_else(|| panic!("missing entity {name} at line {start_line}"))
+            .id
+            .clone()
+    };
+
+    let load_id = entity_id("load", 1);
+    let load_name = entity_id("load", 3);
+    let by_id = entity_id("byId", 5);
+    let by_name = entity_id("byName", 7);
+    let by_age = entity_id("byAge", 9);
+
+    let has_edge = |from: &str, to: &str| {
+        graph.edges.iter().any(|edge| {
+            edge.from_entity == from && edge.to_entity == to && edge.ref_type == RefType::Calls
+        })
+    };
+
+    assert!(has_edge(&by_id, &load_id), "byId should call load(id:)");
+    assert!(
+        !has_edge(&by_id, &load_name),
+        "byId should not call load(name:)"
+    );
+    assert!(
+        has_edge(&by_name, &load_name),
+        "byName should call load(name:)"
+    );
+    assert!(
+        !has_edge(&by_name, &load_id),
+        "byName should not call load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_id),
+        "byAge should not fall back to load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_name),
+        "byAge should not fall back to load(name:)"
+    );
+}
+
+#[test]
+fn swift_overloaded_method_calls_resolve_by_argument_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Example.swift"),
+        r#"struct Loader {
+    func load(id: Int) -> String { return "id" }
+
+    func load(name: String) -> String { return "name" }
+}
+
+func byId(loader: Loader) -> String { return loader.load(id: 1) }
+
+func byName(loader: Loader) -> String { return loader.load(name: "x") }
+
+func byAge(loader: Loader) -> String { return loader.load(age: 1) }
+"#,
+    )
+    .unwrap();
+    init_git(root);
+
+    let registry = create_default_registry();
+    let file_refs = vec!["Example.swift".to_string()];
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
+
+    let entity_id = |name: &str, start_line: usize| {
+        graph
+            .entities
+            .values()
+            .find(|entity| entity.name == name && entity.start_line == start_line)
+            .unwrap_or_else(|| panic!("missing entity {name} at line {start_line}"))
+            .id
+            .clone()
+    };
+
+    let load_id = entity_id("load", 2);
+    let load_name = entity_id("load", 4);
+    let by_id = entity_id("byId", 7);
+    let by_name = entity_id("byName", 9);
+    let by_age = entity_id("byAge", 11);
+
+    let has_edge = |from: &str, to: &str| {
+        graph.edges.iter().any(|edge| {
+            edge.from_entity == from && edge.to_entity == to && edge.ref_type == RefType::Calls
+        })
+    };
+
+    assert!(has_edge(&by_id, &load_id), "byId should call load(id:)");
+    assert!(
+        !has_edge(&by_id, &load_name),
+        "byId should not call load(name:)"
+    );
+    assert!(
+        has_edge(&by_name, &load_name),
+        "byName should call load(name:)"
+    );
+    assert!(
+        !has_edge(&by_name, &load_id),
+        "byName should not call load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_id),
+        "byAge should not fall back to load(id:)"
+    );
+    assert!(
+        !has_edge(&by_age, &load_name),
+        "byAge should not fall back to load(name:)"
+    );
+}
+
+#[test]
+fn swift_overloaded_initializers_resolve_by_argument_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Example.swift"),
+        r#"struct Token {
+    init(id: Int) {}
+
+    init(text: String) {}
+
+    init(copyID: Int) { self.init(id: copyID) }
+
+    init(copyText: String) { self.init(text: copyText) }
+
+    init(copyAge: Double) { self.init(age: copyAge) }
+}
+"#,
+    )
+    .unwrap();
+    init_git(root);
+
+    let registry = create_default_registry();
+    let file_refs = vec!["Example.swift".to_string()];
+    let (graph, _) = EntityGraph::build(root, &file_refs, &registry);
+
+    let entity_id = |start_line: usize| {
+        graph
+            .entities
+            .values()
+            .find(|entity| entity.name == "init" && entity.start_line == start_line)
+            .unwrap_or_else(|| panic!("missing init at line {start_line}"))
+            .id
+            .clone()
+    };
+
+    let init_id = entity_id(2);
+    let init_text = entity_id(4);
+    let copy_id = entity_id(6);
+    let copy_text = entity_id(8);
+    let copy_age = entity_id(10);
+
+    let has_edge = |from: &str, to: &str| {
+        graph.edges.iter().any(|edge| {
+            edge.from_entity == from && edge.to_entity == to && edge.ref_type == RefType::Calls
+        })
+    };
+
+    assert!(has_edge(&copy_id, &init_id), "copyID should call init(id:)");
+    assert!(
+        !has_edge(&copy_id, &init_text),
+        "copyID should not call init(text:)"
+    );
+    assert!(
+        has_edge(&copy_text, &init_text),
+        "copyText should call init(text:)"
+    );
+    assert!(
+        !has_edge(&copy_text, &init_id),
+        "copyText should not call init(id:)"
+    );
+    assert!(
+        !has_edge(&copy_age, &init_id),
+        "copyAge should not fall back to init(id:)"
+    );
+    assert!(
+        !has_edge(&copy_age, &init_text),
+        "copyAge should not fall back to init(text:)"
+    );
+}
+
+#[test]
 fn scope_resolve_comparison() {
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scope_test/python");
+    let fixture_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scope_test/python");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
@@ -207,18 +452,42 @@ fn scope_resolve_comparison() {
     for (from_pat, to_pat, desc) in &expected {
         let old_found = edge_matches(&old_edges, &entity_map, from_pat, to_pat);
         let new_found = edge_matches(&new_edges, &entity_map, from_pat, to_pat);
-        if old_found { old_tp += 1; } else { old_fn += 1; }
-        if new_found { new_tp += 1; } else { new_fn += 1; }
-        details.push((from_pat.to_string(), to_pat.to_string(), desc.to_string(), old_found, new_found));
+        if old_found {
+            old_tp += 1;
+        } else {
+            old_fn += 1;
+        }
+        if new_found {
+            new_tp += 1;
+        } else {
+            new_fn += 1;
+        }
+        details.push((
+            from_pat.to_string(),
+            to_pat.to_string(),
+            desc.to_string(),
+            old_found,
+            new_found,
+        ));
     }
 
     let mut fp_details: Vec<(String, String, String, bool, bool)> = Vec::new();
     for (from_pat, to_pat, desc) in &false_positives {
         let old_found = edge_matches(&old_edges, &entity_map, from_pat, to_pat);
         let new_found = edge_matches(&new_edges, &entity_map, from_pat, to_pat);
-        if old_found { old_fp += 1; }
-        if new_found { new_fp += 1; }
-        fp_details.push((from_pat.to_string(), to_pat.to_string(), desc.to_string(), old_found, new_found));
+        if old_found {
+            old_fp += 1;
+        }
+        if new_found {
+            new_fp += 1;
+        }
+        fp_details.push((
+            from_pat.to_string(),
+            to_pat.to_string(),
+            desc.to_string(),
+            old_found,
+            new_found,
+        ));
     }
 
     let old_precision = if old_tp + old_fp > 0 {
@@ -245,25 +514,56 @@ fn scope_resolve_comparison() {
 
     // Print summary
     eprintln!("\n=== Scope Resolution Comparison ===");
-    eprintln!("Old (bag-of-words): {} TP, {} FN, {} FP | {:.0}% recall, {:.0}% precision",
-        old_tp, old_fn, old_fp, old_recall * 100.0, old_precision * 100.0);
-    eprintln!("New (scope-aware):  {} TP, {} FN, {} FP | {:.0}% recall, {:.0}% precision",
-        new_tp, new_fn, new_fp, new_recall * 100.0, new_precision * 100.0);
-    eprintln!("Total edges: old={}, new={}", old_edges.len(), new_edges.len());
+    eprintln!(
+        "Old (bag-of-words): {} TP, {} FN, {} FP | {:.0}% recall, {:.0}% precision",
+        old_tp,
+        old_fn,
+        old_fp,
+        old_recall * 100.0,
+        old_precision * 100.0
+    );
+    eprintln!(
+        "New (scope-aware):  {} TP, {} FN, {} FP | {:.0}% recall, {:.0}% precision",
+        new_tp,
+        new_fn,
+        new_fp,
+        new_recall * 100.0,
+        new_precision * 100.0
+    );
+    eprintln!(
+        "Total edges: old={}, new={}",
+        old_edges.len(),
+        new_edges.len()
+    );
 
     // Generate HTML report
     let html = generate_html_report(
         &details,
         &fp_details,
-        old_tp, old_fn, old_fp, old_recall, old_precision,
-        new_tp, new_fn, new_fp, new_recall, new_precision,
-        old_edges.len(), new_edges.len(),
-        &old_edges, &new_edges, &entity_map,
+        old_tp,
+        old_fn,
+        old_fp,
+        old_recall,
+        old_precision,
+        new_tp,
+        new_fn,
+        new_fp,
+        new_recall,
+        new_precision,
+        old_edges.len(),
+        new_edges.len(),
+        &old_edges,
+        &new_edges,
+        &entity_map,
         &scope_result.resolution_log,
     );
 
-    let output_path = std::env::var("SCOPE_BENCH_OUTPUT")
-        .unwrap_or_else(|_| std::env::temp_dir().join("scope-resolve-bench.html").to_string_lossy().to_string());
+    let output_path = std::env::var("SCOPE_BENCH_OUTPUT").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("scope-resolve-bench.html")
+            .to_string_lossy()
+            .to_string()
+    });
     let _ = std::fs::write(&output_path, &html);
     eprintln!("Report written to {}", output_path);
 
@@ -274,9 +574,18 @@ fn scope_resolve_comparison() {
 fn generate_html_report(
     details: &[(String, String, String, bool, bool)],
     fp_details: &[(String, String, String, bool, bool)],
-    old_tp: usize, old_fn: usize, old_fp: usize, old_recall: f64, old_precision: f64,
-    new_tp: usize, new_fn: usize, new_fp: usize, new_recall: f64, new_precision: f64,
-    old_total: usize, new_total: usize,
+    old_tp: usize,
+    old_fn: usize,
+    old_fp: usize,
+    old_recall: f64,
+    old_precision: f64,
+    new_tp: usize,
+    new_fn: usize,
+    new_fp: usize,
+    new_recall: f64,
+    new_precision: f64,
+    old_total: usize,
+    new_total: usize,
     old_edges: &[(String, String)],
     new_edges: &[(String, String)],
     entity_map: &HashMap<String, EntityInfo>,
@@ -357,8 +666,14 @@ fn generate_html_report(
         .iter()
         .take(60)
         .map(|(from, to)| {
-            let f = entity_map.get(from).map(|e| format!("{} ({})", e.name, short_file(&e.file_path))).unwrap_or_else(|| from.clone());
-            let t = entity_map.get(to).map(|e| format!("{} ({})", e.name, short_file(&e.file_path))).unwrap_or_else(|| to.clone());
+            let f = entity_map
+                .get(from)
+                .map(|e| format!("{} ({})", e.name, short_file(&e.file_path)))
+                .unwrap_or_else(|| from.clone());
+            let t = entity_map
+                .get(to)
+                .map(|e| format!("{} ({})", e.name, short_file(&e.file_path)))
+                .unwrap_or_else(|| to.clone());
             format!("<tr><td>{}</td><td>{}</td></tr>", f, t)
         })
         .collect();
@@ -367,13 +682,20 @@ fn generate_html_report(
         .iter()
         .take(60)
         .map(|(from, to)| {
-            let f = entity_map.get(from).map(|e| format!("{} ({})", e.name, short_file(&e.file_path))).unwrap_or_else(|| from.clone());
-            let t = entity_map.get(to).map(|e| format!("{} ({})", e.name, short_file(&e.file_path))).unwrap_or_else(|| to.clone());
+            let f = entity_map
+                .get(from)
+                .map(|e| format!("{} ({})", e.name, short_file(&e.file_path)))
+                .unwrap_or_else(|| from.clone());
+            let t = entity_map
+                .get(to)
+                .map(|e| format!("{} ({})", e.name, short_file(&e.file_path)))
+                .unwrap_or_else(|| to.clone());
             format!("<tr><td>{}</td><td>{}</td></tr>", f, t)
         })
         .collect();
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -533,37 +855,126 @@ Test: 4 Python files with same-name methods, variable type tracking, cross-file 
 </body>
 </html>"#,
         // Old card winner class
-        if old_f1 > new_f1 {{ " winner" }} else {{ "" }},
+        if old_f1 > new_f1 {
+            {
+                " winner"
+            }
+        } else {
+            {
+                ""
+            }
+        },
         // Old recall color
-        if old_recall >= 0.8 {{ " green" }} else if old_recall >= 0.5 {{ " yellow" }} else {{ " red" }},
+        if old_recall >= 0.8 {
+            {
+                " green"
+            }
+        } else if old_recall >= 0.5 {
+            {
+                " yellow"
+            }
+        } else {
+            {
+                " red"
+            }
+        },
         old_recall * 100.0,
         // Old precision color
-        if old_precision >= 0.8 {{ " green" }} else if old_precision >= 0.5 {{ " yellow" }} else {{ " red" }},
+        if old_precision >= 0.8 {
+            {
+                " green"
+            }
+        } else if old_precision >= 0.5 {
+            {
+                " yellow"
+            }
+        } else {
+            {
+                " red"
+            }
+        },
         old_precision * 100.0,
         old_f1 * 100.0,
-        old_tp, old_fn, old_fp, old_total,
+        old_tp,
+        old_fn,
+        old_fp,
+        old_total,
         // New card winner class
-        if new_f1 >= old_f1 {{ " winner" }} else {{ "" }},
+        if new_f1 >= old_f1 {
+            {
+                " winner"
+            }
+        } else {
+            {
+                ""
+            }
+        },
         // New recall color
-        if new_recall >= 0.8 {{ " green" }} else if new_recall >= 0.5 {{ " yellow" }} else {{ " red" }},
+        if new_recall >= 0.8 {
+            {
+                " green"
+            }
+        } else if new_recall >= 0.5 {
+            {
+                " yellow"
+            }
+        } else {
+            {
+                " red"
+            }
+        },
         new_recall * 100.0,
         // New precision color
-        if new_precision >= 0.8 {{ " green" }} else if new_precision >= 0.5 {{ " yellow" }} else {{ " red" }},
+        if new_precision >= 0.8 {
+            {
+                " green"
+            }
+        } else if new_precision >= 0.5 {
+            {
+                " yellow"
+            }
+        } else {
+            {
+                " red"
+            }
+        },
         new_precision * 100.0,
         new_f1 * 100.0,
         new_tp,
         // New FN color
-        if new_fn < old_fn {{ " green" }} else {{ " red" }},
+        if new_fn < old_fn {
+            {
+                " green"
+            }
+        } else {
+            {
+                " red"
+            }
+        },
         new_fn,
         // New FP color
-        if new_fp < old_fp {{ " green" }} else if new_fp == 0 {{ " green" }} else {{ " red" }},
+        if new_fp < old_fp {
+            {
+                " green"
+            }
+        } else if new_fp == 0 {
+            {
+                " green"
+            }
+        } else {
+            {
+                " red"
+            }
+        },
         new_fp,
         new_total,
         expected_rows,
         fp_rows,
         log_rows,
-        old_total, all_old_edges,
-        new_total, all_new_edges,
+        old_total,
+        all_old_edges,
+        new_total,
+        all_new_edges,
     )
 }
 
@@ -578,18 +989,37 @@ fn get_ts_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         // service.ts -> models.ts
         ("createDog", "Dog", "service calls Dog constructor"),
         ("createDog", "validate", "service calls dog.validate()"),
-        ("createDog", "getConnection", "service calls getConnection()"),
+        (
+            "createDog",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("createCat", "Cat", "service calls Cat constructor"),
         ("createCat", "validate", "service calls cat.validate()"),
-        ("createCat", "getConnection", "service calls getConnection()"),
-        ("transferAnimal", "Transaction", "service calls Transaction constructor"),
-        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        (
+            "createCat",
+            "getConnection",
+            "service calls getConnection()",
+        ),
+        (
+            "transferAnimal",
+            "Transaction",
+            "service calls Transaction constructor",
+        ),
+        (
+            "transferAnimal",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("transferAnimal", "execute", "txn.execute() on Transaction"),
         ("transferAnimal", "commit", "txn.commit() on Transaction"),
         ("transferAnimal", "add", "shelter.add() on Shelter"),
-        ("listAnimals", "getConnection", "service calls getConnection()"),
+        (
+            "listAnimals",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("listAnimals", "execute", "conn.execute() on Connection"),
-
         // handlers.ts -> service.ts
         ("handleCreateDog", "createDog", "handler calls service"),
         ("handleCreateCat", "createCat", "handler calls service"),
@@ -598,10 +1028,17 @@ fn get_ts_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         ("handleTransfer", "Dog", "handler creates Dog"),
         ("handleTransfer", "count", "shelter.count() on Shelter"),
         ("handleList", "listAnimals", "handler calls service"),
-
         // database.ts internal
-        ("Transaction::execute", "execute", "Transaction.execute calls this.conn.execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls this.conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls this.conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls this.conn.commit",
+        ),
     ]
 }
 
@@ -611,8 +1048,16 @@ fn get_ts_false_positive_edges() -> Vec<(&'static str, &'static str, &'static st
         ("createCat", "Dog", "createCat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -621,30 +1066,60 @@ fn get_rust_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> 
         // service.rs -> models.rs
         ("create_dog", "Dog", "service calls Dog::new"),
         ("create_dog", "validate", "service calls dog.validate()"),
-        ("create_dog", "get_connection", "service calls get_connection()"),
+        (
+            "create_dog",
+            "get_connection",
+            "service calls get_connection()",
+        ),
         ("create_cat", "Cat", "service calls Cat::new"),
         ("create_cat", "validate", "service calls cat.validate()"),
-        ("create_cat", "get_connection", "service calls get_connection()"),
-        ("transfer_animal", "Transaction", "service calls Transaction::new"),
-        ("transfer_animal", "get_connection", "service calls get_connection()"),
+        (
+            "create_cat",
+            "get_connection",
+            "service calls get_connection()",
+        ),
+        (
+            "transfer_animal",
+            "Transaction",
+            "service calls Transaction::new",
+        ),
+        (
+            "transfer_animal",
+            "get_connection",
+            "service calls get_connection()",
+        ),
         ("transfer_animal", "execute", "txn.execute() on Transaction"),
         ("transfer_animal", "commit", "txn.commit() on Transaction"),
         ("transfer_animal", "add", "shelter.add() on Shelter"),
-        ("list_animals", "get_connection", "service calls get_connection()"),
+        (
+            "list_animals",
+            "get_connection",
+            "service calls get_connection()",
+        ),
         ("list_animals", "execute", "conn.execute() on Connection"),
-
         // handlers.rs -> service.rs
         ("handle_create_dog", "create_dog", "handler calls service"),
         ("handle_create_cat", "create_cat", "handler calls service"),
-        ("handle_transfer", "transfer_animal", "handler calls service"),
+        (
+            "handle_transfer",
+            "transfer_animal",
+            "handler calls service",
+        ),
         ("handle_transfer", "Shelter", "handler creates Shelter"),
         ("handle_transfer", "Dog", "handler creates Dog"),
         ("handle_transfer", "count", "shelter.count() on Shelter"),
         ("handle_list", "list_animals", "handler calls service"),
-
         // database.rs internal
-        ("Transaction::execute", "execute", "Transaction.execute calls self.conn.execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls self.conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls self.conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls self.conn.commit",
+        ),
     ]
 }
 
@@ -654,8 +1129,16 @@ fn get_rust_false_positive_edges() -> Vec<(&'static str, &'static str, &'static 
         ("create_cat", "Dog", "create_cat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-        ("handle_create_dog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handle_create_cat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handle_create_dog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handle_create_cat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -664,18 +1147,37 @@ fn get_go_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         // service.go -> models.go
         ("CreateDog", "NewDog", "service calls NewDog()"),
         ("CreateDog", "Validate", "service calls dog.Validate()"),
-        ("CreateDog", "GetConnection", "service calls GetConnection()"),
+        (
+            "CreateDog",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
         ("CreateCat", "NewCat", "service calls NewCat()"),
         ("CreateCat", "Validate", "service calls cat.Validate()"),
-        ("CreateCat", "GetConnection", "service calls GetConnection()"),
-        ("TransferAnimal", "NewTransaction", "service calls NewTransaction()"),
-        ("TransferAnimal", "GetConnection", "service calls GetConnection()"),
+        (
+            "CreateCat",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
+        (
+            "TransferAnimal",
+            "NewTransaction",
+            "service calls NewTransaction()",
+        ),
+        (
+            "TransferAnimal",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
         ("TransferAnimal", "Execute", "txn.Execute() on Transaction"),
         ("TransferAnimal", "Commit", "txn.Commit() on Transaction"),
         ("TransferAnimal", "Add", "shelter.Add() on Shelter"),
-        ("ListAnimals", "GetConnection", "service calls GetConnection()"),
+        (
+            "ListAnimals",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
         ("ListAnimals", "Execute", "conn.Execute() on Connection"),
-
         // handlers.go -> service.go
         ("HandleCreateDog", "CreateDog", "handler calls service"),
         ("HandleCreateCat", "CreateCat", "handler calls service"),
@@ -684,10 +1186,17 @@ fn get_go_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         ("HandleTransfer", "NewDog", "handler creates Dog"),
         ("HandleTransfer", "Count", "shelter.Count() on Shelter"),
         ("HandleList", "ListAnimals", "handler calls service"),
-
         // database.go internal
-        ("Transaction::Execute", "Execute", "Transaction.Execute calls Conn.Execute"),
-        ("Transaction::Commit", "Commit", "Transaction.Commit calls Conn.Commit"),
+        (
+            "Transaction::Execute",
+            "Execute",
+            "Transaction.Execute calls Conn.Execute",
+        ),
+        (
+            "Transaction::Commit",
+            "Commit",
+            "Transaction.Commit calls Conn.Commit",
+        ),
     ]
 }
 
@@ -697,8 +1206,16 @@ fn get_go_false_positive_edges() -> Vec<(&'static str, &'static str, &'static st
         ("CreateCat", "Dog", "CreateCat shouldn't reference Dog"),
         ("Validate", "Dog", "standalone Validate != Dog.Validate"),
         ("Validate", "Cat", "standalone Validate != Cat.Validate"),
-        ("HandleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("HandleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "HandleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "HandleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -721,12 +1238,15 @@ fn run_scope_resolve_for_lang(
 
     // Run old resolver (bag-of-words)
     let (old_graph, _) = EntityGraph::build(root, &file_refs, &registry);
-    let old_edges: Vec<(String, String)> = old_graph.edges.iter()
+    let old_edges: Vec<(String, String)> = old_graph
+        .edges
+        .iter()
         .map(|e| (e.from_entity.clone(), e.to_entity.clone()))
         .collect();
 
     // Run new scope resolver
-    let all_entities: Vec<SemanticEntity> = file_refs.iter()
+    let all_entities: Vec<SemanticEntity> = file_refs
+        .iter()
         .filter_map(|file_path| {
             let full_path = root.join(file_path);
             let content = std::fs::read_to_string(&full_path).ok()?;
@@ -736,65 +1256,136 @@ fn run_scope_resolve_for_lang(
         .flatten()
         .collect();
 
-    let entity_map: HashMap<String, EntityInfo> = all_entities.iter()
-        .map(|e| (e.id.clone(), EntityInfo {
-            id: e.id.clone(),
-            name: e.name.clone(),
-            entity_type: e.entity_type.clone(),
-            file_path: e.file_path.clone(),
-            parent_id: e.parent_id.clone(),
-            start_line: e.start_line,
-            end_line: e.end_line,
-        }))
+    let entity_map: HashMap<String, EntityInfo> = all_entities
+        .iter()
+        .map(|e| {
+            (
+                e.id.clone(),
+                EntityInfo {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    entity_type: e.entity_type.clone(),
+                    file_path: e.file_path.clone(),
+                    parent_id: e.parent_id.clone(),
+                    start_line: e.start_line,
+                    end_line: e.end_line,
+                },
+            )
+        })
         .collect();
 
-    let scope_result = scope_resolve::resolve_with_scopes(root, &file_refs, &all_entities, &entity_map, None);
-    let new_edges: Vec<(String, String)> = scope_result.edges.iter()
+    let scope_result =
+        scope_resolve::resolve_with_scopes(root, &file_refs, &all_entities, &entity_map, None);
+    let new_edges: Vec<(String, String)> = scope_result
+        .edges
+        .iter()
         .map(|(from, to, _)| (from.clone(), to.clone()))
         .collect();
 
     // Debug: dump edges for languages that need config tuning
     if new_edges.is_empty() && !old_edges.is_empty() {
-        eprintln!("  DEBUG [{}]: old_edges={}, new_edges=0, entities={}", lang_name, old_edges.len(), all_entities.len());
+        eprintln!(
+            "  DEBUG [{}]: old_edges={}, new_edges=0, entities={}",
+            lang_name,
+            old_edges.len(),
+            all_entities.len()
+        );
     }
 
     // Score
-    let mut old_tp = 0; let mut old_fn = 0; let mut old_fp = 0;
-    let mut new_tp = 0; let mut new_fn = 0; let mut new_fp = 0;
+    let mut old_tp = 0;
+    let mut old_fn = 0;
+    let mut old_fp = 0;
+    let mut new_tp = 0;
+    let mut new_fn = 0;
+    let mut new_fp = 0;
 
     for (from_pat, to_pat, desc) in expected {
         let old_found = edge_matches(&old_edges, &entity_map, from_pat, to_pat);
         let new_found = edge_matches(&new_edges, &entity_map, from_pat, to_pat);
-        if old_found { old_tp += 1; } else { old_fn += 1; }
-        if new_found { new_tp += 1; } else {
+        if old_found {
+            old_tp += 1;
+        } else {
+            old_fn += 1;
+        }
+        if new_found {
+            new_tp += 1;
+        } else {
             new_fn += 1;
-            eprintln!("  MISSED [{}]: {} -> {} ({})", lang_name, from_pat, to_pat, desc);
+            eprintln!(
+                "  MISSED [{}]: {} -> {} ({})",
+                lang_name, from_pat, to_pat, desc
+            );
         }
     }
 
     for (from_pat, to_pat, desc) in false_positives {
         let old_found = edge_matches(&old_edges, &entity_map, from_pat, to_pat);
         let new_found = edge_matches(&new_edges, &entity_map, from_pat, to_pat);
-        if old_found { old_fp += 1; }
+        if old_found {
+            old_fp += 1;
+        }
         if new_found {
             new_fp += 1;
-            eprintln!("  FALSE POSITIVE [{}]: {} -> {} ({})", lang_name, from_pat, to_pat, desc);
+            eprintln!(
+                "  FALSE POSITIVE [{}]: {} -> {} ({})",
+                lang_name, from_pat, to_pat, desc
+            );
         }
     }
 
-    let old_recall = if old_tp + old_fn > 0 { old_tp as f64 / (old_tp + old_fn) as f64 } else { 0.0 };
-    let new_recall = if new_tp + new_fn > 0 { new_tp as f64 / (new_tp + new_fn) as f64 } else { 0.0 };
+    let old_recall = if old_tp + old_fn > 0 {
+        old_tp as f64 / (old_tp + old_fn) as f64
+    } else {
+        0.0
+    };
+    let new_recall = if new_tp + new_fn > 0 {
+        new_tp as f64 / (new_tp + new_fn) as f64
+    } else {
+        0.0
+    };
 
     eprintln!("\n=== {} Scope Resolution ===", lang_name);
-    eprintln!("Old (bag-of-words): {} TP, {} FN, {} FP | {:.0}% recall",
-        old_tp, old_fn, old_fp, old_recall * 100.0);
-    eprintln!("New (scope-aware):  {} TP, {} FN, {} FP | {:.0}% recall",
-        new_tp, new_fn, new_fp, new_recall * 100.0);
-    eprintln!("Total edges: old={}, new={}", old_edges.len(), new_edges.len());
+    eprintln!(
+        "Old (bag-of-words): {} TP, {} FN, {} FP | {:.0}% recall",
+        old_tp,
+        old_fn,
+        old_fp,
+        old_recall * 100.0
+    );
+    eprintln!(
+        "New (scope-aware):  {} TP, {} FN, {} FP | {:.0}% recall",
+        new_tp,
+        new_fn,
+        new_fp,
+        new_recall * 100.0
+    );
+    eprintln!(
+        "Total edges: old={}, new={}",
+        old_edges.len(),
+        new_edges.len()
+    );
 
     // Report results - the scope resolver should be producing edges for supported languages
     if new_edges.is_empty() && !old_edges.is_empty() {
-        eprintln!("  NOTE [{}]: Scope resolver produced 0 edges (config may need tuning)", lang_name);
+        eprintln!(
+            "  NOTE [{}]: Scope resolver produced 0 edges (config may need tuning)",
+            lang_name
+        );
+    }
+
+    // Languages with complete expected coverage gate CI on the scored result.
+    if lang_name == "swift" {
+        assert_eq!(
+            new_fn, 0,
+            "{} scope resolver missed {} expected edges; see MISSED lines above",
+            lang_name, new_fn
+        );
+        assert_eq!(
+            new_fp, 0,
+            "{} scope resolver produced {} forbidden edges; see FALSE POSITIVE lines above",
+            lang_name, new_fp
+        );
     }
 }
 
@@ -823,7 +1414,8 @@ fn scope_resolve_go() {
 /// and produces the same high-quality edges as the standalone scope resolver.
 #[test]
 fn scope_resolve_integrated_graph() {
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scope_test/python");
+    let fixture_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scope_test/python");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
@@ -859,7 +1451,12 @@ fn scope_resolve_integrated_graph() {
 
     let recall = tp as f64 / expected.len() as f64;
     eprintln!("\n=== Integrated Graph (scope resolver) ===");
-    eprintln!("{} / {} expected edges found ({:.0}% recall)", tp, expected.len(), recall * 100.0);
+    eprintln!(
+        "{} / {} expected edges found ({:.0}% recall)",
+        tp,
+        expected.len(),
+        recall * 100.0
+    );
     if !missed.is_empty() {
         eprintln!("Missed: {:?}", missed);
     }
@@ -878,7 +1475,8 @@ fn scope_resolve_integrated_graph() {
     assert!(
         recall >= 0.90,
         "Integrated graph recall {:.0}% should be >= 90%. Missed: {:?}",
-        recall * 100.0, missed
+        recall * 100.0,
+        missed
     );
 
     // Should have zero false positives from the known FP set
@@ -898,18 +1496,37 @@ fn get_java_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> 
         // Service.java -> Models.java
         ("createDog", "Dog", "service creates Dog"),
         ("createDog", "validate", "service calls dog.validate()"),
-        ("createDog", "getConnection", "service calls DatabaseHelper.getConnection()"),
+        (
+            "createDog",
+            "getConnection",
+            "service calls DatabaseHelper.getConnection()",
+        ),
         ("createCat", "Cat", "service creates Cat"),
         ("createCat", "validate", "service calls cat.validate()"),
-        ("createCat", "getConnection", "service calls getConnection()"),
-        ("transferAnimal", "Transaction", "service creates Transaction"),
-        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        (
+            "createCat",
+            "getConnection",
+            "service calls getConnection()",
+        ),
+        (
+            "transferAnimal",
+            "Transaction",
+            "service creates Transaction",
+        ),
+        (
+            "transferAnimal",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("transferAnimal", "execute", "txn.execute() on Transaction"),
         ("transferAnimal", "commit", "txn.commit() on Transaction"),
         ("transferAnimal", "add", "shelter.add() on Shelter"),
-        ("listAnimals", "getConnection", "service calls getConnection()"),
+        (
+            "listAnimals",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("listAnimals", "execute", "conn.execute() on Connection"),
-
         // Handlers.java -> Service.java
         ("handleCreateDog", "createDog", "handler calls service"),
         ("handleCreateCat", "createCat", "handler calls service"),
@@ -918,10 +1535,17 @@ fn get_java_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> 
         ("handleTransfer", "Dog", "handler creates Dog"),
         ("handleTransfer", "count", "shelter.count() on Shelter"),
         ("handleList", "listAnimals", "handler calls service"),
-
         // Database.java internal
-        ("Transaction::execute", "execute", "Transaction.execute calls conn.execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls conn.commit",
+        ),
     ]
 }
 
@@ -931,8 +1555,16 @@ fn get_java_false_positive_edges() -> Vec<(&'static str, &'static str, &'static 
         ("createCat", "Dog", "createCat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -948,18 +1580,37 @@ fn get_csharp_expected_edges() -> Vec<(&'static str, &'static str, &'static str)
         // Service.cs -> Models.cs
         ("CreateDog", "Dog", "service creates Dog"),
         ("CreateDog", "Validate", "service calls dog.Validate()"),
-        ("CreateDog", "GetConnection", "service calls DatabaseHelper.GetConnection()"),
+        (
+            "CreateDog",
+            "GetConnection",
+            "service calls DatabaseHelper.GetConnection()",
+        ),
         ("CreateCat", "Cat", "service creates Cat"),
         ("CreateCat", "Validate", "service calls cat.Validate()"),
-        ("CreateCat", "GetConnection", "service calls GetConnection()"),
-        ("TransferAnimal", "Transaction", "service creates Transaction"),
-        ("TransferAnimal", "GetConnection", "service calls GetConnection()"),
+        (
+            "CreateCat",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
+        (
+            "TransferAnimal",
+            "Transaction",
+            "service creates Transaction",
+        ),
+        (
+            "TransferAnimal",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
         ("TransferAnimal", "Execute", "txn.Execute() on Transaction"),
         ("TransferAnimal", "Commit", "txn.Commit() on Transaction"),
         ("TransferAnimal", "Add", "shelter.Add() on Shelter"),
-        ("ListAnimals", "GetConnection", "service calls GetConnection()"),
+        (
+            "ListAnimals",
+            "GetConnection",
+            "service calls GetConnection()",
+        ),
         ("ListAnimals", "Execute", "conn.Execute() on Connection"),
-
         // Handlers.cs -> Service.cs
         ("HandleCreateDog", "CreateDog", "handler calls service"),
         ("HandleCreateCat", "CreateCat", "handler calls service"),
@@ -968,10 +1619,17 @@ fn get_csharp_expected_edges() -> Vec<(&'static str, &'static str, &'static str)
         ("HandleTransfer", "Dog", "handler creates Dog"),
         ("HandleTransfer", "Count", "shelter.Count() on Shelter"),
         ("HandleList", "ListAnimals", "handler calls service"),
-
         // Database.cs internal
-        ("Transaction::Execute", "Execute", "Transaction.Execute calls conn.Execute"),
-        ("Transaction::Commit", "Commit", "Transaction.Commit calls conn.Commit"),
+        (
+            "Transaction::Execute",
+            "Execute",
+            "Transaction.Execute calls conn.Execute",
+        ),
+        (
+            "Transaction::Commit",
+            "Commit",
+            "Transaction.Commit calls conn.Commit",
+        ),
     ]
 }
 
@@ -981,8 +1639,16 @@ fn get_csharp_false_positive_edges() -> Vec<(&'static str, &'static str, &'stati
         ("CreateCat", "Dog", "CreateCat shouldn't reference Dog"),
         ("Validate", "Dog", "standalone Validate != Dog.Validate"),
         ("Validate", "Cat", "standalone Validate != Cat.Validate"),
-        ("HandleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("HandleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "HandleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "HandleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -998,18 +1664,37 @@ fn get_cpp_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         // service.cpp -> models.hpp
         ("createDog", "Dog", "service creates Dog"),
         ("createDog", "validate", "service calls dog.validate()"),
-        ("createDog", "getConnection", "service calls getConnection()"),
+        (
+            "createDog",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("createCat", "Cat", "service creates Cat"),
         ("createCat", "validate", "service calls cat.validate()"),
-        ("createCat", "getConnection", "service calls getConnection()"),
-        ("transferAnimal", "Transaction", "service creates Transaction"),
-        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        (
+            "createCat",
+            "getConnection",
+            "service calls getConnection()",
+        ),
+        (
+            "transferAnimal",
+            "Transaction",
+            "service creates Transaction",
+        ),
+        (
+            "transferAnimal",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("transferAnimal", "execute", "txn.execute() on Transaction"),
         ("transferAnimal", "commit", "txn.commit() on Transaction"),
         ("transferAnimal", "add", "shelter->add() on Shelter"),
-        ("listAnimals", "getConnection", "service calls getConnection()"),
+        (
+            "listAnimals",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("listAnimals", "execute", "conn->execute() on Connection"),
-
         // handlers.cpp -> service.cpp
         ("handleCreateDog", "createDog", "handler calls service"),
         ("handleCreateCat", "createCat", "handler calls service"),
@@ -1018,10 +1703,17 @@ fn get_cpp_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> {
         ("handleTransfer", "Dog", "handler creates Dog"),
         ("handleTransfer", "count", "shelter.count() on Shelter"),
         ("handleList", "listAnimals", "handler calls service"),
-
         // database.hpp internal
-        ("Transaction::execute", "execute", "Transaction.execute calls conn->execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls conn->commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls conn->execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls conn->commit",
+        ),
     ]
 }
 
@@ -1031,8 +1723,16 @@ fn get_cpp_false_positive_edges() -> Vec<(&'static str, &'static str, &'static s
         ("createCat", "Dog", "createCat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -1048,30 +1748,60 @@ fn get_ruby_expected_edges() -> Vec<(&'static str, &'static str, &'static str)> 
         // service.rb -> models.rb
         ("create_dog", "Dog", "service creates Dog"),
         ("create_dog", "validate", "service calls dog.validate"),
-        ("create_dog", "get_connection", "service calls get_connection"),
+        (
+            "create_dog",
+            "get_connection",
+            "service calls get_connection",
+        ),
         ("create_cat", "Cat", "service creates Cat"),
         ("create_cat", "validate", "service calls cat.validate"),
-        ("create_cat", "get_connection", "service calls get_connection"),
-        ("transfer_animal", "Transaction", "service creates Transaction"),
-        ("transfer_animal", "get_connection", "service calls get_connection"),
+        (
+            "create_cat",
+            "get_connection",
+            "service calls get_connection",
+        ),
+        (
+            "transfer_animal",
+            "Transaction",
+            "service creates Transaction",
+        ),
+        (
+            "transfer_animal",
+            "get_connection",
+            "service calls get_connection",
+        ),
         ("transfer_animal", "execute", "txn.execute on Transaction"),
         ("transfer_animal", "commit", "txn.commit on Transaction"),
         ("transfer_animal", "add", "shelter.add on Shelter"),
-        ("list_animals", "get_connection", "service calls get_connection"),
+        (
+            "list_animals",
+            "get_connection",
+            "service calls get_connection",
+        ),
         ("list_animals", "execute", "conn.execute on Connection"),
-
         // handlers.rb -> service.rb
         ("handle_create_dog", "create_dog", "handler calls service"),
         ("handle_create_cat", "create_cat", "handler calls service"),
-        ("handle_transfer", "transfer_animal", "handler calls service"),
+        (
+            "handle_transfer",
+            "transfer_animal",
+            "handler calls service",
+        ),
         ("handle_transfer", "Shelter", "handler creates Shelter"),
         ("handle_transfer", "Dog", "handler creates Dog"),
         ("handle_transfer", "count", "shelter.count on Shelter"),
         ("handle_list", "list_animals", "handler calls service"),
-
         // database.rb internal
-        ("Transaction::execute", "execute", "Transaction#execute calls @conn.execute"),
-        ("Transaction::commit", "commit", "Transaction#commit calls @conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction#execute calls @conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction#commit calls @conn.commit",
+        ),
     ]
 }
 
@@ -1081,8 +1811,16 @@ fn get_ruby_false_positive_edges() -> Vec<(&'static str, &'static str, &'static 
         ("create_cat", "Dog", "create_cat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog#validate"),
         ("validate", "Cat", "standalone validate != Cat#validate"),
-        ("handle_create_dog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handle_create_cat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handle_create_dog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handle_create_cat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -1102,18 +1840,37 @@ fn get_swift_expected_edges() -> Vec<(&'static str, &'static str, &'static str)>
         // service.swift -> models.swift
         ("createDog", "Dog", "service creates Dog"),
         ("createDog", "validate", "service calls dog.validate()"),
-        ("createDog", "getConnection", "service calls getConnection()"),
+        (
+            "createDog",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("createCat", "Cat", "service creates Cat"),
         ("createCat", "validate", "service calls cat.validate()"),
-        ("createCat", "getConnection", "service calls getConnection()"),
-        ("transferAnimal", "Transaction", "service creates Transaction"),
-        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        (
+            "createCat",
+            "getConnection",
+            "service calls getConnection()",
+        ),
+        (
+            "transferAnimal",
+            "Transaction",
+            "service creates Transaction",
+        ),
+        (
+            "transferAnimal",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("transferAnimal", "execute", "txn.execute() on Transaction"),
         ("transferAnimal", "commit", "txn.commit() on Transaction"),
         ("transferAnimal", "add", "shelter.add() on Shelter"),
-        ("listAnimals", "getConnection", "service calls getConnection()"),
+        (
+            "listAnimals",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("listAnimals", "execute", "conn.execute() on Connection"),
-
         // handlers.swift -> service.swift
         ("handleCreateDog", "createDog", "handler calls service"),
         ("handleCreateCat", "createCat", "handler calls service"),
@@ -1122,10 +1879,37 @@ fn get_swift_expected_edges() -> Vec<(&'static str, &'static str, &'static str)>
         ("handleTransfer", "Dog", "handler creates Dog"),
         ("handleTransfer", "count", "shelter.count() on Shelter"),
         ("handleList", "listAnimals", "handler calls service"),
-
         // database.swift internal
-        ("Transaction::execute", "execute", "Transaction.execute calls conn.execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls conn.commit",
+        ),
+        (
+            "Replicator::sync",
+            "execute",
+            "Replicator.sync calls primary.execute",
+        ),
+        (
+            "Replicator::sync",
+            "commit",
+            "Replicator.sync calls backup.commit",
+        ),
+        (
+            "AuditedTransaction::write",
+            "commit",
+            "AuditedTransaction.write calls conn.commit",
+        ),
+        (
+            "AuditedTransaction::write",
+            "record",
+            "AuditedTransaction.write calls logger.record",
+        ),
     ]
 }
 
@@ -1135,8 +1919,16 @@ fn get_swift_false_positive_edges() -> Vec<(&'static str, &'static str, &'static
         ("createCat", "Dog", "createCat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
@@ -1152,18 +1944,37 @@ fn get_kotlin_expected_edges() -> Vec<(&'static str, &'static str, &'static str)
         // Service.kt -> Models.kt
         ("createDog", "Dog", "service creates Dog"),
         ("createDog", "validate", "service calls dog.validate()"),
-        ("createDog", "getConnection", "service calls getConnection()"),
+        (
+            "createDog",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("createCat", "Cat", "service creates Cat"),
         ("createCat", "validate", "service calls cat.validate()"),
-        ("createCat", "getConnection", "service calls getConnection()"),
-        ("transferAnimal", "Transaction", "service creates Transaction"),
-        ("transferAnimal", "getConnection", "service calls getConnection()"),
+        (
+            "createCat",
+            "getConnection",
+            "service calls getConnection()",
+        ),
+        (
+            "transferAnimal",
+            "Transaction",
+            "service creates Transaction",
+        ),
+        (
+            "transferAnimal",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("transferAnimal", "execute", "txn.execute() on Transaction"),
         ("transferAnimal", "commit", "txn.commit() on Transaction"),
         ("transferAnimal", "add", "shelter.add() on Shelter"),
-        ("listAnimals", "getConnection", "service calls getConnection()"),
+        (
+            "listAnimals",
+            "getConnection",
+            "service calls getConnection()",
+        ),
         ("listAnimals", "execute", "conn.execute() on Connection"),
-
         // Handlers.kt -> Service.kt
         ("handleCreateDog", "createDog", "handler calls service"),
         ("handleCreateCat", "createCat", "handler calls service"),
@@ -1172,10 +1983,17 @@ fn get_kotlin_expected_edges() -> Vec<(&'static str, &'static str, &'static str)
         ("handleTransfer", "Dog", "handler creates Dog"),
         ("handleTransfer", "count", "shelter.count() on Shelter"),
         ("handleList", "listAnimals", "handler calls service"),
-
         // Database.kt internal
-        ("Transaction::execute", "execute", "Transaction.execute calls conn.execute"),
-        ("Transaction::commit", "commit", "Transaction.commit calls conn.commit"),
+        (
+            "Transaction::execute",
+            "execute",
+            "Transaction.execute calls conn.execute",
+        ),
+        (
+            "Transaction::commit",
+            "commit",
+            "Transaction.commit calls conn.commit",
+        ),
     ]
 }
 
@@ -1185,8 +2003,16 @@ fn get_kotlin_false_positive_edges() -> Vec<(&'static str, &'static str, &'stati
         ("createCat", "Dog", "createCat shouldn't reference Dog"),
         ("validate", "Dog", "standalone validate != Dog.validate"),
         ("validate", "Cat", "standalone validate != Cat.validate"),
-        ("handleCreateDog", "Transaction", "handler doesn't use Transaction directly"),
-        ("handleCreateCat", "Transaction", "handler doesn't use Transaction directly"),
+        (
+            "handleCreateDog",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
+        (
+            "handleCreateCat",
+            "Transaction",
+            "handler doesn't use Transaction directly",
+        ),
     ]
 }
 
