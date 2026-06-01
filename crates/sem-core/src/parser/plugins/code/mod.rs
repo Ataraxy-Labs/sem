@@ -527,6 +527,32 @@ export function hello(): string {
     }
 
     #[test]
+    fn test_typescript_re_export_alias_entity_extraction() {
+        let code = r#"
+export { core as publicCore, helper } from './lib';
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "barrel.ts");
+
+        let exports: Vec<_> = entities
+            .iter()
+            .filter(|entity| entity.entity_type == "export")
+            .collect();
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"publicCore"),
+            "Should find aliased re-export, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "Should find direct re-export, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
     fn test_commonjs_typescript_entity_extraction() {
         let code = r#"
 export class Greeter {

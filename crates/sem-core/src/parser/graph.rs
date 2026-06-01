@@ -28,7 +28,10 @@ macro_rules! maybe_par_iter {
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
-use crate::parser::import_resolution::find_import_target;
+use crate::parser::import_resolution::{
+    find_import_file, find_import_target, is_js_ts_file, sort_import_candidate_files,
+    JS_TS_EXTENSIONS,
+};
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
@@ -434,8 +437,11 @@ impl EntityGraph {
             })
             .collect();
 
+        let export_edges = build_export_alias_edges(&all_entities, &import_table);
+
         // Merge scope edges with bag-of-words edges, deduplicating
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(export_edges);
         combined.extend(resolved_refs);
         let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
         let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
@@ -862,8 +868,11 @@ impl EntityGraph {
             })
             .collect();
 
+        let export_edges = build_export_alias_edges(&all_entities, &import_table);
+
         // Merge scope edges + bag-of-words edges + kept cached edges
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(export_edges);
         combined.extend(resolved_refs);
         let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
         let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
@@ -1361,6 +1370,146 @@ fn is_test_entity(entity: &crate::model::entity::SemanticEntity) -> bool {
     in_test_file && has_test_marker
 }
 
+fn build_export_alias_edges(
+    all_entities: &[SemanticEntity],
+    import_table: &HashMap<(String, String), String>,
+) -> Vec<(String, String, RefType)> {
+    all_entities
+        .iter()
+        .filter(|entity| entity.entity_type == "export")
+        .filter_map(|entity| {
+            let key = (entity.file_path.clone(), entity.name.clone());
+            let target_id = import_table.get(&key)?;
+            if target_id == &entity.id {
+                return None;
+            }
+            Some((entity.id.clone(), target_id.clone(), RefType::Imports))
+        })
+        .collect()
+}
+
+fn build_ts_default_export_table(
+    root: &Path,
+    file_paths: &[String],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    content_map: &HashMap<&str, &str>,
+) -> HashMap<String, String> {
+    let mut default_exports = HashMap::new();
+
+    for file_path in file_paths {
+        if !is_js_ts_file(file_path) {
+            continue;
+        }
+
+        let owned_content;
+        let content = if let Some(content) = content_map.get(file_path.as_str()) {
+            *content
+        } else {
+            let full_path = root.join(file_path);
+            owned_content = match std::fs::read_to_string(&full_path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            owned_content.as_str()
+        };
+
+        for name in default_export_names_from_content(content) {
+            let Some(target_ids) = symbol_table.get(name.as_str()) else {
+                continue;
+            };
+            let target = target_ids.iter().find(|id| {
+                entity_map.get(*id).map_or(false, |entity| {
+                    entity.file_path == *file_path && entity.parent_id.is_none()
+                })
+            });
+            if let Some(target_id) = target {
+                default_exports.insert(file_path.clone(), target_id.clone());
+            }
+        }
+    }
+
+    default_exports
+}
+
+fn default_export_names_from_content(content: &str) -> Vec<String> {
+    static DEFAULT_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bexport\s+default\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][\w$]*)")
+            .unwrap()
+    });
+    static DEFAULT_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bexport\s+default\s+class\s+([A-Za-z_$][\w$]*)").unwrap()
+    });
+    static DEFAULT_IDENTIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*(?:;|$)").unwrap()
+    });
+    static DEFAULT_SPECIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*;?"#).unwrap()
+    });
+
+    let mut names = Vec::new();
+    for cap in DEFAULT_FUNCTION_RE.captures_iter(content) {
+        names.push(cap.get(1).unwrap().as_str().to_string());
+    }
+    for cap in DEFAULT_CLASS_RE.captures_iter(content) {
+        names.push(cap.get(1).unwrap().as_str().to_string());
+    }
+    for cap in DEFAULT_IDENTIFIER_RE.captures_iter(content) {
+        names.push(cap.get(1).unwrap().as_str().to_string());
+    }
+    for cap in DEFAULT_SPECIFIER_RE.captures_iter(content) {
+        let rest = content[cap.get(0).unwrap().end()..].trim_start();
+        if rest.starts_with("from ") {
+            continue;
+        }
+        let names_str = cap.get(1).unwrap().as_str();
+        for name_part in names_str.split(',') {
+            let Some((original_name, local_name)) = parse_js_ts_import_specifier(name_part) else {
+                continue;
+            };
+            if local_name == "default" {
+                names.push(original_name.to_string());
+            }
+        }
+    }
+
+    names
+}
+
+fn resolve_default_export_target(
+    default_exports: &HashMap<String, String>,
+    module_path: &str,
+    file_path: &str,
+) -> Option<String> {
+    let mut default_export_files: Vec<&str> = default_exports.keys().map(String::as_str).collect();
+    sort_import_candidate_files(&mut default_export_files, JS_TS_EXTENSIONS);
+    let target_file = find_import_file(&default_export_files, module_path, file_path, JS_TS_EXTENSIONS)?;
+    default_exports.get(target_file).cloned()
+}
+
+fn parse_js_ts_import_specifier(name_part: &str) -> Option<(&str, &str)> {
+    let name_part = name_part.trim();
+    if name_part.is_empty() {
+        return None;
+    }
+
+    let (original, local) = if let Some(pos) = name_part.find(" as ") {
+        let original = name_part[..pos].trim();
+        let local = name_part[pos + 4..].trim();
+        (original, local)
+    } else {
+        (name_part, name_part)
+    };
+
+    let original = original.strip_prefix("type ").unwrap_or(original).trim();
+    let local = local.strip_prefix("type ").unwrap_or(local).trim();
+    if original.is_empty() || local.is_empty() {
+        return None;
+    }
+
+    Some((original, local))
+}
+
 /// Build import table: maps (file_path, imported_name) → target entity ID.
 ///
 /// Parses `from X import Y` / `import X` / `use X` style statements from entity content
@@ -1378,6 +1527,8 @@ fn build_import_table(
             files.iter().map(|(fp, content, _)| (fp.as_str(), content.as_str())).collect()
         })
         .unwrap_or_default();
+    let ts_default_exports =
+        build_ts_default_export_table(root, file_paths, symbol_table, entity_map, &content_map);
 
     // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
     // We no longer need a go_pkg_index here since Go files are skipped below.
@@ -1487,15 +1638,24 @@ fn build_import_table(
 
             // JS/TS imports: import { foo, bar as baz } from './module'
             //                import Foo from './module'
-            let is_js_ts = file_path.ends_with(".js") || file_path.ends_with(".ts")
-                || file_path.ends_with(".jsx") || file_path.ends_with(".tsx");
+            let is_js_ts = is_js_ts_file(file_path);
 
             if is_js_ts {
                 static JS_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+                    Regex::new(
+                        r#"import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#,
+                    )
+                    .unwrap()
                 });
                 static JS_DEFAULT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+                    Regex::new(
+                        r#"import\s+(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s*,\s*\{[^}]*\})?\s*from\s*['"]([^'"]+)['"]"#,
+                    )
+                    .unwrap()
+                });
+                static JS_REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#)
+                        .unwrap()
                 });
 
                 for cap in JS_NAMED_RE.captures_iter(content) {
@@ -1503,28 +1663,18 @@ fn build_import_table(
                     let module_path = cap.get(2).unwrap().as_str();
 
                     for name_part in names_str.split(',') {
-                        let name_part = name_part.trim();
-                        if name_part.is_empty() { continue; }
-
-                        // Handle "foo as bar" aliases and "type foo" prefixes
-                        let (original_name, local_name) = if let Some(pos) = name_part.find(" as ") {
-                            let orig = name_part[..pos].trim();
-                            let local = name_part[pos + 4..].trim();
-                            let orig = orig.strip_prefix("type ").unwrap_or(orig);
-                            (orig, local)
-                        } else {
-                            let name = name_part.strip_prefix("type ").unwrap_or(name_part);
-                            (name, name)
+                        let Some((original_name, local_name)) =
+                            parse_js_ts_import_specifier(name_part)
+                        else {
+                            continue;
                         };
-
-                        if original_name.is_empty() || local_name.is_empty() { continue; }
 
                         if let Some(target_ids) = symbol_table.get(original_name) {
                             let target = find_import_target(
                                 target_ids,
                                 module_path,
                                 file_path,
-                                &[".ts", ".tsx", ".js", ".jsx"],
+                                JS_TS_EXTENSIONS,
                                 entity_map,
                             );
                             if let Some(target_id) = target {
@@ -1541,18 +1691,50 @@ fn build_import_table(
                     let local_name = cap.get(1).unwrap().as_str();
                     let module_path = cap.get(2).unwrap().as_str();
 
-                    if let Some(target_ids) = symbol_table.get(local_name) {
-                        let target = find_import_target(
-                            target_ids,
-                            module_path,
-                            file_path,
-                            &[".ts", ".tsx", ".js", ".jsx"],
-                            entity_map,
-                        );
-                        if let Some(target_id) = target {
+                    if let Some(target_id) =
+                        resolve_default_export_target(&ts_default_exports, module_path, file_path)
+                    {
+                        local_imports.push((
+                            (file_path.clone(), local_name.to_string()),
+                            target_id,
+                        ));
+                    }
+                }
+
+                for cap in JS_REEXPORT_RE.captures_iter(content) {
+                    let names_str = cap.get(1).unwrap().as_str();
+                    let module_path = cap.get(2).unwrap().as_str();
+
+                    for name_part in names_str.split(',') {
+                        let Some((original_name, local_name)) =
+                            parse_js_ts_import_specifier(name_part)
+                        else {
+                            continue;
+                        };
+
+                        let target_id = if original_name == "default" {
+                            resolve_default_export_target(
+                                &ts_default_exports,
+                                module_path,
+                                file_path,
+                            )
+                        } else {
+                            symbol_table.get(original_name).and_then(|target_ids| {
+                                find_import_target(
+                                    target_ids,
+                                    module_path,
+                                    file_path,
+                                    JS_TS_EXTENSIONS,
+                                    entity_map,
+                                )
+                                .cloned()
+                            })
+                        };
+
+                        if let Some(target_id) = target_id {
                             local_imports.push((
                                 (file_path.clone(), local_name.to_string()),
-                                target_id.clone(),
+                                target_id,
                             ));
                         }
                     }
@@ -1689,9 +1871,13 @@ fn resolve_rust_import(
 /// Strip common file extensions from a filename.
 fn strip_file_ext(s: &str) -> &str {
     s.strip_suffix(".py")
+        .or_else(|| s.strip_suffix(".mts"))
+        .or_else(|| s.strip_suffix(".cts"))
         .or_else(|| s.strip_suffix(".ts"))
-        .or_else(|| s.strip_suffix(".js"))
         .or_else(|| s.strip_suffix(".tsx"))
+        .or_else(|| s.strip_suffix(".mjs"))
+        .or_else(|| s.strip_suffix(".cjs"))
+        .or_else(|| s.strip_suffix(".js"))
         .or_else(|| s.strip_suffix(".jsx"))
         .or_else(|| s.strip_suffix(".rs"))
         .unwrap_or(s)
@@ -2432,6 +2618,365 @@ export function caller() { return helper(); }
             "caller should not resolve explicit ./util.ts to src/util.js. Deps: {:?}",
             deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_resolves_default_export() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export default function makeThing(): string { return 'ok'; }
+export function namedThing(): string { return 'named'; }
+");
+        write_file(root, "consumer.ts", "\
+import build, { namedThing as aliasNamed } from './lib';
+export function useDefault(): string { return build(); }
+export function useNamed(): string { return aliasNamed(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_default_id = graph.entities.keys()
+            .find(|id| id.contains("useDefault"))
+            .expect("useDefault entity should exist");
+        let default_deps = graph.get_dependencies(use_default_id);
+        assert!(
+            default_deps.iter().any(|d| d.name == "makeThing" && d.file_path == "lib.ts"),
+            "useDefault should resolve default import alias to makeThing. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let use_named_id = graph.entities.keys()
+            .find(|id| id.contains("useNamed"))
+            .expect("useNamed entity should exist");
+        let named_deps = graph.get_dependencies(use_named_id);
+        assert!(
+            named_deps.iter().any(|d| d.name == "namedThing" && d.file_path == "lib.ts"),
+            "useNamed should still resolve aliased named import. Deps: {:?}",
+            named_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_resolves_default_export_specifier() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+function makeThing(): string { return 'ok'; }
+export { makeThing as default };
+");
+        write_file(root, "consumer.ts", "\
+import build from './lib';
+export function useDefault(): string { return build(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_default_id = graph.entities.keys()
+            .find(|id| id.contains("useDefault"))
+            .expect("useDefault entity should exist");
+        let default_deps = graph.get_dependencies(use_default_id);
+        assert!(
+            default_deps.iter().any(|d| d.name == "makeThing" && d.file_path == "lib.ts"),
+            "useDefault should resolve export specifier default to makeThing. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_resolves_bare_identifier_export() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+function makeThing(): string { return 'ok'; }
+export default makeThing; // default alias
+");
+        write_file(root, "consumer.ts", "\
+import build from './lib';
+export function useDefault(): string { return build(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_default_id = graph.entities.keys()
+            .find(|id| id.contains("useDefault"))
+            .expect("useDefault entity should exist");
+        let default_deps = graph.get_dependencies(use_default_id);
+        assert!(
+            default_deps.iter().any(|d| d.name == "makeThing" && d.file_path == "lib.ts"),
+            "useDefault should resolve bare identifier default export to makeThing. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_ignores_complex_expression_export() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function foo(): string { return 'foo'; }
+export default foo.bar;
+");
+        write_file(root, "consumer.ts", "\
+import value from './lib';
+export function useDefault(): unknown { return value(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_default_id = graph.entities.keys()
+            .find(|id| id.contains("useDefault"))
+            .expect("useDefault entity should exist");
+        let default_deps = graph.get_dependencies(use_default_id);
+        assert!(
+            !default_deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
+            "useDefault should not guess that foo.bar resolves to foo. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_prefers_ordered_module_variant() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export default function tsThing(): string { return 'ts'; }
+");
+        write_file(root, "lib.js", "\
+export default function jsThing() { return 'js'; }
+");
+        write_file(root, "consumer.ts", "\
+import build from './lib';
+export function useDefault(): string { return build(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "lib.js".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_default_id = graph.entities.keys()
+            .find(|id| id.contains("useDefault"))
+            .expect("useDefault entity should exist");
+        let default_deps = graph.get_dependencies(use_default_id);
+        assert!(
+            default_deps.iter().any(|d| d.name == "tsThing" && d.file_path == "lib.ts"),
+            "extensionless default import should follow JS_TS_EXTENSIONS order. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !default_deps.iter().any(|d| d.name == "jsThing" && d.file_path == "lib.js"),
+            "extensionless default import should not depend on later lib.js variant. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_bare_specifier_prefers_ordered_module_variant() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export default function tsThing(): string { return 'ts'; }
+");
+        write_file(root, "lib.js", "\
+export default function jsThing() { return 'js'; }
+");
+        write_file(root, "consumer.ts", "\
+import build from 'lib';
+export function useDefault(): string { return build(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "lib.js".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_default_id = graph.entities.keys()
+            .find(|id| id.contains("useDefault"))
+            .expect("useDefault entity should exist");
+        let default_deps = graph.get_dependencies(use_default_id);
+        assert!(
+            default_deps.iter().any(|d| d.name == "tsThing" && d.file_path == "lib.ts"),
+            "bare default import should follow JS_TS_EXTENSIONS order. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+        assert!(
+            !default_deps.iter().any(|d| d.name == "jsThing" && d.file_path == "lib.js"),
+            "bare default import should not depend on later lib.js variant. Deps: {:?}",
+            default_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_re_export_alias_resolves_through_barrel() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function core(): string { return 'core'; }
+");
+        write_file(root, "barrel.ts", "\
+export { core as publicCore } from './lib';
+");
+        write_file(root, "consumer.ts", "\
+import { publicCore } from './barrel';
+export function usePublicCore(): string { return publicCore(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "barrel.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let public_core = graph.entities.values()
+            .find(|entity| {
+                entity.name == "publicCore"
+                    && entity.file_path == "barrel.ts"
+                    && entity.entity_type == "export"
+            })
+            .expect("barrel export alias entity should exist");
+        let alias_deps = graph.get_dependencies(&public_core.id);
+        assert!(
+            alias_deps.iter().any(|d| d.name == "core" && d.file_path == "lib.ts"),
+            "publicCore alias should depend on lib.ts core. Deps: {:?}",
+            alias_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let use_public_core_id = graph.entities.keys()
+            .find(|id| id.contains("usePublicCore"))
+            .expect("usePublicCore entity should exist");
+        let consumer_deps = graph.get_dependencies(use_public_core_id);
+        assert!(
+            consumer_deps.iter().any(|d| d.name == "publicCore" && d.file_path == "barrel.ts"),
+            "consumer should resolve publicCore through the barrel alias. Deps: {:?}",
+            consumer_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let core = graph.entities.values()
+            .find(|entity| entity.name == "core" && entity.file_path == "lib.ts")
+            .expect("lib core entity should exist");
+        let impact = graph.impact_analysis(&core.id);
+        assert!(
+            impact.iter().any(|entity| entity.name == "usePublicCore"),
+            "core impact should include usePublicCore through publicCore. Impact: {:?}",
+            impact.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_direct_re_export_resolves_through_barrel() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export function core(): string { return 'core'; }
+");
+        write_file(root, "barrel.ts", "\
+export { core } from './lib';
+");
+        write_file(root, "consumer.ts", "\
+import { core } from './barrel';
+export function useCore(): string { return core(); }
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "barrel.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let barrel_core = graph.entities.values()
+            .find(|entity| {
+                entity.name == "core"
+                    && entity.file_path == "barrel.ts"
+                    && entity.entity_type == "export"
+            })
+            .expect("direct barrel export entity should exist");
+        let alias_deps = graph.get_dependencies(&barrel_core.id);
+        assert!(
+            alias_deps.iter().any(|d| d.name == "core" && d.file_path == "lib.ts"),
+            "barrel core export should depend on lib.ts core. Deps: {:?}",
+            alias_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let use_core_id = graph.entities.keys()
+            .find(|id| id.contains("useCore"))
+            .expect("useCore entity should exist");
+        let consumer_deps = graph.get_dependencies(use_core_id);
+        assert!(
+            consumer_deps.iter().any(|d| d.name == "core" && d.file_path == "barrel.ts"),
+            "consumer should resolve core through the direct barrel export. Deps: {:?}",
+            consumer_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_module_variant_import_resolves_exact_file() {
+        for (extension, target_content) in [
+            (".mts", "export function loadConfig(): string { return 'deep'; }\n"),
+            (".cts", "export function loadConfig(): string { return 'deep'; }\n"),
+            (".mjs", "export function loadConfig() { return 'deep'; }\n"),
+            (".cjs", "export function loadConfig() { return 'deep'; }\n"),
+        ] {
+            let (dir, registry) = create_test_repo();
+            let root = dir.path();
+
+            let target_path = format!("deep/config{extension}");
+            write_file(root, &target_path, target_content);
+            write_file(root, "config.ts", "\
+export function loadConfig(): string { return 'sibling'; }
+");
+            write_file(root, "app.ts", &format!("\
+import {{ loadConfig }} from './deep/config{extension}';
+export function start(): string {{ return loadConfig(); }}
+"));
+
+            let (graph, _) = EntityGraph::build(
+                root,
+                &[target_path.clone(), "config.ts".into(), "app.ts".into()],
+                &registry,
+            );
+
+            let start_id = graph.entities.keys()
+                .find(|id| id.contains("start"))
+                .expect("start entity should exist");
+            let deps = graph.get_dependencies(start_id);
+            assert!(
+                deps.iter().any(|d| d.name == "loadConfig" && d.file_path == target_path),
+                "start should resolve loadConfig to {target_path}. Deps: {:?}",
+                deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            );
+            assert!(
+                !deps.iter().any(|d| d.name == "loadConfig" && d.file_path == "config.ts"),
+                "start should not resolve loadConfig to config.ts for {extension}. Deps: {:?}",
+                deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

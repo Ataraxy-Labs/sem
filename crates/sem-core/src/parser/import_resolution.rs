@@ -3,6 +3,29 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::parser::graph::EntityInfo;
 
+pub(crate) const JS_TS_EXTENSIONS: &[&str] = &[
+    ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+];
+
+pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
+    JS_TS_EXTENSIONS.iter().any(|extension| file_path.ends_with(extension))
+}
+
+pub(crate) fn sort_import_candidate_files(paths: &mut [&str], extensions: &[&str]) {
+    paths.sort_by(|left, right| {
+        extension_priority(left, extensions)
+            .cmp(&extension_priority(right, extensions))
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn extension_priority(file_path: &str, extensions: &[&str]) -> usize {
+    extensions
+        .iter()
+        .position(|extension| file_path.ends_with(extension))
+        .unwrap_or(extensions.len())
+}
+
 pub(crate) fn find_import_target<'a>(
     target_ids: &'a [String],
     source_path: &str,
@@ -10,22 +33,39 @@ pub(crate) fn find_import_target<'a>(
     extensions: &[&str],
     entity_map: &HashMap<String, EntityInfo>,
 ) -> Option<&'a String> {
+    let target_files: Vec<&str> = target_ids
+        .iter()
+        .filter_map(|id| entity_map.get(id).map(|entity| entity.file_path.as_str()))
+        .collect();
+    let target_file = find_import_file(&target_files, source_path, file_path, extensions)?;
+
+    target_ids.iter().find(|id| {
+        entity_map
+            .get(*id)
+            .map_or(false, |entity| entity.file_path == target_file)
+    })
+}
+
+pub(crate) fn find_import_file<'a>(
+    candidate_file_paths: &[&'a str],
+    source_path: &str,
+    file_path: &str,
+    extensions: &[&str],
+) -> Option<&'a str> {
     if let Some(candidates) = import_file_candidates(file_path, source_path, extensions) {
         return candidates.iter().find_map(|candidate_path| {
-            target_ids.iter().find(|id| {
-                entity_map
-                    .get(*id)
-                    .map_or(false, |e| e.file_path == *candidate_path)
-            })
+            candidate_file_paths
+                .iter()
+                .copied()
+                .find(|path| *path == candidate_path)
         });
     }
 
     let source_module = import_stem(source_path);
-    target_ids.iter().find(|id| {
-        entity_map
-            .get(*id)
-            .map_or(false, |e| file_stem(&e.file_path) == source_module)
-    })
+    candidate_file_paths
+        .iter()
+        .copied()
+        .find(|path| file_stem(path) == source_module)
 }
 
 pub(crate) fn import_source_matches_file(
@@ -143,8 +183,12 @@ fn file_stem(file_path: &str) -> &str {
     file_name
         .strip_suffix(".py")
         .or_else(|| file_name.strip_suffix(".rs"))
+        .or_else(|| file_name.strip_suffix(".mts"))
+        .or_else(|| file_name.strip_suffix(".cts"))
         .or_else(|| file_name.strip_suffix(".ts"))
         .or_else(|| file_name.strip_suffix(".tsx"))
+        .or_else(|| file_name.strip_suffix(".mjs"))
+        .or_else(|| file_name.strip_suffix(".cjs"))
         .or_else(|| file_name.strip_suffix(".js"))
         .or_else(|| file_name.strip_suffix(".jsx"))
         .or_else(|| file_name.strip_suffix(".go"))
@@ -182,7 +226,7 @@ mod tests {
             &ids,
             "./util.ts",
             "src/main.ts",
-            &[".ts", ".tsx", ".js", ".jsx"],
+            JS_TS_EXTENSIONS,
             &entity_map,
         );
 
@@ -198,7 +242,7 @@ mod tests {
             &ids,
             "./util.ts",
             "src/main.ts",
-            &[".ts", ".tsx", ".js", ".jsx"],
+            JS_TS_EXTENSIONS,
             &entity_map,
         );
 
@@ -230,10 +274,34 @@ mod tests {
             &ids,
             "util.ts",
             "src/main.ts",
-            &[".ts", ".tsx", ".js", ".jsx"],
+            JS_TS_EXTENSIONS,
             &entity_map,
         );
 
         assert_eq!(target, Some(&ids[0]));
+    }
+
+    #[test]
+    fn explicit_relative_import_resolves_module_variants_before_same_named_ts() {
+        for extension in [".mts", ".cts", ".mjs", ".cjs"] {
+            let ids = vec![
+                "src/config.ts::function::helper".to_string(),
+                format!("src/deep/config{extension}::function::helper"),
+            ];
+            let entity_map = HashMap::from([
+                (ids[0].clone(), entity("src/config.ts")),
+                (ids[1].clone(), entity(&format!("src/deep/config{extension}"))),
+            ]);
+
+            let target = find_import_target(
+                &ids,
+                &format!("./deep/config{extension}"),
+                "src/main.ts",
+                JS_TS_EXTENSIONS,
+                &entity_map,
+            );
+
+            assert_eq!(target, Some(&ids[1]), "extension: {extension}");
+        }
     }
 }

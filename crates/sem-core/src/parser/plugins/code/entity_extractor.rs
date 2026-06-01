@@ -483,6 +483,15 @@ fn visit_node(
             }
         }
 
+        if node_type == "export_statement"
+            && matches!(config.id, "typescript" | "tsx" | "javascript")
+            && node.child_by_field_name("source").is_some()
+        {
+            if emit_js_ts_re_export_entities(node, file_path, parent_id, source, entities) {
+                continue;
+            }
+        }
+
         // For export statements, look inside for the actual declaration
         if node_type == "export_statement" {
             if let Some(declaration) = node.child_by_field_name("declaration") {
@@ -509,6 +518,77 @@ fn visit_node(
             worklist.push((child, pid_owned.clone(), child_enclosing));
         }
     }
+}
+
+fn emit_js_ts_re_export_entities(
+    node: Node,
+    file_path: &str,
+    parent_id: Option<&str>,
+    source: &[u8],
+    entities: &mut Vec<SemanticEntity>,
+) -> bool {
+    let source_path = node
+        .child_by_field_name("source")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '\'' || c == '"');
+    if source_path.is_empty() {
+        return false;
+    }
+
+    let mut emitted = false;
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "export_specifier" {
+                let original = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(clean_js_ts_export_name)
+                    .unwrap_or_default();
+                let local = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(clean_js_ts_export_name)
+                    .unwrap_or_else(|| original.clone());
+
+                if local.is_empty() {
+                    continue;
+                }
+
+                let content = node_text(node, source).to_string();
+                let mut metadata = HashMap::new();
+                metadata.insert("export.source".to_string(), source_path.to_string());
+                if !original.is_empty() {
+                    metadata.insert("export.original".to_string(), original);
+                }
+
+                entities.push(SemanticEntity {
+                    id: build_entity_id(file_path, "export", &local, parent_id),
+                    file_path: file_path.to_string(),
+                    entity_type: "export".to_string(),
+                    name: local,
+                    parent_id: parent_id.map(String::from),
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(compute_structural_hash(child, source)),
+                    content,
+                    start_line: child.start_position().row + 1,
+                    end_line: child.end_position().row + 1,
+                    metadata: Some(metadata),
+                });
+                emitted = true;
+            } else {
+                worklist.push(child);
+            }
+        }
+    }
+
+    emitted
+}
+
+fn clean_js_ts_export_name(name: &str) -> String {
+    name.trim().strip_prefix("type ").unwrap_or(name.trim()).to_string()
 }
 
 #[derive(Clone)]

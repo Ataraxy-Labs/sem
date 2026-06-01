@@ -29,7 +29,10 @@ macro_rules! maybe_par_iter {
     }};
 }
 use crate::parser::graph::{EntityInfo, RefType};
-use crate::parser::import_resolution::{find_import_target, import_source_matches_file};
+use crate::parser::import_resolution::{
+    find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
+    sort_import_candidate_files, JS_TS_EXTENSIONS,
+};
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
     ParamNameField, ScopeResolveConfig,
@@ -241,6 +244,8 @@ pub(crate) fn resolve_with_scopes_full(
         }
     }
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
+    let ts_default_exports =
+        build_ts_default_export_table(parsed_files, &symbol_table, entity_map);
 
     // Pass 1: Scan ALL files for return types and instance attr types first
     // This ensures cross-file return type info is available during resolution
@@ -369,6 +374,7 @@ pub(crate) fn resolve_with_scopes_full(
                 &mut scopes,
                 config,
                 &go_pkg_index,
+                &ts_default_exports,
             );
 
             // Resolve pending call types using the complete return type map
@@ -2404,6 +2410,203 @@ fn inject_return_type_bindings(
     }
 }
 
+fn build_ts_default_export_table(
+    parsed_files: &[(String, String, tree_sitter::Tree)],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> HashMap<String, String> {
+    let mut default_exports = HashMap::new();
+
+    for (file_path, content, tree) in parsed_files {
+        if !is_js_ts_file(file_path) {
+            continue;
+        }
+
+        for name in extract_ts_default_export_names(tree.root_node(), content.as_bytes()) {
+            let Some(target_ids) = symbol_table.get(&name) else {
+                continue;
+            };
+            let target = target_ids.iter().find(|id| {
+                entity_map.get(*id).map_or(false, |entity| {
+                    entity.file_path == *file_path && entity.parent_id.is_none()
+                })
+            });
+            if let Some(target_id) = target {
+                default_exports.insert(file_path.clone(), target_id.clone());
+            }
+        }
+    }
+
+    default_exports
+}
+
+fn extract_ts_default_export_names(root: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut worklist = vec![root];
+
+    while let Some(node) = worklist.pop() {
+        if node.kind() == "export_statement" {
+            let has_source = node.child_by_field_name("source").is_some();
+            let text = node.utf8_text(source).unwrap_or("");
+            if !has_source {
+                if let Some(declaration) = node.child_by_field_name("declaration") {
+                    if text.contains("default") {
+                        if let Some(name) = ts_default_declaration_name(declaration, source) {
+                            names.push(name);
+                        }
+                    }
+                } else if text.contains("default") && !has_ts_export_specifier(node) {
+                    if let Some(name) = ts_bare_default_export_identifier(node, source) {
+                        names.push(name);
+                    }
+                }
+                collect_ts_default_export_specifiers(node, source, &mut names);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            worklist.push(child);
+        }
+    }
+
+    names
+}
+
+fn ts_default_declaration_name(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    match node.kind() {
+        "function_declaration" | "generator_function_declaration" | "class_declaration"
+        | "lexical_declaration" | "variable_declaration" => ts_declaration_name(node, source),
+        "identifier" => node.utf8_text(source).ok().map(str::to_string),
+        _ => None,
+    }
+}
+
+fn has_ts_export_specifier(node: tree_sitter::Node) -> bool {
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "export_specifier" {
+                return true;
+            }
+            worklist.push(child);
+        }
+    }
+    false
+}
+
+fn collect_ts_default_export_specifiers(
+    node: tree_sitter::Node,
+    source: &[u8],
+    names: &mut Vec<String>,
+) {
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "export_specifier" {
+                let original = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let local = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or(original);
+                if local == "default" && !original.is_empty() {
+                    names.push(original.to_string());
+                }
+            } else {
+                worklist.push(child);
+            }
+        }
+    }
+}
+
+fn ts_declaration_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(name.utf8_text(source).ok()?.to_string());
+    }
+
+    if node.kind() == "lexical_declaration" || node.kind() == "variable_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(name) = child.child_by_field_name("name") {
+                    return Some(name.utf8_text(source).ok()?.to_string());
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    let name = node
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+        .and_then(|child| child.utf8_text(source).ok())
+        .map(str::to_string);
+    name
+}
+
+fn ts_bare_default_export_identifier(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    let text = node.utf8_text(source).ok()?.trim();
+    let rest = text.strip_prefix("export")?.trim_start();
+    let rest = rest.strip_prefix("default")?.trim_start();
+    let name_end = js_ts_identifier_end(rest)?;
+    let name = &rest[..name_end];
+    let trailing = rest[name_end..].trim_start();
+    only_js_ts_statement_trivia(trailing).then(|| name.to_string())
+}
+
+fn js_ts_identifier_end(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
+fn only_js_ts_statement_trivia(mut text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix(';') {
+        text = rest;
+    }
+
+    loop {
+        text = text.trim_start();
+        if text.is_empty() {
+            return true;
+        }
+        if text.starts_with("//") {
+            return true;
+        }
+        if let Some(rest) = text.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return false;
+            };
+            text = &rest[end + 2..];
+            continue;
+        }
+        return false;
+    }
+}
+
 /// Extract import statements from the AST.
 fn extract_imports_from_ast(
     root: tree_sitter::Node,
@@ -2415,6 +2618,7 @@ fn extract_imports_from_ast(
     scopes: &mut Vec<Scope>,
     config: &ScopeResolveConfig,
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    ts_default_exports: &HashMap<String, String>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -2433,7 +2637,29 @@ fn extract_imports_from_ast(
                 }
                 "import_statement" if !config.self_keywords.contains(&"cls") => {
                     // TS import_statement (not Python - Python uses import_from_statement)
-                    extract_ts_import(child, file_path, source, symbol_table, entity_map, import_table, scopes);
+                    extract_ts_import(
+                        child,
+                        file_path,
+                        source,
+                        symbol_table,
+                        entity_map,
+                        import_table,
+                        scopes,
+                        ts_default_exports,
+                    );
+                    true
+                }
+                "export_statement" if !config.self_keywords.contains(&"cls") => {
+                    extract_ts_re_export(
+                        child,
+                        file_path,
+                        source,
+                        symbol_table,
+                        entity_map,
+                        import_table,
+                        scopes,
+                        ts_default_exports,
+                    );
                     true
                 }
                 "use_declaration" => {
@@ -2462,6 +2688,7 @@ fn extract_ts_import(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    ts_default_exports: &HashMap<String, String>,
 ) {
     // Extract the source module from the `from '...'` clause
     let source_path = node
@@ -2495,7 +2722,7 @@ fn extract_ts_import(
                                 .unwrap_or(original);
 
                             if !original.is_empty() {
-                                resolve_import_name(original, local, source_path, file_path, &[".ts", ".tsx", ".js", ".jsx"], symbol_table, entity_map, import_table, scopes);
+                                resolve_import_name(original, local, source_path, file_path, JS_TS_EXTENSIONS, symbol_table, entity_map, import_table, scopes);
                             }
                         }
                     }
@@ -2512,15 +2739,95 @@ fn extract_ts_import(
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("");
                     if !alias.is_empty() {
-                        register_namespace_import(alias, source_path, file_path, &[".ts", ".tsx", ".js", ".jsx"], symbol_table, entity_map, import_table, scopes);
+                        register_namespace_import(alias, source_path, file_path, JS_TS_EXTENSIONS, symbol_table, entity_map, import_table, scopes);
                     }
                 } else if clause_child.kind() == "identifier" {
                     // Default import: import Foo from './module'
                     let name = clause_child.utf8_text(source).unwrap_or("");
                     if !name.is_empty() {
-                        resolve_import_name(name, name, source_path, file_path, &[".ts", ".tsx", ".js", ".jsx"], symbol_table, entity_map, import_table, scopes);
+                        resolve_default_import(
+                            name,
+                            source_path,
+                            file_path,
+                            JS_TS_EXTENSIONS,
+                            ts_default_exports,
+                            import_table,
+                            scopes,
+                        );
                     }
                 }
+            }
+        }
+    }
+}
+
+fn extract_ts_re_export(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &[u8],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+    ts_default_exports: &HashMap<String, String>,
+) {
+    let source_path = node
+        .child_by_field_name("source")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '\'' || c == '"');
+
+    if source_path.is_empty() {
+        return;
+    }
+
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            match child.kind() {
+                "export_specifier" => {
+                    let original = child
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("");
+                    let local = child
+                        .child_by_field_name("alias")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or(original);
+
+                    if original.is_empty() || local.is_empty() {
+                        continue;
+                    }
+
+                    if original == "default" {
+                        resolve_default_import(
+                            local,
+                            source_path,
+                            file_path,
+                            JS_TS_EXTENSIONS,
+                            ts_default_exports,
+                            import_table,
+                            scopes,
+                        );
+                    } else {
+                        resolve_import_name(
+                            original,
+                            local,
+                            source_path,
+                            file_path,
+                            JS_TS_EXTENSIONS,
+                            symbol_table,
+                            entity_map,
+                            import_table,
+                            scopes,
+                        );
+                    }
+                }
+                "export_clause" | "namespace_export" => {
+                    worklist.push(child);
+                }
+                _ => {}
             }
         }
     }
@@ -2703,6 +3010,32 @@ fn resolve_import_name(
                     .defs
                     .insert(local_name.to_string(), target_id.clone());
             }
+        }
+    }
+}
+
+fn resolve_default_import(
+    local_name: &str,
+    source_path: &str,
+    file_path: &str,
+    extensions: &[&str],
+    default_exports: &HashMap<String, String>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+) {
+    let mut default_export_files: Vec<&str> = default_exports.keys().map(String::as_str).collect();
+    sort_import_candidate_files(&mut default_export_files, extensions);
+    let target = find_import_file(&default_export_files, source_path, file_path, extensions)
+        .and_then(|target_file| default_exports.get(target_file))
+        .cloned();
+
+    if let Some(target_id) = target {
+        import_table.insert(
+            (file_path.to_string(), local_name.to_string()),
+            target_id.clone(),
+        );
+        if !scopes.is_empty() {
+            scopes[0].defs.insert(local_name.to_string(), target_id);
         }
     }
 }
