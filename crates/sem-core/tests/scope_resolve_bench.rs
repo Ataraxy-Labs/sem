@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::{EntityGraph, EntityInfo, RefType};
+use sem_core::parser::graph::{EntityGraph, EntityInfo};
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::scope_resolve;
 
@@ -796,6 +796,20 @@ fn run_scope_resolve_for_lang(
     if new_edges.is_empty() && !old_edges.is_empty() {
         eprintln!("  NOTE [{}]: Scope resolver produced 0 edges (config may need tuning)", lang_name);
     }
+
+    // Languages with complete expected coverage gate CI on the scored result.
+    if lang_name == "swift" {
+        assert_eq!(
+            new_fn, 0,
+            "{} scope resolver missed {} expected edges; see MISSED lines above",
+            lang_name, new_fn
+        );
+        assert_eq!(
+            new_fp, 0,
+            "{} scope resolver produced {} forbidden edges; see FALSE POSITIVE lines above",
+            lang_name, new_fp
+        );
+    }
 }
 
 #[test]
@@ -1126,6 +1140,10 @@ fn get_swift_expected_edges() -> Vec<(&'static str, &'static str, &'static str)>
         // database.swift internal
         ("Transaction::execute", "execute", "Transaction.execute calls conn.execute"),
         ("Transaction::commit", "commit", "Transaction.commit calls conn.commit"),
+        ("Replicator::sync", "execute", "Replicator.sync calls primary.execute"),
+        ("Replicator::sync", "commit", "Replicator.sync calls backup.commit"),
+        ("AuditedTransaction::write", "commit", "AuditedTransaction.write calls conn.commit"),
+        ("AuditedTransaction::write", "record", "AuditedTransaction.write calls logger.record"),
     ]
 }
 

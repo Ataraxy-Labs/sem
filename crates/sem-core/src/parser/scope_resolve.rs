@@ -1857,25 +1857,47 @@ fn scan_swift_property_declaration(
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    // Swift property_declaration has a "name" (via pattern binding) and type annotation
+    let mut pending_names: Vec<String> = Vec::new();
     let mut cursor = node.walk();
+
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "pattern" || child.kind() == "simple_identifier" || child.kind() == "identifier" {
-            let field_name = child.utf8_text(source).unwrap_or("");
-            if let Some(type_ann) = node.child_by_field_name("type") {
-                let type_text = extract_base_type(type_ann, source);
-                if !field_name.is_empty()
-                    && !type_text.is_empty()
-                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                {
-                    instance_attr_types.insert(
-                        (class_name.to_string(), field_name.to_string()),
-                        type_text,
-                    );
+        match child.kind() {
+            "pattern" | "simple_identifier" | "identifier" => {
+                if let Some(name) = swift_property_pattern_name(child, source) {
+                    pending_names.push(name);
                 }
             }
+            "type_annotation" | "user_type" | "type_identifier" => {
+                let type_text = extract_base_type(child, source);
+                let field_names = std::mem::take(&mut pending_names);
+                if !type_text.is_empty()
+                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                {
+                    for field_name in field_names {
+                        instance_attr_types.insert(
+                            (class_name.to_string(), field_name),
+                            type_text.clone(),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
+}
+
+fn swift_property_pattern_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "simple_identifier" || node.kind() == "identifier" {
+        return node.utf8_text(source).ok().map(str::to_string);
+    }
+
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "simple_identifier" | "identifier"))
+        .and_then(|child| child.utf8_text(source).ok())
+        .map(str::to_string);
+    found
 }
 
 /// Kotlin: extract typed property declarations `val conn: Connection`
@@ -3204,6 +3226,37 @@ fn resolve_ref(
                 if let Some(members) = class_members.get(class_name.as_str()) {
                     if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
                         return Some((mid.clone(), RefType::Calls, "type_tracking"));
+                    }
+                }
+            }
+
+            // Inside class methods, unqualified property receivers resolve
+            // against the enclosing instance when no local binding shadows them.
+            let from_entity_is_container_type = entity_map.get(from_entity_id).map_or(false, |entity| {
+                matches!(
+                    entity.entity_type.as_str(),
+                    "class"
+                        | "struct"
+                        | "interface"
+                        | "enum"
+                        | "protocol_declaration"
+                        | "object_declaration"
+                        | "companion_object"
+                )
+            });
+
+            if !from_entity_is_container_type
+                && !is_local_binding_in_scopes(scope_idx, scopes, receiver)
+            {
+                if let Some(class_name) = find_enclosing_class(scope_idx, scopes, entity_map) {
+                    if let Some(attr_type) =
+                        instance_attr_types.get(&(class_name, receiver.to_string()))
+                    {
+                        if let Some(members) = class_members.get(attr_type.as_str()) {
+                            if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
+                                return Some((mid.clone(), RefType::Calls, "type_tracking"));
+                            }
+                        }
                     }
                 }
             }
