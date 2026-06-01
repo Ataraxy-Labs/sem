@@ -42,6 +42,8 @@ pub struct Scope {
     defs: HashMap<String, String>,
     /// Local bindings that shadow outer names but are not graph entities.
     bindings: HashSet<String>,
+    /// Binding declaration rows keyed by name.
+    binding_rows: HashMap<String, Vec<usize>>,
     /// Variable type bindings: var_name -> class_name (from `x = Foo()`)
     types: HashMap<String, String>,
     /// Unresolved call assignments: var_name -> function_name (from `x = func()`)
@@ -64,6 +66,8 @@ struct AstRef {
 enum AstRefKind {
     /// Bare name call: `foo()`
     Call(String),
+    /// Qualified path call: `module::function()`
+    ScopedCall { path: String, name: String },
     /// Attribute call: `x.method()`
     MethodCall { receiver: String, method: String },
 }
@@ -318,6 +322,7 @@ pub(crate) fn resolve_with_scopes_full(
                 parent: None,
                 defs: HashMap::new(),
                 bindings: HashSet::new(),
+                binding_rows: HashMap::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
@@ -386,6 +391,8 @@ pub(crate) fn resolve_with_scopes_full(
 
             // Walk the AST once for the entire file, collecting all refs with row positions
             let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
+            let descendant_ranges_by_entity =
+                build_descendant_ranges_by_entity(&file_entities, entity_map);
 
             for entity in &file_entities {
                 let scope_idx = entity_inner_scope
@@ -393,15 +400,31 @@ pub(crate) fn resolve_with_scopes_full(
                     .or_else(|| entity_scope_map.get(&entity.id))
                     .copied()
                     .unwrap_or(0);
-
                 let start_row = entity.start_line.saturating_sub(1); // 1-indexed to 0-indexed
                 let end_row = entity.end_line; // exclusive
+                log_scope_bindings(
+                    &mut file_log,
+                    &entity.id,
+                    &scopes[scope_idx],
+                    start_row,
+                    end_row,
+                    &descendant_ranges_by_entity,
+                );
 
                 // Filter pre-collected refs to this entity's line range
                 for ast_ref in all_file_refs.iter().filter(|r| r.row >= start_row && r.row < end_row) {
+                    if row_belongs_to_descendant(
+                        &descendant_ranges_by_entity,
+                        &entity.id,
+                        ast_ref.row,
+                    ) {
+                        continue;
+                    }
+
                     // Skip self-name refs (was previously done during collection)
                     let is_self_ref = match &ast_ref.kind {
                         AstRefKind::Call(name) => name == &entity.name,
+                        AstRefKind::ScopedCall { .. } => false,
                         AstRefKind::MethodCall { .. } => false,
                     };
                     if is_self_ref {
@@ -488,8 +511,101 @@ pub(crate) fn resolve_with_scopes_full(
 fn ref_description(ast_ref: &AstRef) -> String {
     match &ast_ref.kind {
         AstRefKind::Call(name) => format!("{}()", name),
+        AstRefKind::ScopedCall { path, name } => format!("{}::{}()", path, name),
         AstRefKind::MethodCall { receiver, method } => format!("{}.{}()", receiver, method),
     }
+}
+
+fn log_scope_bindings(
+    file_log: &mut Vec<ResolutionEntry>,
+    from_entity: &str,
+    scope: &Scope,
+    start_row: usize,
+    end_row: usize,
+    descendant_ranges_by_entity: &HashMap<String, Vec<(usize, usize)>>,
+) {
+    let mut bindings: Vec<&String> = scope.bindings.iter().collect();
+    bindings.sort();
+    for binding in bindings {
+        let belongs_to_entity = scope
+            .binding_rows
+            .get(binding)
+            .map_or(false, |rows| {
+                rows.iter().any(|row| {
+                    *row >= start_row
+                        && *row < end_row
+                        && !row_belongs_to_descendant(
+                            descendant_ranges_by_entity,
+                            from_entity,
+                            *row,
+                        )
+                })
+            });
+        if !belongs_to_entity {
+            continue;
+        }
+        file_log.push(ResolutionEntry {
+            from_entity: from_entity.to_string(),
+            reference: binding.clone(),
+            resolved_to: None,
+            method: "local_binding",
+        });
+    }
+}
+
+fn build_descendant_ranges_by_entity(
+    file_entities: &[&SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for entity in file_entities {
+        let child_range = (entity.start_line.saturating_sub(1), entity.end_line);
+        let mut current = entity.parent_id.as_deref();
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = current {
+            if !visited.insert(parent_id.to_string()) {
+                break;
+            }
+            ranges_by_entity
+                .entry(parent_id.to_string())
+                .or_default()
+                .push(child_range);
+            current = entity_map
+                .get(parent_id)
+                .and_then(|parent| parent.parent_id.as_deref());
+        }
+
+        for candidate in file_entities {
+            if candidate.id != entity.id && is_strict_enclosing_range(candidate, entity) {
+                ranges_by_entity
+                    .entry(candidate.id.clone())
+                    .or_default()
+                    .push(child_range);
+            }
+        }
+    }
+    for ranges in ranges_by_entity.values_mut() {
+        ranges.sort_unstable();
+        ranges.dedup();
+    }
+    ranges_by_entity
+}
+
+fn is_strict_enclosing_range(candidate: &SemanticEntity, child: &SemanticEntity) -> bool {
+    candidate.file_path == child.file_path
+        && candidate.start_line <= child.start_line
+        && child.end_line <= candidate.end_line
+        && (candidate.start_line < child.start_line || child.end_line < candidate.end_line)
+}
+
+fn row_belongs_to_descendant(
+    descendant_ranges_by_entity: &HashMap<String, Vec<(usize, usize)>>,
+    entity_id: &str,
+    row: usize,
+) -> bool {
+    descendant_ranges_by_entity
+        .get(entity_id)
+        .map_or(false, |ranges| ranges.iter().any(|(start, end)| row >= *start && row < *end))
 }
 
 /// Build scope tree by walking the AST.
@@ -576,6 +692,7 @@ fn build_scopes_from_ast(
                         parent: Some(current_scope),
                         defs: HashMap::new(),
                         bindings: HashSet::new(),
+                        binding_rows: HashMap::new(),
                         types: HashMap::new(),
                         pending_call_types: HashMap::new(),
                         owner_id: Some(ce.id.clone()),
@@ -607,6 +724,7 @@ fn build_scopes_from_ast(
                     parent: Some(current_scope),
                     defs: HashMap::new(),
                     bindings: HashSet::new(),
+                    binding_rows: HashMap::new(),
                     types: HashMap::new(),
                     pending_call_types: HashMap::new(),
                     owner_id: None,
@@ -633,6 +751,7 @@ fn build_scopes_from_ast(
                 parent: Some(current_scope),
                 defs: HashMap::new(),
                 bindings: HashSet::new(),
+                binding_rows: HashMap::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
@@ -703,6 +822,7 @@ fn build_scopes_from_ast(
                 parent: Some(parent_scope),
                 defs: HashMap::new(),
                 bindings: HashSet::new(),
+                binding_rows: HashMap::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
@@ -812,6 +932,15 @@ fn scan_assignments(
     }
 }
 
+fn record_binding(scopes: &mut [Scope], scope_idx: usize, name: &str, row: usize) {
+    scopes[scope_idx].bindings.insert(name.to_string());
+    scopes[scope_idx]
+        .binding_rows
+        .entry(name.to_string())
+        .or_default()
+        .push(row);
+}
+
 /// Scan function parameter type annotations and add them as type bindings.
 /// e.g. `def foo(shelter: Shelter)` -> types["shelter"] = "Shelter"
 fn scan_function_params(
@@ -897,7 +1026,7 @@ fn scan_function_params(
             if param_name.is_empty() || rule.skip_names.contains(&param_name) {
                 continue;
             }
-            scopes[scope_idx].bindings.insert(param_name.to_string());
+            record_binding(scopes, scope_idx, param_name, child.start_position().row);
 
             // Try the configured type field first, then fall back to child type nodes
             // (Swift parameters have user_type children instead of a "type" field)
@@ -959,7 +1088,7 @@ fn scan_single_assignment(
         Ok(n) => n.to_string(),
         Err(_) => return,
     };
-    scopes[scope_idx].bindings.insert(var_name.clone());
+    record_binding(scopes, scope_idx, &var_name, left.start_position().row);
 
     record_type_from_rhs(right, &var_name, scope_idx, scopes, source);
 }
@@ -983,7 +1112,11 @@ fn scan_ts_var_declaration(
             if var_name.is_empty() {
                 continue;
             }
-            scopes[scope_idx].bindings.insert(var_name.clone());
+            let binding_row = child
+                .child_by_field_name("name")
+                .map(|n| n.start_position().row)
+                .unwrap_or_else(|| child.start_position().row);
+            record_binding(scopes, scope_idx, &var_name, binding_row);
 
             // Check for explicit type annotation: `const x: Foo = ...`
             if let Some(type_ann) = child.child_by_field_name("type") {
@@ -1123,7 +1256,7 @@ fn scan_rust_let_declaration(
     if var_name.is_empty() {
         return;
     }
-    scopes[scope_idx].bindings.insert(var_name.clone());
+    record_binding(scopes, scope_idx, &var_name, node.start_position().row);
 
     // Check for explicit type annotation: `let x: Connection = ...`
     if let Some(type_node) = node.child_by_field_name("type") {
@@ -1173,7 +1306,7 @@ fn scan_go_short_var(
     if var_name.is_empty() {
         return;
     }
-    scopes[scope_idx].bindings.insert(var_name.clone());
+    record_binding(scopes, scope_idx, &var_name, left.start_position().row);
 
     let rhs = if right.kind() == "expression_list" {
         match right.named_child(0) {
@@ -1208,7 +1341,7 @@ fn scan_go_var_declaration(
                     if first.kind() == "identifier" {
                         let name = first.utf8_text(source).unwrap_or("").to_string();
                         if !name.is_empty() {
-                            scopes[scope_idx].bindings.insert(name.clone());
+                            record_binding(scopes, scope_idx, &name, first.start_position().row);
                             // Check for type child
                             if let Some(type_node) = child.child_by_field_name("type") {
                                 let type_text = extract_base_type(type_node, source);
@@ -1223,7 +1356,11 @@ fn scan_go_var_declaration(
                 }
                 continue;
             }
-            scopes[scope_idx].bindings.insert(var_name.clone());
+            let binding_row = child
+                .child_by_field_name("name")
+                .map(|n| n.start_position().row)
+                .unwrap_or_else(|| child.start_position().row);
+            record_binding(scopes, scope_idx, &var_name, binding_row);
 
             // Check for explicit type
             if let Some(type_node) = child.child_by_field_name("type") {
@@ -2994,7 +3131,7 @@ fn extract_call_ref(
             let is_path_prefix =
                 parts[0] == "super" || parts[0] == "self" || parts[0] == "crate";
             let method_name = parts[parts.len() - 1];
-            if is_path_prefix {
+            if is_path_prefix && parts.len() == 2 {
                 if !method_name.is_empty() && !is_builtin(method_name, config) {
                     refs.push(AstRef {
                         kind: AstRefKind::Call(method_name.to_string()),
@@ -3002,17 +3139,26 @@ fn extract_call_ref(
                     });
                 }
             } else {
-                let type_name = parts[parts.len() - 2];
-                if !type_name.is_empty() && !method_name.is_empty() {
-                    refs.push(AstRef {
-                        kind: AstRefKind::Call(method_name.to_string()),
-                        row,
-                    });
-                    if type_name.chars().next().map_or(false, |c| c.is_uppercase())
-                        && !is_builtin(type_name, config)
+                let receiver = parts[..parts.len() - 1].join("::");
+                let receiver_base = parts[parts.len() - 2];
+                if !receiver.is_empty() && !method_name.is_empty() {
+                    if parts.len() == 2
+                        && receiver_base.chars().next().map_or(false, |c| c.is_uppercase())
+                        && !is_builtin(receiver_base, config)
                     {
                         refs.push(AstRef {
-                            kind: AstRefKind::Call(type_name.to_string()),
+                            kind: AstRefKind::MethodCall {
+                                receiver: receiver_base.to_string(),
+                                method: method_name.to_string(),
+                            },
+                            row,
+                        });
+                    } else if !is_builtin(method_name, config) {
+                        refs.push(AstRef {
+                            kind: AstRefKind::ScopedCall {
+                                path: receiver,
+                                name: method_name.to_string(),
+                            },
                             row,
                         });
                     }
@@ -3140,6 +3286,8 @@ fn resolve_ref(
 
             None
         }
+
+        AstRefKind::ScopedCall { .. } => None,
 
         AstRefKind::MethodCall { receiver: raw_receiver, method } => {
             // Strip prefix operators like ! (Swift: `!dog.validate()`)

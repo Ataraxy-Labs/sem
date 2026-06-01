@@ -7,6 +7,7 @@
 //!
 //! This enables impact analysis: "if I change entity X, what else is affected?"
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -54,9 +55,85 @@ fn add_scope_reference_words(words: &mut HashSet<String>, reference: &str) {
         if !member.is_empty() {
             words.insert(member.to_string());
         }
+    } else if reference.contains("::") {
+        for part in reference.split("::").filter(|part| !part.is_empty()) {
+            words.insert(part.to_string());
+        }
     } else if !reference.is_empty() {
         words.insert(reference.to_string());
     }
+}
+
+fn build_descendant_ranges_by_entity(
+    entity_map: &HashMap<String, EntityInfo>,
+) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+
+    let mut entities_by_file: HashMap<&str, Vec<(&str, &EntityInfo)>> = HashMap::new();
+    for (id, entity) in entity_map {
+        entities_by_file
+            .entry(entity.file_path.as_str())
+            .or_default()
+            .push((id.as_str(), entity));
+    }
+
+    for file_entities in entities_by_file.values() {
+        for (child_id, child) in file_entities {
+            for (candidate_id, candidate) in file_entities {
+                if child_id == candidate_id {
+                    continue;
+                }
+                if is_strict_enclosing_entity(candidate, child) {
+                    ranges_by_entity
+                        .entry((*candidate_id).to_string())
+                        .or_default()
+                        .push((child.start_line, child.end_line));
+                }
+            }
+        }
+    }
+    for ranges in ranges_by_entity.values_mut() {
+        ranges.sort_unstable();
+        ranges.dedup();
+    }
+
+    ranges_by_entity
+}
+
+fn is_strict_enclosing_entity(candidate: &EntityInfo, child: &EntityInfo) -> bool {
+    candidate.start_line <= child.start_line
+        && child.end_line <= candidate.end_line
+        && (candidate.start_line < child.start_line || child.end_line < candidate.end_line)
+}
+
+fn content_without_descendant_ranges<'a>(
+    content: &'a str,
+    entity_id: &str,
+    start_line: usize,
+    descendant_ranges_by_entity: &HashMap<String, Vec<(usize, usize)>>,
+) -> Cow<'a, str> {
+    let Some(ranges) = descendant_ranges_by_entity.get(entity_id) else {
+        return Cow::Borrowed(content);
+    };
+    if ranges.is_empty() {
+        return Cow::Borrowed(content);
+    }
+
+    let mut masked = String::with_capacity(content.len());
+    for (line_offset, line) in content.lines().enumerate() {
+        let line_number = start_line + line_offset;
+        if ranges
+            .iter()
+            .any(|(range_start, range_end)| line_number >= *range_start && line_number <= *range_end)
+        {
+            masked.push('\n');
+        } else {
+            masked.push_str(line);
+            masked.push('\n');
+        }
+    }
+
+    Cow::Owned(masked)
 }
 
 /// A reference from one entity to another.
@@ -303,6 +380,7 @@ impl EntityGraph {
         } else {
             (vec![], HashMap::new())
         };
+        let descendant_ranges_by_entity = build_descendant_ranges_by_entity(&entity_map);
 
         // Pass 2: Extract references in parallel, then resolve against symbol table
         // Phase 1: Dot-chain resolution (precise self.X, this.X, ClassName.X)
@@ -324,8 +402,16 @@ impl EntityGraph {
                     .cloned()
                     .unwrap_or_default();
 
+                let fallback_content = content_without_descendant_ranges(
+                    &entity.content,
+                    &entity.id,
+                    entity.start_line,
+                    &descendant_ranges_by_entity,
+                );
+                let fallback_content = fallback_content.as_ref();
+
                 // Strip comments/strings once, reuse for both dot-chain and bag-of-words
-                let stripped = strip_comments_and_strings(&entity.content);
+                let stripped = strip_comments_and_strings(fallback_content);
 
                 // Phase 1: Dot-chain resolution
                 let dot_chains = extract_dot_chains(&stripped);
@@ -373,7 +459,7 @@ impl EntityGraph {
 
                 // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
                 // Reuse the stripped content to avoid stripping twice
-                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
+                let refs = extract_references_with_stripped(fallback_content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -392,7 +478,7 @@ impl EntityGraph {
                             && !parent_child_pairs.contains(&(entity.id.as_str(), import_target_id.as_str()))
                             && !parent_child_pairs.contains(&(import_target_id.as_str(), entity.id.as_str()))
                         {
-                            let ref_type = infer_ref_type(&entity.content, &ref_name);
+                            let ref_type = infer_ref_type(fallback_content, &ref_name);
                             entity_edges.push((
                                 entity.id.clone(),
                                 import_target_id.clone(),
@@ -421,7 +507,7 @@ impl EntityGraph {
                             {
                                 continue;
                             }
-                            let ref_type = infer_ref_type(&entity.content, &ref_name);
+                            let ref_type = infer_ref_type(fallback_content, &ref_name);
                             entity_edges.push((
                                 entity.id.clone(),
                                 target_id.clone(),
@@ -745,6 +831,7 @@ impl EntityGraph {
         } else {
             (vec![], HashMap::new())
         };
+        let descendant_ranges_by_entity = build_descendant_ranges_by_entity(&entity_map);
 
         // Resolve references only for entities in needs_resolution
         let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
@@ -762,8 +849,16 @@ impl EntityGraph {
                     .cloned()
                     .unwrap_or_default();
 
+                let fallback_content = content_without_descendant_ranges(
+                    &entity.content,
+                    &entity.id,
+                    entity.start_line,
+                    &descendant_ranges_by_entity,
+                );
+                let fallback_content = fallback_content.as_ref();
+
                 // Strip comments/strings once, reuse for both dot-chain and bag-of-words
-                let stripped = strip_comments_and_strings(&entity.content);
+                let stripped = strip_comments_and_strings(fallback_content);
 
                 // Phase 1: Dot-chain resolution
                 let dot_chains = extract_dot_chains(&stripped);
@@ -808,7 +903,7 @@ impl EntityGraph {
                 }
 
                 // Phase 2: Bag-of-words resolution (reuse stripped content)
-                let refs = extract_references_with_stripped(&entity.content, &entity.name, &stripped);
+                let refs = extract_references_with_stripped(fallback_content, &entity.name, &stripped);
                 for ref_name in refs {
                     if consumed_words.contains(ref_name) {
                         continue;
@@ -823,7 +918,7 @@ impl EntityGraph {
                             && !parent_child_pairs.contains(&(entity.id.as_str(), import_target_id.as_str()))
                             && !parent_child_pairs.contains(&(import_target_id.as_str(), entity.id.as_str()))
                         {
-                            let ref_type = infer_ref_type(&entity.content, &ref_name);
+                            let ref_type = infer_ref_type(fallback_content, &ref_name);
                             entity_edges.push((
                                 entity.id.clone(),
                                 import_target_id.clone(),
@@ -849,7 +944,7 @@ impl EntityGraph {
                             {
                                 continue;
                             }
-                            let ref_type = infer_ref_type(&entity.content, &ref_name);
+                            let ref_type = infer_ref_type(fallback_content, &ref_name);
                             entity_edges.push((
                                 entity.id.clone(),
                                 target_id.clone(),
@@ -2740,6 +2835,183 @@ export function caller(foo) { return foo(); }
         assert!(
             !deps.iter().any(|d| d.name == "foo" && d.file_path == "lib.ts"),
             "local parameter foo should shadow named import. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_nested_local_binding_does_not_hide_parent_reference() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "lib.ts", "\
+export const answer = 42;
+");
+        write_file(root, "main.ts", "\
+import { answer } from './lib';
+export function outer() {
+    const value = answer;
+    function inner() {
+        const answer = 0;
+        return answer;
+    }
+    return value;
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let outer_id = graph.entities.iter()
+            .find(|(_, entity)| entity.name == "outer")
+            .map(|(id, _)| id)
+            .expect("outer entity should exist");
+        let outer_deps = graph.get_dependencies(outer_id);
+        assert!(
+            outer_deps.iter().any(|d| d.name == "answer" && d.file_path == "lib.ts"),
+            "parent bare reference to imported answer should remain resolved. Deps: {:?}",
+            outer_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let inner_id = graph.entities.iter()
+            .find(|(_, entity)| entity.name == "inner")
+            .map(|(id, _)| id)
+            .expect("inner entity should exist");
+        let inner_deps = graph.get_dependencies(inner_id);
+        assert!(
+            !inner_deps.iter().any(|d| d.name == "answer" && d.file_path == "lib.ts"),
+            "nested local binding answer should not resolve to imported answer. Deps: {:?}",
+            inner_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_local_binding_shadows_same_file_function() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "b.py", "\
+def total(items):
+    return sum(items)
+
+def report():
+    total = 0
+    for i in range(10):
+        total = total + i
+    return total
+");
+
+        let (graph, _) = EntityGraph::build(root, &["b.py".into()], &registry);
+
+        let report_id = graph.entities.iter()
+            .find(|(_, entity)| entity.name == "report")
+            .map(|(id, _)| id)
+            .expect("report entity should exist");
+        let deps = graph.get_dependencies(report_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "total"),
+            "local variable total should not resolve to same-file function total. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rust_impl_container_does_not_inherit_child_build_call() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "graph.rs", "\
+pub struct EntityGraph;
+
+impl EntityGraph {
+    pub fn build(a: i32, b: i32, c: i32) -> i32 {
+        a + b + c
+    }
+}
+");
+        write_file(root, "server.rs", "\
+use crate::graph::EntityGraph;
+
+struct SemServer;
+
+impl SemServer {
+    fn find_supported_files() {
+        let mut builder = ignore::WalkBuilder::new(\".\");
+        let walker = builder.build();
+    }
+
+    fn get_or_build_graph() {
+        let _ = EntityGraph::build(1, 2, 3);
+    }
+}
+
+impl SemServer {
+    fn metadata(&self) -> i32 {
+        1
+    }
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["graph.rs".into(), "server.rs".into()],
+            &registry,
+        );
+
+        let sem_server_impls: Vec<_> = graph.entities.iter()
+            .filter(|(_, entity)| entity.entity_type == "impl" && entity.name == "SemServer")
+            .collect();
+        assert!(
+            sem_server_impls.len() >= 2,
+            "test fixture should produce duplicate SemServer impl entities"
+        );
+        for (impl_id, _) in sem_server_impls {
+            let impl_deps = graph.get_dependencies(impl_id);
+            assert!(
+                !impl_deps.iter().any(|d| d.name == "build" && d.file_path == "graph.rs"),
+                "impl container should not inherit child build calls. Deps: {:?}",
+                impl_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+            );
+        }
+
+        let method_id = graph.entities.iter()
+            .find(|(_, entity)| entity.name == "get_or_build_graph")
+            .map(|(id, _)| id)
+            .expect("get_or_build_graph entity should exist");
+        let method_deps = graph.get_dependencies(method_id);
+        assert!(
+            method_deps.iter().any(|d| d.name == "build" && d.file_path == "graph.rs"),
+            "direct EntityGraph::build call should remain resolved. Deps: {:?}",
+            method_deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rust_lowercase_scoped_path_does_not_fallback_to_local_function() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "main.rs", "\
+fn baz() {}
+
+fn caller() {
+    foo::bar::baz();
+}
+");
+
+        let (graph, _) = EntityGraph::build(root, &["main.rs".into()], &registry);
+
+        let caller_id = graph.entities.iter()
+            .find(|(_, entity)| entity.name == "caller")
+            .map(|(id, _)| id)
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "baz"),
+            "lowercase scoped path should not fall back to local baz function. Deps: {:?}",
             deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
         );
     }
