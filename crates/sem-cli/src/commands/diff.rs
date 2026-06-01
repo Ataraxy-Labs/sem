@@ -232,7 +232,6 @@ fn normalize_trailing_output_format(opts: &mut DiffOptions) {
     opts.args = args;
 }
 
-
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
 
@@ -346,7 +345,7 @@ fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
 }
 
 /// Parse a unified diff (e.g. from `git diff`) into FileChange entries.
-/// Uses blob SHAs from `index` lines to retrieve full file contents via `git show`.
+/// Uses blob SHAs when possible and hunk bodies when the patch is not tied to local blobs.
 #[derive(Debug, PartialEq, Eq)]
 enum PatchParseError {
     EmptyInput,
@@ -408,7 +407,26 @@ fn is_binary_files_marker(line: &str) -> bool {
     let Some(paths) = rest.strip_suffix(" differ") else {
         return false;
     };
-    let Some((old, new)) = paths.split_once(" and ") else {
+
+    let Some((old, new)) = (if paths.trim_start().starts_with('"') {
+        let Some((old, rest)) = parse_git_path_token(paths) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix(" and ") else {
+            return false;
+        };
+        let Some((new, rest)) = parse_git_path_token(rest) else {
+            return false;
+        };
+        if !rest.is_empty() {
+            return false;
+        }
+        Some((old, new))
+    } else {
+        paths
+            .split_once(" and ")
+            .map(|(old, new)| (old.to_string(), new.to_string()))
+    }) else {
         return false;
     };
 
@@ -424,9 +442,130 @@ fn is_git_binary_payload_line(line: &str) -> bool {
         && !line.starts_with("+++ ")
 }
 
+fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut bytes = Vec::new();
+        let rest_bytes = rest.as_bytes();
+        let mut index = 0usize;
+
+        while index < rest_bytes.len() {
+            let byte = rest_bytes[index];
+            if byte == b'"' {
+                return Some((
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                    &rest[index + 1..],
+                ));
+            }
+
+            if byte == b'\\' && index + 1 < rest_bytes.len() {
+                let next = rest_bytes[index + 1];
+                if next.is_ascii_digit() && next < b'8' {
+                    let mut value = 0u16;
+                    let mut consumed = 0usize;
+                    while consumed < 3 && index + 1 + consumed < rest_bytes.len() {
+                        let digit = rest_bytes[index + 1 + consumed];
+                        if !digit.is_ascii_digit() || digit >= b'8' {
+                            break;
+                        }
+                        value = value * 8 + u16::from(digit - b'0');
+                        consumed += 1;
+                    }
+                    bytes.push(u8::try_from(value).ok()?);
+                    index += 1 + consumed;
+                    continue;
+                }
+
+                bytes.push(match next {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    other => other,
+                });
+                index += 2;
+                continue;
+            }
+
+            bytes.push(byte);
+            index += 1;
+        }
+
+        None
+    } else {
+        let end = input.find('\t').unwrap_or(input.len());
+        let rest = if end < input.len() {
+            &input[end + 1..]
+        } else {
+            &input[end..]
+        };
+        Some((input[..end].to_string(), rest))
+    }
+}
+
+fn normalize_diff_path(path: &str, side_prefix: &str) -> Option<String> {
+    if path == "/dev/null" {
+        None
+    } else {
+        Some(path.strip_prefix(side_prefix).unwrap_or(path).to_string())
+    }
+}
+
+fn parse_diff_git_paths(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("diff --git ")?;
+    if rest.trim_start().starts_with('"') {
+        let (old_path, rest) = parse_git_path_token(rest)?;
+        let (new_path, _) = parse_git_path_token(rest)?;
+        return Some((
+            normalize_diff_path(&old_path, "a/").unwrap_or(old_path),
+            normalize_diff_path(&new_path, "b/").unwrap_or(new_path),
+        ));
+    }
+
+    let rest = rest.strip_prefix("a/")?;
+    let mut fallback = None;
+    let mut search_start = 0usize;
+    while let Some(relative_pos) = rest[search_start..].find(" b/") {
+        let pos = search_start + relative_pos;
+        let old_path = &rest[..pos];
+        let new_path = &rest[pos + 3..];
+        if old_path == new_path {
+            return Some((old_path.to_string(), new_path.to_string()));
+        }
+        if fallback.is_none() {
+            fallback = Some((old_path, new_path));
+        }
+        search_start = pos + 1;
+    }
+
+    let (old_path, new_path) = fallback.unwrap_or((rest, rest));
+    Some((old_path.to_string(), new_path.to_string()))
+}
+
+fn parse_file_header_path(line: &str, marker: &str, side_prefix: &str) -> Option<Option<String>> {
+    let rest = line.strip_prefix(marker)?;
+    let (path, _) = parse_git_path_token(rest)?;
+    Some(normalize_diff_path(&path, side_prefix))
+}
+
+fn parse_metadata_path(rest: &str) -> String {
+    parse_git_path_token(rest)
+        .map(|(path, _)| path)
+        .unwrap_or_else(|| rest.to_string())
+}
+
 fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchParseError> {
     use sem_core::git::types::FileStatus;
 
+    #[derive(Clone, Copy)]
+    enum HunkLineSide {
+        Before,
+        After,
+        Both,
+    }
 
     struct PatchEntry {
         file_path: String,
@@ -434,7 +573,11 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
         status: FileStatus,
         old_sha: Option<String>,
         new_sha: Option<String>,
+        hunk_before_content: String,
+        hunk_after_content: String,
+        last_hunk_side: Option<HunkLineSide>,
         has_valid_hunk: bool,
+        has_hunk_content: bool,
         has_malformed_hunk: bool,
         has_index: bool,
         has_new_file_mode: bool,
@@ -448,6 +591,74 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
         awaiting_git_binary_payload: bool,
         has_git_binary_payload: bool,
         has_invalid_git_binary_patch: bool,
+    }
+
+    impl PatchEntry {
+        fn from_diff_header(line: &str) -> Option<Self> {
+            let (_old_path, file_path) = parse_diff_git_paths(line)?;
+            Some(Self {
+                file_path,
+                old_file_path: None,
+                status: FileStatus::Modified,
+                old_sha: None,
+                new_sha: None,
+                hunk_before_content: String::new(),
+                hunk_after_content: String::new(),
+                last_hunk_side: None,
+                has_valid_hunk: false,
+                has_hunk_content: false,
+                has_malformed_hunk: false,
+                has_index: false,
+                has_new_file_mode: false,
+                has_deleted_file_mode: false,
+                has_old_mode: false,
+                has_new_mode: false,
+                has_rename_from: false,
+                has_rename_to: false,
+                has_binary_marker: false,
+                has_git_binary_patch: false,
+                awaiting_git_binary_payload: false,
+                has_git_binary_payload: false,
+                has_invalid_git_binary_patch: false,
+            })
+        }
+
+        fn push_hunk_line(&mut self, side: HunkLineSide, content: &str) {
+            match side {
+                HunkLineSide::Before => {
+                    self.hunk_before_content.push_str(content);
+                    self.hunk_before_content.push('\n');
+                }
+                HunkLineSide::After => {
+                    self.hunk_after_content.push_str(content);
+                    self.hunk_after_content.push('\n');
+                }
+                HunkLineSide::Both => {
+                    self.hunk_before_content.push_str(content);
+                    self.hunk_before_content.push('\n');
+                    self.hunk_after_content.push_str(content);
+                    self.hunk_after_content.push('\n');
+                }
+            }
+            self.last_hunk_side = Some(side);
+            self.has_hunk_content = true;
+        }
+
+        fn trim_last_hunk_newline(&mut self) {
+            match self.last_hunk_side {
+                Some(HunkLineSide::Before) => {
+                    self.hunk_before_content.pop();
+                }
+                Some(HunkLineSide::After) => {
+                    self.hunk_after_content.pop();
+                }
+                Some(HunkLineSide::Both) => {
+                    self.hunk_before_content.pop();
+                    self.hunk_after_content.pop();
+                }
+                None => {}
+            }
+        }
     }
 
     if patch.trim().is_empty() {
@@ -471,7 +682,7 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
     };
 
     for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
+        if line.starts_with("diff --git ") {
             // Flush previous entry
             if let Some(entry) = current.take() {
                 if entry.has_valid_hunk
@@ -480,33 +691,7 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
                     entries.push(entry);
                 }
             }
-            // Parse "a/path b/path" — the b-side path is after the last " b/"
-            let file_path = if let Some(pos) = rest.rfind(" b/") {
-                rest[pos + 3..].to_string()
-            } else {
-                rest.to_string()
-            };
-            current = Some(PatchEntry {
-                file_path,
-                old_file_path: None,
-                status: FileStatus::Modified,
-                old_sha: None,
-                new_sha: None,
-                has_valid_hunk: false,
-                has_malformed_hunk: false,
-                has_index: false,
-                has_new_file_mode: false,
-                has_deleted_file_mode: false,
-                has_old_mode: false,
-                has_new_mode: false,
-                has_rename_from: false,
-                has_rename_to: false,
-                has_binary_marker: false,
-                has_git_binary_patch: false,
-                awaiting_git_binary_payload: false,
-                has_git_binary_payload: false,
-                has_invalid_git_binary_patch: false,
-            });
+            current = PatchEntry::from_diff_header(line);
         } else if let Some(ref mut entry) = current {
             let is_git_binary_chunk_header =
                 line.starts_with("literal ") || line.starts_with("delta ");
@@ -519,6 +704,29 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
                     entry.awaiting_git_binary_payload = false;
                     entry.has_invalid_git_binary_patch = true;
                 }
+            } else if line.starts_with("@@") {
+                if is_unified_hunk_header(line) {
+                    entry.has_valid_hunk = true;
+                    entry.last_hunk_side = None;
+                    valid_hunk_count += 1;
+                } else {
+                    malformed_hunk_count += 1;
+                    entry.has_malformed_hunk = true;
+                    eprintln!(
+                        "warning: malformed hunk header in {}: '{}' (expected '@@ -N,M +N,M @@')",
+                        entry.file_path, line
+                    );
+                }
+            } else if entry.has_valid_hunk {
+                if line == r"\ No newline at end of file" {
+                    entry.trim_last_hunk_newline();
+                } else if let Some(content) = line.strip_prefix(' ') {
+                    entry.push_hunk_line(HunkLineSide::Both, content);
+                } else if let Some(content) = line.strip_prefix('-') {
+                    entry.push_hunk_line(HunkLineSide::Before, content);
+                } else if let Some(content) = line.strip_prefix('+') {
+                    entry.push_hunk_line(HunkLineSide::After, content);
+                }
             } else if line.starts_with("new file mode") {
                 entry.status = FileStatus::Added;
                 entry.has_new_file_mode = true;
@@ -529,6 +737,16 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
                 entry.has_old_mode = true;
             } else if line.starts_with("new mode") {
                 entry.has_new_mode = true;
+            } else if let Some(old_path) = parse_file_header_path(line, "--- ", "a/") {
+                if old_path.is_none() {
+                    entry.status = FileStatus::Added;
+                }
+            } else if let Some(new_path) = parse_file_header_path(line, "+++ ", "b/") {
+                if let Some(new_path) = new_path {
+                    entry.file_path = new_path;
+                } else {
+                    entry.status = FileStatus::Deleted;
+                }
             } else if is_binary_files_marker(line) {
                 entry.has_binary_marker = true;
             } else if line.starts_with("GIT binary patch") {
@@ -536,11 +754,11 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
             } else if entry.has_git_binary_patch && is_git_binary_chunk_header {
                 entry.awaiting_git_binary_payload = true;
             } else if let Some(rest) = line.strip_prefix("rename from ") {
-                entry.old_file_path = Some(rest.to_string());
+                entry.old_file_path = Some(parse_metadata_path(rest));
                 entry.status = FileStatus::Renamed;
                 entry.has_rename_from = true;
             } else if let Some(rest) = line.strip_prefix("rename to ") {
-                entry.file_path = rest.to_string();
+                entry.file_path = parse_metadata_path(rest);
                 entry.has_rename_to = true;
             } else if let Some(rest) = line.strip_prefix("index ") {
                 // "index abc123..def456 100644" or "index abc123..def456"
@@ -553,18 +771,6 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
                     if new != "0000000" && !new.chars().all(|c| c == '0') {
                         entry.new_sha = Some(new.to_string());
                     }
-                }
-            } else if line.starts_with("@@") {
-                if is_unified_hunk_header(line) {
-                    entry.has_valid_hunk = true;
-                    valid_hunk_count += 1;
-                } else {
-                    malformed_hunk_count += 1;
-                    entry.has_malformed_hunk = true;
-                    eprintln!(
-                        "warning: malformed hunk header in {}: '{}' (expected '@@ -N,M +N,M @@')",
-                        entry.file_path, line
-                    );
                 }
             }
         }
@@ -596,18 +802,48 @@ fn parse_unified_diff(patch: &str, cwd: &str) -> Result<Vec<FileChange>, PatchPa
             None
         }
     };
+    let git_hash_object_matches = |file_path: &str, sha_prefix: &str| -> bool {
+        if !Path::new(cwd).join(file_path).exists() {
+            return false;
+        }
+        let output = process::Command::new("git")
+            .args(["hash-object", "--", file_path])
+            .current_dir(cwd)
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let hash = String::from_utf8_lossy(&output.stdout);
+        hash.trim().starts_with(sha_prefix)
+    };
 
     Ok(entries
         .into_iter()
         .map(|e| {
-            let before_content = e.old_sha.as_deref().and_then(&git_show);
+            let mut before_content = e.old_sha.as_deref().and_then(&git_show);
             let mut after_content = e.new_sha.as_deref().and_then(&git_show);
 
-            // Fallback: if git show fails for the new SHA (e.g. unstaged working
-            // tree changes where the blob doesn't exist yet), read from disk.
-            if after_content.is_none() && e.new_sha.is_some() {
-                let file = Path::new(cwd).join(&e.file_path);
-                after_content = std::fs::read_to_string(&file).ok();
+            // If git cannot resolve the target blob for a local worktree diff,
+            // read the target file from disk when the base blob resolved.
+            if after_content.is_none()
+                && before_content.is_some()
+                && e.new_sha
+                    .as_deref()
+                    .is_some_and(|sha| git_hash_object_matches(&e.file_path, sha))
+            {
+                after_content = std::fs::read_to_string(Path::new(cwd).join(&e.file_path)).ok();
+            }
+
+            if e.has_hunk_content {
+                if before_content.is_none() {
+                    before_content = Some(e.hunk_before_content.clone());
+                }
+                if after_content.is_none() {
+                    after_content = Some(e.hunk_after_content.clone());
+                }
             }
 
             if before_content.is_none() && after_content.is_none() {
@@ -871,9 +1107,10 @@ pub fn diff_command(mut opts: DiffOptions) {
             changes
                 .into_iter()
                 .filter(|fc| {
-                    parsed.pathspecs.iter().any(|spec| {
-                        file_change_matches_spec(fc, spec)
-                    })
+                    parsed
+                        .pathspecs
+                        .iter()
+                        .any(|spec| file_change_matches_spec(fc, spec))
                 })
                 .collect()
         };
@@ -1242,6 +1479,45 @@ mod tests {
     }
 
     #[test]
+    fn quoted_git_path_tokens_reject_octal_overflow() {
+        assert_eq!(
+            parse_git_path_token(r#""a/\303\274n.py""#).map(|(path, rest)| (path, rest)),
+            Some(("a/ün.py".to_string(), ""))
+        );
+        assert!(parse_git_path_token(r#""a/\777.py""#).is_none());
+        assert_eq!(
+            parse_git_path_token(r#""a/\9.py""#).map(|(path, rest)| (path, rest)),
+            Some(("a/9.py".to_string(), ""))
+        );
+    }
+
+    #[test]
+    fn unquoted_git_path_tokens_consume_tab_metadata() {
+        assert_eq!(
+            parse_git_path_token("a/app.py\t2026-01-01").map(|(path, rest)| (path, rest)),
+            Some(("a/app.py".to_string(), "2026-01-01"))
+        );
+    }
+
+    #[test]
+    fn diff_git_paths_use_first_fallback_split_for_renames() {
+        assert_eq!(
+            parse_diff_git_paths("diff --git a/foo b/bar b/baz"),
+            Some(("foo".to_string(), "bar b/baz".to_string()))
+        );
+    }
+
+    #[test]
+    fn binary_files_marker_accepts_quoted_paths_without_trailing_content() {
+        assert!(is_binary_files_marker(
+            r#"Binary files "a/\303\274n.bin" and "b/\303\274n.bin" differ"#
+        ));
+        assert!(!is_binary_files_marker(
+            r#"Binary files "a/blob.bin" and "b/blob.bin"  differ"#
+        ));
+    }
+
+    #[test]
     fn parse_unified_diff_rejects_empty_input() {
         assert_eq!(
             parse_unified_diff("", ".").unwrap_err(),
@@ -1290,6 +1566,83 @@ mod tests {
         let changes = parse_unified_diff(patch, ".").unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].file_path, "a.ts");
+    }
+
+    #[test]
+    fn parse_unified_diff_decodes_quoted_git_paths() {
+        let patch = concat!(
+            "diff --git \"a/\\303\\274n\\303\\257c\\303\\266d\\303\\251.py\" \"b/\\303\\274n\\303\\257c\\303\\266d\\303\\251.py\"\n",
+            "--- \"a/\\303\\274n\\303\\257c\\303\\266d\\303\\251.py\"\n",
+            "+++ \"b/\\303\\274n\\303\\257c\\303\\266d\\303\\251.py\"\n",
+            "@@ -1,2 +1,2 @@\n",
+            " def foo():\n",
+            "-    return 1\n",
+            "+    return 2\n",
+        );
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "ünïcödé.py");
+        assert_eq!(
+            changes[0].before_content.as_deref(),
+            Some("def foo():\n    return 1\n")
+        );
+        assert_eq!(
+            changes[0].after_content.as_deref(),
+            Some("def foo():\n    return 2\n")
+        );
+    }
+
+    #[test]
+    fn parse_unified_diff_uses_file_headers_for_paths_containing_b_prefix() {
+        let patch = concat!(
+            "diff --git a/my b/app.py b/my b/app.py\n",
+            "--- a/my b/app.py\n",
+            "+++ b/my b/app.py\n",
+            "@@ -1,2 +1,2 @@\n",
+            " def foo():\n",
+            "-    return 1\n",
+            "+    return 2\n",
+        );
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "my b/app.py");
+    }
+
+    #[test]
+    fn parse_unified_diff_reconstructs_indexless_hunk_content() {
+        let patch = concat!(
+            "diff --git a/app.py b/app.py\n",
+            "--- a/app.py\n",
+            "+++ b/app.py\n",
+            "@@ -1,2 +1,2 @@\n",
+            " def foo():\n",
+            "-    return 1\n",
+            "+    return 2\n",
+        );
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].before_content.as_deref(),
+            Some("def foo():\n    return 1\n")
+        );
+        assert_eq!(
+            changes[0].after_content.as_deref(),
+            Some("def foo():\n    return 2\n")
+        );
+    }
+
+    #[test]
+    fn parse_unified_diff_reads_hunkless_b_prefix_path_from_diff_header() {
+        let patch = "diff --git a/my b/app.py b/my b/app.py\n\
+                     old mode 100644\n\
+                     new mode 100755\n";
+
+        let changes = parse_unified_diff(patch, ".").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "my b/app.py");
     }
 
     #[test]

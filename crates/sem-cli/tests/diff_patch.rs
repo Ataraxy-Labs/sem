@@ -74,6 +74,17 @@ fn run_diff_patch(input: &str) -> Output {
     run_sem(&["diff", "--patch"], input.as_bytes(), None)
 }
 
+fn diff_patch_json(input: &[u8], cwd: &Path) -> serde_json::Value {
+    let output = run_sem(&["diff", "--patch", "--json"], input, Some(cwd));
+    assert!(
+        output.status.success(),
+        "sem diff --patch --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout should be json")
+}
+
 fn changed_app_patch() -> (TempRepo, Vec<u8>) {
     let repo = TempRepo::new();
     std::fs::write(
@@ -169,6 +180,119 @@ fn patch_mode_accepts_hunkless_git_metadata_patches() {
 
     assert!(output.status.success());
     assert!(!stderr.contains("no recognizable diff hunks"));
+}
+
+#[test]
+fn patch_mode_accepts_default_quoted_non_ascii_paths() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.path.join("ünïcödé.py"), "def foo():\n    return 1\n")
+        .expect("write initial file");
+    run_git(&repo.path, &["add", "ünïcödé.py"]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+    std::fs::write(repo.path.join("ünïcödé.py"), "def foo():\n    return 2\n")
+        .expect("write changed file");
+    run_git(&repo.path, &["add", "ünïcödé.py"]);
+
+    let patch = run_git(
+        &repo.path,
+        &["-c", "core.quotepath=true", "diff", "--cached"],
+    )
+    .stdout;
+    let patch_text = String::from_utf8_lossy(&patch);
+    assert!(patch_text.contains("\"a/\\303\\274n\\303\\257c\\303\\266d\\303\\251.py\""));
+
+    let json = diff_patch_json(&patch, &repo.path);
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["filePath"].as_str(), Some("ünïcödé.py"));
+    assert_eq!(changes[0]["entityName"].as_str(), Some("foo"));
+    assert_eq!(changes[0]["changeType"].as_str(), Some("modified"));
+}
+
+#[test]
+fn patch_mode_preserves_paths_containing_b_prefix() {
+    let repo = TempRepo::new();
+    std::fs::create_dir(repo.path.join("my b")).expect("create directory");
+    std::fs::write(repo.path.join("my b/app.py"), "def foo():\n    return 1\n")
+        .expect("write initial file");
+    run_git(&repo.path, &["add", "my b/app.py"]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+    std::fs::write(repo.path.join("my b/app.py"), "def foo():\n    return 2\n")
+        .expect("write changed file");
+    run_git(&repo.path, &["add", "my b/app.py"]);
+
+    let patch = run_git(
+        &repo.path,
+        &["-c", "core.quotepath=false", "diff", "--cached"],
+    )
+    .stdout;
+
+    let json = diff_patch_json(&patch, &repo.path);
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["filePath"].as_str(), Some("my b/app.py"));
+    assert_eq!(changes[0]["entityName"].as_str(), Some("foo"));
+}
+
+#[test]
+fn patch_mode_reconstructs_indexless_hunk_content() {
+    let repo = TempRepo::new();
+    let patch = concat!(
+        "diff --git a/app.py b/app.py\n",
+        "--- a/app.py\n",
+        "+++ b/app.py\n",
+        "@@ -1,2 +1,2 @@\n",
+        " def foo():\n",
+        "-    return 1\n",
+        "+    return 2\n",
+    )
+    .as_bytes();
+
+    let json = diff_patch_json(patch, &repo.path);
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["filePath"].as_str(), Some("app.py"));
+    assert_eq!(changes[0]["entityName"].as_str(), Some("foo"));
+    assert_eq!(changes[0]["changeType"].as_str(), Some("modified"));
+}
+
+#[test]
+fn patch_mode_uses_hunks_when_new_blob_is_absent() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.path.join("app.py"), "def foo():\n    return 1\n")
+        .expect("write initial file");
+    run_git(&repo.path, &["add", "app.py"]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+    let old_sha = run_git(&repo.path, &["rev-parse", "HEAD:app.py"]).stdout;
+    let old_sha = String::from_utf8(old_sha).expect("old sha should be utf8");
+    let patch = format!(
+        concat!(
+            "diff --git a/app.py b/app.py\n",
+            "index {}..deadbee 100644\n",
+            "--- a/app.py\n",
+            "+++ b/app.py\n",
+            "@@ -1,2 +1,2 @@\n",
+            " def foo():\n",
+            "-    return 1\n",
+            "+    return 2\n",
+        ),
+        old_sha.trim()
+    );
+
+    let json = diff_patch_json(patch.as_bytes(), &repo.path);
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["filePath"].as_str(), Some("app.py"));
+    assert_eq!(changes[0]["entityName"].as_str(), Some("foo"));
+    assert_eq!(changes[0]["changeType"].as_str(), Some("modified"));
 }
 
 #[test]
