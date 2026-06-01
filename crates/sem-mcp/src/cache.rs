@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{params, Connection, Transaction};
 use sem_core::model::entity::SemanticEntity;
@@ -76,6 +78,182 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CACHE_SCHEMA_SQL, index_sql, CACHE_SCHEMA_VERSION
     );
     conn.execute_batch(&schema_sql)
+}
+
+pub fn cache_db_path(repo_root: &Path) -> Option<PathBuf> {
+    Some(cache_dir_for_repo(repo_root)?.join("cache.db"))
+}
+
+pub fn cache_dir_for_repo(repo_root: &Path) -> Option<PathBuf> {
+    Some(cache_root(repo_root)?.join(repo_cache_key(repo_root)))
+}
+
+fn cache_root(repo_root: &Path) -> Option<PathBuf> {
+    let repo_lexical = normalize_lexical(&absolute_path(repo_root));
+    let repo_resolved = canonicalize_existing_prefix(&repo_lexical);
+
+    for candidate in cache_root_candidates() {
+        let lexical = normalize_lexical(&absolute_path(&candidate));
+        let resolved = canonicalize_existing_prefix(&lexical);
+        if path_is_external_to_repo(&lexical, &resolved, &repo_lexical, &repo_resolved) {
+            return Some(resolved);
+        }
+    }
+
+    fallback_external_cache_root(&repo_lexical, &repo_resolved)
+}
+
+fn cache_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = non_empty_env("SEM_CACHE_DIR") {
+        candidates.push(path);
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(path) = non_empty_env("LOCALAPPDATA").or_else(|| non_empty_env("APPDATA")) {
+            candidates.push(path.join("sem").join("repos"));
+        }
+    } else {
+        if let Some(path) = non_empty_env("XDG_CACHE_HOME") {
+            candidates.push(path.join("sem").join("repos"));
+        }
+
+        if cfg!(target_os = "macos") {
+            if let Some(home) = non_empty_env("HOME") {
+                candidates.push(
+                    home.join("Library")
+                        .join("Caches")
+                        .join("sem")
+                        .join("repos"),
+                );
+            }
+        }
+    }
+
+    if let Some(home) = non_empty_env("HOME").or_else(|| non_empty_env("USERPROFILE")) {
+        candidates.push(home.join(".cache").join("sem").join("repos"));
+    }
+
+    candidates.push(env::temp_dir().join("sem").join("repos"));
+    candidates
+}
+
+fn fallback_external_cache_root(repo_lexical: &Path, repo_resolved: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(parent) = repo_resolved.parent() {
+        candidates.push(parent.join(".sem-cache").join("repos"));
+    }
+    candidates.push(env::temp_dir().join("sem").join("repos"));
+
+    for candidate in candidates {
+        let lexical = normalize_lexical(&absolute_path(&candidate));
+        let resolved = canonicalize_existing_prefix(&lexical);
+        if path_is_external_to_repo(&lexical, &resolved, repo_lexical, repo_resolved) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn path_is_external_to_repo(
+    candidate_lexical: &Path,
+    candidate_resolved: &Path,
+    repo_lexical: &Path,
+    repo_resolved: &Path,
+) -> bool {
+    let lexical_is_inside =
+        candidate_lexical.starts_with(repo_lexical) || candidate_lexical.starts_with(repo_resolved);
+    let resolved_is_inside = candidate_resolved.starts_with(repo_lexical)
+        || candidate_resolved.starts_with(repo_resolved);
+
+    !lexical_is_inside && !resolved_is_inside
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut missing = Vec::<OsString>::new();
+
+    for ancestor in path.ancestors() {
+        if let Ok(existing) = ancestor.canonicalize() {
+            let mut resolved = normalize_lexical(&existing);
+            for part in missing.iter().rev() {
+                resolved.push(part);
+            }
+            return normalize_lexical(&resolved);
+        }
+
+        if let Some(part) = ancestor.file_name() {
+            missing.push(part.to_os_string());
+        }
+    }
+
+    normalize_lexical(path)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    let mut has_prefix = false;
+    let mut has_root = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => {
+                has_prefix = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::RootDir => {
+                has_root = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.as_os_str().is_empty() {
+                    if !has_prefix && !has_root {
+                        normalized.push("..");
+                    }
+                } else if normalized.ends_with("..") {
+                    normalized.push("..");
+                } else if !normalized.pop() {
+                    if !has_prefix && !has_root {
+                        normalized.push("..");
+                    }
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn non_empty_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn repo_cache_key(repo_root: &Path) -> String {
+    let canonical = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path(repo_root));
+    let mut hash = 0xcbf29ce484222325u64;
+
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    format!("{hash:016x}")
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
@@ -218,8 +396,10 @@ pub struct DiskCache {
 
 impl DiskCache {
     pub fn open(repo_root: &Path) -> Result<Self, rusqlite::Error> {
-        let cache_dir = repo_root.join(".sem");
-        std::fs::create_dir_all(&cache_dir).ok();
+        let cache_dir = cache_dir_for_repo(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|_| rusqlite::Error::InvalidPath(cache_dir.clone()))?;
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(db_path)?;
 
@@ -683,7 +863,29 @@ impl DiskCache {
 mod tests {
     use super::*;
 
+    fn test_cache_root() -> &'static Path {
+        static CACHE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+        CACHE_ROOT
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir()
+                    .join(format!("sem-mcp-test-cache-{}-{nanos}", std::process::id()));
+                std::fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .as_path()
+    }
+
+    fn configure_test_cache_root() {
+        std::env::set_var("SEM_CACHE_DIR", test_cache_root());
+    }
+
     fn temp_repo_root(test_name: &str) -> std::path::PathBuf {
+        configure_test_cache_root();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -707,6 +909,13 @@ mod tests {
     fn sample_files(root: &Path) -> Vec<String> {
         write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
         vec!["sample.foo".to_string()]
+    }
+
+    fn cleanup(root: std::path::PathBuf) {
+        let _ = std::fs::remove_dir_all(&root);
+        if let Some(cache_dir) = cache_dir_for_repo(&root) {
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
     }
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
@@ -764,7 +973,7 @@ mod tests {
     }
 
     fn seed_unsupported_cache(root: &Path, version: i32) {
-        let cache_dir = root.join(".sem");
+        let cache_dir = cache_dir_for_repo(root).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -829,7 +1038,7 @@ mod tests {
         let removed_gitattributes = compute_manifest_hash(&root, &files).unwrap();
         assert_eq!(without_gitattributes, removed_gitattributes);
 
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -847,7 +1056,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -864,7 +1073,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -881,7 +1090,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -891,9 +1100,27 @@ mod tests {
 
         assert_eq!(read_user_version(&cache), CACHE_SCHEMA_VERSION);
         assert_lookup_indexes(&cache);
+        assert!(cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cache_path_is_external_and_canonicalized() {
+        let root = temp_repo_root("external-path");
+        let cache_dir = cache_dir_for_repo(&root).unwrap();
+
+        assert_eq!(cache_dir, cache_dir_for_repo(&root.join(".")).unwrap());
+        assert!(!cache_dir.starts_with(&root));
+
+        let cache = DiskCache::open(&root).unwrap();
+        assert!(cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
+
+        drop(cache);
+        cleanup(root);
     }
 
     #[test]
@@ -911,7 +1138,7 @@ mod tests {
             }
 
             drop(cache);
-            let _ = std::fs::remove_dir_all(root);
+            cleanup(root);
         }
     }
 }

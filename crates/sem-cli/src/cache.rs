@@ -21,8 +21,10 @@ pub struct DiskCache {
 
 impl DiskCache {
     pub fn open(repo_root: &Path) -> Result<Self, rusqlite::Error> {
-        let cache_dir = repo_root.join(".sem");
-        std::fs::create_dir_all(&cache_dir).ok();
+        let cache_dir = shared_cache::cache_dir_for_repo(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|_| rusqlite::Error::InvalidPath(cache_dir.clone()))?;
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(db_path)?;
 
@@ -506,7 +508,29 @@ impl DiskCache {
 mod tests {
     use super::*;
 
+    fn test_cache_root() -> &'static Path {
+        static CACHE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+        CACHE_ROOT
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir()
+                    .join(format!("sem-cli-test-cache-{}-{nanos}", std::process::id()));
+                std::fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .as_path()
+    }
+
+    fn configure_test_cache_root() {
+        std::env::set_var("SEM_CACHE_DIR", test_cache_root());
+    }
+
     fn temp_repo_root(test_name: &str) -> std::path::PathBuf {
+        configure_test_cache_root();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -530,6 +554,13 @@ mod tests {
     fn sample_files(root: &Path) -> Vec<String> {
         write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
         vec!["sample.foo".to_string()]
+    }
+
+    fn cleanup(root: std::path::PathBuf) {
+        let _ = std::fs::remove_dir_all(&root);
+        if let Some(cache_dir) = shared_cache::cache_dir_for_repo(&root) {
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
     }
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
@@ -594,7 +625,7 @@ mod tests {
     }
 
     fn seed_unsupported_cache(root: &Path, version: i32) {
-        let cache_dir = root.join(".sem");
+        let cache_dir = shared_cache::cache_dir_for_repo(root).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -654,7 +685,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -671,7 +702,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -688,7 +719,7 @@ mod tests {
         assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
     }
 
     #[test]
@@ -704,7 +735,7 @@ mod tests {
         assert!(mcp_cache.load(&cli_to_mcp, &cli_to_mcp_files).is_some());
         drop(mcp_cache);
         drop(cli_cache);
-        let _ = std::fs::remove_dir_all(cli_to_mcp);
+        cleanup(cli_to_mcp);
 
         let mcp_to_cli = temp_repo_root("mcp-to-cli");
         let mcp_to_cli_files = sample_files(&mcp_to_cli);
@@ -717,7 +748,7 @@ mod tests {
         assert!(cli_cache.load(&mcp_to_cli, &mcp_to_cli_files).is_some());
         drop(cli_cache);
         drop(mcp_cache);
-        let _ = std::fs::remove_dir_all(mcp_to_cli);
+        cleanup(mcp_to_cli);
     }
 
     #[test]
@@ -730,9 +761,23 @@ mod tests {
             shared_cache::CACHE_SCHEMA_VERSION
         );
         assert_lookup_indexes(&cache);
+        assert!(shared_cache::cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
 
         drop(cache);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_uses_shared_external_cache_path() {
+        let root = temp_repo_root("external-path");
+        let cache = DiskCache::open(&root).unwrap();
+
+        assert!(shared_cache::cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
+
+        drop(cache);
+        cleanup(root);
     }
 
     #[test]
@@ -753,7 +798,7 @@ mod tests {
             }
 
             drop(cache);
-            let _ = std::fs::remove_dir_all(root);
+            cleanup(root);
         }
     }
 }

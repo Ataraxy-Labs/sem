@@ -512,7 +512,7 @@
       </div>
 
       <div class="insight">
-        Two cache layers: in-memory (keyed by file manifest hash) and SQLite at <code style="color:var(--green)">.sem/cache.db</code>.
+        Two cache layers: in-memory (keyed by file manifest hash) and SQLite under the OS cache directory or <code style="color:var(--green)">SEM_CACHE_DIR</code>.
         Memory cache serves sequential calls in the same session. SQLite cache survives process restarts.
         If any file's mtime changes, the cache is invalidated and the graph rebuilds.
       </div>
