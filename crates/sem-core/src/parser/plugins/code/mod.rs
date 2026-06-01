@@ -649,6 +649,68 @@ class L1 {
     }
 
     #[test]
+    fn test_typescript_object_literal_methods_are_nested_under_variable() {
+        let code = r#"
+export const svc = {
+  open(): void {},
+  close(): void {},
+  reset: () => {
+    class ResetJob {}
+    return new ResetJob();
+  },
+  flush: function() {
+    return true;
+  },
+  "key${x}": () => true,
+  "": () => false,
+  [Symbol.iterator]: function() {},
+  value: 1,
+};
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "service.ts");
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                        .collect::<Vec<_>>()
+                )
+            })
+        };
+
+        let svc = find("svc");
+        assert_eq!(svc.entity_type, "variable");
+        let svc_id = svc.id.clone();
+
+        for name in ["open", "close", "reset", "flush", "key${x}"] {
+            let method = find(name);
+            assert_eq!(method.entity_type, "method");
+            assert_eq!(method.parent_id.as_deref(), Some(svc_id.as_str()));
+        }
+
+        let reset = find("reset");
+        let reset_job = find("ResetJob");
+        assert_eq!(reset_job.entity_type, "class");
+        assert_eq!(reset_job.parent_id.as_deref(), Some(reset.id.as_str()));
+        assert_eq!(find("open").id, "service.ts::variable::svc::open");
+        assert!(
+            entities.iter().all(|e| e.name != "value"),
+            "non-function object properties should not become entities"
+        );
+        assert!(
+            entities.iter().all(|e| !e.name.is_empty()),
+            "empty object keys should not become entities"
+        );
+        assert!(
+            entities.iter().all(|e| e.name != "[Symbol.iterator]"),
+            "computed object keys should not become entities"
+        );
+    }
+
+    #[test]
     fn test_nested_functions_python() {
         let code = "def outer():\n    def inner():\n        return 42\n    return inner()\n";
         let plugin = CodeParserPlugin;

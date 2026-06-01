@@ -213,6 +213,7 @@ fn suppress_redundant_parents(
         "export",
         "package",
         "field",
+        "variable",
         "svelte_instance_script",
         "svelte_module_script",
         "object",
@@ -339,22 +340,68 @@ fn strip_children_content(
     parent_start_line: usize,
     children: &[&SemanticEntity],
 ) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut excluded: HashSet<usize> = HashSet::new();
+    let mut line_starts = vec![0];
+    for (idx, ch) in content.char_indices() {
+        if ch == '\n' {
+            line_starts.push(idx + ch.len_utf8());
+        }
+    }
+
+    let mut excluded_ranges: Vec<(usize, usize)> = Vec::new();
     for child in children {
         let start_idx = child.start_line.saturating_sub(parent_start_line);
         let end_idx = child.end_line.saturating_sub(parent_start_line);
-        for i in start_idx..=end_idx.max(start_idx) {
-            if i < lines.len() {
-                excluded.insert(i);
+        let search_start = line_starts.get(start_idx).copied().unwrap_or(0);
+        let search_end = line_starts
+            .get(end_idx.saturating_add(1))
+            .copied()
+            .unwrap_or(content.len())
+            .min(content.len());
+
+        if !child.content.is_empty() && search_start <= search_end {
+            if let Some(relative_start) = content[search_start..search_end].find(&child.content) {
+                let start = search_start + relative_start;
+                excluded_ranges.push((start, start + child.content.len()));
+                continue;
             }
         }
     }
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !excluded.contains(i))
-        .map(|(_, l)| l.trim())
+
+    if excluded_ranges.is_empty() {
+        return normalize_content_for_parent_suppression(content);
+    }
+
+    excluded_ranges.sort_unstable();
+    let mut merged_ranges: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in excluded_ranges {
+        if let Some((_, merged_end)) = merged_ranges.last_mut() {
+            if start <= *merged_end {
+                *merged_end = (*merged_end).max(end);
+                continue;
+            }
+        }
+        merged_ranges.push((start, end));
+    }
+
+    let mut stripped = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for (start, end) in merged_ranges {
+        if cursor < start {
+            stripped.push_str(&content[cursor..start]);
+        }
+        cursor = end.max(cursor);
+    }
+    if cursor < content.len() {
+        stripped.push_str(&content[cursor..]);
+    }
+
+    normalize_content_for_parent_suppression(&stripped)
+}
+
+fn normalize_content_for_parent_suppression(content: &str) -> String {
+    content
+        .lines()
+        .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
@@ -770,6 +817,131 @@ mod tests {
         assert!(
             !result.changes.iter().any(|c| c.entity_type == "field"),
             "field containers should be suppressed when only a nested method changed, got: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn test_nested_typescript_object_literal_diff_reports_leaf_method() {
+        let before = r#"export const svc = {
+  open(): number { return 1; },
+  close(): number { return 0; },
+};
+"#;
+        let after = r#"export const svc = {
+  open(): number { return 2; },
+  close(): number { return 0; },
+};
+"#;
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("service.ts", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let changes: Vec<_> = result
+            .changes
+            .iter()
+            .map(|c| (c.entity_name.as_str(), c.entity_type.as_str()))
+            .collect();
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_id == "service.ts::variable::svc::open"),
+            "expected object-literal method leaf change, got: {changes:?}"
+        );
+        assert!(
+            !result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "svc" && c.entity_type == "variable"),
+            "variable container should be suppressed when only a nested method changed, got: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn test_nested_typescript_object_literal_pair_diff_reports_leaf_methods() {
+        let before = r#"export const svc = {
+  reset: () => 1,
+  flush: function() { return 0; },
+};
+"#;
+        let after = r#"export const svc = {
+  reset: () => 2,
+  flush: function() { return 3; },
+};
+"#;
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("service.ts", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let changes: Vec<_> = result
+            .changes
+            .iter()
+            .map(|c| (c.entity_name.as_str(), c.entity_type.as_str()))
+            .collect();
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_id == "service.ts::variable::svc::reset"),
+            "expected arrow-valued object method change, got: {changes:?}"
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_id == "service.ts::variable::svc::flush"),
+            "expected function-valued object method change, got: {changes:?}"
+        );
+        assert!(
+            !result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "svc" && c.entity_type == "variable"),
+            "variable container should be suppressed when only nested function-valued properties changed, got: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn test_inline_typescript_object_literal_keeps_parent_variable_changes() {
+        let before = "export const svc = { open() { return 1; }, enabled: true };\n";
+        let after = "export let svc = { open() { return 2; }, enabled: false };\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("service.ts", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let changes: Vec<_> = result
+            .changes
+            .iter()
+            .map(|c| (c.entity_name.as_str(), c.entity_type.as_str()))
+            .collect();
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_id == "service.ts::variable::svc::open"),
+            "expected nested method change, got: {changes:?}"
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "svc" && c.entity_type == "variable"),
+            "parent variable change should remain visible, got: {changes:?}"
         );
     }
 

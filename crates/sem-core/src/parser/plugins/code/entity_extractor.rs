@@ -268,11 +268,11 @@ fn visit_node(
                     // their own, so their initializer is traversed under the
                     // surrounding parent, matching the single-declarator path.
                     let initializer_parent = emitted_entity_id.as_deref().or(parent_id);
-                    if let Some(initializer_child) =
-                        js_ts_initializer_child(config, *declarator, initializer_parent)
-                    {
-                        initializer_children.push(initializer_child);
-                    }
+                    initializer_children.extend(js_ts_initializer_children(
+                        config,
+                        *declarator,
+                        initializer_parent,
+                    ));
                 }
                 // The worklist is LIFO; push in reverse so initializers are
                 // visited in source order.
@@ -381,6 +381,31 @@ fn visit_node(
                 }
                 continue;
             }
+        }
+
+        if let Some((name, value)) =
+            extract_js_ts_object_function_pair(node, config, source, suppression_context)
+        {
+            let content = node_text(node, source).to_string();
+            let struct_hash = compute_structural_hash(node, source);
+            let entity = SemanticEntity {
+                id: build_entity_id(file_path, "method", &name, parent_id),
+                file_path: file_path.to_string(),
+                entity_type: "method".to_string(),
+                name,
+                parent_id: parent_id.map(String::from),
+                content_hash: content_hash(&content),
+                structural_hash: Some(struct_hash),
+                content,
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                metadata: None,
+            };
+
+            let entity_id = entity.id.clone();
+            entities.push(entity);
+            worklist.push((value, Some(entity_id), Some(value.kind().to_string())));
+            continue;
         }
 
         if config.entity_node_types.contains(&node_type) {
@@ -1074,6 +1099,14 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
         for child in node.named_children(&mut cursor) {
             if child.kind() == "module_type_name" {
                 return Some((child.start_byte(), child.end_byte()));
+            }
+        }
+    }
+
+    if node_type == "pair" {
+        if let Some(key) = node.child_by_field_name("key") {
+            if js_ts_object_key_name(key, _source).is_some() {
+                return Some((key.start_byte(), key.end_byte()));
             }
         }
     }
@@ -1898,26 +1931,63 @@ fn push_js_ts_initializer_children<'tree>(
     node: Node<'tree>,
     entity_id: &str,
 ) {
-    if let Some(initializer_child) = js_ts_initializer_child(config, node, Some(entity_id)) {
+    let initializer_children = js_ts_initializer_children(config, node, Some(entity_id));
+    for initializer_child in initializer_children.into_iter().rev() {
         worklist.push(initializer_child);
     }
 }
 
-fn js_ts_initializer_child<'tree>(
+fn js_ts_initializer_children<'tree>(
     config: &LanguageConfig,
     node: Node<'tree>,
     parent_id: Option<&str>,
-) -> Option<(Node<'tree>, Option<String>, Option<String>)> {
+) -> Vec<(Node<'tree>, Option<String>, Option<String>)> {
     if !matches!(config.id, "typescript" | "tsx" | "javascript") {
-        return None;
+        return Vec::new();
     }
 
-    let value = js_ts_initializer_value(config, node)?;
-    Some((
+    let Some(value) = js_ts_initializer_value(config, node) else {
+        return Vec::new();
+    };
+
+    if value.kind() == "object" {
+        return js_ts_object_initializer_children(value, parent_id);
+    }
+
+    vec![(
         value,
         parent_id.map(String::from),
         Some(value.kind().to_string()),
-    ))
+    )]
+}
+
+fn js_ts_object_initializer_children<'tree>(
+    object: Node<'tree>,
+    parent_id: Option<&str>,
+) -> Vec<(Node<'tree>, Option<String>, Option<String>)> {
+    let mut cursor = object.walk();
+    object
+        .named_children(&mut cursor)
+        .filter_map(|child| {
+            let suppression_context = if child.kind() == "method_definition" {
+                Some(child.kind().to_string())
+            } else if js_ts_pair_function_value(child).is_some() {
+                Some("object".to_string())
+            } else {
+                None
+            };
+
+            if let Some(suppression_context) = suppression_context {
+                Some((
+                    child,
+                    parent_id.map(String::from),
+                    Some(suppression_context),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn js_ts_initializer_value<'tree>(
@@ -1940,7 +2010,59 @@ fn js_ts_initializer_value<'tree>(
 }
 
 fn is_js_ts_initializer_node(config: &LanguageConfig, node: Node) -> bool {
-    config.scope_boundary_types.contains(&node.kind()) || node.kind() == "class"
+    config.scope_boundary_types.contains(&node.kind()) || matches!(node.kind(), "class" | "object")
+}
+
+fn extract_js_ts_object_function_pair<'tree>(
+    node: Node<'tree>,
+    config: &LanguageConfig,
+    source: &[u8],
+    suppression_context: Option<&str>,
+) -> Option<(String, Node<'tree>)> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript")
+        || suppression_context != Some("object")
+    {
+        return None;
+    }
+
+    let value = js_ts_pair_function_value(node)?;
+    let key = node.child_by_field_name("key")?;
+    Some((js_ts_object_key_name(key, source)?, value))
+}
+
+fn js_ts_pair_function_value(node: Node) -> Option<Node> {
+    if node.kind() != "pair" {
+        return None;
+    }
+
+    let value = node.child_by_field_name("value")?;
+    matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    )
+    .then_some(value)
+}
+
+fn js_ts_object_key_name(key: Node, source: &[u8]) -> Option<String> {
+    let text = node_text(key, source).trim();
+    if text.is_empty() || text.starts_with('[') {
+        return None;
+    }
+
+    let name = match key.kind() {
+        "string" | "template_string" => text
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_matches('`')
+            .to_string(),
+        _ => text.to_string(),
+    };
+
+    if name.is_empty() || (key.kind() == "template_string" && name.contains("${")) {
+        return None;
+    }
+
+    Some(name)
 }
 
 /// Dart constructor signatures use `field("name", seq(identifier, optional(".", identifier)))`,
