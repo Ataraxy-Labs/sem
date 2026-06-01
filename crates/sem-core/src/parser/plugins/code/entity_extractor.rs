@@ -783,13 +783,8 @@ fn find_matching_brace(source: &[u8], open_brace: usize) -> Option<usize> {
             continue;
         }
 
-        if is_swift_multiline_string_start(source, i) {
-            i = skip_swift_multiline_string(source, i + 3);
-            continue;
-        }
-
-        if source[i] == b'"' {
-            i = skip_swift_string(source, i + 1);
+        if let Some(string_start) = swift_string_literal_start(source, i) {
+            i = skip_swift_string_literal(source, string_start);
             continue;
         }
 
@@ -799,7 +794,7 @@ fn find_matching_brace(source: &[u8], open_brace: usize) -> Option<usize> {
                 i += 1;
             }
             b'}' => {
-                depth -= 1;
+                depth = depth.checked_sub(1)?;
                 i += 1;
                 if depth == 0 {
                     // Return the byte after the closing brace for use as a slice end.
@@ -830,26 +825,77 @@ fn skip_swift_block_comment(source: &[u8], mut i: usize) -> usize {
     source.len()
 }
 
-fn is_swift_multiline_string_start(source: &[u8], quote: usize) -> bool {
-    source.get(quote) == Some(&b'"')
-        && source.get(quote + 1) == Some(&b'"')
-        && source.get(quote + 2) == Some(&b'"')
+#[derive(Clone, Copy)]
+struct SwiftStringLiteralStart {
+    body_start: usize,
+    hash_count: usize,
+    is_multiline: bool,
 }
 
-fn skip_swift_multiline_string(source: &[u8], mut i: usize) -> usize {
-    while i + 2 < source.len() {
-        if i + 3 < source.len()
-            && source[i] == b'\\'
-            && source.get(i + 1) == Some(&b'"')
-            && source.get(i + 2) == Some(&b'"')
-            && source.get(i + 3) == Some(&b'"')
-        {
-            i = (i + 4).min(source.len());
+const SWIFT_STRING_INTERPOLATION_NESTING_LIMIT: usize = 256;
+
+fn swift_string_literal_start(source: &[u8], start: usize) -> Option<SwiftStringLiteralStart> {
+    let mut quote = start;
+    let mut hash_count = 0usize;
+    while source.get(quote) == Some(&b'#') {
+        hash_count += 1;
+        quote += 1;
+    }
+
+    if source.get(quote) != Some(&b'"') {
+        return None;
+    }
+
+    let is_multiline =
+        source.get(quote + 1) == Some(&b'"') && source.get(quote + 2) == Some(&b'"');
+    let body_start = quote + if is_multiline { 3 } else { 1 };
+    Some(SwiftStringLiteralStart {
+        body_start,
+        hash_count,
+        is_multiline,
+    })
+}
+
+fn skip_swift_string_literal(source: &[u8], start: SwiftStringLiteralStart) -> usize {
+    skip_swift_string_literal_with_depth(source, start, 0)
+}
+
+fn skip_swift_string_literal_with_depth(
+    source: &[u8],
+    start: SwiftStringLiteralStart,
+    interpolation_depth: usize,
+) -> usize {
+    if start.is_multiline {
+        skip_swift_multiline_string(
+            source,
+            start.body_start,
+            start.hash_count,
+            interpolation_depth,
+        )
+    } else {
+        skip_swift_string(source, start.body_start, start.hash_count, interpolation_depth)
+    }
+}
+
+fn skip_swift_multiline_string(
+    source: &[u8],
+    mut i: usize,
+    hash_count: usize,
+    interpolation_depth: usize,
+) -> usize {
+    while i < source.len() {
+        if let Some(interpolation_start) = swift_interpolation_start(source, i, hash_count) {
+            i = skip_swift_interpolation(source, interpolation_start, interpolation_depth + 1);
             continue;
         }
 
-        if source[i] == b'"' && source[i + 1] == b'"' && source[i + 2] == b'"' {
-            return i + 3;
+        if let Some(escaped_start) = swift_escape_payload_start(source, i, hash_count) {
+            i = (escaped_start + 1).min(source.len());
+            continue;
+        }
+
+        if swift_string_closing_at(source, i, hash_count, 3) {
+            return i + 3 + hash_count;
         }
 
         i += 1;
@@ -857,17 +903,116 @@ fn skip_swift_multiline_string(source: &[u8], mut i: usize) -> usize {
     source.len()
 }
 
-fn skip_swift_string(source: &[u8], mut i: usize) -> usize {
+fn skip_swift_string(
+    source: &[u8],
+    mut i: usize,
+    hash_count: usize,
+    interpolation_depth: usize,
+) -> usize {
     while i < source.len() {
-        if source[i] == b'\\' {
-            i = (i + 2).min(source.len());
-        } else if source[i] == b'"' {
-            return i + 1;
-        } else {
-            i += 1;
+        if let Some(interpolation_start) = swift_interpolation_start(source, i, hash_count) {
+            i = skip_swift_interpolation(source, interpolation_start, interpolation_depth + 1);
+            continue;
+        }
+
+        if let Some(escaped_start) = swift_escape_payload_start(source, i, hash_count) {
+            i = (escaped_start + 1).min(source.len());
+            continue;
+        }
+
+        if swift_string_closing_at(source, i, hash_count, 1) {
+            return i + 1 + hash_count;
+        }
+
+        i += 1;
+    }
+    source.len()
+}
+
+fn skip_swift_interpolation(source: &[u8], mut i: usize, interpolation_depth: usize) -> usize {
+    if interpolation_depth > SWIFT_STRING_INTERPOLATION_NESTING_LIMIT {
+        return source.len();
+    }
+
+    let mut depth = 1usize;
+    while i < source.len() {
+        if source[i] == b'/' && source.get(i + 1) == Some(&b'/') {
+            i = skip_swift_line_comment(source, i + 2);
+            continue;
+        }
+
+        if source[i] == b'/' && source.get(i + 1) == Some(&b'*') {
+            i = skip_swift_block_comment(source, i + 2);
+            continue;
+        }
+
+        if let Some(string_start) = swift_string_literal_start(source, i) {
+            i = skip_swift_string_literal_with_depth(source, string_start, interpolation_depth);
+            continue;
+        }
+
+        match source[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                let Some(new_depth) = depth.checked_sub(1) else {
+                    return source.len();
+                };
+                depth = new_depth;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
         }
     }
     source.len()
+}
+
+fn swift_interpolation_start(source: &[u8], backslash: usize, hash_count: usize) -> Option<usize> {
+    let payload_start = swift_escape_payload_start(source, backslash, hash_count)?;
+    (source.get(payload_start) == Some(&b'(')).then_some(payload_start + 1)
+}
+
+fn swift_escape_payload_start(source: &[u8], backslash: usize, hash_count: usize) -> Option<usize> {
+    if source.get(backslash) != Some(&b'\\') {
+        return None;
+    }
+
+    let mut i = backslash + 1;
+    for _ in 0..hash_count {
+        if source.get(i) != Some(&b'#') {
+            return None;
+        }
+        i += 1;
+    }
+
+    (i < source.len()).then_some(i)
+}
+
+fn swift_string_closing_at(
+    source: &[u8],
+    quote: usize,
+    hash_count: usize,
+    quote_count: usize,
+) -> bool {
+    for offset in 0..quote_count {
+        if source.get(quote + offset) != Some(&b'"') {
+            return false;
+        }
+    }
+
+    let hash_start = quote + quote_count;
+    for offset in 0..hash_count {
+        if source.get(hash_start + offset) != Some(&b'#') {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn line_number_for_byte(source: &[u8], byte: usize) -> usize {

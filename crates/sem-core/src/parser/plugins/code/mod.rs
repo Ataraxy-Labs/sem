@@ -417,6 +417,87 @@ public struct TuistCommand: AsyncParsableCommand {
     }
 
     #[test]
+    fn test_swift_conditional_compilation_with_interpolated_brace_string() {
+        let plugin = CodeParserPlugin;
+        for (container_name, code) in [
+            (
+                "Config",
+                r#"
+class Config {
+    let tpl = "prefix \("}") suffix"
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+
+struct Tail { let q: Int }
+"#,
+            ),
+            (
+                "RawConfig",
+                r##"
+class RawConfig {
+    let tpl = #"prefix \#("{") suffix"#
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"##,
+            ),
+            (
+                "MultilineConfig",
+                r#"
+class MultilineConfig {
+    let tpl = """
+    prefix \("}") suffix
+    """
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"#,
+            ),
+            (
+                "ClosureConfig",
+                r#"
+class ClosureConfig {
+    let tpl = "prefix \(["}"].map { $0 }.joined()) suffix"
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"#,
+            ),
+        ] {
+            let file_path = format!("{container_name}.swift");
+            let entities = plugin.extract_entities(code, &file_path);
+            let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+            let container = entities
+                .iter()
+                .find(|e| e.name == container_name)
+                .unwrap_or_else(|| {
+                    panic!("Should recover {container_name}, got: {names:?}");
+                });
+            assert_eq!(container.entity_type, "class");
+            assert!(container.parent_id.is_none());
+
+            for member in ["tpl", "dump", "render"] {
+                let entity = entities
+                    .iter()
+                    .find(|e| e.name == member)
+                    .unwrap_or_else(|| {
+                        panic!("Should find {member} in {container_name}, got: {names:?}");
+                    });
+                assert_eq!(entity.parent_id.as_deref(), Some(container.id.as_str()));
+            }
+        }
+    }
+
+    #[test]
     fn test_elixir_entity_extraction() {
         let code = r#"
 defmodule MyApp.Accounts do
