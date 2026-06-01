@@ -143,7 +143,7 @@ pub(crate) fn resolve_with_scopes_full(
                     if matches!(
                         parent.entity_type.as_str(),
                         "class" | "struct" | "interface" | "impl"
-                            | "enum" | "protocol_declaration"
+                            | "enum" | "protocol"
                             | "object_declaration" | "companion_object"
                     ) {
                         class_members
@@ -560,7 +560,7 @@ fn build_scopes_from_ast(
                     && matches!(
                         e.entity_type.as_str(),
                         "class" | "struct" | "interface"
-                            | "enum" | "protocol_declaration"
+                            | "enum" | "protocol"
                             | "object_declaration" | "companion_object"
                     )
             }).copied();

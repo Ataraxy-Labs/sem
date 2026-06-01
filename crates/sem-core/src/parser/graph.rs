@@ -197,7 +197,7 @@ impl EntityGraph {
                 class_child_names.insert((pid.as_str(), entity.name.as_str()));
             }
 
-            if matches!(entity.entity_type.as_str(), "class" | "struct" | "interface" | "class_type") {
+            if is_nominal_member_container(entity.entity_type.as_str()) {
                 class_entity_names.insert(entity.name.as_str());
                 class_entity_files.insert((entity.name.as_str(), entity.file_path.as_str()));
             }
@@ -227,7 +227,7 @@ impl EntityGraph {
                 }
                 // scope_class_members for scope resolver (checks entity_type of parent)
                 if let Some(parent) = entity_map.get(pid.as_str()) {
-                    if matches!(parent.entity_type.as_str(), "class" | "struct" | "interface" | "impl") {
+                    if is_scope_member_container(parent.entity_type.as_str()) {
                         scope_class_members.entry(parent.name.clone()).or_default()
                             .push((entity.name.clone(), entity.id.clone()));
                     }
@@ -679,12 +679,12 @@ impl EntityGraph {
 
         let class_entity_names: HashSet<&str> = all_entities
             .iter()
-            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
+            .filter(|e| is_nominal_member_container(e.entity_type.as_str()))
             .map(|e| e.name.as_str())
             .collect();
         let class_entity_files: HashSet<(&str, &str)> = all_entities
             .iter()
-            .filter(|e| matches!(e.entity_type.as_str(), "class" | "struct" | "interface" | "class_type"))
+            .filter(|e| is_nominal_member_container(e.entity_type.as_str()))
             .map(|e| (e.name.as_str(), e.file_path.as_str()))
             .collect();
 
@@ -1322,6 +1322,27 @@ impl EntityGraph {
             }
         }
     }
+}
+
+fn is_nominal_member_container(entity_type: &str) -> bool {
+    matches!(
+        entity_type,
+        "class" | "struct" | "interface" | "class_type" | "enum" | "protocol"
+    )
+}
+
+fn is_scope_member_container(entity_type: &str) -> bool {
+    matches!(
+        entity_type,
+        "class"
+            | "struct"
+            | "interface"
+            | "impl"
+            | "enum"
+            | "protocol"
+            | "object_declaration"
+            | "companion_object"
+    )
 }
 
 /// Check if an entity looks like a test based on name, file path, and content patterns.
@@ -2326,6 +2347,12 @@ function caller() { return MathUtils.compute(); }
             "caller should depend on compute via MathUtils.compute(). Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_protocols_are_member_containers() {
+        assert!(is_nominal_member_container("protocol"));
+        assert!(is_scope_member_container("protocol"));
     }
 
     #[test]

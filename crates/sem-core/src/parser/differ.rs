@@ -207,6 +207,7 @@ fn suppress_redundant_parents(
         "module",
         "class",
         "interface",
+        "protocol",
         "mixin",
         "extension",
         "namespace",
@@ -690,6 +691,74 @@ mod tests {
                 .iter()
                 .any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
             "class should be suppressed when only the method body changed, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_protocol_parent_suppressed_when_only_associatedtype_renamed() {
+        let before = "protocol Repository {\n    associatedtype Item\n}\n";
+        let after = "protocol Repository {\n    associatedtype Canvas\n}\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("Repository.swift", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let names: Vec<&str> = result
+            .changes
+            .iter()
+            .map(|c| c.entity_name.as_str())
+            .collect();
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_type == "associatedtype"),
+            "expected associatedtype change, got: {names:?}"
+        );
+        assert!(
+            !result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "Repository" && c.change_type == ChangeType::Modified),
+            "protocol should be suppressed when only the associatedtype changed, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_protocol_parent_not_suppressed_when_own_declaration_changes() {
+        let before = "protocol Repository {\n    associatedtype Item\n}\n";
+        let after = "protocol Repository: Sendable {\n    associatedtype Canvas\n}\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("Repository.swift", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let names: Vec<&str> = result
+            .changes
+            .iter()
+            .map(|c| c.entity_name.as_str())
+            .collect();
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_type == "associatedtype"),
+            "expected associatedtype change, got: {names:?}"
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "Repository" && c.change_type == ChangeType::Modified),
+            "protocol should remain Modified when its own declaration changed, got: {names:?}"
         );
     }
 
