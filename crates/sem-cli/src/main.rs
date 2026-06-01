@@ -206,7 +206,7 @@ enum Commands {
         #[arg(long)]
         file: Option<String>,
 
-        /// Maximum number of commits to scan
+        /// Maximum number of commits to scan (0 = unlimited)
         #[arg(long, default_value = "50")]
         limit: usize,
 
