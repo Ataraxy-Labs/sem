@@ -559,6 +559,150 @@ export async function* streamUsers(): AsyncGenerator<string> {
     }
 
     #[test]
+    fn test_typescript_declare_function_signature_entity_extraction() {
+        let code = r#"
+export declare function createClient(opts: ClientOptions): Client;
+export declare class Client {
+  connect(): Promise<void>;
+}
+export interface ClientOptions { host: string; }
+export declare const VERSION: string;
+export type Row = Record<string, unknown>;
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "types.d.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let create_client = entities.iter().find(|e| e.name == "createClient")
+            .unwrap_or_else(|| panic!("missing createClient, got: {:?}", names));
+
+        assert_eq!(create_client.entity_type, "function");
+        assert!(names.contains(&"Client"), "Should find Client class, got: {:?}", names);
+        assert!(names.contains(&"ClientOptions"), "Should find ClientOptions interface, got: {:?}", names);
+        assert!(names.contains(&"VERSION"), "Should find VERSION const, got: {:?}", names);
+        assert!(names.contains(&"Row"), "Should find Row type, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_typescript_overload_signatures_do_not_duplicate_implementation() {
+        let code = r#"
+export function combine(a: string, b: string): string;
+export function combine(a: number, b: number): number;
+export function combine(a: any, b: any): any { return a + b; }
+declare function ambientFn(x: number): number;
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "overloads.ts");
+        let combine_entities: Vec<_> = entities.iter()
+            .filter(|e| e.name == "combine")
+            .collect();
+        let ambient_fn = entities.iter().find(|e| e.name == "ambientFn")
+            .unwrap_or_else(|| panic!("missing ambientFn, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>()));
+
+        assert_eq!(
+            combine_entities.len(),
+            1,
+            "Should only emit the overload implementation, got: {:?}",
+            combine_entities.iter().map(|e| (&e.name, &e.content)).collect::<Vec<_>>()
+        );
+        assert_eq!(combine_entities[0].entity_type, "function");
+        assert!(
+            combine_entities[0].content.contains("return a + b"),
+            "Should keep the implementation entity"
+        );
+        assert_eq!(ambient_fn.entity_type, "function");
+    }
+
+    #[test]
+    fn test_typescript_ambient_overload_signatures_remain_visible() {
+        let code = r#"
+export declare function lookup(id: string): User;
+export declare function lookup(id: number): User;
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "ambient-overloads.d.ts");
+        let lookup_entities: Vec<_> = entities.iter()
+            .filter(|e| e.name == "lookup")
+            .collect();
+
+        assert_eq!(
+            lookup_entities.len(),
+            2,
+            "Should emit ambient overload signatures without an implementation, got: {:?}",
+            lookup_entities.iter().map(|e| (&e.name, &e.content)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_nested_overload_signatures_do_not_duplicate_implementation() {
+        let code = r#"
+namespace Api {
+  export function request(path: string): string;
+  export function request(path: URL): string;
+  export function request(path: string | URL): string {
+    return path.toString();
+  }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "namespace-overloads.ts");
+        let request_entities: Vec<_> = entities.iter()
+            .filter(|e| e.name == "request")
+            .collect();
+
+        assert_eq!(
+            request_entities.len(),
+            1,
+            "Should only emit the nested overload implementation, got: {:?}",
+            request_entities.iter().map(|e| (&e.name, &e.content)).collect::<Vec<_>>()
+        );
+        assert_eq!(request_entities[0].entity_type, "function");
+        assert!(
+            request_entities[0].content.contains("return path.toString()"),
+            "Should keep the nested implementation entity"
+        );
+    }
+
+    #[test]
+    fn test_typescript_mixed_export_overload_signature_matches_implementation() {
+        let code = r#"
+export function parse(input: string): string;
+function parse(input: unknown): string {
+  return String(input);
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "mixed-export-overloads.ts");
+        let parse_entities: Vec<_> = entities.iter()
+            .filter(|e| e.name == "parse")
+            .collect();
+
+        assert_eq!(
+            parse_entities.len(),
+            1,
+            "Should only emit the mixed-export overload implementation, got: {:?}",
+            parse_entities.iter().map(|e| (&e.name, &e.content)).collect::<Vec<_>>()
+        );
+        assert!(
+            parse_entities[0].content.contains("return String(input)"),
+            "Should keep the implementation entity"
+        );
+    }
+
+    #[test]
+    fn test_tsx_declare_function_signature_entity_extraction() {
+        let code = r#"
+declare function useWidget(name: string): JSX.Element;
+export const Widget = () => <div />;
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "widget.tsx");
+        let use_widget = entities.iter().find(|e| e.name == "useWidget")
+            .unwrap_or_else(|| panic!("missing useWidget, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>()));
+
+        assert_eq!(use_widget.entity_type, "function");
+    }
+
+    #[test]
     fn test_javascript_generator_function_entity_extraction() {
         let code = r#"
 export function* ids() {

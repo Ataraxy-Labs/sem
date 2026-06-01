@@ -1,6 +1,6 @@
 use tree_sitter::{Node, Tree};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::model::entity::{build_entity_id, build_entity_id_disambiguated, SemanticEntity};
 use crate::utils::hash::{content_hash, structural_hash, structural_hash_excluding_range};
 use super::languages::LanguageConfig;
@@ -112,6 +112,8 @@ fn visit_node(
         root_parent_id.map(str::to_owned),
         root_suppression.map(str::to_owned),
     )];
+    let mut ts_implementation_names_by_scope: HashMap<(usize, usize), HashSet<String>> =
+        HashMap::new();
 
     while let Some((node, pid_owned, sup_owned)) = worklist.pop() {
         let parent_id = pid_owned.as_deref();
@@ -381,6 +383,15 @@ fn visit_node(
                 }
                 continue;
             }
+        }
+
+        if should_skip_ts_overload_signature(
+            node,
+            config,
+            source,
+            &mut ts_implementation_names_by_scope,
+        ) {
+            continue;
         }
 
         if config.entity_node_types.contains(&node_type) {
@@ -1499,6 +1510,57 @@ fn should_skip_entity(
         suppression_context == Some(rule.parent_entity_node_type)
             && node_type == rule.child_entity_node_type
     })
+}
+
+fn should_skip_ts_overload_signature(
+    node: Node,
+    config: &LanguageConfig,
+    source: &[u8],
+    implementation_names_by_scope: &mut HashMap<(usize, usize), HashSet<String>>,
+) -> bool {
+    if !matches!(config.id, "typescript" | "tsx") || node.kind() != "function_signature" {
+        return false;
+    }
+
+    let Some(signature_name) = extract_name(node, source) else {
+        return false;
+    };
+
+    let anchor = match node.parent() {
+        Some(parent) if parent.kind() == "export_statement" => parent,
+        _ => node,
+    };
+
+    let Some(scope) = anchor.parent() else {
+        return false;
+    };
+
+    let scope_key = (scope.start_byte(), scope.end_byte());
+    let implementation_names = implementation_names_by_scope
+        .entry(scope_key)
+        .or_insert_with(|| collect_ts_function_implementation_names(scope, source));
+
+    implementation_names.contains(&signature_name)
+}
+
+fn collect_ts_function_implementation_names(scope: Node, source: &[u8]) -> HashSet<String> {
+    let mut cursor = scope.walk();
+    scope
+        .named_children(&mut cursor)
+        .filter_map(|sibling| ts_function_declaration_name(sibling, source))
+        .collect()
+}
+
+fn ts_function_declaration_name(node: Node, source: &[u8]) -> Option<String> {
+    let declaration = if node.kind() == "export_statement" {
+        node.child_by_field_name("declaration")?
+    } else {
+        node
+    };
+
+    (declaration.kind() == "function_declaration")
+        .then(|| extract_name(declaration, source))
+        .flatten()
 }
 
 /// Extract the name from a C declarator (handles pointer_declarator, function_declarator, etc.)
