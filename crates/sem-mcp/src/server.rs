@@ -27,6 +27,8 @@ use crate::tools::*;
 const MCP_INSTRUCTIONS: &str = "sem MCP server for entity-level semantic code intelligence. \
                                 6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context.";
 
+const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
+
 /// Lazily-initialized repo context.
 struct RepoContext {
     git: GitBridge,
@@ -284,12 +286,36 @@ impl SemServer {
         entity_name: &str,
         rel_path: &str,
     ) -> Result<&'a str, String> {
-        graph
+        if let Some(entity) = graph
             .entities
             .values()
             .find(|e| e.name == entity_name && e.file_path == rel_path)
-            .map(|e| e.id.as_str())
-            .ok_or_else(|| format!("Entity '{}' not found in graph", entity_name))
+        {
+            return Ok(entity.id.as_str());
+        }
+
+        let mut candidates: Vec<&str> = graph
+            .entities
+            .values()
+            .filter(|e| e.name == entity_name)
+            .map(|e| e.file_path.as_str())
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        if candidates.is_empty() {
+            Err(format!(
+                "Entity '{}' not found in '{}'",
+                entity_name, rel_path
+            ))
+        } else {
+            Err(format!(
+                "Entity '{}' not found in '{}' (existing candidates: {})",
+                entity_name,
+                rel_path,
+                format_entity_lookup_candidates(&candidates)
+            ))
+        }
     }
 
     /// Get cached graph or build a new one. Checks: memory cache -> SQLite cache -> fresh build.
@@ -1085,6 +1111,19 @@ mod tests {
         assert_eq!(value["isError"], false);
     }
 
+    #[test]
+    fn entity_lookup_candidate_list_is_bounded() {
+        let candidates = [
+            "a.py", "b.py", "c.py", "d.py", "e.py", "f.py", "g.py", "h.py", "i.py", "j.py",
+            "k.py", "l.py",
+        ];
+
+        assert_eq!(
+            format_entity_lookup_candidates(&candidates),
+            "a.py, b.py, c.py, d.py, e.py, f.py, g.py, h.py, i.py, j.py (+2 more)"
+        );
+    }
+
     async fn server_for_repo(root: &Path) -> SemServer {
         let server = SemServer::new();
         let git = GitBridge::open(root).unwrap();
@@ -1350,7 +1389,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_tool_error(result, "Entity 'nonexistent_zzz' not found in graph");
+        assert_tool_error(result, "Entity 'nonexistent_zzz' not found in 'sample.py'");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1390,7 +1429,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_tool_error(result, "Entity 'known_entity' not found in graph");
+        assert_tool_error(
+            result,
+            "Entity 'known_entity' not found in 'notes.txt' (existing candidates: sample.py)",
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1430,7 +1472,30 @@ mod tests {
             .await
             .unwrap();
 
-        assert_tool_error(result, "Entity 'known_entity' not found in graph");
+        assert_tool_error(
+            result,
+            "Entity 'known_entity' not found in 'notes.txt' (existing candidates: sample.py)",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_context_returns_tool_error_for_unknown_entity() {
+        let root = temp_git_repo("unknown-context-entity");
+        let file_path = root.join("sample.py");
+        std::fs::write(&file_path, "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_context(Parameters(ContextParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "nonexistent_zzz".to_string(),
+                token_budget: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Entity 'nonexistent_zzz' not found in 'sample.py'");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1480,6 +1545,22 @@ mod tests {
 
 fn tool_error(msg: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(msg.into())])
+}
+
+fn format_entity_lookup_candidates(candidates: &[&str]) -> String {
+    let shown = candidates
+        .iter()
+        .take(ENTITY_LOOKUP_CANDIDATE_LIMIT)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = candidates.len().saturating_sub(ENTITY_LOOKUP_CANDIDATE_LIMIT);
+
+    if remaining == 0 {
+        shown
+    } else {
+        format!("{shown} (+{remaining} more)")
+    }
 }
 
 fn file_path_error(path: &str, abs_path: &Path) -> Option<String> {
