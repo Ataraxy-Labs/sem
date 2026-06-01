@@ -227,8 +227,8 @@ impl EntityGraph {
                 }
                 // scope_class_members for scope resolver (checks entity_type of parent)
                 if let Some(parent) = entity_map.get(pid.as_str()) {
-                    if matches!(parent.entity_type.as_str(), "class" | "struct" | "interface" | "impl") {
-                        scope_class_members.entry(parent.name.clone()).or_default()
+                    if let Some(owner_name) = scope_resolve::class_member_owner_name(parent) {
+                        scope_class_members.entry(owner_name.to_string()).or_default()
                             .push((entity.name.clone(), entity.id.clone()));
                     }
                 }
@@ -2191,6 +2191,145 @@ mod tests {
         assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
         assert!(graph.entities.contains_key("models.go::type::Service::Run"));
         assert!(!graph.entities.contains_key("methods.go::type::Service::Run"));
+    }
+
+    #[cfg(feature = "lang-swift")]
+    #[test]
+    fn test_swift_extension_member_resolves_through_receiver_type() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "Example.swift",
+            r#"
+struct Widget {
+    let name: String
+}
+
+extension Widget {
+    func render() -> String { return name }
+}
+
+func draw(widget: Widget) {
+    print(widget.render())
+}
+"#,
+        );
+
+        let (graph, _) = EntityGraph::build(root, &["Example.swift".into()], &registry);
+        let draw = graph
+            .entities
+            .values()
+            .find(|entity| entity.name == "draw")
+            .expect("draw function should be in the graph");
+        let extension = graph
+            .entities
+            .values()
+            .find(|entity| entity.entity_type == "extension")
+            .expect("extension should be in the graph");
+        assert_eq!(extension.name, "Widget");
+        let render = graph
+            .entities
+            .values()
+            .find(|entity| entity.name == "render")
+            .expect("extension method should be in the graph");
+        assert_eq!(render.parent_id.as_deref(), Some(extension.id.as_str()));
+
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.from_entity == draw.id
+                    && edge.to_entity == render.id
+                    && edge.ref_type == RefType::Calls
+            }),
+            "draw should call Widget.render. Edges: {:?}",
+            graph.edges
+        );
+
+        let render_dependents = graph.get_dependents(&render.id);
+        assert!(
+            render_dependents.iter().any(|entity| entity.id == draw.id),
+            "render should be impacted by draw. Dependents: {:?}",
+            render_dependents
+                .iter()
+                .map(|entity| &entity.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-swift")]
+    #[test]
+    fn test_swift_extension_member_resolves_without_prebuilt_lookup() {
+        let (_dir, registry) = create_test_repo();
+        let source = r#"
+struct Widget {
+    let name: String
+}
+
+extension Widget {
+    func render() -> String { return name }
+}
+
+func draw(widget: Widget) {
+    print(widget.render())
+}
+"#;
+
+        let all_entities = registry.extract_entities("Example.swift", source);
+        let extension = all_entities
+            .iter()
+            .find(|entity| entity.entity_type == "extension")
+            .expect("extension should be extracted");
+        assert_eq!(extension.name, "Widget");
+        let render = all_entities
+            .iter()
+            .find(|entity| entity.name == "render")
+            .expect("extension method should be extracted");
+        assert_eq!(render.parent_id.as_deref(), Some(extension.id.as_str()));
+        let entity_map: HashMap<String, EntityInfo> = all_entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    EntityInfo {
+                        id: entity.id.clone(),
+                        name: entity.name.clone(),
+                        entity_type: entity.entity_type.clone(),
+                        file_path: entity.file_path.clone(),
+                        parent_id: entity.parent_id.clone(),
+                        start_line: entity.start_line,
+                        end_line: entity.end_line,
+                    },
+                )
+            })
+            .collect();
+
+        let result = scope_resolve::resolve_with_scopes(
+            Path::new("."),
+            &["Example.swift".into()],
+            &all_entities,
+            &entity_map,
+            Some(vec![(
+                "Example.swift".into(),
+                source.into(),
+                registry
+                    .extract_entities_with_tree("Example.swift", source)
+                    .and_then(|(_, tree)| tree)
+                    .expect("Swift parser should produce a tree"),
+            )]),
+        );
+        let draw = all_entities
+            .iter()
+            .find(|entity| entity.name == "draw")
+            .expect("draw function should be extracted");
+
+        assert!(
+            result.edges.iter().any(|(from, to, ref_type)| {
+                from == &draw.id && to == &render.id && *ref_type == RefType::Calls
+            }),
+            "fallback scope resolver should resolve draw to Widget.render. Edges: {:?}",
+            result.edges
+        );
     }
 
     #[test]

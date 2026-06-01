@@ -101,6 +101,17 @@ pub(crate) struct PreBuiltLookups {
     pub(crate) go_pkg_index: HashMap<String, Vec<(String, String)>>,
 }
 
+pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
+    matches!(
+        parent.entity_type.as_str(),
+        "class" | "struct" | "interface" | "impl"
+            | "enum" | "protocol_declaration"
+            | "object_declaration" | "companion_object"
+            | "extension"
+    )
+    .then_some(parent.name.as_str())
+}
+
 /// Public API — preserves the original 5-parameter signature for semver compatibility.
 pub fn resolve_with_scopes(
     root: &Path,
@@ -140,14 +151,9 @@ pub(crate) fn resolve_with_scopes_full(
 
             if let Some(ref pid) = entity.parent_id {
                 if let Some(parent) = entity_map.get(pid) {
-                    if matches!(
-                        parent.entity_type.as_str(),
-                        "class" | "struct" | "interface" | "impl"
-                            | "enum" | "protocol_declaration"
-                            | "object_declaration" | "companion_object"
-                    ) {
+                    if let Some(owner_name) = class_member_owner_name(parent) {
                         class_members
-                            .entry(parent.name.clone())
+                            .entry(owner_name.to_string())
                             .or_default()
                             .push((entity.name.clone(), entity.id.clone()));
                     }
