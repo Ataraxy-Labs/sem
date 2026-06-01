@@ -44,6 +44,9 @@ pub struct Scope {
     bindings: HashSet<String>,
     /// Variable type bindings: var_name -> class_name (from `x = Foo()`)
     types: HashMap<String, String>,
+    /// Iterable element type bindings: var_name -> element class name
+    iterable_types: HashMap<String, String>,
+    scoped_bindings: Vec<ScopedBinding>,
     /// Unresolved call assignments: var_name -> function_name (from `x = func()`)
     /// These get resolved after return type analysis.
     pending_call_types: HashMap<String, String>,
@@ -53,12 +56,21 @@ pub struct Scope {
     kind: &'static str,
 }
 
+struct ScopedBinding {
+    name: String,
+    type_name: Option<String>,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 /// Reference found in the AST
 struct AstRef {
     /// Kind of reference
     kind: AstRefKind,
     /// Row (0-indexed) where this reference appears in the source
     row: usize,
+    /// Byte offset where this reference starts in the source
+    byte: usize,
 }
 
 enum AstRefKind {
@@ -319,6 +331,8 @@ pub(crate) fn resolve_with_scopes_full(
                 defs: HashMap::new(),
                 bindings: HashSet::new(),
                 types: HashMap::new(),
+                iterable_types: HashMap::new(),
+                scoped_bindings: Vec::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
                 kind: "module",
@@ -577,6 +591,8 @@ fn build_scopes_from_ast(
                         defs: HashMap::new(),
                         bindings: HashSet::new(),
                         types: HashMap::new(),
+                        iterable_types: HashMap::new(),
+                        scoped_bindings: Vec::new(),
                         pending_call_types: HashMap::new(),
                         owner_id: Some(ce.id.clone()),
                         kind: "class",
@@ -608,6 +624,8 @@ fn build_scopes_from_ast(
                     defs: HashMap::new(),
                     bindings: HashSet::new(),
                     types: HashMap::new(),
+                    iterable_types: HashMap::new(),
+                    scoped_bindings: Vec::new(),
                     pending_call_types: HashMap::new(),
                     owner_id: None,
                     kind: "class",
@@ -634,6 +652,8 @@ fn build_scopes_from_ast(
                 defs: HashMap::new(),
                 bindings: HashSet::new(),
                 types: HashMap::new(),
+                iterable_types: HashMap::new(),
+                scoped_bindings: Vec::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
                 kind: "module",
@@ -704,6 +724,8 @@ fn build_scopes_from_ast(
                 defs: HashMap::new(),
                 bindings: HashSet::new(),
                 types: HashMap::new(),
+                iterable_types: HashMap::new(),
+                scoped_bindings: Vec::new(),
                 pending_call_types: HashMap::new(),
                 owner_id: None,
                 kind: "function",
@@ -725,8 +747,9 @@ fn build_scopes_from_ast(
                 }
             }
 
-            scan_assignments(node, func_scope_idx, scopes, source, config);
             scan_function_params(node, func_scope_idx, scopes, source, config);
+            scan_assignments(node, func_scope_idx, scopes, source, config);
+            scan_for_in_statements(node, func_scope_idx, scopes, source, config);
 
             if config.external_method && kind == "method_declaration" {
                 if let Some(receiver) = node.child_by_field_name("receiver") {
@@ -804,8 +827,29 @@ fn scan_assignments(
                 }
             }
 
-            // Recurse into configured container nodes
             if config.assignment_recurse_into.contains(&ck) {
+                worklist.push(child);
+            }
+        }
+    }
+}
+
+fn scan_for_in_statements(
+    root: tree_sitter::Node,
+    scope_idx: usize,
+    scopes: &mut Vec<Scope>,
+    source: &[u8],
+    config: &ScopeResolveConfig,
+) {
+    let mut worklist = vec![root];
+    while let Some(node) = worklist.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let kind = child.kind();
+            if kind == "for_in_statement" {
+                scan_for_in_statement(child, scope_idx, scopes, source);
+            }
+            if !config.function_scope_nodes.contains(&kind) {
                 worklist.push(child);
             }
         }
@@ -912,6 +956,7 @@ fn scan_function_params(
                 }
             }
             if let Some(tn) = type_node {
+                record_iterable_element_type(tn, param_name, scope_idx, scopes, source);
                 let type_text = extract_base_type(tn, source);
                 if !type_text.is_empty()
                     && type_text.chars().next().map_or(false, |c| c.is_uppercase())
@@ -964,6 +1009,59 @@ fn scan_single_assignment(
     record_type_from_rhs(right, &var_name, scope_idx, scopes, source);
 }
 
+fn scan_for_in_statement(
+    node: tree_sitter::Node,
+    scope_idx: usize,
+    scopes: &mut Vec<Scope>,
+    source: &[u8],
+) {
+    let left = match node.child_by_field_name("left") {
+        Some(left) if left.kind() == "identifier" => left,
+        _ => return,
+    };
+    let right = node.child_by_field_name("right");
+    let var_name = match left.utf8_text(source) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => return,
+    };
+
+    let type_name = if right.map_or(false, |right| has_for_of_operator(left, right, source)) {
+        right
+            .filter(|right| right.kind() == "identifier")
+            .and_then(|right| {
+                right.utf8_text(source).ok().and_then(|iterable_name| {
+                    lookup_iterable_element_type_in_scopes(
+                        scope_idx,
+                        scopes,
+                        iterable_name,
+                    )
+                })
+            })
+    } else {
+        None
+    };
+
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    scopes[scope_idx].scoped_bindings.push(ScopedBinding {
+        name: var_name,
+        type_name,
+        start_byte: body.start_byte(),
+        end_byte: body.end_byte(),
+    });
+}
+
+fn has_for_of_operator(left: tree_sitter::Node, right: tree_sitter::Node, source: &[u8]) -> bool {
+    std::str::from_utf8(&source[left.end_byte()..right.start_byte()])
+        .ok()
+        .map_or(false, |operator| {
+            operator
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+                .any(|token| token == "of")
+        })
+}
+
 /// TS: `const x = new Foo()` or `const x: Type = ...` or `const x = func()`
 /// Also handles Swift `let x = Foo(...)` and Kotlin `val x = Foo(...)`
 fn scan_ts_var_declaration(
@@ -987,6 +1085,7 @@ fn scan_ts_var_declaration(
 
             // Check for explicit type annotation: `const x: Foo = ...`
             if let Some(type_ann) = child.child_by_field_name("type") {
+                record_iterable_element_type(type_ann, &var_name, scope_idx, scopes, source);
                 let type_text = extract_base_type(type_ann, source);
                 if !type_text.is_empty()
                     && type_text.chars().next().map_or(false, |c| c.is_uppercase())
@@ -1037,6 +1136,7 @@ fn scan_ts_var_declaration(
         if !var_name.is_empty() {
             // Check for type annotation
             if let Some(type_ann) = node.child_by_field_name("type") {
+                record_iterable_element_type(type_ann, &var_name, scope_idx, scopes, source);
                 let type_text = extract_base_type(type_ann, source);
                 if !type_text.is_empty()
                     && type_text.chars().next().map_or(false, |c| c.is_uppercase())
@@ -1075,6 +1175,7 @@ fn scan_ts_var_declaration(
                 if !var_name_kt.is_empty() {
                     // Check for type annotation on the property_declaration
                     if let Some(type_ann) = node.child_by_field_name("type") {
+                        record_iterable_element_type(type_ann, &var_name_kt, scope_idx, scopes, source);
                         let type_text = extract_base_type(type_ann, source);
                         if !type_text.is_empty()
                             && type_text.chars().next().map_or(false, |c| c.is_uppercase())
@@ -1367,6 +1468,92 @@ fn extract_base_type(type_node: tree_sitter::Node, source: &[u8]) -> String {
     // For type_annotation nodes in TS, strip the leading `: `
     let text = text.trim_start_matches(':').trim();
     text.to_string()
+}
+
+fn record_iterable_element_type(
+    type_node: tree_sitter::Node,
+    var_name: &str,
+    scope_idx: usize,
+    scopes: &mut [Scope],
+    source: &[u8],
+) {
+    if let Some(element_type) = extract_iterable_element_type(type_node, source) {
+        scopes[scope_idx]
+            .iterable_types
+            .insert(var_name.to_string(), element_type);
+    }
+}
+
+fn extract_iterable_element_type(type_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let text = type_node.utf8_text(source).ok()?.trim();
+    let text = text.trim_start_matches(':').trim();
+    let text = strip_ts_readonly_type_operator(text);
+
+    if let Some(array_element) = text.strip_suffix("[]") {
+        return normalize_class_type_name(array_element);
+    }
+
+    let open = text.find('<')?;
+    let container = text[..open].trim();
+    let container = container
+        .trim_start_matches("readonly ")
+        .rsplit('.')
+        .next()
+        .unwrap_or(container);
+    if !matches!(container, "Array" | "ReadonlyArray" | "Iterable" | "Set") {
+        return None;
+    }
+
+    let element = first_generic_argument(text)?;
+    normalize_class_type_name(element)
+}
+
+fn strip_ts_readonly_type_operator(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        let Some(after_readonly) = trimmed.strip_prefix("readonly") else {
+            return trimmed;
+        };
+        if !after_readonly
+            .chars()
+            .next()
+            .map_or(false, |ch| ch.is_whitespace())
+        {
+            return trimmed;
+        }
+        text = after_readonly;
+    }
+}
+
+fn first_generic_argument(text: &str) -> Option<&str> {
+    let start = text.find('<')? + 1;
+    let mut depth = 0usize;
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth == 0 => return Some(text[start..start + offset].trim()),
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some(text[start..start + offset].trim()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_class_type_name(type_text: &str) -> Option<String> {
+    let mut text = type_text.trim();
+    text = text.trim_start_matches(':').trim();
+    text = text.trim_start_matches('&').trim_start_matches('*');
+    text = text.strip_prefix("mut ").unwrap_or(text).trim_start();
+    while let Some(stripped) = text.strip_suffix("[]") {
+        text = stripped.trim_end();
+    }
+    let text = text.rsplit('.').next().unwrap_or(text).trim();
+    if text.chars().next().map_or(false, |c| c.is_uppercase()) {
+        Some(text.to_string())
+    } else {
+        None
+    }
 }
 
 /// Parse Go receiver type from method content: `func (r *ReceiverType) Name(...)`
@@ -2871,11 +3058,13 @@ fn collect_all_file_refs(
                             refs.push(AstRef {
                                 kind: AstRefKind::MethodCall { receiver, method: method_name.to_string() },
                                 row: node_row,
+                                byte: node.start_byte(),
                             });
                         } else {
                             refs.push(AstRef {
                                 kind: AstRefKind::Call(method_name.to_string()),
                                 row: node_row,
+                                byte: node.start_byte(),
                             });
                         }
                     }
@@ -2897,6 +3086,7 @@ fn collect_all_file_refs(
                     refs.push(AstRef {
                         kind: AstRefKind::Call(macro_name.to_string()),
                         row: node_row,
+                        byte: node.start_byte(),
                     });
                 }
             }
@@ -2917,6 +3107,7 @@ fn collect_all_file_refs(
                     refs.push(AstRef {
                         kind: AstRefKind::Call(name.to_string()),
                         row: node_row,
+                        byte: node.start_byte(),
                     });
                 }
             }
@@ -2938,6 +3129,7 @@ fn collect_all_file_refs(
                     refs.push(AstRef {
                         kind: AstRefKind::Call(name.to_string()),
                         row: node_row,
+                        byte: node.start_byte(),
                     });
                 }
             }
@@ -2971,6 +3163,7 @@ fn extract_call_ref(
             refs.push(AstRef {
                 kind: AstRefKind::Call(name.to_string()),
                 row,
+                byte: func.start_byte(),
             });
         }
         return;
@@ -2999,6 +3192,7 @@ fn extract_call_ref(
                     refs.push(AstRef {
                         kind: AstRefKind::Call(method_name.to_string()),
                         row,
+                        byte: func.start_byte(),
                     });
                 }
             } else {
@@ -3007,6 +3201,7 @@ fn extract_call_ref(
                     refs.push(AstRef {
                         kind: AstRefKind::Call(method_name.to_string()),
                         row,
+                        byte: func.start_byte(),
                     });
                     if type_name.chars().next().map_or(false, |c| c.is_uppercase())
                         && !is_builtin(type_name, config)
@@ -3014,6 +3209,7 @@ fn extract_call_ref(
                         refs.push(AstRef {
                             kind: AstRefKind::Call(type_name.to_string()),
                             row,
+                            byte: func.start_byte(),
                         });
                     }
                 }
@@ -3048,7 +3244,7 @@ fn extract_member_call_ref(
         .unwrap_or("");
 
     if !obj_text.is_empty() && !attr_text.is_empty() {
-        push_method_call_ref(obj_text, attr_text, refs, row);
+        push_method_call_ref(obj_text, attr_text, refs, row, node.start_byte());
         return;
     }
 
@@ -3063,18 +3259,19 @@ fn extract_member_call_ref(
             .and_then(|n| n.utf8_text(source).ok())
             .unwrap_or("");
         if !obj.is_empty() && !attr.is_empty() {
-            push_method_call_ref(obj, attr, refs, row);
+            push_method_call_ref(obj, attr, refs, row, node.start_byte());
         }
     }
 }
 
-fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>, row: usize) {
+fn push_method_call_ref(obj: &str, method: &str, refs: &mut Vec<AstRef>, row: usize, byte: usize) {
     refs.push(AstRef {
         kind: AstRefKind::MethodCall {
             receiver: obj.to_string(),
             method: method.to_string(),
         },
         row,
+        byte,
     });
 }
 
@@ -3094,7 +3291,7 @@ fn resolve_ref(
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
         AstRefKind::Call(name) => {
-            if is_local_binding_in_scopes(scope_idx, scopes, name) {
+            if is_local_binding_in_scopes_at_byte(scope_idx, scopes, name, ast_ref.byte) {
                 return None;
             }
 
@@ -3185,7 +3382,9 @@ fn resolve_ref(
                 if let Some(dot_pos) = receiver.find('.') {
                     let var_part = &receiver[..dot_pos];
                     let field_part = &receiver[dot_pos + 1..];
-                    if let Some(var_type) = lookup_type_in_scopes(scope_idx, scopes, var_part) {
+                    if let Some(var_type) =
+                        lookup_type_in_scopes_at_byte(scope_idx, scopes, var_part, ast_ref.byte)
+                    {
                         if let Some(attr_type) = instance_attr_types.get(&(var_type, field_part.to_string())) {
                             if let Some(members) = class_members.get(attr_type.as_str()) {
                                 if let Some((_, mid)) = members.iter().find(|(n, _)| n == method) {
@@ -3198,7 +3397,8 @@ fn resolve_ref(
             }
 
             // receiver.method() -> look up receiver type, then resolve method
-            let receiver_type = lookup_type_in_scopes(scope_idx, scopes, receiver);
+            let receiver_type =
+                lookup_type_in_scopes_at_byte(scope_idx, scopes, receiver, ast_ref.byte);
 
             if let Some(class_name) = receiver_type {
                 if let Some(members) = class_members.get(class_name.as_str()) {
@@ -3210,7 +3410,7 @@ fn resolve_ref(
 
             // ClassName.method() static call, only when ClassName is visible and
             // not shadowed by a local binding.
-            if !is_local_binding_in_scopes(scope_idx, scopes, receiver) {
+            if !is_local_binding_in_scopes_at_byte(scope_idx, scopes, receiver, ast_ref.byte) {
                 if let Some(class_id) = lookup_scope_chain(scope_idx, scopes, receiver) {
                     if let Some(info) = entity_map.get(&class_id) {
                         if matches!(info.entity_type.as_str(), "class" | "struct" | "interface")
@@ -3227,7 +3427,7 @@ fn resolve_ref(
             }
 
             // Fallback: check import table for the receiver
-            if !is_local_binding_in_scopes(scope_idx, scopes, receiver) {
+            if !is_local_binding_in_scopes_at_byte(scope_idx, scopes, receiver, ast_ref.byte) {
                 let key = (file_path.to_string(), receiver.to_string());
                 if let Some(target_id) = import_table.get(&key) {
                     if let Some(info) = entity_map.get(target_id) {
@@ -3306,15 +3506,15 @@ fn lookup_scope_chain(
     }
 }
 
-/// Walk up the scope chain looking for a local binding that shadows a definition.
-fn is_local_binding_in_scopes(
+fn is_local_binding_in_scopes_at_byte(
     start_scope: usize,
     scopes: &[Scope],
     name: &str,
+    byte: usize,
 ) -> bool {
     let mut idx = start_scope;
     loop {
-        if scopes[idx].bindings.contains(name) {
+        if scopes[idx].bindings.contains(name) || has_scoped_binding_at_byte(&scopes[idx], name, byte) {
             return true;
         }
         match scopes[idx].parent {
@@ -3324,14 +3524,17 @@ fn is_local_binding_in_scopes(
     }
 }
 
-/// Walk up the scope chain looking for a type binding.
-fn lookup_type_in_scopes(
+fn lookup_type_in_scopes_at_byte(
     start_scope: usize,
     scopes: &[Scope],
     var_name: &str,
+    byte: usize,
 ) -> Option<String> {
     let mut idx = start_scope;
     loop {
+        if let Some(binding) = scoped_binding_at_byte(&scopes[idx], var_name, byte) {
+            return binding.type_name.clone();
+        }
         if let Some(type_name) = scopes[idx].types.get(var_name) {
             return Some(type_name.clone());
         }
@@ -3340,6 +3543,41 @@ fn lookup_type_in_scopes(
             None => return None,
         }
     }
+}
+
+fn lookup_iterable_element_type_in_scopes(
+    start_scope: usize,
+    scopes: &[Scope],
+    var_name: &str,
+) -> Option<String> {
+    let mut idx = start_scope;
+    loop {
+        if let Some(type_name) = scopes[idx].iterable_types.get(var_name) {
+            return Some(type_name.clone());
+        }
+        match scopes[idx].parent {
+            Some(p) => idx = p,
+            None => return None,
+        }
+    }
+}
+
+fn has_scoped_binding_at_byte(scope: &Scope, name: &str, byte: usize) -> bool {
+    scoped_binding_at_byte(scope, name, byte).is_some()
+}
+
+fn scoped_binding_at_byte<'a>(
+    scope: &'a Scope,
+    name: &str,
+    byte: usize,
+) -> Option<&'a ScopedBinding> {
+    scope
+        .scoped_bindings
+        .iter()
+        .rev()
+        .find(|binding| {
+            binding.name == name && byte >= binding.start_byte && byte < binding.end_byte
+        })
 }
 
 fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {

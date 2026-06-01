@@ -2359,6 +2359,258 @@ export function main() { return helper(); }
     }
 
     #[test]
+    fn test_typescript_for_of_resolves_abstract_class_method() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "shapes.ts", "\
+export abstract class Shape {
+  abstract area(): number;
+  describe(): string {
+    return `area is ${this.area()}`;
+  }
+}
+export class Circle extends Shape {
+  constructor(private radius: number) { super(); }
+  area(): number { return Math.PI * this.radius * this.radius; }
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape, Circle } from './shapes';
+export function run(): void {
+  const shapes: Shape[] = [new Circle(2)];
+  for (const s of shapes) { console.log(s.describe()); }
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["shapes.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let run_id = "main.ts::function::run";
+        let deps = graph.get_dependencies(run_id);
+        assert!(
+            deps.iter().any(|d| d.name == "describe" && d.file_path == "shapes.ts"),
+            "run should depend on Shape.describe through the for-of loop variable. Deps: {:?}",
+            deps.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+
+        let describe_id = "shapes.ts::class::Shape::describe";
+        let dependents = graph.get_dependents(describe_id);
+        assert!(
+            dependents.iter().any(|d| d.name == "run" && d.file_path == "main.ts"),
+            "Shape.describe should report run as a dependent. Dependents: {:?}",
+            dependents.iter().map(|d| (&d.name, &d.file_path)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_for_of_loop_variable_type_is_body_scoped() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.ts", "\
+export abstract class Shape {
+  abstract describe(): string;
+}
+export abstract class Widget {
+  abstract describe(): string;
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape, Widget } from './models';
+export function run(shapes: Shape[], widgets: Widget[]): void {
+  for (const item of shapes) { item.describe(); }
+  for (const item of widgets) { item.describe(); }
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let deps = graph.get_dependencies("main.ts::function::run");
+        assert!(
+            deps.iter().any(|d| d.id == "models.ts::class::Shape::describe"),
+            "first loop should resolve item.describe() to Shape.describe. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+        assert!(
+            deps.iter().any(|d| d.id == "models.ts::class::Widget::describe"),
+            "second loop should resolve item.describe() to Widget.describe. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_nested_for_of_resolves_loop_variable_method() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.ts", "\
+export abstract class Shape {
+  abstract describe(): string;
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape } from './models';
+export function run(shapes: Shape[], ok: boolean): void {
+  if (ok) {
+    for (const item of shapes) { item.describe(); }
+  }
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let deps = graph.get_dependencies("main.ts::function::run");
+        assert!(
+            deps.iter().any(|d| d.id == "models.ts::class::Shape::describe"),
+            "nested for-of should resolve item.describe() to Shape.describe. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_for_of_resolves_array_generic_element_method() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.ts", "\
+export abstract class Shape {
+  abstract describe(): string;
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape } from './models';
+export function run(shapes: Array<Shape>): void {
+  for (const item of shapes) { item.describe(); }
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let deps = graph.get_dependencies("main.ts::function::run");
+        assert!(
+            deps.iter().any(|d| d.id == "models.ts::class::Shape::describe"),
+            "for-of over Array<Shape> should resolve item.describe() to Shape.describe. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_for_of_resolves_readonly_array_element_method() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.ts", "\
+export abstract class Shape {
+  abstract describe(): string;
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape } from './models';
+export function run(shapes: readonly  Shape[]): void {
+  for(const item of shapes) { item.describe(); }
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let deps = graph.get_dependencies("main.ts::function::run");
+        assert!(
+            deps.iter().any(|d| d.id == "models.ts::class::Shape::describe"),
+            "for-of over readonly Shape[] should resolve item.describe() to Shape.describe. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_for_of_loop_variable_does_not_leak_on_same_line() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.ts", "\
+export abstract class Shape {
+  abstract inside(): void;
+  abstract outside(): void;
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape } from './models';
+export function run(shapes: Shape[]): void {
+  for (const item of shapes) { item.inside(); } item.outside();
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let deps = graph.get_dependencies("main.ts::function::run");
+        assert!(
+            deps.iter().any(|d| d.id == "models.ts::class::Shape::inside"),
+            "loop body should resolve item.inside() to Shape.inside. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.id == "models.ts::class::Shape::outside"),
+            "loop variable should not resolve outside the loop body. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typescript_nested_block_variable_type_does_not_leak_to_function_scope() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "models.ts", "\
+export abstract class Shape {
+  abstract outside(): void;
+}
+");
+        write_file(root, "main.ts", "\
+import { Shape } from './models';
+export function run(shapes: Shape[], ok: boolean): void {
+  if (ok) { const item: Shape = shapes[0]; }
+  item.outside();
+}
+");
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["models.ts".into(), "main.ts".into()],
+            &registry,
+        );
+
+        let deps = graph.get_dependencies("main.ts::function::run");
+        assert!(
+            !deps.iter().any(|d| d.id == "models.ts::class::Shape::outside"),
+            "block-scoped item should not resolve after its block. Deps: {:?}",
+            deps.iter().map(|d| (&d.id, &d.name)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_js_ts_relative_import_resolution_uses_full_path() {
         let (dir, registry) = create_test_repo();
         let root = dir.path();

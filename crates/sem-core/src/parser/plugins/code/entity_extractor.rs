@@ -1551,8 +1551,8 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "function_signature"
         | "subroutine_declaration_statement" => "function",
         "method_declaration" | "method_definition" | "method" | "singleton_method"
-        | "method_signature" | "operator_signature" => "method",
-        "class_declaration" | "class_definition" | "class_specifier" => "class",
+        | "method_signature" | "abstract_method_signature" | "operator_signature" => "method",
+        "class_declaration" | "abstract_class_declaration" | "class_definition" | "class_specifier" => "class",
         "interface_declaration" => "interface",
         "type_alias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
         "enum_declaration" | "enum_item" | "enum_specifier" | "enum_definition" => "enum",

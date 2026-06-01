@@ -513,6 +513,45 @@ export class Greeter {
     }
 
     #[test]
+    fn test_typescript_abstract_class_entity_extraction() {
+        for file_path in ["shape.ts", "shape.tsx"] {
+            let code = r#"
+export abstract class Shape {
+    abstract area(): number;
+
+    describe(): string {
+        return `area is ${this.area()}`;
+    }
+}
+"#;
+            let plugin = CodeParserPlugin;
+            let entities = plugin.extract_entities(code, file_path);
+            let find = |name: &str| {
+                entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                    panic!(
+                        "missing {name} in {file_path}; got: {:?}",
+                        entities
+                            .iter()
+                            .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                            .collect::<Vec<_>>()
+                    )
+                })
+            };
+
+            let shape = find("Shape");
+            assert_eq!(shape.entity_type, "class");
+
+            let area = find("area");
+            assert_eq!(area.entity_type, "method");
+            assert_eq!(area.parent_id.as_deref(), Some(shape.id.as_str()));
+
+            let describe = find("describe");
+            assert_eq!(describe.entity_type, "method");
+            assert_eq!(describe.parent_id.as_deref(), Some(shape.id.as_str()));
+        }
+    }
+
+    #[test]
     fn test_module_typescript_entity_extraction() {
         let code = r#"
 export function hello(): string {
