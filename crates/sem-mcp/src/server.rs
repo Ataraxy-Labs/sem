@@ -10,11 +10,11 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use sem_core::format::json::format_diff_json;
+use sem_core::format::json::format_diff_json_with_binary_changes;
 use sem_core::git::bridge::GitBridge;
 use sem_core::git::types::{BlameLineInfo, CommitInfo, DiffScope};
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::differ::compute_semantic_diff;
+use sem_core::parser::differ::{collect_binary_file_changes, compute_semantic_diff};
 use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
@@ -527,11 +527,12 @@ impl SemServer {
             Err(err) => return Ok(tool_error(err.to_string())),
         };
 
+        let binary_changes = collect_binary_file_changes(&file_changes);
         let diff_result =
             compute_semantic_diff(&file_changes, &self.registry, None, None);
 
         Ok(CallToolResult::success(vec![Content::text(
-            format_diff_json(&diff_result),
+            format_diff_json_with_binary_changes(&diff_result, &binary_changes),
         )]))
     }
 

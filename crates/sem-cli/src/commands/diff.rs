@@ -8,7 +8,7 @@ use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::{compute_semantic_diff, DiffResult};
+use sem_core::parser::differ::{collect_binary_file_changes, compute_semantic_diff, DiffResult};
 use sem_core::parser::plugins::code::languages::get_language_config;
 use sem_core::parser::registry::{detect_ext_from_content, ParserRegistry};
 
@@ -232,6 +232,28 @@ fn normalize_trailing_output_format(opts: &mut DiffOptions) {
     }
 
     opts.args = args;
+}
+
+fn bytes_look_binary(bytes: &[u8], complete: bool) -> bool {
+    if bytes.iter().any(|byte| *byte == 0) {
+        return true;
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(_) => false,
+        Err(error) => complete || error.error_len().is_some(),
+    }
+}
+
+fn read_file_compare_content(path: &Path) -> Result<Option<String>, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    if bytes_look_binary(&bytes, true) {
+        Ok(None)
+    } else {
+        let content = String::from_utf8(bytes)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        Ok(Some(content))
+    }
 }
 
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
@@ -603,17 +625,31 @@ fn parse_unified_diff(
     Ok(entries
         .into_iter()
         .map(|e| {
-            let before_content = e.old_sha.as_deref().and_then(&git_show);
-            let mut after_content = e.new_sha.as_deref().and_then(&git_show);
+            let is_binary = e.has_binary_marker || e.has_git_binary_patch;
+            let mut has_binary_content = is_binary;
+            let before_content = if is_binary {
+                None
+            } else {
+                e.old_sha.as_deref().and_then(&git_show)
+            };
+            let mut after_content = if is_binary {
+                None
+            } else {
+                e.new_sha.as_deref().and_then(&git_show)
+            };
 
             // Fallback: if git show fails for the new SHA (e.g. unstaged working
             // tree changes where the blob doesn't exist yet), read from disk.
-            if after_content.is_none() && e.new_sha.is_some() {
+            if !is_binary && after_content.is_none() && e.new_sha.is_some() {
                 let file = worktree_root.join(&e.file_path);
-                after_content = std::fs::read_to_string(&file).ok();
+                match read_file_compare_content(&file) {
+                    Ok(Some(content)) => after_content = Some(content),
+                    Ok(None) => has_binary_content = true,
+                    Err(_) => {}
+                }
             }
 
-            if before_content.is_none() && after_content.is_none() {
+            if !has_binary_content && before_content.is_none() && after_content.is_none() {
                 eprintln!(
                     "\x1b[33mwarning:\x1b[0m could not resolve contents for \x1b[1m{}\x1b[0m. \
                      Try running from inside the repo, or use \x1b[1m-C /path/to/repo\x1b[0m.",
@@ -843,11 +879,11 @@ pub fn diff_command(mut opts: DiffOptions) {
             }
         }
 
-        let content_a = std::fs::read_to_string(&path_a).unwrap_or_else(|e| {
+        let content_a = read_file_compare_content(&path_a).unwrap_or_else(|e| {
             eprintln!("\x1b[31mError reading {}: {e}\x1b[0m", path_a.display());
             process::exit(1);
         });
-        let content_b = std::fs::read_to_string(&path_b).unwrap_or_else(|e| {
+        let content_b = read_file_compare_content(&path_b).unwrap_or_else(|e| {
             eprintln!("\x1b[31mError reading {}: {e}\x1b[0m", path_b.display());
             process::exit(1);
         });
@@ -857,16 +893,34 @@ pub fn diff_command(mut opts: DiffOptions) {
             .clone()
             .or_else(|| label.clone())
             .unwrap_or_else(|| after.clone());
-        let registry = super::create_registry(&opts.cwd);
-        let (changes, language_mismatch) =
-            file_compare_changes(before, &target_label, content_a, content_b, &registry);
-        if let Some((language_a, language_b)) = language_mismatch {
-            eprintln!(
-                "warning: comparing files with different languages: {} ({}) and {} ({}); rendering as delete/add",
-                before, language_a, after, language_b
+        if content_a.is_none() || content_b.is_none() {
+            // A None side is binary or otherwise not UTF-8; emit a file-level
+            // change so the diff pipeline reports it as a binary change.
+            let change = FileChange {
+                file_path: target_label,
+                old_file_path: None,
+                status: FileStatus::Modified,
+                before_content: content_a,
+                after_content: content_b,
+            };
+            (vec![change], false)
+        } else {
+            let registry = super::create_registry(&opts.cwd);
+            let (changes, language_mismatch) = file_compare_changes(
+                before,
+                &target_label,
+                content_a.unwrap(),
+                content_b.unwrap(),
+                &registry,
             );
+            if let Some((language_a, language_b)) = language_mismatch {
+                eprintln!(
+                    "warning: comparing files with different languages: {} ({}) and {} ({}); rendering as delete/add",
+                    before, language_a, after, language_b
+                );
+            }
+            (changes, false)
         }
-        (changes, false)
     } else if opts.patch {
         // Read unified diff from stdin and parse it
         let mut input = String::new();
@@ -1045,7 +1099,7 @@ fn run_diff_pipeline(
     if file_changes.is_empty() {
         match opts.format {
             OutputFormat::Json => {
-                println!("{{\"summary\":{{\"fileCount\":0,\"added\":0,\"modified\":0,\"deleted\":0,\"moved\":0,\"renamed\":0,\"reordered\":0,\"orphan\":0,\"total\":0}},\"changes\":[]}}");
+                println!("{{\"summary\":{{\"fileCount\":0,\"added\":0,\"modified\":0,\"deleted\":0,\"moved\":0,\"renamed\":0,\"reordered\":0,\"binary\":0,\"orphan\":0,\"total\":0}},\"changes\":[],\"binaryChanges\":[]}}");
             }
             _ => {
                 println!("\x1b[2mNo semantic changes detected.\x1b[0m");
@@ -1059,6 +1113,7 @@ fn run_diff_pipeline(
     let registry_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
     let t3 = Instant::now();
+    let binary_changes = collect_binary_file_changes(&file_changes);
     let mut result = compute_semantic_diff(&file_changes, &registry, None, None);
     let parse_diff_ms = t3.elapsed().as_secs_f64() * 1000.0;
 
@@ -1068,14 +1123,16 @@ fn run_diff_pipeline(
     }
 
     // Record lifetime stats (best-effort)
-    let _ = SemLifetimeStats::load().record_diff(&result).save();
+    let _ = SemLifetimeStats::load()
+        .record_diff(&result, binary_changes.len())
+        .save();
 
     let t4 = Instant::now();
     let output = match opts.format {
-        OutputFormat::Json => format_json(&result),
-        OutputFormat::Markdown => format_markdown(&result, opts.verbose),
-        OutputFormat::Plain => format_plain(&result),
-        OutputFormat::Terminal => format_terminal(&result, opts.verbose),
+        OutputFormat::Json => format_json(&result, &binary_changes),
+        OutputFormat::Markdown => format_markdown(&result, &binary_changes, opts.verbose),
+        OutputFormat::Plain => format_plain(&result, &binary_changes),
+        OutputFormat::Terminal => format_terminal(&result, &binary_changes, opts.verbose),
     };
     let format_ms = t4.elapsed().as_secs_f64() * 1000.0;
 
@@ -1104,6 +1161,7 @@ fn run_diff_pipeline(
                 + result.moved_count
                 + result.renamed_count
                 + result.reordered_count
+                + binary_changes.len()
         );
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
     }
@@ -1123,16 +1181,20 @@ fn retain_non_cosmetic_changes(result: &mut DiffResult) {
             change.after_content = None;
         }
     }
-    // Drop only purely cosmetic modifications; compound changes are preserved above.
-    result
-        .changes
-        .retain(|c| c.change_type != ChangeType::Modified || c.structural_change != Some(false));
+    // Drop purely cosmetic changes; compound moves/renames/reorders are preserved above.
+    result.changes.retain(|c| {
+        c.structural_change != Some(false)
+            || matches!(
+                c.change_type,
+                ChangeType::Moved | ChangeType::Renamed | ChangeType::Reordered
+            )
+    });
     recalculate_diff_summary(result);
 }
 
 fn recalculate_diff_summary(result: &mut DiffResult) {
-    // Mirrors compute_semantic_diff: any retained change, including an orphan,
-    // marks its file as changed. Orphans only skip the entity change-type buckets.
+    // Mirrors compute_semantic_diff: orphan_count is cross-cutting metadata,
+    // while retained orphans still contribute to change-type buckets.
     result.file_count = result
         .changes
         .iter()
@@ -1151,16 +1213,30 @@ fn recalculate_diff_summary(result: &mut DiffResult) {
     for change in &result.changes {
         if change.entity_type == "orphan" {
             orphan_count += 1;
-            continue;
         }
 
         match change.change_type {
             ChangeType::Added => added_count += 1,
             ChangeType::Modified => modified_count += 1,
             ChangeType::Deleted => deleted_count += 1,
-            ChangeType::Moved => moved_count += 1,
-            ChangeType::Renamed => renamed_count += 1,
-            ChangeType::Reordered => reordered_count += 1,
+            ChangeType::Moved => {
+                moved_count += 1;
+                if change.has_content_change() {
+                    modified_count += 1;
+                }
+            }
+            ChangeType::Renamed => {
+                renamed_count += 1;
+                if change.has_content_change() {
+                    modified_count += 1;
+                }
+            }
+            ChangeType::Reordered => {
+                reordered_count += 1;
+                if change.has_content_change() {
+                    modified_count += 1;
+                }
+            }
         }
     }
 
@@ -1241,12 +1317,27 @@ mod tests {
         assert_eq!(result.changes.len(), 3);
         assert_eq!(result.file_count, 2);
         assert_eq!(result.added_count, 1);
-        assert_eq!(result.modified_count, 1);
+        assert_eq!(result.modified_count, 2);
         assert_eq!(result.deleted_count, 0);
         assert_eq!(result.moved_count, 0);
         assert_eq!(result.renamed_count, 0);
         assert_eq!(result.reordered_count, 0);
         assert_eq!(result.orphan_count, 1);
+    }
+
+    #[test]
+    fn no_cosmetics_filter_drops_cosmetic_orphan_addition() {
+        let mut orphan = change("src/orphan.rs", ChangeType::Added, Some(false));
+        orphan.entity_type = "orphan".to_string();
+
+        let mut result = diff_result(vec![orphan]);
+
+        retain_non_cosmetic_changes(&mut result);
+
+        assert!(result.changes.is_empty());
+        assert_eq!(result.file_count, 0);
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.orphan_count, 0);
     }
 
     #[test]
@@ -1389,5 +1480,44 @@ mod tests {
                 PatchParseError::NoRecognizableHunks
             );
         }
+    }
+
+    #[test]
+    fn file_compare_binary_detection_handles_nuls_and_invalid_utf8() {
+        assert!(bytes_look_binary(b"\0png", true));
+        assert!(bytes_look_binary(&[0xff, 0xfe], true));
+        assert!(!bytes_look_binary("plain text".as_bytes(), true));
+    }
+
+    #[test]
+    fn file_compare_binary_detection_ignores_partial_utf8_at_scan_boundary() {
+        assert!(!bytes_look_binary(&[0xe2, 0x82], false));
+        assert!(bytes_look_binary(&[0xe2, 0x82], true));
+    }
+
+    #[test]
+    fn read_file_compare_content_preserves_text_side_for_mixed_binary_compare() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sem-file-compare-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+
+        let text_path = dir.join("text.txt");
+        let binary_path = dir.join("image.bin");
+        std::fs::write(&text_path, "plain text\n").unwrap();
+        std::fs::write(&binary_path, b"\0binary").unwrap();
+
+        assert_eq!(
+            read_file_compare_content(&text_path).unwrap().as_deref(),
+            Some("plain text\n")
+        );
+        assert!(read_file_compare_content(&binary_path).unwrap().is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

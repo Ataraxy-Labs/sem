@@ -13,6 +13,9 @@ pub trait SemanticParserPlugin: Send + Sync {
     ) -> (Vec<SemanticEntity>, Option<tree_sitter::Tree>) {
         (self.extract_entities(content, file_path), None)
     }
+    fn structural_hash_content(&self, _content: &str, _file_path: &str) -> Option<String> {
+        None
+    }
     fn compute_similarity(&self, a: &SemanticEntity, b: &SemanticEntity) -> f64 {
         crate::model::identity::default_similarity(a, b)
     }

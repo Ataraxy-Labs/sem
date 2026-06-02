@@ -101,7 +101,7 @@ impl SemLifetimeStats {
             .unwrap_or_default()
     }
 
-    pub fn record_diff(mut self, result: &DiffResult) -> Self {
+    pub fn record_diff(mut self, result: &DiffResult, binary_count: usize) -> Self {
         let now = now_iso();
         if self.first_run.is_none() {
             self.first_run = Some(now.clone());
@@ -122,7 +122,8 @@ impl SemLifetimeStats {
             + result.deleted_count
             + result.moved_count
             + result.renamed_count
-            + result.reordered_count) as u64;
+            + result.reordered_count
+            + binary_count) as u64;
         self.total_changes_detected += changes;
         self.noise_filtered += entities_analyzed.saturating_sub(changes);
 

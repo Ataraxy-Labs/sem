@@ -487,6 +487,17 @@ impl GitBridge {
         files
     }
 
+    fn bytes_look_binary(bytes: &[u8], complete: bool) -> bool {
+        if bytes.iter().any(|byte| *byte == 0) {
+            return true;
+        }
+
+        match std::str::from_utf8(bytes) {
+            Ok(_) => false,
+            Err(error) => complete || error.error_len().is_some(),
+        }
+    }
+
     fn populate_contents(
         &self,
         files: &mut [FileChange],
@@ -605,14 +616,22 @@ impl GitBridge {
     fn read_blob_from_tree(&self, tree: &git2::Tree, file_path: &str) -> Option<String> {
         let entry = tree.get_path(Path::new(file_path)).ok()?;
         let blob = self.repo.find_blob(entry.id()).ok()?;
-        std::str::from_utf8(blob.content())
+        let bytes = blob.content();
+        if blob.is_binary() || Self::bytes_look_binary(bytes, true) {
+            return None;
+        }
+        std::str::from_utf8(bytes)
             .ok()
             .map(|s| Self::normalize_line_endings(s.to_string()))
     }
 
     fn read_working_file(&self, file_path: &str) -> Option<String> {
         let full_path = self.repo_root.join(file_path);
-        fs::read_to_string(full_path)
+        let bytes = fs::read(full_path).ok()?;
+        if Self::bytes_look_binary(&bytes, true) {
+            return None;
+        }
+        String::from_utf8(bytes)
             .ok()
             .map(Self::normalize_line_endings)
     }
@@ -621,7 +640,11 @@ impl GitBridge {
         let index = self.repo.index().ok()?;
         let entry = index.get_path(Path::new(file_path), 0)?;
         let blob = self.repo.find_blob(entry.id).ok()?;
-        std::str::from_utf8(blob.content())
+        let bytes = blob.content();
+        if blob.is_binary() || Self::bytes_look_binary(bytes, true) {
+            return None;
+        }
+        std::str::from_utf8(bytes)
             .ok()
             .map(|s| Self::normalize_line_endings(s.to_string()))
     }
@@ -1192,12 +1215,40 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::model::change::ChangeType;
-    use crate::parser::differ::compute_semantic_diff;
+    use crate::parser::differ::{collect_binary_file_changes, compute_semantic_diff};
     use crate::parser::plugins::create_default_registry;
     use git2::{ErrorClass, Oid, Repository, Signature};
     use tempfile::TempDir;
 
     fn commit_file(repo: &Repository, file_path: &str, contents: &str, message: &str) -> Oid {
+        fs::write(repo.workdir().unwrap().join(file_path), contents).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(file_path)).unwrap();
+        index.write().unwrap();
+
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
+
+        match repo.head() {
+            Ok(head) => {
+                let parent = repo.find_commit(head.target().unwrap()).unwrap();
+                repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+                    .unwrap()
+            }
+            Err(_) => repo
+                .commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
+                .unwrap(),
+        }
+    }
+
+    fn commit_binary_file(
+        repo: &Repository,
+        file_path: &str,
+        contents: &[u8],
+        message: &str,
+    ) -> Oid {
         fs::write(repo.workdir().unwrap().join(file_path), contents).unwrap();
 
         let mut index = repo.index().unwrap();
@@ -1414,6 +1465,81 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("pathspec"));
         assert!(message.contains("is outside repository"));
+    }
+
+    #[test]
+    fn working_binary_modification_is_reported_as_binary_change() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        commit_binary_file(&repo, "pic.png", b"\0png-v1\0", "init");
+        fs::write(temp.path().join("pic.png"), b"\0png-v2\0extra").unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge.get_changed_files(&DiffScope::Working, &[]).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path, "pic.png");
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert!(files[0].before_content.is_none());
+        assert!(files[0].after_content.is_none());
+
+        let binary_changes = collect_binary_file_changes(&files);
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&files, &registry, None, None);
+
+        assert!(result.changes.is_empty());
+        assert_eq!(result.file_count, 0);
+        assert_eq!(binary_changes.len(), 1);
+        assert_eq!(binary_changes[0].file_path, "pic.png");
+        assert_eq!(binary_changes[0].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn staged_binary_add_and_delete_are_reported_as_binary_changes() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        fs::write(temp.path().join("added.png"), b"\0added-binary\0").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("added.png")).unwrap();
+        index.write().unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let added_files = bridge.get_changed_files(&DiffScope::Staged, &[]).unwrap();
+        assert_eq!(added_files.len(), 1);
+        assert_eq!(added_files[0].file_path, "added.png");
+        assert_eq!(added_files[0].status, FileStatus::Added);
+        assert!(added_files[0].before_content.is_none());
+        assert!(added_files[0].after_content.is_none());
+        let added_binary_changes = collect_binary_file_changes(&added_files);
+        assert_eq!(added_binary_changes.len(), 1);
+        assert_eq!(added_binary_changes[0].file_path, "added.png");
+
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        commit_binary_file(&repo, "deleted.png", b"\0deleted-binary\0", "init");
+        fs::remove_file(temp.path().join("deleted.png")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("deleted.png")).unwrap();
+        index.write().unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let deleted_files = bridge.get_changed_files(&DiffScope::Staged, &[]).unwrap();
+        assert_eq!(deleted_files.len(), 1);
+        assert_eq!(deleted_files[0].file_path, "deleted.png");
+        assert_eq!(deleted_files[0].status, FileStatus::Deleted);
+        assert!(deleted_files[0].before_content.is_none());
+        assert!(deleted_files[0].after_content.is_none());
+        let deleted_binary_changes = collect_binary_file_changes(&deleted_files);
+        assert_eq!(deleted_binary_changes.len(), 1);
+        assert_eq!(deleted_binary_changes[0].file_path, "deleted.png");
+    }
+
+    #[test]
+    fn partial_utf8_boundary_is_not_treated_as_binary() {
+        assert!(!GitBridge::bytes_look_binary(&[0xe2, 0x82], false));
+        assert!(GitBridge::bytes_look_binary(&[0xe2, 0x82], true));
     }
 
     #[test]

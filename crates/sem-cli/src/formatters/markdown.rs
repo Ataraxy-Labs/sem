@@ -1,29 +1,78 @@
 use super::orphan_summary_parts;
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
 
-pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
-    if result.changes.is_empty() {
+use super::{binary_display_name, file_count, has_reportable_changes};
+
+fn longest_backtick_run(input: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+
+    for ch in input.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+
+    longest
+}
+
+fn push_diff_block(lines: &mut Vec<String>, diff_lines: Vec<String>) {
+    let fence_len = diff_lines
+        .iter()
+        .map(|line| longest_backtick_run(line))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(3);
+    let fence = "`".repeat(fence_len);
+
+    lines.push(format!("{fence}diff"));
+    lines.extend(diff_lines);
+    lines.push(fence);
+}
+
+pub fn format_markdown(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    verbose: bool,
+) -> String {
+    if !has_reportable_changes(result, binary_changes) {
         return "No semantic changes detected.".to_string();
     }
 
     let mut lines: Vec<String> = Vec::new();
 
     // Group changes by file (BTreeMap for sorted output)
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, change) in result.changes.iter().enumerate() {
-        by_file.entry(&change.file_path).or_default().push(i);
+        by_file.entry(&change.file_path).or_default().0.push(i);
+    }
+    for (i, change) in binary_changes.iter().enumerate() {
+        by_file.entry(&change.file_path).or_default().1.push(i);
     }
 
-    for (file_path, indices) in &by_file {
+    for (file_path, (indices, binary_indices)) in &by_file {
         lines.push(format!("### {file_path}"));
         lines.push(String::new());
         lines.push("| Status | Type | Name |".to_string());
         lines.push("|--------|------|------|".to_string());
 
         let mut post_table: Vec<String> = Vec::new();
+
+        for &idx in binary_indices {
+            let change = &binary_changes[idx];
+            lines.push(format!(
+                "| B | file | {} `[binary {}]` |",
+                binary_display_name(change),
+                change.status,
+            ));
+        }
 
         for &idx in indices {
             let change = &result.changes[idx];
@@ -62,22 +111,20 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                         if let Some(ref content) = change.after_content {
                             post_table.push(String::new());
                             post_table.push(format!("**`{}`**", change.entity_name));
-                            post_table.push("```diff".to_string());
-                            for line in content.lines() {
-                                post_table.push(format!("+ {line}"));
-                            }
-                            post_table.push("```".to_string());
+                            push_diff_block(
+                                &mut post_table,
+                                content.lines().map(|line| format!("+ {line}")).collect(),
+                            );
                         }
                     }
                     ChangeType::Deleted => {
                         if let Some(ref content) = change.before_content {
                             post_table.push(String::new());
                             post_table.push(format!("**`{}`**", change.entity_name));
-                            post_table.push("```diff".to_string());
-                            for line in content.lines() {
-                                post_table.push(format!("- {line}"));
-                            }
-                            post_table.push("```".to_string());
+                            push_diff_block(
+                                &mut post_table,
+                                content.lines().map(|line| format!("- {line}")).collect(),
+                            );
                         }
                     }
                     ChangeType::Modified | ChangeType::Moved | ChangeType::Renamed => {
@@ -86,10 +133,10 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                         {
                             post_table.push(String::new());
                             post_table.push(format!("**`{}`**", change.entity_name));
-                            post_table.push("```diff".to_string());
+                            let mut diff_lines = Vec::new();
                             let diff = TextDiff::from_lines(before.as_str(), after.as_str());
                             for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
-                                post_table.push(hunk.header().to_string());
+                                diff_lines.push(hunk.header().to_string());
                                 for op in hunk.ops() {
                                     let mut deletes: Vec<String> = Vec::new();
                                     let mut inserts: Vec<String> = Vec::new();
@@ -100,25 +147,25 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                                             ChangeTag::Delete => deletes.push(line.to_string()),
                                             ChangeTag::Insert => inserts.push(line.to_string()),
                                             ChangeTag::Equal => {
-                                                post_table.push(format!("  {line}"))
+                                                diff_lines.push(format!("  {line}"))
                                             }
                                         }
                                     }
 
                                     let paired = deletes.len().min(inserts.len());
                                     for i in 0..paired {
-                                        post_table.push(format!("- {}", deletes[i]));
-                                        post_table.push(format!("+ {}", inserts[i]));
+                                        diff_lines.push(format!("- {}", deletes[i]));
+                                        diff_lines.push(format!("+ {}", inserts[i]));
                                     }
                                     for d in &deletes[paired..] {
-                                        post_table.push(format!("- {d}"));
+                                        diff_lines.push(format!("- {d}"));
                                     }
                                     for i in &inserts[paired..] {
-                                        post_table.push(format!("+ {i}"));
+                                        diff_lines.push(format!("+ {i}"));
                                     }
                                 }
                             }
-                            post_table.push("```".to_string());
+                            push_diff_block(&mut post_table, diff_lines);
                         }
                     }
                     _ => {}
@@ -132,14 +179,12 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                     if before_lines.len() <= 3 && after_lines.len() <= 3 {
                         post_table.push(String::new());
                         post_table.push(format!("**`{}`**", change.entity_name));
-                        post_table.push("```diff".to_string());
-                        for line in &before_lines {
-                            post_table.push(format!("- {}", line.trim()));
-                        }
-                        for line in &after_lines {
-                            post_table.push(format!("+ {}", line.trim()));
-                        }
-                        post_table.push("```".to_string());
+                        let diff_lines = before_lines
+                            .iter()
+                            .map(|line| format!("- {}", line.trim()))
+                            .chain(after_lines.iter().map(|line| format!("+ {}", line.trim())))
+                            .collect();
+                        push_diff_block(&mut post_table, diff_lines);
                     }
                 }
             }
@@ -181,7 +226,12 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     if result.reordered_count > 0 {
         parts.push(format!("{} reordered", result.reordered_count));
     }
-    let files_label = if result.file_count == 1 {
+    if !binary_changes.is_empty() {
+        parts.push(format!("{} binary", binary_changes.len()));
+    }
+
+    let reported_file_count = file_count(result, binary_changes);
+    let files_label = if reported_file_count == 1 {
         "file"
     } else {
         "files"
@@ -196,9 +246,65 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     lines.push(format!(
         "**Summary:** {} across {} {files_label}{}",
         parts.join(", "),
-        result.file_count,
+        reported_file_count,
         orphan_suffix,
     ));
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sem_core::model::change::SemanticChange;
+
+    fn diff_result(change: SemanticChange) -> DiffResult {
+        DiffResult {
+            changes: vec![change],
+            file_count: 1,
+            added_count: 0,
+            modified_count: 1,
+            deleted_count: 0,
+            moved_count: 0,
+            renamed_count: 0,
+            reordered_count: 0,
+            orphan_count: 0,
+            total_entities_before: 1,
+            total_entities_after: 1,
+        }
+    }
+
+    #[test]
+    fn markdown_diff_fence_is_longer_than_embedded_backticks() {
+        let change: SemanticChange = serde_json::from_value(serde_json::json!({
+            "id": "change::app.py::function::foo",
+            "entityId": "app.py::function::foo",
+            "changeType": "modified",
+            "entityType": "function",
+            "entityName": "foo",
+            "entityLine": 1,
+            "filePath": "app.py",
+            "beforeContent": "def foo():\n    return \"plain\"\n",
+            "afterContent": "def foo():\n    return \"````\"\n",
+            "structuralChange": true
+        }))
+        .unwrap();
+
+        let output = format_markdown(&diff_result(change), &[], true);
+        let lines: Vec<&str> = output.lines().collect();
+        let opening = lines
+            .iter()
+            .position(|line| *line == "`````diff")
+            .expect("diff block should open with a 5-backtick fence");
+        let closing = lines[opening + 1..]
+            .iter()
+            .position(|line| *line == "`````")
+            .map(|offset| opening + 1 + offset)
+            .expect("diff block should close with a matching 5-backtick fence");
+
+        assert!(lines[opening + 1..closing]
+            .iter()
+            .any(|line| line.contains("````")));
+        assert!(!lines.iter().any(|line| *line == "````diff"));
+    }
 }

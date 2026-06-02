@@ -19,6 +19,17 @@ pub enum FileStatus {
     Renamed,
 }
 
+impl std::fmt::Display for FileStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileStatus::Added => write!(f, "added"),
+            FileStatus::Modified => write!(f, "modified"),
+            FileStatus::Deleted => write!(f, "deleted"),
+            FileStatus::Renamed => write!(f, "renamed"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileChange {

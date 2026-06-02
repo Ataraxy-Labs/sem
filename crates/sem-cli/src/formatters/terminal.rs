@@ -1,9 +1,27 @@
 use super::orphan_summary_parts;
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
+
+use super::{binary_display_name, file_count, has_reportable_changes};
+
+fn sanitize_terminal_text(input: &str) -> String {
+    if !input.chars().any(char::is_control) {
+        return input.to_string();
+    }
+
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_control() {
+            output.extend(ch.escape_debug());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
 
 /// Runs word-level diff on two lines and returns (delete_line, insert_line)
 /// with changed words highlighted (strikethrough+red / bold+green).
@@ -13,7 +31,7 @@ fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
     let mut ins = String::new();
 
     for change in diff.iter_all_changes() {
-        let val = change.value();
+        let val = sanitize_terminal_text(change.value());
         match change.tag() {
             ChangeTag::Equal => {
                 del.push_str(&val.dimmed().to_string());
@@ -31,22 +49,30 @@ fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
     (del, ins)
 }
 
-pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
-    if result.changes.is_empty() {
+pub fn format_terminal(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    verbose: bool,
+) -> String {
+    if !has_reportable_changes(result, binary_changes) {
         return "No semantic changes detected.".dimmed().to_string();
     }
 
     let mut lines: Vec<String> = Vec::new();
 
     // Group changes by file (BTreeMap for sorted output)
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, change) in result.changes.iter().enumerate() {
-        by_file.entry(&change.file_path).or_default().push(i);
+        by_file.entry(&change.file_path).or_default().0.push(i);
+    }
+    for (i, change) in binary_changes.iter().enumerate() {
+        by_file.entry(&change.file_path).or_default().1.push(i);
     }
 
-    for (file_path, indices) in &by_file {
+    for (file_path, (indices, binary_indices)) in &by_file {
         // Skip files where all changes are orphans in non-verbose mode
         if !verbose
+            && binary_indices.is_empty()
             && indices
                 .iter()
                 .all(|&i| result.changes[i].entity_type == "orphan")
@@ -54,7 +80,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             continue;
         }
 
-        let header = format!("─ {file_path} ");
+        let header = format!("─ {} ", sanitize_terminal_text(file_path));
         let pad_len = 55usize.saturating_sub(header.len());
         lines.push(
             format!("┌{header}{}", "─".repeat(pad_len))
@@ -62,6 +88,23 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 .to_string(),
         );
         lines.push("│".dimmed().to_string());
+
+        for &idx in binary_indices {
+            let change = &binary_changes[idx];
+            let symbol = "■".yellow().to_string();
+            let tag = format!("[binary {}]", change.status).yellow().to_string();
+            let type_label = format!("{:<10}", "file");
+            let name_label = format!("{:<25}", binary_display_name(change));
+
+            lines.push(format!(
+                "{}  {} {} {} {}",
+                "│".dimmed(),
+                symbol,
+                type_label.dimmed(),
+                name_label.bold(),
+                tag,
+            ));
+        }
 
         for &idx in indices {
             let change = &result.changes[idx];
@@ -105,14 +148,18 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 ),
             };
 
-            let type_label = format!("{:<10}", change.entity_type);
+            let type_label = format!("{:<10}", sanitize_terminal_text(&change.entity_type));
             let base_name = if let Some(ref old_name) = change.old_entity_name {
-                format!("{old_name} -> {}", change.entity_name)
+                format!(
+                    "{} -> {}",
+                    sanitize_terminal_text(old_name),
+                    sanitize_terminal_text(&change.entity_name)
+                )
             } else {
-                change.entity_name.clone()
+                sanitize_terminal_text(&change.entity_name)
             };
             let display_name = match &change.parent_name {
-                Some(p) => format!("{p}::{base_name}"),
+                Some(p) => format!("{}::{base_name}", sanitize_terminal_text(p)),
                 None => base_name,
             };
             let name_label = format!("{:<25}", display_name);
@@ -132,6 +179,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     ChangeType::Added => {
                         if let Some(ref content) = change.after_content {
                             for line in content.lines() {
+                                let line = sanitize_terminal_text(line);
                                 lines.push(format!(
                                     "{}    {}",
                                     "│".dimmed(),
@@ -143,6 +191,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     ChangeType::Deleted => {
                         if let Some(ref content) = change.before_content {
                             for line in content.lines() {
+                                let line = sanitize_terminal_text(line);
                                 lines.push(format!(
                                     "{}    {}",
                                     "│".dimmed(),
@@ -167,10 +216,12 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                                     let mut inserts: Vec<String> = Vec::new();
 
                                     for diff_change in diff.iter_changes(op) {
-                                        let line = diff_change.value().trim_end_matches('\n');
+                                        let line = sanitize_terminal_text(
+                                            diff_change.value().trim_end_matches('\n'),
+                                        );
                                         match diff_change.tag() {
-                                            ChangeTag::Delete => deletes.push(line.to_string()),
-                                            ChangeTag::Insert => inserts.push(line.to_string()),
+                                            ChangeTag::Delete => deletes.push(line),
+                                            ChangeTag::Insert => inserts.push(line),
                                             ChangeTag::Equal => {
                                                 lines.push(format!(
                                                     "{}    {}",
@@ -226,17 +277,19 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
 
                     if before_lines.len() <= 3 && after_lines.len() <= 3 {
                         for line in &before_lines {
+                            let line = sanitize_terminal_text(line.trim());
                             lines.push(format!(
                                 "{}    {}",
                                 "│".dimmed(),
-                                format!("- {}", line.trim()).red(),
+                                format!("- {line}").red(),
                             ));
                         }
                         for line in &after_lines {
+                            let line = sanitize_terminal_text(line.trim());
                             lines.push(format!(
                                 "{}    {}",
                                 "│".dimmed(),
-                                format!("+ {}", line.trim()).green(),
+                                format!("+ {line}").green(),
                             ));
                         }
                     }
@@ -249,7 +302,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     lines.push(format!(
                         "{}    {}",
                         "│".dimmed(),
-                        format!("from {old_path}").dimmed(),
+                        format!("from {}", sanitize_terminal_text(old_path)).dimmed(),
                     ));
                 } else if let Some(ref old_parent) = change.old_parent_id {
                     // Intra-file move: extract parent name from entity ID
@@ -257,7 +310,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     lines.push(format!(
                         "{}    {}",
                         "│".dimmed(),
-                        format!("moved from {parent_name}").dimmed(),
+                        format!("moved from {}", sanitize_terminal_text(parent_name)).dimmed(),
                     ));
                 }
             }
@@ -304,7 +357,12 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 .to_string(),
         );
     }
-    let files_label = if result.file_count == 1 {
+    if !binary_changes.is_empty() {
+        parts.push(format!("{} binary", binary_changes.len()).yellow().to_string());
+    }
+
+    let reported_file_count = file_count(result, binary_changes);
+    let files_label = if reported_file_count == 1 {
         "file"
     } else {
         "files"
@@ -321,7 +379,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     lines.push(format!(
         "Summary: {} across {} {files_label}{}",
         parts.join(", "),
-        result.file_count,
+        reported_file_count,
         orphan_suffix,
     ));
 
@@ -334,7 +392,8 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         + result.deleted_count
         + result.moved_count
         + result.renamed_count
-        + result.reordered_count;
+        + result.reordered_count
+        + binary_changes.len();
     if entities_analyzed > changes_detected {
         let noise = entities_analyzed - changes_detected;
         lines.push(
@@ -348,11 +407,11 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     }
 
     // Warn if fallback chunking was used (unsupported file extension)
-    let chunk_files: Vec<&str> = result
+    let chunk_files: Vec<String> = result
         .changes
         .iter()
         .filter(|c| c.entity_type == "chunk")
-        .map(|c| c.file_path.as_str())
+        .map(|c| sanitize_terminal_text(&c.file_path))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -374,4 +433,61 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sem_core::model::change::SemanticChange;
+
+    #[test]
+    fn terminal_source_content_escapes_control_characters() {
+        let output = sanitize_terminal_text("\u{1b}[31mRED\u{1b}[0m\t\r\n");
+
+        assert!(!output.contains('\u{1b}'));
+        assert!(output.contains("\\u{1b}[31mRED\\u{1b}[0m"));
+        assert!(output.contains("\\t\\r\\n"));
+    }
+
+    #[test]
+    fn terminal_chunk_warning_escapes_file_path_control_characters() {
+        colored::control::set_override(false);
+        let change: SemanticChange = serde_json::from_value(serde_json::json!({
+            "id": "change::bad.txt::chunk::1",
+            "entityId": "bad.txt::chunk::1",
+            "changeType": "modified",
+            "entityType": "chunk",
+            "entityName": "chunk 1",
+            "entityLine": 1,
+            "startLine": 1,
+            "endLine": 2,
+            "filePath": "bad\u{1b}[31m.txt",
+            "beforeContent": "alpha\nbeta\n",
+            "afterContent": "alpha\nchanged\n",
+            "structuralChange": true
+        }))
+        .unwrap();
+        let result = DiffResult {
+            changes: vec![change],
+            file_count: 1,
+            added_count: 0,
+            modified_count: 1,
+            deleted_count: 0,
+            moved_count: 0,
+            renamed_count: 0,
+            reordered_count: 0,
+            orphan_count: 0,
+            total_entities_before: 1,
+            total_entities_after: 1,
+        };
+
+        let output = format_terminal(&result, &[], true);
+
+        assert!(!output.contains('\u{1b}'), "{output}");
+        assert!(output.contains("bad\\u{1b}[31m.txt"), "{output}");
+        assert!(
+            output.contains("used line-based chunking (unsupported file extension)"),
+            "{output}"
+        );
+    }
 }

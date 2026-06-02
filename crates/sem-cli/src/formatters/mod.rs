@@ -1,10 +1,30 @@
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::DiffResult;
+use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 
 pub mod json;
 pub mod markdown;
 pub mod plain;
 pub mod terminal;
+
+pub(crate) fn binary_display_name(change: &BinaryFileChange) -> String {
+    match change.old_file_path.as_deref() {
+        Some(old_path) if old_path != change.file_path => {
+            format!("{old_path} -> {}", change.file_path)
+        }
+        _ => change.file_path.clone(),
+    }
+}
+
+pub(crate) fn has_reportable_changes(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+) -> bool {
+    !result.changes.is_empty() || !binary_changes.is_empty()
+}
+
+pub(crate) fn file_count(result: &DiffResult, binary_changes: &[BinaryFileChange]) -> usize {
+    result.file_count + binary_changes.len()
+}
 
 pub(crate) fn orphan_summary_parts(result: &DiffResult) -> Vec<String> {
     let mut added = 0;

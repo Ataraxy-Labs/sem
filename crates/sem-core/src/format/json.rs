@@ -1,7 +1,22 @@
-use crate::parser::differ::DiffResult;
+use crate::parser::differ::{BinaryFileChange, DiffResult};
 use serde_json::{json, Value};
 
 pub fn diff_json_value(result: &DiffResult) -> Value {
+    diff_json_value_inner(result, &[], false)
+}
+
+pub fn diff_json_value_with_binary_changes(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+) -> Value {
+    diff_json_value_inner(result, binary_changes, true)
+}
+
+fn diff_json_value_inner(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    include_binary_changes: bool,
+) -> Value {
     let changes: Vec<Value> = result
         .changes
         .iter()
@@ -28,24 +43,63 @@ pub fn diff_json_value(result: &DiffResult) -> Value {
         })
         .collect();
 
+    if !include_binary_changes {
+        return json!({
+            "summary": {
+                "fileCount": result.file_count,
+                "added": result.added_count,
+                "modified": result.modified_count,
+                "deleted": result.deleted_count,
+                "moved": result.moved_count,
+                "renamed": result.renamed_count,
+                "reordered": result.reordered_count,
+                "orphan": result.orphan_count,
+                "total": result.changes.len(),
+            },
+            "changes": changes,
+        });
+    }
+
+    let binary_changes_json: Vec<Value> = binary_changes
+        .iter()
+        .map(|c| {
+            json!({
+                "changeType": "binary",
+                "filePath": c.file_path,
+                "oldFilePath": c.old_file_path,
+                "fileStatus": c.status,
+            })
+        })
+        .collect();
+
     json!({
         "summary": {
-            "fileCount": result.file_count,
+            "fileCount": result.file_count + binary_changes.len(),
             "added": result.added_count,
             "modified": result.modified_count,
             "deleted": result.deleted_count,
             "moved": result.moved_count,
             "renamed": result.renamed_count,
             "reordered": result.reordered_count,
+            "binary": binary_changes.len(),
             "orphan": result.orphan_count,
-            "total": result.changes.len(),
+            "total": result.changes.len() + binary_changes.len(),
         },
         "changes": changes,
+        "binaryChanges": binary_changes_json,
     })
 }
 
 pub fn format_diff_json(result: &DiffResult) -> String {
     serde_json::to_string(&diff_json_value(result)).unwrap_or_default()
+}
+
+pub fn format_diff_json_with_binary_changes(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+) -> String {
+    serde_json::to_string(&diff_json_value_with_binary_changes(result, binary_changes))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -54,7 +108,7 @@ mod tests {
     use crate::model::change::{ChangeType, SemanticChange};
 
     #[test]
-    fn diff_json_value_matches_cli_envelope() {
+    fn diff_json_value_preserves_public_schema() {
         let result = DiffResult {
             changes: vec![SemanticChange {
                 id: "internal-change-id".to_string(),
@@ -125,6 +179,55 @@ mod tests {
                     "commitSha": "abc123",
                     "author": "Ada",
                     "structuralChange": true,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn diff_json_value_with_binary_changes_matches_cli_envelope() {
+        let result = DiffResult {
+            changes: Vec::new(),
+            file_count: 0,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 0,
+            moved_count: 0,
+            renamed_count: 0,
+            reordered_count: 0,
+            orphan_count: 0,
+            total_entities_before: 0,
+            total_entities_after: 0,
+        };
+        let binary_changes = vec![BinaryFileChange {
+            file_path: "pic.png".to_string(),
+            status: crate::git::types::FileStatus::Modified,
+            old_file_path: None,
+        }];
+
+        let value = diff_json_value_with_binary_changes(&result, &binary_changes);
+
+        assert_eq!(
+            value,
+            json!({
+                "summary": {
+                    "fileCount": 1,
+                    "added": 0,
+                    "modified": 0,
+                    "deleted": 0,
+                    "moved": 0,
+                    "renamed": 0,
+                    "reordered": 0,
+                    "binary": 1,
+                    "orphan": 0,
+                    "total": 1,
+                },
+                "changes": [],
+                "binaryChanges": [{
+                    "changeType": "binary",
+                    "filePath": "pic.png",
+                    "oldFilePath": null,
+                    "fileStatus": "modified",
                 }],
             })
         );
