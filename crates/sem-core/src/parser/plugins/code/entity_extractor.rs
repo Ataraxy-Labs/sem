@@ -1,14 +1,12 @@
 use tree_sitter::{Node, Tree};
 
-use std::collections::{HashMap, HashSet};
+use super::languages::LanguageConfig;
 use crate::model::entity::{
-    build_entity_id,
-    build_entity_id_disambiguated,
-    build_entity_id_disambiguated_with_ordinal,
+    build_entity_id, build_entity_id_disambiguated, build_entity_id_disambiguated_with_ordinal,
     SemanticEntity,
 };
 use crate::utils::hash::{content_hash, structural_hash, structural_hash_excluding_range};
-use super::languages::LanguageConfig;
+use std::collections::{HashMap, HashSet};
 
 pub fn extract_entities(
     tree: &Tree,
@@ -176,7 +174,11 @@ fn select_rewritten_parent_id(
             continue;
         }
         let parent = &entities[*parent_idx];
-        let same_file_rank = if parent.file_path == child.file_path { 0 } else { 1 };
+        let same_file_rank = if parent.file_path == child.file_path {
+            0
+        } else {
+            1
+        };
         let before_rank = if *parent_idx < child_idx { 0 } else { 1 };
         let line_span_contains_child =
             parent.start_line <= child.start_line && child.end_line <= parent.end_line;
@@ -265,6 +267,8 @@ fn visit_node(
         root_parent_id.map(str::to_owned),
         root_suppression.map(str::to_owned),
     )];
+    let mut ts_implementation_names_by_scope: HashMap<(usize, usize), HashSet<String>> =
+        HashMap::new();
 
     while let Some((node, pid_owned, sup_owned)) = worklist.pop() {
         let parent_id = pid_owned.as_deref();
@@ -314,7 +318,8 @@ fn visit_node(
         // Extract each binding as a separate entity.
         if node_type == "value_definition" && config.entity_node_types.contains(&node_type) {
             let mut cursor = node.walk();
-            let bindings: Vec<_> = node.named_children(&mut cursor)
+            let bindings: Vec<_> = node
+                .named_children(&mut cursor)
                 .filter(|c| c.kind() == "let_binding")
                 .collect();
             if !bindings.is_empty() {
@@ -347,26 +352,53 @@ fn visit_node(
 
         if node_type == "module_definition" && config.entity_node_types.contains(&node_type) {
             let extracted = extract_ocaml_named_bindings(
-                node, "module_binding", "module_name",
-                map_node_type(node_type), file_path, parent_id, source, config, entities,
+                node,
+                "module_binding",
+                "module_name",
+                map_node_type(node_type),
+                file_path,
+                parent_id,
+                source,
+                config,
+                entities,
             );
-            if extracted { continue; }
+            if extracted {
+                continue;
+            }
         }
 
         if node_type == "class_definition" && config.entity_node_types.contains(&node_type) {
             let extracted = extract_ocaml_named_bindings(
-                node, "class_binding", "class_name",
-                map_node_type(node_type), file_path, parent_id, source, config, entities,
+                node,
+                "class_binding",
+                "class_name",
+                map_node_type(node_type),
+                file_path,
+                parent_id,
+                source,
+                config,
+                entities,
             );
-            if extracted { continue; }
+            if extracted {
+                continue;
+            }
         }
 
         if node_type == "class_type_definition" && config.entity_node_types.contains(&node_type) {
             let extracted = extract_ocaml_named_bindings(
-                node, "class_type_binding", "class_type_name",
-                map_node_type(node_type), file_path, parent_id, source, config, entities,
+                node,
+                "class_type_binding",
+                "class_type_name",
+                map_node_type(node_type),
+                file_path,
+                parent_id,
+                source,
+                config,
+                entities,
             );
-            if extracted { continue; }
+            if extracted {
+                continue;
+            }
         }
 
         // TypeScript/JS multi-declarator: `const a = 1, b = 2` should produce
@@ -384,48 +416,47 @@ fn visit_node(
                 let skip_declaration = should_skip_entity(config, suppression_context, node_type);
                 let mut initializer_children = Vec::new();
                 for declarator in &declarators {
-                    let emitted_entity_id = if let Some(name_node) =
-                        declarator.child_by_field_name("name")
-                    {
-                        let entity_type =
-                            map_js_ts_declarator_entity_type(node, *declarator, config);
-                        if !skip_declaration || entity_type == "function" {
-                            let name = node_text(name_node, source).to_string();
-                            let content = node_text(*declarator, source).to_string();
-                            let struct_hash = compute_structural_hash(*declarator, source);
-                            let entity = SemanticEntity {
-                                id: build_entity_id(file_path, entity_type, &name, parent_id),
-                                file_path: file_path.to_string(),
-                                entity_type: entity_type.to_string(),
-                                name,
-                                parent_id: parent_id.map(String::from),
-                                content_hash: content_hash(&content),
-                                structural_hash: Some(struct_hash),
-                                content,
-                                start_line: declarator.start_position().row + 1,
-                                end_line: declarator.end_position().row + 1,
-                                metadata: None,
-                            };
+                    let emitted_entity_id =
+                        if let Some(name_node) = declarator.child_by_field_name("name") {
+                            let entity_type =
+                                map_js_ts_declarator_entity_type(node, *declarator, config);
+                            if !skip_declaration || entity_type == "function" {
+                                let name = node_text(name_node, source).to_string();
+                                let content = node_text(*declarator, source).to_string();
+                                let struct_hash = compute_structural_hash(*declarator, source);
+                                let entity = SemanticEntity {
+                                    id: build_entity_id(file_path, entity_type, &name, parent_id),
+                                    file_path: file_path.to_string(),
+                                    entity_type: entity_type.to_string(),
+                                    name,
+                                    parent_id: parent_id.map(String::from),
+                                    content_hash: content_hash(&content),
+                                    structural_hash: Some(struct_hash),
+                                    content,
+                                    start_line: declarator.start_position().row + 1,
+                                    end_line: declarator.end_position().row + 1,
+                                    metadata: None,
+                                };
 
-                            let entity_id = entity.id.clone();
-                            entities.push(entity);
-                            Some(entity_id)
+                                let entity_id = entity.id.clone();
+                                entities.push(entity);
+                                Some(entity_id)
+                            } else {
+                                None
+                            }
                         } else {
                             None
-                        }
-                    } else {
-                        None
-                    };
+                        };
 
                     // Suppressed local declarators do not have an entity of
                     // their own, so their initializer is traversed under the
                     // surrounding parent, matching the single-declarator path.
                     let initializer_parent = emitted_entity_id.as_deref().or(parent_id);
-                    if let Some(initializer_child) =
-                        js_ts_initializer_child(config, *declarator, initializer_parent)
-                    {
-                        initializer_children.push(initializer_child);
-                    }
+                    initializer_children.extend(js_ts_initializer_children(
+                        config,
+                        *declarator,
+                        initializer_parent,
+                    ));
                 }
                 // The worklist is LIFO; push in reverse so initializers are
                 // visited in source order.
@@ -496,7 +527,9 @@ fn visit_node(
         }
 
         // JS/TS test call expressions: describe("name", () => {}), test(...), it(...), etc.
-        if node_type == "call_expression" && matches!(config.id, "typescript" | "tsx" | "javascript") {
+        if node_type == "call_expression"
+            && matches!(config.id, "typescript" | "tsx" | "javascript")
+        {
             if let Some((test_name, test_entity_type, is_container)) =
                 extract_js_test_call(node, source)
             {
@@ -536,6 +569,40 @@ fn visit_node(
             }
         }
 
+        if should_skip_ts_overload_signature(
+            node,
+            config,
+            source,
+            &mut ts_implementation_names_by_scope,
+        ) {
+            continue;
+        }
+
+        if let Some((name, value)) =
+            extract_js_ts_object_function_pair(node, config, source, suppression_context)
+        {
+            let content = node_text(node, source).to_string();
+            let struct_hash = compute_structural_hash(node, source);
+            let entity = SemanticEntity {
+                id: build_entity_id(file_path, "method", &name, parent_id),
+                file_path: file_path.to_string(),
+                entity_type: "method".to_string(),
+                name,
+                parent_id: parent_id.map(String::from),
+                content_hash: content_hash(&content),
+                structural_hash: Some(struct_hash),
+                content,
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                metadata: None,
+            };
+
+            let entity_id = entity.id.clone();
+            entities.push(entity);
+            worklist.push((value, Some(entity_id), Some(value.kind().to_string())));
+            continue;
+        }
+
         if config.entity_node_types.contains(&node_type) {
             if let Some(name) = extract_name(node, source) {
                 let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
@@ -545,17 +612,22 @@ fn visit_node(
                 if !should_skip {
                     // Go method_declaration: extract receiver type for parent linkage.
                     // e.g. `func (t *Transaction) Execute(...)` -> parent is Transaction struct
-                    let effective_parent = if node_type == "method_declaration" && parent_id.is_none() {
-                        extract_go_receiver_struct(node, source, file_path, entities)
-                    } else {
-                        None
-                    };
+                    let effective_parent =
+                        if node_type == "method_declaration" && parent_id.is_none() {
+                            extract_go_receiver_struct(node, source, file_path, entities)
+                        } else {
+                            None
+                        };
                     let parent_ref = effective_parent.as_deref().or(parent_id);
 
                     // Dart top-level signatures are split from their body node.
                     // When a sibling function_body exists, extend the entity to
                     // cover the full definition so body changes are detected.
-                    let body = if config.id == "dart" { sibling_function_body(node) } else { None };
+                    let body = if config.id == "dart" {
+                        sibling_function_body(node)
+                    } else {
+                        None
+                    };
                     let end_byte = body.map_or(node.end_byte(), |b| b.end_byte());
                     let end_line =
                         body.map_or(node.end_position().row + 1, |b| b.end_position().row + 1);
@@ -563,11 +635,10 @@ fn visit_node(
                     // Extend start backward to include outer attributes (e.g. Rust
                     // #[derive(...)], #[cfg(...)], #[test]) so attribute changes
                     // are captured as part of the entity diff.
-                    let (start_byte, start_line) =
-                        preceding_attributes_start(node, config).map_or(
-                            (node.start_byte(), node.start_position().row + 1),
-                            |(sb, sr)| (sb, sr + 1),
-                        );
+                    let (start_byte, start_line) = preceding_attributes_start(node, config).map_or(
+                        (node.start_byte(), node.start_position().row + 1),
+                        |(sb, sr)| (sb, sr + 1),
+                    );
 
                     let content = std::str::from_utf8(&source[start_byte..end_byte])
                         .unwrap_or("")
@@ -606,7 +677,11 @@ fn visit_node(
                             let mut inner_cursor = child.walk();
                             let nested: Vec<_> = child.named_children(&mut inner_cursor).collect();
                             for n in nested.into_iter().rev() {
-                                worklist.push((n, Some(entity_id.clone()), next_suppression.clone()));
+                                worklist.push((
+                                    n,
+                                    Some(entity_id.clone()),
+                                    next_suppression.clone(),
+                                ));
                             }
                         }
                     }
@@ -636,6 +711,15 @@ fn visit_node(
             }
         }
 
+        if node_type == "export_statement"
+            && matches!(config.id, "typescript" | "tsx" | "javascript")
+            && node.child_by_field_name("source").is_some()
+        {
+            if emit_js_ts_re_export_entities(node, file_path, parent_id, source, entities) {
+                continue;
+            }
+        }
+
         // For export statements, look inside for the actual declaration
         if node_type == "export_statement" {
             if let Some(declaration) = node.child_by_field_name("declaration") {
@@ -662,6 +746,80 @@ fn visit_node(
             worklist.push((child, pid_owned.clone(), child_enclosing));
         }
     }
+}
+
+fn emit_js_ts_re_export_entities(
+    node: Node,
+    file_path: &str,
+    parent_id: Option<&str>,
+    source: &[u8],
+    entities: &mut Vec<SemanticEntity>,
+) -> bool {
+    let source_path = node
+        .child_by_field_name("source")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '\'' || c == '"');
+    if source_path.is_empty() {
+        return false;
+    }
+
+    let mut emitted = false;
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "export_specifier" {
+                let original = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(clean_js_ts_export_name)
+                    .unwrap_or_default();
+                let local = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(clean_js_ts_export_name)
+                    .unwrap_or_else(|| original.clone());
+
+                if local.is_empty() {
+                    continue;
+                }
+
+                let content = node_text(node, source).to_string();
+                let mut metadata = HashMap::new();
+                metadata.insert("export.source".to_string(), source_path.to_string());
+                if !original.is_empty() {
+                    metadata.insert("export.original".to_string(), original);
+                }
+
+                entities.push(SemanticEntity {
+                    id: build_entity_id(file_path, "export", &local, parent_id),
+                    file_path: file_path.to_string(),
+                    entity_type: "export".to_string(),
+                    name: local,
+                    parent_id: parent_id.map(String::from),
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(compute_structural_hash(child, source)),
+                    content,
+                    start_line: child.start_position().row + 1,
+                    end_line: child.end_position().row + 1,
+                    metadata: Some(metadata),
+                });
+                emitted = true;
+            } else {
+                worklist.push(child);
+            }
+        }
+    }
+
+    emitted
+}
+
+fn clean_js_ts_export_name(name: &str) -> String {
+    name.trim()
+        .strip_prefix("type ")
+        .unwrap_or(name.trim())
+        .to_string()
 }
 
 #[derive(Clone)]
@@ -695,10 +853,9 @@ fn recover_swift_conditional_compilation_containers(
     while let Some(node) = worklist.pop() {
         if node.kind() == "ERROR" {
             if let Some(container) = parse_swift_recovered_container(node, source) {
-                if !recovered
-                    .iter()
-                    .any(|existing: &RecoveredSwiftContainer| existing.start_byte == container.start_byte)
-                {
+                if !recovered.iter().any(|existing: &RecoveredSwiftContainer| {
+                    existing.start_byte == container.start_byte
+                }) {
                     recovered.push(container);
                 }
             }
@@ -1219,7 +1376,10 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
         }
     }
 
-    if node_type == "module_binding" || node_type == "class_binding" || node_type == "class_type_binding" {
+    if node_type == "module_binding"
+        || node_type == "class_binding"
+        || node_type == "class_type_binding"
+    {
         let name_kind = match node_type {
             "module_binding" => "module_name",
             "class_binding" => "class_name",
@@ -1240,6 +1400,14 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
         for child in node.named_children(&mut cursor) {
             if child.kind() == "module_type_name" {
                 return Some((child.start_byte(), child.end_byte()));
+            }
+        }
+    }
+
+    if node_type == "pair" {
+        if let Some(key) = node.child_by_field_name("key") {
+            if js_ts_object_key_name(key, _source).is_some() {
+                return Some((key.start_byte(), key.end_byte()));
             }
         }
     }
@@ -1311,7 +1479,9 @@ fn find_declarator_name_range(mut node: Node) -> Option<(usize, usize)> {
             "qualified_identifier" | "scoped_identifier" => {
                 return Some((node.start_byte(), node.end_byte()));
             }
-            "pointer_declarator" | "function_declarator" | "array_declarator"
+            "pointer_declarator"
+            | "function_declarator"
+            | "array_declarator"
             | "parenthesized_declarator" => {
                 if let Some(inner) = node.child_by_field_name("declarator") {
                     node = inner;
@@ -1474,7 +1644,10 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
     }
 
     // For C# property_declaration, namespace_declaration, struct_declaration
-    if node_type == "property_declaration" || node_type == "namespace_declaration" || node_type == "struct_declaration" {
+    if node_type == "property_declaration"
+        || node_type == "namespace_declaration"
+        || node_type == "struct_declaration"
+    {
         if let Some(name_node) = node.child_by_field_name("name") {
             return Some(node_text(name_node, source).to_string());
         }
@@ -1684,11 +1857,64 @@ fn should_skip_entity(
     })
 }
 
+fn should_skip_ts_overload_signature(
+    node: Node,
+    config: &LanguageConfig,
+    source: &[u8],
+    implementation_names_by_scope: &mut HashMap<(usize, usize), HashSet<String>>,
+) -> bool {
+    if !matches!(config.id, "typescript" | "tsx") || node.kind() != "function_signature" {
+        return false;
+    }
+
+    let Some(signature_name) = extract_name(node, source) else {
+        return false;
+    };
+
+    let anchor = match node.parent() {
+        Some(parent) if parent.kind() == "export_statement" => parent,
+        _ => node,
+    };
+
+    let Some(scope) = anchor.parent() else {
+        return false;
+    };
+
+    let scope_key = (scope.start_byte(), scope.end_byte());
+    let implementation_names = implementation_names_by_scope
+        .entry(scope_key)
+        .or_insert_with(|| collect_ts_function_implementation_names(scope, source));
+
+    implementation_names.contains(&signature_name)
+}
+
+fn collect_ts_function_implementation_names(scope: Node, source: &[u8]) -> HashSet<String> {
+    let mut cursor = scope.walk();
+    scope
+        .named_children(&mut cursor)
+        .filter_map(|sibling| ts_function_declaration_name(sibling, source))
+        .collect()
+}
+
+fn ts_function_declaration_name(node: Node, source: &[u8]) -> Option<String> {
+    let declaration = if node.kind() == "export_statement" {
+        node.child_by_field_name("declaration")?
+    } else {
+        node
+    };
+
+    (declaration.kind() == "function_declaration")
+        .then(|| extract_name(declaration, source))
+        .flatten()
+}
+
 /// Extract the name from a C declarator (handles pointer_declarator, function_declarator, etc.)
 fn extract_declarator_name(mut node: Node, source: &[u8]) -> Option<String> {
     loop {
         match node.kind() {
-            "identifier" | "type_identifier" | "field_identifier" => return Some(node_text(node, source).to_string()),
+            "identifier" | "type_identifier" | "field_identifier" => {
+                return Some(node_text(node, source).to_string())
+            }
             "qualified_identifier" | "scoped_identifier" => {
                 // For C++ qualified names like ClassName::method, return the full qualified name
                 return Some(node_text(node, source).to_string());
@@ -1733,15 +1959,28 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "function_item"
         | "function_signature"
         | "subroutine_declaration_statement" => "function",
-        "method_declaration" | "method_definition" | "method" | "singleton_method"
-        | "method_signature" | "operator_signature" => "method",
-        "class_declaration" | "class_definition" | "class_specifier" => "class",
+        "method_declaration"
+        | "method_definition"
+        | "method"
+        | "singleton_method"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "operator_signature" => "method",
+        "class_declaration"
+        | "abstract_class_declaration"
+        | "class_definition"
+        | "class_specifier" => "class",
         "interface_declaration" => "interface",
         "protocol_declaration" => "protocol",
         "init_declaration" => "init",
         "deinit_declaration" => "deinit",
         "subscript_declaration" => "subscript",
-        "type_alias_declaration" | "typealias_declaration" | "type_declaration" | "type_item" | "type_definition" | "type_alias" => "type",
+        "type_alias_declaration"
+        | "typealias_declaration"
+        | "type_declaration"
+        | "type_item"
+        | "type_definition"
+        | "type_alias" => "type",
         "associatedtype_declaration" => "associatedtype",
         "operator_declaration" => "operator",
         "enum_declaration" | "enum_item" | "enum_specifier" | "enum_definition" => "enum",
@@ -1754,7 +1993,11 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "union_specifier" => "union",
         "impl_item" => "impl",
         "trait_item" => "trait",
-        "mod_item" | "module" | "module_definition" | "namespace_definition" | "namespace_declaration"
+        "mod_item"
+        | "module"
+        | "module_definition"
+        | "namespace_definition"
+        | "namespace_declaration"
         | "package_object" => "module",
         "object_definition" => "object",
         "trait_definition" => "trait",
@@ -1763,7 +2006,9 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "extension_definition" => "extension",
         "package_statement" => "package",
         "export_statement" => "export",
-        "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => "variable",
+        "lexical_declaration" | "variable_declaration" | "var_declaration" | "declaration" => {
+            "variable"
+        }
         "const_declaration" | "const_item" => "constant",
         "binding" => "binding",
         "inherit" | "inherit_from" => "inherit",
@@ -1784,7 +2029,11 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
 }
 
 /// Extract entity info from a call node (Elixir macros like def, defmodule, etc.)
-fn extract_call_entity(node: Node, config: &LanguageConfig, source: &[u8]) -> Option<(String, &'static str)> {
+fn extract_call_entity(
+    node: Node,
+    config: &LanguageConfig,
+    source: &[u8],
+) -> Option<(String, &'static str)> {
     let target = node.child_by_field_name("target")?;
     if target.kind() != "identifier" {
         return None;
@@ -1809,7 +2058,9 @@ fn extract_call_entity(node: Node, config: &LanguageConfig, source: &[u8]) -> Op
 
     // Get arguments node (child by kind, not field name)
     let mut cursor = node.walk();
-    let args = node.named_children(&mut cursor).find(|c| c.kind() == "arguments")?;
+    let args = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
 
     let name = match keyword {
         "defmodule" | "defprotocol" => extract_first_alias_or_identifier(args, source)?,
@@ -1846,7 +2097,8 @@ fn extract_fn_name_from_arg(mut node: Node, source: &[u8]) -> Option<String> {
                     Some(node_text(fn_target, source).to_string())
                 } else {
                     let mut c = node.walk();
-                    let id = node.named_children(&mut c)
+                    let id = node
+                        .named_children(&mut c)
                         .find(|n| n.kind() == "identifier")?;
                     Some(node_text(id, source).to_string())
                 };
@@ -1922,7 +2174,9 @@ fn map_class_member_type(node: Node) -> &'static str {
                             "function_signature" => "method",
                             "getter_signature" => "getter",
                             "setter_signature" => "setter",
-                            "constructor_signature" | "factory_constructor_signature" => "constructor",
+                            "constructor_signature" | "factory_constructor_signature" => {
+                                "constructor"
+                            }
                             "operator_signature" => "method",
                             _ => continue,
                         };
@@ -1971,8 +2225,11 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
     match node.kind() {
         "decorated_definition" => map_decorated_type(node),
         "class_member" => map_class_member_type(node),
-        "class_declaration" if config.id == "swift" => swift_class_declaration_type(node)
+        "method_definition" => map_js_ts_accessor_method_type(node, config)
             .unwrap_or_else(|| map_node_type(node.kind())),
+        "class_declaration" if config.id == "swift" => {
+            swift_class_declaration_type(node).unwrap_or_else(|| map_node_type(node.kind()))
+        }
         // C/C++ declarations with a function_declarator are function prototypes,
         // not variables (#152).
         "declaration" if matches!(config.id, "c" | "cpp") && has_function_declarator(node) => {
@@ -1982,6 +2239,31 @@ fn map_entity_type(node: Node, config: &LanguageConfig) -> &'static str {
             .or_else(|| promote_js_ts_const_function(node, config))
             .unwrap_or_else(|| map_node_type(node.kind())),
     }
+}
+
+fn map_js_ts_accessor_method_type(node: Node, config: &LanguageConfig) -> Option<&'static str> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript") {
+        return None;
+    }
+
+    let name = node.child_by_field_name("name")?;
+    let mut accessor_type = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_byte() >= name.start_byte() {
+            break;
+        }
+        if child.is_extra() {
+            continue;
+        }
+        match child.kind() {
+            "get" => accessor_type = Some("getter"),
+            "set" => accessor_type = Some("setter"),
+            _ => {}
+        }
+    }
+
+    accessor_type
 }
 
 fn swift_class_declaration_type(node: Node) -> Option<&'static str> {
@@ -2051,7 +2333,9 @@ fn promote_js_ts_const_function(node: Node, config: &LanguageConfig) -> Option<&
     }
 
     let mut cursor = node.walk();
-    let declarator = node.named_children(&mut cursor).find(|child| child.kind() == "variable_declarator")?;
+    let declarator = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "variable_declarator")?;
     promote_js_ts_const_declarator_function(node, declarator, config)
 }
 
@@ -2087,26 +2371,61 @@ fn push_js_ts_initializer_children<'tree>(
     node: Node<'tree>,
     entity_id: &str,
 ) {
-    if let Some(initializer_child) = js_ts_initializer_child(config, node, Some(entity_id)) {
+    let initializer_children = js_ts_initializer_children(config, node, Some(entity_id));
+    for initializer_child in initializer_children.into_iter().rev() {
         worklist.push(initializer_child);
     }
 }
 
-fn js_ts_initializer_child<'tree>(
+fn js_ts_initializer_children<'tree>(
     config: &LanguageConfig,
     node: Node<'tree>,
     parent_id: Option<&str>,
-) -> Option<(Node<'tree>, Option<String>, Option<String>)> {
+) -> Vec<(Node<'tree>, Option<String>, Option<String>)> {
     if !matches!(config.id, "typescript" | "tsx" | "javascript") {
-        return None;
+        return Vec::new();
     }
 
-    let value = js_ts_initializer_value(config, node)?;
-    Some((
+    let Some(value) = js_ts_initializer_value(config, node) else {
+        return Vec::new();
+    };
+
+    if value.kind() == "object" {
+        return js_ts_object_initializer_children(value, parent_id);
+    }
+
+    vec![(
         value,
         parent_id.map(String::from),
         Some(value.kind().to_string()),
-    ))
+    )]
+}
+
+fn js_ts_object_initializer_children<'tree>(
+    object: Node<'tree>,
+    parent_id: Option<&str>,
+) -> Vec<(Node<'tree>, Option<String>, Option<String>)> {
+    let mut cursor = object.walk();
+    object
+        .named_children(&mut cursor)
+        .filter_map(|child| {
+            let suppression_context = if child.kind() == "method_definition" {
+                Some(child.kind().to_string())
+            } else if js_ts_pair_function_value(child).is_some() {
+                Some("object".to_string())
+            } else {
+                None
+            };
+
+            suppression_context.map(|suppression_context| {
+                (
+                    child,
+                    parent_id.map(String::from),
+                    Some(suppression_context),
+                )
+            })
+        })
+        .collect()
 }
 
 fn js_ts_initializer_value<'tree>(
@@ -2129,7 +2448,59 @@ fn js_ts_initializer_value<'tree>(
 }
 
 fn is_js_ts_initializer_node(config: &LanguageConfig, node: Node) -> bool {
-    config.scope_boundary_types.contains(&node.kind()) || node.kind() == "class"
+    config.scope_boundary_types.contains(&node.kind()) || matches!(node.kind(), "class" | "object")
+}
+
+fn extract_js_ts_object_function_pair<'tree>(
+    node: Node<'tree>,
+    config: &LanguageConfig,
+    source: &[u8],
+    suppression_context: Option<&str>,
+) -> Option<(String, Node<'tree>)> {
+    if !matches!(config.id, "typescript" | "tsx" | "javascript")
+        || suppression_context != Some("object")
+    {
+        return None;
+    }
+
+    let value = js_ts_pair_function_value(node)?;
+    let key = node.child_by_field_name("key")?;
+    Some((js_ts_object_key_name(key, source)?, value))
+}
+
+fn js_ts_pair_function_value(node: Node) -> Option<Node> {
+    if node.kind() != "pair" {
+        return None;
+    }
+
+    let value = node.child_by_field_name("value")?;
+    matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    )
+    .then_some(value)
+}
+
+fn js_ts_object_key_name(key: Node, source: &[u8]) -> Option<String> {
+    let text = node_text(key, source).trim();
+    if text.is_empty() || text.starts_with('[') {
+        return None;
+    }
+
+    let name = match key.kind() {
+        "string" | "template_string" => text
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_matches('`')
+            .to_string(),
+        _ => text.to_string(),
+    };
+
+    if name.is_empty() || (key.kind() == "template_string" && name.contains("${")) {
+        return None;
+    }
+
+    Some(name)
 }
 
 /// Dart constructor signatures use `field("name", seq(identifier, optional(".", identifier)))`,
@@ -2144,7 +2515,9 @@ const DART_CONSTRUCTOR_SIG_KINDS: &[&str] = &[
 
 fn extract_dart_constructor_full_name(sig: Node, source: &[u8]) -> Option<String> {
     let (start, end) = dart_constructor_name_byte_range(sig)?;
-    std::str::from_utf8(&source[start..end]).ok().map(|s| s.to_string())
+    std::str::from_utf8(&source[start..end])
+        .ok()
+        .map(|s| s.to_string())
 }
 
 /// Byte range spanning all "name" field children of a Dart constructor signature,
@@ -2346,7 +2719,8 @@ fn extract_ocaml_named_bindings(
     entities: &mut Vec<SemanticEntity>,
 ) -> bool {
     let mut cursor = node.walk();
-    let bindings: Vec<_> = node.named_children(&mut cursor)
+    let bindings: Vec<_> = node
+        .named_children(&mut cursor)
         .filter(|c| c.kind() == binding_kind)
         .collect();
     if bindings.is_empty() {
@@ -2354,7 +2728,8 @@ fn extract_ocaml_named_bindings(
     }
     for binding in bindings {
         let mut inner = binding.walk();
-        let name = binding.named_children(&mut inner)
+        let name = binding
+            .named_children(&mut inner)
             .find(|c| c.kind() == name_kind)
             .map(|c| node_text(c, source).to_string());
         if let Some(name) = name {
@@ -2426,7 +2801,10 @@ fn extract_go_receiver_struct(
             for e in entities.iter().rev() {
                 if e.file_path == file_path
                     && e.name == struct_name
-                    && matches!(e.entity_type.as_str(), "type" | "struct" | "class" | "interface")
+                    && matches!(
+                        e.entity_type.as_str(),
+                        "type" | "struct" | "class" | "interface"
+                    )
                 {
                     return Some(e.id.clone());
                 }
@@ -2483,7 +2861,10 @@ fn extract_js_test_call(node: Node, source: &[u8]) -> Option<(String, &'static s
         }
         _ => {
             // Hooks like beforeEach don't need a string name
-            if matches!(callee_name, "beforeEach" | "afterEach" | "beforeAll" | "afterAll") {
+            if matches!(
+                callee_name,
+                "beforeEach" | "afterEach" | "beforeAll" | "afterAll"
+            ) {
                 callee_name.to_string()
             } else {
                 return None;

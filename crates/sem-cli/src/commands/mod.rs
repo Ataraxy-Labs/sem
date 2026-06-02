@@ -104,6 +104,27 @@ fn normalize_existing_prefix(path: &Path) -> Option<PathBuf> {
     None
 }
 
+pub fn entity_matches_query(entity: &sem_core::parser::graph::EntityInfo, query: &str) -> bool {
+    if entity.name == query {
+        return true;
+    }
+
+    let Some((entity_type, name)) = split_type_qualified_query(query) else {
+        return false;
+    };
+
+    entity.entity_type == entity_type && entity.name == name
+}
+
+fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
+    let (entity_type, name) = query.split_once(' ')?;
+    if entity_type.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    Some((entity_type, name))
+}
+
 /// Truncate a string to `max_chars` Unicode scalar values (codepoints), appending "..." if
 /// truncated. Safe for multibyte encodings (CJK, simple emoji). Note: does not split on grapheme
 /// cluster boundaries — ZWJ emoji sequences may render incorrectly at the truncation point.
@@ -141,8 +162,40 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_existing_prefix, normalize_lexical, normalize_repo_relative_path, truncate_str};
+    use super::{
+        entity_matches_query, normalize_existing_prefix, normalize_lexical,
+        normalize_repo_relative_path, truncate_str,
+    };
+    use sem_core::parser::graph::EntityInfo;
     use std::path::Path;
+
+    fn entity(entity_type: &str, name: &str) -> EntityInfo {
+        EntityInfo {
+            id: format!("a.ts::{entity_type}::{name}"),
+            name: name.to_string(),
+            entity_type: entity_type.to_string(),
+            file_path: "a.ts".to_string(),
+            parent_id: None,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    #[test]
+    fn entity_query_matches_exact_name() {
+        let entity = entity("function", "getter value");
+
+        assert!(entity_matches_query(&entity, "getter value"));
+    }
+
+    #[test]
+    fn entity_query_matches_type_qualified_name() {
+        let entity = entity("getter", "value");
+
+        assert!(entity_matches_query(&entity, "getter value"));
+        assert!(!entity_matches_query(&entity, "setter value"));
+        assert!(!entity_matches_query(&entity, "method value"));
+    }
 
     #[test]
     fn ascii_short_string_unchanged() {
