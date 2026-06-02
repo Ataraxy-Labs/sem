@@ -1,7 +1,12 @@
 use tree_sitter::{Node, Tree};
 
-use std::collections::HashMap;
-use crate::model::entity::{build_entity_id, build_entity_id_disambiguated, SemanticEntity};
+use std::collections::{HashMap, HashSet};
+use crate::model::entity::{
+    build_entity_id,
+    build_entity_id_disambiguated,
+    build_entity_id_disambiguated_with_ordinal,
+    SemanticEntity,
+};
 use crate::utils::hash::{content_hash, structural_hash, structural_hash_excluding_range};
 use super::languages::LanguageConfig;
 
@@ -34,30 +39,178 @@ pub fn extract_entities(
         attach_go_package_metadata(tree.root_node(), source_code.as_bytes(), &mut entities);
     }
 
-    // Post-pass: disambiguate colliding entity IDs by appending @L{line}.
-    // Two overloads with the same name (e.g. function overloads in C++/TS)
-    // get identical IDs; re-assign all colliding entries with line suffixes.
+    disambiguate_colliding_entity_ids(&mut entities);
+
+    entities
+}
+
+type IdRewrites = HashMap<String, Vec<(usize, String)>>;
+
+fn disambiguate_colliding_entity_ids(entities: &mut [SemanticEntity]) {
+    if !has_duplicate_entity_ids(entities) {
+        return;
+    }
+
+    // Each pass can expose child ID collisions at the next descendant level.
+    // The entity count bounds the maximum number of parent-child propagation steps.
+    for _ in 0..=entities.len() {
+        let rewrites = disambiguate_current_entity_ids(entities);
+        if rewrites.is_empty() {
+            assert_unique_entity_ids(entities);
+            return;
+        }
+
+        propagate_parent_id_rewrites(entities, rewrites);
+    }
+
+    assert_unique_entity_ids(entities);
+}
+
+fn has_duplicate_entity_ids(entities: &[SemanticEntity]) -> bool {
+    let mut seen = HashSet::with_capacity(entities.len());
+    for entity in entities {
+        if !seen.insert(entity.id.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn disambiguate_current_entity_ids(entities: &mut [SemanticEntity]) -> IdRewrites {
     let mut id_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, entity) in entities.iter().enumerate() {
         id_indices.entry(entity.id.clone()).or_default().push(i);
     }
+
+    let mut rewrites: IdRewrites = HashMap::new();
     for (_id, indices) in &id_indices {
         if indices.len() > 1 {
-            for &idx in indices {
+            let mut indices = indices.clone();
+            indices.sort_unstable();
+
+            let mut line_counts: HashMap<usize, usize> = HashMap::new();
+            for &idx in &indices {
+                *line_counts.entry(entities[idx].start_line).or_default() += 1;
+            }
+
+            let mut line_ordinals: HashMap<usize, usize> = HashMap::new();
+            for &idx in &indices {
                 let e = &entities[idx];
-                let new_id = build_entity_id_disambiguated(
-                    &e.file_path,
-                    &e.entity_type,
-                    &e.name,
-                    e.parent_id.as_deref(),
-                    e.start_line,
-                );
-                entities[idx].id = new_id;
+                let new_id = if line_counts[&e.start_line] > 1 {
+                    let ordinal = line_ordinals.entry(e.start_line).or_default();
+                    *ordinal += 1;
+                    build_entity_id_disambiguated_with_ordinal(
+                        &e.file_path,
+                        &e.entity_type,
+                        &e.name,
+                        e.parent_id.as_deref(),
+                        e.start_line,
+                        *ordinal,
+                    )
+                } else {
+                    build_entity_id_disambiguated(
+                        &e.file_path,
+                        &e.entity_type,
+                        &e.name,
+                        e.parent_id.as_deref(),
+                        e.start_line,
+                    )
+                };
+                let old_id = std::mem::replace(&mut entities[idx].id, new_id.clone());
+                if old_id != new_id {
+                    rewrites.entry(old_id).or_default().push((idx, new_id));
+                }
             }
         }
     }
 
-    entities
+    rewrites
+}
+
+fn propagate_parent_id_rewrites(entities: &mut [SemanticEntity], mut rewrites: IdRewrites) {
+    while !rewrites.is_empty() {
+        let mut child_rewrites: IdRewrites = HashMap::new();
+
+        for child_idx in 0..entities.len() {
+            let Some(parent_id) = entities[child_idx].parent_id.clone() else {
+                continue;
+            };
+            let Some(candidates) = rewrites.get(&parent_id) else {
+                continue;
+            };
+            let Some(new_parent_id) = select_rewritten_parent_id(entities, child_idx, candidates)
+            else {
+                continue;
+            };
+
+            entities[child_idx].parent_id = Some(new_parent_id.clone());
+            let new_child_id = build_entity_id(
+                &entities[child_idx].file_path,
+                &entities[child_idx].entity_type,
+                &entities[child_idx].name,
+                Some(&new_parent_id),
+            );
+            let old_child_id = std::mem::replace(&mut entities[child_idx].id, new_child_id.clone());
+            if old_child_id != new_child_id {
+                child_rewrites
+                    .entry(old_child_id)
+                    .or_default()
+                    .push((child_idx, new_child_id));
+            }
+        }
+
+        rewrites = child_rewrites;
+    }
+}
+
+fn select_rewritten_parent_id(
+    entities: &[SemanticEntity],
+    child_idx: usize,
+    candidates: &[(usize, String)],
+) -> Option<String> {
+    let child = &entities[child_idx];
+    let mut best: Option<((u8, u8, u8, usize, usize), String)> = None;
+
+    for (parent_idx, parent_id) in candidates {
+        if *parent_idx == child_idx {
+            continue;
+        }
+        let parent = &entities[*parent_idx];
+        let same_file_rank = if parent.file_path == child.file_path { 0 } else { 1 };
+        let before_rank = if *parent_idx < child_idx { 0 } else { 1 };
+        let line_span_contains_child =
+            parent.start_line <= child.start_line && child.end_line <= parent.end_line;
+        let line_span_differs =
+            (parent.start_line, parent.end_line) != (child.start_line, child.end_line);
+        let contains_rank = if line_span_contains_child && line_span_differs {
+            0
+        } else {
+            1
+        };
+        let distance = parent_idx.abs_diff(child_idx);
+        let span = parent.end_line.saturating_sub(parent.start_line);
+        let key = (same_file_rank, contains_rank, before_rank, distance, span);
+
+        if match best.as_ref() {
+            Some((best_key, _)) => key < *best_key,
+            None => true,
+        } {
+            best = Some((key, parent_id.clone()));
+        }
+    }
+
+    best.map(|(_, parent_id)| parent_id)
+}
+
+fn assert_unique_entity_ids(entities: &[SemanticEntity]) {
+    let mut seen = HashSet::with_capacity(entities.len());
+    for entity in entities {
+        assert!(
+            seen.insert(entity.id.as_str()),
+            "duplicate semantic entity id generated: {}",
+            entity.id
+        );
+    }
 }
 
 fn attach_go_package_metadata(root: Node, source: &[u8], entities: &mut [SemanticEntity]) {

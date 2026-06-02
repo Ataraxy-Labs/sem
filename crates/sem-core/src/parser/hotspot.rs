@@ -37,8 +37,8 @@ pub fn compute_hotspots(
         return Vec::new();
     }
 
-    // entity key (name, type, file) -> count
-    let mut churn: HashMap<(String, String, String), usize> = HashMap::new();
+    // entity key (id, name, type, file) -> count
+    let mut churn: HashMap<(String, String, String, String), usize> = HashMap::new();
 
     let pathspecs: Vec<String> = file_path.map(|f| vec![f.to_string()]).unwrap_or_default();
 
@@ -68,6 +68,7 @@ pub fn compute_hotspots(
             }
 
             let key = (
+                change.entity_id.clone(),
                 change.entity_name.clone(),
                 change.entity_type.clone(),
                 change.file_path.clone(),
@@ -78,12 +79,14 @@ pub fn compute_hotspots(
 
     let mut hotspots: Vec<EntityHotspot> = churn
         .into_iter()
-        .map(|((name, entity_type, file_path), count)| EntityHotspot {
-            entity_name: name,
-            entity_type,
-            file_path,
-            change_count: count,
-        })
+        .map(
+            |((_id, name, entity_type, file_path), count)| EntityHotspot {
+                entity_name: name,
+                entity_type,
+                file_path,
+                change_count: count,
+            },
+        )
         .collect();
 
     hotspots.sort_by(|a, b| b.change_count.cmp(&a.change_count));

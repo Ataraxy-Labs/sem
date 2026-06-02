@@ -85,15 +85,11 @@ pub fn compute_semantic_diff(
                 let before_count = before_entities.len();
                 let after_count = after_entities.len();
 
-                let sim_fn = |a: &crate::model::entity::SemanticEntity,
-                              b: &crate::model::entity::SemanticEntity|
-                 -> f64 { plugin.compute_similarity(a, b) };
-
                 let mut result = match_entities(
                     &before_entities,
                     &after_entities,
                     &file.file_path,
-                    Some(&sim_fn),
+                    None,
                     commit_sha,
                     author,
                 );
