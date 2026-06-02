@@ -465,6 +465,230 @@ func helper(x: Int) -> Int {
     }
 
     #[test]
+    fn test_swift_multi_binding_property_extraction() {
+        let code = r#"
+struct Point {
+    var x, y: Int
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Point.swift");
+        let point = entities.iter().find(|e| e.name == "Point").unwrap();
+        let properties: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+
+        assert_eq!(
+            properties.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        assert!(properties
+            .iter()
+            .all(|property| property.parent_id.as_deref() == Some(point.id.as_str())));
+        assert_eq!(properties[0].content, "var x: Int");
+        assert_eq!(properties[1].content, "var y: Int");
+    }
+
+    #[test]
+    fn test_swift_multi_binding_property_content_is_per_binding() {
+        let typed_code = r#"
+struct Types {
+    var x: Int, y: String
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let typed_entities = plugin.extract_entities(typed_code, "Types.swift");
+        let typed_properties: Vec<_> = typed_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(typed_properties[0].content, "var x: Int");
+        assert_eq!(typed_properties[1].content, "var y: String");
+
+        let mixed_code = r#"
+struct Mixed {
+    var x, y: Int, z: String
+}
+"#;
+        let mixed_entities = plugin.extract_entities(mixed_code, "Mixed.swift");
+        let mixed_properties: Vec<_> = mixed_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(mixed_properties[0].content, "var x: Int");
+        assert_eq!(mixed_properties[1].content, "var y: Int");
+        assert_eq!(mixed_properties[2].content, "var z: String");
+
+        let generic_code = r#"
+struct GenericTypes {
+    var lookup: Dictionary<String, Int>, count: Int
+}
+"#;
+        let generic_entities = plugin.extract_entities(generic_code, "GenericTypes.swift");
+        let generic_properties: Vec<_> = generic_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(
+            generic_properties[0].content,
+            "var lookup: Dictionary<String, Int>"
+        );
+        assert_eq!(generic_properties[1].content, "var count: Int");
+
+        let initializer_code = r#"
+struct Initializers {
+    var a = Foo(), b = Bar()
+}
+"#;
+        let initializer_entities = plugin.extract_entities(initializer_code, "Initializers.swift");
+        let initializer_properties: Vec<_> = initializer_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert!(initializer_properties[0].content.contains("Foo()"));
+        assert!(!initializer_properties[0].content.contains("Bar()"));
+        assert!(initializer_properties[1].content.contains("Bar()"));
+        assert!(!initializer_properties[1].content.contains("Foo()"));
+
+        let constants_code = r#"
+struct Constants {
+    let first, second, third: Int
+}
+"#;
+        let constants_entities = plugin.extract_entities(constants_code, "Constants.swift");
+        let constants_properties: Vec<_> = constants_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(
+            constants_properties.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(constants_properties[0].content, "let first: Int");
+        assert_eq!(constants_properties[1].content, "let second: Int");
+        assert_eq!(constants_properties[2].content, "let third: Int");
+
+        let semicolon_code = r#"
+struct Semicolons {
+    var left, right: Int; var next: Int
+}
+"#;
+        let semicolon_entities = plugin.extract_entities(semicolon_code, "Semicolons.swift");
+        let semicolon_properties: Vec<_> = semicolon_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(semicolon_properties[0].content, "var left: Int");
+        assert_eq!(semicolon_properties[1].content, "var right: Int");
+        assert_eq!(semicolon_properties[2].content, "var next: Int");
+    }
+
+    #[test]
+    fn test_swift_body_locals_not_extracted_as_properties() {
+        let code = r#"
+class Cache {
+    var stored: Int
+
+    var computed: Int {
+        let computedLocal = stored + 1
+        func computedNested() -> Int {
+            return computedLocal
+        }
+        return computedNested()
+    }
+
+    var explicit: Int {
+        get {
+            let getterLocal = stored
+            func getterNested() -> Int {
+                return getterLocal
+            }
+            return getterNested()
+        }
+    }
+
+    init(seed: Int) {
+        let initial = seed
+        self.stored = initial
+    }
+
+    func value() -> Int {
+        let doubled = stored * 2
+        var offset = doubled + 1
+        func nested() -> Int {
+            let insideNested = offset
+            return insideNested
+        }
+        return nested()
+    }
+
+    subscript(index: Int) -> Int {
+        let shifted = index + stored
+        func subscriptNested() -> Int {
+            return shifted
+        }
+        return subscriptNested()
+    }
+
+    deinit {
+        let closing = stored
+        _ = closing
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Cache.swift");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"Cache"), "got: {:?}", names);
+        assert!(names.contains(&"stored"), "got: {:?}", names);
+        assert!(names.contains(&"computed"), "got: {:?}", names);
+        assert!(names.contains(&"explicit"), "got: {:?}", names);
+        assert!(names.contains(&"init"), "got: {:?}", names);
+        assert!(names.contains(&"value"), "got: {:?}", names);
+        assert!(names.contains(&"computedNested"), "got: {:?}", names);
+        assert!(names.contains(&"getterNested"), "got: {:?}", names);
+        assert!(names.contains(&"nested"), "got: {:?}", names);
+        assert!(names.contains(&"subscriptNested"), "got: {:?}", names);
+        assert!(names.contains(&"subscript"), "got: {:?}", names);
+        assert!(names.contains(&"deinit"), "got: {:?}", names);
+        assert!(!names.contains(&"Int"), "got: {:?}", names);
+
+        for local in [
+            "computedLocal",
+            "getterLocal",
+            "initial",
+            "doubled",
+            "offset",
+            "insideNested",
+            "shifted",
+            "closing",
+        ] {
+            assert!(!names.contains(&local), "{local} should not be an entity. Got: {:?}", names);
+        }
+    }
+
+    #[test]
+    fn test_swift_suppressed_multi_binding_initializers_are_traversed() {
+        let code = r#"
+func outer() {
+    let a = { func innerA() -> Int { 1 } },
+        b = { func innerB() -> Int { 2 } }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Locals.swift");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"), "got: {:?}", names);
+        assert!(names.contains(&"innerA"), "got: {:?}", names);
+        assert!(names.contains(&"innerB"), "got: {:?}", names);
+        assert!(!names.contains(&"a"), "local binding should stay suppressed: {:?}", names);
+        assert!(!names.contains(&"b"), "local binding should stay suppressed: {:?}", names);
+    }
+
+    #[test]
     fn test_swift_conditional_compilation_inside_struct() {
         let code = r#"
 import ArgumentParser
@@ -536,6 +760,87 @@ public struct TuistCommand: AsyncParsableCommand {
         assert!(grouped_subcommands
             .iter()
             .all(|entity| entity.parent_id.as_deref() == Some(command.id.as_str())));
+    }
+
+    #[test]
+    fn test_swift_conditional_compilation_with_interpolated_brace_string() {
+        let plugin = CodeParserPlugin;
+        for (container_name, code) in [
+            (
+                "Config",
+                r#"
+class Config {
+    let tpl = "prefix \("}") suffix"
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+
+struct Tail { let q: Int }
+"#,
+            ),
+            (
+                "RawConfig",
+                r##"
+class RawConfig {
+    let tpl = #"prefix \#("{") suffix"#
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"##,
+            ),
+            (
+                "MultilineConfig",
+                r#"
+class MultilineConfig {
+    let tpl = """
+    prefix \("}") suffix
+    """
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"#,
+            ),
+            (
+                "ClosureConfig",
+                r#"
+class ClosureConfig {
+    let tpl = "prefix \(["}"].map { $0 }.joined()) suffix"
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"#,
+            ),
+        ] {
+            let file_path = format!("{container_name}.swift");
+            let entities = plugin.extract_entities(code, &file_path);
+            let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+            let container = entities
+                .iter()
+                .find(|e| e.name == container_name)
+                .unwrap_or_else(|| {
+                    panic!("Should recover {container_name}, got: {names:?}");
+                });
+            assert_eq!(container.entity_type, "class");
+            assert!(container.parent_id.is_none());
+
+            for member in ["tpl", "dump", "render"] {
+                let entity = entities
+                    .iter()
+                    .find(|e| e.name == member)
+                    .unwrap_or_else(|| {
+                        panic!("Should find {member} in {container_name}, got: {names:?}");
+                    });
+                assert_eq!(entity.parent_id.as_deref(), Some(container.id.as_str()));
+            }
+        }
     }
 
     #[test]

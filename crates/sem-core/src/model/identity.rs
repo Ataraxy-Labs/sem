@@ -698,7 +698,14 @@ fn detect_reorders(
             if lnds_set.contains(&i) {
                 continue;
             }
-            changes.push(make_change(after_entity, ChangeType::Reordered, Some(before_entity), commit_sha, author, by_id));
+            changes.push(make_change(
+                after_entity,
+                ChangeType::Reordered,
+                Some(before_entity),
+                commit_sha,
+                author,
+                by_id,
+            ));
         }
     }
 }

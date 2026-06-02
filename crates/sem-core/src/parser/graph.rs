@@ -40,40 +40,6 @@ use crate::parser::import_resolution::{
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
-fn build_scope_consumed_words(
-    resolution_log: &[scope_resolve::ResolutionEntry],
-) -> HashMap<String, HashSet<String>> {
-    let mut consumed_by_entity: HashMap<String, HashSet<String>> = HashMap::new();
-    for entry in resolution_log {
-        let words = consumed_by_entity
-            .entry(entry.from_entity.clone())
-            .or_default();
-        add_scope_reference_words(words, &entry.reference);
-    }
-    consumed_by_entity
-}
-
-fn add_scope_reference_words(words: &mut HashSet<String>, reference: &str) {
-    let reference = reference.strip_suffix("()").unwrap_or(reference);
-    let reference = reference
-        .split_once('(')
-        .map_or(reference, |(name, _)| name);
-    if let Some((receiver, member)) = reference.rsplit_once('.') {
-        if !receiver.is_empty() {
-            words.insert(receiver.to_string());
-        }
-        if !member.is_empty() {
-            words.insert(member.to_string());
-        }
-    } else if reference.contains("::") {
-        for part in reference.split("::").filter(|part| !part.is_empty()) {
-            words.insert(part.to_string());
-        }
-    } else if !reference.is_empty() {
-        words.insert(reference.to_string());
-    }
-}
-
 #[derive(Clone, Copy)]
 struct ChildRange<'a> {
     file_path: &'a str,
@@ -856,9 +822,9 @@ impl EntityGraph {
                 Some(parsed_files),
                 Some(pre_built),
                 Some(&import_table),
+                false,
             );
-            let consumed_words = build_scope_consumed_words(&result.resolution_log);
-            (result.edges, consumed_words)
+            (result.edges, result.consumed_words)
         } else {
             (vec![], HashMap::new())
         };
@@ -1623,9 +1589,9 @@ impl EntityGraph {
                 pre,
                 None,
                 Some(&import_table),
+                false,
             );
-            let consumed_words = build_scope_consumed_words(&result.resolution_log);
-            (result.edges, consumed_words)
+            (result.edges, result.consumed_words)
         } else {
             (vec![], HashMap::new())
         };

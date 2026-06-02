@@ -471,6 +471,35 @@ fn visit_node(
             }
         }
 
+        if node_type == "property_declaration"
+            && config.id == "swift"
+            && config.entity_node_types.contains(&node_type)
+        {
+            let bindings = extract_swift_property_bindings(node, source);
+            if bindings.len() > 1 {
+                let should_skip = should_skip_entity(config, suppression_context, node_type);
+                if !should_skip {
+                    for binding in bindings {
+                        let entity_type = map_entity_type(node, config);
+                        entities.push(SemanticEntity {
+                            id: build_entity_id(file_path, entity_type, &binding.name, parent_id),
+                            file_path: file_path.to_string(),
+                            entity_type: entity_type.to_string(),
+                            name: binding.name,
+                            parent_id: parent_id.map(String::from),
+                            content_hash: content_hash(&binding.content),
+                            structural_hash: Some(binding.structural_hash),
+                            content: binding.content,
+                            start_line: binding.start_line,
+                            end_line: binding.end_line,
+                            metadata: None,
+                        });
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Go grouped declarations: `var ( a = 1; b = 2 )` should produce
         // one entity per spec instead of collapsing to the first (#149).
         if (node_type == "var_declaration"
@@ -1093,13 +1122,8 @@ fn find_matching_brace(source: &[u8], open_brace: usize) -> Option<usize> {
             continue;
         }
 
-        if is_swift_multiline_string_start(source, i) {
-            i = skip_swift_multiline_string(source, i + 3);
-            continue;
-        }
-
-        if source[i] == b'"' {
-            i = skip_swift_string(source, i + 1);
+        if let Some(string_start) = swift_string_literal_start(source, i) {
+            i = skip_swift_string_literal(source, string_start);
             continue;
         }
 
@@ -1109,7 +1133,7 @@ fn find_matching_brace(source: &[u8], open_brace: usize) -> Option<usize> {
                 i += 1;
             }
             b'}' => {
-                depth -= 1;
+                depth = depth.checked_sub(1)?;
                 i += 1;
                 if depth == 0 {
                     // Return the byte after the closing brace for use as a slice end.
@@ -1140,26 +1164,77 @@ fn skip_swift_block_comment(source: &[u8], mut i: usize) -> usize {
     source.len()
 }
 
-fn is_swift_multiline_string_start(source: &[u8], quote: usize) -> bool {
-    source.get(quote) == Some(&b'"')
-        && source.get(quote + 1) == Some(&b'"')
-        && source.get(quote + 2) == Some(&b'"')
+#[derive(Clone, Copy)]
+struct SwiftStringLiteralStart {
+    body_start: usize,
+    hash_count: usize,
+    is_multiline: bool,
 }
 
-fn skip_swift_multiline_string(source: &[u8], mut i: usize) -> usize {
-    while i + 2 < source.len() {
-        if i + 3 < source.len()
-            && source[i] == b'\\'
-            && source.get(i + 1) == Some(&b'"')
-            && source.get(i + 2) == Some(&b'"')
-            && source.get(i + 3) == Some(&b'"')
-        {
-            i = (i + 4).min(source.len());
+const SWIFT_STRING_INTERPOLATION_NESTING_LIMIT: usize = 256;
+
+fn swift_string_literal_start(source: &[u8], start: usize) -> Option<SwiftStringLiteralStart> {
+    let mut quote = start;
+    let mut hash_count = 0usize;
+    while source.get(quote) == Some(&b'#') {
+        hash_count += 1;
+        quote += 1;
+    }
+
+    if source.get(quote) != Some(&b'"') {
+        return None;
+    }
+
+    let is_multiline =
+        source.get(quote + 1) == Some(&b'"') && source.get(quote + 2) == Some(&b'"');
+    let body_start = quote + if is_multiline { 3 } else { 1 };
+    Some(SwiftStringLiteralStart {
+        body_start,
+        hash_count,
+        is_multiline,
+    })
+}
+
+fn skip_swift_string_literal(source: &[u8], start: SwiftStringLiteralStart) -> usize {
+    skip_swift_string_literal_with_depth(source, start, 0)
+}
+
+fn skip_swift_string_literal_with_depth(
+    source: &[u8],
+    start: SwiftStringLiteralStart,
+    interpolation_depth: usize,
+) -> usize {
+    if start.is_multiline {
+        skip_swift_multiline_string(
+            source,
+            start.body_start,
+            start.hash_count,
+            interpolation_depth,
+        )
+    } else {
+        skip_swift_string(source, start.body_start, start.hash_count, interpolation_depth)
+    }
+}
+
+fn skip_swift_multiline_string(
+    source: &[u8],
+    mut i: usize,
+    hash_count: usize,
+    interpolation_depth: usize,
+) -> usize {
+    while i < source.len() {
+        if let Some(interpolation_start) = swift_interpolation_start(source, i, hash_count) {
+            i = skip_swift_interpolation(source, interpolation_start, interpolation_depth + 1);
             continue;
         }
 
-        if source[i] == b'"' && source[i + 1] == b'"' && source[i + 2] == b'"' {
-            return i + 3;
+        if let Some(escaped_start) = swift_escape_payload_start(source, i, hash_count) {
+            i = (escaped_start + 1).min(source.len());
+            continue;
+        }
+
+        if swift_string_closing_at(source, i, hash_count, 3) {
+            return i + 3 + hash_count;
         }
 
         i += 1;
@@ -1167,17 +1242,112 @@ fn skip_swift_multiline_string(source: &[u8], mut i: usize) -> usize {
     source.len()
 }
 
-fn skip_swift_string(source: &[u8], mut i: usize) -> usize {
+fn skip_swift_string(
+    source: &[u8],
+    mut i: usize,
+    hash_count: usize,
+    interpolation_depth: usize,
+) -> usize {
     while i < source.len() {
-        if source[i] == b'\\' {
-            i = (i + 2).min(source.len());
-        } else if source[i] == b'"' {
-            return i + 1;
-        } else {
-            i += 1;
+        if let Some(interpolation_start) = swift_interpolation_start(source, i, hash_count) {
+            i = skip_swift_interpolation(source, interpolation_start, interpolation_depth + 1);
+            continue;
+        }
+
+        if let Some(escaped_start) = swift_escape_payload_start(source, i, hash_count) {
+            i = (escaped_start + 1).min(source.len());
+            continue;
+        }
+
+        if swift_string_closing_at(source, i, hash_count, 1) {
+            return i + 1 + hash_count;
+        }
+
+        i += 1;
+    }
+    source.len()
+}
+
+fn skip_swift_interpolation(source: &[u8], mut i: usize, interpolation_depth: usize) -> usize {
+    if interpolation_depth > SWIFT_STRING_INTERPOLATION_NESTING_LIMIT {
+        return source.len();
+    }
+
+    let mut depth = 1usize;
+    while i < source.len() {
+        if source[i] == b'/' && source.get(i + 1) == Some(&b'/') {
+            i = skip_swift_line_comment(source, i + 2);
+            continue;
+        }
+
+        if source[i] == b'/' && source.get(i + 1) == Some(&b'*') {
+            i = skip_swift_block_comment(source, i + 2);
+            continue;
+        }
+
+        if let Some(string_start) = swift_string_literal_start(source, i) {
+            i = skip_swift_string_literal_with_depth(source, string_start, interpolation_depth);
+            continue;
+        }
+
+        match source[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                let Some(new_depth) = depth.checked_sub(1) else {
+                    return source.len();
+                };
+                depth = new_depth;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
         }
     }
     source.len()
+}
+
+fn swift_interpolation_start(source: &[u8], backslash: usize, hash_count: usize) -> Option<usize> {
+    let payload_start = swift_escape_payload_start(source, backslash, hash_count)?;
+    (source.get(payload_start) == Some(&b'(')).then_some(payload_start + 1)
+}
+
+fn swift_escape_payload_start(source: &[u8], backslash: usize, hash_count: usize) -> Option<usize> {
+    if source.get(backslash) != Some(&b'\\') {
+        return None;
+    }
+
+    let mut i = backslash + 1;
+    for _ in 0..hash_count {
+        if source.get(i) != Some(&b'#') {
+            return None;
+        }
+        i += 1;
+    }
+    (i < source.len()).then_some(i)
+}
+
+fn swift_string_closing_at(
+    source: &[u8],
+    quote: usize,
+    hash_count: usize,
+    quote_count: usize,
+) -> bool {
+    for offset in 0..quote_count {
+        if source.get(quote + offset) != Some(&b'"') {
+            return false;
+        }
+    }
+    for hash_offset in 0..hash_count {
+        if source.get(quote + quote_count + hash_offset) != Some(&b'#') {
+            return false;
+        }
+    }
+    true
 }
 
 fn line_number_for_byte(source: &[u8], byte: usize) -> usize {
@@ -1949,6 +2119,165 @@ fn extract_declarator_name(mut node: Node, source: &[u8]) -> Option<String> {
 
 fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
+}
+
+struct SwiftPropertyBinding {
+    name: String,
+    content: String,
+    structural_hash: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+struct SwiftRawPropertyBinding {
+    name: String,
+    segment_start_byte: usize,
+    segment_end_byte: usize,
+    has_type: bool,
+    has_value: bool,
+    type_text: Option<String>,
+}
+
+fn extract_swift_property_bindings(node: Node, source: &[u8]) -> Vec<SwiftPropertyBinding> {
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+    let prefix_end = children
+        .iter()
+        .find(|child| child.kind() == "value_binding_pattern")
+        .map(|child| child.end_byte())
+        .unwrap_or(node.start_byte());
+    let prefix = source
+        .get(node.start_byte()..prefix_end)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or("")
+        .trim();
+
+    let mut name_nodes = Vec::new();
+    for index in 0..node.child_count() {
+        if node.field_name_for_child(index as u32) == Some("name") {
+            if let Some(child) = node.child(index as u32) {
+                name_nodes.push(child);
+            }
+        }
+    }
+
+    if name_nodes.len() <= 1 {
+        return Vec::new();
+    }
+
+    let mut raw_bindings = Vec::new();
+    for (index, name_node) in name_nodes.iter().enumerate() {
+        let next_name_start = name_nodes.get(index + 1).map(|next| next.start_byte());
+        let segment_end_byte = next_name_start
+            .and_then(|next_start| {
+                children
+                    .iter()
+                    .find(|child| {
+                        child.kind() == ","
+                            && child.start_byte() >= name_node.end_byte()
+                            && child.start_byte() < next_start
+                    })
+                    .map(|child| child.start_byte())
+            })
+            .unwrap_or_else(|| {
+                if let Some(next_start) = next_name_start {
+                    next_start
+                } else {
+                    let mut end_byte = name_node.end_byte();
+                    for child_index in 0..node.child_count() {
+                        let Some(child) = node.child(child_index as u32) else {
+                            continue;
+                        };
+                        if child.start_byte() < name_node.end_byte() {
+                            continue;
+                        }
+                        let field_name = node.field_name_for_child(child_index as u32);
+                        if field_name == Some("type")
+                            || matches!(field_name, Some("value") | Some("computed_value"))
+                            || child.kind() == "type_annotation"
+                        {
+                            end_byte = end_byte.max(child.end_byte());
+                        }
+                    }
+                    end_byte
+                }
+            });
+
+        let mut has_type = false;
+        let mut has_value = false;
+        let mut type_text = None;
+        for child_index in 0..node.child_count() {
+            let Some(child) = node.child(child_index as u32) else {
+                continue;
+            };
+            if child.start_byte() < name_node.end_byte() || child.start_byte() >= segment_end_byte {
+                continue;
+            }
+            let field_name = node.field_name_for_child(child_index as u32);
+            if field_name == Some("type") || child.kind() == "type_annotation" {
+                has_type = true;
+                let text = node_text(child, source).trim();
+                if !text.is_empty() {
+                    type_text = Some(text.to_string());
+                }
+            }
+            if matches!(field_name, Some("value") | Some("computed_value")) {
+                has_value = true;
+            }
+        }
+
+        raw_bindings.push(SwiftRawPropertyBinding {
+            name: node_text(*name_node, source).to_string(),
+            segment_start_byte: name_node.start_byte(),
+            segment_end_byte,
+            has_type,
+            has_value,
+            type_text,
+        });
+    }
+
+    raw_bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            let mut segment = source
+                .get(binding.segment_start_byte..binding.segment_end_byte)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            if !binding.has_type && !binding.has_value {
+                if let Some(type_text) = raw_bindings
+                    .iter()
+                    .skip(index + 1)
+                    .find_map(|next| next.type_text.as_deref())
+                {
+                    segment.push_str(type_text);
+                }
+            }
+
+            let mut content = prefix.to_string();
+            if !content.is_empty() && !segment.is_empty() {
+                content.push(' ');
+            }
+            let name_offset = content.len();
+            content.push_str(&segment);
+            let name_end_offset = name_offset + binding.name.len();
+
+            SwiftPropertyBinding {
+                name: binding.name.clone(),
+                structural_hash: recovered_swift_structural_hash(
+                    &content,
+                    name_offset,
+                    name_end_offset,
+                ),
+                content,
+                start_line: line_number_for_byte(source, binding.segment_start_byte),
+                end_line: line_number_for_byte(source, binding.segment_end_byte),
+            }
+        })
+        .collect()
 }
 
 fn map_node_type(tree_sitter_type: &str) -> &str {
