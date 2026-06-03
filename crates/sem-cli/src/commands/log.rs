@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use colored::Colorize;
@@ -138,21 +139,14 @@ pub fn log_command(opts: LogOptions) {
         }
     }
 
-    let use_file_history = git_file_path.as_deref().is_some_and(|path| {
-        bridge
-            .get_head_sha()
-            .ok()
-            .and_then(|head| entity_by_name_at_ref(&bridge, &registry, &head, path, &opts.entity_name))
-            .is_some()
-    });
-
-    let mut commits = if use_file_history {
+    let history_limit = history_limit_with_baseline(opts.limit);
+    let mut commits = if git_file_path.is_some() {
         let path = git_file_path.as_deref().unwrap();
-        match bridge.get_file_commits_follow_renames(path, 0) {
+        match bridge.get_file_commits_follow_renames(path, history_limit) {
             Ok(file_commits) if !file_commits.is_empty() => {
                 file_commits.into_iter().map(|info| info.commit).collect()
             }
-            Ok(_) => match bridge.get_log(0) {
+            Ok(_) => match bridge.get_log(history_limit) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("{} Failed to get history: {}", "error:".red().bold(), e);
@@ -160,12 +154,16 @@ pub fn log_command(opts: LogOptions) {
                 }
             },
             Err(e) => {
-                eprintln!("{} Failed to get file history: {}", "error:".red().bold(), e);
+                eprintln!(
+                    "{} Failed to get file history: {}",
+                    "error:".red().bold(),
+                    e
+                );
                 std::process::exit(1);
             }
         }
     } else {
-        match bridge.get_log(0) {
+        match bridge.get_log(history_limit) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{} Failed to get history: {}", "error:".red().bold(), e);
@@ -180,7 +178,8 @@ pub fn log_command(opts: LogOptions) {
     }
     commits.reverse();
 
-    let total_commits = commits.len();
+    let total_commits = scanned_commit_count(commits.len(), opts.limit);
+    let scanned_commits = scanned_commit_shas(&commits, opts.limit);
     let Some(seed) = find_seed_occurrence(
         &bridge,
         &registry,
@@ -203,9 +202,8 @@ pub fn log_command(opts: LogOptions) {
     let entity_type = seed.entity.entity_type.clone();
     let mut entries = trace_back_to_origin(&bridge, &registry, &commits, seed.clone());
     entries.extend(trace_forward_from_seed(&bridge, &registry, &commits, seed));
-    if opts.limit != 0 && entries.len() > opts.limit {
-        let drop_count = entries.len() - opts.limit;
-        entries.drain(0..drop_count);
+    if let Some(scanned_commits) = &scanned_commits {
+        entries.retain(|entry| scanned_commits.contains(&entry.sha));
     }
 
     let first_seen = entries.first().map(|e| e.date.clone()).unwrap_or_default();
@@ -246,6 +244,35 @@ pub fn log_command(opts: LogOptions) {
             opts.verbose,
         );
     }
+}
+
+fn history_limit_with_baseline(limit: usize) -> usize {
+    if limit == 0 {
+        0
+    } else {
+        limit.saturating_add(1)
+    }
+}
+
+fn scanned_commit_count(commit_count: usize, limit: usize) -> usize {
+    if limit == 0 {
+        commit_count
+    } else {
+        commit_count.min(limit)
+    }
+}
+
+fn scanned_commit_shas(commits: &[CommitInfo], limit: usize) -> Option<HashSet<String>> {
+    if limit == 0 || commits.len() <= limit {
+        return None;
+    }
+
+    Some(
+        commits[commits.len() - limit..]
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect(),
+    )
 }
 
 fn find_seed_occurrence(
