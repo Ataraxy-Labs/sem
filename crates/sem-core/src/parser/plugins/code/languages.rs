@@ -411,6 +411,29 @@ const CPP_SUPPRESSED_NESTED: &[SuppressedNestedEntity] = &[
 
 const CPP_SCOPE_BOUNDARIES: &[&str] = &["lambda_expression"];
 
+const SWIFT_SUPPRESSED_NESTED: &[SuppressedNestedEntity] = &[
+    SuppressedNestedEntity {
+        parent_entity_node_type: "function_declaration",
+        child_entity_node_type: "property_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "init_declaration",
+        child_entity_node_type: "property_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "deinit_declaration",
+        child_entity_node_type: "property_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "subscript_declaration",
+        child_entity_node_type: "property_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "property_declaration",
+        child_entity_node_type: "property_declaration",
+    },
+];
+
 #[cfg(feature = "lang-typescript")]
 static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     id: "typescript",
@@ -750,9 +773,10 @@ static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
         "enum_class_body",
         "struct_body",
         "function_body",
+        "computed_property",
     ],
     call_entity_identifiers: &[],
-    suppressed_nested_entities: &[],
+    suppressed_nested_entities: SWIFT_SUPPRESSED_NESTED,
     scope_boundary_types: &[],
     get_language: get_swift,
     scope_resolve: Some(&SWIFT_SCOPE_CONFIG),
@@ -1930,7 +1954,13 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         "enum_declaration",
     ],
     impl_scope_nodes: &["extension_declaration"],
-    function_scope_nodes: &["function_declaration", "init_declaration"],
+    function_scope_nodes: &[
+        "function_declaration",
+        "init_declaration",
+        "deinit_declaration",
+        "subscript_declaration",
+        "property_declaration",
+    ],
     class_name_field: ClassNameField::Simple("name"),
 
     assignment_rules: &[AssignmentRule {
@@ -1939,6 +1969,7 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     }],
     assignment_recurse_into: &[
         "function_body",
+        "computed_property",
         "code_block",
         "statements",
         "if_statement",

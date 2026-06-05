@@ -199,6 +199,12 @@ fn find_entity_source_span(
     source: &str,
     line_starts: &[usize],
 ) -> Option<SourceSpan> {
+    if entity.file_path.ends_with(".swift") && entity.entity_type == "property" {
+        if let Some(span) = swift_property_binding_span(entity, source.as_bytes(), line_starts) {
+            return Some(span);
+        }
+    }
+
     let line_index = entity.start_line.checked_sub(1)?;
     let line_start = *line_starts.get(line_index)?;
 
@@ -243,6 +249,114 @@ fn source_span_at(source: &str, content: &str, start_byte: usize) -> Option<Sour
     }
 }
 
+fn line_start(line_starts: &[usize], line: usize) -> usize {
+    line_starts
+        .get(line.saturating_sub(1))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn line_end(line_starts: &[usize], source_len: usize, line: usize) -> usize {
+    line_starts
+        .get(line)
+        .copied()
+        .map(|offset| offset.saturating_sub(1))
+        .unwrap_or(source_len)
+}
+
+fn swift_property_binding_span(
+    entity: &SemanticEntity,
+    source: &[u8],
+    line_starts: &[usize],
+) -> Option<SourceSpan> {
+    let search_start = line_start(line_starts, entity.start_line);
+    let search_end = line_end(line_starts, source.len(), entity.end_line).min(source.len());
+    let haystack = source.get(search_start..search_end)?;
+    let content = entity.content.trim();
+    if !content.is_empty() {
+        if let Some(local_start) = find_subslice(haystack, content.as_bytes()) {
+            let start = search_start + local_start;
+            return Some(SourceSpan {
+                start_byte: start,
+                end_byte: start + content.len(),
+            });
+        }
+    }
+
+    let name = entity.name.as_bytes();
+    if name.is_empty() {
+        return None;
+    }
+    let mut local_search_start = 0;
+    while let Some(local_start) = find_subslice(&haystack[local_search_start..], name) {
+        let local_start = local_search_start + local_start;
+        let start = search_start + local_start;
+        let end = start + entity.name.len();
+        if !identifier_boundary(source, start, end) {
+            local_search_start = local_start + name.len();
+            continue;
+        }
+        let segment_end = swift_binding_segment_end(source, end, search_end);
+        return Some(SourceSpan {
+            start_byte: start,
+            end_byte: segment_end,
+        });
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn swift_binding_segment_end(source: &[u8], start: usize, search_end: usize) -> usize {
+    let mut depth = 0usize;
+    let mut idx = start;
+    let mut string_delimiter: Option<u8> = None;
+    while idx < search_end {
+        let byte = source[idx];
+        if let Some(delimiter) = string_delimiter {
+            if byte == b'\\' {
+                idx = (idx + 2).min(search_end);
+                continue;
+            }
+            if byte == delimiter {
+                string_delimiter = None;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' | b'\'' => string_delimiter = Some(byte),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => return idx,
+            _ => {}
+        }
+        idx += 1;
+    }
+    search_end
+}
+
+fn identifier_boundary(source: &[u8], start: usize, end: usize) -> bool {
+    let before = start
+        .checked_sub(1)
+        .and_then(|idx| source.get(idx))
+        .copied();
+    let after = source.get(end).copied();
+    !before.map_or(false, is_identifier_byte) && !after.map_or(false, is_identifier_byte)
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 /// Result of scope-aware resolution
 pub struct ScopeResult {
     pub edges: Vec<(String, String, RefType)>,
@@ -250,12 +364,18 @@ pub struct ScopeResult {
     pub resolution_log: Vec<ResolutionEntry>,
 }
 
+pub(crate) struct ScopeResultFull {
+    pub(crate) edges: Vec<(String, String, RefType)>,
+    pub(crate) resolution_log: Vec<ResolutionEntry>,
+    pub(crate) consumed_words: HashMap<String, HashSet<String>>,
+}
+
 #[derive(Clone)]
 pub struct ResolutionEntry {
     pub from_entity: String,
     pub reference: String,
     pub resolved_to: Option<String>,
-    pub method: &'static str, // "scope_chain", "type_tracking", "import", "unresolved"
+    pub method: &'static str, // "scope_chain", "type_tracking", "import", "unresolved", "local_binding"
 }
 
 /// Resolve references using tree-sitter scope analysis.
@@ -364,7 +484,7 @@ pub fn resolve_with_scopes(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
 ) -> ScopeResult {
-    resolve_with_scopes_full(
+    let result = resolve_with_scopes_full(
         root,
         file_paths,
         all_entities,
@@ -372,7 +492,12 @@ pub fn resolve_with_scopes(
         pre_parsed,
         None,
         None,
-    )
+        true,
+    );
+    ScopeResult {
+        edges: result.edges,
+        resolution_log: result.resolution_log,
+    }
 }
 
 /// Internal version with pre-built lookups for performance.
@@ -384,9 +509,11 @@ pub(crate) fn resolve_with_scopes_full(
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
     pre_built: Option<PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
-) -> ScopeResult {
+    emit_local_binding_log: bool,
+) -> ScopeResultFull {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
+    let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
 
     // Use pre-built lookups if provided, otherwise build from scratch
     let (symbol_table, class_members, owner_members, entity_ranges, go_pkg_index) =
@@ -599,116 +726,121 @@ pub(crate) fn resolve_with_scopes_full(
         build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map);
 
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
-    let per_file_results: Vec<(Vec<(String, String, RefType)>, Vec<ResolutionEntry>)> =
-        maybe_par_iter!(parsed_files)
-            .filter_map(|(file_path, content, tree)| {
-                let source = content.as_bytes();
-                let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-                let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
+    let per_file_results: Vec<(
+        Vec<(String, String, RefType)>,
+        Vec<ResolutionEntry>,
+        HashMap<String, HashSet<String>>,
+    )> = maybe_par_iter!(parsed_files)
+        .filter_map(|(file_path, content, tree)| {
+            let source = content.as_bytes();
+            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+            let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
 
-                let mut scopes: Vec<Scope> = vec![Scope {
-                    parent: None,
-                    defs: HashMap::new(),
-                    bindings: HashSet::new(),
-                    binding_rows: HashMap::new(),
-                    types: HashMap::new(),
-                    pending_call_types: HashMap::new(),
-                    owner_id: None,
-                    kind: "module",
-                }];
+            let mut scopes: Vec<Scope> = vec![Scope {
+                parent: None,
+                defs: HashMap::new(),
+                bindings: HashSet::new(),
+                binding_rows: HashMap::new(),
+                types: HashMap::new(),
+                pending_call_types: HashMap::new(),
+                owner_id: None,
+                kind: "module",
+            }];
 
-                let mut entity_scope_map: HashMap<String, usize> = HashMap::new();
-                let mut entity_inner_scope: HashMap<String, usize> = HashMap::new();
+            let mut entity_scope_map: HashMap<String, usize> = HashMap::new();
+            let mut entity_inner_scope: HashMap<String, usize> = HashMap::new();
 
-                if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
-                    for (_start, _end, eid) in ranges {
-                        if let Some(info) = entity_map.get(eid) {
-                            if info.parent_id.is_none() {
-                                scopes[0].defs.insert(info.name.clone(), eid.clone());
-                                entity_scope_map.insert(eid.clone(), 0);
-                            }
+            if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
+                for (_start, _end, eid) in ranges {
+                    if let Some(info) = entity_map.get(eid) {
+                        if info.parent_id.is_none() {
+                            scopes[0].defs.insert(info.name.clone(), eid.clone());
+                            entity_scope_map.insert(eid.clone(), 0);
                         }
                     }
                 }
+            }
 
-                let file_entities: Vec<&SemanticEntity> = entities_by_file
-                    .get(file_path.as_str())
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[])
-                    .to_vec();
-                let file_lookup = FileEntityLookup::new(&file_entities);
-                let entity_spans = find_entity_source_spans(&file_entities, content);
+            let file_entities: Vec<&SemanticEntity> = entities_by_file
+                .get(file_path.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .to_vec();
+            let file_lookup = FileEntityLookup::new(&file_entities);
+            let entity_spans = find_entity_source_spans(&file_entities, content);
 
-                build_scopes_from_ast(
-                    tree.root_node(),
-                    0,
-                    &mut scopes,
-                    &mut entity_scope_map,
-                    &mut entity_inner_scope,
-                    &file_lookup,
-                    &children_by_parent,
-                    entity_map,
-                    file_path,
-                    source,
-                    config,
-                );
+            build_scopes_from_ast(
+                tree.root_node(),
+                0,
+                &mut scopes,
+                &mut entity_scope_map,
+                &mut entity_inner_scope,
+                &file_lookup,
+                &children_by_parent,
+                entity_map,
+                file_path,
+                source,
+                config,
+            );
 
-                let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
-                if let Some(import_table) = pre_built_import_table {
-                    for ((import_file_path, local_name), target_id) in import_table {
-                        if import_file_path != file_path {
-                            continue;
-                        }
-                        local_import_table.insert(
-                            (import_file_path.clone(), local_name.clone()),
-                            target_id.clone(),
-                        );
-                        scopes[0].defs.insert(local_name.clone(), target_id.clone());
+            let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
+            if let Some(import_table) = pre_built_import_table {
+                for ((import_file_path, local_name), target_id) in import_table {
+                    if import_file_path != file_path {
+                        continue;
                     }
+                    local_import_table.insert(
+                        (import_file_path.clone(), local_name.clone()),
+                        target_id.clone(),
+                    );
+                    scopes[0].defs.insert(local_name.clone(), target_id.clone());
                 }
-                extract_imports_from_ast(
-                    tree.root_node(),
-                    file_path,
-                    source,
-                    &symbol_table,
-                    entity_map,
-                    &mut local_import_table,
-                    &mut scopes,
-                    config,
-                    &go_pkg_index,
-                    &ts_default_exports,
-                    &top_level_entities,
-                );
+            }
+            extract_imports_from_ast(
+                tree.root_node(),
+                file_path,
+                source,
+                &symbol_table,
+                entity_map,
+                &mut local_import_table,
+                &mut scopes,
+                config,
+                &go_pkg_index,
+                &ts_default_exports,
+                &top_level_entities,
+            );
 
-                // Resolve pending call types using the complete return type map
-                inject_return_type_bindings(
-                    &entity_inner_scope,
-                    &mut scopes,
-                    &return_type_map,
-                    &local_import_table,
-                    file_path,
-                    entity_map,
-                );
+            // Resolve pending call types using the complete return type map
+            inject_return_type_bindings(
+                &entity_inner_scope,
+                &mut scopes,
+                &return_type_map,
+                &local_import_table,
+                file_path,
+                entity_map,
+            );
 
-                let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
-                let mut file_log: Vec<ResolutionEntry> = Vec::new();
+            let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
+            let mut file_log: Vec<ResolutionEntry> = Vec::new();
+            let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
 
-                // Walk the AST once for the entire file, collecting all refs with row positions
-                let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
-                let refs_by_row = build_refs_by_row(&all_file_refs);
-                let descendant_ranges_by_entity =
-                    build_descendant_ranges_by_entity(&file_entities, entity_map);
-                let mut lookup_cache = ScopeLookupCache::default();
+            // Walk the AST once for the entire file, collecting all refs with row positions
+            let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
+            let refs_by_row = build_refs_by_row(&all_file_refs);
+            let descendant_ranges_by_entity =
+                build_descendant_ranges_by_entity(&file_entities, entity_map);
+            let mut lookup_cache = ScopeLookupCache::default();
 
-                for entity in &file_entities {
-                    let scope_idx = entity_inner_scope
-                        .get(&entity.id)
-                        .or_else(|| entity_scope_map.get(&entity.id))
-                        .copied()
-                        .unwrap_or(0);
+            for entity in &file_entities {
+                let scope_idx = entity_inner_scope
+                    .get(&entity.id)
+                    .or_else(|| entity_scope_map.get(&entity.id))
+                    .copied()
+                    .unwrap_or(0);
 
-                    let start_row = entity.start_line.saturating_sub(1).min(refs_by_row.len());
-                    let end_row = entity.end_line.min(refs_by_row.len()).max(start_row);
+                let start_row = entity.start_line.saturating_sub(1).min(refs_by_row.len());
+                let end_row = entity.end_line.min(refs_by_row.len()).max(start_row);
+                if emit_local_binding_log {
                     log_scope_bindings(
                         &mut file_log,
                         &entity.id,
@@ -717,102 +849,120 @@ pub(crate) fn resolve_with_scopes_full(
                         end_row,
                         &descendant_ranges_by_entity,
                     );
-                    let allow_implicit_instance_member_receiver =
-                        allows_implicit_instance_member_receiver(
+                }
+                add_local_bindings_to_consumed_words(
+                    file_consumed_words.entry(entity.id.clone()).or_default(),
+                    scope_idx,
+                    &scopes,
+                );
+                let allow_implicit_instance_member_receiver =
+                    allows_implicit_instance_member_receiver(
+                        file_path,
+                        &entity.entity_type,
+                        &entity.content,
+                    );
+
+                // Filter pre-collected refs to this entity's line range
+                for row_refs in &refs_by_row[start_row..end_row] {
+                    for &ref_idx in row_refs {
+                        let ast_ref = &all_file_refs[ref_idx];
+                        if !entity_owns_ref(entity, ast_ref, &children_by_parent, &entity_spans) {
+                            continue;
+                        }
+                        if row_belongs_to_descendant(
+                            &descendant_ranges_by_entity,
+                            &entity.id,
+                            ast_ref.row,
+                        ) {
+                            continue;
+                        }
+                        // Skip self-name refs (was previously done during collection)
+                        let is_self_ref = match &ast_ref.kind {
+                            AstRefKind::Call { name, .. } => name == &entity.name,
+                            AstRefKind::ScopedCall { .. } => false,
+                            AstRefKind::MethodCall { .. } => false,
+                        };
+                        if is_self_ref {
+                            continue;
+                        }
+
+                        // Languages without per-symbol imports (e.g. Swift, Kotlin)
+                        // allow cross-file resolution for lowercase function names.
+                        let allow_cross_file = config.import_extractor.is_none();
+                        let resolution = resolve_ref(
+                            ast_ref,
+                            scope_idx,
+                            &scopes,
+                            &symbol_table,
+                            &class_members,
+                            &owner_members,
+                            &local_import_table,
+                            &instance_attr_types,
+                            entity_map,
+                            &swift_call_signatures,
                             file_path,
-                            &entity.entity_type,
-                            &entity.content,
+                            &entity.id,
+                            allow_cross_file,
+                            allow_implicit_instance_member_receiver,
+                            &mut lookup_cache,
                         );
 
-                    // Filter pre-collected refs to this entity's line range
-                    for row_refs in &refs_by_row[start_row..end_row] {
-                        for &ref_idx in row_refs {
-                            let ast_ref = &all_file_refs[ref_idx];
-                            if !entity_owns_ref(entity, ast_ref, &children_by_parent, &entity_spans)
-                            {
-                                continue;
-                            }
-                            if row_belongs_to_descendant(
-                                &descendant_ranges_by_entity,
-                                &entity.id,
-                                ast_ref.row,
-                            ) {
-                                continue;
-                            }
-                            // Skip self-name refs (was previously done during collection)
-                            let is_self_ref = match &ast_ref.kind {
-                                AstRefKind::Call { name, .. } => name == &entity.name,
-                                AstRefKind::ScopedCall { .. } => false,
-                                AstRefKind::MethodCall { .. } => false,
-                            };
-                            if is_self_ref {
-                                continue;
-                            }
+                        if let Some((target_id, ref_type, method)) = resolution {
+                            if target_id != entity.id {
+                                let is_parent_child =
+                                    entity.parent_id.as_ref().map_or(false, |pid| {
+                                        pid == &target_id
+                                            || entity_map.get(&target_id).map_or(false, |t| {
+                                                t.parent_id.as_ref() == Some(&entity.id)
+                                            })
+                                    });
 
-                            // Languages without per-symbol imports (e.g. Swift, Kotlin)
-                            // allow cross-file resolution for lowercase function names.
-                            let allow_cross_file = config.import_extractor.is_none();
-                            let resolution = resolve_ref(
-                                ast_ref,
-                                scope_idx,
-                                &scopes,
-                                &symbol_table,
-                                &class_members,
-                                &owner_members,
-                                &local_import_table,
-                                &instance_attr_types,
-                                entity_map,
-                                &swift_call_signatures,
-                                file_path,
-                                &entity.id,
-                                allow_cross_file,
-                                allow_implicit_instance_member_receiver,
-                                &mut lookup_cache,
-                            );
-
-                            if let Some((target_id, ref_type, method)) = resolution {
-                                if target_id != entity.id {
-                                    let is_parent_child =
-                                        entity.parent_id.as_ref().map_or(false, |pid| {
-                                            pid == &target_id
-                                                || entity_map.get(&target_id).map_or(false, |t| {
-                                                    t.parent_id.as_ref() == Some(&entity.id)
-                                                })
-                                        });
-
-                                    if !is_parent_child {
-                                        file_edges.push((
-                                            entity.id.clone(),
-                                            target_id.clone(),
-                                            ref_type,
-                                        ));
-                                        file_log.push(ResolutionEntry {
-                                            from_entity: entity.id.clone(),
-                                            reference: ref_description(ast_ref),
-                                            resolved_to: Some(target_id),
-                                            method,
-                                        });
-                                    }
+                                if !is_parent_child {
+                                    let reference = ref_description(ast_ref);
+                                    file_edges.push((
+                                        entity.id.clone(),
+                                        target_id.clone(),
+                                        ref_type,
+                                    ));
+                                    add_scope_reference_words(
+                                        file_consumed_words.entry(entity.id.clone()).or_default(),
+                                        &reference,
+                                    );
+                                    file_log.push(ResolutionEntry {
+                                        from_entity: entity.id.clone(),
+                                        reference,
+                                        resolved_to: Some(target_id),
+                                        method,
+                                    });
                                 }
-                            } else {
-                                file_log.push(ResolutionEntry {
-                                    from_entity: entity.id.clone(),
-                                    reference: ref_description(ast_ref),
-                                    resolved_to: None,
-                                    method: "unresolved",
-                                });
                             }
+                        } else {
+                            let reference = ref_description(ast_ref);
+                            add_scope_reference_words(
+                                file_consumed_words.entry(entity.id.clone()).or_default(),
+                                &reference,
+                            );
+                            file_log.push(ResolutionEntry {
+                                from_entity: entity.id.clone(),
+                                reference,
+                                resolved_to: None,
+                                method: "unresolved",
+                            });
                         }
                     }
                 }
+            }
 
-                Some((file_edges, file_log))
-            })
-            .collect();
+            Some((file_edges, file_log, file_consumed_words))
+        })
+        .collect();
 
-    for (file_edges, file_log) in per_file_results {
+    for (file_edges, file_log, file_consumed_words) in per_file_results {
         all_edges.extend(file_edges);
         log.extend(file_log);
+        for (entity_id, words) in file_consumed_words {
+            consumed_words.entry(entity_id).or_default().extend(words);
+        }
     }
 
     // Deduplicate edges
@@ -829,9 +979,10 @@ pub(crate) fn resolve_with_scopes_full(
     };
     let all_edges = deduped_edges;
 
-    ScopeResult {
+    ScopeResultFull {
         edges: all_edges,
         resolution_log: log,
+        consumed_words,
     }
 }
 
@@ -873,6 +1024,39 @@ fn format_argument_labels(argument_labels: Option<&[Option<String>]>) -> String 
                 .join(", ")
         })
         .unwrap_or_default()
+}
+
+fn add_scope_reference_words(words: &mut HashSet<String>, reference: &str) {
+    let reference = reference.strip_suffix("()").unwrap_or(reference);
+    let reference = reference
+        .split_once('(')
+        .map_or(reference, |(name, _)| name);
+    if let Some((receiver, member)) = reference.rsplit_once('.') {
+        if !receiver.is_empty() {
+            words.insert(receiver.to_string());
+        }
+        if !member.is_empty() {
+            words.insert(member.to_string());
+        }
+    } else if reference.contains("::") {
+        for part in reference.split("::").filter(|part| !part.is_empty()) {
+            words.insert(part.to_string());
+        }
+    } else if !reference.is_empty() {
+        words.insert(reference.to_string());
+    }
+}
+
+fn add_local_bindings_to_consumed_words(
+    words: &mut HashSet<String>,
+    start_scope: usize,
+    scopes: &[Scope],
+) {
+    let mut idx = Some(start_scope);
+    while let Some(scope_idx) = idx {
+        words.extend(scopes[scope_idx].bindings.iter().cloned());
+        idx = scopes[scope_idx].parent;
+    }
 }
 
 fn log_scope_bindings(
@@ -1529,56 +1713,79 @@ fn scan_ts_var_declaration(
         }
     }
 
-    // Swift: property_declaration has "name" and "value" fields directly,
-    // or "pattern" child with simple_identifier for the name
-    // e.g. `let dog = Dog(name: name)`
     if node.kind() == "property_declaration" {
-        // Try "name" field first (Swift uses this), then pattern > simple_identifier
-        let var_name_opt = node
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source).ok());
-        let var_name = if let Some(name) = var_name_opt {
-            name.to_string()
-        } else {
-            // Look for pattern > simple_identifier (Swift)
-            let mut c = node.walk();
-            let mut found = String::new();
-            for ch in node.named_children(&mut c) {
-                if ch.kind() == "pattern" {
-                    if let Some(id) = ch.named_child(0) {
-                        if id.kind() == "simple_identifier" || id.kind() == "identifier" {
-                            if let Ok(name) = id.utf8_text(source) {
-                                found = name.to_string();
-                            }
+        let var_names = swift_property_declaration_names(node, source);
+
+        if !var_names.is_empty() {
+            if let Some(name_nodes) = swift_property_declaration_name_nodes(node) {
+                for (idx, var_name) in var_names.iter().enumerate() {
+                    let binding_row = name_nodes
+                        .get(idx)
+                        .map(|name_node| name_node.start_position().row)
+                        .unwrap_or_else(|| node.start_position().row);
+                    record_binding(scopes, scope_idx, var_name, binding_row);
+                }
+
+                let type_names: Vec<Option<String>> = name_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, name_node)| {
+                        swift_property_type_for_name(node, *name_node, idx, source)
+                    })
+                    .collect();
+                for (idx, name_node) in name_nodes.iter().enumerate() {
+                    let Some(var_name) = var_names.get(idx) else {
+                        continue;
+                    };
+                    let type_name =
+                        type_names
+                            .get(idx)
+                            .and_then(|name| name.clone())
+                            .or_else(|| {
+                                if type_names[..idx].iter().any(Option::is_some) {
+                                    None
+                                } else {
+                                    type_names
+                                        .iter()
+                                        .skip(idx + 1)
+                                        .find_map(|name| name.clone())
+                                }
+                            });
+                    if let Some(type_name) = type_name {
+                        if !type_name.is_empty()
+                            && type_name.chars().next().map_or(false, |c| c.is_uppercase())
+                        {
+                            scopes[scope_idx].types.insert(var_name.clone(), type_name);
+                            continue;
                         }
                     }
-                    break;
+                    if let Some(value) =
+                        swift_property_value_for_name(node, *name_node, idx, source)
+                    {
+                        record_type_from_rhs(value, var_name, scope_idx, scopes, source);
+                    }
                 }
-            }
-            found
-        };
+            } else if let Some(var_name) = var_names.first() {
+                record_binding(scopes, scope_idx, var_name, node.start_position().row);
 
-        if !var_name.is_empty() {
-            // Check for type annotation
-            if let Some(type_ann) = node.child_by_field_name("type") {
-                let type_text = extract_base_type(type_ann, source);
-                if !type_text.is_empty()
-                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                {
-                    scopes[scope_idx].types.insert(var_name.clone(), type_text);
-                    return;
+                if let Some(type_ann) = node.child_by_field_name("type") {
+                    let type_text = extract_base_type(type_ann, source);
+                    if !type_text.is_empty()
+                        && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                    {
+                        scopes[scope_idx].types.insert(var_name.clone(), type_text);
+                        return;
+                    }
                 }
-            }
-            // Check RHS value
-            if let Some(value) = node.child_by_field_name("value") {
-                record_type_from_rhs(value, &var_name, scope_idx, scopes, source);
-            } else {
-                // Swift/Kotlin: value might be a sibling call_expression, not a field
-                let mut c = node.walk();
-                for ch in node.named_children(&mut c) {
-                    if ch.kind() == "call_expression" || ch.kind() == "new_expression" {
-                        record_type_from_rhs(ch, &var_name, scope_idx, scopes, source);
-                        break;
+                if let Some(value) = node.child_by_field_name("value") {
+                    record_type_from_rhs(value, var_name, scope_idx, scopes, source);
+                } else {
+                    let mut c = node.walk();
+                    for ch in node.named_children(&mut c) {
+                        if ch.kind() == "call_expression" || ch.kind() == "new_expression" {
+                            record_type_from_rhs(ch, var_name, scope_idx, scopes, source);
+                            break;
+                        }
                     }
                 }
             }
@@ -1623,6 +1830,152 @@ fn scan_ts_var_declaration(
             }
         }
     }
+}
+
+fn swift_property_declaration_names(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    for index in 0..node.child_count() {
+        if node.field_name_for_child(index as u32) == Some("name") {
+            if let Some(child) = node.child(index as u32) {
+                if let Ok(name) = child.utf8_text(source) {
+                    if !name.is_empty() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if !names.is_empty() {
+        return names;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "pattern" {
+            continue;
+        }
+        if let Some(id) = child.named_child(0) {
+            if id.kind() == "simple_identifier" || id.kind() == "identifier" {
+                if let Ok(name) = id.utf8_text(source) {
+                    if !name.is_empty() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    names
+}
+
+fn swift_property_declaration_name_nodes<'a>(
+    node: tree_sitter::Node<'a>,
+) -> Option<Vec<tree_sitter::Node<'a>>> {
+    let mut nodes = Vec::new();
+    for index in 0..node.child_count() {
+        if node.field_name_for_child(index as u32) == Some("name") {
+            if let Some(child) = node.child(index as u32) {
+                nodes.push(child);
+            }
+        }
+    }
+    if nodes.is_empty() {
+        None
+    } else {
+        Some(nodes)
+    }
+}
+
+fn swift_property_value_for_name<'a>(
+    node: tree_sitter::Node<'a>,
+    name_node: tree_sitter::Node<'a>,
+    name_index: usize,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'a>> {
+    let segment_end = swift_property_segment_end_for_name(node, name_node, name_index);
+
+    for child_index in 0..node.child_count() {
+        let Some(child) = node.child(child_index as u32) else {
+            continue;
+        };
+        if child.start_byte() < name_node.end_byte() || child.start_byte() >= segment_end {
+            continue;
+        }
+        let field_name = node.field_name_for_child(child_index as u32);
+        if matches!(field_name, Some("value") | Some("computed_value"))
+            || child.kind() == "call_expression"
+            || child.kind() == "new_expression"
+        {
+            return Some(child);
+        }
+    }
+
+    let segment = source
+        .get(name_node.end_byte()..segment_end)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or("");
+    if segment.contains('=') {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() >= name_node.end_byte()
+                && child.start_byte() < segment_end
+                && (child.kind() == "call_expression" || child.kind() == "new_expression")
+            {
+                return Some(child);
+            }
+        }
+    }
+
+    None
+}
+
+fn swift_property_type_for_name(
+    node: tree_sitter::Node,
+    name_node: tree_sitter::Node,
+    name_index: usize,
+    source: &[u8],
+) -> Option<String> {
+    let segment_end = swift_property_segment_end_for_name(node, name_node, name_index);
+    for child_index in 0..node.child_count() {
+        let Some(child) = node.child(child_index as u32) else {
+            continue;
+        };
+        if child.start_byte() < name_node.end_byte() || child.start_byte() >= segment_end {
+            continue;
+        }
+        let field_name = node.field_name_for_child(child_index as u32);
+        if field_name == Some("type") || child.kind() == "type_annotation" {
+            let type_text = extract_base_type(child, source);
+            if !type_text.is_empty() {
+                return Some(type_text);
+            }
+        }
+    }
+    None
+}
+
+fn swift_property_segment_end_for_name(
+    node: tree_sitter::Node,
+    name_node: tree_sitter::Node,
+    name_index: usize,
+) -> usize {
+    let name_nodes = swift_property_declaration_name_nodes(node).unwrap_or_default();
+    let next_name_start = name_nodes.get(name_index + 1).map(|next| next.start_byte());
+    let mut segment_end = next_name_start.unwrap_or_else(|| node.end_byte());
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == ","
+            && child.start_byte() >= name_node.end_byte()
+            && next_name_start.map_or(true, |next| child.start_byte() < next)
+        {
+            segment_end = child.start_byte();
+            break;
+        }
+    }
+
+    segment_end
 }
 
 /// Rust: `let x: Type = ...` or `let x = Foo::new()`
