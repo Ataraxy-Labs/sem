@@ -60,12 +60,18 @@ struct CachedGraph {
     entities: Arc<Vec<SemanticEntity>>,
 }
 
+struct CachedTopology {
+    manifest_hash: u64,
+    graph: Arc<EntityGraph>,
+}
+
 #[derive(Clone)]
 pub struct SemServer {
     context: Arc<Mutex<Option<RepoContext>>>,
     registry: Arc<ParserRegistry>,
     entity_cache: Arc<Mutex<EntityCache>>,
     graph_cache: Arc<Mutex<Option<CachedGraph>>>,
+    topology_cache: Arc<Mutex<Option<CachedTopology>>>,
     _tool_router: ToolRouter<Self>,
 }
 
@@ -75,7 +81,11 @@ impl SemServer {
         if let Some(fp) = file_path_hint {
             let p = Path::new(fp);
             if p.is_absolute() {
-                let search_dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+                let search_dir = if p.is_dir() {
+                    p
+                } else {
+                    p.parent().unwrap_or(p)
+                };
                 if let Ok(bridge) = GitBridge::open(search_dir) {
                     return Ok(bridge.repo_root().to_path_buf());
                 }
@@ -97,13 +107,11 @@ impl SemServer {
             }
         }
 
-        Err(
-            "Cannot find git repository. Either:\n\
+        Err("Cannot find git repository. Either:\n\
              - Pass an absolute file path\n\
              - Set SEM_REPO env var to the repo root\n\
              - Run sem-mcp from within a git repo"
-                .to_string(),
-        )
+            .to_string())
     }
 
     fn resolve_file_path(repo_root: &Path, file_path: &str) -> (String, PathBuf) {
@@ -251,11 +259,7 @@ impl SemServer {
         Ok(entities)
     }
 
-    async fn cached_extract_entities(
-        &self,
-        content: &str,
-        rel_path: &str,
-    ) -> Vec<SemanticEntity> {
+    async fn cached_extract_entities(&self, content: &str, rel_path: &str) -> Vec<SemanticEntity> {
         let hash = content_hash_u64(content);
         let key = (rel_path.to_string(), hash);
 
@@ -348,6 +352,11 @@ impl SemServer {
                     graph: graph.clone(),
                     entities: entities.clone(),
                 });
+                let mut topology_guard = self.topology_cache.lock().await;
+                *topology_guard = Some(CachedTopology {
+                    manifest_hash,
+                    graph: graph.clone(),
+                });
                 return (graph, entities);
             }
 
@@ -369,6 +378,8 @@ impl SemServer {
                     &graph,
                     &entities,
                     metadata.repaired_clean_entity_ids,
+                    &metadata.recomputed_edge_source_ids,
+                    &metadata.deleted_entity_ids,
                 );
 
                 let graph = Arc::new(graph);
@@ -378,6 +389,11 @@ impl SemServer {
                     manifest_hash,
                     graph: graph.clone(),
                     entities: entities.clone(),
+                });
+                let mut topology_guard = self.topology_cache.lock().await;
+                *topology_guard = Some(CachedTopology {
+                    manifest_hash,
+                    graph: graph.clone(),
                 });
                 return (graph, entities);
             }
@@ -403,8 +419,56 @@ impl SemServer {
                 entities: entities.clone(),
             });
         }
+        {
+            let mut guard = self.topology_cache.lock().await;
+            *guard = Some(CachedTopology {
+                manifest_hash,
+                graph: graph.clone(),
+            });
+        }
 
         (graph, entities)
+    }
+
+    async fn get_or_build_graph_topology(
+        &self,
+        repo_root: &Path,
+        file_paths: &[String],
+    ) -> Arc<EntityGraph> {
+        let manifest_hash = cache::compute_manifest_hash(repo_root, file_paths).unwrap_or(0);
+
+        {
+            let guard = self.graph_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                if cached.manifest_hash == manifest_hash {
+                    return cached.graph.clone();
+                }
+            }
+        }
+
+        {
+            let guard = self.topology_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                if cached.manifest_hash == manifest_hash {
+                    return cached.graph.clone();
+                }
+            }
+        }
+
+        if let Ok(disk) = cache::DiskCache::open(repo_root) {
+            if let Some(graph) = disk.load_graph_topology(repo_root, file_paths) {
+                let graph = Arc::new(graph);
+                let mut guard = self.topology_cache.lock().await;
+                *guard = Some(CachedTopology {
+                    manifest_hash,
+                    graph: graph.clone(),
+                });
+                return graph;
+            }
+        }
+
+        let (graph, _) = self.get_or_build_graph(repo_root, file_paths).await;
+        graph
     }
 }
 
@@ -418,13 +482,16 @@ impl SemServer {
                 std::num::NonZeroUsize::new(500).unwrap(),
             ))),
             graph_cache: Arc::new(Mutex::new(None)),
+            topology_cache: Arc::new(Mutex::new(None)),
             _tool_router: Self::tool_router(),
         }
     }
 
     // ── Tool 1: Entities ──
 
-    #[tool(description = "List semantic entities (functions, classes, etc.) under a file or directory path. Defaults to '.'.")]
+    #[tool(
+        description = "List semantic entities (functions, classes, etc.) under a file or directory path. Defaults to '.'."
+    )]
     async fn sem_entities(
         &self,
         Parameters(params): Parameters<EntitiesParams>,
@@ -492,7 +559,9 @@ impl SemServer {
 
     // ── Tool 2: Diff ──
 
-    #[tool(description = "Semantic diff between two refs: shows entity-level changes (added, modified, deleted, renamed) instead of line-level diffs")]
+    #[tool(
+        description = "Semantic diff between two refs: shows entity-level changes (added, modified, deleted, renamed) instead of line-level diffs"
+    )]
     async fn sem_diff(
         &self,
         Parameters(params): Parameters<DiffParams>,
@@ -529,8 +598,7 @@ impl SemServer {
         };
 
         let binary_changes = collect_binary_file_changes(&file_changes);
-        let diff_result =
-            compute_semantic_diff(&file_changes, &self.registry, None, None);
+        let diff_result = compute_semantic_diff(&file_changes, &self.registry, None, None);
 
         Ok(CallToolResult::success(vec![Content::text(
             format_diff_json_with_binary_changes(&diff_result, &binary_changes),
@@ -539,7 +607,9 @@ impl SemServer {
 
     // ── Tool 3: Blame ──
 
-    #[tool(description = "Entity-level git blame: for each entity in a file, shows who last modified it, when, and why")]
+    #[tool(
+        description = "Entity-level git blame: for each entity in a file, shows who last modified it, when, and why"
+    )]
     async fn sem_blame(
         &self,
         Parameters(params): Parameters<BlameParams>,
@@ -561,10 +631,7 @@ impl SemServer {
             }
         }
 
-        let blame = match ctx
-            .git
-            .blame_file_porcelain(Path::new(&rel_path))
-        {
+        let blame = match ctx.git.blame_file_porcelain(Path::new(&rel_path)) {
             Ok(blame) => blame,
             Err(err) => return Ok(tool_error(format!("Cannot blame {}: {}", rel_path, err))),
         };
@@ -603,9 +670,7 @@ impl SemServer {
                     } else {
                         info.author.clone()
                     },
-                    info.author_time
-                        .map(chrono_lite_format)
-                        .unwrap_or_default(),
+                    info.author_time.map(chrono_lite_format).unwrap_or_default(),
                     info.commit_sha.clone(),
                     info.summary.clone(),
                 ),
@@ -635,7 +700,9 @@ impl SemServer {
 
     // ── Tool 4: Impact ──
 
-    #[tool(description = "Unified entity analysis: dependencies, dependents, transitive impact, and affected tests. Use 'mode' to narrow: 'all' (default), 'deps', 'dependents', 'tests'.")]
+    #[tool(
+        description = "Unified entity analysis: dependencies, dependents, transitive impact, and affected tests. Use 'mode' to narrow: 'all' (default), 'deps', 'dependents', 'tests'."
+    )]
     async fn sem_impact(
         &self,
         Parameters(params): Parameters<ImpactAnalysisParams>,
@@ -656,13 +723,6 @@ impl SemServer {
             Ok(file_paths) => file_paths,
             Err(err) => return Ok(tool_error(err)),
         };
-        let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
-
-        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
-            Ok(entity_id) => entity_id,
-            Err(err) => return Ok(tool_error(err)),
-        };
-
         let mode = params.mode.as_deref().unwrap_or("all");
         let valid_modes = ["all", "deps", "dependents", "tests"];
         if !valid_modes.contains(&mode) {
@@ -673,47 +733,79 @@ impl SemServer {
             )));
         }
 
+        if matches!(mode, "deps" | "dependents") {
+            let graph = self
+                .get_or_build_graph_topology(&ctx.repo_root, &file_paths)
+                .await;
+            let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)
+            {
+                Ok(entity_id) => entity_id,
+                Err(err) => return Ok(tool_error(err)),
+            };
+
+            let output = match mode {
+                "deps" => {
+                    let deps = graph.get_dependencies(entity_id);
+                    let result: Vec<serde_json::Value> = deps
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "name": d.name, "type": d.entity_type,
+                                "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "entity": params.entity_name,
+                        "file": rel_path,
+                        "mode": "deps",
+                        "dependencies": result,
+                    })
+                }
+                "dependents" => {
+                    let deps = graph.get_dependents(entity_id);
+                    let result: Vec<serde_json::Value> = deps
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "name": d.name, "type": d.entity_type,
+                                "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "entity": params.entity_name,
+                        "file": rel_path,
+                        "mode": "dependents",
+                        "dependents": result,
+                    })
+                }
+                _ => unreachable!(),
+            };
+
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&output).unwrap(),
+            )]));
+        }
+
+        let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
+
+        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
+            Ok(entity_id) => entity_id,
+            Err(err) => return Ok(tool_error(err)),
+        };
+
         let output = match mode {
-            "deps" => {
-                let deps = graph.get_dependencies(entity_id);
-                let result: Vec<serde_json::Value> = deps
-                    .iter()
-                    .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    }))
-                    .collect();
-                serde_json::json!({
-                    "entity": params.entity_name,
-                    "file": rel_path,
-                    "mode": "deps",
-                    "dependencies": result,
-                })
-            }
-            "dependents" => {
-                let deps = graph.get_dependents(entity_id);
-                let result: Vec<serde_json::Value> = deps
-                    .iter()
-                    .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    }))
-                    .collect();
-                serde_json::json!({
-                    "entity": params.entity_name,
-                    "file": rel_path,
-                    "mode": "dependents",
-                    "dependents": result,
-                })
-            }
             "tests" => {
                 let tests = graph.test_impact(entity_id, &all_entities);
                 let result: Vec<serde_json::Value> = tests
                     .iter()
-                    .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    }))
+                    .map(|d| {
+                        serde_json::json!({
+                            "name": d.name, "type": d.entity_type,
+                            "file": d.file_path, "lines": [d.start_line, d.end_line],
+                        })
+                    })
                     .collect();
                 serde_json::json!({
                     "entity": params.entity_name,
@@ -723,6 +815,7 @@ impl SemServer {
                     "tests": result,
                 })
             }
+            "deps" | "dependents" => unreachable!(),
             _ => {
                 // "all" mode: everything
                 let deps = graph.get_dependencies(entity_id);
@@ -730,12 +823,17 @@ impl SemServer {
                 let impact = graph.impact_analysis(entity_id);
                 let tests = graph.test_impact(entity_id, &all_entities);
 
-                let map_entities = |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
-                    list.iter().map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    })).collect()
-                };
+                let map_entities =
+                    |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
+                        list.iter()
+                            .map(|d| {
+                                serde_json::json!({
+                                    "name": d.name, "type": d.entity_type,
+                                    "file": d.file_path, "lines": [d.start_line, d.end_line],
+                                })
+                            })
+                            .collect()
+                    };
 
                 serde_json::json!({
                     "entity": params.entity_name,
@@ -759,7 +857,9 @@ impl SemServer {
 
     // ── Tool 5: Log ──
 
-    #[tool(description = "Entity evolution history: trace how a specific entity changed across git commits, distinguishing logic changes from cosmetic ones")]
+    #[tool(
+        description = "Entity evolution history: trace how a specific entity changed across git commits, distinguishing logic changes from cosmetic ones"
+    )]
     async fn sem_log(
         &self,
         Parameters(params): Parameters<LogParams>,
@@ -864,7 +964,8 @@ impl SemServer {
         };
 
         let entity_type = seed.entity.entity_type.clone();
-        let mut entries = mcp_trace_back_to_origin(&ctx.git, &self.registry, &commits, seed.clone());
+        let mut entries =
+            mcp_trace_back_to_origin(&ctx.git, &self.registry, &commits, seed.clone());
         entries.extend(mcp_trace_forward_from_seed(
             &ctx.git,
             &self.registry,
@@ -890,7 +991,9 @@ impl SemServer {
 
     // ── Tool 6: Context ──
 
-    #[tool(description = "Pack optimal entity context into a token budget. Priority: target entity > direct dependencies > direct dependents > transitive dependencies > transitive dependents.")]
+    #[tool(
+        description = "Pack optimal entity context into a token budget. Priority: target entity > direct dependencies > direct dependents > transitive dependencies > transitive dependents."
+    )]
     async fn sem_context(
         &self,
         Parameters(params): Parameters<ContextParams>,
@@ -926,7 +1029,8 @@ impl SemServer {
             budget,
         );
 
-        let result: Vec<serde_json::Value> = context_result.entries
+        let result: Vec<serde_json::Value> = context_result
+            .entries
             .iter()
             .map(|e| {
                 serde_json::json!({
@@ -1016,7 +1120,9 @@ mod tests {
         let mut commits = if git
             .get_head_sha()
             .ok()
-            .and_then(|head| mcp_entity_by_name_at_ref(&git, &registry, &head, file_path, entity_name))
+            .and_then(|head| {
+                mcp_entity_by_name_at_ref(&git, &registry, &head, file_path, entity_name)
+            })
             .is_some()
         {
             git.get_file_commits_follow_renames(file_path, 0)
@@ -1058,12 +1164,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "sem-mcp-{}-{}-{}",
-            name,
-            std::process::id(),
-            nanos
-        ));
+        let root =
+            std::env::temp_dir().join(format!("sem-mcp-{}-{}-{}", name, std::process::id(), nanos));
         std::fs::create_dir_all(&root).unwrap();
         git2::Repository::init(&root).unwrap();
         root
@@ -1116,8 +1218,8 @@ mod tests {
     #[test]
     fn entity_lookup_candidate_list_is_bounded() {
         let candidates = [
-            "a.py", "b.py", "c.py", "d.py", "e.py", "f.py", "g.py", "h.py", "i.py", "j.py",
-            "k.py", "l.py",
+            "a.py", "b.py", "c.py", "d.py", "e.py", "f.py", "g.py", "h.py", "i.py", "j.py", "k.py",
+            "l.py",
         ];
 
         assert_eq!(
@@ -1136,10 +1238,8 @@ mod tests {
 
     #[test]
     fn find_supported_files_returns_walk_errors() {
-        let missing_root = std::env::temp_dir().join(format!(
-            "sem-mcp-missing-root-{}",
-            std::process::id()
-        ));
+        let missing_root =
+            std::env::temp_dir().join(format!("sem-mcp-missing-root-{}", std::process::id()));
         let registry = ParserRegistry::new();
 
         let err = SemServer::find_supported_files(&missing_root, &registry).unwrap_err();
@@ -1235,7 +1335,11 @@ mod tests {
         fs::write(root.join("src/app.js"), "export function app() {}\n").unwrap();
         fs::write(root.join("src/blob.weird"), b"abc\0def").unwrap();
         fs::write(root.join("src/icon.png"), b"\x89PNG\r\n").unwrap();
-        fs::write(root.join("dist/generated.js"), "export function generated() {}\n").unwrap();
+        fs::write(
+            root.join("dist/generated.js"),
+            "export function generated() {}\n",
+        )
+        .unwrap();
 
         let registry = create_default_registry();
         let files = SemServer::find_supported_files(&root, &registry).unwrap();
@@ -1419,7 +1523,11 @@ mod tests {
         let root = temp_git_repo("wrong-impact-file");
         let file_path = root.join("notes.txt");
         std::fs::write(&file_path, "known_entity\n").unwrap();
-        std::fs::write(root.join("sample.py"), "def known_entity():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("sample.py"),
+            "def known_entity():\n    return 1\n",
+        )
+        .unwrap();
         let server = SemServer::new();
 
         let result = server
@@ -1441,7 +1549,11 @@ mod tests {
     #[tokio::test]
     async fn sem_impact_normalizes_relative_file_path_before_entity_lookup() {
         let root = temp_git_repo("normalized-impact-file");
-        std::fs::write(root.join("sample.py"), "def known_entity():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("sample.py"),
+            "def known_entity():\n    return 1\n",
+        )
+        .unwrap();
         let server = server_for_repo(&root).await;
 
         let result = server
@@ -1462,7 +1574,11 @@ mod tests {
         let root = temp_git_repo("wrong-context-file");
         let file_path = root.join("notes.txt");
         std::fs::write(&file_path, "known_entity\n").unwrap();
-        std::fs::write(root.join("sample.py"), "def known_entity():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("sample.py"),
+            "def known_entity():\n    return 1\n",
+        )
+        .unwrap();
         let server = SemServer::new();
 
         let result = server
@@ -1556,7 +1672,9 @@ fn format_entity_lookup_candidates(candidates: &[&str]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join(", ");
-    let remaining = candidates.len().saturating_sub(ENTITY_LOOKUP_CANDIDATE_LIMIT);
+    let remaining = candidates
+        .len()
+        .saturating_sub(ENTITY_LOOKUP_CANDIDATE_LIMIT);
 
     if remaining == 0 {
         shown
@@ -1621,17 +1739,15 @@ fn normalize_relative_path(path: &Path) -> PathBuf {
     for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                match normalized.components().next_back() {
-                    Some(std::path::Component::Normal(_)) => {
-                        normalized.pop();
-                    }
-                    Some(std::path::Component::ParentDir) | None => normalized.push(".."),
-                    Some(std::path::Component::RootDir)
-                    | Some(std::path::Component::Prefix(_))
-                    | Some(std::path::Component::CurDir) => {}
+            std::path::Component::ParentDir => match normalized.components().next_back() {
+                Some(std::path::Component::Normal(_)) => {
+                    normalized.pop();
                 }
-            }
+                Some(std::path::Component::ParentDir) | None => normalized.push(".."),
+                Some(std::path::Component::RootDir)
+                | Some(std::path::Component::Prefix(_))
+                | Some(std::path::Component::CurDir) => {}
+            },
             std::path::Component::Normal(part) => normalized.push(part),
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 normalized.push(component.as_os_str())
@@ -1663,13 +1779,19 @@ fn mcp_find_seed_occurrence(
     for (index, commit) in commits.iter().enumerate().rev() {
         let paths = match file_path {
             Some(path) => vec![path.to_string()],
-            None => git.get_commit_changed_files(&commit.sha).unwrap_or_default(),
+            None => git
+                .get_commit_changed_files(&commit.sha)
+                .unwrap_or_default(),
         };
         for path in paths {
             if let Some(entity) =
                 mcp_entity_by_name_at_ref(git, registry, &commit.sha, &path, entity_name)
             {
-                return Some(McpLogOccurrence { commit_index: index, file_path: path, entity });
+                return Some(McpLogOccurrence {
+                    commit_index: index,
+                    file_path: path,
+                    entity,
+                });
             }
         }
     }
@@ -1687,7 +1809,9 @@ fn mcp_trace_back_to_origin(
     for child_index in (1..=current.commit_index).rev() {
         let child_commit = &commits[child_index];
         let parent_commit = &commits[child_index - 1];
-        let changed_paths = git.get_commit_changed_files(&child_commit.sha).unwrap_or_default();
+        let changed_paths = git
+            .get_commit_changed_files(&child_commit.sha)
+            .unwrap_or_default();
         let previous = mcp_find_related_entity_at_ref(
             git,
             registry,
@@ -1705,7 +1829,10 @@ fn mcp_trace_back_to_origin(
         if let Some(entry) = mcp_transition_entry(child_commit, &previous, &current) {
             entries.push(entry);
         }
-        current = McpLogOccurrence { commit_index: child_index - 1, ..previous };
+        current = McpLogOccurrence {
+            commit_index: child_index - 1,
+            ..previous
+        };
     }
     entries.push(mcp_added_entry(&commits[current.commit_index], &current));
     entries.reverse();
@@ -1722,7 +1849,9 @@ fn mcp_trace_forward_from_seed(
     let mut entries = Vec::new();
     for child_index in current.commit_index + 1..commits.len() {
         let child_commit = &commits[child_index];
-        let changed_paths = git.get_commit_changed_files(&child_commit.sha).unwrap_or_default();
+        let changed_paths = git
+            .get_commit_changed_files(&child_commit.sha)
+            .unwrap_or_default();
         let next = mcp_find_related_entity_at_ref(
             git,
             registry,
@@ -1739,7 +1868,10 @@ fn mcp_trace_forward_from_seed(
         if let Some(entry) = mcp_transition_entry(child_commit, &current, &next) {
             entries.push(entry);
         }
-        current = McpLogOccurrence { commit_index: child_index, ..next };
+        current = McpLogOccurrence {
+            commit_index: child_index,
+            ..next
+        };
     }
     entries
 }
@@ -1756,7 +1888,11 @@ fn mcp_find_related_entity_at_ref(
     let paths = mcp_candidate_paths(preferred_file, changed_paths);
     for path in &paths {
         if let Some(entity) = mcp_entity_by_name_at_ref(git, registry, sha, path, entity_name) {
-            return Some(McpLogOccurrence { commit_index: 0, file_path: path.clone(), entity });
+            return Some(McpLogOccurrence {
+                commit_index: 0,
+                file_path: path.clone(),
+                entity,
+            });
         }
     }
     let structural_hash = structural_hash?;
@@ -1764,7 +1900,11 @@ fn mcp_find_related_entity_at_ref(
         if let Some(entity) =
             mcp_entity_by_structural_hash_at_ref(git, registry, sha, path, structural_hash)
         {
-            return Some(McpLogOccurrence { commit_index: 0, file_path: path.clone(), entity });
+            return Some(McpLogOccurrence {
+                commit_index: 0,
+                file_path: path.clone(),
+                entity,
+            });
         }
     }
     None

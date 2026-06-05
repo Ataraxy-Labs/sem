@@ -26,6 +26,34 @@ pub(crate) fn file_count(result: &DiffResult, binary_changes: &[BinaryFileChange
     result.file_count + binary_changes.len()
 }
 
+pub(crate) fn estimated_output_capacity(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    verbose: bool,
+) -> usize {
+    let content_len = if verbose {
+        result
+            .changes
+            .iter()
+            .map(|change| {
+                change.before_content.as_ref().map_or(0, String::len)
+                    + change.after_content.as_ref().map_or(0, String::len)
+            })
+            .sum()
+    } else {
+        0
+    };
+
+    256 + content_len + result.changes.len() * 160 + binary_changes.len() * 96
+}
+
+pub(crate) fn push_line(output: &mut String, line: impl AsRef<str>) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(line.as_ref());
+}
+
 pub(crate) fn orphan_summary_parts(result: &DiffResult) -> Vec<String> {
     let mut added = 0;
     let mut modified = 0;

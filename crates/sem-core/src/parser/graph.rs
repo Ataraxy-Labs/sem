@@ -298,9 +298,11 @@ pub struct EntityGraph {
 }
 
 /// Metadata describing repairs made during an incremental graph build.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IncrementalBuildMetadata {
     pub repaired_clean_entity_ids: bool,
+    pub recomputed_edge_source_ids: Vec<String>,
+    pub deleted_entity_ids: Vec<String>,
 }
 
 /// Minimal entity info stored in the graph.
@@ -319,36 +321,53 @@ pub struct EntityInfo {
 
 #[derive(Debug)]
 struct LineReferenceIndex {
-    words: Vec<String>,
-    dot_chains: Vec<(String, String)>,
-    call_words: HashSet<String>,
-    import_words: HashSet<String>,
+    words: Vec<IndexedWordRef>,
+    dot_chains: Vec<(u32, u32)>,
 }
 
 #[derive(Debug)]
 struct FileReferenceIndex {
-    lines: Vec<LineReferenceIndex>,
+    tokens: Vec<String>,
+    token_ids: HashMap<String, u32>,
+    lines: Vec<Option<LineReferenceIndex>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedWordRef {
+    token_id: u32,
+    flags: u8,
+}
+
+impl IndexedWordRef {
+    const CALL: u8 = 0b01;
+    const IMPORT: u8 = 0b10;
 }
 
 impl FileReferenceIndex {
     fn from_content(content: &str) -> Self {
         let stripped = strip_comments_and_strings(content);
+        let mut index = Self {
+            tokens: Vec::new(),
+            token_ids: HashMap::new(),
+            lines: Vec::new(),
+        };
         let lines = stripped
             .lines()
-            .map(LineReferenceIndex::from_stripped_line)
+            .map(|line| LineReferenceIndex::from_stripped_line(line, &mut index))
             .collect();
-        Self { lines }
+        index.lines = lines;
+        index
     }
 
     fn dot_chains_in_ranges(&self, ranges: &[(usize, usize)]) -> Vec<(&str, &str)> {
         let mut chains = Vec::new();
-        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        let mut seen: HashSet<(u32, u32)> = HashSet::new();
         for &(start_line, end_line) in ranges {
             for line in self.line_range(start_line, end_line) {
                 for (receiver, member) in &line.dot_chains {
-                    let pair = (receiver.as_str(), member.as_str());
+                    let pair = (*receiver, *member);
                     if seen.insert(pair) {
-                        chains.push(pair);
+                        chains.push((self.token(*receiver), self.token(*member)));
                     }
                 }
             }
@@ -362,35 +381,34 @@ impl FileReferenceIndex {
         own_name: &str,
     ) -> Vec<(&str, RefType)> {
         let mut refs = Vec::new();
-        let mut seen: HashMap<&str, (bool, bool)> = HashMap::new();
+        let mut seen: HashMap<u32, u8> = HashMap::new();
         for &(start_line, end_line) in ranges {
             for line in self.line_range(start_line, end_line) {
                 for word in &line.words {
-                    let word = word.as_str();
-                    if word == own_name {
+                    let word_text = self.token(word.token_id);
+                    if word_text == own_name {
                         continue;
                     }
-                    let first_seen = !seen.contains_key(word);
-                    let flags = seen.entry(word).or_insert((false, false));
-                    flags.0 |= line.call_words.contains(word);
-                    flags.1 |= line.import_words.contains(word);
+                    let first_seen = !seen.contains_key(&word.token_id);
+                    let flags = seen.entry(word.token_id).or_insert(0);
+                    *flags |= word.flags;
                     if first_seen {
-                        refs.push(word);
+                        refs.push(word.token_id);
                     }
                 }
             }
         }
         refs.into_iter()
-            .map(|word| {
-                let (has_call, has_import) = seen.get(word).copied().unwrap_or_default();
-                let ref_type = if has_call {
+            .map(|token_id| {
+                let flags = seen.get(&token_id).copied().unwrap_or_default();
+                let ref_type = if flags & IndexedWordRef::CALL != 0 {
                     RefType::Calls
-                } else if has_import {
+                } else if flags & IndexedWordRef::IMPORT != 0 {
                     RefType::Imports
                 } else {
                     RefType::TypeRef
                 };
-                (word, ref_type)
+                (self.token(token_id), ref_type)
             })
             .collect()
     }
@@ -402,16 +420,31 @@ impl FileReferenceIndex {
     ) -> impl Iterator<Item = &LineReferenceIndex> {
         let start = start_line.saturating_sub(1).min(self.lines.len());
         let end = end_line.min(self.lines.len()).max(start);
-        self.lines[start..end].iter()
+        self.lines[start..end].iter().filter_map(Option::as_ref)
+    }
+
+    fn intern(&mut self, token: &str) -> u32 {
+        if let Some(id) = self.token_ids.get(token) {
+            return *id;
+        }
+        let id = self.tokens.len() as u32;
+        self.tokens.push(token.to_string());
+        self.token_ids.insert(token.to_string(), id);
+        id
+    }
+
+    fn token(&self, token_id: u32) -> &str {
+        self.tokens
+            .get(token_id as usize)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 }
 
 impl LineReferenceIndex {
-    fn from_stripped_line(line: &str) -> Self {
+    fn from_stripped_line(line: &str, file_index: &mut FileReferenceIndex) -> Option<Self> {
         let mut words = Vec::new();
-        let mut seen_words = HashSet::new();
-        let mut call_words = HashSet::new();
-        let mut import_words = HashSet::new();
+        let mut seen_words: HashSet<u32> = HashSet::new();
         let import_like = {
             let trimmed = line.trim();
             trimmed.starts_with("import ")
@@ -424,28 +457,34 @@ impl LineReferenceIndex {
             if !is_reference_word(word) {
                 continue;
             }
-            if seen_words.insert(word) {
-                words.push(word.to_string());
-            }
+            let token_id = file_index.intern(word);
+            let mut flags = 0;
             if line.as_bytes().get(end_byte) == Some(&b'(') {
-                call_words.insert(word.to_string());
+                flags |= IndexedWordRef::CALL;
             }
             if import_like {
-                import_words.insert(word.to_string());
+                flags |= IndexedWordRef::IMPORT;
+            }
+            if seen_words.insert(token_id) {
+                words.push(IndexedWordRef { token_id, flags });
+            } else if let Some(indexed) = words
+                .iter_mut()
+                .find(|indexed| indexed.token_id == token_id)
+            {
+                indexed.flags |= flags;
             }
         }
 
-        let dot_chains = extract_dot_chains(line)
+        let dot_chains: Vec<(u32, u32)> = extract_dot_chains(line)
             .into_iter()
-            .map(|(receiver, member)| (receiver.to_string(), member.to_string()))
+            .map(|(receiver, member)| (file_index.intern(receiver), file_index.intern(member)))
             .collect();
 
-        Self {
-            words,
-            dot_chains,
-            call_words,
-            import_words,
+        if words.is_empty() && dot_chains.is_empty() {
+            return None;
         }
+
+        Some(Self { words, dot_chains })
     }
 }
 
@@ -1444,6 +1483,53 @@ impl EntityGraph {
             }
         }
 
+        let stale_js_ts_file_paths: Vec<&str> = stale_set
+            .iter()
+            .copied()
+            .filter(|file_path| is_js_ts_file(file_path))
+            .collect();
+        if !stale_js_ts_file_paths.is_empty() {
+            let clean_js_ts_import_tokens: HashMap<&str, Vec<String>> = all_file_paths
+                .iter()
+                .map(String::as_str)
+                .filter(|file_path| !stale_set.contains(*file_path) && is_js_ts_file(file_path))
+                .filter_map(|file_path| {
+                    let content = read_import_scan_prefix(&root.join(file_path))?;
+                    let mut tokens: Vec<String> = stale_js_ts_file_paths
+                        .iter()
+                        .flat_map(|stale_file_path| {
+                            content_import_tokens_for_file(file_path, &content, stale_file_path)
+                        })
+                        .collect();
+                    if tokens.is_empty() {
+                        return None;
+                    }
+                    tokens.sort_unstable();
+                    tokens.dedup();
+                    Some((file_path, tokens))
+                })
+                .collect();
+
+            for entity in all_entities
+                .iter()
+                .filter(|entity| !stale_set.contains(entity.file_path.as_str()))
+            {
+                if affected_clean_ids.contains(&entity.id) {
+                    continue;
+                }
+                let Some(tokens) = clean_js_ts_import_tokens.get(entity.file_path.as_str()) else {
+                    continue;
+                };
+                if tokens
+                    .iter()
+                    .any(|token| content_contains_identifier(&entity.content, token))
+                {
+                    affected_clean_ids.insert(entity.id.clone());
+                    affected_clean_file_paths.insert(entity.file_path.as_str());
+                }
+            }
+        }
+
         // Keep edges where both endpoints are in clean (non-stale) files and from_entity
         // is not affected by target changes. Drop ALL cached edges from stale-file entities
         // (even content_clean ones) because import/scope context may have changed even when
@@ -1856,11 +1942,25 @@ impl EntityGraph {
             dependencies,
         };
 
+        let mut recomputed_edge_source_ids: Vec<String> = needs_resolution
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        recomputed_edge_source_ids.sort_unstable();
+        recomputed_edge_source_ids.dedup();
+
+        let mut deleted_entity_ids: Vec<String> =
+            deleted_ids.iter().map(|id| (*id).to_string()).collect();
+        deleted_entity_ids.sort_unstable();
+        deleted_entity_ids.dedup();
+
         (
             graph,
             all_entities,
             IncrementalBuildMetadata {
                 repaired_clean_entity_ids,
+                recomputed_edge_source_ids,
+                deleted_entity_ids,
             },
         )
     }
@@ -2364,6 +2464,11 @@ struct TsDefaultExportTable {
     sorted_files: Vec<String>,
 }
 
+struct TsTopLevelEntityTable {
+    entities_by_file: HashMap<String, Vec<(String, String)>>,
+    sorted_files: Vec<String>,
+}
+
 struct TsDefaultReExport {
     file_path: String,
     original_name: String,
@@ -2425,6 +2530,30 @@ fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec
     let mut sorted_files: Vec<String> = default_exports.keys().cloned().collect();
     sort_import_candidate_files(&mut sorted_files, JS_TS_EXTENSIONS);
     sorted_files
+}
+
+fn build_ts_top_level_entity_table(
+    entity_map: &HashMap<String, EntityInfo>,
+) -> TsTopLevelEntityTable {
+    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for entity in entity_map.values() {
+        if !is_js_ts_file(&entity.file_path) || entity.parent_id.is_some() {
+            continue;
+        }
+        entities_by_file
+            .entry(entity.file_path.clone())
+            .or_default()
+            .push((entity.name.clone(), entity.id.clone()));
+    }
+    for entries in entities_by_file.values_mut() {
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    let mut sorted_files: Vec<String> = entities_by_file.keys().cloned().collect();
+    sort_import_candidate_files(&mut sorted_files, JS_TS_EXTENSIONS);
+    TsTopLevelEntityTable {
+        entities_by_file,
+        sorted_files,
+    }
 }
 
 fn resolve_ts_default_re_exports(
@@ -2645,6 +2774,7 @@ fn build_import_table(
     );
     let ts_default_exports =
         build_ts_default_export_table(file_paths, symbol_table, entity_map, &content_map);
+    let ts_top_level_entities = build_ts_top_level_entity_table(entity_map);
 
     // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
     // We no longer need a go_pkg_index here since Go files are skipped below.
@@ -2764,6 +2894,12 @@ fn build_import_table(
                     Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#)
                         .unwrap()
                 });
+                static JS_NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(
+                        r#"import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]"#,
+                    )
+                    .unwrap()
+                });
 
                 for cap in JS_NAMED_RE.captures_iter(content) {
                     let names_str = cap.get(1).unwrap().as_str();
@@ -2804,6 +2940,29 @@ fn build_import_table(
                         local_imports.push((
                             (file_path.clone(), local_name.to_string()),
                             target_id,
+                        ));
+                    }
+                }
+
+                for cap in JS_NAMESPACE_RE.captures_iter(content) {
+                    let alias = cap.get(1).unwrap().as_str();
+                    let module_path = cap.get(2).unwrap().as_str();
+                    let Some(target_file) = find_import_file(
+                        &ts_top_level_entities.sorted_files,
+                        module_path,
+                        file_path,
+                        JS_TS_EXTENSIONS,
+                    ) else {
+                        continue;
+                    };
+                    let Some(entries) = ts_top_level_entities.entities_by_file.get(target_file)
+                    else {
+                        continue;
+                    };
+                    for (name, target_id) in entries {
+                        local_imports.push((
+                            (file_path.clone(), format!("{alias}.{name}")),
+                            target_id.clone(),
                         ));
                     }
                 }
@@ -3383,13 +3542,23 @@ fn content_import_tokens_for_file(
         || importing_file_path.ends_with(".tsx")
     {
         static JS_NAMED_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+            Regex::new(
+                r#"import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#,
+            )
+            .unwrap()
         });
         static JS_NAMESPACE_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r#"import\s+\*\s+as\s+([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+            Regex::new(r#"import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]([^'"]+)['"]"#)
+                .unwrap()
         });
         static JS_DEFAULT_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+            Regex::new(
+                r#"import\s+(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s*,\s*\{[^}]*\})?\s*from\s*['"]([^'"]+)['"]"#,
+            )
+            .unwrap()
+        });
+        static JS_REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
         });
 
         for cap in JS_NAMED_IMPORT_RE.captures_iter(content) {
@@ -3434,6 +3603,26 @@ fn content_import_tokens_for_file(
                 &[".ts", ".tsx", ".js", ".jsx"],
                 candidate_file_path,
             ) {
+                push_import_token(&mut tokens, local);
+            }
+        }
+
+        for cap in JS_REEXPORT_RE.captures_iter(content) {
+            let names = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let source_path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if !import_source_matches_file(
+                importing_file_path,
+                source_path,
+                &[".ts", ".tsx", ".js", ".jsx"],
+                candidate_file_path,
+            ) {
+                continue;
+            }
+            for name_part in names.split(',') {
+                let name_part = name_part.trim();
+                let name_part = name_part.strip_prefix("type ").unwrap_or(name_part);
+                let (original, local) = split_import_alias(name_part);
+                push_import_token(&mut tokens, original);
                 push_import_token(&mut tokens, local);
             }
         }
@@ -3921,6 +4110,37 @@ class Runner {
         assert!(refs
             .iter()
             .any(|(word, ref_type)| *word == "validate" && *ref_type == RefType::Calls));
+    }
+
+    #[test]
+    fn test_js_ts_import_token_scan_matches_supported_import_forms() {
+        let content = "\
+import type { X as TypeX } from './stale';
+import DefaultThing, { X as Y, Z } from './stale';
+import * as ns$ from './stale';
+export { default as PublicDefault, X as PublicX } from './stale';
+";
+
+        let mut tokens = content_import_tokens_for_file("consumer.ts", content, "stale.ts");
+        tokens.sort_unstable();
+        tokens.dedup();
+
+        for expected in [
+            "X",
+            "TypeX",
+            "DefaultThing",
+            "Y",
+            "Z",
+            "ns$",
+            "default",
+            "PublicDefault",
+            "PublicX",
+        ] {
+            assert!(
+                tokens.iter().any(|token| token == expected),
+                "missing token {expected}; tokens: {tokens:?}"
+            );
+        }
     }
 
     #[test]
@@ -4542,6 +4762,95 @@ comment with Helper
                 .any(|entity_id| *entity_id == "a.ts::function::useIt"),
             "namespace clean caller should resolve to added go. Dependents: {:?}",
             incremental_dependents
+        );
+    }
+
+    #[test]
+    fn test_incremental_stale_default_re_export_re_resolves_clean_barrel() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.ts",
+            "export default function targetA() { return 1; }\n",
+        );
+        write_file(
+            root,
+            "b.ts",
+            "export default function targetB() { return 2; }\n",
+        );
+        write_file(root, "stale.ts", "export { default } from './a';\n");
+        write_file(
+            root,
+            "barrel.ts",
+            "export { default as publicTarget } from './stale';\n",
+        );
+
+        let all_files = vec![
+            "a.ts".to_string(),
+            "b.ts".to_string(),
+            "stale.ts".to_string(),
+            "barrel.ts".to_string(),
+        ];
+        let (cached_graph, cached_entities) = EntityGraph::build(root, &all_files, &registry);
+        let initial_deps = cached_graph.get_dependencies("barrel.ts::export::publicTarget");
+        assert!(
+            initial_deps
+                .iter()
+                .any(|entity| entity.file_path == "a.ts" && entity.name == "targetA"),
+            "initial barrel export should resolve through stale.ts to a.ts. Deps: {:?}",
+            initial_deps
+                .iter()
+                .map(|entity| (&entity.file_path, &entity.name))
+                .collect::<Vec<_>>()
+        );
+
+        write_file(root, "stale.ts", "export { default } from './b';\n");
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "stale.ts")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "stale.ts")
+            .collect();
+
+        let (incremental_graph, _) = EntityGraph::build_incremental(
+            root,
+            &["stale.ts".into()],
+            &all_files,
+            cached_clean_entities,
+            cached_graph.edges,
+            cached_stale_entities,
+            &registry,
+        );
+        let (fresh_graph, _) = EntityGraph::build(root, &all_files, &registry);
+
+        let mut incremental_deps = incremental_graph
+            .get_dependencies("barrel.ts::export::publicTarget")
+            .iter()
+            .map(|entity| (entity.file_path.as_str(), entity.name.as_str()))
+            .collect::<Vec<_>>();
+        incremental_deps.sort_unstable();
+        let mut fresh_deps = fresh_graph
+            .get_dependencies("barrel.ts::export::publicTarget")
+            .iter()
+            .map(|entity| (entity.file_path.as_str(), entity.name.as_str()))
+            .collect::<Vec<_>>();
+        fresh_deps.sort_unstable();
+        assert_eq!(
+            incremental_deps, fresh_deps,
+            "incremental graph should match fresh re-export retargeting"
+        );
+        assert!(
+            incremental_deps
+                .iter()
+                .any(|(file_path, name)| *file_path == "b.ts" && *name == "targetB"),
+            "clean barrel export should retarget to b.ts. Deps: {:?}",
+            incremental_deps
         );
     }
 

@@ -2,6 +2,7 @@ mod cache;
 mod commands;
 mod formatters;
 mod stats;
+mod timings;
 
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};

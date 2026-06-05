@@ -1,4 +1,4 @@
-use super::orphan_summary_parts;
+use super::{estimated_output_capacity, orphan_summary_parts, push_line};
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use similar::{ChangeTag, TextDiff};
@@ -22,7 +22,7 @@ fn longest_backtick_run(input: &str) -> usize {
     longest
 }
 
-fn push_diff_block(lines: &mut Vec<String>, diff_lines: Vec<String>) {
+fn push_diff_block(output: &mut String, diff_lines: Vec<String>) {
     let fence_len = diff_lines
         .iter()
         .map(|line| longest_backtick_run(line))
@@ -32,9 +32,11 @@ fn push_diff_block(lines: &mut Vec<String>, diff_lines: Vec<String>) {
         .max(3);
     let fence = "`".repeat(fence_len);
 
-    lines.push(format!("{fence}diff"));
-    lines.extend(diff_lines);
-    lines.push(fence);
+    push_line(output, format!("{fence}diff"));
+    for line in diff_lines {
+        push_line(output, line);
+    }
+    push_line(output, fence);
 }
 
 pub fn format_markdown(
@@ -46,7 +48,8 @@ pub fn format_markdown(
         return "No semantic changes detected.".to_string();
     }
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut output =
+        String::with_capacity(estimated_output_capacity(result, binary_changes, verbose));
 
     // Group changes by file (BTreeMap for sorted output)
     let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
@@ -58,20 +61,23 @@ pub fn format_markdown(
     }
 
     for (file_path, (indices, binary_indices)) in &by_file {
-        lines.push(format!("### {file_path}"));
-        lines.push(String::new());
-        lines.push("| Status | Type | Name |".to_string());
-        lines.push("|--------|------|------|".to_string());
+        push_line(&mut output, format!("### {file_path}"));
+        push_line(&mut output, "");
+        push_line(&mut output, "| Status | Type | Name |");
+        push_line(&mut output, "|--------|------|------|");
 
-        let mut post_table: Vec<String> = Vec::new();
+        let mut post_table = String::new();
 
         for &idx in binary_indices {
             let change = &binary_changes[idx];
-            lines.push(format!(
-                "| B | file | {} `[binary {}]` |",
-                binary_display_name(change),
-                change.status,
-            ));
+            push_line(
+                &mut output,
+                format!(
+                    "| B | file | {} `[binary {}]` |",
+                    binary_display_name(change),
+                    change.status,
+                ),
+            );
         }
 
         for &idx in indices {
@@ -99,18 +105,18 @@ pub fn format_markdown(
             } else {
                 change.entity_name.clone()
             };
-            lines.push(format!(
-                "| {} | {} | {} |",
-                status, change.entity_type, name_display
-            ));
+            push_line(
+                &mut output,
+                format!("| {} | {} | {} |", status, change.entity_type, name_display),
+            );
 
             // Show content diff
             if verbose {
                 match change.change_type {
                     ChangeType::Added => {
                         if let Some(ref content) = change.after_content {
-                            post_table.push(String::new());
-                            post_table.push(format!("**`{}`**", change.entity_name));
+                            push_line(&mut post_table, "");
+                            push_line(&mut post_table, format!("**`{}`**", change.entity_name));
                             push_diff_block(
                                 &mut post_table,
                                 content.lines().map(|line| format!("+ {line}")).collect(),
@@ -119,8 +125,8 @@ pub fn format_markdown(
                     }
                     ChangeType::Deleted => {
                         if let Some(ref content) = change.before_content {
-                            post_table.push(String::new());
-                            post_table.push(format!("**`{}`**", change.entity_name));
+                            push_line(&mut post_table, "");
+                            push_line(&mut post_table, format!("**`{}`**", change.entity_name));
                             push_diff_block(
                                 &mut post_table,
                                 content.lines().map(|line| format!("- {line}")).collect(),
@@ -131,8 +137,8 @@ pub fn format_markdown(
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
-                            post_table.push(String::new());
-                            post_table.push(format!("**`{}`**", change.entity_name));
+                            push_line(&mut post_table, "");
+                            push_line(&mut post_table, format!("**`{}`**", change.entity_name));
                             let mut diff_lines = Vec::new();
                             let diff = TextDiff::from_lines(before.as_str(), after.as_str());
                             for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
@@ -173,16 +179,16 @@ pub fn format_markdown(
             } else if change.change_type == ChangeType::Modified {
                 if let (Some(before), Some(after)) = (&change.before_content, &change.after_content)
                 {
-                    let before_lines: Vec<&str> = before.lines().collect();
-                    let after_lines: Vec<&str> = after.lines().collect();
+                    let before_line_count = before.lines().count();
+                    let after_line_count = after.lines().count();
 
-                    if before_lines.len() <= 3 && after_lines.len() <= 3 {
-                        post_table.push(String::new());
-                        post_table.push(format!("**`{}`**", change.entity_name));
-                        let diff_lines = before_lines
-                            .iter()
+                    if before_line_count <= 3 && after_line_count <= 3 {
+                        push_line(&mut post_table, "");
+                        push_line(&mut post_table, format!("**`{}`**", change.entity_name));
+                        let diff_lines = before
+                            .lines()
                             .map(|line| format!("- {}", line.trim()))
-                            .chain(after_lines.iter().map(|line| format!("+ {}", line.trim())))
+                            .chain(after.lines().map(|line| format!("+ {}", line.trim())))
                             .collect();
                         push_diff_block(&mut post_table, diff_lines);
                     }
@@ -192,18 +198,21 @@ pub fn format_markdown(
             // Show rename/move details
             if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
-                    post_table.push(String::new());
-                    post_table.push(format!("> from {old_path}"));
+                    push_line(&mut post_table, "");
+                    push_line(&mut post_table, format!("> from {old_path}"));
                 } else if let Some(ref old_parent) = change.old_parent_id {
                     let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
-                    post_table.push(String::new());
-                    post_table.push(format!("> moved from {parent_name}"));
+                    push_line(&mut post_table, "");
+                    push_line(&mut post_table, format!("> moved from {parent_name}"));
                 }
             }
         }
 
-        lines.extend(post_table);
-        lines.push(String::new());
+        if !post_table.is_empty() {
+            push_line(&mut output, "");
+            push_line(&mut output, post_table);
+        }
+        push_line(&mut output, "");
     }
 
     // Summary
@@ -243,14 +252,17 @@ pub fn format_markdown(
         format!(" ({})", orphan_parts.join(", "))
     };
 
-    lines.push(format!(
-        "**Summary:** {} across {} {files_label}{}",
-        parts.join(", "),
-        reported_file_count,
-        orphan_suffix,
-    ));
+    push_line(
+        &mut output,
+        format!(
+            "**Summary:** {} across {} {files_label}{}",
+            parts.join(", "),
+            reported_file_count,
+            orphan_suffix,
+        ),
+    );
 
-    lines.join("\n")
+    output
 }
 
 #[cfg(test)]

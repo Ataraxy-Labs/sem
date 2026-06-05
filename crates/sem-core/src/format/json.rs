@@ -1,5 +1,154 @@
 use crate::parser::differ::{BinaryFileChange, DiffResult};
-use serde_json::{json, Value};
+use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
+use serde_json::Value;
+
+struct DiffJsonEnvelope<'a> {
+    result: &'a DiffResult,
+    binary_changes: &'a [BinaryFileChange],
+    include_binary_changes: bool,
+}
+
+impl Serialize for DiffJsonEnvelope<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = if self.include_binary_changes { 3 } else { 2 };
+        let mut fields = serializer.serialize_struct("DiffJsonEnvelope", field_count)?;
+        fields.serialize_field(
+            "summary",
+            &DiffJsonSummary {
+                result: self.result,
+                binary_count: self.binary_changes.len(),
+                include_binary_count: self.include_binary_changes,
+            },
+        )?;
+        fields.serialize_field("changes", &SemanticChangesJson(&self.result.changes))?;
+        if self.include_binary_changes {
+            fields.serialize_field("binaryChanges", &BinaryChangesJson(self.binary_changes))?;
+        }
+        fields.end()
+    }
+}
+
+struct DiffJsonSummary<'a> {
+    result: &'a DiffResult,
+    binary_count: usize,
+    include_binary_count: bool,
+}
+
+impl Serialize for DiffJsonSummary<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = if self.include_binary_count { 10 } else { 9 };
+        let mut fields = serializer.serialize_struct("DiffJsonSummary", field_count)?;
+        fields.serialize_field("fileCount", &(self.result.file_count + self.binary_count))?;
+        fields.serialize_field("added", &self.result.added_count)?;
+        fields.serialize_field("modified", &self.result.modified_count)?;
+        fields.serialize_field("deleted", &self.result.deleted_count)?;
+        fields.serialize_field("moved", &self.result.moved_count)?;
+        fields.serialize_field("renamed", &self.result.renamed_count)?;
+        fields.serialize_field("reordered", &self.result.reordered_count)?;
+        if self.include_binary_count {
+            fields.serialize_field("binary", &self.binary_count)?;
+        }
+        fields.serialize_field("orphan", &self.result.orphan_count)?;
+        fields.serialize_field("total", &(self.result.changes.len() + self.binary_count))?;
+        fields.end()
+    }
+}
+
+struct SemanticChangesJson<'a>(&'a [crate::model::change::SemanticChange]);
+
+impl Serialize for SemanticChangesJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for change in self.0 {
+            sequence.serialize_element(&SemanticChangeJson(change))?;
+        }
+        sequence.end()
+    }
+}
+
+struct SemanticChangeJson<'a>(&'a crate::model::change::SemanticChange);
+
+impl Serialize for SemanticChangeJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let change = self.0;
+        let mut fields = serializer.serialize_struct("SemanticChangeJson", 17)?;
+        fields.serialize_field("entityId", &change.entity_id)?;
+        fields.serialize_field("changeType", &change.change_type)?;
+        fields.serialize_field("entityType", &change.entity_type)?;
+        fields.serialize_field("entityName", &change.entity_name)?;
+        fields.serialize_field("startLine", &change.start_line)?;
+        fields.serialize_field("endLine", &change.end_line)?;
+        fields.serialize_field("oldStartLine", &change.old_start_line)?;
+        fields.serialize_field("oldEndLine", &change.old_end_line)?;
+        fields.serialize_field("oldEntityName", &change.old_entity_name)?;
+        fields.serialize_field("filePath", &change.file_path)?;
+        fields.serialize_field("oldFilePath", &change.old_file_path)?;
+        fields.serialize_field("oldParentId", &change.old_parent_id)?;
+        fields.serialize_field("beforeContent", &change.before_content)?;
+        fields.serialize_field("afterContent", &change.after_content)?;
+        fields.serialize_field("commitSha", &change.commit_sha)?;
+        fields.serialize_field("author", &change.author)?;
+        fields.serialize_field("structuralChange", &change.structural_change)?;
+        fields.end()
+    }
+}
+
+struct BinaryChangesJson<'a>(&'a [BinaryFileChange]);
+
+impl Serialize for BinaryChangesJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for change in self.0 {
+            sequence.serialize_element(&BinaryChangeJson(change))?;
+        }
+        sequence.end()
+    }
+}
+
+struct BinaryChangeJson<'a>(&'a BinaryFileChange);
+
+impl Serialize for BinaryChangeJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let change = self.0;
+        let mut fields = serializer.serialize_struct("BinaryChangeJson", 4)?;
+        fields.serialize_field("changeType", "binary")?;
+        fields.serialize_field("filePath", &change.file_path)?;
+        fields.serialize_field("oldFilePath", &change.old_file_path)?;
+        fields.serialize_field("fileStatus", &change.status)?;
+        fields.end()
+    }
+}
+
+fn estimate_json_capacity(result: &DiffResult, binary_changes: &[BinaryFileChange]) -> usize {
+    let content_len = result
+        .changes
+        .iter()
+        .map(|change| {
+            change.before_content.as_ref().map_or(0, String::len)
+                + change.after_content.as_ref().map_or(0, String::len)
+        })
+        .sum::<usize>();
+
+    256 + content_len + result.changes.len() * 256 + binary_changes.len() * 128
+}
 
 pub fn diff_json_value(result: &DiffResult) -> Value {
     diff_json_value_inner(result, &[], false)
@@ -17,95 +166,47 @@ fn diff_json_value_inner(
     binary_changes: &[BinaryFileChange],
     include_binary_changes: bool,
 ) -> Value {
-    let changes: Vec<Value> = result
-        .changes
-        .iter()
-        .map(|c| {
-            json!({
-                "entityId": c.entity_id,
-                "changeType": c.change_type,
-                "entityType": c.entity_type,
-                "entityName": c.entity_name,
-                "startLine": c.start_line,
-                "endLine": c.end_line,
-                "oldStartLine": c.old_start_line,
-                "oldEndLine": c.old_end_line,
-                "oldEntityName": c.old_entity_name,
-                "filePath": c.file_path,
-                "oldFilePath": c.old_file_path,
-                "oldParentId": c.old_parent_id,
-                "beforeContent": c.before_content,
-                "afterContent": c.after_content,
-                "commitSha": c.commit_sha,
-                "author": c.author,
-                "structuralChange": c.structural_change,
-            })
-        })
-        .collect();
-
-    if !include_binary_changes {
-        return json!({
-            "summary": {
-                "fileCount": result.file_count,
-                "added": result.added_count,
-                "modified": result.modified_count,
-                "deleted": result.deleted_count,
-                "moved": result.moved_count,
-                "renamed": result.renamed_count,
-                "reordered": result.reordered_count,
-                "orphan": result.orphan_count,
-                "total": result.changes.len(),
-            },
-            "changes": changes,
-        });
-    }
-
-    let binary_changes_json: Vec<Value> = binary_changes
-        .iter()
-        .map(|c| {
-            json!({
-                "changeType": "binary",
-                "filePath": c.file_path,
-                "oldFilePath": c.old_file_path,
-                "fileStatus": c.status,
-            })
-        })
-        .collect();
-
-    json!({
-        "summary": {
-            "fileCount": result.file_count + binary_changes.len(),
-            "added": result.added_count,
-            "modified": result.modified_count,
-            "deleted": result.deleted_count,
-            "moved": result.moved_count,
-            "renamed": result.renamed_count,
-            "reordered": result.reordered_count,
-            "binary": binary_changes.len(),
-            "orphan": result.orphan_count,
-            "total": result.changes.len() + binary_changes.len(),
-        },
-        "changes": changes,
-        "binaryChanges": binary_changes_json,
+    serde_json::to_value(DiffJsonEnvelope {
+        result,
+        binary_changes,
+        include_binary_changes,
     })
+    .unwrap_or(Value::Null)
+}
+
+fn format_diff_json_inner(
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+    include_binary_changes: bool,
+) -> String {
+    let mut output = Vec::with_capacity(estimate_json_capacity(result, binary_changes));
+    let envelope = DiffJsonEnvelope {
+        result,
+        binary_changes,
+        include_binary_changes,
+    };
+    if serde_json::to_writer(&mut output, &envelope).is_err() {
+        return String::new();
+    }
+    String::from_utf8(output).unwrap_or_default()
 }
 
 pub fn format_diff_json(result: &DiffResult) -> String {
-    serde_json::to_string(&diff_json_value(result)).unwrap_or_default()
+    format_diff_json_inner(result, &[], false)
 }
 
 pub fn format_diff_json_with_binary_changes(
     result: &DiffResult,
     binary_changes: &[BinaryFileChange],
 ) -> String {
-    serde_json::to_string(&diff_json_value_with_binary_changes(result, binary_changes))
-        .unwrap_or_default()
+    format_diff_json_inner(result, binary_changes, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::change::{ChangeType, SemanticChange};
+    use serde_json::json;
 
     #[test]
     fn diff_json_value_preserves_public_schema() {
@@ -146,6 +247,9 @@ mod tests {
         };
 
         let value = diff_json_value(&result);
+        let formatted_value: Value =
+            serde_json::from_str(&format_diff_json(&result)).expect("format should be valid json");
+        assert_eq!(formatted_value, value);
 
         assert_eq!(
             value,
@@ -206,6 +310,12 @@ mod tests {
         }];
 
         let value = diff_json_value_with_binary_changes(&result, &binary_changes);
+        let formatted_value: Value = serde_json::from_str(&format_diff_json_with_binary_changes(
+            &result,
+            &binary_changes,
+        ))
+        .expect("format should be valid json");
+        assert_eq!(formatted_value, value);
 
         assert_eq!(
             value,

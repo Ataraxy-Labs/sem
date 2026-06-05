@@ -1,4 +1,4 @@
-use super::orphan_summary_parts;
+use super::{estimated_output_capacity, orphan_summary_parts, push_line};
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::{BinaryFileChange, DiffResult};
@@ -11,7 +11,8 @@ pub fn format_plain(result: &DiffResult, binary_changes: &[BinaryFileChange]) ->
         return "No semantic changes detected.".to_string();
     }
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut output =
+        String::with_capacity(estimated_output_capacity(result, binary_changes, false));
 
     // Group changes by file (BTreeMap for sorted output)
     let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
@@ -23,20 +24,23 @@ pub fn format_plain(result: &DiffResult, binary_changes: &[BinaryFileChange]) ->
     }
 
     for (file_path, (indices, binary_indices)) in &by_file {
-        lines.push(file_path.bold().to_string());
+        push_line(&mut output, file_path.bold().to_string());
 
         for &idx in binary_indices {
             let change = &binary_changes[idx];
             let letter = "B".yellow().to_string();
             let type_label = format!("{:<12}", "file");
             let name_display = binary_display_name(change);
-            lines.push(format!(
-                "  {}  {}{} {}",
-                letter,
-                type_label.dimmed(),
-                name_display,
-                format!("[binary {}]", change.status).yellow(),
-            ));
+            push_line(
+                &mut output,
+                format!(
+                    "  {}  {}{} {}",
+                    letter,
+                    type_label.dimmed(),
+                    name_display,
+                    format!("[binary {}]", change.status).yellow(),
+                ),
+            );
         }
 
         for &idx in indices {
@@ -59,27 +63,28 @@ pub fn format_plain(result: &DiffResult, binary_changes: &[BinaryFileChange]) ->
             } else {
                 change.entity_name.clone()
             };
-            lines.push(format!(
-                "  {}  {}{}",
-                letter,
-                type_label.dimmed(),
-                name_display,
-            ));
+            push_line(
+                &mut output,
+                format!("  {}  {}{}", letter, type_label.dimmed(), name_display),
+            );
 
             if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
-                    lines.push(format!("       {}", format!("from {old_path}").dimmed()));
+                    push_line(
+                        &mut output,
+                        format!("       {}", format!("from {old_path}").dimmed()),
+                    );
                 } else if let Some(ref old_parent) = change.old_parent_id {
                     let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
-                    lines.push(format!(
-                        "       {}",
-                        format!("moved from {parent_name}").dimmed()
-                    ));
+                    push_line(
+                        &mut output,
+                        format!("       {}", format!("moved from {parent_name}").dimmed()),
+                    );
                 }
             }
         }
 
-        lines.push(String::new());
+        push_line(&mut output, "");
     }
 
     // Summary
@@ -119,7 +124,11 @@ pub fn format_plain(result: &DiffResult, binary_changes: &[BinaryFileChange]) ->
         );
     }
     if !binary_changes.is_empty() {
-        parts.push(format!("{} binary", binary_changes.len()).yellow().to_string());
+        parts.push(
+            format!("{} binary", binary_changes.len())
+                .yellow()
+                .to_string(),
+        );
     }
 
     let reported_file_count = file_count(result, binary_changes);
@@ -136,12 +145,15 @@ pub fn format_plain(result: &DiffResult, binary_changes: &[BinaryFileChange]) ->
             .dimmed()
             .to_string()
     };
-    lines.push(format!(
-        "{} across {} {files_label}{}",
-        parts.join(", "),
-        reported_file_count,
-        orphan_suffix,
-    ));
+    push_line(
+        &mut output,
+        format!(
+            "{} across {} {files_label}{}",
+            parts.join(", "),
+            reported_file_count,
+            orphan_suffix,
+        ),
+    );
 
-    lines.join("\n")
+    output
 }

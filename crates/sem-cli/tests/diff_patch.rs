@@ -51,15 +51,24 @@ fn run_git(repo: &Path, args: &[&str]) -> Output {
     output
 }
 
-fn run_sem(args: &[&str], input: &[u8], cwd: Option<&Path>) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sem"))
+fn run_sem_with_path(
+    args: &[&str],
+    input: &[u8],
+    cwd: Option<&Path>,
+    path: Option<&Path>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sem"));
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(cwd.unwrap_or_else(|| Path::new(".")))
-        .spawn()
-        .expect("spawn sem");
+        .current_dir(cwd.unwrap_or_else(|| Path::new(".")));
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+
+    let mut child = command.spawn().expect("spawn sem");
 
     child
         .stdin
@@ -69,6 +78,10 @@ fn run_sem(args: &[&str], input: &[u8], cwd: Option<&Path>) -> Output {
         .expect("write stdin");
 
     child.wait_with_output().expect("wait for sem")
+}
+
+fn run_sem(args: &[&str], input: &[u8], cwd: Option<&Path>) -> Output {
+    run_sem_with_path(args, input, cwd, None)
 }
 
 fn run_diff_patch(input: &str) -> Output {
@@ -333,6 +346,60 @@ fn patch_mode_uses_hunks_when_new_blob_is_absent() {
     assert_eq!(changes[0]["filePath"].as_str(), Some("app.py"));
     assert_eq!(changes[0]["entityName"].as_str(), Some("foo"));
     assert_eq!(changes[0]["changeType"].as_str(), Some("modified"));
+}
+
+#[test]
+fn patch_mode_resolves_blobs_and_worktree_hash_without_git_executable() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.path.join("app.py"), "def foo():\n    return 1\n")
+        .expect("write initial file");
+    run_git(&repo.path, &["add", "app.py"]);
+    run_git(&repo.path, &["commit", "-qm", "init"]);
+    let old_sha = run_git(&repo.path, &["rev-parse", "HEAD:app.py"]).stdout;
+    let old_sha = String::from_utf8(old_sha).expect("old sha should be utf8");
+
+    std::fs::write(repo.path.join("app.py"), "def foo():\n    return 2\n")
+        .expect("write changed file");
+    let new_sha = run_git(&repo.path, &["hash-object", "--", "app.py"]).stdout;
+    let new_sha = String::from_utf8(new_sha).expect("new sha should be utf8");
+    let patch = format!(
+        concat!(
+            "diff --git a/app.py b/app.py\n",
+            "old mode 100644\n",
+            "new mode 100755\n",
+            "index {}..{} 100644\n",
+        ),
+        old_sha.trim(),
+        new_sha.trim()
+    );
+
+    let empty_path = repo.path.join("empty-path");
+    std::fs::create_dir(&empty_path).expect("create empty PATH directory");
+    let output = run_sem_with_path(
+        &["diff", "--patch", "--json"],
+        patch.as_bytes(),
+        Some(&repo.path),
+        Some(&empty_path),
+    );
+    assert!(
+        output.status.success(),
+        "sem diff --patch --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("could not resolve contents"), "{stderr}");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be json");
+    let changes = json["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["filePath"].as_str(), Some("app.py"));
+    assert_eq!(changes[0]["entityName"].as_str(), Some("foo"));
+    assert_eq!(changes[0]["changeType"].as_str(), Some("modified"));
+    assert_eq!(json["binaryChanges"].as_array().unwrap().len(), 0);
 }
 
 #[test]

@@ -808,6 +808,7 @@ pub(crate) fn resolve_with_scopes_full(
                 &go_pkg_index,
                 &ts_default_exports,
                 &top_level_entities,
+                pre_built_import_table.is_some(),
             );
 
             // Resolve pending call types using the complete return type map
@@ -3835,6 +3836,7 @@ fn extract_imports_from_ast(
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    skip_js_ts_imports: bool,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -3871,31 +3873,34 @@ fn extract_imports_from_ast(
                     true
                 }
                 "import_statement" if !config.self_keywords.contains(&"cls") => {
-                    // TS import_statement (not Python - Python uses import_from_statement)
-                    extract_ts_import(
-                        child,
-                        file_path,
-                        source,
-                        symbol_table,
-                        entity_map,
-                        import_table,
-                        scopes,
-                        ts_default_exports,
-                        top_level_entities,
-                    );
+                    if !skip_js_ts_imports {
+                        extract_ts_import(
+                            child,
+                            file_path,
+                            source,
+                            symbol_table,
+                            entity_map,
+                            import_table,
+                            scopes,
+                            ts_default_exports,
+                            top_level_entities,
+                        );
+                    }
                     true
                 }
                 "export_statement" if !config.self_keywords.contains(&"cls") => {
-                    extract_ts_re_export(
-                        child,
-                        file_path,
-                        source,
-                        symbol_table,
-                        entity_map,
-                        import_table,
-                        scopes,
-                        ts_default_exports,
-                    );
+                    if !skip_js_ts_imports {
+                        extract_ts_re_export(
+                            child,
+                            file_path,
+                            source,
+                            symbol_table,
+                            entity_map,
+                            import_table,
+                            scopes,
+                            ts_default_exports,
+                        );
+                    }
                     true
                 }
                 "use_declaration" => {

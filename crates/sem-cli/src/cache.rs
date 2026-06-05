@@ -221,6 +221,104 @@ impl DiskCache {
         Some((graph, entities))
     }
 
+    /// Load only graph topology from a fresh cache.
+    pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return None;
+        }
+
+        let cached_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .ok()?;
+        if (cached_count - shared_cache::manifest_entry_count(&self.conn)) as usize
+            != shared_cache::source_file_count(files)
+        {
+            return None;
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
+            .ok()?;
+        let cached_mtimes: HashMap<String, (i64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                ))
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for file in files {
+            if shared_cache::is_manifest_file_name(file) {
+                continue;
+            }
+            let (secs, nanos) = cached_mtimes.get(file.as_str()).copied()?;
+            let full = root.join(file);
+            let (current_secs, current_nanos) = shared_cache::file_mtime_parts(&full)?;
+            if secs != current_secs || nanos != current_nanos {
+                return None;
+            }
+        }
+
+        let mut entity_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id FROM entities",
+            )
+            .ok()?;
+        let entity_map: HashMap<String, EntityInfo> = entity_stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                Ok((
+                    id.clone(),
+                    EntityInfo {
+                        id,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        file_path: row.get(3)?,
+                        start_line: row.get::<_, i64>(4)? as usize,
+                        end_line: row.get::<_, i64>(5)? as usize,
+                        parent_id: row.get(6)?,
+                    },
+                ))
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let edges = self.load_edges()?;
+        Some(EntityGraph::from_parts(entity_map, edges))
+    }
+
+    fn load_edges(&self) -> Option<Vec<EntityRef>> {
+        let mut edge_stmt = self
+            .conn
+            .prepare("SELECT from_entity, to_entity, ref_type FROM edges")
+            .ok()?;
+        let edges: Vec<EntityRef> = edge_stmt
+            .query_map([], |row| {
+                let rt: String = row.get(2)?;
+                let ref_type = match rt.as_str() {
+                    "calls" => RefType::Calls,
+                    "imports" => RefType::Imports,
+                    _ => RefType::TypeRef,
+                };
+                Ok(EntityRef {
+                    from_entity: row.get(0)?,
+                    to_entity: row.get(1)?,
+                    ref_type,
+                })
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        Some(edges)
+    }
+
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
@@ -383,6 +481,8 @@ impl DiskCache {
         graph: &EntityGraph,
         entities: &[SemanticEntity],
         repair_changed_clean_entity_ids: bool,
+        recomputed_edge_source_ids: &[String],
+        deleted_entity_ids: &[String],
     ) -> Result<(), rusqlite::Error> {
         let source_stale_files: Vec<&String> = stale_files
             .iter()
@@ -423,6 +523,29 @@ impl DiskCache {
                     && !current_set.contains(path.as_str())
             })
             .collect();
+        let use_legacy_edge_fallback = !repair_changed_clean_entity_ids
+            && recomputed_edge_source_ids.is_empty()
+            && deleted_entity_ids.is_empty();
+        let cached_rewritten_entity_ids: HashSet<String> = if use_legacy_edge_fallback {
+            let rewritten_file_paths: HashSet<&str> = source_stale_files
+                .iter()
+                .map(|file| file.as_str())
+                .chain(deleted_cached_files.iter().map(String::as_str))
+                .collect();
+            let mut stmt = tx.prepare("SELECT id, file_path FROM entities")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|row| row.ok())
+                .filter_map(|(id, file_path)| {
+                    rewritten_file_paths
+                        .contains(file_path.as_str())
+                        .then_some(id)
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         // Delete files that are no longer in the file list (deleted from disk)
         {
@@ -490,15 +613,69 @@ impl DiskCache {
             }
         }
 
-        // Delete all edges and re-insert from graph
-        // (Edges are complex to incrementally update since affected clean entities
-        //  get re-resolved too. Simpler to just rewrite all edges.)
-        tx.execute("DELETE FROM edges", [])?;
-        {
+        if repair_changed_clean_entity_ids {
+            tx.execute("DELETE FROM edges", [])?;
             let mut ins = tx.prepare(
                 "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
             )?;
             for edge in &graph.edges {
+                let rt = match edge.ref_type {
+                    RefType::Calls => "calls",
+                    RefType::TypeRef => "typeref",
+                    RefType::Imports => "imports",
+                };
+                ins.execute(params![edge.from_entity, edge.to_entity, rt])?;
+            }
+        } else {
+            let mut affected_sources: HashSet<String> =
+                recomputed_edge_source_ids.iter().cloned().collect();
+            let mut deleted_ids: HashSet<String> = deleted_entity_ids.iter().cloned().collect();
+            if use_legacy_edge_fallback {
+                let current_rewritten_entity_ids: HashSet<&str> = entities
+                    .iter()
+                    .filter(|entity| source_stale_set.contains(entity.file_path.as_str()))
+                    .map(|entity| entity.id.as_str())
+                    .collect();
+                affected_sources.extend(cached_rewritten_entity_ids.iter().cloned());
+                affected_sources.extend(
+                    current_rewritten_entity_ids
+                        .iter()
+                        .map(|entity_id| (*entity_id).to_string()),
+                );
+                deleted_ids.extend(
+                    cached_rewritten_entity_ids
+                        .iter()
+                        .filter(|entity_id| {
+                            !current_rewritten_entity_ids.contains(entity_id.as_str())
+                        })
+                        .cloned(),
+                );
+            }
+            affected_sources.extend(deleted_ids.iter().cloned());
+
+            {
+                let mut del_from = tx.prepare("DELETE FROM edges WHERE from_entity = ?1")?;
+                for entity_id in &affected_sources {
+                    del_from.execute(params![entity_id])?;
+                }
+            }
+            {
+                let mut del_to = tx.prepare("DELETE FROM edges WHERE to_entity = ?1")?;
+                for entity_id in &deleted_ids {
+                    del_to.execute(params![entity_id])?;
+                }
+            }
+
+            let mut ins = tx.prepare(
+                "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
+            )?;
+            for edge in &graph.edges {
+                if !affected_sources.contains(&edge.from_entity)
+                    || deleted_ids.contains(&edge.from_entity)
+                    || deleted_ids.contains(&edge.to_entity)
+                {
+                    continue;
+                }
                 let rt = match edge.ref_type {
                     RefType::Calls => "calls",
                     RefType::TypeRef => "typeref",
@@ -583,6 +760,61 @@ mod tests {
             .unwrap();
         let mut rows = stmt.query(rusqlite::params![id]).unwrap();
         rows.next().unwrap().map(|row| row.get(0).unwrap())
+    }
+
+    fn entity_info(id: &str, file_path: &str, name: &str) -> EntityInfo {
+        EntityInfo {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            entity_type: "function".to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn graph_with_edges(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
+        let entity_map = entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    entity_info(&entity.id, &entity.file_path, &entity.name),
+                )
+            })
+            .collect();
+        EntityGraph::from_parts(entity_map, edges)
+    }
+
+    fn edge(from_entity: &str, to_entity: &str) -> EntityRef {
+        EntityRef {
+            from_entity: from_entity.to_string(),
+            to_entity: to_entity.to_string(),
+            ref_type: RefType::Calls,
+        }
+    }
+
+    fn edge_rowid(cache: &DiskCache, from_entity: &str, to_entity: &str) -> Option<i64> {
+        cache
+            .conn
+            .query_row(
+                "SELECT rowid FROM edges WHERE from_entity = ?1 AND to_entity = ?2",
+                rusqlite::params![from_entity, to_entity],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn edge_count(cache: &DiskCache, from_entity: &str, to_entity: &str) -> i64 {
+        cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE from_entity = ?1 AND to_entity = ?2",
+                rusqlite::params![from_entity, to_entity],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn sample_files(root: &Path) -> Vec<String> {
@@ -787,6 +1019,8 @@ mod tests {
                 &empty_graph(),
                 &entities,
                 false,
+                &["stale-id".to_string()],
+                &[],
             )
             .unwrap();
 
@@ -834,6 +1068,8 @@ mod tests {
                 &empty_graph(),
                 &entities,
                 true,
+                &[],
+                &[],
             )
             .unwrap();
 
@@ -845,6 +1081,70 @@ mod tests {
         assert_eq!(
             entity_content(&cache, "stale-id"),
             Some("stale new".to_string())
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_incremental_rewrites_only_recomputed_edge_sources() {
+        let root = temp_repo_root("incremental-edge-sources");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        write_file(&root.join("clean.rs"), "fn clean() {}\n");
+        write_file(&root.join("other.rs"), "fn other() {}\n");
+        write_file(&root.join("target.rs"), "fn target() {}\n");
+        let files = vec![
+            "stale.rs".to_string(),
+            "clean.rs".to_string(),
+            "other.rs".to_string(),
+            "target.rs".to_string(),
+        ];
+        let cache = DiskCache::open(&root).unwrap();
+        let entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale old"),
+            entity("clean-id", "clean.rs", "clean", "clean old"),
+            entity("other-id", "other.rs", "other", "other"),
+            entity("old-target-id", "target.rs", "oldTarget", "old target"),
+            entity("new-target-id", "target.rs", "newTarget", "new target"),
+        ];
+        let initial_graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("stale-id", "old-target-id"),
+                edge("clean-id", "other-id"),
+            ],
+        );
+        cache
+            .save(&root, &files, &initial_graph, &entities)
+            .unwrap();
+        let clean_edge_rowid = edge_rowid(&cache, "clean-id", "other-id").unwrap();
+
+        let updated_graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("stale-id", "new-target-id"),
+                edge("clean-id", "other-id"),
+            ],
+        );
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["stale.rs".to_string()],
+                &updated_graph,
+                &entities,
+                false,
+                &["stale-id".to_string()],
+                &["old-target-id".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(edge_count(&cache, "stale-id", "old-target-id"), 0);
+        assert_eq!(edge_count(&cache, "stale-id", "new-target-id"), 1);
+        assert_eq!(
+            edge_rowid(&cache, "clean-id", "other-id"),
+            Some(clean_edge_rowid)
         );
 
         drop(cache);

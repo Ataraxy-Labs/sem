@@ -7,6 +7,7 @@ use sem_core::parser::graph::{EntityGraph, EntityRef, RefType};
 use sem_core::parser::registry::ParserRegistry;
 
 use crate::cache::DiskCache;
+use crate::timings::Timings;
 
 pub struct GraphOptions {
     pub cwd: String,
@@ -17,6 +18,7 @@ pub struct GraphOptions {
 }
 
 pub fn graph_command(opts: GraphOptions) {
+    let mut timings = Timings::from_env("graph");
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
         Ok(git) => git.repo_root().to_path_buf(),
         Err(_) => Path::new(&opts.cwd).to_path_buf(),
@@ -26,7 +28,9 @@ pub fn graph_command(opts: GraphOptions) {
     let ext_filter = normalize_exts(&opts.file_exts);
     let file_paths =
         find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
-    let (graph, _entities) = get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
+    timings.mark("file_discovery");
+    let (graph, _entities) =
+        get_or_build_graph_with_timings(root, &file_paths, &registry, opts.no_cache, &mut timings);
 
     if opts.json {
         let mut entities = graph.entities.values().collect::<Vec<_>>();
@@ -43,8 +47,11 @@ pub fn graph_command(opts: GraphOptions) {
                 "edgeCount": graph.edges.len()
             }
         });
-        println!("{}", serde_json::to_string(&output).unwrap());
+        let output = serde_json::to_string(&output).unwrap();
+        timings.mark("cli_output_serialization");
+        println!("{}", output);
     } else {
+        timings.mark("cli_output_serialization");
         println!(
             "{} {} entities, {} edges",
             "⊕".green(),
@@ -52,6 +59,7 @@ pub fn graph_command(opts: GraphOptions) {
             graph.edges.len().to_string().bold(),
         );
     }
+    timings.finish();
 }
 
 fn compare_entity_refs(a: &&EntityRef, b: &&EntityRef) -> std::cmp::Ordering {
@@ -123,15 +131,29 @@ pub fn get_or_build_graph(
     registry: &ParserRegistry,
     no_cache: bool,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
+    let mut timings = Timings::disabled("graph");
+    get_or_build_graph_with_timings(root, file_paths, registry, no_cache, &mut timings)
+}
+
+pub fn get_or_build_graph_with_timings(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    timings: &mut Timings,
+) -> (EntityGraph, Vec<SemanticEntity>) {
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
+            timings.mark("cache_open");
             // Try full cache hit
             if let Some(cached) = disk.load(root, file_paths) {
+                timings.mark("cache_full_load");
                 return cached;
             }
 
             // Try incremental: load clean cached data, rebuild only stale files
             if let Some(partial) = disk.load_partial(root, file_paths) {
+                timings.mark("cache_partial_load");
                 let (graph, entities, metadata) = EntityGraph::build_incremental_with_metadata(
                     root,
                     &partial.stale_files,
@@ -141,6 +163,7 @@ pub fn get_or_build_graph(
                     partial.stale_file_entities,
                     registry,
                 );
+                timings.mark("incremental_graph_rebuild");
                 let _ = disk.save_incremental_with_repair_metadata(
                     root,
                     file_paths,
@@ -148,7 +171,10 @@ pub fn get_or_build_graph(
                     &graph,
                     &entities,
                     metadata.repaired_clean_entity_ids,
+                    &metadata.recomputed_edge_source_ids,
+                    &metadata.deleted_entity_ids,
                 );
+                timings.mark("cache_incremental_save");
                 return (graph, entities);
             }
         }
@@ -156,12 +182,36 @@ pub fn get_or_build_graph(
 
     // Full rebuild
     let (graph, entities) = EntityGraph::build(root, file_paths, registry);
+    timings.mark("full_graph_build");
 
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             let _ = disk.save(root, file_paths, &graph, &entities);
+            timings.mark("cache_full_save");
         }
     }
 
     (graph, entities)
+}
+
+pub fn get_or_build_graph_topology_with_timings(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    timings: &mut Timings,
+) -> EntityGraph {
+    if !no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            timings.mark("cache_open");
+            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+                timings.mark("cache_topology_load");
+                return graph;
+            }
+        }
+    }
+
+    let (graph, _entities) =
+        get_or_build_graph_with_timings(root, file_paths, registry, no_cache, timings);
+    graph
 }

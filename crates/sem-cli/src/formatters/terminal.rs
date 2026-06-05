@@ -1,4 +1,4 @@
-use super::orphan_summary_parts;
+use super::{estimated_output_capacity, orphan_summary_parts, push_line};
 use colored::Colorize;
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::{BinaryFileChange, DiffResult};
@@ -58,7 +58,8 @@ pub fn format_terminal(
         return "No semantic changes detected.".dimmed().to_string();
     }
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut output =
+        String::with_capacity(estimated_output_capacity(result, binary_changes, verbose));
 
     // Group changes by file (BTreeMap for sorted output)
     let mut by_file: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
@@ -82,12 +83,13 @@ pub fn format_terminal(
 
         let header = format!("─ {} ", sanitize_terminal_text(file_path));
         let pad_len = 55usize.saturating_sub(header.len());
-        lines.push(
+        push_line(
+            &mut output,
             format!("┌{header}{}", "─".repeat(pad_len))
                 .dimmed()
                 .to_string(),
         );
-        lines.push("│".dimmed().to_string());
+        push_line(&mut output, "│".dimmed().to_string());
 
         for &idx in binary_indices {
             let change = &binary_changes[idx];
@@ -96,14 +98,17 @@ pub fn format_terminal(
             let type_label = format!("{:<10}", "file");
             let name_label = format!("{:<25}", binary_display_name(change));
 
-            lines.push(format!(
-                "{}  {} {} {} {}",
-                "│".dimmed(),
-                symbol,
-                type_label.dimmed(),
-                name_label.bold(),
-                tag,
-            ));
+            push_line(
+                &mut output,
+                format!(
+                    "{}  {} {} {} {}",
+                    "│".dimmed(),
+                    symbol,
+                    type_label.dimmed(),
+                    name_label.bold(),
+                    tag,
+                ),
+            );
         }
 
         for &idx in indices {
@@ -164,14 +169,17 @@ pub fn format_terminal(
             };
             let name_label = format!("{:<25}", display_name);
 
-            lines.push(format!(
-                "{}  {} {} {} {}",
-                "│".dimmed(),
-                symbol,
-                type_label.dimmed(),
-                name_label.bold(),
-                tag,
-            ));
+            push_line(
+                &mut output,
+                format!(
+                    "{}  {} {} {} {}",
+                    "│".dimmed(),
+                    symbol,
+                    type_label.dimmed(),
+                    name_label.bold(),
+                    tag,
+                ),
+            );
 
             // Show content diff
             if verbose {
@@ -180,11 +188,10 @@ pub fn format_terminal(
                         if let Some(ref content) = change.after_content {
                             for line in content.lines() {
                                 let line = sanitize_terminal_text(line);
-                                lines.push(format!(
-                                    "{}    {}",
-                                    "│".dimmed(),
-                                    format!("+ {line}").green(),
-                                ));
+                                push_line(
+                                    &mut output,
+                                    format!("{}    {}", "│".dimmed(), format!("+ {line}").green()),
+                                );
                             }
                         }
                     }
@@ -192,11 +199,10 @@ pub fn format_terminal(
                         if let Some(ref content) = change.before_content {
                             for line in content.lines() {
                                 let line = sanitize_terminal_text(line);
-                                lines.push(format!(
-                                    "{}    {}",
-                                    "│".dimmed(),
-                                    format!("- {line}").red(),
-                                ));
+                                push_line(
+                                    &mut output,
+                                    format!("{}    {}", "│".dimmed(), format!("- {line}").red()),
+                                );
                             }
                         }
                     }
@@ -206,11 +212,14 @@ pub fn format_terminal(
                         {
                             let diff = TextDiff::from_lines(before.as_str(), after.as_str());
                             for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
-                                lines.push(format!(
-                                    "{}    {}",
-                                    "│".dimmed(),
-                                    format!("{}", hunk.header()).dimmed(),
-                                ));
+                                push_line(
+                                    &mut output,
+                                    format!(
+                                        "{}    {}",
+                                        "│".dimmed(),
+                                        format!("{}", hunk.header()).dimmed(),
+                                    ),
+                                );
                                 for op in hunk.ops() {
                                     let mut deletes: Vec<String> = Vec::new();
                                     let mut inserts: Vec<String> = Vec::new();
@@ -223,11 +232,14 @@ pub fn format_terminal(
                                             ChangeTag::Delete => deletes.push(line),
                                             ChangeTag::Insert => inserts.push(line),
                                             ChangeTag::Equal => {
-                                                lines.push(format!(
-                                                    "{}    {}",
-                                                    "│".dimmed(),
-                                                    format!("  {line}").dimmed(),
-                                                ));
+                                                push_line(
+                                                    &mut output,
+                                                    format!(
+                                                        "{}    {}",
+                                                        "│".dimmed(),
+                                                        format!("  {line}").dimmed(),
+                                                    ),
+                                                );
                                             }
                                         }
                                     }
@@ -236,32 +248,34 @@ pub fn format_terminal(
                                     for i in 0..paired {
                                         let (del, ins) =
                                             render_inline_diff(&deletes[i], &inserts[i]);
-                                        lines.push(format!(
-                                            "{}    {} {}",
-                                            "│".dimmed(),
-                                            "-".red(),
-                                            del,
-                                        ));
-                                        lines.push(format!(
-                                            "{}    {} {}",
-                                            "│".dimmed(),
-                                            "+".green(),
-                                            ins,
-                                        ));
+                                        push_line(
+                                            &mut output,
+                                            format!("{}    {} {}", "│".dimmed(), "-".red(), del),
+                                        );
+                                        push_line(
+                                            &mut output,
+                                            format!("{}    {} {}", "│".dimmed(), "+".green(), ins),
+                                        );
                                     }
                                     for d in &deletes[paired..] {
-                                        lines.push(format!(
-                                            "{}    {}",
-                                            "│".dimmed(),
-                                            format!("- {d}").red(),
-                                        ));
+                                        push_line(
+                                            &mut output,
+                                            format!(
+                                                "{}    {}",
+                                                "│".dimmed(),
+                                                format!("- {d}").red()
+                                            ),
+                                        );
                                     }
                                     for i in &inserts[paired..] {
-                                        lines.push(format!(
-                                            "{}    {}",
-                                            "│".dimmed(),
-                                            format!("+ {i}").green(),
-                                        ));
+                                        push_line(
+                                            &mut output,
+                                            format!(
+                                                "{}    {}",
+                                                "│".dimmed(),
+                                                format!("+ {i}").green()
+                                            ),
+                                        );
                                     }
                                 }
                             }
@@ -272,25 +286,23 @@ pub fn format_terminal(
             } else if change.change_type == ChangeType::Modified {
                 if let (Some(before), Some(after)) = (&change.before_content, &change.after_content)
                 {
-                    let before_lines: Vec<&str> = before.lines().collect();
-                    let after_lines: Vec<&str> = after.lines().collect();
+                    let before_line_count = before.lines().count();
+                    let after_line_count = after.lines().count();
 
-                    if before_lines.len() <= 3 && after_lines.len() <= 3 {
-                        for line in &before_lines {
+                    if before_line_count <= 3 && after_line_count <= 3 {
+                        for line in before.lines() {
                             let line = sanitize_terminal_text(line.trim());
-                            lines.push(format!(
-                                "{}    {}",
-                                "│".dimmed(),
-                                format!("- {line}").red(),
-                            ));
+                            push_line(
+                                &mut output,
+                                format!("{}    {}", "│".dimmed(), format!("- {line}").red()),
+                            );
                         }
-                        for line in &after_lines {
+                        for line in after.lines() {
                             let line = sanitize_terminal_text(line.trim());
-                            lines.push(format!(
-                                "{}    {}",
-                                "│".dimmed(),
-                                format!("+ {line}").green(),
-                            ));
+                            push_line(
+                                &mut output,
+                                format!("{}    {}", "│".dimmed(), format!("+ {line}").green()),
+                            );
                         }
                     }
                 }
@@ -299,26 +311,35 @@ pub fn format_terminal(
             // Show rename/move details
             if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
-                    lines.push(format!(
-                        "{}    {}",
-                        "│".dimmed(),
-                        format!("from {}", sanitize_terminal_text(old_path)).dimmed(),
-                    ));
+                    push_line(
+                        &mut output,
+                        format!(
+                            "{}    {}",
+                            "│".dimmed(),
+                            format!("from {}", sanitize_terminal_text(old_path)).dimmed(),
+                        ),
+                    );
                 } else if let Some(ref old_parent) = change.old_parent_id {
                     // Intra-file move: extract parent name from entity ID
                     let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
-                    lines.push(format!(
-                        "{}    {}",
-                        "│".dimmed(),
-                        format!("moved from {}", sanitize_terminal_text(parent_name)).dimmed(),
-                    ));
+                    push_line(
+                        &mut output,
+                        format!(
+                            "{}    {}",
+                            "│".dimmed(),
+                            format!("moved from {}", sanitize_terminal_text(parent_name)).dimmed(),
+                        ),
+                    );
                 }
             }
         }
 
-        lines.push("│".dimmed().to_string());
-        lines.push(format!("└{}", "─".repeat(55)).dimmed().to_string());
-        lines.push(String::new());
+        push_line(&mut output, "│".dimmed().to_string());
+        push_line(
+            &mut output,
+            format!("└{}", "─".repeat(55)).dimmed().to_string(),
+        );
+        push_line(&mut output, "");
     }
 
     // Summary
@@ -358,7 +379,11 @@ pub fn format_terminal(
         );
     }
     if !binary_changes.is_empty() {
-        parts.push(format!("{} binary", binary_changes.len()).yellow().to_string());
+        parts.push(
+            format!("{} binary", binary_changes.len())
+                .yellow()
+                .to_string(),
+        );
     }
 
     let reported_file_count = file_count(result, binary_changes);
@@ -376,12 +401,15 @@ pub fn format_terminal(
             .to_string()
     };
 
-    lines.push(format!(
-        "Summary: {} across {} {files_label}{}",
-        parts.join(", "),
-        reported_file_count,
-        orphan_suffix,
-    ));
+    push_line(
+        &mut output,
+        format!(
+            "Summary: {} across {} {files_label}{}",
+            parts.join(", "),
+            reported_file_count,
+            orphan_suffix,
+        ),
+    );
 
     // Show noise-filtered line when entities were analyzed
     let entities_analyzed = result
@@ -396,7 +424,8 @@ pub fn format_terminal(
         + binary_changes.len();
     if entities_analyzed > changes_detected {
         let noise = entities_analyzed - changes_detected;
-        lines.push(
+        push_line(
+            &mut output,
             format!(
                 "Analyzed {} entities, {} unchanged filtered out",
                 entities_analyzed, noise
@@ -416,8 +445,9 @@ pub fn format_terminal(
         .into_iter()
         .collect();
     if !chunk_files.is_empty() {
-        lines.push(String::new());
-        lines.push(
+        push_line(&mut output, "");
+        push_line(
+            &mut output,
             format!(
                 "Warning: {} used line-based chunking (unsupported file extension).",
                 chunk_files.join(", ")
@@ -425,14 +455,15 @@ pub fn format_terminal(
             .yellow()
             .to_string(),
         );
-        lines.push(
+        push_line(
+            &mut output,
             "If this language should be supported, open an issue: https://github.com/Ataraxy-Labs/sem/issues"
                 .dimmed()
                 .to_string(),
         );
     }
 
-    lines.join("\n")
+    output
 }
 
 #[cfg(test)]

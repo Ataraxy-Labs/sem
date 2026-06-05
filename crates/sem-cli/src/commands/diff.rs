@@ -1,10 +1,11 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::process;
 use std::time::Instant;
 
+use git2::{ObjectType, Oid, Repository};
 use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange, FileStatus};
@@ -509,6 +510,52 @@ fn read_file_compare_content(path: &Path) -> Result<Option<String>, std::io::Err
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         Ok(Some(content))
     }
+}
+
+enum WorktreePatchContent {
+    Text(String),
+    Binary,
+}
+
+fn read_git_blob_content(repo: &Repository, sha: &str) -> Option<String> {
+    let object = repo.revparse_single(sha).ok()?;
+    let blob = object.peel_to_blob().ok()?;
+
+    String::from_utf8(blob.content().to_vec()).ok()
+}
+
+fn cached_git_blob_content(
+    repo: Option<&Repository>,
+    blob_cache: &mut HashMap<String, Option<String>>,
+    sha: &str,
+) -> Option<String> {
+    if let Some(content) = blob_cache.get(sha) {
+        return content.clone();
+    }
+
+    let content = repo.and_then(|repo| read_git_blob_content(repo, sha));
+    blob_cache.insert(sha.to_string(), content.clone());
+    content
+}
+
+fn read_worktree_content_matching_sha(
+    worktree_root: &Path,
+    file_path: &str,
+    sha_prefix: &str,
+) -> Option<WorktreePatchContent> {
+    let bytes = std::fs::read(worktree_root.join(file_path)).ok()?;
+    let oid = Oid::hash_object(ObjectType::Blob, &bytes).ok()?;
+    if !oid.to_string().starts_with(sha_prefix) {
+        return None;
+    }
+
+    if bytes_look_binary(&bytes, true) {
+        return Some(WorktreePatchContent::Binary);
+    }
+
+    String::from_utf8(bytes)
+        .ok()
+        .map(WorktreePatchContent::Text)
 }
 
 fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
@@ -1100,36 +1147,8 @@ fn parse_unified_diff(
         return Err(PatchParseError::NoRecognizableHunks);
     }
 
-    // Resolve blob contents via git show
-    let git_show = |sha: &str| -> Option<String> {
-        let output = process::Command::new("git")
-            .args(["show", sha])
-            .current_dir(worktree_root)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            String::from_utf8(output.stdout).ok()
-        } else {
-            None
-        }
-    };
-    let git_hash_object_matches = |file_path: &str, sha_prefix: &str| -> bool {
-        if !worktree_root.join(file_path).exists() {
-            return false;
-        }
-        let output = process::Command::new("git")
-            .args(["hash-object", "--", file_path])
-            .current_dir(worktree_root)
-            .output();
-        let Ok(output) = output else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
-        }
-        let hash = String::from_utf8_lossy(&output.stdout);
-        hash.trim().starts_with(sha_prefix)
-    };
+    let repo = Repository::discover(worktree_root).ok();
+    let mut blob_cache: HashMap<String, Option<String>> = HashMap::new();
 
     Ok(entries
         .into_iter()
@@ -1139,12 +1158,16 @@ fn parse_unified_diff(
             let mut before_content = if is_binary {
                 None
             } else {
-                e.old_sha.as_deref().and_then(&git_show)
+                e.old_sha
+                    .as_deref()
+                    .and_then(|sha| cached_git_blob_content(repo.as_ref(), &mut blob_cache, sha))
             };
             let mut after_content = if is_binary {
                 None
             } else {
-                e.new_sha.as_deref().and_then(&git_show)
+                e.new_sha
+                    .as_deref()
+                    .and_then(|sha| cached_git_blob_content(repo.as_ref(), &mut blob_cache, sha))
             };
 
             // If git cannot resolve the target blob for a local worktree diff,
@@ -1152,14 +1175,15 @@ fn parse_unified_diff(
             if !is_binary
                 && after_content.is_none()
                 && before_content.is_some()
-                && e.new_sha
-                    .as_deref()
-                    .is_some_and(|sha| git_hash_object_matches(&e.file_path, sha))
+                && e.new_sha.is_some()
             {
-                match read_file_compare_content(&worktree_root.join(&e.file_path)) {
-                    Ok(Some(content)) => after_content = Some(content),
-                    Ok(None) => has_binary_content = true,
-                    Err(_) => {}
+                if let Some(content) = e.new_sha.as_deref().and_then(|sha| {
+                    read_worktree_content_matching_sha(worktree_root, &e.file_path, sha)
+                }) {
+                    match content {
+                        WorktreePatchContent::Text(content) => after_content = Some(content),
+                        WorktreePatchContent::Binary => has_binary_content = true,
+                    }
                 }
             }
 

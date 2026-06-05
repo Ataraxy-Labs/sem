@@ -216,3 +216,7 @@ This prints the full AST with node types.
 ## Questions?
 
 Open an issue or check the existing language configs in `languages.rs` for reference. The simplest configs (Python, Bash) are good starting points. The Elixir config shows the call-based approach.
+
+## Performance Fixtures
+
+For graph-build performance work, use the generated JS/TS fixture benchmark in `benchmarks/large-js-fixture/`. It can regenerate large public fixtures and measure cold cache, warm cache, and one-file incremental rebuild timings without relying on private repositories.
