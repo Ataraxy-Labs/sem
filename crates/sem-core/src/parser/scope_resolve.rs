@@ -128,41 +128,40 @@ fn entity_creates_reference_scope(entity_type: &str) -> bool {
     )
 }
 
-fn entity_owns_ref(
-    entity: &SemanticEntity,
+/// A reference-scope child as needed to decide ref ownership: its line range and
+/// (if known) byte span. Precomputed once per entity so the per-ref ownership test
+/// does no HashMap lookups.
+type ChildRefCheck = (usize, usize, Option<(usize, usize)>);
+
+/// Whether `ast_ref` belongs directly to an entity (inside its span, not inside any
+/// of its reference-scope children). `entity_span` and `child_ref_checks` are fetched
+/// once per entity by the caller; this keeps the hot per-ref loop allocation- and
+/// hash-free.
+fn ref_owned_by_entity(
     ast_ref: &AstRef,
-    children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_spans: &HashMap<&str, SourceSpan>,
+    entity_span: Option<SourceSpan>,
+    child_ref_checks: &[ChildRefCheck],
 ) -> bool {
-    let source_line = ast_ref.row + 1;
-    if let Some(entity_span) = entity_spans.get(entity.id.as_str()) {
+    if let Some(entity_span) = entity_span {
         if ast_ref.end_byte <= entity_span.start_byte || ast_ref.start_byte >= entity_span.end_byte
         {
             return false;
         }
     }
 
-    children_by_parent
-        .get(entity.id.as_str())
-        .map_or(true, |children| {
-            children.iter().all(|child| {
-                if !entity_creates_reference_scope(&child.entity_type) {
-                    return true;
+    let source_line = ast_ref.row + 1;
+    child_ref_checks
+        .iter()
+        .all(|(child_start_line, child_end_line, child_span)| {
+            if source_line < *child_start_line || source_line > *child_end_line {
+                return true;
+            }
+            match child_span {
+                Some((start_byte, end_byte)) => {
+                    ast_ref.end_byte <= *start_byte || ast_ref.start_byte >= *end_byte
                 }
-                if child.file_path != entity.file_path
-                    || source_line < child.start_line
-                    || source_line > child.end_line
-                {
-                    return true;
-                }
-
-                if let Some(child_span) = entity_spans.get(child.id.as_str()) {
-                    ast_ref.end_byte <= child_span.start_byte
-                        || ast_ref.start_byte >= child_span.end_byte
-                } else {
-                    false
-                }
-            })
+                None => false,
+            }
         })
 }
 
@@ -429,6 +428,16 @@ impl<'a> FileEntityLookup<'a> {
         Self { by_name }
     }
 
+    /// First entity ID for `name` defined in this file, in entity-discovery order.
+    /// Equivalent to scanning the global symbol table for same-file candidates and
+    /// taking the first, but O(1) instead of O(entities-sharing-this-name).
+    fn first_id_by_name(&self, name: &str) -> Option<&'a str> {
+        self.by_name
+            .get(name)
+            .and_then(|entities| entities.first())
+            .map(|entity| entity.id.as_str())
+    }
+
     fn find_at_line<F>(
         &self,
         name: &str,
@@ -645,7 +654,18 @@ pub(crate) fn resolve_with_scopes_full(
         }
     }
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
-    let ts_default_exports = build_ts_default_export_table(parsed_files, &symbol_table, entity_map);
+    // The default-export table is consulted only while resolving JS/TS imports.
+    // When an import table is supplied (the graph-build path), those imports are
+    // already resolved and `extract_ts_import`/`extract_ts_re_export` are skipped,
+    // so the table is never read — building it would be pure waste on a large repo.
+    let ts_default_exports = if pre_built_import_table.is_some() {
+        TsDefaultExportTable {
+            exports_by_file: HashMap::new(),
+            sorted_files: Vec::new(),
+        }
+    } else {
+        build_ts_default_export_table(parsed_files, &symbol_table, entity_map)
+    };
     let top_level_entities = OnceLock::new();
 
     // Pass 1: Scan ALL files for return types and instance attr types first
@@ -725,6 +745,24 @@ pub(crate) fn resolve_with_scopes_full(
     let swift_call_signatures =
         build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map);
 
+    // Group the prebuilt import table by importing file once. Otherwise every file
+    // in Pass 2 would rescan the entire table to find its own entries — O(files ×
+    // imports), which is quadratic on a large repo. Grouping makes each file O(its
+    // own imports).
+    let import_table_by_file: HashMap<&str, Vec<(&str, &str)>> =
+        if let Some(import_table) = pre_built_import_table {
+            let mut grouped: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+            for ((import_file_path, local_name), target_id) in import_table {
+                grouped
+                    .entry(import_file_path.as_str())
+                    .or_default()
+                    .push((local_name.as_str(), target_id.as_str()));
+            }
+            grouped
+        } else {
+            HashMap::new()
+        };
+
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
     let per_file_results: Vec<(
         Vec<(String, String, RefType)>,
@@ -784,16 +822,17 @@ pub(crate) fn resolve_with_scopes_full(
             );
 
             let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
-            if let Some(import_table) = pre_built_import_table {
-                for ((import_file_path, local_name), target_id) in import_table {
-                    if import_file_path != file_path {
-                        continue;
+            if pre_built_import_table.is_some() {
+                if let Some(entries) = import_table_by_file.get(file_path.as_str()) {
+                    for (local_name, target_id) in entries {
+                        local_import_table.insert(
+                            (file_path.clone(), (*local_name).to_string()),
+                            (*target_id).to_string(),
+                        );
+                        scopes[0]
+                            .defs
+                            .insert((*local_name).to_string(), (*target_id).to_string());
                     }
-                    local_import_table.insert(
-                        (import_file_path.clone(), local_name.clone()),
-                        target_id.clone(),
-                    );
-                    scopes[0].defs.insert(local_name.clone(), target_id.clone());
                 }
             }
             extract_imports_from_ast(
@@ -820,6 +859,14 @@ pub(crate) fn resolve_with_scopes_full(
                 file_path,
                 entity_map,
             );
+
+            // The per-file import table is keyed by (file_path, name) but only ever
+            // holds this file's entries, so re-key it by name once. resolve_ref then
+            // looks up imports without allocating a key string per reference.
+            let local_import_by_name: HashMap<&str, &str> = local_import_table
+                .iter()
+                .map(|((_, name), target_id)| (name.as_str(), target_id.as_str()))
+                .collect();
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
@@ -851,11 +898,34 @@ pub(crate) fn resolve_with_scopes_full(
                         &descendant_ranges_by_entity,
                     );
                 }
-                add_local_bindings_to_consumed_words(
-                    file_consumed_words.entry(entity.id.clone()).or_default(),
-                    scope_idx,
-                    &scopes,
-                );
+                // Hoist per-entity lookups out of the per-reference loop. Each reference
+                // previously re-hashed the entity id against several maps (and every
+                // child id, once per ref); on dense, deeply nested files that hashing
+                // dominated resolution. Fetch them once per entity instead.
+                let entity_consumed = file_consumed_words.entry(entity.id.clone()).or_default();
+                add_local_bindings_to_consumed_words(entity_consumed, scope_idx, &scopes);
+
+                let entity_span = entity_spans.get(entity.id.as_str()).copied();
+                let child_ref_checks: Vec<ChildRefCheck> = children_by_parent
+                    .get(entity.id.as_str())
+                    .map(|children| {
+                        children
+                            .iter()
+                            .filter(|child| {
+                                entity_creates_reference_scope(&child.entity_type)
+                                    && child.file_path == entity.file_path
+                            })
+                            .map(|child| {
+                                let span = entity_spans
+                                    .get(child.id.as_str())
+                                    .map(|span| (span.start_byte, span.end_byte));
+                                (child.start_line, child.end_line, span)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let entity_descendant_ranges = descendant_ranges_by_entity.get(&entity.id);
+
                 let allow_implicit_instance_member_receiver =
                     allows_implicit_instance_member_receiver(
                         file_path,
@@ -867,14 +937,10 @@ pub(crate) fn resolve_with_scopes_full(
                 for row_refs in &refs_by_row[start_row..end_row] {
                     for &ref_idx in row_refs {
                         let ast_ref = &all_file_refs[ref_idx];
-                        if !entity_owns_ref(entity, ast_ref, &children_by_parent, &entity_spans) {
+                        if !ref_owned_by_entity(ast_ref, entity_span, &child_ref_checks) {
                             continue;
                         }
-                        if row_belongs_to_descendant(
-                            &descendant_ranges_by_entity,
-                            &entity.id,
-                            ast_ref.row,
-                        ) {
+                        if row_in_descendant_ranges(entity_descendant_ranges, ast_ref.row) {
                             continue;
                         }
                         // Skip self-name refs (was previously done during collection)
@@ -897,7 +963,7 @@ pub(crate) fn resolve_with_scopes_full(
                             &symbol_table,
                             &class_members,
                             &owner_members,
-                            &local_import_table,
+                            &local_import_by_name,
                             &instance_attr_types,
                             entity_map,
                             &swift_call_signatures,
@@ -905,6 +971,7 @@ pub(crate) fn resolve_with_scopes_full(
                             &entity.id,
                             allow_cross_file,
                             allow_implicit_instance_member_receiver,
+                            &file_lookup,
                             &mut lookup_cache,
                         );
 
@@ -925,10 +992,7 @@ pub(crate) fn resolve_with_scopes_full(
                                         target_id.clone(),
                                         ref_type,
                                     ));
-                                    add_scope_reference_words(
-                                        file_consumed_words.entry(entity.id.clone()).or_default(),
-                                        &reference,
-                                    );
+                                    add_scope_reference_words(entity_consumed, &reference);
                                     file_log.push(ResolutionEntry {
                                         from_entity: entity.id.clone(),
                                         reference,
@@ -939,10 +1003,7 @@ pub(crate) fn resolve_with_scopes_full(
                             }
                         } else {
                             let reference = ref_description(ast_ref);
-                            add_scope_reference_words(
-                                file_consumed_words.entry(entity.id.clone()).or_default(),
-                                &reference,
-                            );
+                            add_scope_reference_words(entity_consumed, &reference);
                             file_log.push(ResolutionEntry {
                                 from_entity: entity.id.clone(),
                                 reference,
@@ -1160,15 +1221,19 @@ fn row_belongs_to_descendant(
     entity_id: &str,
     row: usize,
 ) -> bool {
-    descendant_ranges_by_entity
-        .get(entity_id)
-        .map_or(false, |ranges| {
-            let eligible = ranges.partition_point(|(start, _)| *start <= row);
-            ranges[..eligible]
-                .iter()
-                .rev()
-                .any(|(start, end)| row >= *start && row < *end)
-        })
+    row_in_descendant_ranges(descendant_ranges_by_entity.get(entity_id), row)
+}
+
+/// Same check as [`row_belongs_to_descendant`], but over pre-fetched ranges so the
+/// per-ref loop avoids a HashMap lookup per reference.
+fn row_in_descendant_ranges(ranges: Option<&Vec<(usize, usize)>>, row: usize) -> bool {
+    ranges.map_or(false, |ranges| {
+        let eligible = ranges.partition_point(|(start, _)| *start <= row);
+        ranges[..eligible]
+            .iter()
+            .rev()
+            .any(|(start, end)| row >= *start && row < *end)
+    })
 }
 
 /// Build scope tree by walking the AST.
@@ -3502,38 +3567,52 @@ fn build_ts_default_export_table(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> TsDefaultExportTable {
+    // Per-file AST extraction is independent, so run it in parallel and merge.
+    // Collecting preserves file order, so the merged result matches a sequential scan.
+    let per_file: Vec<(Option<(String, String)>, Vec<TsDefaultReExport>)> =
+        maybe_par_iter!(parsed_files)
+            .filter_map(|(file_path, content, tree)| {
+                if !is_js_ts_file(file_path) {
+                    return None;
+                }
+
+                let extracted = extract_ts_default_exports(tree.root_node(), content.as_bytes());
+                let mut default_export: Option<(String, String)> = None;
+                for name in extracted.names {
+                    let Some(target_ids) = symbol_table.get(&name) else {
+                        continue;
+                    };
+                    let target = target_ids.iter().find(|id| {
+                        entity_map.get(*id).map_or(false, |entity| {
+                            entity.file_path == *file_path && entity.parent_id.is_none()
+                        })
+                    });
+                    if let Some(target_id) = target {
+                        default_export = Some((file_path.clone(), target_id.clone()));
+                    }
+                }
+
+                let re_exports: Vec<TsDefaultReExport> = extracted
+                    .re_exports
+                    .into_iter()
+                    .map(|(original_name, module_path)| TsDefaultReExport {
+                        file_path: file_path.clone(),
+                        original_name,
+                        module_path,
+                    })
+                    .collect();
+
+                Some((default_export, re_exports))
+            })
+            .collect();
+
     let mut default_exports = HashMap::new();
     let mut re_exports = Vec::new();
-
-    for (file_path, content, tree) in parsed_files {
-        if !is_js_ts_file(file_path) {
-            continue;
+    for (default_export, file_re_exports) in per_file {
+        if let Some((file_path, target_id)) = default_export {
+            default_exports.insert(file_path, target_id);
         }
-
-        let extracted = extract_ts_default_exports(tree.root_node(), content.as_bytes());
-        for name in extracted.names {
-            let Some(target_ids) = symbol_table.get(&name) else {
-                continue;
-            };
-            let target = target_ids.iter().find(|id| {
-                entity_map.get(*id).map_or(false, |entity| {
-                    entity.file_path == *file_path && entity.parent_id.is_none()
-                })
-            });
-            if let Some(target_id) = target {
-                default_exports.insert(file_path.clone(), target_id.clone());
-            }
-        }
-        re_exports.extend(
-            extracted
-                .re_exports
-                .into_iter()
-                .map(|(original_name, module_path)| TsDefaultReExport {
-                    file_path: file_path.clone(),
-                    original_name,
-                    module_path,
-                }),
-        );
+        re_exports.extend(file_re_exports);
     }
 
     resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
@@ -5204,7 +5283,7 @@ fn resolve_ref(
     symbol_table: &HashMap<String, Vec<String>>,
     class_members: &HashMap<String, Vec<(String, String)>>,
     owner_members: &HashMap<String, Vec<(String, String)>>,
-    import_table: &HashMap<(String, String), String>,
+    import_table_by_name: &HashMap<&str, &str>,
     instance_attr_types: &HashMap<(String, String), String>,
     entity_map: &HashMap<String, EntityInfo>,
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
@@ -5212,6 +5291,7 @@ fn resolve_ref(
     from_entity_id: &str,
     allow_cross_file_calls: bool,
     allow_implicit_instance_member_receiver: bool,
+    file_lookup: &FileEntityLookup<'_>,
     lookup_cache: &mut ScopeLookupCache,
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
@@ -5223,8 +5303,50 @@ fn resolve_ref(
                 return None;
             }
 
-            if argument_labels.is_some() {
-                if let Some(target_ids) = symbol_table.get(name.as_str()) {
+            // Swift overload disambiguation needs call-signature data that is only
+            // built for Swift sources. For every other language the pre-resolution
+            // candidate scan below is inert, yet it scans the global symbol table —
+            // in a large monorepo a single common name maps to thousands of entities,
+            // so this scan dominates graph resolution. Skip it unless Swift
+            // signatures are present.
+            if !swift_call_signatures.is_empty() {
+                if argument_labels.is_some() {
+                    if let Some(target_ids) = symbol_table.get(name.as_str()) {
+                        let same_file_targets: Vec<&String> = target_ids
+                            .iter()
+                            .filter(|id| {
+                                entity_map
+                                    .get(*id)
+                                    .map_or(false, |e| e.file_path == file_path)
+                            })
+                            .collect();
+                        let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
+                            same_file_targets
+                        } else if allow_cross_file_calls {
+                            target_ids.iter().collect()
+                        } else {
+                            Vec::new()
+                        };
+                        match select_swift_overload_candidate(
+                            &visible_targets,
+                            argument_labels.as_deref(),
+                            swift_call_signatures,
+                        ) {
+                            SwiftOverloadSelection::Matched(target_id) => {
+                                let is_constructor =
+                                    name.chars().next().map_or(false, |c| c.is_uppercase());
+                                let ref_type = if is_constructor {
+                                    RefType::TypeRef
+                                } else {
+                                    RefType::Calls
+                                };
+                                return Some((target_id, ref_type, "scope_chain"));
+                            }
+                            SwiftOverloadSelection::NoMatch => return None,
+                            SwiftOverloadSelection::NotApplicable => {}
+                        }
+                    }
+                } else if let Some(target_ids) = symbol_table.get(name.as_str()) {
                     let same_file_targets: Vec<&String> = target_ids
                         .iter()
                         .filter(|id| {
@@ -5240,44 +5362,12 @@ fn resolve_ref(
                     } else {
                         Vec::new()
                     };
-                    match select_swift_overload_candidate(
+                    if has_ambiguous_swift_signature_candidates(
                         &visible_targets,
-                        argument_labels.as_deref(),
                         swift_call_signatures,
                     ) {
-                        SwiftOverloadSelection::Matched(target_id) => {
-                            let is_constructor =
-                                name.chars().next().map_or(false, |c| c.is_uppercase());
-                            let ref_type = if is_constructor {
-                                RefType::TypeRef
-                            } else {
-                                RefType::Calls
-                            };
-                            return Some((target_id, ref_type, "scope_chain"));
-                        }
-                        SwiftOverloadSelection::NoMatch => return None,
-                        SwiftOverloadSelection::NotApplicable => {}
+                        return None;
                     }
-                }
-            } else if let Some(target_ids) = symbol_table.get(name.as_str()) {
-                let same_file_targets: Vec<&String> = target_ids
-                    .iter()
-                    .filter(|id| {
-                        entity_map
-                            .get(*id)
-                            .map_or(false, |e| e.file_path == file_path)
-                    })
-                    .collect();
-                let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
-                    same_file_targets
-                } else if allow_cross_file_calls {
-                    target_ids.iter().collect()
-                } else {
-                    Vec::new()
-                };
-                if has_ambiguous_swift_signature_candidates(&visible_targets, swift_call_signatures)
-                {
-                    return None;
                 }
             }
 
@@ -5288,10 +5378,11 @@ fn resolve_ref(
                 }
             }
 
-            // 2. Check import table
-            let key = (file_path.to_string(), name.clone());
-            if let Some(target_id) = import_table.get(&key) {
-                return Some((target_id.clone(), RefType::Calls, "import"));
+            // 2. Check import table. The per-file table only holds this file's
+            // imports, so a name lookup suffices — avoiding a (path, name) key string
+            // allocated for every reference (millions on a large repo).
+            if let Some(target_id) = import_table_by_name.get(name.as_str()) {
+                return Some(((*target_id).to_string(), RefType::Calls, "import"));
             }
 
             // 3. Global symbol table fallback (constructor calls or cross-file functions)
@@ -5302,6 +5393,29 @@ fn resolve_ref(
                 } else {
                     RefType::Calls
                 };
+
+                if swift_call_signatures.is_empty() {
+                    // Fast path: the per-file name index gives the first same-file
+                    // definition in O(1); the cross-file fallback takes the first
+                    // global definition. Both preserve entity-discovery order, so the
+                    // result matches the candidate scan below without iterating the
+                    // thousands of same-named entities a monorepo accumulates.
+                    let target = file_lookup
+                        .first_id_by_name(name)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            if is_constructor || allow_cross_file_calls {
+                                target_ids.first().cloned()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(tid) = target {
+                        return Some((tid, ref_type, "scope_chain"));
+                    }
+                    return None;
+                }
+
                 let same_file_targets: Vec<&String> = target_ids
                     .iter()
                     .filter(|id| {
@@ -5572,9 +5686,8 @@ fn resolve_ref(
 
             // Fallback: check import table for the receiver
             if !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache) {
-                let key = (file_path.to_string(), receiver.to_string());
-                if let Some(target_id) = import_table.get(&key) {
-                    if let Some(info) = entity_map.get(target_id) {
+                if let Some(target_id) = import_table_by_name.get(receiver) {
+                    if let Some(info) = entity_map.get(*target_id) {
                         if matches!(info.entity_type.as_str(), "class" | "struct") {
                             if let Some(members) = class_members.get(&info.name) {
                                 match select_member_candidate(
@@ -5595,18 +5708,17 @@ fn resolve_ref(
                 }
 
                 // Namespace import: alias.method()
-                let key = (file_path.to_string(), format!("{receiver}.{method}"));
-                if let Some(target_id) = import_table.get(&key) {
-                    return Some((target_id.clone(), RefType::Calls, "import"));
+                let namespaced = format!("{receiver}.{method}");
+                if let Some(target_id) = import_table_by_name.get(namespaced.as_str()) {
+                    return Some(((*target_id).to_string(), RefType::Calls, "import"));
                 }
             }
 
             // Go package-qualified call: package.Function()
             // Try the method name directly in the import table
             if file_path.ends_with(".go") {
-                let key = (file_path.to_string(), method.clone());
-                if let Some(target_id) = import_table.get(&key) {
-                    return Some((target_id.clone(), RefType::Calls, "import"));
+                if let Some(target_id) = import_table_by_name.get(method.as_str()) {
+                    return Some(((*target_id).to_string(), RefType::Calls, "import"));
                 }
             }
 

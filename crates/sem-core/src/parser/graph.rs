@@ -2481,39 +2481,53 @@ fn build_ts_default_export_table(
     entity_map: &HashMap<String, EntityInfo>,
     content_map: &HashMap<&str, &str>,
 ) -> TsDefaultExportTable {
+    // Per-file extraction is independent, so run it in parallel and merge. Each
+    // file contributes at most one default export (last name wins, as below) plus
+    // any default re-export records. Collecting preserves file order, so the merged
+    // result is identical to a sequential scan.
+    let per_file: Vec<(Option<(String, String)>, Vec<TsDefaultReExport>)> =
+        maybe_par_iter!(file_paths)
+            .filter_map(|file_path| {
+                if !is_js_ts_file(file_path) {
+                    return None;
+                }
+                let content = content_map.get(file_path.as_str()).copied()?;
+
+                let mut default_export: Option<(String, String)> = None;
+                for name in default_export_names_from_content(content) {
+                    let Some(target_ids) = symbol_table.get(name.as_str()) else {
+                        continue;
+                    };
+                    let target = target_ids.iter().find(|id| {
+                        entity_map.get(*id).map_or(false, |entity| {
+                            entity.file_path == *file_path && entity.parent_id.is_none()
+                        })
+                    });
+                    if let Some(target_id) = target {
+                        default_export = Some((file_path.clone(), target_id.clone()));
+                    }
+                }
+
+                let re_exports: Vec<TsDefaultReExport> = default_re_exports_from_content(content)
+                    .into_iter()
+                    .map(|(original_name, module_path)| TsDefaultReExport {
+                        file_path: file_path.clone(),
+                        original_name,
+                        module_path,
+                    })
+                    .collect();
+
+                Some((default_export, re_exports))
+            })
+            .collect();
+
     let mut default_exports = HashMap::new();
     let mut re_exports = Vec::new();
-
-    for file_path in file_paths {
-        if !is_js_ts_file(file_path) {
-            continue;
+    for (default_export, file_re_exports) in per_file {
+        if let Some((file_path, target_id)) = default_export {
+            default_exports.insert(file_path, target_id);
         }
-
-        let Some(content) = content_map.get(file_path.as_str()).copied() else {
-            continue;
-        };
-
-        for name in default_export_names_from_content(content) {
-            let Some(target_ids) = symbol_table.get(name.as_str()) else {
-                continue;
-            };
-            let target = target_ids.iter().find(|id| {
-                entity_map.get(*id).map_or(false, |entity| {
-                    entity.file_path == *file_path && entity.parent_id.is_none()
-                })
-            });
-            if let Some(target_id) = target {
-                default_exports.insert(file_path.clone(), target_id.clone());
-            }
-        }
-
-        for (original_name, module_path) in default_re_exports_from_content(content) {
-            re_exports.push(TsDefaultReExport {
-                file_path: file_path.clone(),
-                original_name,
-                module_path,
-            });
-        }
+        re_exports.extend(file_re_exports);
     }
 
     resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
