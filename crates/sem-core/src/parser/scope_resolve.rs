@@ -4516,10 +4516,7 @@ fn register_ts_namespace_import<'a>(
             .clone()
     };
     for (name, target_id) in entries {
-        let is_export_entity = entity_map
-            .get(target_id)
-            .map_or(false, |entity| entity.entity_type == "export");
-        if !is_export_entity && !exported_names.contains(name) {
+        if !exported_names.contains(name) {
             continue;
         }
         let qualified_name = format!("{alias}.{name}");

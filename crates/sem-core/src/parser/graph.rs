@@ -2992,10 +2992,7 @@ fn build_import_table(
                             .clone()
                     };
                     for (name, target_id) in entries {
-                        let is_export_entity = entity_map
-                            .get(target_id)
-                            .map_or(false, |entity| entity.entity_type == "export");
-                        if !is_export_entity && !exported_names.contains(name) {
+                        if !exported_names.contains(name) {
                             continue;
                         }
                         local_imports.push((
@@ -6128,6 +6125,58 @@ export function usePublicCore(): string { return publicCore(); }
                 .iter()
                 .any(|d| d.name == "publicCore" && d.file_path == "barrel.ts"),
             "consumer should resolve publicCore through the barrel export. Deps: {:?}",
+            consumer_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_namespace_import_resolves_re_export_alias() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "lib.ts",
+            "\
+export function core(): string { return 'core'; }
+",
+        );
+        write_file(
+            root,
+            "barrel.ts",
+            "\
+export { core as publicCore } from './lib';
+",
+        );
+        write_file(
+            root,
+            "consumer.ts",
+            "\
+import * as barrel from './barrel';
+export function usePublicCore(): string { return barrel.publicCore(); }
+",
+        );
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "barrel.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let use_public_core_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("usePublicCore"))
+            .expect("usePublicCore entity should exist");
+        let consumer_deps = graph.get_dependencies(use_public_core_id);
+        assert!(
+            consumer_deps
+                .iter()
+                .any(|d| d.name == "publicCore" && d.file_path == "barrel.ts"),
+            "namespace import should resolve the exported barrel alias. Deps: {:?}",
             consumer_deps
                 .iter()
                 .map(|d| (&d.name, &d.file_path))
