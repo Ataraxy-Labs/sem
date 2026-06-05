@@ -33,7 +33,10 @@ macro_rules! maybe_par_iter {
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
-use crate::parser::import_resolution::{find_import_target, import_source_matches_file};
+use crate::parser::import_resolution::{
+    find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
+    sort_import_candidate_files, JS_TS_EXTENSIONS,
+};
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
@@ -420,7 +423,7 @@ impl FileReferenceIndex {
                     RefType::Imports
                 } else {
                     RefType::TypeRef
-                    };
+                };
                 (word, ref_type)
             })
             .collect()
@@ -737,9 +740,14 @@ impl EntityGraph {
         let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
         let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
         let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
+                scope_owner_members
+                    .entry(pid.clone())
+                    .or_default()
+                    .push((entity.name.clone(), entity.id.clone()));
                 if let Some(&parent_name) = id_to_name.get(pid.as_str()) {
                     if class_entity_names.contains(parent_name) {
                         enclosing_class.insert(entity.id.as_str(), parent_name);
@@ -825,6 +833,7 @@ impl EntityGraph {
         let pre_built = scope_resolve::PreBuiltLookups {
             symbol_table: Arc::clone(&symbol_table),
             class_members: scope_class_members,
+            owner_members: scope_owner_members,
             entity_ranges: scope_entity_ranges,
             go_pkg_index: owned_go_pkg_index,
         };
@@ -846,6 +855,7 @@ impl EntityGraph {
                 &entity_map,
                 Some(parsed_files),
                 Some(pre_built),
+                Some(&import_table),
             );
             let consumed_words = build_scope_consumed_words(&result.resolution_log);
             (result.edges, consumed_words)
@@ -870,7 +880,7 @@ impl EntityGraph {
                     crate::parser::plugins::code::languages::get_language_config(ext)
                 else {
                     return vec![];
-                    };
+                };
                 let fallback_end_line =
                     fallback_reference_end_line(entity, language_config.scope_resolve.is_some());
                 let fallback_ranges =
@@ -921,7 +931,7 @@ impl EntityGraph {
                                 })
                                 .collect()
                         }
-                };
+                    };
 
                 for (receiver, member, position) in &dot_chains {
                     if consumed_words.contains(*member) {
@@ -1063,8 +1073,11 @@ impl EntityGraph {
             })
             .collect();
 
+        let export_edges = build_export_alias_edges(&all_entities, &import_table);
+
         // Merge scope edges with bag-of-words edges, deduplicating
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(export_edges);
         combined.extend(resolved_refs);
         let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
         let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
@@ -1609,6 +1622,7 @@ impl EntityGraph {
                 &entity_map,
                 pre,
                 None,
+                Some(&import_table),
             );
             let consumed_words = build_scope_consumed_words(&result.resolution_log);
             (result.edges, consumed_words)
@@ -1680,7 +1694,7 @@ impl EntityGraph {
                                 })
                                 .collect()
                         }
-                };
+                    };
 
                 for (receiver, member, position) in &dot_chains {
                     if consumed_words.contains(*member) {
@@ -1813,8 +1827,11 @@ impl EntityGraph {
             })
             .collect();
 
+        let export_edges = build_export_alias_edges(&all_entities, &import_table);
+
         // Merge scope edges + bag-of-words edges + kept cached edges
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        combined.extend(export_edges);
         combined.extend(resolved_refs);
         let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
         let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
@@ -2358,6 +2375,274 @@ fn is_test_entity(entity: &crate::model::entity::SemanticEntity) -> bool {
     in_test_file && has_test_marker
 }
 
+fn build_export_alias_edges(
+    all_entities: &[SemanticEntity],
+    import_table: &HashMap<(String, String), String>,
+) -> Vec<(String, String, RefType)> {
+    all_entities
+        .iter()
+        .filter(|entity| entity.entity_type == "export")
+        .filter_map(|entity| {
+            let key = (entity.file_path.clone(), entity.name.clone());
+            let target_id = import_table.get(&key)?;
+            if target_id == &entity.id {
+                return None;
+            }
+            Some((entity.id.clone(), target_id.clone(), RefType::Imports))
+        })
+        .collect()
+}
+
+struct TsDefaultExportTable {
+    exports_by_file: HashMap<String, String>,
+    sorted_files: Vec<String>,
+}
+
+struct TsDefaultReExport {
+    file_path: String,
+    original_name: String,
+    module_path: String,
+}
+
+fn build_ts_default_export_table(
+    file_paths: &[String],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    content_map: &HashMap<&str, &str>,
+) -> TsDefaultExportTable {
+    let mut default_exports = HashMap::new();
+    let mut re_exports = Vec::new();
+
+    for file_path in file_paths {
+        if !is_js_ts_file(file_path) {
+            continue;
+        }
+
+        let Some(content) = content_map.get(file_path.as_str()).copied() else {
+            continue;
+        };
+
+        for name in default_export_names_from_content(content) {
+            let Some(target_ids) = symbol_table.get(name.as_str()) else {
+                continue;
+            };
+            let target = target_ids.iter().find(|id| {
+                entity_map.get(*id).map_or(false, |entity| {
+                    entity.file_path == *file_path && entity.parent_id.is_none()
+                })
+            });
+            if let Some(target_id) = target {
+                default_exports.insert(file_path.clone(), target_id.clone());
+            }
+        }
+
+        for (original_name, module_path) in default_re_exports_from_content(content) {
+            re_exports.push(TsDefaultReExport {
+                file_path: file_path.clone(),
+                original_name,
+                module_path,
+            });
+        }
+    }
+
+    resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
+
+    let sorted_files = sorted_default_export_files(&default_exports);
+
+    TsDefaultExportTable {
+        exports_by_file: default_exports,
+        sorted_files,
+    }
+}
+
+fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec<String> {
+    let mut sorted_files: Vec<String> = default_exports.keys().cloned().collect();
+    sort_import_candidate_files(&mut sorted_files, JS_TS_EXTENSIONS);
+    sorted_files
+}
+
+fn resolve_ts_default_re_exports(
+    default_exports: &mut HashMap<String, String>,
+    pending: Vec<TsDefaultReExport>,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    let mut pending = pending;
+    while !pending.is_empty() {
+        let sorted_files = sorted_default_export_files(default_exports);
+        let mut unresolved = Vec::new();
+        let mut progressed = false;
+
+        for re_export in pending {
+            let target_id = if re_export.original_name == "default" {
+                find_import_file(
+                    &sorted_files,
+                    &re_export.module_path,
+                    &re_export.file_path,
+                    JS_TS_EXTENSIONS,
+                )
+                .and_then(|target_file| default_exports.get(target_file))
+                .cloned()
+            } else {
+                symbol_table
+                    .get(&re_export.original_name)
+                    .and_then(|target_ids| {
+                        find_import_target(
+                            target_ids,
+                            &re_export.module_path,
+                            &re_export.file_path,
+                            JS_TS_EXTENSIONS,
+                            entity_map,
+                        )
+                        .cloned()
+                    })
+            };
+
+            if let Some(target_id) = target_id {
+                default_exports.insert(re_export.file_path, target_id);
+                progressed = true;
+            } else {
+                unresolved.push(re_export);
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+        pending = unresolved;
+    }
+}
+
+fn default_export_names_from_content(content: &str) -> Vec<String> {
+    static DEFAULT_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bexport\s+default\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][\w$]*)")
+            .unwrap()
+    });
+    static DEFAULT_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bexport\s+default\s+(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)").unwrap()
+    });
+    static DEFAULT_IDENTIFIER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\bexport\s+default\s+([A-Za-z_$][\w$]*)").unwrap());
+    static DEFAULT_SPECIFIER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*;?"#).unwrap());
+
+    let mut names = Vec::new();
+    for cap in DEFAULT_FUNCTION_RE.captures_iter(content) {
+        names.push(cap.get(1).unwrap().as_str().to_string());
+    }
+    for cap in DEFAULT_CLASS_RE.captures_iter(content) {
+        names.push(cap.get(1).unwrap().as_str().to_string());
+    }
+    for cap in DEFAULT_IDENTIFIER_RE.captures_iter(content) {
+        let name = cap.get(1).unwrap();
+        let line_tail = content[name.end()..]
+            .split_once('\n')
+            .map_or(&content[name.end()..], |(line, _)| line);
+        if only_js_ts_statement_trivia(line_tail) {
+            names.push(name.as_str().to_string());
+        }
+    }
+    for cap in DEFAULT_SPECIFIER_RE.captures_iter(content) {
+        let rest = content[cap.get(0).unwrap().end()..].trim_start();
+        if rest.starts_with("from ") {
+            continue;
+        }
+        let names_str = cap.get(1).unwrap().as_str();
+        for name_part in names_str.split(',') {
+            let Some((original_name, local_name)) = parse_js_ts_import_specifier(name_part) else {
+                continue;
+            };
+            if local_name == "default" {
+                names.push(original_name.to_string());
+            }
+        }
+    }
+
+    names
+}
+
+fn default_re_exports_from_content(content: &str) -> Vec<(String, String)> {
+    static REEXPORT_SPECIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+    });
+
+    let mut re_exports = Vec::new();
+    for cap in REEXPORT_SPECIFIER_RE.captures_iter(content) {
+        let names_str = cap.get(1).unwrap().as_str();
+        let module_path = cap.get(2).unwrap().as_str();
+        for name_part in names_str.split(',') {
+            let Some((original_name, local_name)) = parse_js_ts_import_specifier(name_part) else {
+                continue;
+            };
+            if local_name == "default" {
+                re_exports.push((original_name.to_string(), module_path.to_string()));
+            }
+        }
+    }
+    re_exports
+}
+
+fn only_js_ts_statement_trivia(mut text: &str) -> bool {
+    loop {
+        text = text.trim_start();
+        if let Some(rest) = text.strip_prefix(';') {
+            text = rest;
+            continue;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        if text.starts_with("//") {
+            return true;
+        }
+        if let Some(rest) = text.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return false;
+            };
+            text = &rest[end + 2..];
+            continue;
+        }
+        return false;
+    }
+}
+
+fn resolve_default_export_target(
+    default_exports: &TsDefaultExportTable,
+    module_path: &str,
+    file_path: &str,
+) -> Option<String> {
+    let target_file = find_import_file(
+        &default_exports.sorted_files,
+        module_path,
+        file_path,
+        JS_TS_EXTENSIONS,
+    )?;
+    default_exports.exports_by_file.get(target_file).cloned()
+}
+
+fn parse_js_ts_import_specifier(name_part: &str) -> Option<(&str, &str)> {
+    let name_part = name_part.trim();
+    if name_part.is_empty() {
+        return None;
+    }
+
+    let (original, local) = if let Some(pos) = name_part.find(" as ") {
+        let original = name_part[..pos].trim();
+        let local = name_part[pos + 4..].trim();
+        (original, local)
+    } else {
+        (name_part, name_part)
+    };
+
+    let original = original.strip_prefix("type ").unwrap_or(original).trim();
+    let local = local.strip_prefix("type ").unwrap_or(local).trim();
+    if original.is_empty() || local.is_empty() {
+        return None;
+    }
+
+    Some((original, local))
+}
+
 /// Build import table: maps (file_path, imported_name) → target entity ID.
 ///
 /// Parses `from X import Y` / `import X` / `use X` style statements from entity content
@@ -2370,14 +2655,30 @@ fn build_import_table(
     pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
 ) -> HashMap<(String, String), String> {
     // Build a content lookup from pre-parsed files to avoid re-reading from disk
-    let content_map: HashMap<&str, &str> = pre_parsed_content
-        .map(|files| {
+    let mut content_map: HashMap<&str, &str> = HashMap::new();
+    if let Some(files) = pre_parsed_content {
+        content_map.extend(
             files
                 .iter()
-                .map(|(fp, content, _)| (fp.as_str(), content.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+                .map(|(fp, content, _)| (fp.as_str(), content.as_str())),
+        );
+    }
+    let mut owned_content: HashMap<String, String> = HashMap::new();
+    for file_path in file_paths {
+        if file_path.ends_with(".go") || content_map.contains_key(file_path.as_str()) {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(root.join(file_path)) {
+            owned_content.insert(file_path.clone(), content);
+        }
+    }
+    content_map.extend(
+        owned_content
+            .iter()
+            .map(|(file_path, content)| (file_path.as_str(), content.as_str())),
+    );
+    let ts_default_exports =
+        build_ts_default_export_table(file_paths, symbol_table, entity_map, &content_map);
 
     // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
     // We no longer need a go_pkg_index here since Go files are skipped below.
@@ -2390,17 +2691,8 @@ fn build_import_table(
                 return None;
             }
 
-            // Use pre-parsed content if available, otherwise read from disk
-            let owned_content: Option<String>;
-            let content: &str = if let Some(c) = content_map.get(file_path.as_str()) {
-                c
-            } else {
-                let full_path = root.join(file_path);
-                owned_content = std::fs::read_to_string(&full_path).ok();
-                match owned_content.as_deref() {
-                    Some(c) => c,
-                    None => return None,
-                }
+            let Some(content) = content_map.get(file_path.as_str()).copied() else {
+                return None;
             };
 
             let mut local_imports: Vec<((String, String), String)> = Vec::new();
@@ -2487,15 +2779,24 @@ fn build_import_table(
 
             // JS/TS imports: import { foo, bar as baz } from './module'
             //                import Foo from './module'
-            let is_js_ts = file_path.ends_with(".js") || file_path.ends_with(".ts")
-                || file_path.ends_with(".jsx") || file_path.ends_with(".tsx");
+            let is_js_ts = is_js_ts_file(file_path);
 
             if is_js_ts {
                 static JS_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+                    Regex::new(
+                        r#"import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#,
+                    )
+                    .unwrap()
                 });
                 static JS_DEFAULT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(r#"import\s+(?:type\s+)?([A-Za-z_]\w*)\s+from\s*['"]([^'"]+)['"]"#).unwrap()
+                    Regex::new(
+                        r#"import\s+(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s*,\s*\{[^}]*\})?\s*from\s*['"]([^'"]+)['"]"#,
+                    )
+                    .unwrap()
+                });
+                static JS_REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#)
+                        .unwrap()
                 });
 
                 for cap in JS_NAMED_RE.captures_iter(content) {
@@ -2503,28 +2804,18 @@ fn build_import_table(
                     let module_path = cap.get(2).unwrap().as_str();
 
                     for name_part in names_str.split(',') {
-                        let name_part = name_part.trim();
-                        if name_part.is_empty() { continue; }
-
-                        // Handle "foo as bar" aliases and "type foo" prefixes
-                        let (original_name, local_name) = if let Some(pos) = name_part.find(" as ") {
-                            let orig = name_part[..pos].trim();
-                            let local = name_part[pos + 4..].trim();
-                            let orig = orig.strip_prefix("type ").unwrap_or(orig);
-                            (orig, local)
-                        } else {
-                            let name = name_part.strip_prefix("type ").unwrap_or(name_part);
-                            (name, name)
+                        let Some((original_name, local_name)) =
+                            parse_js_ts_import_specifier(name_part)
+                        else {
+                            continue;
                         };
-
-                        if original_name.is_empty() || local_name.is_empty() { continue; }
 
                         if let Some(target_ids) = symbol_table.get(original_name) {
                             let target = find_import_target(
                                 target_ids,
                                 module_path,
                                 file_path,
-                                &[".ts", ".tsx", ".js", ".jsx"],
+                                JS_TS_EXTENSIONS,
                                 entity_map,
                             );
                             if let Some(target_id) = target {
@@ -2541,18 +2832,50 @@ fn build_import_table(
                     let local_name = cap.get(1).unwrap().as_str();
                     let module_path = cap.get(2).unwrap().as_str();
 
-                    if let Some(target_ids) = symbol_table.get(local_name) {
-                        let target = find_import_target(
-                            target_ids,
-                            module_path,
-                            file_path,
-                            &[".ts", ".tsx", ".js", ".jsx"],
-                            entity_map,
-                        );
-                        if let Some(target_id) = target {
+                    if let Some(target_id) =
+                        resolve_default_export_target(&ts_default_exports, module_path, file_path)
+                    {
+                        local_imports.push((
+                            (file_path.clone(), local_name.to_string()),
+                            target_id,
+                        ));
+                    }
+                }
+
+                for cap in JS_REEXPORT_RE.captures_iter(content) {
+                    let names_str = cap.get(1).unwrap().as_str();
+                    let module_path = cap.get(2).unwrap().as_str();
+
+                    for name_part in names_str.split(',') {
+                        let Some((original_name, local_name)) =
+                            parse_js_ts_import_specifier(name_part)
+                        else {
+                            continue;
+                        };
+
+                        let target_id = if original_name == "default" {
+                            resolve_default_export_target(
+                                &ts_default_exports,
+                                module_path,
+                                file_path,
+                            )
+                        } else {
+                            symbol_table.get(original_name).and_then(|target_ids| {
+                                find_import_target(
+                                    target_ids,
+                                    module_path,
+                                    file_path,
+                                    JS_TS_EXTENSIONS,
+                                    entity_map,
+                                )
+                                .cloned()
+                            })
+                        };
+
+                        if let Some(target_id) = target_id {
                             local_imports.push((
                                 (file_path.clone(), local_name.to_string()),
-                                target_id.clone(),
+                                target_id,
                             ));
                         }
                     }
@@ -5380,6 +5703,171 @@ export function caller() { return helper(); }
             "caller should not resolve explicit ./util.ts to src/util.js. Deps: {:?}",
             deps.iter()
                 .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_default_import_resolves_static_member() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "base.ts",
+            "\
+export default class Widget {
+  static make(): string { return 'ok'; }
+}
+",
+        );
+        write_file(
+            root,
+            "consumer.ts",
+            "\
+import RenamedWidget from './base';
+export function useWidget(): string { return RenamedWidget.make(); }
+",
+        );
+
+        let (graph, _) =
+            EntityGraph::build(root, &["base.ts".into(), "consumer.ts".into()], &registry);
+
+        let use_widget_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("useWidget"))
+            .expect("useWidget entity should exist");
+        let deps = graph.get_dependencies(use_widget_id);
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "make" && d.file_path == "base.ts"),
+            "default import alias should resolve the static member. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_re_export_alias_resolves_through_barrel() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "lib.ts",
+            "\
+export function core(): string { return 'core'; }
+",
+        );
+        write_file(
+            root,
+            "barrel.ts",
+            "\
+export { core as publicCore } from './lib';
+",
+        );
+        write_file(
+            root,
+            "consumer.ts",
+            "\
+import { publicCore } from './barrel';
+export function usePublicCore(): string { return publicCore(); }
+",
+        );
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &["lib.ts".into(), "barrel.ts".into(), "consumer.ts".into()],
+            &registry,
+        );
+
+        let public_core = graph
+            .entities
+            .values()
+            .find(|entity| {
+                entity.name == "publicCore"
+                    && entity.file_path == "barrel.ts"
+                    && entity.entity_type == "export"
+            })
+            .expect("barrel export alias entity should exist");
+        let alias_deps = graph.get_dependencies(&public_core.id);
+        assert!(
+            alias_deps
+                .iter()
+                .any(|d| d.name == "core" && d.file_path == "lib.ts"),
+            "barrel export alias should depend on lib.ts core. Deps: {:?}",
+            alias_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+
+        let use_public_core_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("usePublicCore"))
+            .expect("usePublicCore entity should exist");
+        let consumer_deps = graph.get_dependencies(use_public_core_id);
+        assert!(
+            consumer_deps
+                .iter()
+                .any(|d| d.name == "publicCore" && d.file_path == "barrel.ts"),
+            "consumer should resolve publicCore through the barrel export. Deps: {:?}",
+            consumer_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_object_literal_receiver_resolves_owned_member() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "service.ts",
+            "\
+export const other = {
+    open() { return 'other'; }
+};
+export const svc = {
+    open() { return 'svc'; }
+};
+export function run(): string {
+    return svc.open();
+}
+",
+        );
+
+        let (graph, _) = EntityGraph::build(root, &["service.ts".into()], &registry);
+
+        let run_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("run"))
+            .expect("run entity should exist");
+        let deps = graph.get_dependencies(run_id);
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "open"
+                    && d.parent_id.as_deref().is_some_and(|id| id.contains("svc"))),
+            "svc.open() should resolve to the object literal member owned by svc. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "open"
+                && d.parent_id
+                    .as_deref()
+                    .is_some_and(|id| id.contains("other"))),
+            "svc.open() should not resolve to another object literal member. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
                 .collect::<Vec<_>>()
         );
     }

@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -33,7 +33,10 @@ macro_rules! maybe_par_iter {
     }};
 }
 use crate::parser::graph::{EntityInfo, RefType};
-use crate::parser::import_resolution::{find_import_target, import_source_matches_file};
+use crate::parser::import_resolution::{
+    find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
+    sort_import_candidate_files, JS_TS_EXTENSIONS,
+};
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
     ParamNameField, ScopeResolveConfig,
@@ -221,9 +224,7 @@ fn find_entity_source_span(
     }
 
     for (candidate_offset, _) in line.match_indices(first_content_line) {
-        if let Some(span) =
-            source_span_at(source, &entity.content, line_start + candidate_offset)
-        {
+        if let Some(span) = source_span_at(source, &entity.content, line_start + candidate_offset) {
             return Some(span);
         }
     }
@@ -269,10 +270,27 @@ pub struct ResolutionEntry {
 pub(crate) struct PreBuiltLookups {
     pub(crate) symbol_table: Arc<HashMap<String, Vec<String>>>,
     pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
+    pub(crate) owner_members: HashMap<String, Vec<(String, String)>>,
     pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
     /// Go package index: pkg_name → [(entity_name, entity_id)]
     /// Avoids O(symbol_table) scan per Go import.
     pub(crate) go_pkg_index: HashMap<String, Vec<(String, String)>>,
+}
+
+struct TsDefaultExportTable {
+    exports_by_file: HashMap<String, String>,
+    sorted_files: Vec<String>,
+}
+
+struct TsDefaultReExport {
+    file_path: String,
+    original_name: String,
+    module_path: String,
+}
+
+struct TopLevelEntityIndex {
+    entities_by_file: HashMap<String, Vec<(String, String)>>,
+    sorted_files: Vec<String>,
 }
 
 struct FileEntityLookup<'a> {
@@ -346,7 +364,15 @@ pub fn resolve_with_scopes(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
 ) -> ScopeResult {
-    resolve_with_scopes_full(root, file_paths, all_entities, entity_map, pre_parsed, None)
+    resolve_with_scopes_full(
+        root,
+        file_paths,
+        all_entities,
+        entity_map,
+        pre_parsed,
+        None,
+        None,
+    )
 }
 
 /// Internal version with pre-built lookups for performance.
@@ -357,65 +383,74 @@ pub(crate) fn resolve_with_scopes_full(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
     pre_built: Option<PreBuiltLookups>,
+    pre_built_import_table: Option<&HashMap<(String, String), String>>,
 ) -> ScopeResult {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
 
     // Use pre-built lookups if provided, otherwise build from scratch
-    let (symbol_table, class_members, entity_ranges, go_pkg_index) = if let Some(pb) = pre_built {
-        (
-            pb.symbol_table,
-            pb.class_members,
-            pb.entity_ranges,
-            pb.go_pkg_index,
-        )
-    } else {
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+    let (symbol_table, class_members, owner_members, entity_ranges, go_pkg_index) =
+        if let Some(pb) = pre_built {
+            (
+                pb.symbol_table,
+                pb.class_members,
+                pb.owner_members,
+                pb.entity_ranges,
+                pb.go_pkg_index,
+            )
+        } else {
+            let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
+            let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
-        for entity in all_entities {
-            symbol_table
-                .entry(entity.name.clone())
-                .or_default()
-                .push(entity.id.clone());
+            for entity in all_entities {
+                symbol_table
+                    .entry(entity.name.clone())
+                    .or_default()
+                    .push(entity.id.clone());
 
-            if let Some(ref pid) = entity.parent_id {
-                if let Some(parent) = entity_map.get(pid) {
-                    if let Some(owner_name) = class_member_owner_name(parent) {
+                if let Some(ref pid) = entity.parent_id {
+                    owner_members
+                        .entry(pid.clone())
+                        .or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                    if let Some(parent) = entity_map.get(pid) {
+                        if let Some(owner_name) = class_member_owner_name(parent) {
+                            class_members
+                                .entry(owner_name.to_string())
+                                .or_default()
+                                .push((entity.name.clone(), entity.id.clone()));
+                        }
+                    }
+                }
+
+                if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                    if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
                         class_members
-                            .entry(owner_name.to_string())
+                            .entry(struct_name)
                             .or_default()
                             .push((entity.name.clone(), entity.id.clone()));
                     }
                 }
+
+                entity_ranges
+                    .entry(entity.file_path.clone())
+                    .or_default()
+                    .push((entity.start_line, entity.end_line, entity.id.clone()));
             }
 
-            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
-                if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
-                    class_members
-                        .entry(struct_name)
-                        .or_default()
-                        .push((entity.name.clone(), entity.id.clone()));
-                }
-            }
+            // Build Go package index for O(1) import lookup
+            let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
 
-            entity_ranges
-                .entry(entity.file_path.clone())
-                .or_default()
-                .push((entity.start_line, entity.end_line, entity.id.clone()));
-        }
-
-        // Build Go package index for O(1) import lookup
-        let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
-
-        (
-            Arc::new(symbol_table),
-            class_members,
-            entity_ranges,
-            go_pkg_index,
-        )
-    };
+            (
+                Arc::new(symbol_table),
+                class_members,
+                owner_members,
+                entity_ranges,
+                go_pkg_index,
+            )
+        };
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
     let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
@@ -483,6 +518,8 @@ pub(crate) fn resolve_with_scopes_full(
         }
     }
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
+    let ts_default_exports = build_ts_default_export_table(parsed_files, &symbol_table, entity_map);
+    let top_level_entities = OnceLock::new();
 
     // Pass 1: Scan ALL files for return types and instance attr types first
     // This ensures cross-file return type info is available during resolution
@@ -617,6 +654,18 @@ pub(crate) fn resolve_with_scopes_full(
                 );
 
                 let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
+                if let Some(import_table) = pre_built_import_table {
+                    for ((import_file_path, local_name), target_id) in import_table {
+                        if import_file_path != file_path {
+                            continue;
+                        }
+                        local_import_table.insert(
+                            (import_file_path.clone(), local_name.clone()),
+                            target_id.clone(),
+                        );
+                        scopes[0].defs.insert(local_name.clone(), target_id.clone());
+                    }
+                }
                 extract_imports_from_ast(
                     tree.root_node(),
                     file_path,
@@ -627,6 +676,8 @@ pub(crate) fn resolve_with_scopes_full(
                     &mut scopes,
                     config,
                     &go_pkg_index,
+                    &ts_default_exports,
+                    &top_level_entities,
                 );
 
                 // Resolve pending call types using the complete return type map
@@ -707,6 +758,7 @@ pub(crate) fn resolve_with_scopes_full(
                                 &scopes,
                                 &symbol_table,
                                 &class_members,
+                                &owner_members,
                                 &local_import_table,
                                 &instance_attr_types,
                                 entity_map,
@@ -868,10 +920,9 @@ fn build_descendant_ranges_by_entity(
 
     let mut ancestor_stack: Vec<&SemanticEntity> = Vec::new();
     for entity in sorted_entities {
-        while ancestor_stack
-            .last()
-            .map_or(false, |candidate| !is_strict_enclosing_range(candidate, entity))
-        {
+        while ancestor_stack.last().map_or(false, |candidate| {
+            !is_strict_enclosing_range(candidate, entity)
+        }) {
             ancestor_stack.pop();
         }
 
@@ -3092,6 +3143,332 @@ fn inject_return_type_bindings(
     }
 }
 
+fn build_ts_default_export_table(
+    parsed_files: &[(String, String, tree_sitter::Tree)],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> TsDefaultExportTable {
+    let mut default_exports = HashMap::new();
+    let mut re_exports = Vec::new();
+
+    for (file_path, content, tree) in parsed_files {
+        if !is_js_ts_file(file_path) {
+            continue;
+        }
+
+        let extracted = extract_ts_default_exports(tree.root_node(), content.as_bytes());
+        for name in extracted.names {
+            let Some(target_ids) = symbol_table.get(&name) else {
+                continue;
+            };
+            let target = target_ids.iter().find(|id| {
+                entity_map.get(*id).map_or(false, |entity| {
+                    entity.file_path == *file_path && entity.parent_id.is_none()
+                })
+            });
+            if let Some(target_id) = target {
+                default_exports.insert(file_path.clone(), target_id.clone());
+            }
+        }
+        re_exports.extend(
+            extracted
+                .re_exports
+                .into_iter()
+                .map(|(original_name, module_path)| TsDefaultReExport {
+                    file_path: file_path.clone(),
+                    original_name,
+                    module_path,
+                }),
+        );
+    }
+
+    resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
+    let sorted_files = sorted_default_export_files(&default_exports);
+
+    TsDefaultExportTable {
+        exports_by_file: default_exports,
+        sorted_files,
+    }
+}
+
+fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec<String> {
+    let mut sorted_files: Vec<String> = default_exports.keys().cloned().collect();
+    sort_import_candidate_files(&mut sorted_files, JS_TS_EXTENSIONS);
+    sorted_files
+}
+
+fn resolve_ts_default_re_exports(
+    default_exports: &mut HashMap<String, String>,
+    pending: Vec<TsDefaultReExport>,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    let mut pending = pending;
+    while !pending.is_empty() {
+        let sorted_files = sorted_default_export_files(default_exports);
+        let mut unresolved = Vec::new();
+        let mut progressed = false;
+
+        for re_export in pending {
+            let target_id = if re_export.original_name == "default" {
+                find_import_file(
+                    &sorted_files,
+                    &re_export.module_path,
+                    &re_export.file_path,
+                    JS_TS_EXTENSIONS,
+                )
+                .and_then(|target_file| default_exports.get(target_file))
+                .cloned()
+            } else {
+                symbol_table
+                    .get(&re_export.original_name)
+                    .and_then(|target_ids| {
+                        find_import_target(
+                            target_ids,
+                            &re_export.module_path,
+                            &re_export.file_path,
+                            JS_TS_EXTENSIONS,
+                            entity_map,
+                        )
+                        .cloned()
+                    })
+            };
+
+            if let Some(target_id) = target_id {
+                default_exports.insert(re_export.file_path, target_id);
+                progressed = true;
+            } else {
+                unresolved.push(re_export);
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+        pending = unresolved;
+    }
+}
+
+fn build_top_level_entity_index(
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> TopLevelEntityIndex {
+    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+    for (name, target_ids) in symbol_table {
+        for target_id in target_ids {
+            let Some(info) = entity_map.get(target_id) else {
+                continue;
+            };
+            if info.parent_id.is_some() {
+                continue;
+            }
+            entities_by_file
+                .entry(info.file_path.clone())
+                .or_default()
+                .push((name.clone(), target_id.clone()));
+        }
+    }
+
+    let mut sorted_files: Vec<String> = entities_by_file.keys().cloned().collect();
+    sort_import_candidate_files(&mut sorted_files, JS_TS_EXTENSIONS);
+
+    TopLevelEntityIndex {
+        entities_by_file,
+        sorted_files,
+    }
+}
+
+struct TsDefaultExports {
+    names: Vec<String>,
+    re_exports: Vec<(String, String)>,
+}
+
+fn extract_ts_default_exports(root: tree_sitter::Node, source: &[u8]) -> TsDefaultExports {
+    let mut names = Vec::new();
+    let mut re_exports = Vec::new();
+    let mut worklist = vec![root];
+
+    while let Some(node) = worklist.pop() {
+        if node.kind() == "export_statement" {
+            let has_source = node.child_by_field_name("source").is_some();
+            let source_path = node
+                .child_by_field_name("source")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|text| {
+                    text.trim_matches(|c: char| c == '\'' || c == '"')
+                        .to_string()
+                });
+            let text = node.utf8_text(source).unwrap_or("");
+            if !has_source {
+                if let Some(declaration) = node.child_by_field_name("declaration") {
+                    if text.contains("default") {
+                        if let Some(name) = ts_default_declaration_name(declaration, source) {
+                            names.push(name);
+                        }
+                    }
+                } else if text.contains("default") && !has_ts_export_specifier(node) {
+                    if let Some(name) = ts_bare_default_export_identifier(node, source) {
+                        names.push(name);
+                    }
+                }
+            }
+            collect_ts_default_export_specifiers(
+                node,
+                source,
+                source_path.as_deref(),
+                &mut names,
+                &mut re_exports,
+            );
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            worklist.push(child);
+        }
+    }
+
+    TsDefaultExports { names, re_exports }
+}
+
+fn ts_default_declaration_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "lexical_declaration"
+        | "variable_declaration" => ts_declaration_name(node, source),
+        "identifier" => node.utf8_text(source).ok().map(str::to_string),
+        _ => None,
+    }
+}
+
+fn has_ts_export_specifier(node: tree_sitter::Node) -> bool {
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "export_specifier" {
+                return true;
+            }
+            worklist.push(child);
+        }
+    }
+    false
+}
+
+fn collect_ts_default_export_specifiers(
+    node: tree_sitter::Node,
+    source: &[u8],
+    source_path: Option<&str>,
+    names: &mut Vec<String>,
+    re_exports: &mut Vec<(String, String)>,
+) {
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "export_specifier" {
+                let original = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let local = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or(original);
+                if local == "default" && !original.is_empty() {
+                    if let Some(source_path) = source_path {
+                        re_exports.push((original.to_string(), source_path.to_string()));
+                    } else {
+                        names.push(original.to_string());
+                    }
+                }
+            } else {
+                worklist.push(child);
+            }
+        }
+    }
+}
+
+fn ts_declaration_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(name.utf8_text(source).ok()?.to_string());
+    }
+
+    if node.kind() == "lexical_declaration" || node.kind() == "variable_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(name) = child.child_by_field_name("name") {
+                    return Some(name.utf8_text(source).ok()?.to_string());
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    let name = node
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+        .and_then(|child| child.utf8_text(source).ok())
+        .map(str::to_string);
+    name
+}
+
+fn ts_bare_default_export_identifier(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let text = node.utf8_text(source).ok()?.trim();
+    let rest = text.strip_prefix("export")?.trim_start();
+    let rest = rest.strip_prefix("default")?.trim_start();
+    let name_end = js_ts_identifier_end(rest)?;
+    let name = &rest[..name_end];
+    let trailing = rest[name_end..].trim_start();
+    only_js_ts_statement_trivia(trailing).then(|| name.to_string())
+}
+
+fn js_ts_identifier_end(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
+fn only_js_ts_statement_trivia(mut text: &str) -> bool {
+    loop {
+        text = text.trim_start();
+        if let Some(rest) = text.strip_prefix(';') {
+            text = rest;
+            continue;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        if text.starts_with("//") {
+            return true;
+        }
+        if let Some(rest) = text.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return false;
+            };
+            text = &rest[end + 2..];
+            continue;
+        }
+        return false;
+    }
+}
+
 /// Extract import statements from the AST.
 fn extract_imports_from_ast(
     root: tree_sitter::Node,
@@ -3103,6 +3480,8 @@ fn extract_imports_from_ast(
     scopes: &mut Vec<Scope>,
     config: &ScopeResolveConfig,
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    ts_default_exports: &TsDefaultExportTable,
+    top_level_entities: &OnceLock<TopLevelEntityIndex>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -3148,6 +3527,21 @@ fn extract_imports_from_ast(
                         entity_map,
                         import_table,
                         scopes,
+                        ts_default_exports,
+                        top_level_entities,
+                    );
+                    true
+                }
+                "export_statement" if !config.self_keywords.contains(&"cls") => {
+                    extract_ts_re_export(
+                        child,
+                        file_path,
+                        source,
+                        symbol_table,
+                        entity_map,
+                        import_table,
+                        scopes,
+                        ts_default_exports,
                     );
                     true
                 }
@@ -3194,6 +3588,8 @@ fn extract_ts_import(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    ts_default_exports: &TsDefaultExportTable,
+    top_level_entities: &OnceLock<TopLevelEntityIndex>,
 ) {
     // Extract the source module from the `from '...'` clause
     let source_path = node
@@ -3232,7 +3628,7 @@ fn extract_ts_import(
                                     local,
                                     source_path,
                                     file_path,
-                                    &[".ts", ".tsx", ".js", ".jsx"],
+                                    JS_TS_EXTENSIONS,
                                     symbol_table,
                                     entity_map,
                                     import_table,
@@ -3255,11 +3651,12 @@ fn extract_ts_import(
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("");
                     if !alias.is_empty() {
-                        register_namespace_import(
+                        register_ts_namespace_import(
                             alias,
                             source_path,
                             file_path,
-                            &[".ts", ".tsx", ".js", ".jsx"],
+                            JS_TS_EXTENSIONS,
+                            top_level_entities,
                             symbol_table,
                             entity_map,
                             import_table,
@@ -3270,12 +3667,78 @@ fn extract_ts_import(
                     // Default import: import Foo from './module'
                     let name = clause_child.utf8_text(source).unwrap_or("");
                     if !name.is_empty() {
-                        resolve_import_name(
-                            name,
+                        resolve_default_import(
                             name,
                             source_path,
                             file_path,
-                            &[".ts", ".tsx", ".js", ".jsx"],
+                            JS_TS_EXTENSIONS,
+                            ts_default_exports,
+                            import_table,
+                            scopes,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn extract_ts_re_export(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &[u8],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+    ts_default_exports: &TsDefaultExportTable,
+) {
+    let source_path = node
+        .child_by_field_name("source")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '\'' || c == '"');
+
+    if source_path.is_empty() {
+        return;
+    }
+
+    let mut worklist = vec![node];
+    while let Some(current) = worklist.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            match child.kind() {
+                "export_specifier" => {
+                    let original = child
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("");
+                    let local = child
+                        .child_by_field_name("alias")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or(original);
+
+                    if original.is_empty() || local.is_empty() {
+                        continue;
+                    }
+
+                    if original == "default" {
+                        resolve_default_import(
+                            local,
+                            source_path,
+                            file_path,
+                            JS_TS_EXTENSIONS,
+                            ts_default_exports,
+                            import_table,
+                            scopes,
+                        );
+                    } else {
+                        resolve_import_name(
+                            original,
+                            local,
+                            source_path,
+                            file_path,
+                            JS_TS_EXTENSIONS,
                             symbol_table,
                             entity_map,
                             import_table,
@@ -3283,6 +3746,10 @@ fn extract_ts_import(
                         );
                     }
                 }
+                "export_clause" | "namespace_export" => {
+                    worklist.push(child);
+                }
+                _ => {}
             }
         }
     }
@@ -3514,9 +3981,70 @@ fn resolve_import_name(
     }
 }
 
+fn resolve_default_import(
+    local_name: &str,
+    source_path: &str,
+    file_path: &str,
+    extensions: &[&str],
+    default_exports: &TsDefaultExportTable,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+) {
+    let target = find_import_file(
+        &default_exports.sorted_files,
+        source_path,
+        file_path,
+        extensions,
+    )
+    .and_then(|target_file| default_exports.exports_by_file.get(target_file))
+    .cloned();
+
+    if let Some(target_id) = target {
+        import_table.insert(
+            (file_path.to_string(), local_name.to_string()),
+            target_id.clone(),
+        );
+        if !scopes.is_empty() {
+            scopes[0].defs.insert(local_name.to_string(), target_id);
+        }
+    }
+}
+
 /// Register all entities from a source module under a namespace alias.
 /// For `import * as m from './module'`, all entities from the module
 /// are registered so that `m.foo()` resolves via the method call path.
+fn register_ts_namespace_import(
+    alias: &str,
+    source_path: &str,
+    file_path: &str,
+    extensions: &[&str],
+    top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    _scopes: &mut Vec<Scope>,
+) {
+    let top_level_entities =
+        top_level_entities.get_or_init(|| build_top_level_entity_index(symbol_table, entity_map));
+    let Some(candidate_file) = find_import_file(
+        &top_level_entities.sorted_files,
+        source_path,
+        file_path,
+        extensions,
+    ) else {
+        return;
+    };
+    let Some(entries) = top_level_entities.entities_by_file.get(candidate_file) else {
+        return;
+    };
+    for (name, target_id) in entries {
+        let qualified_name = format!("{alias}.{name}");
+        import_table
+            .entry((file_path.to_string(), qualified_name))
+            .or_insert_with(|| target_id.clone());
+    }
+}
+
 fn register_namespace_import(
     alias: &str,
     source_path: &str,
@@ -4317,6 +4845,7 @@ fn resolve_ref(
     scopes: &[Scope],
     symbol_table: &HashMap<String, Vec<String>>,
     class_members: &HashMap<String, Vec<(String, String)>>,
+    owner_members: &HashMap<String, Vec<(String, String)>>,
     import_table: &HashMap<(String, String), String>,
     instance_attr_types: &HashMap<(String, String), String>,
     entity_map: &HashMap<String, EntityInfo>,
@@ -4388,10 +4917,8 @@ fn resolve_ref(
                 } else {
                     Vec::new()
                 };
-                if has_ambiguous_swift_signature_candidates(
-                    &visible_targets,
-                    swift_call_signatures,
-                ) {
+                if has_ambiguous_swift_signature_candidates(&visible_targets, swift_call_signatures)
+                {
                     return None;
                 }
             }
@@ -4651,8 +5178,20 @@ fn resolve_ref(
                     lookup_scope_chain_cached(scope_idx, scopes, receiver, lookup_cache)
                 {
                     if let Some(info) = entity_map.get(&class_id) {
-                        if matches!(info.entity_type.as_str(), "class" | "struct" | "interface")
+                        if matches!(info.entity_type.as_str(), "module" | "variable" | "object")
                             && info.name == receiver
+                        {
+                            if let Some(mid) =
+                                lookup_entity_member(owner_members, &class_id, method).or_else(
+                                    || lookup_owned_scope_member(scopes, &class_id, method),
+                                )
+                            {
+                                return Some((mid, RefType::Calls, "scope_chain"));
+                            }
+                        } else if matches!(
+                            info.entity_type.as_str(),
+                            "class" | "struct" | "interface"
+                        ) && info.name == receiver
                         {
                             if let Some(members) = class_members.get(&info.name) {
                                 match select_member_candidate(
@@ -4820,6 +5359,24 @@ fn is_simple_identifier_name(name: &str) -> bool {
     };
 
     (first == '_' || first.is_alphabetic()) && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> Option<String> {
+    scopes
+        .iter()
+        .find(|scope| scope.owner_id.as_deref() == Some(owner_id))
+        .and_then(|scope| scope.defs.get(member).cloned())
+}
+
+fn lookup_entity_member(
+    owner_members: &HashMap<String, Vec<(String, String)>>,
+    owner_id: &str,
+    member: &str,
+) -> Option<String> {
+    owner_members
+        .get(owner_id)
+        .and_then(|members| members.iter().find(|(name, _)| name == member))
+        .map(|(_, id)| id.clone())
 }
 
 /// Find the class name for the enclosing class scope.
