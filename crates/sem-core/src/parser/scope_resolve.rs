@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -35,7 +35,7 @@ macro_rules! maybe_par_iter {
 use crate::parser::graph::{EntityInfo, RefType};
 use crate::parser::import_resolution::{
     find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
-    sort_import_candidate_files, JS_TS_EXTENSIONS,
+    js_ts_named_exports_from_content, sort_import_candidate_files, JS_TS_EXTENSIONS,
 };
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
@@ -654,6 +654,9 @@ pub(crate) fn resolve_with_scopes_full(
         }
     }
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
+    let content_by_file = OnceLock::new();
+    let exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
+        Mutex::new(HashMap::new());
     // The default-export table is consulted only while resolving JS/TS imports.
     // When an import table is supplied (the graph-build path), those imports are
     // already resolved and `extract_ts_import`/`extract_ts_re_export` are skipped,
@@ -847,6 +850,9 @@ pub(crate) fn resolve_with_scopes_full(
                 &go_pkg_index,
                 &ts_default_exports,
                 &top_level_entities,
+                parsed_files,
+                &content_by_file,
+                &exported_names_by_file,
                 pre_built_import_table.is_some(),
             );
 
@@ -3693,7 +3699,7 @@ fn build_top_level_entity_index(
             let Some(info) = entity_map.get(target_id) else {
                 continue;
             };
-            if info.parent_id.is_some() {
+            if !is_js_ts_file(&info.file_path) || info.parent_id.is_some() {
                 continue;
             }
             entities_by_file
@@ -3903,7 +3909,7 @@ fn only_js_ts_statement_trivia(mut text: &str) -> bool {
 }
 
 /// Extract import statements from the AST.
-fn extract_imports_from_ast(
+fn extract_imports_from_ast<'a>(
     root: tree_sitter::Node,
     file_path: &str,
     source: &[u8],
@@ -3915,6 +3921,9 @@ fn extract_imports_from_ast(
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    parsed_files: &'a [(String, String, tree_sitter::Tree)],
+    content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
+    exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
     skip_js_ts_imports: bool,
 ) {
     let mut worklist = vec![root];
@@ -3963,6 +3972,9 @@ fn extract_imports_from_ast(
                             scopes,
                             ts_default_exports,
                             top_level_entities,
+                            parsed_files,
+                            content_by_file,
+                            exported_names_by_file,
                         );
                     }
                     true
@@ -4017,7 +4029,7 @@ fn extract_imports_from_ast(
 }
 
 /// TS: `import { Foo, Bar } from './module'` or `import Foo from './module'`
-fn extract_ts_import(
+fn extract_ts_import<'a>(
     node: tree_sitter::Node,
     file_path: &str,
     source: &[u8],
@@ -4027,6 +4039,9 @@ fn extract_ts_import(
     scopes: &mut Vec<Scope>,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    parsed_files: &'a [(String, String, tree_sitter::Tree)],
+    content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
+    exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
 ) {
     // Extract the source module from the `from '...'` clause
     let source_path = node
@@ -4076,7 +4091,7 @@ fn extract_ts_import(
                     }
                 } else if clause_child.kind() == "namespace_import" {
                     // import * as m from './module'
-                    // Register all entities from source module so m.foo() resolves
+                    // Register exported source module entities so m.foo() resolves.
                     let mut ns_cursor = clause_child.walk();
                     let alias = clause_child
                         .child_by_field_name("alias")
@@ -4096,6 +4111,9 @@ fn extract_ts_import(
                             top_level_entities,
                             symbol_table,
                             entity_map,
+                            parsed_files,
+                            content_by_file,
+                            exported_names_by_file,
                             import_table,
                             scopes,
                         );
@@ -4447,10 +4465,10 @@ fn resolve_default_import(
     }
 }
 
-/// Register all entities from a source module under a namespace alias.
-/// For `import * as m from './module'`, all entities from the module
+/// Register exported source module entities under a namespace alias.
+/// For `import * as m from './module'`, exported entities from the module
 /// are registered so that `m.foo()` resolves via the method call path.
-fn register_ts_namespace_import(
+fn register_ts_namespace_import<'a>(
     alias: &str,
     source_path: &str,
     file_path: &str,
@@ -4458,6 +4476,9 @@ fn register_ts_namespace_import(
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
+    parsed_files: &'a [(String, String, tree_sitter::Tree)],
+    content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
+    exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
     import_table: &mut HashMap<(String, String), String>,
     _scopes: &mut Vec<Scope>,
 ) {
@@ -4474,7 +4495,33 @@ fn register_ts_namespace_import(
     let Some(entries) = top_level_entities.entities_by_file.get(candidate_file) else {
         return;
     };
+    let exported_names = {
+        let mut cache = exported_names_by_file.lock().unwrap();
+        cache
+            .entry(candidate_file.to_string())
+            .or_insert_with(|| {
+                let content_by_file = content_by_file.get_or_init(|| {
+                    parsed_files
+                        .iter()
+                        .map(|(file_path, content, _)| (file_path.as_str(), content.as_str()))
+                        .collect()
+                });
+                Arc::new(
+                    content_by_file
+                        .get(candidate_file)
+                        .map(|content| js_ts_named_exports_from_content(content))
+                        .unwrap_or_default(),
+                )
+            })
+            .clone()
+    };
     for (name, target_id) in entries {
+        let is_export_entity = entity_map
+            .get(target_id)
+            .map_or(false, |entity| entity.entity_type == "export");
+        if !is_export_entity && !exported_names.contains(name) {
+            continue;
+        }
         let qualified_name = format!("{alias}.{name}");
         import_table
             .entry((file_path.to_string(), qualified_name))

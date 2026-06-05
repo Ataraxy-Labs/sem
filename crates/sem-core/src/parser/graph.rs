@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -35,7 +35,7 @@ use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
 use crate::parser::import_resolution::{
     find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
-    sort_import_candidate_files, JS_TS_EXTENSIONS,
+    js_ts_named_exports_from_content, sort_import_candidate_files, JS_TS_EXTENSIONS,
 };
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
@@ -2788,7 +2788,9 @@ fn build_import_table(
     );
     let ts_default_exports =
         build_ts_default_export_table(file_paths, symbol_table, entity_map, &content_map);
-    let ts_top_level_entities = build_ts_top_level_entity_table(entity_map);
+    let ts_top_level_entities = OnceLock::new();
+    let ts_exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
+        Mutex::new(HashMap::new());
 
     // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
     // We no longer need a go_pkg_index here since Go files are skipped below.
@@ -2961,6 +2963,8 @@ fn build_import_table(
                 for cap in JS_NAMESPACE_RE.captures_iter(content) {
                     let alias = cap.get(1).unwrap().as_str();
                     let module_path = cap.get(2).unwrap().as_str();
+                    let ts_top_level_entities = ts_top_level_entities
+                        .get_or_init(|| build_ts_top_level_entity_table(entity_map));
                     let Some(target_file) = find_import_file(
                         &ts_top_level_entities.sorted_files,
                         module_path,
@@ -2973,7 +2977,27 @@ fn build_import_table(
                     else {
                         continue;
                     };
+                    let exported_names = {
+                        let mut cache = ts_exported_names_by_file.lock().unwrap();
+                        cache
+                            .entry(target_file.to_string())
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    content_map
+                                        .get(target_file)
+                                        .map(|content| js_ts_named_exports_from_content(content))
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .clone()
+                    };
                     for (name, target_id) in entries {
+                        let is_export_entity = entity_map
+                            .get(target_id)
+                            .map_or(false, |entity| entity.entity_type == "export");
+                        if !is_export_entity && !exported_names.contains(name) {
+                            continue;
+                        }
                         local_imports.push((
                             (file_path.clone(), format!("{alias}.{name}")),
                             target_id.clone(),
@@ -6478,6 +6502,66 @@ export function actual() { return lib.foo(); }
                 .any(|d| d.name == "foo" && d.file_path == "other.ts"),
             "lib.foo() should not resolve to other.ts. Deps: {:?}",
             actual_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_namespace_import_skips_unexported_top_level_entities() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "lib.ts",
+            "\
+function hidden() { return 1; }
+export function visible() { return 2; }
+",
+        );
+        write_file(
+            root,
+            "main.ts",
+            "\
+import * as lib from './lib';
+export function callVisible() { return lib.visible(); }
+export function callHidden() { return lib.hidden(); }
+",
+        );
+
+        let (graph, _) = EntityGraph::build(root, &["lib.ts".into(), "main.ts".into()], &registry);
+
+        let visible_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("callVisible"))
+            .expect("callVisible entity should exist");
+        let visible_deps = graph.get_dependencies(visible_id);
+        assert!(
+            visible_deps
+                .iter()
+                .any(|d| d.name == "visible" && d.file_path == "lib.ts"),
+            "lib.visible() should resolve to the exported function. Deps: {:?}",
+            visible_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+
+        let hidden_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("callHidden"))
+            .expect("callHidden entity should exist");
+        let hidden_deps = graph.get_dependencies(hidden_id);
+        assert!(
+            !hidden_deps
+                .iter()
+                .any(|d| d.name == "hidden" && d.file_path == "lib.ts"),
+            "lib.hidden() should not resolve to a module-private function. Deps: {:?}",
+            hidden_deps
                 .iter()
                 .map(|d| (&d.name, &d.file_path))
                 .collect::<Vec<_>>()

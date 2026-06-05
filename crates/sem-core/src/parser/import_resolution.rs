@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 use crate::parser::graph::EntityInfo;
+use regex::Regex;
 
 pub(crate) const JS_TS_EXTENSIONS: &[&str] =
     &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
@@ -10,6 +12,103 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
     JS_TS_EXTENSIONS
         .iter()
         .any(|extension| file_path.ends_with(extension))
+}
+
+pub(crate) fn js_ts_named_exports_from_content(content: &str) -> HashSet<String> {
+    static NAMED_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\bexport\s+(?:declare\s+)?(?:async\s+)?(?:abstract\s+)?(?:function\s*\*?|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+        )
+        .unwrap()
+    });
+    static VAR_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bexport\s+(?:declare\s+)?(?:const|let|var)\s+([^;\n]+)").unwrap()
+    });
+    static SPECIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}(?:\s*from\s*['"][^'"]+['"])?\s*;?"#).unwrap()
+    });
+
+    let mut names = HashSet::new();
+
+    for cap in NAMED_DECL_RE.captures_iter(content) {
+        names.insert(cap.get(1).unwrap().as_str().to_string());
+    }
+
+    for cap in VAR_DECL_RE.captures_iter(content) {
+        for declarator in split_js_ts_var_declarators(cap.get(1).unwrap().as_str()) {
+            if let Some(name) = js_ts_identifier_prefix(declarator) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    for cap in SPECIFIER_RE.captures_iter(content) {
+        for name_part in cap.get(1).unwrap().as_str().split(',') {
+            if let Some(exported_name) = js_ts_export_specifier_name(name_part) {
+                names.insert(exported_name.to_string());
+            }
+        }
+    }
+
+    names
+}
+
+fn split_js_ts_var_declarators(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&input[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    parts.push(&input[start..]);
+    parts
+}
+
+fn js_ts_export_specifier_name(name_part: &str) -> Option<&str> {
+    let name_part = name_part.trim();
+    if name_part.is_empty() {
+        return None;
+    }
+
+    let exported = if let Some(pos) = name_part.find(" as ") {
+        &name_part[pos + 4..]
+    } else {
+        name_part
+    };
+    let exported = exported.trim();
+    let exported = exported.strip_prefix("type ").unwrap_or(exported).trim();
+
+    js_ts_identifier_prefix(exported)
+}
+
+fn js_ts_identifier_prefix(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    Some(&input[..end])
 }
 
 pub(crate) fn sort_import_candidate_files<P: AsRef<str>>(paths: &mut [P], extensions: &[&str]) {
