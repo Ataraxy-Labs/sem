@@ -319,6 +319,35 @@ pub struct EntityInfo {
     pub end_line: usize,
 }
 
+fn sort_symbol_table_targets_by_source(
+    symbol_table: &mut HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    for target_ids in symbol_table.values_mut() {
+        if target_ids.len() > 1 {
+            target_ids.sort_unstable_by(|left, right| {
+                match (entity_map.get(left), entity_map.get(right)) {
+                    (Some(left), Some(right)) => (
+                        left.file_path.as_str(),
+                        left.start_line,
+                        left.end_line,
+                        left.id.as_str(),
+                    )
+                        .cmp(&(
+                            right.file_path.as_str(),
+                            right.start_line,
+                            right.end_line,
+                            right.id.as_str(),
+                        )),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => left.cmp(right),
+                }
+            });
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LineReferenceIndex {
     words: Vec<IndexedWordRef>,
@@ -783,6 +812,7 @@ impl EntityGraph {
                 }
             }
         }
+        sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
 
         // Build import table: (file_path, imported_name) → target entity ID
         // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
@@ -826,6 +856,9 @@ impl EntityGraph {
                             }
                         }
                     }
+                }
+                for entries in idx.values_mut() {
+                    entries.sort_unstable();
                 }
                 idx
             } else {
@@ -873,7 +906,7 @@ impl EntityGraph {
         // Skip entities already resolved by scope resolver (Python files)
         // Skip entities from non-code file types (JSON, SQL, etc.) that can't produce edges
         let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
-            .flat_map(|entity| {
+            .map(|entity| {
                 // Skip entities from file types that don't have language configs
                 // (JSON, SQL, YAML, etc. — they extract entities but never produce reference edges)
                 let ext = entity
@@ -1076,6 +1109,9 @@ impl EntityGraph {
                 }
                 entity_edges
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
             .collect();
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table);
@@ -1267,6 +1303,7 @@ impl EntityGraph {
                 },
             );
         }
+        sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
 
         let import_table = build_import_table(
             root,
@@ -1683,8 +1720,10 @@ impl EntityGraph {
         };
         // Resolve references only for entities in needs_resolution
         let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
-            .filter(|e| needs_resolution.contains(e.id.as_str()))
-            .flat_map(|entity| {
+            .map(|entity| {
+                if !needs_resolution.contains(entity.id.as_str()) {
+                    return vec![];
+                }
                 // Skip entities from non-code file types (JSON, SQL, etc.)
                 let ext = entity
                     .file_path
@@ -1877,6 +1916,9 @@ impl EntityGraph {
                 }
                 entity_edges
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
             .collect();
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table);
@@ -2311,7 +2353,15 @@ impl EntityGraph {
     /// Build a symbol table from all current entities.
     fn build_symbol_table(&self) -> HashMap<String, Vec<String>> {
         let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-        for entity in self.entities.values() {
+        let mut entities = self.entities.values().collect::<Vec<_>>();
+        entities.sort_unstable_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then_with(|| left.start_line.cmp(&right.start_line))
+                .then_with(|| left.end_line.cmp(&right.end_line))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for entity in entities {
             symbol_table
                 .entry(entity.name.clone())
                 .or_default()
@@ -4104,6 +4154,38 @@ mod tests {
         }
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn graph_json_payload(graph: &EntityGraph) -> serde_json::Value {
+        let mut entities = graph.entities.values().collect::<Vec<_>>();
+        entities.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut edges = graph.edges.iter().collect::<Vec<_>>();
+        edges.sort_by(|a, b| {
+            a.from_entity
+                .cmp(&b.from_entity)
+                .then_with(|| a.to_entity.cmp(&b.to_entity))
+                .then_with(|| {
+                    test_ref_type_sort_key(&a.ref_type).cmp(&test_ref_type_sort_key(&b.ref_type))
+                })
+        });
+
+        serde_json::json!({
+            "entities": entities,
+            "edges": edges,
+            "stats": {
+                "entityCount": graph.entities.len(),
+                "edgeCount": graph.edges.len(),
+            },
+        })
+    }
+
+    fn test_ref_type_sort_key(ref_type: &RefType) -> u8 {
+        match ref_type {
+            RefType::Calls => 0,
+            RefType::Imports => 1,
+            RefType::TypeRef => 2,
+        }
     }
 
     fn deep_typescript(depth: usize) -> String {
@@ -6851,6 +6933,98 @@ def report():
                 .map(|d| (&d.name, &d.file_path))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_constructor_return_type_tie_break_uses_stable_source_order() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a_primary.py",
+            "\
+class Primary:
+    def get(self):
+        return True
+
+def make_conn():
+    return Primary()
+",
+        );
+        write_file(
+            root,
+            "holder.py",
+            "\
+class Holder:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def use(self):
+        return self.conn.get()
+
+def wire():
+    Holder(make_conn())
+",
+        );
+        write_file(
+            root,
+            "z_backup.py",
+            "\
+class Backup:
+    def get(self):
+        return False
+
+def make_conn():
+    return Backup()
+",
+        );
+
+        let files = vec![
+            "a_primary.py".to_string(),
+            "holder.py".to_string(),
+            "z_backup.py".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &files, &registry);
+        let graph_payload = graph_json_payload(&graph);
+
+        let use_id = graph
+            .entities
+            .iter()
+            .find(|(_, entity)| entity.name == "use")
+            .map(|(id, _)| id)
+            .expect("Holder.use entity should exist");
+        let deps = graph.get_dependencies(use_id);
+
+        assert!(
+            deps.iter().any(|d| {
+                d.name == "get"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Primary"))
+            }),
+            "Holder.use should resolve conn.get to Primary.get. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|d| {
+                d.name == "get"
+                    && d.parent_id
+                        .as_deref()
+                        .map_or(false, |parent| parent.contains("Backup"))
+            }),
+            "Holder.use should not resolve conn.get to Backup.get. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        for _ in 0..16 {
+            let (repeat_graph, _) = EntityGraph::build(root, &files, &registry);
+            assert_eq!(graph_json_payload(&repeat_graph), graph_payload);
+        }
     }
 
     #[test]

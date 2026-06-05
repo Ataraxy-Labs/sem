@@ -11,6 +11,7 @@
 //! - Tracks variable types through assignments (x = Foo() → x.method → Foo.method)
 //! - Uses AST structure, not string matching
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,6 +42,8 @@ use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
     ParamNameField, ScopeResolveConfig,
 };
+
+type AttrToParamIndex<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str, &'a str)>>;
 
 /// A scope in the scope tree. Scopes are nested: module -> class -> function -> block.
 pub struct Scope {
@@ -485,6 +488,43 @@ pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
     .then_some(parent.name.as_str())
 }
 
+fn sort_symbol_table_targets_by_source(
+    symbol_table: &mut HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    for target_ids in symbol_table.values_mut() {
+        if target_ids.len() > 1 {
+            target_ids.sort_unstable_by(|left, right| {
+                compare_entity_ids_by_source(left, right, entity_map)
+            });
+        }
+    }
+}
+
+fn compare_entity_ids_by_source(
+    left: &str,
+    right: &str,
+    entity_map: &HashMap<String, EntityInfo>,
+) -> Ordering {
+    match (entity_map.get(left), entity_map.get(right)) {
+        (Some(left), Some(right)) => (
+            left.file_path.as_str(),
+            left.start_line,
+            left.end_line,
+            left.id.as_str(),
+        )
+            .cmp(&(
+                right.file_path.as_str(),
+                right.start_line,
+                right.end_line,
+                right.id.as_str(),
+            )),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
 /// Public API — preserves the original 5-parameter signature for semver compatibility.
 pub fn resolve_with_scopes(
     root: &Path,
@@ -574,6 +614,16 @@ pub(crate) fn resolve_with_scopes_full(
                     .entry(entity.file_path.clone())
                     .or_default()
                     .push((entity.start_line, entity.end_line, entity.id.clone()));
+            }
+            sort_symbol_table_targets_by_source(&mut symbol_table, entity_map);
+            for members in class_members.values_mut() {
+                members.sort_unstable();
+            }
+            for members in owner_members.values_mut() {
+                members.sort_unstable();
+            }
+            for ranges in entity_ranges.values_mut() {
+                ranges.sort_unstable();
             }
 
             // Build Go package index for O(1) import lookup
@@ -741,7 +791,6 @@ pub(crate) fn resolve_with_scopes_full(
         &init_params,
         &attr_to_param,
         &symbol_table,
-        entity_map,
         &mut instance_attr_types,
     );
 
@@ -861,9 +910,9 @@ pub(crate) fn resolve_with_scopes_full(
                 &entity_inner_scope,
                 &mut scopes,
                 &return_type_map,
+                &symbol_table,
                 &local_import_table,
                 file_path,
-                entity_map,
             );
 
             // The per-file import table is keyed by (file_path, name) but only ever
@@ -2381,6 +2430,9 @@ fn build_go_pkg_index(
             }
         }
     }
+    for entries in idx.values_mut() {
+        entries.sort_unstable();
+    }
     idx
 }
 
@@ -3391,17 +3443,11 @@ fn infer_constructor_param_types(
     return_type_map: &HashMap<String, String>,
     init_params: &HashMap<String, Vec<String>>,
     attr_to_param: &HashMap<(String, String), String>,
-    _symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &HashMap<String, Vec<String>>,
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    // Build func_name -> return_type lookup for quick access
-    let mut func_name_returns: HashMap<String, String> = HashMap::new();
-    for (eid, ret_type) in return_type_map {
-        if let Some(info) = entity_map.get(eid) {
-            func_name_returns.insert(info.name.clone(), ret_type.clone());
-        }
-    }
+    let func_name_returns = deterministic_return_types_by_name(return_type_map, symbol_table);
+    let attr_to_param_index = build_attr_to_param_index(attr_to_param);
 
     // Scan all files for constructor call sites: ClassName(arg1, arg2, ...)
     // Parallelized: each file produces local results, then merged.
@@ -3414,7 +3460,7 @@ fn infer_constructor_param_types(
                 source,
                 &func_name_returns,
                 init_params,
-                attr_to_param,
+                &attr_to_param_index,
                 &mut local_attr_types,
             );
             local_attr_types
@@ -3422,10 +3468,44 @@ fn infer_constructor_param_types(
         .collect();
 
     for local in local_results {
-        for (key, val) in local {
+        let mut local_entries: Vec<((String, String), String)> = local.into_iter().collect();
+        local_entries.sort_unstable();
+        for (key, val) in local_entries {
             instance_attr_types.entry(key).or_insert(val);
         }
     }
+}
+
+fn deterministic_return_types_by_name(
+    return_type_map: &HashMap<String, String>,
+    symbol_table: &HashMap<String, Vec<String>>,
+) -> HashMap<String, String> {
+    let mut by_name = HashMap::with_capacity(return_type_map.len());
+    for (name, target_ids) in symbol_table {
+        if let Some(return_type) = target_ids
+            .iter()
+            .find_map(|target_id| return_type_map.get(target_id))
+        {
+            by_name.insert(name.clone(), return_type.clone());
+        }
+    }
+    by_name
+}
+
+fn build_attr_to_param_index(
+    attr_to_param: &HashMap<(String, String), String>,
+) -> AttrToParamIndex<'_> {
+    let mut index: AttrToParamIndex<'_> = HashMap::with_capacity(attr_to_param.len());
+    for ((class_name, attr_name), param_name) in attr_to_param {
+        index
+            .entry((class_name.as_str(), param_name.as_str()))
+            .or_default()
+            .push((class_name.as_str(), attr_name.as_str()));
+    }
+    for attrs in index.values_mut() {
+        attrs.sort_unstable();
+    }
+    index
 }
 
 fn scan_constructor_calls(
@@ -3433,7 +3513,7 @@ fn scan_constructor_calls(
     source: &[u8],
     func_name_returns: &HashMap<String, String>,
     init_params: &HashMap<String, Vec<String>>,
-    attr_to_param: &HashMap<(String, String), String>,
+    attr_to_param_index: &AttrToParamIndex<'_>,
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
     let mut worklist = vec![root];
@@ -3465,12 +3545,13 @@ fn scan_constructor_calls(
                                     let arg_type = infer_expr_type(arg, source, func_name_returns);
 
                                     if let Some(at) = arg_type {
-                                        // Check if any self.attr maps to this param
-                                        for ((cn, attr), pn) in attr_to_param.iter() {
-                                            if cn == class_name && pn == param_name {
+                                        if let Some(attrs) = attr_to_param_index
+                                            .get(&(class_name, param_name.as_str()))
+                                        {
+                                            for (cn, attr) in attrs {
                                                 instance_attr_types
-                                                    .entry((cn.clone(), attr.clone()))
-                                                    .or_insert(at.clone());
+                                                    .entry(((*cn).to_string(), (*attr).to_string()))
+                                                    .or_insert_with(|| at.clone());
                                             }
                                         }
                                     }
@@ -3529,24 +3610,29 @@ fn inject_return_type_bindings(
     _entity_inner_scope: &HashMap<String, usize>,
     scopes: &mut Vec<Scope>,
     return_type_map: &HashMap<String, String>,
+    symbol_table: &HashMap<String, Vec<String>>,
     import_table: &HashMap<(String, String), String>,
     file_path: &str,
-    entity_map: &HashMap<String, EntityInfo>,
 ) {
-    // Build function name -> return type lookup
-    let mut func_name_return_types: HashMap<String, String> = HashMap::new();
-    for (eid, ret_type) in return_type_map {
-        if let Some(info) = entity_map.get(eid) {
-            func_name_return_types.insert(info.name.clone(), ret_type.clone());
-        }
-    }
+    let mut func_name_return_types =
+        deterministic_return_types_by_name(return_type_map, symbol_table);
 
     // Also resolve through imports: if `get_connection` is imported and has a known return type
-    for ((fp, local_name), target_id) in import_table {
-        if fp == file_path {
-            if let Some(ret_type) = return_type_map.get(target_id) {
-                func_name_return_types.insert(local_name.clone(), ret_type.clone());
-            }
+    let mut import_entries: Vec<(&(String, String), &String)> = import_table
+        .iter()
+        .filter(|((fp, _), _)| fp == file_path)
+        .collect();
+    import_entries.sort_unstable_by(
+        |((_, left_name), left_target), ((_, right_name), right_target)| {
+            left_name
+                .cmp(right_name)
+                .then_with(|| left_target.cmp(right_target))
+        },
+    );
+
+    for ((_, local_name), target_id) in import_entries {
+        if let Some(ret_type) = return_type_map.get(target_id) {
+            func_name_return_types.insert(local_name.clone(), ret_type.clone());
         }
     }
 
@@ -6064,4 +6150,84 @@ fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {
         return true;
     }
     config.builtins.contains(&name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn return_type_name_lookup_uses_symbol_table_order() {
+        let mut return_type_map = HashMap::new();
+        return_type_map.insert(
+            "z_backup.py::function::make_conn".to_string(),
+            "Backup".to_string(),
+        );
+        return_type_map.insert(
+            "a_primary.py::function::make_conn".to_string(),
+            "Primary".to_string(),
+        );
+
+        let mut symbol_table = HashMap::new();
+        symbol_table.insert(
+            "make_conn".to_string(),
+            vec![
+                "a_primary.py::function::make_conn".to_string(),
+                "z_backup.py::function::make_conn".to_string(),
+            ],
+        );
+
+        let by_name = deterministic_return_types_by_name(&return_type_map, &symbol_table);
+
+        assert_eq!(
+            by_name.get("make_conn").map(String::as_str),
+            Some("Primary")
+        );
+    }
+
+    #[test]
+    fn go_package_index_entries_are_sorted() {
+        let first_id = "pkg/foo/a.go::function::zeta".to_string();
+        let second_id = "pkg/foo/b.go::function::alpha".to_string();
+
+        let mut symbol_table = HashMap::new();
+        symbol_table.insert("zeta".to_string(), vec![first_id.clone()]);
+        symbol_table.insert("alpha".to_string(), vec![second_id.clone()]);
+
+        let mut entity_map = HashMap::new();
+        entity_map.insert(
+            first_id.clone(),
+            EntityInfo {
+                id: first_id.clone(),
+                name: "zeta".to_string(),
+                entity_type: "function".to_string(),
+                file_path: "pkg/foo/a.go".to_string(),
+                parent_id: None,
+                start_line: 1,
+                end_line: 3,
+            },
+        );
+        entity_map.insert(
+            second_id.clone(),
+            EntityInfo {
+                id: second_id.clone(),
+                name: "alpha".to_string(),
+                entity_type: "function".to_string(),
+                file_path: "pkg/foo/b.go".to_string(),
+                parent_id: None,
+                start_line: 1,
+                end_line: 3,
+            },
+        );
+
+        let index = build_go_pkg_index(&symbol_table, &entity_map);
+
+        assert_eq!(
+            index.get("foo"),
+            Some(&vec![
+                ("alpha".to_string(), second_id),
+                ("zeta".to_string(), first_id),
+            ])
+        );
+    }
 }
