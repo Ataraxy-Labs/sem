@@ -7,8 +7,9 @@ use std::path::{Component, Path, PathBuf};
 use rusqlite::{params, Connection, Transaction};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 2;
+pub const CACHE_SCHEMA_VERSION: i32 = 3;
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
     ("idx_entities_file_path", "entities", "file_path"),
     ("idx_entities_name", "entities", "name"),
@@ -27,7 +28,8 @@ const CACHE_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
     mtime_secs INTEGER NOT NULL,
-    mtime_nanos INTEGER NOT NULL
+    mtime_nanos INTEGER NOT NULL,
+    content_hash TEXT
 );
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
@@ -325,6 +327,51 @@ pub fn file_mtime_parts(path: &Path) -> Option<(i64, i64)> {
     Some((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }
 
+pub fn file_content_hash(path: &Path) -> Option<String> {
+    let content = std::fs::read(path).ok()?;
+    Some(content_hash_bytes(&content))
+}
+
+pub fn file_fingerprint(path: &Path) -> Option<(i64, i64, String)> {
+    let (secs, nanos) = file_mtime_parts(path)?;
+    let hash = file_content_hash(path)?;
+    Some((secs, nanos, hash))
+}
+
+pub enum FileFreshness {
+    Fresh,
+    FreshWithUpdatedFingerprint {
+        secs: i64,
+        nanos: i64,
+        content_hash: String,
+    },
+    Stale,
+}
+
+pub fn file_freshness(
+    path: &Path,
+    cached_secs: i64,
+    cached_nanos: i64,
+    cached_content_hash: Option<&str>,
+) -> Option<FileFreshness> {
+    let (current_secs, current_nanos) = file_mtime_parts(path)?;
+    if cached_secs == current_secs && cached_nanos == current_nanos {
+        return Some(FileFreshness::Fresh);
+    }
+
+    let cached_content_hash = cached_content_hash?;
+    let current_content_hash = file_content_hash(path)?;
+    if current_content_hash == cached_content_hash {
+        return Some(FileFreshness::FreshWithUpdatedFingerprint {
+            secs: current_secs,
+            nanos: current_nanos,
+            content_hash: current_content_hash,
+        });
+    }
+
+    Some(FileFreshness::Stale)
+}
+
 pub fn is_cache_manifest_key(path: &str) -> bool {
     CACHE_MANIFEST_FILES
         .iter()
@@ -394,7 +441,7 @@ pub fn refresh_manifest_entries(tx: &Transaction<'_>, root: &Path) -> Result<(),
     }
 
     let mut insert = tx.prepare(
-        "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, NULL)",
     )?;
     for (file_name, cache_key) in CACHE_MANIFEST_FILES {
         let full = root.join(file_name);
@@ -436,15 +483,16 @@ impl DiskCache {
         tx.execute_batch("DELETE FROM files; DELETE FROM entities; DELETE FROM edges;")?;
 
         {
-            let mut stmt = tx
-                .prepare("INSERT INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)")?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
+            )?;
             for file in files {
                 if is_manifest_file_name(file) {
                     continue;
                 }
                 let full = root.join(file);
-                if let Some((secs, nanos)) = file_mtime_parts(&full) {
-                    stmt.execute(params![file, secs, nanos])?;
+                if let Some((secs, nanos, content_hash)) = file_fingerprint(&full) {
+                    stmt.execute(params![file, secs, nanos, content_hash])?;
                 }
             }
         }
@@ -516,20 +564,28 @@ impl DiskCache {
         // Verify all mtimes match
         let mut stmt = self
             .conn
-            .prepare("SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1")
+            .prepare("SELECT mtime_secs, mtime_nanos, content_hash FROM files WHERE path = ?1")
             .ok()?;
         for file in files {
             if is_manifest_file_name(file) {
                 continue;
             }
-            let full = root.join(file);
-            let (current_secs, current_nanos) = file_mtime_parts(&full)?;
-
-            let (secs, nanos): (i64, i64) = stmt
-                .query_row(params![file], |row| Ok((row.get(0)?, row.get(1)?)))
+            let (secs, nanos, content_hash): (i64, i64, Option<String>) = stmt
+                .query_row(params![file], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .ok()?;
-            if secs != current_secs || nanos != current_nanos {
-                return None;
+            let full = root.join(file);
+            match file_freshness(&full, secs, nanos, content_hash.as_deref())? {
+                FileFreshness::Fresh => {}
+                FileFreshness::FreshWithUpdatedFingerprint {
+                    secs,
+                    nanos,
+                    content_hash,
+                } => {
+                    self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                }
+                FileFreshness::Stale => return None,
             }
         }
 
@@ -622,13 +678,17 @@ impl DiskCache {
 
         let mut stmt = self
             .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
+            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
             .ok()?;
-        let cached_mtimes: HashMap<String, (i64, i64)> = stmt
+        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ),
                 ))
             })
             .ok()?
@@ -639,11 +699,18 @@ impl DiskCache {
             if is_manifest_file_name(file) {
                 continue;
             }
-            let (secs, nanos) = cached_mtimes.get(file.as_str()).copied()?;
+            let (secs, nanos, content_hash) = cached_mtimes.get(file.as_str())?;
             let full = root.join(file);
-            let (current_secs, current_nanos) = file_mtime_parts(&full)?;
-            if secs != current_secs || nanos != current_nanos {
-                return None;
+            match file_freshness(&full, *secs, *nanos, content_hash.as_deref())? {
+                FileFreshness::Fresh => {}
+                FileFreshness::FreshWithUpdatedFingerprint {
+                    secs,
+                    nanos,
+                    content_hash,
+                } => {
+                    self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                }
+                FileFreshness::Stale => return None,
             }
         }
 
@@ -675,6 +742,13 @@ impl DiskCache {
 
         let edges = self.load_edges()?;
         Some(EntityGraph::from_parts(entity_map, edges))
+    }
+
+    fn refresh_file_fingerprint(&self, file: &str, secs: i64, nanos: i64, content_hash: &str) {
+        let _ = self.conn.execute(
+            "UPDATE files SET mtime_secs = ?2, mtime_nanos = ?3, content_hash = ?4 WHERE path = ?1",
+            params![file, secs, nanos, content_hash],
+        );
     }
 
     fn load_edges(&self) -> Option<Vec<EntityRef>> {
@@ -711,13 +785,17 @@ impl DiskCache {
 
         let mut stmt = self
             .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
+            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
             .ok()?;
-        let cached_files: HashMap<String, (i64, i64)> = stmt
+        let cached_files: HashMap<String, (i64, i64, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ),
                 ))
             })
             .ok()?
@@ -739,16 +817,21 @@ impl DiskCache {
         let mut stale_current_file_count = 0;
         for file in source_files {
             match cached_files.get(file) {
-                Some(&(secs, nanos)) => {
+                Some((secs, nanos, content_hash)) => {
                     let full = root.join(file);
-                    let is_stale = file_mtime_parts(&full)
-                        .map(|(current_secs, current_nanos)| {
-                            secs != current_secs || nanos != current_nanos
-                        })
-                        .unwrap_or(true);
-                    if is_stale {
-                        stale_current_file_count += 1;
-                        stale_source_files.push(file.clone());
+                    match file_freshness(&full, *secs, *nanos, content_hash.as_deref()) {
+                        Some(FileFreshness::Fresh) => {}
+                        Some(FileFreshness::FreshWithUpdatedFingerprint {
+                            secs,
+                            nanos,
+                            content_hash,
+                        }) => {
+                            self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                        }
+                        Some(FileFreshness::Stale) | None => {
+                            stale_current_file_count += 1;
+                            stale_source_files.push(file.clone());
+                        }
                     }
                 }
                 None => {
@@ -955,12 +1038,12 @@ impl DiskCache {
 
         {
             let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for file in &source_stale_files {
                 let full = root.join(file);
-                if let Some((secs, nanos)) = file_mtime_parts(&full) {
-                    ins.execute(params![file, secs, nanos])?;
+                if let Some((secs, nanos, content_hash)) = file_fingerprint(&full) {
+                    ins.execute(params![file, secs, nanos, content_hash])?;
                 }
             }
         }
@@ -1203,6 +1286,17 @@ mod tests {
             .unwrap()
     }
 
+    fn cached_file_mtime(cache: &DiskCache, file: &str) -> (i64, i64) {
+        cache
+            .conn
+            .query_row(
+                "SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1",
+                rusqlite::params![file],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     fn sample_files(root: &Path) -> Vec<String> {
         write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
         vec!["sample.foo".to_string()]
@@ -1335,6 +1429,27 @@ mod tests {
         let removed_gitattributes = compute_manifest_hash(&root, &files).unwrap();
         assert_eq!(without_gitattributes, removed_gitattributes);
 
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_refreshes_mtime_when_file_content_is_unchanged() {
+        let root = temp_repo_root("mtime-only-refresh");
+        let file = root.join("same.rs");
+        write_file(&file, "fn same() {}\n");
+        let files = vec!["same.rs".to_string()];
+        let cache = save_empty_cache(&root, &files);
+        let before = cached_file_mtime(&cache, "same.rs");
+
+        rewrite_after_mtime_tick(&file, "fn same() {}\n");
+        let current = file_mtime_parts(&file).unwrap();
+        assert_ne!(before, current);
+
+        assert!(cache.load_graph_topology(&root, &files).is_some());
+        assert!(cache.load_partial(&root, &files).is_none());
+        assert_eq!(cached_file_mtime(&cache, "same.rs"), current);
+
+        drop(cache);
         cleanup(root);
     }
 

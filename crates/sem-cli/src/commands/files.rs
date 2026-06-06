@@ -1,12 +1,8 @@
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use colored::Colorize;
-use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
 use sem_core::parser::registry::ParserRegistry;
-
-const BINARY_PROBE_BYTES: usize = 4096;
+use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
 
 pub fn find_supported_files_in_path(
     root: &Path,
@@ -27,6 +23,21 @@ pub fn find_supported_files_in_path(
     let semignore = root.join(".semignore");
     if semignore.exists() {
         builder.add_ignore(semignore);
+    }
+
+    if !no_default_excludes {
+        let root = root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                return true;
+            }
+
+            let rel_path = file_path_for_entity(&root, entry.path());
+            !is_default_excluded(&rel_path)
+        });
     }
 
     let walker = builder.build();
@@ -64,10 +75,7 @@ pub fn find_supported_files_in_path(
         if is_probably_binary_path(&rel_path) {
             continue;
         }
-        if registry.get_plugin(&rel_path).is_none() {
-            continue;
-        }
-        if has_nul_byte(path).unwrap_or(false) {
+        if !has_supported_plugin(path, &rel_path, registry, ext_filter) {
             continue;
         }
         files.push(rel_path);
@@ -77,6 +85,27 @@ pub fn find_supported_files_in_path(
     files
 }
 
+fn has_supported_plugin(
+    path: &Path,
+    rel_path: &str,
+    registry: &ParserRegistry,
+    ext_filter: &[String],
+) -> bool {
+    if registry.get_explicit_plugin(rel_path).is_some() {
+        return true;
+    }
+
+    if !ext_filter.is_empty() || Path::new(rel_path).extension().is_some() {
+        return false;
+    }
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+
+    registry.detect_plugin_from_content(&content).is_some()
+}
+
 pub fn file_path_for_entity(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .ok()
@@ -84,13 +113,6 @@ pub fn file_path_for_entity(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn has_nul_byte(path: &Path) -> std::io::Result<bool> {
-    let mut file = File::open(path)?;
-    let mut buffer = [0; BINARY_PROBE_BYTES];
-    let len = file.read(&mut buffer)?;
-    Ok(buffer[..len].contains(&0))
 }
 
 #[cfg(test)]
@@ -120,6 +142,12 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("src/run"),
+            "#!/usr/bin/env node\nfunction main() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/notes.weird"), "plain text\n").unwrap();
         fs::write(root.join("src/blob.weird"), b"abc\0def").unwrap();
         fs::write(root.join("src/icon.png"), b"\x89PNG\r\n").unwrap();
         fs::write(root.join("dist/generated.js"), "function generated() {}\n").unwrap();
@@ -127,13 +155,22 @@ mod tests {
         let registry = create_default_registry();
         let files = find_supported_files_in_path(&root, &root, &registry, &[], false);
 
-        assert_eq!(files, vec!["src/main.rs".to_string()]);
+        assert_eq!(
+            files,
+            vec!["src/main.rs".to_string(), "src/run".to_string()]
+        );
 
         let files_with_generated = find_supported_files_in_path(&root, &root, &registry, &[], true);
         assert!(files_with_generated.contains(&"src/main.rs".to_string()));
+        assert!(files_with_generated.contains(&"src/run".to_string()));
         assert!(files_with_generated.contains(&"dist/generated.js".to_string()));
+        assert!(!files_with_generated.contains(&"src/notes.weird".to_string()));
         assert!(!files_with_generated.contains(&"src/blob.weird".to_string()));
         assert!(!files_with_generated.contains(&"src/icon.png".to_string()));
+
+        let rs_files =
+            find_supported_files_in_path(&root, &root, &registry, &[".rs".to_string()], true);
+        assert_eq!(rs_files, vec!["src/main.rs".to_string()]);
 
         fs::remove_dir_all(root).unwrap();
     }

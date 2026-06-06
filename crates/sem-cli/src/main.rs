@@ -4,6 +4,9 @@ mod formatters;
 mod stats;
 mod timings;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::control;

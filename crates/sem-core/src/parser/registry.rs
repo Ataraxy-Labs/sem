@@ -48,6 +48,19 @@ impl ParserRegistry {
         self.get_plugin_by_id("fallback")
     }
 
+    pub fn get_explicit_plugin(&self, file_path: &str) -> Option<&dyn SemanticParserPlugin> {
+        for ext in get_extensions(file_path) {
+            if let Some(&idx) = self.extension_map.get(&ext) {
+                return Some(self.plugins[idx].as_ref());
+            }
+        }
+        None
+    }
+
+    pub fn detect_plugin_from_content(&self, content: &str) -> Option<&dyn SemanticParserPlugin> {
+        self.detect_from_shebang(content)
+    }
+
     /// Try to detect language from shebang line when extension-based lookup fails.
     /// Call this as a fallback when file content is available.
     pub fn get_plugin_with_content(&self, file_path: &str, content: &str) -> Option<&dyn SemanticParserPlugin> {

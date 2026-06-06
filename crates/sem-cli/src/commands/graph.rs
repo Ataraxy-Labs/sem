@@ -5,6 +5,7 @@ use sem_core::git::bridge::GitBridge;
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityRef, RefType};
 use sem_core::parser::registry::ParserRegistry;
+use serde::ser::{SerializeMap, Serializer};
 
 use crate::cache::DiskCache;
 use crate::timings::Timings;
@@ -29,27 +30,40 @@ pub fn graph_command(opts: GraphOptions) {
     let file_paths =
         find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
     timings.mark("file_discovery");
-    let (graph, _entities) =
-        get_or_build_graph_with_timings(root, &file_paths, &registry, opts.no_cache, &mut timings);
+    if opts.json && !opts.no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            timings.mark("cache_open");
+            let stdout = std::io::stdout();
+            match disk.write_graph_json_topology(root, &file_paths, stdout.lock()) {
+                Ok(true) => {
+                    timings.mark("cache_topology_json_stream");
+                    timings.finish();
+                    return;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    eprintln!(
+                        "{} failed to stream cached graph JSON: {}",
+                        "error:".red().bold(),
+                        err
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    let graph = get_or_build_graph_topology_with_timings(
+        root,
+        &file_paths,
+        &registry,
+        opts.no_cache,
+        &mut timings,
+    );
 
     if opts.json {
-        let mut entities = graph.entities.values().collect::<Vec<_>>();
-        entities.sort_by(|a, b| a.id.cmp(&b.id));
-
-        let mut edges = graph.edges.iter().collect::<Vec<_>>();
-        edges.sort_by(compare_entity_refs);
-
-        let output = serde_json::json!({
-            "entities": entities,
-            "edges": edges,
-            "stats": {
-                "entityCount": graph.entities.len(),
-                "edgeCount": graph.edges.len()
-            }
-        });
-        let output = serde_json::to_string(&output).unwrap();
+        write_graph_json(&graph).unwrap();
         timings.mark("cli_output_serialization");
-        println!("{}", output);
     } else {
         timings.mark("cli_output_serialization");
         println!(
@@ -60,6 +74,38 @@ pub fn graph_command(opts: GraphOptions) {
         );
     }
     timings.finish();
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphStats {
+    entity_count: usize,
+    edge_count: usize,
+}
+
+fn write_graph_json(graph: &EntityGraph) -> serde_json::Result<()> {
+    let mut entities = graph.entities.values().collect::<Vec<_>>();
+    entities.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut edges = graph.edges.iter().collect::<Vec<_>>();
+    edges.sort_by(compare_entity_refs);
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let mut serializer = serde_json::Serializer::new(&mut stdout);
+    let mut map = (&mut serializer).serialize_map(Some(3))?;
+    map.serialize_entry("entities", &entities)?;
+    map.serialize_entry("edges", &edges)?;
+    map.serialize_entry(
+        "stats",
+        &GraphStats {
+            entity_count: graph.entities.len(),
+            edge_count: graph.edges.len(),
+        },
+    )?;
+    map.end()?;
+    use std::io::Write;
+    stdout.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
 fn compare_entity_refs(a: &&EntityRef, b: &&EntityRef) -> std::cmp::Ordering {

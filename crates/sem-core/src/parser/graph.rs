@@ -40,6 +40,15 @@ use crate::parser::import_resolution::{
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
 
+#[cfg(not(test))]
+const PARSED_FILE_REUSE_LIMIT: usize = 20_000;
+#[cfg(test)]
+const PARSED_FILE_REUSE_LIMIT: usize = 8;
+#[cfg(not(test))]
+const SCOPE_RESOLVE_FILE_CHUNK_SIZE: usize = 5_000;
+#[cfg(test)]
+const SCOPE_RESOLVE_FILE_CHUNK_SIZE: usize = 3;
+
 #[derive(Clone, Copy)]
 struct ChildRange<'a> {
     file_path: &'a str,
@@ -517,34 +526,6 @@ impl LineReferenceIndex {
     }
 }
 
-fn build_reference_indexes(
-    root: &Path,
-    file_paths: &[String],
-    parsed_files: &[(String, String, tree_sitter::Tree)],
-) -> HashMap<String, FileReferenceIndex> {
-    let parsed_content: HashMap<&str, &str> = parsed_files
-        .iter()
-        .map(|(file_path, content, _)| (file_path.as_str(), content.as_str()))
-        .collect();
-
-    maybe_par_iter!(file_paths)
-        .filter_map(|file_path| {
-            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-            crate::parser::plugins::code::languages::get_language_config(ext)?;
-
-            if let Some(content) = parsed_content.get(file_path.as_str()) {
-                return Some((file_path.clone(), FileReferenceIndex::from_content(content)));
-            }
-
-            let content = std::fs::read_to_string(root.join(file_path)).ok()?;
-            Some((
-                file_path.clone(),
-                FileReferenceIndex::from_content(&content),
-            ))
-        })
-        .collect()
-}
-
 fn identifier_tokens(line: &str) -> impl Iterator<Item = (&str, usize)> {
     let mut start = None;
     let mut chars = line.char_indices();
@@ -652,6 +633,335 @@ fn direct_reference_line_ranges(
     ranges
 }
 
+struct ReferenceResolutionContext<'a> {
+    symbol_table: &'a HashMap<String, Vec<String>>,
+    entity_map: &'a HashMap<String, EntityInfo>,
+    import_table: &'a HashMap<(String, String), String>,
+    scope_consumed_words: &'a HashMap<String, HashSet<String>>,
+    child_ranges_by_parent: &'a HashMap<&'a str, Vec<ChildRange<'a>>>,
+    child_line_ranges: &'a HashMap<String, Vec<(usize, usize)>>,
+    parent_child_pairs: &'a HashSet<(&'a str, &'a str)>,
+    class_child_names: &'a HashSet<(&'a str, &'a str)>,
+    class_entity_files: &'a HashSet<(&'a str, &'a str)>,
+    enclosing_class: &'a HashMap<&'a str, &'a str>,
+    class_members: &'a HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+}
+
+fn resolve_references_with_file_indexes<'a>(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &'a [SemanticEntity],
+    needs_resolution: Option<&HashSet<&'a str>>,
+    context: &ReferenceResolutionContext<'a>,
+) -> Vec<(String, String, RefType)> {
+    let mut entities_by_file: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::new();
+    for entity in all_entities {
+        if needs_resolution
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(entity.id.as_str()))
+        {
+            continue;
+        }
+        let ext = entity
+            .file_path
+            .rfind('.')
+            .map(|i| &entity.file_path[i..])
+            .unwrap_or("");
+        if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
+            continue;
+        }
+        entities_by_file
+            .entry(entity.file_path.as_str())
+            .or_default()
+            .push(entity);
+    }
+
+    let mut sorted_file_paths = file_paths.to_vec();
+    sorted_file_paths.sort_unstable();
+    sorted_file_paths.dedup();
+
+    maybe_par_iter!(sorted_file_paths)
+        .filter_map(|file_path| {
+            let entities = entities_by_file.get(file_path.as_str())?;
+            let needs_index = entities.iter().any(|entity| {
+                !entity_requires_content_span_filter(entity, context.child_ranges_by_parent)
+            });
+            let reference_index = if needs_index {
+                build_file_reference_index(root, file_path)
+            } else {
+                None
+            };
+
+            let mut file_edges = Vec::new();
+            for entity in entities {
+                file_edges.extend(resolve_entity_references(
+                    entity,
+                    reference_index.as_ref(),
+                    context,
+                ));
+            }
+            Some(file_edges)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn build_file_reference_index(root: &Path, file_path: &str) -> Option<FileReferenceIndex> {
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    crate::parser::plugins::code::languages::get_language_config(ext)?;
+    let content = std::fs::read_to_string(root.join(file_path)).ok()?;
+    Some(FileReferenceIndex::from_content(&content))
+}
+
+fn resolve_scopes_in_file_chunks(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_built: &scope_resolve::PreBuiltLookups,
+    import_table: &HashMap<(String, String), String>,
+) -> (
+    Vec<(String, String, RefType)>,
+    HashMap<String, HashSet<String>>,
+) {
+    let mut all_edges = Vec::new();
+    let mut all_consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for chunk in file_paths.chunks(SCOPE_RESOLVE_FILE_CHUNK_SIZE) {
+        if !chunk.iter().any(|file_path| {
+            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+            crate::parser::plugins::code::languages::get_language_config(ext)
+                .and_then(|config| config.scope_resolve)
+                .is_some()
+        }) {
+            continue;
+        }
+
+        let result = scope_resolve::resolve_with_scopes_full(
+            root,
+            chunk,
+            all_entities,
+            entity_map,
+            None,
+            Some(pre_built),
+            Some(import_table),
+            false,
+        );
+        all_edges.extend(result.edges);
+        for (entity_id, words) in result.consumed_words {
+            all_consumed_words
+                .entry(entity_id)
+                .or_default()
+                .extend(words);
+        }
+    }
+
+    (all_edges, all_consumed_words)
+}
+
+fn resolve_entity_references(
+    entity: &SemanticEntity,
+    reference_index: Option<&FileReferenceIndex>,
+    context: &ReferenceResolutionContext<'_>,
+) -> Vec<(String, String, RefType)> {
+    let ext = entity
+        .file_path
+        .rfind('.')
+        .map(|i| &entity.file_path[i..])
+        .unwrap_or("");
+    let Some(language_config) = crate::parser::plugins::code::languages::get_language_config(ext)
+    else {
+        return vec![];
+    };
+    let fallback_end_line =
+        fallback_reference_end_line(entity, language_config.scope_resolve.is_some());
+    let fallback_ranges =
+        direct_reference_line_ranges(entity, fallback_end_line, context.child_line_ranges);
+
+    let mut entity_edges = Vec::new();
+    let mut consumed_words = context
+        .scope_consumed_words
+        .get(&entity.id)
+        .cloned()
+        .unwrap_or_default();
+
+    let reference_index =
+        if entity_requires_content_span_filter(entity, context.child_ranges_by_parent) {
+            None
+        } else {
+            reference_index
+        };
+    let fallback_stripped = if reference_index.is_none() {
+        Some(strip_comments_and_strings(&entity.content))
+    } else {
+        None
+    };
+    let local_bindings =
+        local_binding_names_filtered(&entity.content, ext, |local_line, start, end| {
+            entity_owns_content_span(
+                entity.id.as_str(),
+                entity.file_path.as_str(),
+                source_line_for_entity_content(entity, local_line),
+                Some(start),
+                Some(end),
+                context.child_ranges_by_parent,
+            )
+        });
+
+    let dot_chains: Vec<(&str, &str, Option<(usize, usize, usize)>)> = match reference_index {
+        Some(index) => index
+            .dot_chains_in_ranges(&fallback_ranges)
+            .into_iter()
+            .map(|(receiver, member)| (receiver, member, None))
+            .collect(),
+        None => extract_dot_chains_with_positions(fallback_stripped.as_ref().unwrap())
+            .into_iter()
+            .map(|(receiver, member, line, start, end)| {
+                (receiver, member, Some((line, start, end)))
+            })
+            .collect(),
+    };
+
+    for (receiver, member, position) in &dot_chains {
+        if consumed_words.contains(*member) {
+            continue;
+        }
+        if let Some((local_line, local_start_byte, local_end_byte)) = *position {
+            if !entity_owns_content_span(
+                entity.id.as_str(),
+                entity.file_path.as_str(),
+                source_line_for_entity_content(entity, local_line),
+                Some(local_start_byte),
+                Some(local_end_byte),
+                context.child_ranges_by_parent,
+            ) {
+                continue;
+            }
+        }
+        let edge_count_before = entity_edges.len();
+        if *receiver == "self" || *receiver == "this" {
+            if let Some(class_name) = context.enclosing_class.get(entity.id.as_str()) {
+                if let Some(members) = context.class_members.get(class_name) {
+                    for (name, target_id) in members {
+                        if *name == *member && *target_id != entity.id.as_str() {
+                            entity_edges.push((
+                                entity.id.clone(),
+                                target_id.to_string(),
+                                RefType::Calls,
+                            ));
+                            consumed_words.insert(member.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if context
+            .class_entity_files
+            .contains(&(*receiver, entity.file_path.as_str()))
+        {
+            if let Some(members) = context.class_members.get(*receiver) {
+                for (name, target_id) in members {
+                    if *name == *member {
+                        entity_edges.push((
+                            entity.id.clone(),
+                            target_id.to_string(),
+                            RefType::Calls,
+                        ));
+                        consumed_words.insert(member.to_string());
+                        consumed_words.insert(receiver.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if entity_edges.len() == edge_count_before {
+            consumed_words.insert(member.to_string());
+        }
+    }
+
+    let refs: Vec<(&str, RefType)> = match reference_index {
+        Some(index) => index.refs_with_types_in_ranges(&fallback_ranges, &entity.name),
+        None => {
+            let stripped = fallback_stripped.as_ref().unwrap();
+            extract_references_with_stripped_filtered(
+                &entity.content,
+                &entity.name,
+                stripped,
+                |local_line, local_start_byte, local_end_byte| {
+                    entity_owns_content_span(
+                        entity.id.as_str(),
+                        entity.file_path.as_str(),
+                        source_line_for_entity_content(entity, local_line),
+                        Some(local_start_byte),
+                        Some(local_end_byte),
+                        context.child_ranges_by_parent,
+                    )
+                },
+            )
+            .into_iter()
+            .map(|ref_name| (ref_name, infer_ref_type(&entity.content, ref_name)))
+            .collect()
+        }
+    };
+    for (ref_name, ref_type) in refs {
+        if consumed_words.contains(ref_name) {
+            continue;
+        }
+        if local_bindings.contains(ref_name) {
+            continue;
+        }
+
+        if context
+            .class_child_names
+            .contains(&(entity.id.as_str(), ref_name))
+        {
+            continue;
+        }
+
+        let import_key = (entity.file_path.clone(), ref_name.to_string());
+        if let Some(import_target_id) = context.import_table.get(&import_key) {
+            if import_target_id != &entity.id
+                && !context
+                    .parent_child_pairs
+                    .contains(&(entity.id.as_str(), import_target_id.as_str()))
+                && !context
+                    .parent_child_pairs
+                    .contains(&(import_target_id.as_str(), entity.id.as_str()))
+            {
+                entity_edges.push((entity.id.clone(), import_target_id.clone(), ref_type));
+            }
+            continue;
+        }
+
+        if let Some(target_ids) = context.symbol_table.get(ref_name) {
+            let target = target_ids.iter().find(|id| {
+                *id != &entity.id
+                    && context
+                        .entity_map
+                        .get(*id)
+                        .map_or(false, |e| e.file_path == entity.file_path)
+            });
+
+            if let Some(target_id) = target {
+                if context
+                    .parent_child_pairs
+                    .contains(&(entity.id.as_str(), target_id.as_str()))
+                    || context
+                        .parent_child_pairs
+                        .contains(&(target_id.as_str(), entity.id.as_str()))
+                {
+                    continue;
+                }
+                entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
+            }
+        }
+    }
+
+    entity_edges
+}
+
 impl EntityGraph {
     /// Reconstruct an EntityGraph from pre-loaded parts (e.g. from a cache).
     pub fn from_parts(entities: HashMap<String, EntityInfo>, edges: Vec<EntityRef>) -> Self {
@@ -685,8 +995,10 @@ impl EntityGraph {
         file_paths: &[String],
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
+        let retain_parsed_files = file_paths.len() <= PARSED_FILE_REUSE_LIMIT;
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
-        // Also collect (file_path, content, tree) for scope_resolve reuse
+        // Small and medium repos reuse parse trees in scope resolution; large repos
+        // keep peak memory bounded by reparsing scope chunks.
         let per_file: Vec<(
             Vec<SemanticEntity>,
             Option<(String, String, tree_sitter::Tree)>,
@@ -694,9 +1006,15 @@ impl EntityGraph {
             .filter_map(|file_path| {
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
-                let (entities, tree) = registry.extract_entities_with_tree(file_path, &content)?;
-                let parsed = tree.map(|t| (file_path.clone(), content, t));
-                Some((entities, parsed))
+                if retain_parsed_files {
+                    let (entities, tree) =
+                        registry.extract_entities_with_tree(file_path, &content)?;
+                    let parsed = tree.map(|tree| (file_path.clone(), content, tree));
+                    Some((entities, parsed))
+                } else {
+                    let entities = registry.extract_entities(file_path, &content);
+                    Some((entities, None))
+                }
             })
             .collect();
 
@@ -813,6 +1131,7 @@ impl EntityGraph {
             }
         }
         sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
+        let symbol_table = Arc::new(symbol_table);
 
         // Build import table: (file_path, imported_name) → target entity ID
         // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
@@ -821,7 +1140,7 @@ impl EntityGraph {
             file_paths,
             &symbol_table,
             &entity_map,
-            Some(&parsed_files),
+            retain_parsed_files.then_some(parsed_files.as_slice()),
         );
         // Build owned Go package index for scope resolver
         let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
@@ -865,9 +1184,6 @@ impl EntityGraph {
                 HashMap::new()
             };
 
-        // Wrap symbol_table in Arc to avoid expensive deep clone (621K entries)
-        let symbol_table = Arc::new(symbol_table);
-
         let pre_built = scope_resolve::PreBuiltLookups {
             symbol_table: Arc::clone(&symbol_table),
             class_members: scope_class_members,
@@ -876,8 +1192,6 @@ impl EntityGraph {
             go_pkg_index: owned_go_pkg_index,
         };
 
-        let reference_indexes = build_reference_indexes(root, file_paths, &parsed_files);
-
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
             let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
@@ -885,234 +1199,51 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
-        let (scope_edges, scope_consumed_words) = if has_scope_lang {
+        let (scope_edges, scope_consumed_words) = if has_scope_lang && retain_parsed_files {
             let result = scope_resolve::resolve_with_scopes_full(
                 root,
                 file_paths,
                 &all_entities,
                 &entity_map,
                 Some(parsed_files),
-                Some(pre_built),
+                Some(&pre_built),
                 Some(&import_table),
                 false,
             );
             (result.edges, result.consumed_words)
+        } else if has_scope_lang {
+            resolve_scopes_in_file_chunks(
+                root,
+                file_paths,
+                &all_entities,
+                &entity_map,
+                &pre_built,
+                &import_table,
+            )
         } else {
             (vec![], HashMap::new())
         };
-        // Pass 2: Extract references in parallel, then resolve against symbol table
-        // Phase 1: Dot-chain resolution (precise self.X, this.X, ClassName.X)
-        // Phase 2: Bag-of-words resolution (existing logic, skipping consumed words)
-        // Skip entities already resolved by scope resolver (Python files)
-        // Skip entities from non-code file types (JSON, SQL, etc.) that can't produce edges
-        let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
-            .map(|entity| {
-                // Skip entities from file types that don't have language configs
-                // (JSON, SQL, YAML, etc. — they extract entities but never produce reference edges)
-                let ext = entity
-                    .file_path
-                    .rfind('.')
-                    .map(|i| &entity.file_path[i..])
-                    .unwrap_or("");
-                let Some(language_config) =
-                    crate::parser::plugins::code::languages::get_language_config(ext)
-                else {
-                    return vec![];
-                };
-                let fallback_end_line =
-                    fallback_reference_end_line(entity, language_config.scope_resolve.is_some());
-                let fallback_ranges =
-                    direct_reference_line_ranges(entity, fallback_end_line, &child_line_ranges);
 
-                let mut entity_edges = Vec::new();
-                let mut consumed_words = scope_consumed_words
-                    .get(&entity.id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let reference_index =
-                    if entity_requires_content_span_filter(entity, &child_ranges_by_parent) {
-                        None
-                    } else {
-                        reference_indexes.get(entity.file_path.as_str())
-                    };
-                let fallback_stripped = if reference_index.is_none() {
-                    Some(strip_comments_and_strings(&entity.content))
-                } else {
-                    None
-                };
-                let local_bindings =
-                    local_binding_names_filtered(&entity.content, ext, |local_line, start, end| {
-                        entity_owns_content_span(
-                            entity.id.as_str(),
-                            entity.file_path.as_str(),
-                            source_line_for_entity_content(entity, local_line),
-                            Some(start),
-                            Some(end),
-                            &child_ranges_by_parent,
-                        )
-                    });
-
-                // Phase 1: Dot-chain resolution
-                let dot_chains: Vec<(&str, &str, Option<(usize, usize, usize)>)> =
-                    match reference_index {
-                        Some(index) => index
-                            .dot_chains_in_ranges(&fallback_ranges)
-                            .into_iter()
-                            .map(|(receiver, member)| (receiver, member, None))
-                            .collect(),
-                        None => {
-                            extract_dot_chains_with_positions(fallback_stripped.as_ref().unwrap())
-                                .into_iter()
-                                .map(|(receiver, member, line, start, end)| {
-                                    (receiver, member, Some((line, start, end)))
-                                })
-                                .collect()
-                        }
-                    };
-
-                for (receiver, member, position) in &dot_chains {
-                    if consumed_words.contains(*member) {
-                        continue;
-                    }
-                    if let Some((local_line, local_start_byte, local_end_byte)) = *position {
-                        if !entity_owns_content_span(
-                            entity.id.as_str(),
-                            entity.file_path.as_str(),
-                            source_line_for_entity_content(entity, local_line),
-                            Some(local_start_byte),
-                            Some(local_end_byte),
-                            &child_ranges_by_parent,
-                        ) {
-                            continue;
-                        }
-                    }
-                    let edge_count_before = entity_edges.len();
-                    if *receiver == "self" || *receiver == "this" {
-                        // self.B / this.B: resolve to sibling method in enclosing class
-                        if let Some(class_name) = enclosing_class.get(entity.id.as_str()) {
-                            if let Some(members) = class_members.get(class_name) {
-                                for (n, tid) in members {
-                                    if *n == *member && *tid != entity.id.as_str() {
-                                        entity_edges.push((
-                                            entity.id.clone(),
-                                            tid.to_string(),
-                                            RefType::Calls,
-                                        ));
-                                        consumed_words.insert(member.to_string());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    } else if class_entity_files.contains(&(*receiver, entity.file_path.as_str())) {
-                        // ClassName.B: resolve to class member
-                        if let Some(members) = class_members.get(*receiver) {
-                            for (n, tid) in members {
-                                if *n == *member {
-                                    entity_edges.push((
-                                        entity.id.clone(),
-                                        tid.to_string(),
-                                        RefType::Calls,
-                                    ));
-                                    consumed_words.insert(member.to_string());
-                                    consumed_words.insert(receiver.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if entity_edges.len() == edge_count_before {
-                        consumed_words.insert(member.to_string());
-                    }
-                }
-
-                // Phase 2: Bag-of-words resolution (skip words consumed by dot-chains)
-                let refs: Vec<(&str, RefType)> = match reference_index {
-                    Some(index) => index.refs_with_types_in_ranges(&fallback_ranges, &entity.name),
-                    None => {
-                        let stripped = fallback_stripped.as_ref().unwrap();
-                        extract_references_with_stripped_filtered(
-                            &entity.content,
-                            &entity.name,
-                            stripped,
-                            |local_line, local_start_byte, local_end_byte| {
-                                entity_owns_content_span(
-                                    entity.id.as_str(),
-                                    entity.file_path.as_str(),
-                                    source_line_for_entity_content(entity, local_line),
-                                    Some(local_start_byte),
-                                    Some(local_end_byte),
-                                    &child_ranges_by_parent,
-                                )
-                            },
-                        )
-                        .into_iter()
-                        .map(|ref_name| (ref_name, infer_ref_type(&entity.content, ref_name)))
-                        .collect()
-                    }
-                };
-                for (ref_name, ref_type) in refs {
-                    if consumed_words.contains(ref_name) {
-                        continue;
-                    }
-                    if local_bindings.contains(ref_name) {
-                        continue;
-                    }
-
-                    // Skip references to names that are this class's own methods
-                    if class_child_names.contains(&(entity.id.as_str(), ref_name)) {
-                        continue;
-                    }
-
-                    // Check import table first: if this file imports this name,
-                    // resolve to the import target instead of global symbol table
-                    let import_key = (entity.file_path.clone(), ref_name.to_string());
-                    if let Some(import_target_id) = import_table.get(&import_key) {
-                        if import_target_id != &entity.id
-                            && !parent_child_pairs
-                                .contains(&(entity.id.as_str(), import_target_id.as_str()))
-                            && !parent_child_pairs
-                                .contains(&(import_target_id.as_str(), entity.id.as_str()))
-                        {
-                            entity_edges.push((
-                                entity.id.clone(),
-                                import_target_id.clone(),
-                                ref_type,
-                            ));
-                        }
-                        continue;
-                    }
-
-                    if let Some(target_ids) = symbol_table.get(ref_name) {
-                        // Without an import, only resolve to entities in the same file.
-                        // Cross-file resolution is handled by the import table above.
-                        let target = target_ids.iter().find(|id| {
-                            *id != &entity.id
-                                && entity_map
-                                    .get(*id)
-                                    .map_or(false, |e| e.file_path == entity.file_path)
-                        });
-
-                        if let Some(target_id) = target {
-                            // Skip parent-child edges (class -> own method)
-                            if parent_child_pairs
-                                .contains(&(entity.id.as_str(), target_id.as_str()))
-                                || parent_child_pairs
-                                    .contains(&(target_id.as_str(), entity.id.as_str()))
-                            {
-                                continue;
-                            }
-                            entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
-                        }
-                    }
-                }
-                entity_edges
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect();
+        let reference_context = ReferenceResolutionContext {
+            symbol_table: symbol_table.as_ref(),
+            entity_map: &entity_map,
+            import_table: &import_table,
+            scope_consumed_words: &scope_consumed_words,
+            child_ranges_by_parent: &child_ranges_by_parent,
+            child_line_ranges: &child_line_ranges,
+            parent_child_pairs: &parent_child_pairs,
+            class_child_names: &class_child_names,
+            class_entity_files: &class_entity_files,
+            enclosing_class: &enclosing_class,
+            class_members: &class_members,
+        };
+        let resolved_refs = resolve_references_with_file_indexes(
+            root,
+            file_paths,
+            &all_entities,
+            None,
+            &reference_context,
+        );
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table);
 
@@ -1304,14 +1435,7 @@ impl EntityGraph {
             );
         }
         sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
-
-        let import_table = build_import_table(
-            root,
-            all_file_paths,
-            &symbol_table,
-            &entity_map,
-            Some(&parsed_files),
-        );
+        let symbol_table = Arc::new(symbol_table);
 
         let entity_file_paths: HashMap<&str, &str> = all_entities
             .iter()
@@ -1328,6 +1452,11 @@ impl EntityGraph {
             HashSet::with_capacity(stale_entity_ids.len() + stale_cached_entity_ids.len());
         stale_or_cached_stale_entity_ids.extend(stale_entity_ids.iter().copied());
         stale_or_cached_stale_entity_ids.extend(stale_cached_entity_ids.iter().copied());
+
+        let has_new_or_deleted_stale_entities = all_entities.iter().any(|entity| {
+            stale_set.contains(entity.file_path.as_str())
+                && !cached_hashes.contains_key(entity.id.as_str())
+        }) || !deleted_ids.is_empty();
 
         // Find clean entities whose cached outgoing edges are invalidated by stale targets.
         let mut affected_clean_ids: HashSet<String> = HashSet::new();
@@ -1404,6 +1533,18 @@ impl EntityGraph {
             }
         }
 
+        let import_table = if has_new_or_deleted_stale_entities {
+            Some(build_import_table(
+                root,
+                all_file_paths,
+                &symbol_table,
+                &entity_map,
+                Some(&parsed_files),
+            ))
+        } else {
+            None
+        };
+
         let mut new_stale_entity_ids: HashSet<&str> = HashSet::new();
         let mut new_stale_names: HashSet<&str> = HashSet::new();
         for entity in &all_entities {
@@ -1415,6 +1556,9 @@ impl EntityGraph {
             }
         }
         if !new_stale_names.is_empty() {
+            let import_table = import_table
+                .as_ref()
+                .expect("new stale entity analysis requires a full import table");
             let new_stale_import_refs: HashSet<(&str, &str)> = import_table
                 .iter()
                 .filter(|(_, target_id)| new_stale_entity_ids.contains(target_id.as_str()))
@@ -1567,6 +1711,28 @@ impl EntityGraph {
             }
         }
 
+        let import_table = match import_table {
+            Some(import_table) => import_table,
+            None => {
+                let mut file_paths = stale_files.to_vec();
+                file_paths.extend(
+                    affected_clean_file_paths
+                        .iter()
+                        .map(|file_path| (*file_path).to_string()),
+                );
+                file_paths.sort_unstable();
+                file_paths.dedup();
+                build_import_table_with_default_export_paths(
+                    root,
+                    &file_paths,
+                    all_file_paths,
+                    &symbol_table,
+                    &entity_map,
+                    Some(&parsed_files),
+                )
+            }
+        };
+
         // Keep edges where both endpoints are in clean (non-stale) files and from_entity
         // is not affected by target changes. Drop ALL cached edges from stale-file entities
         // (even content_clean ones) because import/scope context may have changed even when
@@ -1659,9 +1825,28 @@ impl EntityGraph {
 
         let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
         let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
         for entity in &all_entities {
+            scope_entity_ranges
+                .entry(entity.file_path.clone())
+                .or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
             if let Some(ref pid) = entity.parent_id {
+                scope_owner_members
+                    .entry(pid.clone())
+                    .or_default()
+                    .push((entity.name.clone(), entity.id.clone()));
+                if let Some(parent) = entity_map.get(pid.as_str()) {
+                    if let Some(owner_name) = scope_resolve::class_member_owner_name(parent) {
+                        scope_class_members
+                            .entry(owner_name.to_string())
+                            .or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
                 if let Some(&parent_name) = id_to_name.get(pid.as_str()) {
                     if class_entity_names.contains(parent_name) {
                         enclosing_class.insert(entity.id.as_str(), parent_name);
@@ -1672,6 +1857,24 @@ impl EntityGraph {
                     }
                 }
             }
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content)
+                {
+                    scope_class_members
+                        .entry(struct_name)
+                        .or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                }
+            }
+        }
+        for members in scope_class_members.values_mut() {
+            members.sort_unstable();
+        }
+        for members in scope_owner_members.values_mut() {
+            members.sort_unstable();
+        }
+        for ranges in scope_entity_ranges.values_mut() {
+            ranges.sort_unstable();
         }
 
         // Run scope-aware resolver only on files that need resolution
@@ -1682,8 +1885,6 @@ impl EntityGraph {
             })
             .cloned()
             .collect();
-
-        let reference_indexes = build_reference_indexes(root, &resolve_file_paths, &parsed_files);
 
         let has_scope_lang = resolve_file_paths.iter().any(|f| {
             let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
@@ -1704,13 +1905,26 @@ impl EntityGraph {
             } else {
                 Some(relevant_parsed)
             };
+            let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
+                if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
+                    scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
+                } else {
+                    HashMap::new()
+                };
+            let pre_built = scope_resolve::PreBuiltLookups {
+                symbol_table: Arc::clone(&symbol_table),
+                class_members: scope_class_members,
+                owner_members: scope_owner_members,
+                entity_ranges: scope_entity_ranges,
+                go_pkg_index: owned_go_pkg_index,
+            };
             let result = scope_resolve::resolve_with_scopes_full(
                 root,
                 &resolve_file_paths,
                 &all_entities,
                 &entity_map,
                 pre,
-                None,
+                Some(&pre_built),
                 Some(&import_table),
                 false,
             );
@@ -1718,208 +1932,27 @@ impl EntityGraph {
         } else {
             (vec![], HashMap::new())
         };
-        // Resolve references only for entities in needs_resolution
-        let resolved_refs: Vec<(String, String, RefType)> = maybe_par_iter!(all_entities)
-            .map(|entity| {
-                if !needs_resolution.contains(entity.id.as_str()) {
-                    return vec![];
-                }
-                // Skip entities from non-code file types (JSON, SQL, etc.)
-                let ext = entity
-                    .file_path
-                    .rfind('.')
-                    .map(|i| &entity.file_path[i..])
-                    .unwrap_or("");
-                let Some(language_config) =
-                    crate::parser::plugins::code::languages::get_language_config(ext)
-                else {
-                    return vec![];
-                };
-                let fallback_end_line =
-                    fallback_reference_end_line(entity, language_config.scope_resolve.is_some());
-                let fallback_ranges =
-                    direct_reference_line_ranges(entity, fallback_end_line, &child_line_ranges);
 
-                let mut entity_edges = Vec::new();
-                let mut consumed_words = scope_consumed_words
-                    .get(&entity.id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let reference_index =
-                    if entity_requires_content_span_filter(entity, &child_ranges_by_parent) {
-                        None
-                    } else {
-                        reference_indexes.get(entity.file_path.as_str())
-                    };
-                let fallback_stripped = if reference_index.is_none() {
-                    Some(strip_comments_and_strings(&entity.content))
-                } else {
-                    None
-                };
-                let local_bindings =
-                    local_binding_names_filtered(&entity.content, ext, |local_line, start, end| {
-                        entity_owns_content_span(
-                            entity.id.as_str(),
-                            entity.file_path.as_str(),
-                            source_line_for_entity_content(entity, local_line),
-                            Some(start),
-                            Some(end),
-                            &child_ranges_by_parent,
-                        )
-                    });
-
-                // Phase 1: Dot-chain resolution
-                let dot_chains: Vec<(&str, &str, Option<(usize, usize, usize)>)> =
-                    match reference_index {
-                        Some(index) => index
-                            .dot_chains_in_ranges(&fallback_ranges)
-                            .into_iter()
-                            .map(|(receiver, member)| (receiver, member, None))
-                            .collect(),
-                        None => {
-                            extract_dot_chains_with_positions(fallback_stripped.as_ref().unwrap())
-                                .into_iter()
-                                .map(|(receiver, member, line, start, end)| {
-                                    (receiver, member, Some((line, start, end)))
-                                })
-                                .collect()
-                        }
-                    };
-
-                for (receiver, member, position) in &dot_chains {
-                    if consumed_words.contains(*member) {
-                        continue;
-                    }
-                    if let Some((local_line, local_start_byte, local_end_byte)) = *position {
-                        if !entity_owns_content_span(
-                            entity.id.as_str(),
-                            entity.file_path.as_str(),
-                            source_line_for_entity_content(entity, local_line),
-                            Some(local_start_byte),
-                            Some(local_end_byte),
-                            &child_ranges_by_parent,
-                        ) {
-                            continue;
-                        }
-                    }
-                    let edge_count_before = entity_edges.len();
-                    if *receiver == "self" || *receiver == "this" {
-                        if let Some(class_name) = enclosing_class.get(entity.id.as_str()) {
-                            if let Some(members) = class_members.get(class_name) {
-                                for (n, tid) in members {
-                                    if *n == *member && *tid != entity.id.as_str() {
-                                        entity_edges.push((
-                                            entity.id.clone(),
-                                            tid.to_string(),
-                                            RefType::Calls,
-                                        ));
-                                        consumed_words.insert(member.to_string());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    } else if class_entity_files.contains(&(*receiver, entity.file_path.as_str())) {
-                        if let Some(members) = class_members.get(*receiver) {
-                            for (n, tid) in members {
-                                if *n == *member {
-                                    entity_edges.push((
-                                        entity.id.clone(),
-                                        tid.to_string(),
-                                        RefType::Calls,
-                                    ));
-                                    consumed_words.insert(member.to_string());
-                                    consumed_words.insert(receiver.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if entity_edges.len() == edge_count_before {
-                        consumed_words.insert(member.to_string());
-                    }
-                }
-
-                // Phase 2: Bag-of-words resolution
-                let refs: Vec<(&str, RefType)> = match reference_index {
-                    Some(index) => index.refs_with_types_in_ranges(&fallback_ranges, &entity.name),
-                    None => {
-                        let stripped = fallback_stripped.as_ref().unwrap();
-                        extract_references_with_stripped_filtered(
-                            &entity.content,
-                            &entity.name,
-                            stripped,
-                            |local_line, local_start_byte, local_end_byte| {
-                                entity_owns_content_span(
-                                    entity.id.as_str(),
-                                    entity.file_path.as_str(),
-                                    source_line_for_entity_content(entity, local_line),
-                                    Some(local_start_byte),
-                                    Some(local_end_byte),
-                                    &child_ranges_by_parent,
-                                )
-                            },
-                        )
-                        .into_iter()
-                        .map(|ref_name| (ref_name, infer_ref_type(&entity.content, ref_name)))
-                        .collect()
-                    }
-                };
-                for (ref_name, ref_type) in refs {
-                    if consumed_words.contains(ref_name) {
-                        continue;
-                    }
-                    if local_bindings.contains(ref_name) {
-                        continue;
-                    }
-                    if class_child_names.contains(&(entity.id.as_str(), ref_name)) {
-                        continue;
-                    }
-
-                    let import_key = (entity.file_path.clone(), ref_name.to_string());
-                    if let Some(import_target_id) = import_table.get(&import_key) {
-                        if import_target_id != &entity.id
-                            && !parent_child_pairs
-                                .contains(&(entity.id.as_str(), import_target_id.as_str()))
-                            && !parent_child_pairs
-                                .contains(&(import_target_id.as_str(), entity.id.as_str()))
-                        {
-                            entity_edges.push((
-                                entity.id.clone(),
-                                import_target_id.clone(),
-                                ref_type,
-                            ));
-                        }
-                        continue;
-                    }
-
-                    if let Some(target_ids) = symbol_table.get(ref_name) {
-                        let target = target_ids.iter().find(|id| {
-                            *id != &entity.id
-                                && entity_map
-                                    .get(*id)
-                                    .map_or(false, |e| e.file_path == entity.file_path)
-                        });
-
-                        if let Some(target_id) = target {
-                            if parent_child_pairs
-                                .contains(&(entity.id.as_str(), target_id.as_str()))
-                                || parent_child_pairs
-                                    .contains(&(target_id.as_str(), entity.id.as_str()))
-                            {
-                                continue;
-                            }
-                            entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
-                        }
-                    }
-                }
-                entity_edges
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect();
+        let reference_context = ReferenceResolutionContext {
+            symbol_table: symbol_table.as_ref(),
+            entity_map: &entity_map,
+            import_table: &import_table,
+            scope_consumed_words: &scope_consumed_words,
+            child_ranges_by_parent: &child_ranges_by_parent,
+            child_line_ranges: &child_line_ranges,
+            parent_child_pairs: &parent_child_pairs,
+            class_child_names: &class_child_names,
+            class_entity_files: &class_entity_files,
+            enclosing_class: &enclosing_class,
+            class_members: &class_members,
+        };
+        let resolved_refs = resolve_references_with_file_indexes(
+            root,
+            &resolve_file_paths,
+            &all_entities,
+            Some(&needs_resolution),
+            &reference_context,
+        );
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table);
 
@@ -2813,6 +2846,24 @@ fn build_import_table(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
 ) -> HashMap<(String, String), String> {
+    build_import_table_with_default_export_paths(
+        root,
+        file_paths,
+        file_paths,
+        symbol_table,
+        entity_map,
+        pre_parsed_content,
+    )
+}
+
+fn build_import_table_with_default_export_paths(
+    root: &Path,
+    file_paths: &[String],
+    default_export_file_paths: &[String],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
+) -> HashMap<(String, String), String> {
     // Build a content lookup from pre-parsed files to avoid re-reading from disk
     let mut content_map: HashMap<&str, &str> = HashMap::new();
     if let Some(files) = pre_parsed_content {
@@ -2823,7 +2874,11 @@ fn build_import_table(
         );
     }
     let mut owned_content: HashMap<String, String> = HashMap::new();
-    for file_path in file_paths {
+    let mut content_file_paths: Vec<&String> = file_paths.iter().collect();
+    content_file_paths.extend(default_export_file_paths.iter());
+    content_file_paths.sort_unstable();
+    content_file_paths.dedup();
+    for file_path in content_file_paths {
         if file_path.ends_with(".go") || content_map.contains_key(file_path.as_str()) {
             continue;
         }
@@ -2836,8 +2891,12 @@ fn build_import_table(
             .iter()
             .map(|(file_path, content)| (file_path.as_str(), content.as_str())),
     );
-    let ts_default_exports =
-        build_ts_default_export_table(file_paths, symbol_table, entity_map, &content_map);
+    let ts_default_exports = build_ts_default_export_table(
+        default_export_file_paths,
+        symbol_table,
+        entity_map,
+        &content_map,
+    );
     let ts_top_level_entities = OnceLock::new();
     let ts_exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
         Mutex::new(HashMap::new());
@@ -4311,6 +4370,42 @@ function outer() {
         assert!(graph.entities.contains_key("deep.ts::class::L0"));
         assert!(entities.iter().any(|e| e.name == "method"));
         assert_eq!(entities.len(), depth + 1);
+    }
+
+    #[test]
+    fn test_chunked_scope_resolution_keeps_cross_chunk_import_edges() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        let mut files = Vec::new();
+        for index in 0..10 {
+            let file_name = format!("file_{index}.ts");
+            let content = if index == 0 {
+                "export function target() { return 1; }\n".to_string()
+            } else if index == 9 {
+                "import { target } from './file_0';\nexport function caller() { return target(); }\n"
+                    .to_string()
+            } else {
+                format!("export function filler_{index}() {{ return {index}; }}\n")
+            };
+            write_file(root, &file_name, &content);
+            files.push(file_name);
+        }
+
+        let (graph, _) = EntityGraph::build(root, &files, &registry);
+        let caller_id = graph
+            .entities
+            .iter()
+            .find(|(_, entity)| entity.name == "caller")
+            .map(|(id, _)| id.clone())
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(&caller_id);
+
+        assert!(
+            deps.iter().any(|dep| dep.name == "target"),
+            "caller should resolve imported target across scope chunks. Deps: {:?}",
+            deps.iter().map(|dep| &dep.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

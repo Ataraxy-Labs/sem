@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
@@ -44,15 +45,16 @@ impl DiskCache {
         tx.execute_batch("DELETE FROM files; DELETE FROM entities; DELETE FROM edges;")?;
 
         {
-            let mut stmt = tx
-                .prepare("INSERT INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)")?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
+            )?;
             for file in files {
                 if shared_cache::is_manifest_file_name(file) {
                     continue;
                 }
                 let full = root.join(file);
-                if let Some((secs, nanos)) = shared_cache::file_mtime_parts(&full) {
-                    stmt.execute(params![file, secs, nanos])?;
+                if let Some((secs, nanos, content_hash)) = shared_cache::file_fingerprint(&full) {
+                    stmt.execute(params![file, secs, nanos, content_hash])?;
                 }
             }
         }
@@ -109,46 +111,8 @@ impl DiskCache {
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
-        if shared_cache::is_manifest_stale(&self.conn, root) {
+        if !self.has_fresh_complete_cache(root, files) {
             return None;
-        }
-
-        let cached_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
-            .ok()?;
-        if (cached_count - shared_cache::manifest_entry_count(&self.conn)) as usize
-            != shared_cache::source_file_count(files)
-        {
-            return None;
-        }
-
-        // Load all cached mtimes in one query and validate against disk
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
-            .ok()?;
-        let cached_mtimes: HashMap<String, (i64, i64)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
-                ))
-            })
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for file in files {
-            if shared_cache::is_manifest_file_name(file) {
-                continue;
-            }
-            let (secs, nanos) = cached_mtimes.get(file.as_str()).copied()?;
-            let full = root.join(file);
-            let (current_secs, current_nanos) = shared_cache::file_mtime_parts(&full)?;
-            if secs != current_secs || nanos != current_nanos {
-                return None;
-            }
         }
 
         let mut entity_stmt = self
@@ -223,45 +187,8 @@ impl DiskCache {
 
     /// Load only graph topology from a fresh cache.
     pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
-        if shared_cache::is_manifest_stale(&self.conn, root) {
+        if !self.has_fresh_complete_cache(root, files) {
             return None;
-        }
-
-        let cached_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
-            .ok()?;
-        if (cached_count - shared_cache::manifest_entry_count(&self.conn)) as usize
-            != shared_cache::source_file_count(files)
-        {
-            return None;
-        }
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
-            .ok()?;
-        let cached_mtimes: HashMap<String, (i64, i64)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
-                ))
-            })
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for file in files {
-            if shared_cache::is_manifest_file_name(file) {
-                continue;
-            }
-            let (secs, nanos) = cached_mtimes.get(file.as_str()).copied()?;
-            let full = root.join(file);
-            let (current_secs, current_nanos) = shared_cache::file_mtime_parts(&full)?;
-            if secs != current_secs || nanos != current_nanos {
-                return None;
-            }
         }
 
         let mut entity_stmt = self
@@ -292,6 +219,160 @@ impl DiskCache {
 
         let edges = self.load_edges()?;
         Some(EntityGraph::from_parts(entity_map, edges))
+    }
+
+    pub fn write_graph_json_topology<W: Write>(
+        &self,
+        root: &Path,
+        files: &[String],
+        mut writer: W,
+    ) -> std::io::Result<bool> {
+        if !self.has_fresh_complete_cache(root, files) {
+            return Ok(false);
+        }
+
+        let entity_count: i64 =
+            match self
+                .conn
+                .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+            {
+                Ok(count) => count,
+                Err(_) => return Ok(false),
+            };
+        let edge_count: i64 = match self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+        {
+            Ok(count) => count,
+            Err(_) => return Ok(false),
+        };
+
+        let mut entity_stmt = match self.conn.prepare(
+            "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id FROM entities ORDER BY id",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Ok(false),
+        };
+        let mut edge_stmt = match self.conn.prepare(
+            "SELECT from_entity, to_entity, ref_type FROM edges ORDER BY from_entity, to_entity, CASE ref_type WHEN 'calls' THEN 0 WHEN 'imports' THEN 1 ELSE 2 END",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Ok(false),
+        };
+
+        writer.write_all(b"{\"entities\":[")?;
+        let mut entity_rows = entity_stmt.query([]).map_err(sql_io_error)?;
+        let mut first = true;
+        while let Some(row) = entity_rows.next().map_err(sql_io_error)? {
+            if first {
+                first = false;
+            } else {
+                writer.write_all(b",")?;
+            }
+            let entity = EntityInfo {
+                id: row.get(0).map_err(sql_io_error)?,
+                name: row.get(1).map_err(sql_io_error)?,
+                entity_type: row.get(2).map_err(sql_io_error)?,
+                file_path: row.get(3).map_err(sql_io_error)?,
+                start_line: row.get::<_, i64>(4).map_err(sql_io_error)? as usize,
+                end_line: row.get::<_, i64>(5).map_err(sql_io_error)? as usize,
+                parent_id: row.get(6).map_err(sql_io_error)?,
+            };
+            serde_json::to_writer(&mut writer, &entity).map_err(json_io_error)?;
+        }
+
+        writer.write_all(b"],\"edges\":[")?;
+        let mut edge_rows = edge_stmt.query([]).map_err(sql_io_error)?;
+        let mut first = true;
+        while let Some(row) = edge_rows.next().map_err(sql_io_error)? {
+            if first {
+                first = false;
+            } else {
+                writer.write_all(b",")?;
+            }
+            let rt: String = row.get(2).map_err(sql_io_error)?;
+            let ref_type = match rt.as_str() {
+                "calls" => RefType::Calls,
+                "imports" => RefType::Imports,
+                _ => RefType::TypeRef,
+            };
+            let edge = EntityRef {
+                from_entity: row.get(0).map_err(sql_io_error)?,
+                to_entity: row.get(1).map_err(sql_io_error)?,
+                ref_type,
+            };
+            serde_json::to_writer(&mut writer, &edge).map_err(json_io_error)?;
+        }
+
+        write!(
+            writer,
+            "],\"stats\":{{\"entityCount\":{},\"edgeCount\":{}}}}}\n",
+            entity_count, edge_count
+        )?;
+        Ok(true)
+    }
+
+    fn has_fresh_complete_cache(&self, root: &Path, files: &[String]) -> bool {
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return false;
+        }
+
+        let cached_count: i64 = match self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        {
+            Ok(count) => count,
+            Err(_) => return false,
+        };
+        if (cached_count - shared_cache::manifest_entry_count(&self.conn)) as usize
+            != shared_cache::source_file_count(files)
+        {
+            return false;
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
+            .ok();
+        let Some(ref mut stmt) = stmt else {
+            return false;
+        };
+        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> = match stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ),
+            ))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => return false,
+        };
+
+        for file in files {
+            if shared_cache::is_manifest_file_name(file) {
+                continue;
+            }
+            let Some((secs, nanos, content_hash)) = cached_mtimes.get(file.as_str()) else {
+                return false;
+            };
+            let full = root.join(file);
+            match shared_cache::file_freshness(&full, *secs, *nanos, content_hash.as_deref()) {
+                Some(shared_cache::FileFreshness::Fresh) => {}
+                Some(shared_cache::FileFreshness::FreshWithUpdatedFingerprint {
+                    secs,
+                    nanos,
+                    content_hash,
+                }) => {
+                    self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                }
+                Some(shared_cache::FileFreshness::Stale) | None => return false,
+            }
+        }
+
+        true
     }
 
     fn load_edges(&self) -> Option<Vec<EntityRef>> {
@@ -329,13 +410,17 @@ impl DiskCache {
         // Load all cached file paths + mtimes
         let mut stmt = self
             .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
+            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
             .ok()?;
-        let cached_files: HashMap<String, (i64, i64)> = stmt
+        let cached_files: HashMap<String, (i64, i64, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ),
                 ))
             })
             .ok()?
@@ -358,16 +443,26 @@ impl DiskCache {
         let mut stale_current_file_count = 0;
         for file in source_files {
             match cached_files.get(file) {
-                Some(&(secs, nanos)) => {
+                Some((secs, nanos, content_hash)) => {
                     let full = root.join(file);
-                    let is_stale = shared_cache::file_mtime_parts(&full)
-                        .map(|(current_secs, current_nanos)| {
-                            secs != current_secs || nanos != current_nanos
-                        })
-                        .unwrap_or(true);
-                    if is_stale {
-                        stale_current_file_count += 1;
-                        stale_source_files.push(file.clone());
+                    match shared_cache::file_freshness(
+                        &full,
+                        *secs,
+                        *nanos,
+                        content_hash.as_deref(),
+                    ) {
+                        Some(shared_cache::FileFreshness::Fresh) => {}
+                        Some(shared_cache::FileFreshness::FreshWithUpdatedFingerprint {
+                            secs,
+                            nanos,
+                            content_hash,
+                        }) => {
+                            self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                        }
+                        Some(shared_cache::FileFreshness::Stale) | None => {
+                            stale_current_file_count += 1;
+                            stale_source_files.push(file.clone());
+                        }
                     }
                 }
                 None => {
@@ -409,35 +504,28 @@ impl DiskCache {
             .conn
             .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
             .ok()?;
-        let all_cached: Vec<SemanticEntity> = entity_stmt
-            .query_map([], |row| {
-                let metadata_json: Option<String> = row.get(10)?;
-                let metadata = metadata_json.and_then(|j| serde_json::from_str(&j).ok());
-                Ok(SemanticEntity {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    entity_type: row.get(2)?,
-                    file_path: row.get(3)?,
-                    start_line: row.get::<_, i64>(4)? as usize,
-                    end_line: row.get::<_, i64>(5)? as usize,
-                    content: row.get(6)?,
-                    content_hash: row.get(7)?,
-                    structural_hash: row.get(8)?,
-                    parent_id: row.get(9)?,
-                    metadata,
-                })
-            })
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-
         let mut cached_entities = Vec::new();
         let mut stale_file_entities = Vec::new();
-        for e in all_cached {
-            if stale_set.contains(e.file_path.as_str()) {
-                stale_file_entities.push(e);
+        let mut entity_rows = entity_stmt.query([]).ok()?;
+        while let Some(row) = entity_rows.next().ok()? {
+            let metadata_json: Option<String> = row.get(10).ok()?;
+            let entity = SemanticEntity {
+                id: row.get(0).ok()?,
+                name: row.get(1).ok()?,
+                entity_type: row.get(2).ok()?,
+                file_path: row.get(3).ok()?,
+                start_line: row.get::<_, i64>(4).ok()? as usize,
+                end_line: row.get::<_, i64>(5).ok()? as usize,
+                content: row.get(6).ok()?,
+                content_hash: row.get(7).ok()?,
+                structural_hash: row.get(8).ok()?,
+                parent_id: row.get(9).ok()?,
+                metadata: metadata_json.and_then(|j| serde_json::from_str(&j).ok()),
+            };
+            if stale_set.contains(entity.file_path.as_str()) {
+                stale_file_entities.push(entity);
             } else {
-                cached_entities.push(e);
+                cached_entities.push(entity);
             }
         }
 
@@ -558,12 +646,12 @@ impl DiskCache {
         // Insert new mtimes for stale files
         {
             let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for file in &source_stale_files {
                 let full = root.join(file);
-                if let Some((secs, nanos)) = shared_cache::file_mtime_parts(&full) {
-                    ins.execute(params![file, secs, nanos])?;
+                if let Some((secs, nanos, content_hash)) = shared_cache::file_fingerprint(&full) {
+                    ins.execute(params![file, secs, nanos, content_hash])?;
                 }
             }
         }
@@ -688,6 +776,21 @@ impl DiskCache {
         tx.commit()?;
         Ok(())
     }
+
+    fn refresh_file_fingerprint(&self, file: &str, secs: i64, nanos: i64, content_hash: &str) {
+        let _ = self.conn.execute(
+            "UPDATE files SET mtime_secs = ?2, mtime_nanos = ?3, content_hash = ?4 WHERE path = ?1",
+            params![file, secs, nanos, content_hash],
+        );
+    }
+}
+
+fn sql_io_error(error: rusqlite::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, error)
+}
+
+fn json_io_error(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, error)
 }
 
 #[cfg(test)]
@@ -817,6 +920,17 @@ mod tests {
             .unwrap()
     }
 
+    fn cached_file_mtime(cache: &DiskCache, file: &str) -> (i64, i64) {
+        cache
+            .conn
+            .query_row(
+                "SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1",
+                rusqlite::params![file],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     fn sample_files(root: &Path) -> Vec<String> {
         write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
         vec!["sample.foo".to_string()]
@@ -834,6 +948,60 @@ mod tests {
         cache.save(root, files, &empty_graph(), &[]).unwrap();
         assert!(cache.load(root, files).is_some());
         cache
+    }
+
+    #[test]
+    fn write_graph_json_topology_streams_fresh_cache() {
+        let root = temp_repo_root("graph-json-topology");
+        write_file(&root.join("a.rs"), "fn a() {}\n");
+        write_file(&root.join("b.rs"), "fn b() { a(); }\n");
+        let files = vec!["b.rs".to_string(), "a.rs".to_string()];
+        let entities = vec![
+            entity("b-id", "b.rs", "b", "fn b() { a(); }"),
+            entity("a-id", "a.rs", "a", "fn a() {}"),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+        cache.save(&root, &files, &graph, &entities).unwrap();
+
+        let mut output = Vec::new();
+        assert!(cache
+            .write_graph_json_topology(&root, &files, &mut output)
+            .unwrap());
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(
+            value["stats"],
+            serde_json::json!({"entityCount": 2, "edgeCount": 1})
+        );
+        assert_eq!(value["entities"][0]["id"], "a-id");
+        assert_eq!(value["entities"][1]["id"], "b-id");
+        assert_eq!(value["edges"][0]["fromEntity"], "b-id");
+        assert_eq!(value["edges"][0]["toEntity"], "a-id");
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_refreshes_mtime_when_file_content_is_unchanged() {
+        let root = temp_repo_root("mtime-only-refresh");
+        let file = root.join("same.rs");
+        write_file(&file, "fn same() {}\n");
+        let files = vec!["same.rs".to_string()];
+        let cache = save_empty_cache(&root, &files);
+        let before = cached_file_mtime(&cache, "same.rs");
+
+        rewrite_after_mtime_tick(&file, "fn same() {}\n");
+        let current = shared_cache::file_mtime_parts(&file).unwrap();
+        assert_ne!(before, current);
+
+        assert!(cache.load_graph_topology(&root, &files).is_some());
+        assert!(cache.load_partial(&root, &files).is_none());
+        assert_eq!(cached_file_mtime(&cache, "same.rs"), current);
+
+        drop(cache);
+        cleanup(root);
     }
 
     fn write_gitattributes(root: &Path) {
