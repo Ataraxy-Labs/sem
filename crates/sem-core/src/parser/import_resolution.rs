@@ -14,6 +14,45 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
         .any(|extension| file_path.ends_with(extension))
 }
 
+pub fn js_ts_import_source_files_from_content<P: AsRef<str>>(
+    file_path: &str,
+    content: &str,
+    candidate_file_paths: &[P],
+) -> Vec<String> {
+    if !is_js_ts_file(file_path) {
+        return Vec::new();
+    }
+
+    static FROM_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\bfrom\s*['"]([^'"]+)['"]"#).unwrap());
+    static SIDE_EFFECT_IMPORT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\bimport\s*['"]([^'"]+)['"]"#).unwrap());
+
+    let mut imported_files = HashSet::new();
+    for cap in FROM_RE.captures_iter(content) {
+        if let Some(source) = cap.get(1).map(|m| m.as_str()) {
+            if let Some(imported_file) =
+                find_import_file(candidate_file_paths, source, file_path, JS_TS_EXTENSIONS)
+            {
+                imported_files.insert(imported_file.to_string());
+            }
+        }
+    }
+    for cap in SIDE_EFFECT_IMPORT_RE.captures_iter(content) {
+        if let Some(source) = cap.get(1).map(|m| m.as_str()) {
+            if let Some(imported_file) =
+                find_import_file(candidate_file_paths, source, file_path, JS_TS_EXTENSIONS)
+            {
+                imported_files.insert(imported_file.to_string());
+            }
+        }
+    }
+
+    let mut imported_files: Vec<String> = imported_files.into_iter().collect();
+    sort_import_candidate_files(&mut imported_files, JS_TS_EXTENSIONS);
+    imported_files
+}
+
 pub(crate) fn js_ts_named_exports_from_content(content: &str) -> HashSet<String> {
     static NAMED_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
@@ -350,6 +389,26 @@ mod tests {
         );
 
         assert_eq!(target, None);
+    }
+
+    #[test]
+    fn js_ts_import_source_files_resolves_relative_imports_and_re_exports() {
+        let candidates = vec![
+            "src/a.ts".to_string(),
+            "src/b.ts".to_string(),
+            "src/c/index.ts".to_string(),
+            "src/unused.ts".to_string(),
+        ];
+        let content = r#"
+import { a } from './a';
+import DefaultB from "./b";
+import './c';
+export { a as publicA } from './a';
+"#;
+
+        let imports = js_ts_import_source_files_from_content("src/main.ts", content, &candidates);
+
+        assert_eq!(imports, vec!["src/a.ts", "src/b.ts", "src/c/index.ts"]);
     }
 
     #[test]

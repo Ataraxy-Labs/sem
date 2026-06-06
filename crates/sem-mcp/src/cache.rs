@@ -7,15 +7,26 @@ use std::path::{Component, Path, PathBuf};
 use rusqlite::{params, Connection, Transaction};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::parser::js_ts_import_source_files_from_content;
 use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 3;
+pub const CACHE_SCHEMA_VERSION: i32 = 4;
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
     ("idx_entities_file_path", "entities", "file_path"),
     ("idx_entities_name", "entities", "name"),
     ("idx_entities_parent_id", "entities", "parent_id"),
     ("idx_edges_from_entity", "edges", "from_entity"),
     ("idx_edges_to_entity", "edges", "to_entity"),
+    (
+        "idx_file_imports_imported_file",
+        "file_imports",
+        "imported_file",
+    ),
+    (
+        "idx_file_imports_importing_file",
+        "file_imports",
+        "importing_file",
+    ),
 ];
 
 // Cache-only keys use a NUL prefix so they cannot collide with git paths.
@@ -49,12 +60,18 @@ CREATE TABLE IF NOT EXISTS edges (
     to_entity TEXT NOT NULL,
     ref_type TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS file_imports (
+    importing_file TEXT NOT NULL,
+    imported_file TEXT NOT NULL,
+    PRIMARY KEY (importing_file, imported_file)
+);
 ";
 
 const CACHE_RESET_SQL: &str = "
 DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS entities;
 DROP TABLE IF EXISTS edges;
+DROP TABLE IF EXISTS file_imports;
 ";
 
 pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -279,6 +296,7 @@ pub struct PartialCache {
     pub stale_files: Vec<String>,
     pub cached_entities: Vec<SemanticEntity>,
     pub cached_edges: Vec<EntityRef>,
+    pub cached_importing_stale_files: Vec<String>,
     /// Cached entities from stale files (for entity-level content_hash comparison)
     pub stale_file_entities: Vec<SemanticEntity>,
 }
@@ -453,6 +471,77 @@ pub fn refresh_manifest_entries(tx: &Transaction<'_>, root: &Path) -> Result<(),
     Ok(())
 }
 
+pub fn refresh_file_import_entries(
+    tx: &Transaction<'_>,
+    root: &Path,
+    files_to_refresh: &[String],
+    all_files: &[String],
+) -> Result<(), rusqlite::Error> {
+    let candidate_files: Vec<String> = all_files
+        .iter()
+        .filter(|file| !is_manifest_file_name(file))
+        .cloned()
+        .collect();
+
+    let mut delete = tx.prepare("DELETE FROM file_imports WHERE importing_file = ?1")?;
+    let mut insert = tx.prepare(
+        "INSERT OR IGNORE INTO file_imports (importing_file, imported_file) VALUES (?1, ?2)",
+    )?;
+
+    for file in files_to_refresh {
+        if is_manifest_file_name(file) {
+            continue;
+        }
+
+        delete.execute(params![file])?;
+        let Ok(content) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        for imported_file in
+            js_ts_import_source_files_from_content(file, &content, &candidate_files)
+        {
+            insert.execute(params![file, imported_file])?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn cached_importing_files_for_stale_files(
+    conn: &Connection,
+    stale_files: &[String],
+    current_source_files: &[&String],
+) -> Vec<String> {
+    let current_set: HashSet<&str> = current_source_files
+        .iter()
+        .map(|file| file.as_str())
+        .collect();
+    let stale_set: HashSet<&str> = stale_files.iter().map(String::as_str).collect();
+    let mut importing_files = HashSet::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT importing_file FROM file_imports WHERE imported_file = ?1")
+    else {
+        return Vec::new();
+    };
+
+    for stale_file in stale_files {
+        let Ok(rows) = stmt.query_map(params![stale_file], |row| row.get::<_, String>(0)) else {
+            continue;
+        };
+        for importing_file in rows.filter_map(|row| row.ok()) {
+            if current_set.contains(importing_file.as_str())
+                && !stale_set.contains(importing_file.as_str())
+            {
+                importing_files.insert(importing_file);
+            }
+        }
+    }
+
+    let mut importing_files: Vec<String> = importing_files.into_iter().collect();
+    importing_files.sort_unstable();
+    importing_files
+}
+
 pub struct DiskCache {
     conn: Connection,
 }
@@ -480,7 +569,9 @@ impl DiskCache {
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
-        tx.execute_batch("DELETE FROM files; DELETE FROM entities; DELETE FROM edges;")?;
+        tx.execute_batch(
+            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports;",
+        )?;
 
         {
             let mut stmt = tx.prepare(
@@ -498,6 +589,7 @@ impl DiskCache {
         }
 
         refresh_manifest_entries(&tx, root)?;
+        refresh_file_import_entries(&tx, root, files, files)?;
 
         {
             let mut stmt = tx.prepare(
@@ -815,10 +907,10 @@ impl DiskCache {
 
         let mut stale_source_files: Vec<String> = Vec::new();
         let mut stale_current_file_count = 0;
-        for file in source_files {
-            match cached_files.get(file) {
+        for file in &source_files {
+            match cached_files.get(file.as_str()) {
                 Some((secs, nanos, content_hash)) => {
-                    let full = root.join(file);
+                    let full = root.join(file.as_str());
                     match file_freshness(&full, *secs, *nanos, content_hash.as_deref()) {
                         Some(FileFreshness::Fresh) => {}
                         Some(FileFreshness::FreshWithUpdatedFingerprint {
@@ -830,13 +922,13 @@ impl DiskCache {
                         }
                         Some(FileFreshness::Stale) | None => {
                             stale_current_file_count += 1;
-                            stale_source_files.push(file.clone());
+                            stale_source_files.push((*file).clone());
                         }
                     }
                 }
                 None => {
                     stale_current_file_count += 1;
-                    stale_source_files.push(file.clone());
+                    stale_source_files.push((*file).clone());
                 }
             }
         }
@@ -865,6 +957,10 @@ impl DiskCache {
             .chain(deleted_cached_files.iter())
             .map(|s| s.as_str())
             .collect();
+        let mut import_stale_files = stale_source_files.clone();
+        import_stale_files.extend(deleted_cached_files.iter().cloned());
+        let cached_importing_stale_files =
+            cached_importing_files_for_stale_files(&self.conn, &import_stale_files, &source_files);
 
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
@@ -930,6 +1026,7 @@ impl DiskCache {
             stale_files: stale_source_files,
             cached_entities,
             cached_edges,
+            cached_importing_stale_files,
             stale_file_entities,
         })
     }
@@ -1049,6 +1146,12 @@ impl DiskCache {
         }
 
         refresh_manifest_entries(&tx, root)?;
+        let mut import_files_to_refresh: Vec<String> = source_stale_files
+            .iter()
+            .map(|file| (*file).clone())
+            .collect();
+        import_files_to_refresh.extend(deleted_cached_files.iter().cloned());
+        refresh_file_import_entries(&tx, root, &import_files_to_refresh, all_files)?;
 
         if repair_changed_clean_entity_ids {
             tx.execute("DELETE FROM entities", [])?;
@@ -1286,6 +1389,17 @@ mod tests {
             .unwrap()
     }
 
+    fn file_import_count(cache: &DiskCache, importing_file: &str, imported_file: &str) -> i64 {
+        cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE importing_file = ?1 AND imported_file = ?2",
+                rusqlite::params![importing_file, imported_file],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn cached_file_mtime(cache: &DiskCache, file: &str) -> (i64, i64) {
         cache
             .conn
@@ -1314,6 +1428,58 @@ mod tests {
         cache.save(root, files, &empty_graph(), &[]).unwrap();
         assert!(cache.load(root, files).is_some());
         cache
+    }
+
+    #[test]
+    fn partial_cache_reports_clean_files_that_import_stale_js_ts_files() {
+        let root = temp_repo_root("incremental-import-metadata");
+        write_file(
+            &root.join("a.ts"),
+            "import { target } from './b';\nexport function useIt() { return target(); }\n",
+        );
+        write_file(
+            &root.join("b.ts"),
+            "export function target() { return 1; }\n",
+        );
+        write_file(
+            &root.join("c.ts"),
+            "export function other() { return 2; }\n",
+        );
+        let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache.save(&root, &files, &empty_graph(), &[]).unwrap();
+
+        assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
+
+        rewrite_after_mtime_tick(
+            &root.join("b.ts"),
+            "export function target() { return 3; }\n",
+        );
+        let partial = cache.load_partial(&root, &files).unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+        assert_eq!(partial.cached_importing_stale_files, vec!["a.ts"]);
+
+        rewrite_after_mtime_tick(
+            &root.join("a.ts"),
+            "import { other } from './c';\nexport function useIt() { return other(); }\n",
+        );
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["a.ts".to_string()],
+                &empty_graph(),
+                &[],
+                false,
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 0);
+        assert_eq!(file_import_count(&cache, "a.ts", "c.ts"), 1);
+
+        drop(cache);
+        cleanup(root);
     }
 
     fn rewrite_after_mtime_tick(path: &Path, content: &str) {

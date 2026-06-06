@@ -12,6 +12,7 @@ pub struct PartialCache {
     pub stale_files: Vec<String>,
     pub cached_entities: Vec<SemanticEntity>,
     pub cached_edges: Vec<EntityRef>,
+    pub cached_importing_stale_files: Vec<String>,
     /// Cached entities from stale files (for entity-level content_hash comparison)
     pub stale_file_entities: Vec<SemanticEntity>,
 }
@@ -42,7 +43,9 @@ impl DiskCache {
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
-        tx.execute_batch("DELETE FROM files; DELETE FROM entities; DELETE FROM edges;")?;
+        tx.execute_batch(
+            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports;",
+        )?;
 
         {
             let mut stmt = tx.prepare(
@@ -60,6 +63,7 @@ impl DiskCache {
         }
 
         shared_cache::refresh_manifest_entries(&tx, root)?;
+        shared_cache::refresh_file_import_entries(&tx, root, files, files)?;
 
         // Insert entities with prepared statement (already in a transaction, so fast)
         {
@@ -337,19 +341,20 @@ impl DiskCache {
         let Some(ref mut stmt) = stmt else {
             return false;
         };
-        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> = match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                (
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ),
-            ))
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(_) => return false,
-        };
+        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> =
+            match stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ),
+                ))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => return false,
+            };
 
         for file in files {
             if shared_cache::is_manifest_file_name(file) {
@@ -441,10 +446,10 @@ impl DiskCache {
         // Find stale source files: mtime differs or not in cache
         let mut stale_source_files: Vec<String> = Vec::new();
         let mut stale_current_file_count = 0;
-        for file in source_files {
-            match cached_files.get(file) {
+        for file in &source_files {
+            match cached_files.get(file.as_str()) {
                 Some((secs, nanos, content_hash)) => {
-                    let full = root.join(file);
+                    let full = root.join(file.as_str());
                     match shared_cache::file_freshness(
                         &full,
                         *secs,
@@ -461,13 +466,13 @@ impl DiskCache {
                         }
                         Some(shared_cache::FileFreshness::Stale) | None => {
                             stale_current_file_count += 1;
-                            stale_source_files.push(file.clone());
+                            stale_source_files.push((*file).clone());
                         }
                     }
                 }
                 None => {
                     stale_current_file_count += 1;
-                    stale_source_files.push(file.clone());
+                    stale_source_files.push((*file).clone());
                 }
             }
         }
@@ -498,6 +503,13 @@ impl DiskCache {
             .chain(deleted_cached_files.iter())
             .map(|s| s.as_str())
             .collect();
+        let mut import_stale_files = stale_source_files.clone();
+        import_stale_files.extend(deleted_cached_files.iter().cloned());
+        let cached_importing_stale_files = shared_cache::cached_importing_files_for_stale_files(
+            &self.conn,
+            &import_stale_files,
+            &source_files,
+        );
 
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
@@ -556,6 +568,7 @@ impl DiskCache {
             stale_files: stale_source_files,
             cached_entities,
             cached_edges,
+            cached_importing_stale_files,
             stale_file_entities,
         })
     }
@@ -657,6 +670,12 @@ impl DiskCache {
         }
 
         shared_cache::refresh_manifest_entries(&tx, root)?;
+        let mut import_files_to_refresh: Vec<String> = source_stale_files
+            .iter()
+            .map(|file| (*file).clone())
+            .collect();
+        import_files_to_refresh.extend(deleted_cached_files.iter().cloned());
+        shared_cache::refresh_file_import_entries(&tx, root, &import_files_to_refresh, all_files)?;
 
         if repair_changed_clean_entity_ids {
             tx.execute("DELETE FROM entities", [])?;
@@ -920,6 +939,17 @@ mod tests {
             .unwrap()
     }
 
+    fn file_import_count(cache: &DiskCache, importing_file: &str, imported_file: &str) -> i64 {
+        cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE importing_file = ?1 AND imported_file = ?2",
+                rusqlite::params![importing_file, imported_file],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn cached_file_mtime(cache: &DiskCache, file: &str) -> (i64, i64) {
         cache
             .conn
@@ -999,6 +1029,58 @@ mod tests {
         assert!(cache.load_graph_topology(&root, &files).is_some());
         assert!(cache.load_partial(&root, &files).is_none());
         assert_eq!(cached_file_mtime(&cache, "same.rs"), current);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn partial_cache_reports_clean_files_that_import_stale_js_ts_files() {
+        let root = temp_repo_root("incremental-import-metadata");
+        write_file(
+            &root.join("a.ts"),
+            "import { target } from './b';\nexport function useIt() { return target(); }\n",
+        );
+        write_file(
+            &root.join("b.ts"),
+            "export function target() { return 1; }\n",
+        );
+        write_file(
+            &root.join("c.ts"),
+            "export function other() { return 2; }\n",
+        );
+        let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache.save(&root, &files, &empty_graph(), &[]).unwrap();
+
+        assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
+
+        rewrite_after_mtime_tick(
+            &root.join("b.ts"),
+            "export function target() { return 3; }\n",
+        );
+        let partial = cache.load_partial(&root, &files).unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+        assert_eq!(partial.cached_importing_stale_files, vec!["a.ts"]);
+
+        rewrite_after_mtime_tick(
+            &root.join("a.ts"),
+            "import { other } from './c';\nexport function useIt() { return other(); }\n",
+        );
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["a.ts".to_string()],
+                &empty_graph(),
+                &[],
+                false,
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 0);
+        assert_eq!(file_import_count(&cache, "a.ts", "c.ts"), 1);
 
         drop(cache);
         cleanup(root);

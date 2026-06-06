@@ -362,15 +362,17 @@ impl SemServer {
 
             // Incremental: load clean cached data, rebuild only stale files
             if let Some(partial) = disk.load_partial(repo_root, file_paths) {
-                let (graph, entities, metadata) = EntityGraph::build_incremental_with_metadata(
-                    repo_root,
-                    &partial.stale_files,
-                    file_paths,
-                    partial.cached_entities,
-                    partial.cached_edges,
-                    partial.stale_file_entities,
-                    &self.registry,
-                );
+                let (graph, entities, metadata) =
+                    EntityGraph::build_incremental_with_metadata_and_import_candidates(
+                        repo_root,
+                        &partial.stale_files,
+                        file_paths,
+                        partial.cached_entities,
+                        partial.cached_edges,
+                        partial.stale_file_entities,
+                        Some(&partial.cached_importing_stale_files),
+                        &self.registry,
+                    );
                 let _ = disk.save_incremental_with_repair_metadata(
                     repo_root,
                     file_paths,

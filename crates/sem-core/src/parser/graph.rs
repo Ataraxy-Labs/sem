@@ -35,7 +35,8 @@ use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
 use crate::parser::import_resolution::{
     find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
-    js_ts_named_exports_from_content, sort_import_candidate_files, JS_TS_EXTENSIONS,
+    js_ts_import_source_files_from_content, js_ts_named_exports_from_content,
+    sort_import_candidate_files, JS_TS_EXTENSIONS,
 };
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 use crate::parser::scope_resolve;
@@ -355,6 +356,25 @@ fn sort_symbol_table_targets_by_source(
             });
         }
     }
+}
+
+fn dedupe_resolved_edges(
+    combined: Vec<(String, String, RefType)>,
+) -> Vec<(String, String, RefType)> {
+    let mut keep = vec![false; combined.len()];
+    let mut seen_edges: HashSet<(&str, &str)> = HashSet::with_capacity(combined.len());
+    for (index, (from_entity, to_entity, _)) in combined.iter().enumerate() {
+        if seen_edges.insert((from_entity.as_str(), to_entity.as_str())) {
+            keep[index] = true;
+        }
+    }
+    drop(seen_edges);
+
+    combined
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, edge)| keep[index].then_some(edge))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1251,13 +1271,7 @@ impl EntityGraph {
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
-        let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
-        let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
-        for edge in combined {
-            if seen_edges.insert((edge.0.clone(), edge.1.clone())) {
-                all_resolved.push(edge);
-            }
-        }
+        let all_resolved = dedupe_resolved_edges(combined);
 
         // Build edge indexes from resolved references
         let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
@@ -1323,6 +1337,28 @@ impl EntityGraph {
         cached_entities: Vec<SemanticEntity>,
         cached_edges: Vec<EntityRef>,
         stale_file_cached_entities: Vec<SemanticEntity>,
+        registry: &ParserRegistry,
+    ) -> (Self, Vec<SemanticEntity>, IncrementalBuildMetadata) {
+        Self::build_incremental_with_metadata_and_import_candidates(
+            root,
+            stale_files,
+            all_file_paths,
+            cached_entities,
+            cached_edges,
+            stale_file_cached_entities,
+            None,
+            registry,
+        )
+    }
+
+    pub fn build_incremental_with_metadata_and_import_candidates(
+        root: &Path,
+        stale_files: &[String],
+        all_file_paths: &[String],
+        cached_entities: Vec<SemanticEntity>,
+        cached_edges: Vec<EntityRef>,
+        stale_file_cached_entities: Vec<SemanticEntity>,
+        cached_importing_stale_files: Option<&[String]>,
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>, IncrementalBuildMetadata) {
         // Build set of stale file paths for quick lookup
@@ -1670,26 +1706,37 @@ impl EntityGraph {
             .filter(|file_path| is_js_ts_file(file_path))
             .collect();
         if !stale_js_ts_file_paths.is_empty() {
-            let clean_js_ts_import_tokens: HashMap<&str, Vec<String>> = all_file_paths
-                .iter()
-                .map(String::as_str)
-                .filter(|file_path| !stale_set.contains(*file_path) && is_js_ts_file(file_path))
-                .filter_map(|file_path| {
-                    let content = read_import_scan_prefix(&root.join(file_path))?;
-                    let mut tokens: Vec<String> = stale_js_ts_file_paths
-                        .iter()
-                        .flat_map(|stale_file_path| {
-                            content_import_tokens_for_file(file_path, &content, stale_file_path)
-                        })
-                        .collect();
-                    if tokens.is_empty() {
-                        return None;
-                    }
-                    tokens.sort_unstable();
-                    tokens.dedup();
-                    Some((file_path, tokens))
-                })
-                .collect();
+            let clean_import_candidate_files: Vec<&str> = match cached_importing_stale_files {
+                Some(files) => files
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|file_path| !stale_set.contains(*file_path) && is_js_ts_file(file_path))
+                    .collect(),
+                None => all_file_paths
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|file_path| !stale_set.contains(*file_path) && is_js_ts_file(file_path))
+                    .collect(),
+            };
+            let clean_js_ts_import_tokens: HashMap<&str, Vec<String>> =
+                clean_import_candidate_files
+                    .into_iter()
+                    .filter_map(|file_path| {
+                        let content = read_import_scan_prefix(&root.join(file_path))?;
+                        let mut tokens: Vec<String> = stale_js_ts_file_paths
+                            .iter()
+                            .flat_map(|stale_file_path| {
+                                content_import_tokens_for_file(file_path, &content, stale_file_path)
+                            })
+                            .collect();
+                        if tokens.is_empty() {
+                            return None;
+                        }
+                        tokens.sort_unstable();
+                        tokens.dedup();
+                        Some((file_path, tokens))
+                    })
+                    .collect();
 
             for entity in all_entities
                 .iter()
@@ -1960,25 +2007,29 @@ impl EntityGraph {
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
-        let mut seen_edges: HashSet<(String, String)> = HashSet::with_capacity(combined.len());
-        let mut all_resolved: Vec<(String, String, RefType)> = Vec::with_capacity(combined.len());
-        for edge in combined {
-            if seen_edges.insert((edge.0.clone(), edge.1.clone())) {
-                all_resolved.push(edge);
-            }
-        }
+        let all_resolved = dedupe_resolved_edges(combined);
 
         // Build final edge list: kept edges + newly resolved edges
         let mut edges: Vec<EntityRef> = Vec::with_capacity(kept_edges.len() + all_resolved.len());
         let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
         let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Track all edge pairs for dedup
-        let mut all_edge_pairs: HashSet<(String, String)> = HashSet::new();
+        let mut kept_edge_pairs: HashSet<(&str, &str)> = HashSet::with_capacity(kept_edges.len());
+        for edge in &kept_edges {
+            kept_edge_pairs.insert((edge.from_entity.as_str(), edge.to_entity.as_str()));
+        }
+
+        let mut new_edges: Vec<(String, String, RefType)> = Vec::with_capacity(all_resolved.len());
+        for (from_entity, to_entity, ref_type) in all_resolved {
+            if kept_edge_pairs.contains(&(from_entity.as_str(), to_entity.as_str())) {
+                continue;
+            }
+            new_edges.push((from_entity, to_entity, ref_type));
+        }
+        drop(kept_edge_pairs);
 
         // Add kept cached edges
         for edge in kept_edges {
-            all_edge_pairs.insert((edge.from_entity.clone(), edge.to_entity.clone()));
             dependents
                 .entry(edge.to_entity.clone())
                 .or_default()
@@ -1991,10 +2042,7 @@ impl EntityGraph {
         }
 
         // Add newly resolved edges, dedup against kept edges
-        for (from_entity, to_entity, ref_type) in all_resolved {
-            if !all_edge_pairs.insert((from_entity.clone(), to_entity.clone())) {
-                continue;
-            }
+        for (from_entity, to_entity, ref_type) in new_edges {
             dependents
                 .entry(to_entity.clone())
                 .or_default()
@@ -2874,16 +2922,45 @@ fn build_import_table_with_default_export_paths(
         );
     }
     let mut owned_content: HashMap<String, String> = HashMap::new();
-    let mut content_file_paths: Vec<&String> = file_paths.iter().collect();
-    content_file_paths.extend(default_export_file_paths.iter());
-    content_file_paths.sort_unstable();
-    content_file_paths.dedup();
-    for file_path in content_file_paths {
-        if file_path.ends_with(".go") || content_map.contains_key(file_path.as_str()) {
-            continue;
+    let mut content_file_set: HashSet<String> = file_paths.iter().cloned().collect();
+    if file_paths.len() == default_export_file_paths.len() {
+        content_file_set.extend(default_export_file_paths.iter().cloned());
+        for file_path in &content_file_set {
+            if file_path.ends_with(".go") || content_map.contains_key(file_path.as_str()) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(root.join(file_path)) {
+                owned_content.insert(file_path.clone(), content);
+            }
         }
-        if let Ok(content) = std::fs::read_to_string(root.join(file_path)) {
-            owned_content.insert(file_path.clone(), content);
+    } else {
+        let mut content_file_queue: Vec<String> = file_paths.to_vec();
+        while let Some(file_path) = content_file_queue.pop() {
+            if !file_path.ends_with(".go")
+                && !content_map.contains_key(file_path.as_str())
+                && !owned_content.contains_key(&file_path)
+            {
+                if let Ok(content) = std::fs::read_to_string(root.join(&file_path)) {
+                    owned_content.insert(file_path.clone(), content);
+                }
+            }
+
+            let Some(content) = content_map
+                .get(file_path.as_str())
+                .copied()
+                .or_else(|| owned_content.get(&file_path).map(String::as_str))
+            else {
+                continue;
+            };
+            for imported_file in js_ts_import_source_files_from_content(
+                &file_path,
+                content,
+                default_export_file_paths,
+            ) {
+                if content_file_set.insert(imported_file.clone()) {
+                    content_file_queue.push(imported_file);
+                }
+            }
         }
     }
     content_map.extend(
@@ -2891,12 +2968,10 @@ fn build_import_table_with_default_export_paths(
             .iter()
             .map(|(file_path, content)| (file_path.as_str(), content.as_str())),
     );
-    let ts_default_exports = build_ts_default_export_table(
-        default_export_file_paths,
-        symbol_table,
-        entity_map,
-        &content_map,
-    );
+    let mut content_file_paths: Vec<String> = content_file_set.into_iter().collect();
+    content_file_paths.sort_unstable();
+    let ts_default_exports =
+        build_ts_default_export_table(&content_file_paths, symbol_table, entity_map, &content_map);
     let ts_top_level_entities = OnceLock::new();
     let ts_exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
         Mutex::new(HashMap::new());
@@ -5062,6 +5137,85 @@ comment with Helper
                 .iter()
                 .any(|(file_path, name)| *file_path == "b.ts" && *name == "targetB"),
             "clean barrel export should retarget to b.ts. Deps: {:?}",
+            incremental_deps
+        );
+    }
+
+    #[test]
+    fn test_incremental_import_candidates_re_resolve_clean_barrel() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "a.ts",
+            "export default function targetA() { return 1; }\n",
+        );
+        write_file(
+            root,
+            "b.ts",
+            "export default function targetB() { return 2; }\n",
+        );
+        write_file(root, "stale.ts", "export { default } from './a';\n");
+        write_file(
+            root,
+            "barrel.ts",
+            "export { default as publicTarget } from './stale';\n",
+        );
+
+        let all_files = vec![
+            "a.ts".to_string(),
+            "b.ts".to_string(),
+            "stale.ts".to_string(),
+            "barrel.ts".to_string(),
+        ];
+        let (cached_graph, cached_entities) = EntityGraph::build(root, &all_files, &registry);
+
+        write_file(root, "stale.ts", "export { default } from './b';\n");
+
+        let cached_clean_entities = cached_entities
+            .iter()
+            .filter(|entity| entity.file_path != "stale.ts")
+            .cloned()
+            .collect();
+        let cached_stale_entities = cached_entities
+            .into_iter()
+            .filter(|entity| entity.file_path == "stale.ts")
+            .collect();
+        let cached_importing_stale_files = vec!["barrel.ts".to_string()];
+
+        let (incremental_graph, _, _) =
+            EntityGraph::build_incremental_with_metadata_and_import_candidates(
+                root,
+                &["stale.ts".into()],
+                &all_files,
+                cached_clean_entities,
+                cached_graph.edges,
+                cached_stale_entities,
+                Some(&cached_importing_stale_files),
+                &registry,
+            );
+        let (fresh_graph, _) = EntityGraph::build(root, &all_files, &registry);
+
+        let mut incremental_deps = incremental_graph
+            .get_dependencies("barrel.ts::export::publicTarget")
+            .iter()
+            .map(|entity| (entity.file_path.as_str(), entity.name.as_str()))
+            .collect::<Vec<_>>();
+        incremental_deps.sort_unstable();
+        let mut fresh_deps = fresh_graph
+            .get_dependencies("barrel.ts::export::publicTarget")
+            .iter()
+            .map(|entity| (entity.file_path.as_str(), entity.name.as_str()))
+            .collect::<Vec<_>>();
+        fresh_deps.sort_unstable();
+
+        assert_eq!(incremental_deps, fresh_deps);
+        assert!(
+            incremental_deps
+                .iter()
+                .any(|(file_path, name)| *file_path == "b.ts" && *name == "targetB"),
+            "candidate-aware incremental rebuild should retarget the clean barrel export. Deps: {:?}",
             incremental_deps
         );
     }
