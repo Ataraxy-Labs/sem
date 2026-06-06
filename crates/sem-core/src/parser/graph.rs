@@ -1304,6 +1304,316 @@ impl EntityGraph {
         (graph, all_entities)
     }
 
+    /// Build an entity graph containing dependency edges for selected entities.
+    ///
+    /// The graph includes every entity so callers can perform the same lookup and
+    /// ambiguity checks as a full graph build. Only selected entities contribute
+    /// outgoing dependency edges.
+    pub fn build_direct_dependencies<F>(
+        root: &Path,
+        file_paths: &[String],
+        registry: &ParserRegistry,
+        mut should_resolve: F,
+    ) -> (Self, Vec<SemanticEntity>)
+    where
+        F: FnMut(&EntityInfo) -> bool,
+    {
+        let retain_parsed_files = file_paths.len() <= PARSED_FILE_REUSE_LIMIT;
+        let per_file: Vec<(
+            Vec<SemanticEntity>,
+            Option<(String, String, tree_sitter::Tree)>,
+        )> = maybe_par_iter!(file_paths)
+            .filter_map(|file_path| {
+                let content = std::fs::read_to_string(root.join(file_path)).ok()?;
+                if retain_parsed_files {
+                    let (entities, tree) =
+                        registry.extract_entities_with_tree(file_path, &content)?;
+                    let parsed = tree.map(|tree| (file_path.clone(), content, tree));
+                    Some((entities, parsed))
+                } else {
+                    Some((registry.extract_entities(file_path, &content), None))
+                }
+            })
+            .collect();
+
+        let mut all_entities: Vec<SemanticEntity> = Vec::new();
+        let mut retained_parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
+        for (entities, parsed) in per_file {
+            all_entities.extend(entities);
+            if let Some(parsed) = parsed {
+                retained_parsed_files.push(parsed);
+            }
+        }
+        resolve_go_method_parent_ids(&mut all_entities);
+
+        let mut symbol_table: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(all_entities.len());
+        let mut entity_map: HashMap<String, EntityInfo> =
+            HashMap::with_capacity(all_entities.len());
+        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
+        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
+        let child_ranges_by_parent = build_child_ranges_by_parent(&all_entities);
+        let mut class_entity_names: HashSet<&str> = HashSet::new();
+        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::new();
+        let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+
+        for entity in &all_entities {
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+
+            entity_map.insert(
+                entity.id.clone(),
+                EntityInfo {
+                    id: entity.id.clone(),
+                    name: entity.name.clone(),
+                    entity_type: entity.entity_type.clone(),
+                    file_path: entity.file_path.clone(),
+                    parent_id: entity.parent_id.clone(),
+                    start_line: entity.start_line,
+                    end_line: entity.end_line,
+                },
+            );
+
+            if let Some(ref pid) = entity.parent_id {
+                parent_child_pairs.insert((pid.as_str(), entity.id.as_str()));
+                child_line_ranges
+                    .entry(pid.clone())
+                    .or_default()
+                    .push((entity.start_line, entity.end_line));
+                class_child_names.insert((pid.as_str(), entity.name.as_str()));
+            }
+
+            if is_nominal_member_container(entity.entity_type.as_str()) {
+                class_entity_names.insert(entity.name.as_str());
+                class_entity_files.insert((entity.name.as_str(), entity.file_path.as_str()));
+            }
+
+            id_to_name.insert(entity.id.as_str(), entity.name.as_str());
+
+            scope_entity_ranges
+                .entry(entity.file_path.clone())
+                .or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
+        }
+        for ranges in child_line_ranges.values_mut() {
+            ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+        }
+
+        let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
+        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        for entity in &all_entities {
+            if let Some(ref pid) = entity.parent_id {
+                scope_owner_members
+                    .entry(pid.clone())
+                    .or_default()
+                    .push((entity.name.clone(), entity.id.clone()));
+                if let Some(&parent_name) = id_to_name.get(pid.as_str()) {
+                    if class_entity_names.contains(parent_name) {
+                        enclosing_class.insert(entity.id.as_str(), parent_name);
+                        class_members
+                            .entry(parent_name)
+                            .or_default()
+                            .push((entity.name.as_str(), entity.id.as_str()));
+                    }
+                }
+                if let Some(parent) = entity_map.get(pid.as_str()) {
+                    if let Some(owner_name) = scope_resolve::class_member_owner_name(parent) {
+                        scope_class_members
+                            .entry(owner_name.to_string())
+                            .or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content)
+                {
+                    scope_class_members
+                        .entry(struct_name)
+                        .or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                }
+            }
+        }
+        sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
+        let symbol_table = Arc::new(symbol_table);
+
+        let mut needs_resolution: HashSet<String> = HashSet::new();
+        let mut resolve_file_paths: Vec<String> = Vec::new();
+        let mut resolve_file_set: HashSet<String> = HashSet::new();
+        let mut entity_ids: Vec<&String> = entity_map.keys().collect();
+        entity_ids.sort_unstable();
+        for entity_id in entity_ids {
+            let Some(entity) = entity_map.get(entity_id) else {
+                continue;
+            };
+            if should_resolve(entity) {
+                needs_resolution.insert(entity.id.clone());
+                if resolve_file_set.insert(entity.file_path.clone()) {
+                    resolve_file_paths.push(entity.file_path.clone());
+                }
+            }
+        }
+        resolve_file_paths.sort_unstable();
+
+        if needs_resolution.is_empty() {
+            return (
+                EntityGraph {
+                    entities: entity_map,
+                    edges: Vec::new(),
+                    dependents: HashMap::new(),
+                    dependencies: HashMap::new(),
+                },
+                all_entities,
+            );
+        }
+
+        let scope_file_paths = if file_paths.len() > PARSED_FILE_REUSE_LIMIT {
+            let mut scoped = Vec::new();
+            for chunk in file_paths.chunks(SCOPE_RESOLVE_FILE_CHUNK_SIZE) {
+                if chunk.iter().any(|file| resolve_file_set.contains(file)) {
+                    scoped.extend(chunk.iter().cloned());
+                }
+            }
+            scoped
+        } else {
+            file_paths.to_vec()
+        };
+        let has_scope_lang = resolve_file_paths.iter().any(|f| {
+            let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
+            crate::parser::plugins::code::languages::get_language_config(ext)
+                .and_then(|c| c.scope_resolve)
+                .is_some()
+        });
+        let parsed_files: Vec<(String, String, tree_sitter::Tree)> = if !has_scope_lang {
+            Vec::new()
+        } else if !retained_parsed_files.is_empty() && scope_file_paths.len() == file_paths.len() {
+            retained_parsed_files
+        } else {
+            maybe_par_iter!(&scope_file_paths)
+                .filter_map(|file_path| {
+                    let content = std::fs::read_to_string(root.join(file_path)).ok()?;
+                    let (_entities, tree) =
+                        registry.extract_entities_with_tree(file_path, &content)?;
+                    tree.map(|tree| (file_path.clone(), content, tree))
+                })
+                .collect()
+        };
+
+        let import_table = build_import_table_with_default_export_paths(
+            root,
+            &resolve_file_paths,
+            file_paths,
+            &symbol_table,
+            &entity_map,
+            Some(parsed_files.as_slice()),
+        );
+
+        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
+            if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
+                scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
+            } else {
+                HashMap::new()
+            };
+
+        let pre_built = scope_resolve::PreBuiltLookups {
+            symbol_table: Arc::clone(&symbol_table),
+            class_members: scope_class_members,
+            owner_members: scope_owner_members,
+            entity_ranges: scope_entity_ranges,
+            go_pkg_index: owned_go_pkg_index,
+        };
+
+        let needs_resolution_refs: HashSet<&str> =
+            needs_resolution.iter().map(String::as_str).collect();
+        let (scope_edges, scope_consumed_words) = if has_scope_lang {
+            let result = scope_resolve::resolve_with_scopes_full_for_entities(
+                root,
+                &scope_file_paths,
+                &all_entities,
+                &entity_map,
+                (!parsed_files.is_empty()).then_some(parsed_files),
+                Some(&pre_built),
+                Some(&import_table),
+                &needs_resolution_refs,
+            );
+            (result.edges, result.consumed_words)
+        } else {
+            (vec![], HashMap::new())
+        };
+
+        let reference_context = ReferenceResolutionContext {
+            symbol_table: symbol_table.as_ref(),
+            entity_map: &entity_map,
+            import_table: &import_table,
+            scope_consumed_words: &scope_consumed_words,
+            child_ranges_by_parent: &child_ranges_by_parent,
+            child_line_ranges: &child_line_ranges,
+            parent_child_pairs: &parent_child_pairs,
+            class_child_names: &class_child_names,
+            class_entity_files: &class_entity_files,
+            enclosing_class: &enclosing_class,
+            class_members: &class_members,
+        };
+        let resolved_refs = resolve_references_with_file_indexes(
+            root,
+            &resolve_file_paths,
+            &all_entities,
+            Some(&needs_resolution_refs),
+            &reference_context,
+        );
+
+        let export_edges = build_export_alias_edges(&all_entities, &import_table)
+            .into_iter()
+            .filter(|(from_entity, _, _)| needs_resolution.contains(from_entity))
+            .collect::<Vec<_>>();
+
+        let mut combined: Vec<(String, String, RefType)> = scope_edges
+            .into_iter()
+            .filter(|(from_entity, _, _)| needs_resolution.contains(from_entity))
+            .collect();
+        combined.extend(export_edges);
+        combined.extend(resolved_refs);
+        let all_resolved = dedupe_resolved_edges(combined);
+
+        let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (from_entity, to_entity, ref_type) in all_resolved {
+            dependents
+                .entry(to_entity.clone())
+                .or_default()
+                .push(from_entity.clone());
+            dependencies
+                .entry(from_entity.clone())
+                .or_default()
+                .push(to_entity.clone());
+            edges.push(EntityRef {
+                from_entity,
+                to_entity,
+                ref_type,
+            });
+        }
+
+        (
+            EntityGraph {
+                entities: entity_map,
+                edges,
+                dependents,
+                dependencies,
+            },
+            all_entities,
+        )
+    }
+
     /// Incrementally build an entity graph: reparse only stale files, reuse cached data for clean files.
     ///
     /// Uses the same full 3-phase resolution (scope + dot-chain + bag-of-words) as `build()`,
@@ -4290,6 +4600,32 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
+    fn dependency_ids(graph: &EntityGraph, entity_id: &str) -> Vec<String> {
+        let mut ids = graph
+            .get_dependencies(entity_id)
+            .into_iter()
+            .map(|entity| entity.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn assert_direct_dependencies_match_full(
+        root: &Path,
+        files: &[String],
+        registry: &ParserRegistry,
+        entity_id: &str,
+    ) {
+        let (full_graph, _) = EntityGraph::build(root, files, registry);
+        let expected = dependency_ids(&full_graph, entity_id);
+        let (direct_graph, _) =
+            EntityGraph::build_direct_dependencies(root, files, registry, |entity| {
+                entity.id == entity_id
+            });
+        let actual = dependency_ids(&direct_graph, entity_id);
+        assert_eq!(actual, expected);
+    }
+
     fn graph_json_payload(graph: &EntityGraph) -> serde_json::Value {
         let mut entities = graph.entities.values().collect::<Vec<_>>();
         entities.sort_by(|a, b| a.id.cmp(&b.id));
@@ -6223,6 +6559,40 @@ export function main() { return helper(); }
     }
 
     #[test]
+    fn test_direct_dependencies_match_full_graph_for_js_ts_import_forms() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "lib.ts",
+            "\
+export function namedThing() { return 1; }
+export default function defaultThing() { return 2; }
+",
+        );
+        write_file(
+            root,
+            "consumer.ts",
+            "\
+import defaultThing, { namedThing } from './lib';
+import * as lib from './lib';
+
+export function useEverything() {
+    return defaultThing() + namedThing() + lib.namedThing();
+}
+",
+        );
+        let files = vec!["lib.ts".to_string(), "consumer.ts".to_string()];
+        assert_direct_dependencies_match_full(
+            root,
+            &files,
+            &registry,
+            "consumer.ts::function::useEverything",
+        );
+    }
+
+    #[test]
     fn test_js_ts_relative_import_resolution_uses_full_path() {
         let (dir, registry) = create_test_repo();
         let root = dir.path();
@@ -6460,6 +6830,53 @@ export function usePublicCore(): string { return publicCore(); }
                 .iter()
                 .map(|d| (&d.name, &d.file_path))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_direct_dependencies_match_full_graph_for_js_ts_re_exports() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "lib.ts",
+            "\
+export function core(): string { return 'core'; }
+",
+        );
+        write_file(
+            root,
+            "barrel.ts",
+            "\
+export { core as publicCore } from './lib';
+",
+        );
+        write_file(
+            root,
+            "consumer.ts",
+            "\
+import { publicCore } from './barrel';
+export function usePublicCore(): string { return publicCore(); }
+",
+        );
+        let files = vec![
+            "lib.ts".to_string(),
+            "barrel.ts".to_string(),
+            "consumer.ts".to_string(),
+        ];
+
+        assert_direct_dependencies_match_full(
+            root,
+            &files,
+            &registry,
+            "barrel.ts::export::publicCore",
+        );
+        assert_direct_dependencies_match_full(
+            root,
+            &files,
+            &registry,
+            "consumer.ts::function::usePublicCore",
         );
     }
 

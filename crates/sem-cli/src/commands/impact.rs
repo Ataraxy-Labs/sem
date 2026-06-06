@@ -26,6 +26,8 @@ pub enum ImpactMode {
     Tests,
 }
 
+const DIRECT_DEPS_CACHE_MISS_FILE_THRESHOLD: usize = 20_000;
+
 pub fn impact_command(opts: ImpactOptions) {
     let mut timings = Timings::from_env("impact");
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
@@ -50,7 +52,54 @@ pub fn impact_command(opts: ImpactOptions) {
         .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
 
     match opts.mode {
-        ImpactMode::Deps | ImpactMode::Dependents => {
+        ImpactMode::Deps => {
+            let graph = if opts.no_cache || file_paths.len() > DIRECT_DEPS_CACHE_MISS_FILE_THRESHOLD
+            {
+                let entity_name = opts.entity_name.clone();
+                let entity_id = opts.entity_id.clone();
+                let file_hint_for_match = file_hint.clone();
+                super::graph::get_or_build_direct_dependency_graph_with_timings(
+                    root,
+                    &file_paths,
+                    &registry,
+                    opts.no_cache,
+                    &mut timings,
+                    move |entity| {
+                        if let Some(id) = entity_id.as_deref() {
+                            return entity.id == id;
+                        }
+                        let Some(name) = entity_name.as_deref() else {
+                            return false;
+                        };
+                        if file_hint_for_match
+                            .as_deref()
+                            .is_some_and(|file| entity.file_path != file)
+                        {
+                            return false;
+                        }
+                        super::entity_matches_query(entity, name)
+                    },
+                )
+            } else {
+                super::graph::get_or_build_graph_topology_with_timings(
+                    root,
+                    &file_paths,
+                    &registry,
+                    opts.no_cache,
+                    &mut timings,
+                )
+            };
+            let entity = find_entity(
+                &graph,
+                opts.entity_name.as_deref(),
+                opts.entity_id.as_deref(),
+                file_hint.as_deref(),
+            );
+            timings.mark("entity_lookup");
+            print_deps(&graph, entity, opts.json);
+            timings.mark("cli_output_serialization");
+        }
+        ImpactMode::Dependents => {
             let graph = super::graph::get_or_build_graph_topology_with_timings(
                 root,
                 &file_paths,
@@ -65,11 +114,7 @@ pub fn impact_command(opts: ImpactOptions) {
                 file_hint.as_deref(),
             );
             timings.mark("entity_lookup");
-            match opts.mode {
-                ImpactMode::Deps => print_deps(&graph, entity, opts.json),
-                ImpactMode::Dependents => print_dependents(&graph, entity, opts.json),
-                _ => unreachable!(),
-            }
+            print_dependents(&graph, entity, opts.json);
             timings.mark("cli_output_serialization");
         }
         ImpactMode::Tests | ImpactMode::All => {

@@ -263,3 +263,30 @@ pub fn get_or_build_graph_topology_with_timings(
         get_or_build_graph_with_timings(root, file_paths, registry, no_cache, timings);
     graph
 }
+
+pub fn get_or_build_direct_dependency_graph_with_timings<F>(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    timings: &mut Timings,
+    should_resolve: F,
+) -> EntityGraph
+where
+    F: FnMut(&sem_core::parser::graph::EntityInfo) -> bool,
+{
+    if !no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            timings.mark("cache_open");
+            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+                timings.mark("cache_topology_load");
+                return graph;
+            }
+        }
+    }
+
+    let (graph, _entities) =
+        EntityGraph::build_direct_dependencies(root, file_paths, registry, should_resolve);
+    timings.mark("direct_dependency_graph_build");
+    graph
+}

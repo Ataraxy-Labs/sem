@@ -560,6 +560,53 @@ pub(crate) fn resolve_with_scopes_full(
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
     emit_local_binding_log: bool,
 ) -> ScopeResultFull {
+    resolve_with_scopes_full_inner(
+        root,
+        file_paths,
+        all_entities,
+        entity_map,
+        pre_parsed,
+        pre_built,
+        pre_built_import_table,
+        emit_local_binding_log,
+        None,
+    )
+}
+
+pub(crate) fn resolve_with_scopes_full_for_entities(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+    pre_built: Option<&PreBuiltLookups>,
+    pre_built_import_table: Option<&HashMap<(String, String), String>>,
+    emit_entity_ids: &HashSet<&str>,
+) -> ScopeResultFull {
+    resolve_with_scopes_full_inner(
+        root,
+        file_paths,
+        all_entities,
+        entity_map,
+        pre_parsed,
+        pre_built,
+        pre_built_import_table,
+        false,
+        Some(emit_entity_ids),
+    )
+}
+
+fn resolve_with_scopes_full_inner(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+    pre_built: Option<&PreBuiltLookups>,
+    pre_built_import_table: Option<&HashMap<(String, String), String>>,
+    emit_local_binding_log: bool,
+    emit_entity_ids: Option<&HashSet<&str>>,
+) -> ScopeResultFull {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
     let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
@@ -940,6 +987,13 @@ pub(crate) fn resolve_with_scopes_full(
             let mut lookup_cache = ScopeLookupCache::default();
 
             for entity in &file_entities {
+                if emit_entity_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(entity.id.as_str()))
+                {
+                    continue;
+                }
+
                 let scope_idx = entity_inner_scope
                     .get(&entity.id)
                     .or_else(|| entity_scope_map.get(&entity.id))
