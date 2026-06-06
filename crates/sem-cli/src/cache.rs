@@ -44,7 +44,7 @@ impl DiskCache {
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute_batch(
-            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports;",
+            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports; DELETE FROM entity_flags;",
         )?;
 
         {
@@ -106,6 +106,82 @@ impl DiskCache {
             }
         }
 
+        shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn save_topology(
+        &self,
+        root: &Path,
+        files: &[String],
+        graph: &EntityGraph,
+        entities: &[SemanticEntity],
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports; DELETE FROM entity_flags;",
+        )?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for file in files {
+                if shared_cache::is_manifest_file_name(file) {
+                    continue;
+                }
+                let full = root.join(file);
+                if let Some((secs, nanos, content_hash)) = shared_cache::file_fingerprint(&full) {
+                    stmt.execute(params![file, secs, nanos, content_hash])?;
+                }
+            }
+        }
+
+        shared_cache::refresh_manifest_entries(&tx, root)?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', '', NULL, ?7, NULL)",
+            )?;
+            for e in graph.entities.values() {
+                stmt.execute(params![
+                    e.id,
+                    e.name,
+                    e.entity_type,
+                    e.file_path,
+                    e.start_line as i64,
+                    e.end_line as i64,
+                    e.parent_id,
+                ])?;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
+            )?;
+            for edge in &graph.edges {
+                let rt = match edge.ref_type {
+                    RefType::Calls => "calls",
+                    RefType::TypeRef => "typeref",
+                    RefType::Imports => "imports",
+                };
+                stmt.execute(params![edge.from_entity, edge.to_entity, rt])?;
+            }
+        }
+
+        let test_entity_ids = graph.filter_test_entities(entities);
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")?;
+            for entity_id in &test_entity_ids {
+                stmt.execute(params![entity_id])?;
+            }
+        }
+
+        shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_TOPOLOGY)?;
         tx.commit()?;
         Ok(())
     }
@@ -191,10 +267,28 @@ impl DiskCache {
 
     /// Load only graph topology from a fresh cache.
     pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
-        if !self.has_fresh_complete_cache(root, files) {
+        if !self.has_fresh_topology_cache(root, files) {
             return None;
         }
 
+        self.load_graph_topology_rows()
+    }
+
+    pub fn load_graph_topology_with_test_ids(
+        &self,
+        root: &Path,
+        files: &[String],
+    ) -> Option<(EntityGraph, HashSet<String>)> {
+        if !self.has_fresh_topology_only_cache(root, files) {
+            return None;
+        }
+
+        let graph = self.load_graph_topology_rows()?;
+        let test_entity_ids = self.load_test_entity_ids()?;
+        Some((graph, test_entity_ids))
+    }
+
+    fn load_graph_topology_rows(&self) -> Option<EntityGraph> {
         let mut entity_stmt = self
             .conn
             .prepare(
@@ -225,13 +319,26 @@ impl DiskCache {
         Some(EntityGraph::from_parts(entity_map, edges))
     }
 
+    fn load_test_entity_ids(&self) -> Option<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entity_id FROM entity_flags WHERE is_test != 0")
+            .ok()?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        Some(ids)
+    }
+
     pub fn write_graph_json_topology<W: Write>(
         &self,
         root: &Path,
         files: &[String],
         mut writer: W,
     ) -> std::io::Result<bool> {
-        if !self.has_fresh_complete_cache(root, files) {
+        if !self.has_fresh_topology_cache(root, files) {
             return Ok(false);
         }
 
@@ -317,6 +424,36 @@ impl DiskCache {
     }
 
     fn has_fresh_complete_cache(&self, root: &Path, files: &[String]) -> bool {
+        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files)
+    }
+
+    fn has_fresh_topology_cache(&self, root: &Path, files: &[String]) -> bool {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files)
+    }
+
+    fn has_fresh_topology_only_cache(&self, root: &Path, files: &[String]) -> bool {
+        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_TOPOLOGY]) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files)
+    }
+
+    fn has_fresh_cache(&self, root: &Path, files: &[String]) -> bool {
         if shared_cache::is_manifest_stale(&self.conn, root) {
             return false;
         }
@@ -408,6 +545,10 @@ impl DiskCache {
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
+            return None;
+        }
+
         if shared_cache::is_manifest_stale(&self.conn, root) {
             return None;
         }
@@ -792,6 +933,7 @@ impl DiskCache {
             }
         }
 
+        shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
         tx.commit()?;
         Ok(())
     }
@@ -1008,6 +1150,63 @@ mod tests {
         assert_eq!(value["entities"][1]["id"], "b-id");
         assert_eq!(value["edges"][0]["fromEntity"], "b-id");
         assert_eq!(value["edges"][0]["toEntity"], "a-id");
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn topology_cache_loads_only_topology_readers() {
+        let root = temp_repo_root("topology-only-cache");
+        write_file(&root.join("a.rs"), "fn a() {}\n");
+        write_file(&root.join("b.rs"), "fn b() { a(); }\n");
+        write_file(&root.join("a_test.rs"), "#[test]\nfn test_a() { a(); }\n");
+        let files = vec![
+            "b.rs".to_string(),
+            "a.rs".to_string(),
+            "a_test.rs".to_string(),
+        ];
+        let entities = vec![
+            entity("b-id", "b.rs", "b", "fn b() { a(); }"),
+            entity("a-id", "a.rs", "a", "fn a() {}"),
+            entity(
+                "test-id",
+                "a_test.rs",
+                "test_a",
+                "#[test]\nfn test_a() { a(); }",
+            ),
+        ];
+        let graph = graph_with_edges(
+            &entities,
+            vec![edge("b-id", "a-id"), edge("test-id", "a-id")],
+        );
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save_topology(&root, &files, &graph, &entities)
+            .unwrap();
+
+        assert!(cache.load(&root, &files).is_none());
+        let topology = cache.load_graph_topology(&root, &files).unwrap();
+        assert_eq!(topology.entities.len(), 3);
+        assert_eq!(topology.edges.len(), 2);
+        let (_, test_entity_ids) = cache
+            .load_graph_topology_with_test_ids(&root, &files)
+            .unwrap();
+        assert!(test_entity_ids.contains("test-id"));
+        assert!(!test_entity_ids.contains("a-id"));
+
+        let mut output = Vec::new();
+        assert!(cache
+            .write_graph_json_topology(&root, &files, &mut output)
+            .unwrap());
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            value["stats"],
+            serde_json::json!({"entityCount": 3, "edgeCount": 2})
+        );
+
+        rewrite_after_mtime_tick(&root.join("a.rs"), "fn a() { let _x = 1; }\n");
+        assert!(cache.load_partial(&root, &files).is_none());
 
         drop(cache);
         cleanup(root);
@@ -1428,6 +1627,28 @@ mod tests {
         drop(cli_cache);
         drop(mcp_cache);
         cleanup(mcp_to_cli);
+
+        let cli_topology_to_mcp = temp_repo_root("cli-topology-to-mcp");
+        let cli_topology_to_mcp_files = sample_files(&cli_topology_to_mcp);
+        let cli_cache = DiskCache::open(&cli_topology_to_mcp).unwrap();
+        cli_cache
+            .save_topology(
+                &cli_topology_to_mcp,
+                &cli_topology_to_mcp_files,
+                &empty_graph(),
+                &[],
+            )
+            .unwrap();
+        let mcp_cache = shared_cache::DiskCache::open(&cli_topology_to_mcp).unwrap();
+        assert!(mcp_cache
+            .load(&cli_topology_to_mcp, &cli_topology_to_mcp_files)
+            .is_none());
+        assert!(mcp_cache
+            .load_graph_topology(&cli_topology_to_mcp, &cli_topology_to_mcp_files)
+            .is_some());
+        drop(mcp_cache);
+        drop(cli_cache);
+        cleanup(cli_topology_to_mcp);
     }
 
     #[test]

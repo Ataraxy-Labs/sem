@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
@@ -188,6 +188,122 @@ pub fn get_or_build_graph_with_timings(
     no_cache: bool,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
+    get_or_build_graph_with_cache_policy(
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        CacheMissSavePolicy::Full,
+        timings,
+    )
+}
+
+pub fn get_or_build_graph_with_topology_save_on_miss_with_timings(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    timings: &mut Timings,
+) -> (EntityGraph, Vec<SemanticEntity>) {
+    get_or_build_graph_with_cache_policy(
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        CacheMissSavePolicy::Topology,
+        timings,
+    )
+}
+
+pub enum GraphWithTestData {
+    Full(EntityGraph, Vec<SemanticEntity>),
+    Topology {
+        graph: EntityGraph,
+        test_entity_ids: HashSet<String>,
+    },
+}
+
+pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    timings: &mut Timings,
+) -> GraphWithTestData {
+    if !no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            timings.mark("cache_open");
+            if let Some((graph, entities)) = disk.load(root, file_paths) {
+                timings.mark("cache_full_load");
+                return GraphWithTestData::Full(graph, entities);
+            }
+            if let Some((graph, test_entity_ids)) =
+                disk.load_graph_topology_with_test_ids(root, file_paths)
+            {
+                timings.mark("cache_topology_load");
+                return GraphWithTestData::Topology {
+                    graph,
+                    test_entity_ids,
+                };
+            }
+
+            if let Some(partial) = disk.load_partial(root, file_paths) {
+                timings.mark("cache_partial_load");
+                let (graph, entities, metadata) =
+                    EntityGraph::build_incremental_with_metadata_and_import_candidates(
+                        root,
+                        &partial.stale_files,
+                        file_paths,
+                        partial.cached_entities,
+                        partial.cached_edges,
+                        partial.stale_file_entities,
+                        Some(&partial.cached_importing_stale_files),
+                        registry,
+                    );
+                timings.mark("incremental_graph_rebuild");
+                let _ = disk.save_incremental_with_repair_metadata(
+                    root,
+                    file_paths,
+                    &partial.stale_files,
+                    &graph,
+                    &entities,
+                    metadata.repaired_clean_entity_ids,
+                    &metadata.recomputed_edge_source_ids,
+                    &metadata.deleted_entity_ids,
+                );
+                timings.mark("cache_incremental_save");
+                return GraphWithTestData::Full(graph, entities);
+            }
+        }
+    }
+
+    let (graph, entities) = EntityGraph::build(root, file_paths, registry);
+    timings.mark("full_graph_build");
+
+    if !no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            let _ = disk.save_topology(root, file_paths, &graph, &entities);
+            timings.mark("cache_topology_save");
+        }
+    }
+
+    GraphWithTestData::Full(graph, entities)
+}
+
+#[derive(Clone, Copy)]
+enum CacheMissSavePolicy {
+    Full,
+    Topology,
+}
+
+fn get_or_build_graph_with_cache_policy(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    save_policy: CacheMissSavePolicy,
+    timings: &mut Timings,
+) -> (EntityGraph, Vec<SemanticEntity>) {
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
@@ -233,9 +349,19 @@ pub fn get_or_build_graph_with_timings(
     timings.mark("full_graph_build");
 
     if !no_cache {
-        if let Ok(disk) = DiskCache::open(root) {
-            let _ = disk.save(root, file_paths, &graph, &entities);
-            timings.mark("cache_full_save");
+        match save_policy {
+            CacheMissSavePolicy::Full => {
+                if let Ok(disk) = DiskCache::open(root) {
+                    let _ = disk.save(root, file_paths, &graph, &entities);
+                    timings.mark("cache_full_save");
+                }
+            }
+            CacheMissSavePolicy::Topology => {
+                if let Ok(disk) = DiskCache::open(root) {
+                    let _ = disk.save_topology(root, file_paths, &graph, &entities);
+                    timings.mark("cache_topology_save");
+                }
+            }
         }
     }
 
@@ -261,6 +387,29 @@ pub fn get_or_build_graph_topology_with_timings(
 
     let (graph, _entities) =
         get_or_build_graph_with_timings(root, file_paths, registry, no_cache, timings);
+    graph
+}
+
+pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
+    root: &Path,
+    file_paths: &[String],
+    registry: &ParserRegistry,
+    no_cache: bool,
+    timings: &mut Timings,
+) -> EntityGraph {
+    if !no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            timings.mark("cache_open");
+            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+                timings.mark("cache_topology_load");
+                return graph;
+            }
+        }
+    }
+
+    let (graph, _entities) = get_or_build_graph_with_topology_save_on_miss_with_timings(
+        root, file_paths, registry, no_cache, timings,
+    );
     graph
 }
 

@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
-use sem_core::parser::graph::EntityGraph;
+use sem_core::parser::graph::{EntityGraph, EntityInfo};
 
 use crate::timings::Timings;
 
@@ -26,7 +26,7 @@ pub enum ImpactMode {
     Tests,
 }
 
-const DIRECT_DEPS_CACHE_MISS_FILE_THRESHOLD: usize = 20_000;
+const LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD: usize = 20_000;
 
 pub fn impact_command(opts: ImpactOptions) {
     let mut timings = Timings::from_env("impact");
@@ -53,32 +53,60 @@ pub fn impact_command(opts: ImpactOptions) {
 
     match opts.mode {
         ImpactMode::Deps => {
-            let graph = if opts.no_cache || file_paths.len() > DIRECT_DEPS_CACHE_MISS_FILE_THRESHOLD
-            {
-                let entity_name = opts.entity_name.clone();
-                let entity_id = opts.entity_id.clone();
-                let file_hint_for_match = file_hint.clone();
-                super::graph::get_or_build_direct_dependency_graph_with_timings(
+            let graph =
+                if opts.no_cache || file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
+                    let entity_name = opts.entity_name.clone();
+                    let entity_id = opts.entity_id.clone();
+                    let file_hint_for_match = file_hint.clone();
+                    super::graph::get_or_build_direct_dependency_graph_with_timings(
+                        root,
+                        &file_paths,
+                        &registry,
+                        opts.no_cache,
+                        &mut timings,
+                        move |entity| {
+                            if let Some(id) = entity_id.as_deref() {
+                                return entity.id == id;
+                            }
+                            let Some(name) = entity_name.as_deref() else {
+                                return false;
+                            };
+                            if file_hint_for_match
+                                .as_deref()
+                                .is_some_and(|file| entity.file_path != file)
+                            {
+                                return false;
+                            }
+                            super::entity_matches_query(entity, name)
+                        },
+                    )
+                } else {
+                    super::graph::get_or_build_graph_topology_with_timings(
+                        root,
+                        &file_paths,
+                        &registry,
+                        opts.no_cache,
+                        &mut timings,
+                    )
+                };
+            let entity = find_entity(
+                &graph,
+                opts.entity_name.as_deref(),
+                opts.entity_id.as_deref(),
+                file_hint.as_deref(),
+            );
+            timings.mark("entity_lookup");
+            print_deps(&graph, entity, opts.json);
+            timings.mark("cli_output_serialization");
+        }
+        ImpactMode::Dependents => {
+            let graph = if file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
+                super::graph::get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
                     root,
                     &file_paths,
                     &registry,
                     opts.no_cache,
                     &mut timings,
-                    move |entity| {
-                        if let Some(id) = entity_id.as_deref() {
-                            return entity.id == id;
-                        }
-                        let Some(name) = entity_name.as_deref() else {
-                            return false;
-                        };
-                        if file_hint_for_match
-                            .as_deref()
-                            .is_some_and(|file| entity.file_path != file)
-                        {
-                            return false;
-                        }
-                        super::entity_matches_query(entity, name)
-                    },
                 )
             } else {
                 super::graph::get_or_build_graph_topology_with_timings(
@@ -96,46 +124,86 @@ pub fn impact_command(opts: ImpactOptions) {
                 file_hint.as_deref(),
             );
             timings.mark("entity_lookup");
-            print_deps(&graph, entity, opts.json);
-            timings.mark("cli_output_serialization");
-        }
-        ImpactMode::Dependents => {
-            let graph = super::graph::get_or_build_graph_topology_with_timings(
-                root,
-                &file_paths,
-                &registry,
-                opts.no_cache,
-                &mut timings,
-            );
-            let entity = find_entity(
-                &graph,
-                opts.entity_name.as_deref(),
-                opts.entity_id.as_deref(),
-                file_hint.as_deref(),
-            );
-            timings.mark("entity_lookup");
             print_dependents(&graph, entity, opts.json);
             timings.mark("cli_output_serialization");
         }
         ImpactMode::Tests | ImpactMode::All => {
-            let (graph, all_entities) = super::graph::get_or_build_graph_with_timings(
-                root,
-                &file_paths,
-                &registry,
-                opts.no_cache,
-                &mut timings,
-            );
-            let entity = find_entity(
-                &graph,
-                opts.entity_name.as_deref(),
-                opts.entity_id.as_deref(),
-                file_hint.as_deref(),
-            );
-            timings.mark("entity_lookup");
-            match opts.mode {
-                ImpactMode::Tests => print_tests(&graph, entity, &all_entities, opts.json),
-                ImpactMode::All => print_all(&graph, entity, &all_entities, opts.json, opts.depth),
-                _ => unreachable!(),
+            if file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
+                let graph_data =
+                    super::graph::get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
+                    root,
+                    &file_paths,
+                    &registry,
+                    opts.no_cache,
+                    &mut timings,
+                );
+                match graph_data {
+                    super::graph::GraphWithTestData::Full(graph, all_entities) => {
+                        let entity = find_entity(
+                            &graph,
+                            opts.entity_name.as_deref(),
+                            opts.entity_id.as_deref(),
+                            file_hint.as_deref(),
+                        );
+                        timings.mark("entity_lookup");
+                        match opts.mode {
+                            ImpactMode::Tests => {
+                                print_tests(&graph, entity, &all_entities, opts.json)
+                            }
+                            ImpactMode::All => {
+                                print_all(&graph, entity, &all_entities, opts.json, opts.depth)
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    super::graph::GraphWithTestData::Topology {
+                        graph,
+                        test_entity_ids,
+                    } => {
+                        let entity = find_entity(
+                            &graph,
+                            opts.entity_name.as_deref(),
+                            opts.entity_id.as_deref(),
+                            file_hint.as_deref(),
+                        );
+                        timings.mark("entity_lookup");
+                        match opts.mode {
+                            ImpactMode::Tests => {
+                                print_tests_with_ids(&graph, entity, &test_entity_ids, opts.json)
+                            }
+                            ImpactMode::All => print_all_with_ids(
+                                &graph,
+                                entity,
+                                &test_entity_ids,
+                                opts.json,
+                                opts.depth,
+                            ),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            } else {
+                let (graph, all_entities) = super::graph::get_or_build_graph_with_timings(
+                    root,
+                    &file_paths,
+                    &registry,
+                    opts.no_cache,
+                    &mut timings,
+                );
+                let entity = find_entity(
+                    &graph,
+                    opts.entity_name.as_deref(),
+                    opts.entity_id.as_deref(),
+                    file_hint.as_deref(),
+                );
+                timings.mark("entity_lookup");
+                match opts.mode {
+                    ImpactMode::Tests => print_tests(&graph, entity, &all_entities, opts.json),
+                    ImpactMode::All => {
+                        print_all(&graph, entity, &all_entities, opts.json, opts.depth)
+                    }
+                    _ => unreachable!(),
+                }
             }
             timings.mark("cli_output_serialization");
         }
@@ -303,16 +371,29 @@ fn print_dependents(graph: &EntityGraph, entity: &sem_core::parser::graph::Entit
 
 fn print_tests(
     graph: &EntityGraph,
-    entity: &sem_core::parser::graph::EntityInfo,
+    entity: &EntityInfo,
     all_entities: &[sem_core::model::entity::SemanticEntity],
     json: bool,
 ) {
     let tests = graph.test_impact(&entity.id, all_entities);
+    print_tests_result(entity, &tests, json);
+}
 
+fn print_tests_with_ids(
+    graph: &EntityGraph,
+    entity: &EntityInfo,
+    test_entity_ids: &HashSet<String>,
+    json: bool,
+) {
+    let tests = test_impact_from_ids(graph, &entity.id, test_entity_ids);
+    print_tests_result(entity, &tests, json);
+}
+
+fn print_tests_result(entity: &EntityInfo, tests: &[&EntityInfo], json: bool) {
     if json {
         let output = serde_json::json!({
             "entity": entity_json(entity),
-            "tests": entity_list_json(&tests),
+            "tests": entity_list_json(tests),
         });
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
@@ -327,7 +408,7 @@ fn print_tests(
             );
             let mut by_file: std::collections::HashMap<&str, Vec<_>> =
                 std::collections::HashMap::new();
-            for t in &tests {
+            for t in tests {
                 by_file.entry(t.file_path.as_str()).or_default().push(t);
             }
             let mut files: Vec<_> = by_file.keys().copied().collect();
@@ -353,15 +434,48 @@ fn print_tests(
 
 fn print_all(
     graph: &EntityGraph,
-    entity: &sem_core::parser::graph::EntityInfo,
+    entity: &EntityInfo,
     all_entities: &[sem_core::model::entity::SemanticEntity],
+    json: bool,
+    depth: usize,
+) {
+    let tests = graph.test_impact(&entity.id, all_entities);
+    print_all_with_tests(graph, entity, &tests, json, depth);
+}
+
+fn print_all_with_ids(
+    graph: &EntityGraph,
+    entity: &EntityInfo,
+    test_entity_ids: &HashSet<String>,
+    json: bool,
+    depth: usize,
+) {
+    let tests = test_impact_from_ids(graph, &entity.id, test_entity_ids);
+    print_all_with_tests(graph, entity, &tests, json, depth);
+}
+
+fn test_impact_from_ids<'a>(
+    graph: &'a EntityGraph,
+    entity_id: &str,
+    test_entity_ids: &HashSet<String>,
+) -> Vec<&'a EntityInfo> {
+    graph
+        .impact_analysis(entity_id)
+        .into_iter()
+        .filter(|info| test_entity_ids.contains(&info.id))
+        .collect()
+}
+
+fn print_all_with_tests(
+    graph: &EntityGraph,
+    entity: &EntityInfo,
+    tests: &[&EntityInfo],
     json: bool,
     depth: usize,
 ) {
     let deps = graph.get_dependencies(&entity.id);
     let dependents = graph.get_dependents(&entity.id);
     let impact_bounded = graph.impact_analysis_bounded(&entity.id, depth);
-    let tests = graph.test_impact(&entity.id, all_entities);
 
     if json {
         let impact_entities: Vec<serde_json::Value> = impact_bounded
@@ -383,7 +497,7 @@ fn print_all(
                 "total": impact_bounded.len(),
                 "entities": impact_entities,
             },
-            "tests": entity_list_json(&tests),
+            "tests": entity_list_json(tests),
         });
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
@@ -478,7 +592,7 @@ fn print_all(
                 "⚡".yellow(),
                 format!("{} tests affected:", tests.len()).bold()
             );
-            for t in &tests {
+            for t in tests {
                 println!(
                     "    {} {} ({})",
                     t.entity_type.dimmed(),

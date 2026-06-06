@@ -10,7 +10,9 @@ use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_core::parser::js_ts_import_source_files_from_content;
 use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 4;
+pub const CACHE_SCHEMA_VERSION: i32 = 5;
+pub const CACHE_KIND_FULL: &str = "full";
+pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
     ("idx_entities_file_path", "entities", "file_path"),
     ("idx_entities_name", "entities", "name"),
@@ -65,6 +67,14 @@ CREATE TABLE IF NOT EXISTS file_imports (
     imported_file TEXT NOT NULL,
     PRIMARY KEY (importing_file, imported_file)
 );
+CREATE TABLE IF NOT EXISTS cache_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_flags (
+    entity_id TEXT PRIMARY KEY,
+    is_test INTEGER NOT NULL
+);
 ";
 
 const CACHE_RESET_SQL: &str = "
@@ -72,6 +82,8 @@ DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS entities;
 DROP TABLE IF EXISTS edges;
 DROP TABLE IF EXISTS file_imports;
+DROP TABLE IF EXISTS cache_metadata;
+DROP TABLE IF EXISTS entity_flags;
 ";
 
 pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -97,6 +109,24 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CACHE_SCHEMA_SQL, index_sql, CACHE_SCHEMA_VERSION
     );
     conn.execute_batch(&schema_sql)
+}
+
+pub fn set_cache_kind(tx: &Transaction<'_>, kind: &str) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES ('cache_kind', ?1)",
+        params![kind],
+    )?;
+    Ok(())
+}
+
+pub fn cache_has_kind(conn: &Connection, accepted: &[&str]) -> bool {
+    conn.query_row(
+        "SELECT value FROM cache_metadata WHERE key = 'cache_kind'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .is_some_and(|kind| accepted.contains(&kind.as_str()))
 }
 
 pub fn cache_db_path(repo_root: &Path) -> Option<PathBuf> {
@@ -570,7 +600,7 @@ impl DiskCache {
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute_batch(
-            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports;",
+            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports; DELETE FROM entity_flags;",
         )?;
 
         {
@@ -630,6 +660,7 @@ impl DiskCache {
             }
         }
 
+        set_cache_kind(&tx, CACHE_KIND_FULL)?;
         tx.commit()?;
         Ok(())
     }
@@ -640,6 +671,10 @@ impl DiskCache {
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL]) {
+            return None;
+        }
+
         if is_manifest_stale(&self.conn, root) {
             return None;
         }
@@ -756,6 +791,10 @@ impl DiskCache {
 
     /// Load only graph topology from a fresh cache.
     pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
+        if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL, CACHE_KIND_TOPOLOGY]) {
+            return None;
+        }
+
         if is_manifest_stale(&self.conn, root) {
             return None;
         }
@@ -871,6 +910,10 @@ impl DiskCache {
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL]) {
+            return None;
+        }
+
         if is_manifest_stale(&self.conn, root) {
             return None;
         }
@@ -1268,6 +1311,7 @@ impl DiskCache {
             }
         }
 
+        set_cache_kind(&tx, CACHE_KIND_FULL)?;
         tx.commit()?;
         Ok(())
     }
