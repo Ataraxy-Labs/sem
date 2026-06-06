@@ -556,7 +556,7 @@ pub(crate) fn resolve_with_scopes_full(
     all_entities: &[SemanticEntity],
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
-    pre_built: Option<PreBuiltLookups>,
+    pre_built: Option<&PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
     emit_local_binding_log: bool,
 ) -> ScopeResultFull {
@@ -564,79 +564,79 @@ pub(crate) fn resolve_with_scopes_full(
     let mut log: Vec<ResolutionEntry> = Vec::new();
     let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
 
-    // Use pre-built lookups if provided, otherwise build from scratch
-    let (symbol_table, class_members, owner_members, entity_ranges, go_pkg_index) =
-        if let Some(pb) = pre_built {
-            (
-                pb.symbol_table,
-                pb.class_members,
-                pb.owner_members,
-                pb.entity_ranges,
-                pb.go_pkg_index,
-            )
-        } else {
-            let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-            let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+    // Use pre-built lookups if provided, otherwise build from scratch.
+    let owned_lookups;
+    let lookups = if let Some(pb) = pre_built {
+        pb
+    } else {
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
+        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
 
-            for entity in all_entities {
-                symbol_table
-                    .entry(entity.name.clone())
+        for entity in all_entities {
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+
+            if let Some(ref pid) = entity.parent_id {
+                owner_members
+                    .entry(pid.clone())
                     .or_default()
-                    .push(entity.id.clone());
-
-                if let Some(ref pid) = entity.parent_id {
-                    owner_members
-                        .entry(pid.clone())
-                        .or_default()
-                        .push((entity.name.clone(), entity.id.clone()));
-                    if let Some(parent) = entity_map.get(pid) {
-                        if let Some(owner_name) = class_member_owner_name(parent) {
-                            class_members
-                                .entry(owner_name.to_string())
-                                .or_default()
-                                .push((entity.name.clone(), entity.id.clone()));
-                        }
-                    }
-                }
-
-                if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
-                    if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
+                    .push((entity.name.clone(), entity.id.clone()));
+                if let Some(parent) = entity_map.get(pid) {
+                    if let Some(owner_name) = class_member_owner_name(parent) {
                         class_members
-                            .entry(struct_name)
+                            .entry(owner_name.to_string())
                             .or_default()
                             .push((entity.name.clone(), entity.id.clone()));
                     }
                 }
-
-                entity_ranges
-                    .entry(entity.file_path.clone())
-                    .or_default()
-                    .push((entity.start_line, entity.end_line, entity.id.clone()));
-            }
-            sort_symbol_table_targets_by_source(&mut symbol_table, entity_map);
-            for members in class_members.values_mut() {
-                members.sort_unstable();
-            }
-            for members in owner_members.values_mut() {
-                members.sort_unstable();
-            }
-            for ranges in entity_ranges.values_mut() {
-                ranges.sort_unstable();
             }
 
-            // Build Go package index for O(1) import lookup
-            let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = extract_go_receiver_type(&entity.content) {
+                    class_members
+                        .entry(struct_name)
+                        .or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                }
+            }
 
-            (
-                Arc::new(symbol_table),
-                class_members,
-                owner_members,
-                entity_ranges,
-                go_pkg_index,
-            )
+            entity_ranges
+                .entry(entity.file_path.clone())
+                .or_default()
+                .push((entity.start_line, entity.end_line, entity.id.clone()));
+        }
+        sort_symbol_table_targets_by_source(&mut symbol_table, entity_map);
+        for members in class_members.values_mut() {
+            members.sort_unstable();
+        }
+        for members in owner_members.values_mut() {
+            members.sort_unstable();
+        }
+        for ranges in entity_ranges.values_mut() {
+            ranges.sort_unstable();
+        }
+
+        // Build Go package index for O(1) import lookup
+        let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
+
+        owned_lookups = PreBuiltLookups {
+            symbol_table: Arc::new(symbol_table),
+            class_members,
+            owner_members,
+            entity_ranges,
+            go_pkg_index,
         };
+        &owned_lookups
+    };
+    let symbol_table = lookups.symbol_table.as_ref();
+    let class_members = &lookups.class_members;
+    let owner_members = &lookups.owner_members;
+    let entity_ranges = &lookups.entity_ranges;
+    let go_pkg_index = &lookups.go_pkg_index;
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
     let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
@@ -793,9 +793,16 @@ pub(crate) fn resolve_with_scopes_full(
         &symbol_table,
         &mut instance_attr_types,
     );
+    let func_name_return_types = deterministic_return_types_by_name(&return_type_map, symbol_table);
 
-    let swift_call_signatures =
-        build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map);
+    let swift_call_signatures = if parsed_files
+        .iter()
+        .any(|(file_path, _, _)| file_path.ends_with(".swift"))
+    {
+        build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map)
+    } else {
+        HashMap::new()
+    };
 
     // Group the prebuilt import table by importing file once. Otherwise every file
     // in Pass 2 would rescan the entire table to find its own entries — O(files ×
@@ -905,16 +912,6 @@ pub(crate) fn resolve_with_scopes_full(
                 pre_built_import_table.is_some(),
             );
 
-            // Resolve pending call types using the complete return type map
-            inject_return_type_bindings(
-                &entity_inner_scope,
-                &mut scopes,
-                &return_type_map,
-                &symbol_table,
-                &local_import_table,
-                file_path,
-            );
-
             // The per-file import table is keyed by (file_path, name) but only ever
             // holds this file's entries, so re-key it by name once. resolve_ref then
             // looks up imports without allocating a key string per reference.
@@ -922,6 +919,14 @@ pub(crate) fn resolve_with_scopes_full(
                 .iter()
                 .map(|((_, name), target_id)| (name.as_str(), target_id.as_str()))
                 .collect();
+
+            // Resolve pending call types using the complete return type map.
+            inject_return_type_bindings(
+                &mut scopes,
+                &func_name_return_types,
+                &return_type_map,
+                &local_import_by_name,
+            );
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
@@ -1295,6 +1300,29 @@ fn row_in_descendant_ranges(ranges: Option<&Vec<(usize, usize)>>, row: usize) ->
 /// Creates class scopes and maps methods to them.
 /// Uses an iterative worklist to avoid stack overflow on deeply nested ASTs.
 /// Fixes: https://github.com/Ataraxy-Labs/sem/issues/103
+fn push_named_children_rev<'a>(
+    worklist: &mut Vec<tree_sitter::Node<'a>>,
+    node: tree_sitter::Node<'a>,
+) {
+    for idx in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(idx as u32) {
+            worklist.push(child);
+        }
+    }
+}
+
+fn push_scoped_named_children_rev<'a>(
+    worklist: &mut Vec<(tree_sitter::Node<'a>, usize)>,
+    node: tree_sitter::Node<'a>,
+    scope: usize,
+) {
+    for idx in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(idx as u32) {
+            worklist.push((child, scope));
+        }
+    }
+}
+
 fn build_scopes_from_ast(
     root: tree_sitter::Node,
     root_scope: usize,
@@ -1398,11 +1426,7 @@ fn build_scopes_from_ast(
                     }
                 }
 
-                let mut cursor = node.walk();
-                let children: Vec<_> = node.named_children(&mut cursor).collect();
-                for child in children.into_iter().rev() {
-                    worklist.push((child, class_scope_idx));
-                }
+                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
                 continue;
             } else if !is_impl {
                 let class_scope_idx = scopes.len();
@@ -1416,11 +1440,7 @@ fn build_scopes_from_ast(
                     owner_id: None,
                     kind: "class",
                 });
-                let mut cursor = node.walk();
-                let children: Vec<_> = node.named_children(&mut cursor).collect();
-                for child in children.into_iter().rev() {
-                    worklist.push((child, class_scope_idx));
-                }
+                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
                 continue;
             }
         }
@@ -1467,11 +1487,7 @@ fn build_scopes_from_ast(
                 }
             }
 
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push((child, mod_scope_idx));
-            }
+            push_scoped_named_children_rev(&mut worklist, node, mod_scope_idx);
             continue;
         }
 
@@ -1563,19 +1579,11 @@ fn build_scopes_from_ast(
                 }
             }
 
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push((child, func_scope_idx));
-            }
+            push_scoped_named_children_rev(&mut worklist, node, func_scope_idx);
             continue;
         }
 
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push((child, current_scope));
-        }
+        push_scoped_named_children_rev(&mut worklist, node, current_scope);
     }
 }
 
@@ -2392,7 +2400,7 @@ pub fn extract_go_receiver_type(content: &str) -> Option<String> {
 
 /// Build Go package index: pkg_name → [(entity_name, entity_id)]
 /// Maps file stems and parent directory names to entities for O(1) package import lookup.
-fn build_go_pkg_index(
+pub(crate) fn build_go_pkg_index(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, Vec<(String, String)>> {
@@ -2481,11 +2489,7 @@ fn scan_return_types(
             }
         }
 
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push(child);
-        }
+        push_named_children_rev(&mut worklist, node);
     }
 }
 
@@ -2619,11 +2623,7 @@ fn scan_init_self_attrs(
             InitStrategy::None => {}
         }
 
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push(child);
-        }
+        push_named_children_rev(&mut worklist, node);
     }
 }
 
@@ -3565,11 +3565,7 @@ fn scan_constructor_calls(
             }
         }
 
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push(child);
-        }
+        push_named_children_rev(&mut worklist, node);
     }
 }
 
@@ -3607,43 +3603,21 @@ fn infer_expr_type(
 /// Resolve pending call types using the return type map.
 /// For scopes with `x = func()` where func has a known return type, bind x to that type.
 fn inject_return_type_bindings(
-    _entity_inner_scope: &HashMap<String, usize>,
     scopes: &mut Vec<Scope>,
+    func_name_return_types: &HashMap<String, String>,
     return_type_map: &HashMap<String, String>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    import_table: &HashMap<(String, String), String>,
-    file_path: &str,
+    import_table_by_name: &HashMap<&str, &str>,
 ) {
-    let mut func_name_return_types =
-        deterministic_return_types_by_name(return_type_map, symbol_table);
-
-    // Also resolve through imports: if `get_connection` is imported and has a known return type
-    let mut import_entries: Vec<(&(String, String), &String)> = import_table
-        .iter()
-        .filter(|((fp, _), _)| fp == file_path)
-        .collect();
-    import_entries.sort_unstable_by(
-        |((_, left_name), left_target), ((_, right_name), right_target)| {
-            left_name
-                .cmp(right_name)
-                .then_with(|| left_target.cmp(right_target))
-        },
-    );
-
-    for ((_, local_name), target_id) in import_entries {
-        if let Some(ret_type) = return_type_map.get(target_id) {
-            func_name_return_types.insert(local_name.clone(), ret_type.clone());
-        }
-    }
-
     // Resolve pending call types in all scopes
     for scope in scopes.iter_mut() {
         let resolved: Vec<(String, String)> = scope
             .pending_call_types
             .iter()
             .filter_map(|(var_name, func_name)| {
-                func_name_return_types
-                    .get(func_name)
+                import_table_by_name
+                    .get(func_name.as_str())
+                    .and_then(|target_id| return_type_map.get(*target_id))
+                    .or_else(|| func_name_return_types.get(func_name))
                     .map(|ret_type| (var_name.clone(), ret_type.clone()))
             })
             .collect();
@@ -4774,11 +4748,7 @@ fn build_swift_call_signatures(
                 }
             }
 
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push(child);
-            }
+            push_named_children_rev(&mut worklist, node);
         }
     }
 
@@ -4880,11 +4850,7 @@ fn find_first_swift_callable_declaration<'a>(
             return Some(node);
         }
 
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push(child);
-        }
+        push_named_children_rev(&mut worklist, node);
     }
 
     None
@@ -4907,11 +4873,7 @@ fn extract_swift_declaration_argument_labels(
             continue;
         }
 
-        let mut cursor = current.walk();
-        let children: Vec<_> = current.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push(child);
-        }
+        push_named_children_rev(&mut worklist, current);
     }
 
     labels
@@ -5130,11 +5092,7 @@ fn collect_all_file_refs(
                     }
                 }
             }
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push(child);
-            }
+            push_named_children_rev(&mut worklist, node);
             continue;
         }
 
@@ -5154,11 +5112,7 @@ fn collect_all_file_refs(
                     });
                 }
             }
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push(child);
-            }
+            push_named_children_rev(&mut worklist, node);
             continue;
         }
 
@@ -5179,11 +5133,7 @@ fn collect_all_file_refs(
                     });
                 }
             }
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push(child);
-            }
+            push_named_children_rev(&mut worklist, node);
             continue;
         }
 
@@ -5208,11 +5158,7 @@ fn collect_all_file_refs(
         }
 
         // Recurse into children
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            worklist.push(child);
-        }
+        push_named_children_rev(&mut worklist, node);
     }
     refs
 }

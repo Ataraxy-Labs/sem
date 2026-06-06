@@ -3,7 +3,11 @@ use tree_sitter::Node;
 use xxhash_rust::xxh3::Xxh3;
 
 pub fn content_hash(content: &str) -> String {
-    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content.as_bytes()))
+    content_hash_bytes(content.as_bytes())
+}
+
+pub fn content_hash_bytes(content: &[u8]) -> String {
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content))
 }
 
 pub fn short_hash(content: &str, length: usize) -> String {
@@ -150,6 +154,11 @@ mod tests {
         let h = content_hash("test");
         assert_eq!(h.len(), 16); // xxHash64 = 8 bytes = 16 hex chars
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_content_hash_bytes_matches_string_hash() {
+        assert_eq!(content_hash_bytes(b"test"), content_hash("test"));
     }
 
     #[test]
