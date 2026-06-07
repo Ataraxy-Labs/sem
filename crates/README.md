@@ -49,7 +49,7 @@ sem-cli/     # Binary: diff, blame, graph, impact commands
 
 The library that weave, agenthub, effect-system, agent-lint, unified-build, and agent-bench all depend on.
 
-- **Parser registry** with 23 language plugins via tree-sitter + shebang detection
+- **Parser registry** with 24 language plugins via tree-sitter + shebang detection
 - **Structural hashing** (AST-normalized, ignores whitespace/comments)
 - **Semantic diff** with 3-phase entity matching (exact ID, content hash, fuzzy similarity)
 - **Cosmetic vs structural** change detection

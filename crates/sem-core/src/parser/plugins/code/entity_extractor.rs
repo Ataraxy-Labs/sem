@@ -1697,6 +1697,40 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
+    // Haskell instance declarations: construct name from class name + type patterns
+    // e.g. "instance Eq Bool where" -> "Eq Bool"
+    // Must be before the generic 'name' field lookup since instance has a 'name'
+    // field that only captures the class name, not the full instance head.
+    if node_type == "instance" {
+        let name_node = node.child_by_field_name("name");
+        let patterns_node = node.child_by_field_name("patterns");
+        match (name_node, patterns_node) {
+            (Some(name), Some(patterns)) => {
+                return Some(format!(
+                    "{} {}",
+                    node_text(name, source),
+                    node_text(patterns, source)
+                ));
+            }
+            (Some(name), None) => {
+                // Check for unnamed children (infix or parens) that hold type info
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    let kind = child.kind();
+                    if kind == "infix" || kind == "parens" {
+                        return Some(format!(
+                            "{} {}",
+                            node_text(name, source),
+                            node_text(child, source)
+                        ));
+                    }
+                }
+                return Some(node_text(name, source).to_string());
+            }
+            _ => {}
+        }
+    }
+
     // Try 'name' field first (works for most languages)
     if let Some(name_node) = node.child_by_field_name("name") {
         return Some(node_text(name_node, source).to_string());
@@ -2298,7 +2332,8 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "class_declaration"
         | "abstract_class_declaration"
         | "class_definition"
-        | "class_specifier" => "class",
+        | "class_specifier"
+        | "class" => "class",
         "interface_declaration" => "interface",
         "protocol_declaration" => "protocol",
         "init_declaration" => "init",
@@ -2309,7 +2344,9 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "type_declaration"
         | "type_item"
         | "type_definition"
-        | "type_alias" => "type",
+        | "type_alias"
+        | "type_synomym"
+        | "type_family" => "type",
         "associatedtype_declaration" => "associatedtype",
         "operator_declaration" => "operator",
         "enum_declaration" | "enum_item" | "enum_specifier" | "enum_definition" => "enum",
@@ -2339,6 +2376,11 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
             "variable"
         }
         "const_declaration" | "const_item" => "constant",
+        "signature" => "signature",
+        "instance" => "instance",
+        "data_type" | "newtype" | "data_family" => "type",
+        "pattern_synonym" => "pattern",
+        "fixity" => "fixity",
         "binding" => "binding",
         "inherit" | "inherit_from" => "inherit",
         "static_item" => "static",
@@ -2346,7 +2388,7 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "module_type_definition" => "module_type",
         "exception_definition" => "exception",
         "class_type_definition" => "class_type",
-        "external" => "external",
+        "external" | "foreign_import" | "foreign_export" => "external",
         "decorated_definition" => "decorated_definition",
         "constructor_declaration" => "constructor",
         "field_declaration" | "public_field_definition" | "field_definition" => "field",
