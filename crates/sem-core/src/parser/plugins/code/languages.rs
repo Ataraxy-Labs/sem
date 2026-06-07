@@ -329,6 +329,11 @@ fn get_haskell() -> Option<Language> {
     Some(tree_sitter_haskell::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-elm")]
+fn get_elm() -> Option<Language> {
+    Some(tree_sitter_elm::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -1042,6 +1047,25 @@ static HASKELL_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &["function"],
     get_language: get_haskell,
+    scope_resolve: None,
+};
+
+#[cfg(feature = "lang-elm")]
+static ELM_CONFIG: LanguageConfig = LanguageConfig {
+    id: "elm",
+    extensions: &[".elm"],
+    entity_node_types: &[
+        "value_declaration",
+        "type_alias_declaration",
+        "type_declaration",
+        "port_annotation",
+        "infix_declaration",
+    ],
+    container_node_types: &[],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &["value_declaration"],
+    get_language: get_elm,
     scope_resolve: None,
 };
 
@@ -2327,6 +2351,8 @@ macro_rules! all_configs {
             &NIX_CONFIG,
             #[cfg(feature = "lang-haskell")]
             &HASKELL_CONFIG,
+            #[cfg(feature = "lang-elm")]
+            &ELM_CONFIG,
         ]
     }};
 }

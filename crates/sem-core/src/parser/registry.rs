@@ -440,6 +440,7 @@ const LANG_MAPPING: &[(&str, &str)] = &[
     ("ocaml", ".ml"),
     ("scala", ".scala"),
     ("haskell", ".hs"),
+    ("elm", ".elm"),
     ("zig", ".zig"),
     ("xml", ".xml"),
     ("json", ".json"),

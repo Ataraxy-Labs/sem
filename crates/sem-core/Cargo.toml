@@ -29,6 +29,7 @@ grammar-all = [
     "lang-scala", "lang-zig", "lang-nix",
     "lang-svelte", "lang-erb",
     "lang-haskell",
+    "lang-elm",
 ]
 
 # Individual grammar features
@@ -59,6 +60,7 @@ lang-nix = ["dep:tree-sitter-nix"]
 lang-svelte = ["dep:tree-sitter-htmlx-svelte"]
 lang-erb = ["dep:tree-sitter-embedded-template"]
 lang-haskell = ["dep:tree-sitter-haskell"]
+lang-elm = ["dep:tree-sitter-elm"]
 
 [dependencies]
 git2 = { version = "0.20", optional = true }
@@ -98,6 +100,7 @@ rayon = { version = "1.10", optional = true }
 tree-sitter-zig = { version = "1.1.2", optional = true }
 tree-sitter-nix = { version = "0.3", optional = true }
 tree-sitter-haskell = { version = "0.23", optional = true }
+tree-sitter-elm = { version = "5.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3.24.0"

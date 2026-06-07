@@ -1697,6 +1697,27 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
+    // Elm value_declaration: name is inside the function_declaration_left child
+    // e.g. "update msg model = ..." -> "update"
+    if node_type == "value_declaration" {
+        if let Some(left) = node.child_by_field_name("functionDeclarationLeft") {
+            let mut cursor = left.walk();
+            for child in left.named_children(&mut cursor) {
+                if child.kind() == "lower_case_identifier" {
+                    return Some(node_text(child, source).to_string());
+                }
+            }
+        }
+    }
+
+    // Elm infix_declaration: name is the operator field
+    // e.g. "infix right 5 (|>) = apR" -> "|>"
+    if node_type == "infix_declaration" {
+        if let Some(op) = node.child_by_field_name("operator") {
+            return Some(node_text(op, source).to_string());
+        }
+    }
+
     // Haskell instance declarations: construct name from class name + type patterns
     // e.g. "instance Eq Bool where" -> "Eq Bool"
     // Must be before the generic 'name' field lookup since instance has a 'name'
