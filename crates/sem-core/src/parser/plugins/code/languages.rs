@@ -324,6 +324,11 @@ fn get_nix() -> Option<Language> {
     Some(tree_sitter_nix::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-haskell")]
+fn get_haskell() -> Option<Language> {
+    Some(tree_sitter_haskell::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -1010,6 +1015,33 @@ static NIX_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_nix,
+    scope_resolve: None,
+};
+
+#[cfg(feature = "lang-haskell")]
+static HASKELL_CONFIG: LanguageConfig = LanguageConfig {
+    id: "haskell",
+    extensions: &[".hs"],
+    entity_node_types: &[
+        "function",        // top-level function definitions
+        "signature",       // type signatures (e.g. foo :: Int -> Int)
+        "data_type",       // data declarations
+        "newtype",         // newtype declarations
+        "class",           // type class declarations
+        "instance",        // instance declarations
+        "type_synomym",    // type aliases (note: typo in grammar)
+        "foreign_import",  // FFI imports
+        "foreign_export",  // FFI exports
+        "pattern_synonym", // pattern synonyms
+        "type_family",     // type families
+        "data_family",     // data families
+        "fixity",          // fixity declarations
+    ],
+    container_node_types: &["declarations", "class_body", "instance_body"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &["function"],
+    get_language: get_haskell,
     scope_resolve: None,
 };
 
@@ -2293,6 +2325,8 @@ macro_rules! all_configs {
             &ZIG_CONFIG,
             #[cfg(feature = "lang-nix")]
             &NIX_CONFIG,
+            #[cfg(feature = "lang-haskell")]
+            &HASKELL_CONFIG,
         ]
     }};
 }

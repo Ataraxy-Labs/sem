@@ -24,7 +24,7 @@
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
   <img src="https://img.shields.io/badge/tests-133_passing-brightgreen" alt="Tests">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License"></a>
-  <img src="https://img.shields.io/badge/languages-27-blue" alt="Languages">
+  <img src="https://img.shields.io/badge/languages-28-blue" alt="Languages">
 </p>
 
 sem is a semantic version control tool that works on top of Git. It parses your code with tree-sitter, extracts every function, class, and method as an entity, and diffs at the entity level instead of lines. This means you see "function `blahh` was modified" instead of "lines x-y changed."
@@ -244,7 +244,7 @@ sem unsetup
 
 ## What it parses
 
-27 programming languages with full entity extraction via tree-sitter:
+28 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -274,6 +274,7 @@ sem unsetup
 | OCaml | `.ml` `.mli` | values, modules, types, classes, externals |
 | Scala | `.scala` `.sc` `.sbt` | classes, objects, traits, enums, functions, vals, extensions |
 | Nix | `.nix` | bindings, inherit declarations |
+| Haskell | `.hs` | functions, signatures, data types, newtypes, classes, instances, type synonyms |
 | Zig | `.zig` | functions, tests, variables |
 
 Plus structured data formats:

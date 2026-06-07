@@ -3,7 +3,7 @@ name = "sem-core"
 version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 20 languages via tree-sitter and diffs at the entity level."
+description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 28 languages via tree-sitter and diffs at the entity level."
 repository = "https://github.com/Ataraxy-Labs/sem"
 homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["diff", "semantic", "tree-sitter", "ast", "code-analysis"]
@@ -28,6 +28,7 @@ grammar-all = [
     "lang-kotlin", "lang-xml", "lang-dart", "lang-perl", "lang-ocaml",
     "lang-scala", "lang-zig", "lang-nix",
     "lang-svelte", "lang-erb",
+    "lang-haskell",
 ]
 
 # Individual grammar features
@@ -57,6 +58,7 @@ lang-zig = ["dep:tree-sitter-zig"]
 lang-nix = ["dep:tree-sitter-nix"]
 lang-svelte = ["dep:tree-sitter-htmlx-svelte"]
 lang-erb = ["dep:tree-sitter-embedded-template"]
+lang-haskell = ["dep:tree-sitter-haskell"]
 
 [dependencies]
 git2 = { version = "0.20", optional = true }
@@ -95,6 +97,7 @@ thiserror = "2"
 rayon = { version = "1.10", optional = true }
 tree-sitter-zig = { version = "1.1.2", optional = true }
 tree-sitter-nix = { version = "0.3", optional = true }
+tree-sitter-haskell = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tempfile = "3.24.0"
