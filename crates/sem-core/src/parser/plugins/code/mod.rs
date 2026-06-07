@@ -893,6 +893,203 @@ end
     }
 
     #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_entity_extraction() {
+        let code = r#"
+(ns my.app.core
+  (:require [clojure.string :as str]))
+
+(def my-var 42)
+
+(def ^:private secret "hunter2")
+
+(defonce connection (atom nil))
+
+(defn greet
+  "Returns a greeting string."
+  [name]
+  (str "Hello, " name "!"))
+
+(defmacro unless [pred & body]
+  `(when (not ~pred) ~@body))
+
+(defprotocol Greeter
+  (greet! [this name]))
+
+(defrecord Person [name age])
+
+(defmulti area :shape)
+
+(defmethod area :circle [{:keys [radius]}]
+  (* Math/PI radius radius))
+
+(defmethod area :rectangle [{:keys [width height]}]
+  (* width height))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "core.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!(
+            "Clojure entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(!names.contains(&"my.app.core"), "Should not extract ns form as entity, got: {:?}", names);
+        assert!(names.contains(&"my-var"), "Should find def, got: {:?}", names);
+        assert!(names.contains(&"secret"), "Should strip ^:private metadata from name, got: {:?}", names);
+        assert!(names.contains(&"connection"), "Should find defonce, got: {:?}", names);
+        assert!(names.contains(&"greet"), "Should find defn, got: {:?}", names);
+        assert!(names.contains(&"unless"), "Should find defmacro, got: {:?}", names);
+        assert!(names.contains(&"Greeter"), "Should find defprotocol, got: {:?}", names);
+        assert!(names.contains(&"Person"), "Should find defrecord, got: {:?}", names);
+        assert!(names.contains(&"area"), "Should find defmulti, got: {:?}", names);
+        // defmethods get dispatch-qualified names so two methods on the same multimethod are distinct
+        assert!(names.contains(&"area/:circle"), "Should find defmethod area :circle, got: {:?}", names);
+        assert!(names.contains(&"area/:rectangle"), "Should find defmethod area :rectangle, got: {:?}", names);
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
+            "All entity IDs must be unique, got: {:?}", ids);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_defn_private() {
+        let code = r#"
+(ns my.app)
+
+(defn- private-helper [x]
+  (* x 2))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "app.clj");
+        let entity = entities
+            .iter()
+            .find(|e| e.name == "private-helper")
+            .expect("Should extract defn- as a function entity");
+        assert_eq!(entity.entity_type, "function");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_predicate_and_bang_functions() {
+        let code = r#"
+(ns my.app.validators)
+
+(defn empty? [coll]
+  (= 0 (count coll)))
+
+(defn reset! [state new-val]
+  (compare-and-set! state @state new-val))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "validators.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"empty?"), "Should extract predicate fn empty?, got: {:?}", names);
+        assert!(names.contains(&"reset!"), "Should extract bang fn reset!, got: {:?}", names);
+        let empty_entity = entities.iter().find(|e| e.name == "empty?").unwrap();
+        let reset_entity = entities.iter().find(|e| e.name == "reset!").unwrap();
+        assert_eq!(empty_entity.entity_type, "function");
+        assert_eq!(reset_entity.entity_type, "function");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_dynamic_vars_and_equality_fns() {
+        let code = r#"
+(ns my.app.core)
+
+(def *db* (atom nil))
+
+(defn not= [a b]
+  (not (= a b)))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "core.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"*db*"), "Should extract dynamic var *db*, got: {:?}", names);
+        assert!(names.contains(&"not="), "Should extract fn not=, got: {:?}", names);
+        let db_entity = entities.iter().find(|e| e.name == "*db*").unwrap();
+        let noteq_entity = entities.iter().find(|e| e.name == "not=").unwrap();
+        assert_eq!(db_entity.entity_type, "var");
+        assert_eq!(noteq_entity.entity_type, "function");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_deftype_definterface_defstruct() {
+        let code = r#"
+(ns my.app)
+
+(deftype MyType [field])
+
+(definterface IFoo
+  (foo [this]))
+
+(defstruct point :x :y)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "app.clj");
+        let by_name = |name: &str| entities.iter().find(|e| e.name == name);
+
+        assert!(by_name("MyType").is_some(), "Should extract deftype, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(by_name("MyType").unwrap().entity_type, "type");
+
+        assert!(by_name("IFoo").is_some(), "Should extract definterface, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(by_name("IFoo").unwrap().entity_type, "interface");
+
+        assert!(by_name("point").is_some(), "Should extract defstruct, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(by_name("point").unwrap().entity_type, "struct");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_cljc_extension() {
+        let code = r#"
+(ns my.app.shared)
+
+(defn platform-key [] :default)
+
+(def shared-value 99)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "shared.cljc");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"platform-key"), "Should extract defn from .cljc, got: {:?}", names);
+        assert!(names.contains(&"shared-value"), "Should extract def from .cljc, got: {:?}", names);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_defmethod_non_keyword_dispatch() {
+        let code = r#"
+(ns my.app)
+
+(defmulti process identity)
+
+(defmethod process nil [_] :nothing)
+
+(defmethod process "string" [s] s)
+
+(defmethod process 42 [n] n)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "app.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"process"), "Should extract defmulti, got: {:?}", names);
+        assert!(names.contains(&"process/nil"), "Should extract defmethod with nil dispatch, got: {:?}", names);
+        assert!(names.contains(&"process/\"string\""), "Should extract defmethod with string dispatch, got: {:?}", names);
+        assert!(names.contains(&"process/42"), "Should extract defmethod with integer dispatch, got: {:?}", names);
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
+            "All entity IDs must be unique, got: {:?}", ids
+        );
+    }
+
+    #[test]
     fn test_bash_entity_extraction() {
         let code = r#"#!/bin/bash
 
@@ -2556,5 +2753,66 @@ test "basic addition" {
         assert_eq!(types["Point"], "struct");
         assert_eq!(types["Color"], "enum");
         assert_eq!(types["Person"], "struct");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_deps_edn_map_entries() {
+        let code = r#"{:deps {org.clojure/clojure {:mvn/version "1.11.0"}}
+ :paths ["src" "resources"]
+ :aliases {:dev {:extra-deps {cider/cider-nrepl {:mvn/version "0.28.5"}}}}}"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "deps.edn");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: std::collections::HashMap<&str, &str> = entities
+            .iter()
+            .map(|e| (e.name.as_str(), e.entity_type.as_str()))
+            .collect();
+
+        assert!(names.contains(&":deps"), "Should find :deps, got: {:?}", names);
+        assert!(names.contains(&":paths"), "Should find :paths, got: {:?}", names);
+        assert!(names.contains(&":aliases"), "Should find :aliases, got: {:?}", names);
+        assert_eq!(names.len(), 3, "Should have exactly 3 entries, got: {:?}", names);
+        assert_eq!(types[":deps"], "entry");
+        assert_eq!(types[":paths"], "entry");
+        assert_eq!(types[":aliases"], "entry");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_nested_map_values_not_extracted() {
+        // Inner map entries (inside :aliases) must not leak as top-level entities.
+        let code = r#"{:a {:b 1 :c 2} :d 3}"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "config.edn");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&":a"), "Should find :a, got: {:?}", names);
+        assert!(names.contains(&":d"), "Should find :d, got: {:?}", names);
+        assert!(!names.contains(&":b"), "Inner :b should not be extracted");
+        assert!(!names.contains(&":c"), "Inner :c should not be extracted");
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_non_map_top_level_forms_not_extracted() {
+        // A bare vector at the top level has no meaningful name and yields no entities.
+        let code = r#"["alpha" "beta"]"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "data.edn");
+        assert_eq!(entities.len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_symbol_keys_extracted() {
+        let code = r#"{foo 1 bar 2}"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "sym.edn");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"foo"), "Should find foo, got: {:?}", names);
+        assert!(names.contains(&"bar"), "Should find bar, got: {:?}", names);
     }
 }

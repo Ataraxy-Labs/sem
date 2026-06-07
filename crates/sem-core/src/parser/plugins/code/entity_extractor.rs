@@ -313,6 +313,81 @@ fn visit_node(
             }
         }
 
+        // EDN map-entry extraction: treat each keyword key–value pair in a top-level
+        // map_lit as a named "entry" entity. Values are kept as opaque content and are
+        // not recursed into, so nested maps don't leak inner entries as entities.
+        if node_type == "map_lit" && config.extract_map_entries {
+            let mut cursor = node.walk();
+            // Skip comment and dis_expr nodes: they are named children of map_lit
+            // in tree-sitter-clojure but are not actual forms. Without this filter,
+            // a comment inside a map shifts the key/value pairing by one slot,
+            // causing the entry after the comment to be misidentified as a key.
+            let children: Vec<_> = node
+                .named_children(&mut cursor)
+                .filter(|n| !matches!(n.kind(), "comment" | "dis_expr"))
+                .collect();
+            let mut i = 0;
+            while i + 1 < children.len() {
+                let key = children[i];
+                let value = children[i + 1];
+                i += 2;
+                let name = match key.kind() {
+                    "kwd_lit" | "sym_lit" => node_text(key, source).to_string(),
+                    _ => continue,
+                };
+                let content = std::str::from_utf8(
+                    &source[key.start_byte()..value.end_byte()],
+                )
+                .unwrap_or("")
+                .to_string();
+                let struct_hash = compute_structural_hash(value, source);
+                let entity = SemanticEntity {
+                    id: build_entity_id(file_path, "entry", &name, parent_id),
+                    file_path: file_path.to_string(),
+                    entity_type: "entry".to_string(),
+                    name,
+                    parent_id: parent_id.map(String::from),
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(struct_hash),
+                    content,
+                    start_line: key.start_position().row + 1,
+                    end_line: value.end_position().row + 1,
+                    metadata: None,
+                };
+                entities.push(entity);
+            }
+            continue;
+        }
+
+        // Handle Clojure-style list form entities: list_lit whose first sym_lit child
+        // is a defining keyword (defn, ns, defrecord, etc.).
+        // Gated on call_entity_identifiers being non-empty, mirroring the `call` branch
+        // used for Elixir. The config's call_entity_identifiers list is the whitelist.
+        if node_type == "list_lit" && !config.call_entity_identifiers.is_empty() {
+            if let Some((name, entity_type)) = extract_list_form_entity(node, config, source) {
+                let content_str = node_text(node, source);
+                let content = content_str.to_string();
+                let struct_hash = compute_structural_hash(node, source);
+                let entity = SemanticEntity {
+                    id: build_entity_id(file_path, entity_type, &name, parent_id),
+                    file_path: file_path.to_string(),
+                    entity_type: entity_type.to_string(),
+                    name: name.clone(),
+                    parent_id: parent_id.map(String::from),
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(struct_hash),
+                    content,
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
+                    metadata: None,
+                };
+                entities.push(entity);
+            }
+            // Always skip children: in practice, Clojure definitions are always top-level
+            // list forms, nesting defn would be so unidiomatic it's not worth checking for.
+            continue;
+        }
+
         // OCaml: value_definition, module_definition, class_definition, and
         // class_type_definition can each contain multiple bindings via `... and ...`.
         // Extract each binding as a separate entity.
@@ -1185,8 +1260,7 @@ fn swift_string_literal_start(source: &[u8], start: usize) -> Option<SwiftString
         return None;
     }
 
-    let is_multiline =
-        source.get(quote + 1) == Some(&b'"') && source.get(quote + 2) == Some(&b'"');
+    let is_multiline = source.get(quote + 1) == Some(&b'"') && source.get(quote + 2) == Some(&b'"');
     let body_start = quote + if is_multiline { 3 } else { 1 };
     Some(SwiftStringLiteralStart {
         body_start,
@@ -1212,7 +1286,12 @@ fn skip_swift_string_literal_with_depth(
             interpolation_depth,
         )
     } else {
-        skip_swift_string(source, start.body_start, start.hash_count, interpolation_depth)
+        skip_swift_string(
+            source,
+            start.body_start,
+            start.hash_count,
+            interpolation_depth,
+        )
     }
 }
 
@@ -2418,6 +2497,74 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         "template_declaration" => "template",
         other => other,
     }
+}
+
+/// Extract entity from a Clojure-style list form (list_lit where first sym_lit is a def keyword).
+/// Returns (name, entity_type) or None if the list head is not in config.call_entity_identifiers.
+fn extract_list_form_entity<'a>(
+    node: Node<'a>,
+    config: &LanguageConfig,
+    source: &[u8],
+) -> Option<(String, &'static str)> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+
+    let head = children.next()?;
+    if head.kind() != "sym_lit" {
+        return None;
+    }
+    let keyword = node_text(head, source);
+    if !config.call_entity_identifiers.contains(&keyword) {
+        return None;
+    }
+    let entity_type = match keyword {
+        "defn" | "defn-" => "function",
+        "defmacro" => "macro",
+        "defmulti" => "multimethod",
+        "defmethod" => "method",
+        "defprotocol" => "protocol",
+        "defrecord" => "record",
+        "deftype" => "type",
+        "definterface" => "interface",
+        "defstruct" => "struct",
+        "def" | "defonce" => "var",
+        // Keyword is in call_entity_identifiers but has no entity-type mapping here.
+        // This is a config/code mismatch — add an arm above when adding a new keyword.
+        _ => {
+            debug_assert!(false, "unhandled call_entity_identifier: {keyword}");
+            return None;
+        }
+    };
+
+    let name_node = children.next()?;
+    // In this grammar, `^:private my-fn` is a single sym_lit whose `name` field child
+    // (sym_name) holds only the bare symbol. Use that to strip metadata annotations.
+    let base_name = clojure_sym_name(name_node, source).to_string();
+
+    // defmethod: include the dispatch value so (defmethod area :circle ...) and
+    // (defmethod area :rectangle ...) get distinct stable names instead of colliding.
+    let name = if keyword == "defmethod" {
+        if let Some(dispatch_node) = children.next() {
+            format!("{}/{}", base_name, node_text(dispatch_node, source))
+        } else {
+            base_name
+        }
+    } else {
+        base_name
+    };
+
+    Some((name, entity_type))
+}
+
+/// Extract the bare symbol text from a Clojure `sym_lit`, ignoring any metadata prefix.
+/// `^:private my-fn` is a sym_lit whose `name` field is a sym_name holding "my-fn".
+fn clojure_sym_name<'a>(node: Node<'a>, source: &'a [u8]) -> &'a str {
+    if node.kind() == "sym_lit" {
+        if let Some(name_child) = node.child_by_field_name("name") {
+            return node_text(name_child, source);
+        }
+    }
+    node_text(node, source)
 }
 
 /// Extract entity info from a call node (Elixir macros like def, defmodule, etc.)

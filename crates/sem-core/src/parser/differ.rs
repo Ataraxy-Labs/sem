@@ -1320,4 +1320,53 @@ mod tests {
         assert_eq!(changes[2].change_type, ChangeType::Added);
         assert_eq!(changes[2].after_content.as_deref(), Some("use new2;"));
     }
+
+    /// Regression: a commented-out key inside an EDN map must not displace the
+    /// key/value pairing for the entries that follow the comment.
+    ///
+    /// In tree-sitter-clojure-orchard, `comment` nodes are *named* children of
+    /// `map_lit`. The old code called `named_children()` without filtering, so a
+    /// `;` comment consumed one slot and shifted every subsequent key/value pair
+    /// by one position. Uncommenting `:published` then produced a spurious rename
+    /// (`:spinning-genai → :slug`) for a completely unchanged entry.
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn edn_comment_inside_map_does_not_displace_key_value_pairing() {
+        let before = r#"{:body [:div]
+ ; :published #inst "2025-12-14T14:05:00Z"
+ :slug :my-post
+ :title "Hello"}"#;
+
+        let after = r#"{:body [:div]
+ :published #inst "2025-12-14T14:05:00Z"
+ :slug :my-post
+ :title "Hello"}"#;
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("post.edn", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        let non_orphan: Vec<_> = result
+            .changes
+            .iter()
+            .filter(|c| c.entity_type != "orphan")
+            .collect();
+
+        // Only :published should be added; :slug and :title are unchanged
+        assert_eq!(
+            non_orphan.len(),
+            1,
+            "expected only :published to be added, got: {:?}",
+            non_orphan
+                .iter()
+                .map(|c| (&c.entity_name, &c.change_type))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(non_orphan[0].entity_name, ":published");
+        assert_eq!(non_orphan[0].change_type, ChangeType::Added);
+    }
 }

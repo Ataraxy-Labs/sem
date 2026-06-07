@@ -402,8 +402,13 @@ impl IndexedWordRef {
 }
 
 impl FileReferenceIndex {
-    fn from_content(content: &str) -> Self {
+    #[cfg(test)]
+    fn from_content(content: &str, extra_ident_chars: &'static [char]) -> Self {
         let stripped = strip_comments_and_strings(content);
+        Self::from_stripped(&stripped, extra_ident_chars)
+    }
+
+    fn from_stripped(stripped: &str, extra_ident_chars: &'static [char]) -> Self {
         let mut index = Self {
             tokens: Vec::new(),
             token_ids: HashMap::new(),
@@ -411,7 +416,7 @@ impl FileReferenceIndex {
         };
         let lines = stripped
             .lines()
-            .map(|line| LineReferenceIndex::from_stripped_line(line, &mut index))
+            .map(|line| LineReferenceIndex::from_stripped_line(line, &mut index, extra_ident_chars))
             .collect();
         index.lines = lines;
         index
@@ -500,7 +505,11 @@ impl FileReferenceIndex {
 }
 
 impl LineReferenceIndex {
-    fn from_stripped_line(line: &str, file_index: &mut FileReferenceIndex) -> Option<Self> {
+    fn from_stripped_line(
+        line: &str,
+        file_index: &mut FileReferenceIndex,
+        extra_ident_chars: &'static [char],
+    ) -> Option<Self> {
         let mut words = Vec::new();
         let mut seen_words: HashSet<u32> = HashSet::new();
         let import_like = {
@@ -511,7 +520,7 @@ impl LineReferenceIndex {
                 || trimmed.starts_with("require(")
         };
 
-        for (word, end_byte) in identifier_tokens(line) {
+        for (word, end_byte) in identifier_tokens(line, extra_ident_chars) {
             if !is_reference_word(word) {
                 continue;
             }
@@ -546,13 +555,16 @@ impl LineReferenceIndex {
     }
 }
 
-fn identifier_tokens(line: &str) -> impl Iterator<Item = (&str, usize)> {
+fn identifier_tokens<'a>(
+    line: &'a str,
+    extra_ident_chars: &'static [char],
+) -> impl Iterator<Item = (&'a str, usize)> {
     let mut start = None;
     let mut chars = line.char_indices();
 
     std::iter::from_fn(move || {
         for (idx, ch) in chars.by_ref() {
-            if ch.is_alphanumeric() || ch == '_' {
+            if ch.is_alphanumeric() || ch == '_' || extra_ident_chars.contains(&ch) {
                 if start.is_none() {
                     start = Some(idx);
                 }
@@ -577,7 +589,23 @@ fn is_reference_word(word: &str) -> bool {
     if word.starts_with(|c: char| c.is_lowercase()) && word.len() < 3 {
         return false;
     }
-    if !word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+    // Reject purely symbolic tokens (e.g. `*` used as arithmetic in Clojure).
+    // A valid name always contains at least one alphanumeric char or `-`/`_`.
+    // Note: extra_ident_chars like `*`, `?`, `!`, `=` are intentionally NOT added
+    // to this allowlist because bare `?` or `*` alone are never namespace references.
+    // Mixed tokens such as `my-fn?` still pass: their alphanumeric chars make
+    // `all()` return false, so we do not reject them.
+    if word
+        .chars()
+        .all(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return false;
+    }
+    // Tokens starting with '-' or '*' only appear here for Clojure files because
+    // `extra_ident_chars_for_file` controls tokenization upstream — only Clojure
+    // has these in extra_ident_chars. '?', '!', '=' only appear as suffixes in
+    // Clojure (empty?, reset!, not=) so the start-character check below suffices.
+    if !word.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '-' || c == '*') {
         return false;
     }
     if is_common_local_name(word) {
@@ -730,9 +758,13 @@ fn resolve_references_with_file_indexes<'a>(
 
 fn build_file_reference_index(root: &Path, file_path: &str) -> Option<FileReferenceIndex> {
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-    crate::parser::plugins::code::languages::get_language_config(ext)?;
+    let config = crate::parser::plugins::code::languages::get_language_config(ext)?;
     let content = std::fs::read_to_string(root.join(file_path)).ok()?;
-    Some(FileReferenceIndex::from_content(&content))
+    let stripped = strip_for_language(config.strip_strategy, &content);
+    Some(FileReferenceIndex::from_stripped(
+        &stripped,
+        extra_ident_chars_for_file(file_path),
+    ))
 }
 
 fn resolve_scopes_in_file_chunks(
@@ -814,7 +846,10 @@ fn resolve_entity_references(
             reference_index
         };
     let fallback_stripped = if reference_index.is_none() {
-        Some(strip_comments_and_strings(&entity.content))
+        Some(strip_for_language(
+            language_config.strip_strategy,
+            &entity.content,
+        ))
     } else {
         None
     };
@@ -909,6 +944,7 @@ fn resolve_entity_references(
                 &entity.content,
                 &entity.name,
                 stripped,
+                extra_ident_chars_for_file(&entity.file_path),
                 |local_line, local_start_byte, local_end_byte| {
                     entity_owns_content_span(
                         entity.id.as_str(),
@@ -975,6 +1011,38 @@ fn resolve_entity_references(
                     continue;
                 }
                 entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
+            }
+        }
+    }
+
+    // Resolve namespace-qualified calls (alias/name) for languages that use this pattern.
+    // The regular tokenizer splits `alias/name` at the slash, so bare `name` tokens don't
+    // match cross-file entities via the symbol table. We scan the stripped content for
+    // `alias/name` patterns and resolve them via the import table (populated by
+    // resolve_clojure_as during import table building).
+    if language_config.has_slash_qualified_refs {
+        // Always restrip via the language's own strategy: fallback_stripped may have been
+        // computed with a different strategy when reference_index was non-None above.
+        let qualified_ref_stripped =
+            strip_for_language(language_config.strip_strategy, &entity.content);
+        for cap in CLOJURE_QUALIFIED_REF_RE.captures_iter(&qualified_ref_stripped) {
+            let qualified = cap.get(1).unwrap().as_str();
+            let import_key = (entity.file_path.clone(), qualified.to_string());
+            if let Some(import_target_id) = context.import_table.get(&import_key) {
+                if import_target_id != &entity.id
+                    && !context
+                        .parent_child_pairs
+                        .contains(&(entity.id.as_str(), import_target_id.as_str()))
+                    && !context
+                        .parent_child_pairs
+                        .contains(&(import_target_id.as_str(), entity.id.as_str()))
+                {
+                    entity_edges.push((
+                        entity.id.clone(),
+                        import_target_id.clone(),
+                        RefType::Calls,
+                    ));
+                }
             }
         }
     }
@@ -1867,12 +1935,13 @@ impl EntityGraph {
                     continue;
                 }
 
-                if !text_mentions_any_name(&entity.content, &affected_target_names) {
+                let extra = extra_ident_chars_for_file(&entity.file_path);
+                if !text_mentions_any_name(&entity.content, &affected_target_names, extra) {
                     continue;
                 }
 
-                let stripped = strip_comments_and_strings(&entity.content);
-                if text_mentions_any_name(&stripped, &affected_target_names) {
+                let stripped = strip_for_language(strip_strategy_for_file(&entity.file_path), &entity.content);
+                if text_mentions_any_name(&stripped, &affected_target_names, extra) {
                     affected_clean_ids.insert(entity.id.clone());
                     affected_clean_file_paths.insert(entity.file_path.as_str());
                 }
@@ -1923,15 +1992,16 @@ impl EntityGraph {
                 .iter()
                 .filter(|entity| !stale_set.contains(entity.file_path.as_str()))
             {
+                let extra = extra_ident_chars_for_file(&entity.file_path);
                 if !new_stale_names
                     .iter()
-                    .any(|name| content_contains_identifier(&entity.content, name))
+                    .any(|name| content_contains_identifier(&entity.content, name, extra))
                 {
                     continue;
                 }
 
-                let stripped = strip_comments_and_strings(&entity.content);
-                if text_mentions_any_name(&stripped, &new_stale_names) {
+                let stripped = strip_for_language(strip_strategy_for_file(&entity.file_path), &entity.content);
+                if text_mentions_any_name(&stripped, &new_stale_names, extra) {
                     clean_entities_mentioning_new_stale_names.insert(entity.id.as_str());
                     clean_import_candidate_files.insert(entity.file_path.as_str());
                 }
@@ -1982,19 +2052,26 @@ impl EntityGraph {
 
                 let import_tokens = clean_file_import_tokens.get(entity.file_path.as_str());
                 let mentions_new_stale_name = entity_mentions_new_stale_name;
+                let extra = extra_ident_chars_for_file(&entity.file_path);
+                let strip_strategy = strip_strategy_for_file(&entity.file_path);
                 let mentions_new_stale_import_token = import_tokens.map_or(false, |tokens| {
                     tokens
                         .iter()
-                        .any(|token| content_contains_identifier(&entity.content, token))
+                        .any(|token| content_contains_identifier(&entity.content, token, extra))
                 });
                 let imported_new_stale_ref = new_stale_import_refs_by_file
                     .get(entity.file_path.as_str())
                     .map_or(false, |local_names| {
                         local_names.iter().any(|local_name| {
-                            content_contains_identifier(&entity.content, local_name)
+                            content_contains_identifier(&entity.content, local_name, extra)
                         })
                     });
-                let refs = extract_references_from_content(&entity.content, &entity.name);
+                let refs = extract_references_from_content(
+                    &entity.content,
+                    &entity.name,
+                    extra,
+                    strip_strategy,
+                );
                 if mentions_new_stale_name
                     || mentions_new_stale_import_token
                     || imported_new_stale_ref
@@ -2058,9 +2135,10 @@ impl EntityGraph {
                 let Some(tokens) = clean_js_ts_import_tokens.get(entity.file_path.as_str()) else {
                     continue;
                 };
+                let extra = extra_ident_chars_for_file(&entity.file_path);
                 if tokens
                     .iter()
-                    .any(|token| content_contains_identifier(&entity.content, token))
+                    .any(|token| content_contains_identifier(&entity.content, token, extra))
                 {
                     affected_clean_ids.insert(entity.id.clone());
                     affected_clean_file_paths.insert(entity.file_path.as_str());
@@ -2773,6 +2851,7 @@ impl EntityGraph {
             &entity.content,
             &entity.name,
             &stripped,
+            extra_ident_chars_for_file(&entity.file_path),
             |local_line, local_start_byte, local_end_byte| {
                 entity_owns_content_span(
                     entity.id.as_str(),
@@ -3289,6 +3368,8 @@ fn build_import_table_with_default_export_paths(
     // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
     // We no longer need a go_pkg_index here since Go files are skipped below.
 
+    let clojure_ns_index = build_clojure_ns_index(entity_map);
+
     // Process files in parallel, each producing local import entries
     let per_file_imports: Vec<Vec<((String, String), String)>> = maybe_par_iter!(file_paths)
         .filter_map(|file_path| {
@@ -3621,6 +3702,52 @@ fn build_import_table_with_default_export_paths(
             // Go imports are handled by the scope resolver (avoids O(n²) import table explosion).
             // Skip Go files here entirely.
 
+            // Parse (:require [...]) forms for languages that use slash-qualified refs.
+            // Namespace `foo.bar-baz` maps to file `foo/bar_baz.clj` (dots→slashes, hyphens→underscores).
+            let file_ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+            if let Some(file_config) =
+                crate::parser::plugins::code::languages::get_language_config(file_ext)
+            {
+                if file_config.has_slash_qualified_refs {
+                    // Strip using the language's own strategy so language-specific syntax (e.g.
+                    // Clojure's `#` for reader macros/gensyms) is preserved correctly.
+                    let clojure_stripped = strip_for_language(file_config.strip_strategy, content);
+                    for cap in CLOJURE_REFER_RE.captures_iter(&clojure_stripped) {
+                        let ns_name = cap.get(1).unwrap().as_str();
+                        let symbols_str = cap.get(2).unwrap().as_str();
+                        for symbol in symbols_str.split_whitespace() {
+                            let symbol = symbol.trim_matches(|c: char| c == ',' || c == '(' || c == ')');
+                            if symbol.is_empty() {
+                                continue;
+                            }
+                            resolve_clojure_require(
+                                file_path,
+                                ns_name,
+                                symbol,
+                                symbol_table,
+                                entity_map,
+                                &mut local_imports,
+                            );
+                        }
+                    }
+                    // `:as alias` forms: add qualified `alias/name` entries for all entities in the
+                    // namespace. The tokenizer splits `alias/name` at the slash, so reference
+                    // resolution looks up the full qualified token via a separate scan (see
+                    // resolve_entity_references). We store "alias/name" as the import key.
+                    for cap in CLOJURE_AS_RE.captures_iter(&clojure_stripped) {
+                        let ns_name = cap.get(1).unwrap().as_str();
+                        let alias = cap.get(2).unwrap().as_str();
+                        resolve_clojure_as(
+                            file_path,
+                            ns_name,
+                            alias,
+                            &clojure_ns_index,
+                            &mut local_imports,
+                        );
+                    }
+                }
+            }
+
             Some(local_imports)
         })
         .collect();
@@ -3661,6 +3788,112 @@ fn resolve_rust_import(
             );
         }
     }
+}
+
+/// Pre-built index for Clojure namespace resolution.
+/// Maps file-path-without-extension → Vec<(entity_name, entity_id)>.
+/// Built once before the import-table loop to avoid O(total-entities) scans per :as alias.
+type ClojureNsIndex = HashMap<String, Vec<(String, String)>>;
+
+fn build_clojure_ns_index(entity_map: &HashMap<String, EntityInfo>) -> ClojureNsIndex {
+    let mut index: ClojureNsIndex = HashMap::new();
+    for (entity_id, entity_info) in entity_map {
+        let fp = &entity_info.file_path;
+        if !fp.ends_with(".clj") && !fp.ends_with(".cljs") && !fp.ends_with(".cljc") {
+            continue;
+        }
+        let path_no_ext = fp.rsplit_once('.').map(|(p, _)| p).unwrap_or(fp.as_str());
+        index
+            .entry(path_no_ext.to_string())
+            .or_default()
+            .push((entity_info.name.clone(), entity_id.clone()));
+    }
+    index
+}
+
+/// Resolve one symbol from a Clojure (:require [ns :refer [symbol]]) form.
+/// Converts namespace dots to slashes and hyphens to underscores to derive the file path,
+/// then matches against entity_map to find the target entity.
+fn resolve_clojure_require(
+    file_path: &str,
+    ns_name: &str,
+    symbol: &str,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    local_imports: &mut Vec<((String, String), String)>,
+) {
+    if ns_name.is_empty() {
+        return;
+    }
+    let Some(target_ids) = symbol_table.get(symbol) else {
+        return;
+    };
+    // www.util → www/util; my-app.core → my_app/core
+    let ns_path = ns_name.replace('.', "/").replace('-', "_");
+    // Pre-build the three suffixes once to avoid allocating inside the find loop.
+    let suffix_clj = format!("{ns_path}.clj");
+    let suffix_cljs = format!("{ns_path}.cljs");
+    let suffix_cljc = format!("{ns_path}.cljc");
+    // Match at a path-component boundary: exact or preceded by '/'.
+    // This prevents "notmyapp/core.clj" from matching namespace "myapp.core".
+    let ns_matches = |fp: &str, suffix: &str| fp == suffix || fp.ends_with(&format!("/{suffix}"));
+    let target = target_ids.iter().find(|id| {
+        entity_map.get(*id).map_or(false, |e| {
+            let fp = &e.file_path;
+            ns_matches(fp, &suffix_clj)
+                || ns_matches(fp, &suffix_cljs)
+                || ns_matches(fp, &suffix_cljc)
+        })
+    });
+    if let Some(target_id) = target {
+        local_imports.push((
+            (file_path.to_string(), symbol.to_string()),
+            target_id.clone(),
+        ));
+    }
+}
+
+/// Resolve all entities from a Clojure namespace aliased with `:as alias`.
+/// Adds `(importing_file, "alias/entity_name")` → entity_id entries so that
+/// namespace-qualified calls like `(alias/fn-name ...)` are resolved via the
+/// import table when `resolve_entity_references` scans for `alias/name` patterns.
+fn resolve_clojure_as(
+    file_path: &str,
+    ns_name: &str,
+    alias: &str,
+    ns_index: &ClojureNsIndex,
+    local_imports: &mut Vec<((String, String), String)>,
+) {
+    let ns_path = ns_name.replace('.', "/").replace('-', "_");
+    let ns_path_suffix = format!("/{}", ns_path);
+    for (path_no_ext, entities) in ns_index {
+        if path_no_ext == &ns_path || path_no_ext.ends_with(&ns_path_suffix) {
+            for (entity_name, entity_id) in entities {
+                local_imports.push((
+                    (file_path.to_string(), format!("{}/{}", alias, entity_name)),
+                    entity_id.clone(),
+                ));
+            }
+        }
+    }
+}
+
+/// Strip Clojure semicolon line comments from already-string-blanked content.
+/// `strip_comments_and_strings` blanks string literals but does not remove `;` line comments,
+/// so any remaining `;` after that call is a real comment start.
+fn strip_clojure_line_comments(s: &str) -> String {
+    // `.lines()` in Rust drops the final empty element produced by a trailing '\n',
+    // so `join("\n")` loses exactly one trailing newline — the push restores it.
+    // No double-newline: "a\nb\n" → lines=["a","b"] → join="a\nb" → push → "a\nb\n".
+    let mut result = s
+        .lines()
+        .map(|line| line.find(';').map_or(line, |pos| &line[..pos]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if s.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 /// Strip common file extensions from a filename.
@@ -3808,6 +4041,61 @@ fn strip_comments_and_strings(content: &str) -> String {
     String::from_utf8(result).expect("stripped source preserves UTF-8 boundaries")
 }
 
+/// Strip double-quoted string literals from Clojure content, preserving everything else.
+///
+/// Unlike `strip_comments_and_strings`, this does NOT treat `#` as a line comment.
+/// In Clojure, `#` is used for gensyms (`result#`), reader dispatch (`#?`, `#{}`), and
+/// other reader macros — not for comments. Treating it as a comment would blank out
+/// everything after e.g. `result#` on a line, including calls like
+/// `(rewrite/add-expected-value! ...)` that follow in the same binding form.
+///
+/// Semicolon line comments must be handled separately via `strip_clojure_line_comments`.
+fn strip_clojure_content(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut result = vec![b' '; len];
+    let mut i = 0;
+
+    while i < len {
+        // Double-quoted strings: blank them (preserving newlines for line alignment)
+        if bytes[i] == b'"' {
+            let span_start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(len);
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            blank_span_preserving_newlines(&mut result, bytes, span_start, i);
+            continue;
+        }
+        // Regular code: copy through
+        result[i] = bytes[i];
+        i += 1;
+    }
+
+    String::from_utf8(result).expect("stripped source preserves UTF-8 boundaries")
+}
+
+/// Dispatch to the appropriate content stripper for the given language strategy.
+/// Add a new arm here when adding a `StripStrategy` variant for a new language.
+fn strip_for_language(
+    strategy: crate::parser::plugins::code::languages::StripStrategy,
+    content: &str,
+) -> String {
+    use crate::parser::plugins::code::languages::StripStrategy;
+    match strategy {
+        StripStrategy::Generic => strip_comments_and_strings(content),
+        StripStrategy::Clojure => strip_clojure_line_comments(&strip_clojure_content(content)),
+    }
+}
+
 /// Extract dot-chains (receiver.member) from content for precise resolution.
 /// Returns unique (receiver, member) pairs found in the content.
 fn extract_dot_chains<'a>(content: &'a str) -> Vec<(&'a str, &'a str)> {
@@ -3893,6 +4181,24 @@ static PY_LOCAL_ASSIGN_RE: LazyLock<Regex> =
 static PY_FOR_BINDING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*for\s+([A-Za-z_]\w*)\s+in\b").unwrap());
 
+// Clojure `:require [ns :refer [sym1 sym2]]` — matches inside any require form.
+// `[^\[\]]*` prevents crossing both `[` and `]` boundaries, so the regex cannot
+// span from one require form's namespace into a later form's :refer list.
+static CLOJURE_REFER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([a-zA-Z][a-zA-Z0-9._-]*)\b[^\[\]]*:refer\s+\[([^\]]+)\]").unwrap());
+
+// Clojure `:require [ns :as alias]` — matches inside any require form.
+// `[^\]]*` prevents crossing bracket boundaries.
+static CLOJURE_AS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[([a-zA-Z][a-zA-Z0-9._-]*)\b[^\]]*:as\s+([a-zA-Z][a-zA-Z0-9_-]*)").unwrap()
+});
+
+// Clojure `alias/name` qualified references, e.g. `u/vectorize-if-not-sequential`.
+// Alias and name may contain hyphens, `?` (predicates), or `!` (bang fns).
+static CLOJURE_QUALIFIED_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b([a-zA-Z][a-zA-Z0-9_?!=*-]*/[a-zA-Z][a-zA-Z0-9_?!=*-]*)").unwrap()
+});
+
 fn collect_local_binding_captures<F>(
     line: &str,
     line_no: usize,
@@ -3971,23 +4277,73 @@ fn maybe_add_local_binding_name<F>(
     }
 }
 
+/// Returns the extra identifier characters for a given file path.
+/// Clojure uses '-' as a word character; all other languages use none.
+fn extra_ident_chars_for_file(file_path: &str) -> &'static [char] {
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    crate::parser::plugins::code::languages::get_language_config(ext)
+        .map_or(&[], |c| c.extra_ident_chars)
+}
+
+fn strip_strategy_for_file(
+    file_path: &str,
+) -> crate::parser::plugins::code::languages::StripStrategy {
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    crate::parser::plugins::code::languages::get_language_config(ext).map_or(
+        crate::parser::plugins::code::languages::StripStrategy::Generic,
+        |c| c.strip_strategy,
+    )
+}
+
 /// Extract identifier references from entity content using simple token analysis.
 /// Strips comments and strings first to avoid false positives from docstrings.
 /// Returns borrowed slices from the stripped content.
-fn extract_references_from_content<'a>(content: &'a str, own_name: &str) -> Vec<&'a str> {
-    let stripped = strip_comments_and_strings(content);
-    extract_references_with_stripped(content, own_name, &stripped)
+fn extract_references_from_content<'a>(
+    content: &'a str,
+    own_name: &str,
+    extra_ident_chars: &'static [char],
+    strip_strategy: crate::parser::plugins::code::languages::StripStrategy,
+) -> Vec<&'a str> {
+    let stripped = strip_for_language(strip_strategy, content);
+    extract_references_with_stripped(content, own_name, &stripped, extra_ident_chars)
 }
 
-fn text_mentions_any_name(text: &str, names: &HashSet<&str>) -> bool {
-    text.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|word| names.contains(word))
+/// Yields each contiguous run of identifier characters (alphanumeric, `_`, or `extra`) as a
+/// `&str` slice. Used by `text_mentions_any_name` and `content_contains_identifier` to avoid
+/// duplicating the same char-walk state machine.
+fn token_iter<'a>(text: &'a str, extra: &'static [char]) -> impl Iterator<Item = &'a str> + 'a {
+    let mut token_start: Option<usize> = None;
+    let mut char_iter = text.char_indices();
+    std::iter::from_fn(move || loop {
+        match char_iter.next() {
+            None => {
+                return token_start.take().map(|s| &text[s..]);
+            }
+            Some((idx, ch)) => {
+                if ch.is_alphanumeric() || ch == '_' || extra.contains(&ch) {
+                    token_start.get_or_insert(idx);
+                } else if let Some(s) = token_start.take() {
+                    return Some(&text[s..idx]);
+                }
+            }
+        }
+    })
 }
 
-fn content_contains_identifier(content: &str, identifier: &str) -> bool {
-    content
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|word| word == identifier)
+fn text_mentions_any_name(
+    text: &str,
+    names: &HashSet<&str>,
+    extra_ident_chars: &'static [char],
+) -> bool {
+    token_iter(text, extra_ident_chars).any(|t| names.contains(t))
+}
+
+fn content_contains_identifier(
+    content: &str,
+    identifier: &str,
+    extra_ident_chars: &'static [char],
+) -> bool {
+    token_iter(content, extra_ident_chars).any(|t| t == identifier)
 }
 
 const IMPORT_SCAN_PREFIX_LINES: usize = 80;
@@ -4185,14 +4541,22 @@ fn extract_references_with_stripped<'a>(
     content: &'a str,
     own_name: &str,
     stripped: &str,
+    extra_ident_chars: &'static [char],
 ) -> Vec<&'a str> {
-    extract_references_with_stripped_filtered(content, own_name, stripped, |_, _, _| true)
+    extract_references_with_stripped_filtered(
+        content,
+        own_name,
+        stripped,
+        extra_ident_chars,
+        |_, _, _| true,
+    )
 }
 
 fn extract_references_with_stripped_filtered<'a, F>(
     content: &'a str,
     own_name: &str,
     stripped: &str,
+    extra_ident_chars: &'static [char],
     mut include_token: F,
 ) -> Vec<&'a str>
 where
@@ -4204,7 +4568,7 @@ where
     let mut line = 1;
 
     for (idx, ch) in content.char_indices() {
-        if ch.is_alphanumeric() || ch == '_' {
+        if ch.is_alphanumeric() || ch == '_' || extra_ident_chars.contains(&ch) {
             if token_start.is_none() {
                 token_start = Some(idx);
             }
@@ -4271,7 +4635,18 @@ fn maybe_push_reference_token<'a, F>(
     if word.starts_with(|c: char| c.is_lowercase()) && word.len() < 3 {
         return;
     }
-    if !word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+    // Reject purely symbolic tokens (e.g. `*` used as arithmetic in Clojure).
+    if word
+        .chars()
+        .all(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return;
+    }
+    // Tokens starting with '-' or '*' only appear here for Clojure files because
+    // `extra_ident_chars_for_file` controls tokenization upstream — only Clojure
+    // has these in extra_ident_chars. '?', '!', '=' only appear as suffixes in
+    // Clojure (empty?, reset!, not=) so the start-character check below suffices.
+    if !word.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '-' || c == '*') {
         return;
     }
     // Skip common local variable names that create false graph edges
@@ -4582,6 +4957,7 @@ fn is_keyword(word: &str) -> bool {
 mod tests {
     use super::*;
     use crate::git::types::{FileChange, FileStatus};
+    use crate::parser::plugins::code::languages::StripStrategy;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -4683,7 +5059,7 @@ class Runner {
     validate(input) { return input; }
 }
 ";
-        let index = FileReferenceIndex::from_content(content);
+        let index = FileReferenceIndex::from_content(content, &[]);
         let refs = index.refs_with_types_in_ranges(&[(1, 5)], "run");
         assert!(refs.iter().any(|(word, _)| *word == "Foo"));
         assert!(refs.iter().any(|(word, _)| *word == "Runner"));
@@ -4760,7 +5136,7 @@ function outer() {
   finish();
 }
 ";
-        let index = FileReferenceIndex::from_content(content);
+        let index = FileReferenceIndex::from_content(content, &[]);
         let refs = index.refs_with_types_in_ranges(&ranges, "outer");
 
         assert!(refs.iter().any(|(word, _)| *word == "setup"));
@@ -5906,7 +6282,8 @@ func draw(widget: Widget) {
     #[test]
     fn test_extract_references() {
         let content = "function processData(input) {\n  const result = validateInput(input);\n  return transform(result);\n}";
-        let refs = extract_references_from_content(content, "processData");
+        let refs =
+            extract_references_from_content(content, "processData", &[], StripStrategy::Generic);
         assert!(refs.contains(&"validateInput"));
         assert!(refs.contains(&"transform"));
         assert!(!refs.contains(&"processData")); // self excluded
@@ -6073,7 +6450,7 @@ func draw(widget: Widget) {
     #[test]
     fn test_extract_references_skips_keywords() {
         let content = "function foo() { if (true) { return false; } }";
-        let refs = extract_references_from_content(content, "foo");
+        let refs = extract_references_from_content(content, "foo", &[], StripStrategy::Generic);
         assert!(!refs.contains(&"if"));
         assert!(!refs.contains(&"true"));
         assert!(!refs.contains(&"return"));
@@ -7898,6 +8275,368 @@ export function caller() {
         assert!(
             deps.iter().any(|d| d.name == "helper"),
             "caller should still resolve helper via bag-of-words. Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-clojure")]
+    #[test]
+    fn test_clojure_namespace_alias_resolution() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        // util.cljs defines a function
+        write_file(
+            root,
+            "src/myapp/util.cljs",
+            r#"(ns myapp.util)
+
+(defn vectorize-if-not-sequential [x]
+  (if (sequential? x) x [x]))
+"#,
+        );
+
+        // elements.cljs requires util with :as u and calls u/vectorize-if-not-sequential
+        write_file(
+            root,
+            "src/myapp/elements.cljs",
+            r#"(ns myapp.elements
+  (:require [myapp.util :as u]))
+
+(defn render-items [items]
+  (u/vectorize-if-not-sequential items))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/util.cljs".to_string(),
+            "src/myapp/elements.cljs".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let render_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("render-items"))
+            .expect("render-items entity should exist");
+
+        let deps = graph.get_dependencies(render_id);
+        assert!(
+            deps.iter().any(|d| d.name == "vectorize-if-not-sequential"),
+            "render-items should depend on vectorize-if-not-sequential via :as alias. Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+
+        let util_fn_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("vectorize-if-not-sequential"))
+            .expect("vectorize-if-not-sequential entity should exist");
+
+        let dependents = graph.get_dependents(util_fn_id);
+        assert!(
+            dependents.iter().any(|d| d.name == "render-items"),
+            "vectorize-if-not-sequential should be depended on by render-items. Dependents: {:?}",
+            dependents.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-clojure")]
+    #[test]
+    fn test_clojure_refer_resolution() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "src/myapp/strings.clj",
+            r#"(ns myapp.strings)
+
+(defn capitalize-first [s]
+  (str (clojure.string/upper-case (subs s 0 1)) (subs s 1)))
+"#,
+        );
+
+        write_file(
+            root,
+            "src/myapp/greeting.clj",
+            r#"(ns myapp.greeting
+  (:require [myapp.strings :refer [capitalize-first]]))
+
+(defn greet [name]
+  (str "Hello, " (capitalize-first name) "!"))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/strings.clj".to_string(),
+            "src/myapp/greeting.clj".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let greet_id = graph
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "greet")
+            .map(|(id, _)| id)
+            .expect("greet entity should exist");
+
+        let deps = graph.get_dependencies(greet_id);
+        assert!(
+            deps.iter().any(|d| d.name == "capitalize-first"),
+            "greet should depend on capitalize-first via :refer. Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-clojure")]
+    #[test]
+    fn test_clojure_kebab_reference_tracking() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "src/myapp/math.clj",
+            r#"(ns myapp.math)
+
+(defn square-root-of [n]
+  (Math/sqrt n))
+"#,
+        );
+
+        write_file(
+            root,
+            "src/myapp/stats.clj",
+            r#"(ns myapp.stats
+  (:require [myapp.math :refer [square-root-of]]))
+
+(defn std-deviation [xs]
+  (square-root-of (/ (reduce + xs) (count xs))))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/math.clj".to_string(),
+            "src/myapp/stats.clj".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let std_dev_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("std-deviation"))
+            .expect("std-deviation entity should exist");
+
+        let deps = graph.get_dependencies(std_dev_id);
+        assert!(
+            deps.iter().any(|d| d.name == "square-root-of"),
+            "std-deviation should depend on square-root-of (kebab name via :refer). Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "lang-clojure")]
+    #[test]
+    fn test_clojure_arithmetic_star_no_false_edge() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        // math.clj defines a function whose body uses (*) for multiplication.
+        // It does NOT import anything from another file.
+        write_file(
+            root,
+            "src/myapp/math.clj",
+            r#"(ns myapp.math)
+
+(defn hypotenuse [a b]
+  (Math/sqrt (+ (* a a) (* b b))))
+"#,
+        );
+
+        // other.clj defines a function named * — this should NOT become a dependency
+        // of hypotenuse because myapp.math never requires myapp.other.
+        write_file(
+            root,
+            "src/myapp/other.clj",
+            r#"(ns myapp.other)
+
+(defn * [x y] (* x y))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/math.clj".to_string(),
+            "src/myapp/other.clj".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let hyp_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("hypotenuse"))
+            .expect("hypotenuse entity should exist");
+
+        let deps = graph.get_dependencies(hyp_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "*"),
+            "hypotenuse should not have a false '*' dependency from arithmetic use. Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_gensym_does_not_blank_qualified_call() {
+        // Regression: `strip_comments_and_strings` treated `#` as a Python/Ruby line
+        // comment, so `result# (rewrite/fn! ...)` had everything from `#` to EOL blanked.
+        // This prevented `CLOJURE_QUALIFIED_REF_RE` from finding `rewrite/fn!`.
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "src/myapp/rewrite.cljc",
+            r#"(ns myapp.rewrite)
+
+(defn add-expected-value! [path line value]
+  (str path line value))
+"#,
+        );
+
+        // The macro body contains `result#` (a gensym) followed by a qualified call
+        // `rewrite/add-expected-value!` on the same line — this is the pattern that
+        // was being incorrectly blanked.
+        write_file(
+            root,
+            "src/myapp/core.cljc",
+            r#"(ns myapp.core
+  (:require [myapp.rewrite :as rewrite]))
+
+(defmacro snap! [path line]
+  `(let [result# (rewrite/add-expected-value! ~path ~line :result)]
+     result#))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/rewrite.cljc".to_string(),
+            "src/myapp/core.cljc".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let snap_id = graph
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "snap!")
+            .map(|(id, _)| id.clone())
+            .expect("snap! macro entity should exist");
+
+        let deps = graph.get_dependencies(&snap_id);
+        assert!(
+            deps.iter().any(|d| d.name == "add-expected-value!"),
+            "snap! should depend on add-expected-value! via rewrite/add-expected-value! alias call. Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_reader_conditional_require_alias_resolved() {
+        // Regression: `strip_comments_and_strings` treated `#` as a comment, so
+        // `#?(:clj [still.rewrite :as rewrite] ...)` was blanked from `#` to EOL,
+        // preventing CLOJURE_AS_RE from finding the `:as rewrite` alias.
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "src/myapp/backend.clj",
+            r#"(ns myapp.backend)
+
+(defn do-work! [x] x)
+"#,
+        );
+
+        write_file(
+            root,
+            "src/myapp/shared.cljc",
+            r#"(ns myapp.shared
+  (:require #?(:clj [myapp.backend :as backend])))
+
+(defn entry-point []
+  (backend/do-work! 42))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/backend.clj".to_string(),
+            "src/myapp/shared.cljc".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let entry_id = graph
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "entry-point")
+            .map(|(id, _)| id.clone())
+            .expect("entry-point entity should exist");
+
+        let deps = graph.get_dependencies(&entry_id);
+        assert!(
+            deps.iter().any(|d| d.name == "do-work!"),
+            "entry-point should depend on do-work! via reader-conditional alias. Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_multiline_require_refer_resolution() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "src/myapp/strings.clj",
+            r#"(ns myapp.strings)
+
+(defn capitalize-first [s]
+  (str (clojure.string/upper-case (subs s 0 1)) (subs s 1)))
+"#,
+        );
+
+        // :refer vector is on a separate line from the namespace vector opening bracket.
+        write_file(
+            root,
+            "src/myapp/greeting.clj",
+            r#"(ns myapp.greeting
+  (:require
+   [myapp.strings
+    :refer [capitalize-first]]))
+
+(defn greet [name]
+  (str "Hello, " (capitalize-first name) "!"))
+"#,
+        );
+
+        let file_paths = vec![
+            "src/myapp/strings.clj".to_string(),
+            "src/myapp/greeting.clj".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let greet_id = graph
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "greet")
+            .map(|(id, _)| id)
+            .expect("greet entity should exist");
+
+        let deps = graph.get_dependencies(greet_id);
+        assert!(
+            deps.iter().any(|d| d.name == "capitalize-first"),
+            "greet should depend on capitalize-first via multi-line :refer. Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
     }
