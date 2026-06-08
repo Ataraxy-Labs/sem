@@ -334,6 +334,11 @@ fn get_elm() -> Option<Language> {
     Some(tree_sitter_elm::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-d")]
+fn get_d() -> Option<Language> {
+    Some(tree_sitter_d::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -1066,6 +1071,63 @@ static ELM_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &["value_declaration"],
     get_language: get_elm,
+    scope_resolve: None,
+};
+
+#[cfg(feature = "lang-d")]
+static D_CONFIG: LanguageConfig = LanguageConfig {
+    id: "d",
+    extensions: &[".d", ".di"],
+    entity_node_types: &[
+        "module_declaration",
+        "function_declaration",
+        "class_declaration",
+        "struct_declaration",
+        "interface_declaration",
+        "union_declaration",
+        "enum_declaration",
+        "anonymous_enum_declaration",
+        "template_declaration",
+        "mixin_template_declaration",
+        "constructor",
+        "destructor",
+        "postblit",
+        "alias_declaration",
+        "unittest_declaration",
+        "variable_declaration",
+        "manifest_constant",
+        "auto_declaration",
+    ],
+    container_node_types: &["aggregate_body"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[
+        SuppressedNestedEntity {
+            parent_entity_node_type: "function_declaration",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "function_declaration",
+            child_entity_node_type: "auto_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "constructor",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "destructor",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "unittest_declaration",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "unittest_declaration",
+            child_entity_node_type: "auto_declaration",
+        },
+    ],
+    scope_boundary_types: &["function_body", "block_statement"],
+    get_language: get_d,
     scope_resolve: None,
 };
 
@@ -2353,6 +2415,8 @@ macro_rules! all_configs {
             &HASKELL_CONFIG,
             #[cfg(feature = "lang-elm")]
             &ELM_CONFIG,
+            #[cfg(feature = "lang-d")]
+            &D_CONFIG,
         ]
     }};
 }

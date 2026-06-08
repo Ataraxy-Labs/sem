@@ -1389,7 +1389,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sem-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "clap",
  "clap_complete_command",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "sem-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "git2",
  "rayon",
@@ -1425,6 +1425,7 @@ dependencies = [
  "tree-sitter-c",
  "tree-sitter-c-sharp",
  "tree-sitter-cpp",
+ "tree-sitter-d",
  "tree-sitter-dart",
  "tree-sitter-elixir",
  "tree-sitter-elm",
@@ -1454,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "sem-mcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "git2",
  "ignore",
@@ -1475,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "sem-plugin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "sem-core",
  "serde",
@@ -1928,6 +1929,16 @@ name = "tree-sitter-cpp"
 version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-d"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66c6fa0082e20747a92c5c863cadb7775fbe344f212837f03fc0f7187adf6fd1"
 dependencies = [
  "cc",
  "tree-sitter-language",
