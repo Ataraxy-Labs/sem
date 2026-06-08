@@ -472,6 +472,65 @@ struct ScopeLookupCache {
     enclosing_classes: HashMap<usize, Option<String>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionCacheKey<'a> {
+    Call {
+        scope_idx: usize,
+        from_entity_id: &'a str,
+        name: &'a str,
+        argument_labels: Option<&'a [Option<String>]>,
+        allow_cross_file_calls: bool,
+    },
+    MethodCall {
+        scope_idx: usize,
+        from_entity_id: &'a str,
+        receiver: &'a str,
+        method: &'a str,
+        argument_labels: Option<&'a [Option<String>]>,
+        allow_cross_file_calls: bool,
+        allow_implicit_instance_member_receiver: bool,
+    },
+}
+
+fn resolution_cache_key<'a>(
+    ast_ref: &'a AstRef,
+    scope_idx: usize,
+    from_entity_id: &'a str,
+    allow_cross_file_calls: bool,
+    allow_implicit_instance_member_receiver: bool,
+) -> Option<ResolutionCacheKey<'a>> {
+    match &ast_ref.kind {
+        AstRefKind::Call {
+            name,
+            argument_labels,
+        } => Some(ResolutionCacheKey::Call {
+            scope_idx,
+            from_entity_id,
+            name,
+            argument_labels: argument_labels.as_deref(),
+            allow_cross_file_calls,
+        }),
+        AstRefKind::ScopedCall { .. } => None,
+        AstRefKind::MethodCall {
+            receiver,
+            method,
+            argument_labels,
+        } => Some(ResolutionCacheKey::MethodCall {
+            scope_idx,
+            from_entity_id,
+            receiver: normalized_method_receiver(receiver),
+            method,
+            argument_labels: argument_labels.as_deref(),
+            allow_cross_file_calls,
+            allow_implicit_instance_member_receiver,
+        }),
+    }
+}
+
+fn normalized_method_receiver(receiver: &str) -> &str {
+    receiver.trim_start_matches('!').trim_start_matches('~')
+}
+
 pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
     matches!(
         parent.entity_type.as_str(),
@@ -1016,6 +1075,10 @@ fn resolve_with_scopes_full_inner(
             let descendant_ranges_by_entity =
                 build_descendant_ranges_by_entity(&file_entities, entity_map);
             let mut lookup_cache = ScopeLookupCache::default();
+            let mut last_resolution: Option<(
+                ResolutionCacheKey<'_>,
+                Option<(String, RefType, &'static str)>,
+            )> = None;
 
             for entity in &file_entities {
                 if emit_entity_ids
@@ -1101,24 +1164,61 @@ fn resolve_with_scopes_full_inner(
                         // Languages without per-symbol imports (e.g. Swift, Kotlin)
                         // allow cross-file resolution for lowercase function names.
                         let allow_cross_file = config.import_extractor.is_none();
-                        let resolution = resolve_ref(
+                        let cache_key = resolution_cache_key(
                             ast_ref,
                             scope_idx,
-                            &scopes,
-                            &symbol_table,
-                            &class_members,
-                            &owner_members,
-                            &local_import_by_name,
-                            &instance_attr_types,
-                            entity_map,
-                            &swift_call_signatures,
-                            file_path,
-                            &entity.id,
+                            entity.id.as_str(),
                             allow_cross_file,
                             allow_implicit_instance_member_receiver,
-                            &file_lookup,
-                            &mut lookup_cache,
                         );
+                        let resolution = if let Some(cache_key) = cache_key {
+                            if let Some((_, cached)) = last_resolution
+                                .as_ref()
+                                .filter(|(last_key, _)| *last_key == cache_key)
+                            {
+                                cached.clone()
+                            } else {
+                                let resolved = resolve_ref(
+                                    ast_ref,
+                                    scope_idx,
+                                    &scopes,
+                                    &symbol_table,
+                                    &class_members,
+                                    &owner_members,
+                                    &local_import_by_name,
+                                    &instance_attr_types,
+                                    entity_map,
+                                    &swift_call_signatures,
+                                    file_path,
+                                    &entity.id,
+                                    allow_cross_file,
+                                    allow_implicit_instance_member_receiver,
+                                    &file_lookup,
+                                    &mut lookup_cache,
+                                );
+                                last_resolution = Some((cache_key, resolved.clone()));
+                                resolved
+                            }
+                        } else {
+                            resolve_ref(
+                                ast_ref,
+                                scope_idx,
+                                &scopes,
+                                &symbol_table,
+                                &class_members,
+                                &owner_members,
+                                &local_import_by_name,
+                                &instance_attr_types,
+                                entity_map,
+                                &swift_call_signatures,
+                                file_path,
+                                &entity.id,
+                                allow_cross_file,
+                                allow_implicit_instance_member_receiver,
+                                &file_lookup,
+                                &mut lookup_cache,
+                            )
+                        };
 
                         if let Some((target_id, ref_type, method)) = resolution {
                             if target_id != entity.id {
@@ -5635,7 +5735,7 @@ fn resolve_ref(
             argument_labels,
         } => {
             // Strip prefix operators like ! (Swift: `!dog.validate()`)
-            let receiver = raw_receiver.trim_start_matches('!').trim_start_matches('~');
+            let receiver = normalized_method_receiver(raw_receiver);
             if receiver == "self" || receiver == "this" {
                 // self.method() -> find in enclosing class
                 let mut idx = scope_idx;
@@ -6202,6 +6302,70 @@ fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_cache_key_includes_resolution_context() {
+        let ast_ref = AstRef {
+            kind: AstRefKind::Call {
+                name: "load".to_string(),
+                argument_labels: Some(vec![Some("id".to_string())]),
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 4,
+        };
+
+        let base = resolution_cache_key(&ast_ref, 1, "entity_a", true, false);
+
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 2, "entity_a", true, false)
+        );
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 1, "entity_b", true, false)
+        );
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 1, "entity_a", false, false)
+        );
+
+        let method_ref = AstRef {
+            kind: AstRefKind::MethodCall {
+                receiver: "client".to_string(),
+                method: "load".to_string(),
+                argument_labels: None,
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 11,
+        };
+
+        assert_ne!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&method_ref, 1, "entity_a", false, false)
+        );
+        assert_ne!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&method_ref, 1, "entity_a", true, true)
+        );
+
+        let prefixed_method_ref = AstRef {
+            kind: AstRefKind::MethodCall {
+                receiver: "!client".to_string(),
+                method: "load".to_string(),
+                argument_labels: None,
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 12,
+        };
+
+        assert_eq!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&prefixed_method_ref, 1, "entity_a", true, false)
+        );
+    }
 
     #[test]
     fn return_type_name_lookup_uses_symbol_table_order() {
