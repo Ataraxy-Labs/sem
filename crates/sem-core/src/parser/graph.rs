@@ -681,10 +681,25 @@ fn direct_reference_line_ranges(
     ranges
 }
 
+type ImportsByFile<'a> = HashMap<&'a str, HashMap<&'a str, &'a str>>;
+
+fn build_imports_by_file<'a>(
+    import_table: &'a HashMap<(String, String), String>,
+) -> ImportsByFile<'a> {
+    let mut imports_by_file: ImportsByFile<'a> = HashMap::new();
+    for ((file_path, import_name), target_id) in import_table {
+        imports_by_file
+            .entry(file_path.as_str())
+            .or_default()
+            .insert(import_name.as_str(), target_id.as_str());
+    }
+    imports_by_file
+}
+
 struct ReferenceResolutionContext<'a> {
     symbol_table: &'a HashMap<String, Vec<String>>,
     entity_map: &'a HashMap<String, EntityInfo>,
-    import_table: &'a HashMap<(String, String), String>,
+    imports_by_file: &'a ImportsByFile<'a>,
     scope_consumed_words: &'a HashMap<String, HashSet<String>>,
     child_ranges_by_parent: &'a HashMap<&'a str, Vec<ChildRange<'a>>>,
     child_line_ranges: &'a HashMap<String, Vec<(usize, usize)>>,
@@ -833,11 +848,6 @@ fn resolve_entity_references(
         direct_reference_line_ranges(entity, fallback_end_line, context.child_line_ranges);
 
     let mut entity_edges = Vec::new();
-    let mut consumed_words = context
-        .scope_consumed_words
-        .get(&entity.id)
-        .cloned()
-        .unwrap_or_default();
 
     let reference_index =
         if entity_requires_content_span_filter(entity, context.child_ranges_by_parent) {
@@ -878,6 +888,11 @@ fn resolve_entity_references(
             })
             .collect(),
     };
+    let mut consumed_words: HashSet<&str> = context
+        .scope_consumed_words
+        .get(&entity.id)
+        .map(|set| set.iter().map(String::as_str).collect())
+        .unwrap_or_default();
 
     for (receiver, member, position) in &dot_chains {
         if consumed_words.contains(*member) {
@@ -906,7 +921,7 @@ fn resolve_entity_references(
                                 target_id.to_string(),
                                 RefType::Calls,
                             ));
-                            consumed_words.insert(member.to_string());
+                            consumed_words.insert(*member);
                             break;
                         }
                     }
@@ -924,15 +939,15 @@ fn resolve_entity_references(
                             target_id.to_string(),
                             RefType::Calls,
                         ));
-                        consumed_words.insert(member.to_string());
-                        consumed_words.insert(receiver.to_string());
+                        consumed_words.insert(*member);
+                        consumed_words.insert(*receiver);
                         break;
                     }
                 }
             }
         }
         if entity_edges.len() == edge_count_before {
-            consumed_words.insert(member.to_string());
+            consumed_words.insert(*member);
         }
     }
 
@@ -961,6 +976,9 @@ fn resolve_entity_references(
             .collect()
         }
     };
+    let entity_id = entity.id.as_str();
+    let imports_for_file = context.imports_by_file.get(entity.file_path.as_str());
+
     for (ref_name, ref_type) in refs {
         if consumed_words.contains(ref_name) {
             continue;
@@ -976,17 +994,18 @@ fn resolve_entity_references(
             continue;
         }
 
-        let import_key = (entity.file_path.clone(), ref_name.to_string());
-        if let Some(import_target_id) = context.import_table.get(&import_key) {
-            if import_target_id != &entity.id
+        if let Some(import_target_id) =
+            imports_for_file.and_then(|imports| imports.get(ref_name).copied())
+        {
+            if import_target_id != entity_id
                 && !context
                     .parent_child_pairs
-                    .contains(&(entity.id.as_str(), import_target_id.as_str()))
+                    .contains(&(entity_id, import_target_id))
                 && !context
                     .parent_child_pairs
-                    .contains(&(import_target_id.as_str(), entity.id.as_str()))
+                    .contains(&(import_target_id, entity_id))
             {
-                entity_edges.push((entity.id.clone(), import_target_id.clone(), ref_type));
+                entity_edges.push((entity.id.clone(), import_target_id.to_string(), ref_type));
             }
             continue;
         }
@@ -1018,8 +1037,7 @@ fn resolve_entity_references(
     // Resolve namespace-qualified calls (alias/name) for languages that use this pattern.
     // The regular tokenizer splits `alias/name` at the slash, so bare `name` tokens don't
     // match cross-file entities via the symbol table. We scan the stripped content for
-    // `alias/name` patterns and resolve them via the import table (populated by
-    // resolve_clojure_as during import table building).
+    // `alias/name` patterns and resolve them via the per-file import map.
     if language_config.has_slash_qualified_refs() {
         // Always restrip via the language's own strategy: fallback_stripped may have been
         // computed with a different strategy when reference_index was non-None above.
@@ -1027,19 +1045,20 @@ fn resolve_entity_references(
             strip_for_language(language_config.strip_strategy(), &entity.content);
         for cap in CLOJURE_QUALIFIED_REF_RE.captures_iter(&qualified_ref_stripped) {
             let qualified = cap.get(1).unwrap().as_str();
-            let import_key = (entity.file_path.clone(), qualified.to_string());
-            if let Some(import_target_id) = context.import_table.get(&import_key) {
-                if import_target_id != &entity.id
+            if let Some(import_target_id) =
+                imports_for_file.and_then(|imports| imports.get(qualified).copied())
+            {
+                if import_target_id != entity_id
                     && !context
                         .parent_child_pairs
-                        .contains(&(entity.id.as_str(), import_target_id.as_str()))
+                        .contains(&(entity_id, import_target_id))
                     && !context
                         .parent_child_pairs
-                        .contains(&(import_target_id.as_str(), entity.id.as_str()))
+                        .contains(&(import_target_id, entity_id))
                 {
                     entity_edges.push((
                         entity.id.clone(),
-                        import_target_id.clone(),
+                        import_target_id.to_string(),
                         RefType::Calls,
                     ));
                 }
@@ -1312,10 +1331,11 @@ impl EntityGraph {
             (vec![], HashMap::new())
         };
 
+        let imports_by_file = build_imports_by_file(&import_table);
         let reference_context = ReferenceResolutionContext {
             symbol_table: symbol_table.as_ref(),
             entity_map: &entity_map,
-            import_table: &import_table,
+            imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
             child_ranges_by_parent: &child_ranges_by_parent,
             child_line_ranges: &child_line_ranges,
@@ -1617,10 +1637,11 @@ impl EntityGraph {
             (vec![], HashMap::new())
         };
 
+        let imports_by_file = build_imports_by_file(&import_table);
         let reference_context = ReferenceResolutionContext {
             symbol_table: symbol_table.as_ref(),
             entity_map: &entity_map,
-            import_table: &import_table,
+            imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
             child_ranges_by_parent: &child_ranges_by_parent,
             child_line_ranges: &child_line_ranges,
@@ -2370,10 +2391,11 @@ impl EntityGraph {
             (vec![], HashMap::new())
         };
 
+        let imports_by_file = build_imports_by_file(&import_table);
         let reference_context = ReferenceResolutionContext {
             symbol_table: symbol_table.as_ref(),
             entity_map: &entity_map,
-            import_table: &import_table,
+            imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
             child_ranges_by_parent: &child_ranges_by_parent,
             child_line_ranges: &child_line_ranges,
