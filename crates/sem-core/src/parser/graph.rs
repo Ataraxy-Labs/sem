@@ -601,10 +601,10 @@ fn is_reference_word(word: &str) -> bool {
     {
         return false;
     }
-    // Tokens starting with '-' or '*' only appear here for Clojure files because
-    // `extra_ident_chars_for_file` controls tokenization upstream — only Clojure
-    // has these in extra_ident_chars. '?', '!', '=' only appear as suffixes in
-    // Clojure (empty?, reset!, not=) so the start-character check below suffices.
+    // Tokens starting with '-' or '*' only appear here for Clojure-family files
+    // because `extra_ident_chars_for_file` controls tokenization upstream.
+    // '?', '!', '=' only appear as suffixes in symbols such as empty?, reset!,
+    // and not=, so the start-character check below suffices.
     if !word.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '-' || c == '*') {
         return false;
     }
@@ -760,7 +760,7 @@ fn build_file_reference_index(root: &Path, file_path: &str) -> Option<FileRefere
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
     let config = crate::parser::plugins::code::languages::get_language_config(ext)?;
     let content = std::fs::read_to_string(root.join(file_path)).ok()?;
-    let stripped = strip_for_language(config.strip_strategy, &content);
+    let stripped = strip_for_language(config.strip_strategy(), &content);
     Some(FileReferenceIndex::from_stripped(
         &stripped,
         extra_ident_chars_for_file(file_path),
@@ -847,7 +847,7 @@ fn resolve_entity_references(
         };
     let fallback_stripped = if reference_index.is_none() {
         Some(strip_for_language(
-            language_config.strip_strategy,
+            language_config.strip_strategy(),
             &entity.content,
         ))
     } else {
@@ -1020,11 +1020,11 @@ fn resolve_entity_references(
     // match cross-file entities via the symbol table. We scan the stripped content for
     // `alias/name` patterns and resolve them via the import table (populated by
     // resolve_clojure_as during import table building).
-    if language_config.has_slash_qualified_refs {
+    if language_config.has_slash_qualified_refs() {
         // Always restrip via the language's own strategy: fallback_stripped may have been
         // computed with a different strategy when reference_index was non-None above.
         let qualified_ref_stripped =
-            strip_for_language(language_config.strip_strategy, &entity.content);
+            strip_for_language(language_config.strip_strategy(), &entity.content);
         for cap in CLOJURE_QUALIFIED_REF_RE.captures_iter(&qualified_ref_stripped) {
             let qualified = cap.get(1).unwrap().as_str();
             let import_key = (entity.file_path.clone(), qualified.to_string());
@@ -1940,7 +1940,8 @@ impl EntityGraph {
                     continue;
                 }
 
-                let stripped = strip_for_language(strip_strategy_for_file(&entity.file_path), &entity.content);
+                let stripped =
+                    strip_for_language(strip_strategy_for_file(&entity.file_path), &entity.content);
                 if text_mentions_any_name(&stripped, &affected_target_names, extra) {
                     affected_clean_ids.insert(entity.id.clone());
                     affected_clean_file_paths.insert(entity.file_path.as_str());
@@ -2000,7 +2001,8 @@ impl EntityGraph {
                     continue;
                 }
 
-                let stripped = strip_for_language(strip_strategy_for_file(&entity.file_path), &entity.content);
+                let stripped =
+                    strip_for_language(strip_strategy_for_file(&entity.file_path), &entity.content);
                 if text_mentions_any_name(&stripped, &new_stale_names, extra) {
                     clean_entities_mentioning_new_stale_names.insert(entity.id.as_str());
                     clean_import_candidate_files.insert(entity.file_path.as_str());
@@ -3708,10 +3710,10 @@ fn build_import_table_with_default_export_paths(
             if let Some(file_config) =
                 crate::parser::plugins::code::languages::get_language_config(file_ext)
             {
-                if file_config.has_slash_qualified_refs {
+                if file_config.has_slash_qualified_refs() {
                     // Strip using the language's own strategy so language-specific syntax (e.g.
                     // Clojure's `#` for reader macros/gensyms) is preserved correctly.
-                    let clojure_stripped = strip_for_language(file_config.strip_strategy, content);
+                    let clojure_stripped = strip_for_language(file_config.strip_strategy(), content);
                     for cap in CLOJURE_REFER_RE.captures_iter(&clojure_stripped) {
                         let ns_name = cap.get(1).unwrap().as_str();
                         let symbols_str = cap.get(2).unwrap().as_str();
@@ -4084,7 +4086,7 @@ fn strip_clojure_content(content: &str) -> String {
 }
 
 /// Dispatch to the appropriate content stripper for the given language strategy.
-/// Add a new arm here when adding a `StripStrategy` variant for a new language.
+/// Each `StripStrategy` variant must be handled explicitly.
 fn strip_for_language(
     strategy: crate::parser::plugins::code::languages::StripStrategy,
     content: &str,
@@ -4184,8 +4186,9 @@ static PY_FOR_BINDING_RE: LazyLock<Regex> =
 // Clojure `:require [ns :refer [sym1 sym2]]` — matches inside any require form.
 // `[^\[\]]*` prevents crossing both `[` and `]` boundaries, so the regex cannot
 // span from one require form's namespace into a later form's :refer list.
-static CLOJURE_REFER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[([a-zA-Z][a-zA-Z0-9._-]*)\b[^\[\]]*:refer\s+\[([^\]]+)\]").unwrap());
+static CLOJURE_REFER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[([a-zA-Z][a-zA-Z0-9._-]*)\b[^\[\]]*:refer\s+\[([^\]]+)\]").unwrap()
+});
 
 // Clojure `:require [ns :as alias]` — matches inside any require form.
 // `[^\]]*` prevents crossing bracket boundaries.
@@ -4282,7 +4285,7 @@ fn maybe_add_local_binding_name<F>(
 fn extra_ident_chars_for_file(file_path: &str) -> &'static [char] {
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
     crate::parser::plugins::code::languages::get_language_config(ext)
-        .map_or(&[], |c| c.extra_ident_chars)
+        .map_or(&[], |c| c.extra_ident_chars())
 }
 
 fn strip_strategy_for_file(
@@ -4291,7 +4294,7 @@ fn strip_strategy_for_file(
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
     crate::parser::plugins::code::languages::get_language_config(ext).map_or(
         crate::parser::plugins::code::languages::StripStrategy::Generic,
-        |c| c.strip_strategy,
+        |c| c.strip_strategy(),
     )
 }
 
@@ -4642,10 +4645,10 @@ fn maybe_push_reference_token<'a, F>(
     {
         return;
     }
-    // Tokens starting with '-' or '*' only appear here for Clojure files because
-    // `extra_ident_chars_for_file` controls tokenization upstream — only Clojure
-    // has these in extra_ident_chars. '?', '!', '=' only appear as suffixes in
-    // Clojure (empty?, reset!, not=) so the start-character check below suffices.
+    // Tokens starting with '-' or '*' only appear here for Clojure-family files
+    // because `extra_ident_chars_for_file` controls tokenization upstream.
+    // '?', '!', '=' only appear as suffixes in symbols such as empty?, reset!,
+    // and not=, so the start-character check below suffices.
     if !word.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '-' || c == '*') {
         return;
     }

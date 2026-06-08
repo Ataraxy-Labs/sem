@@ -471,15 +471,14 @@ impl DiskCache {
             return false;
         }
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
-            .ok();
-        let Some(ref mut stmt) = stmt else {
-            return false;
-        };
-        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> =
-            match stmt.query_map([], |row| {
+        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> = {
+            let Ok(mut stmt) = self
+                .conn
+                .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
+            else {
+                return false;
+            };
+            let cached_mtimes = match stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     (
@@ -492,7 +491,10 @@ impl DiskCache {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(_) => return false,
             };
+            cached_mtimes
+        };
 
+        let mut fingerprint_refreshes = Vec::new();
         for file in files {
             if shared_cache::is_manifest_file_name(file) {
                 continue;
@@ -508,12 +510,18 @@ impl DiskCache {
                     nanos,
                     content_hash,
                 }) => {
-                    self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                    fingerprint_refreshes.push(shared_cache::FileFingerprintRefresh {
+                        path: file.clone(),
+                        mtime_secs: secs,
+                        mtime_nanos: nanos,
+                        content_hash,
+                    });
                 }
                 Some(shared_cache::FileFreshness::Stale) | None => return false,
             }
         }
 
+        shared_cache::refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
         true
     }
 
@@ -572,6 +580,7 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+        drop(stmt);
 
         if cached_files.is_empty() {
             return None;
@@ -587,6 +596,7 @@ impl DiskCache {
         // Find stale source files: mtime differs or not in cache
         let mut stale_source_files: Vec<String> = Vec::new();
         let mut stale_current_file_count = 0;
+        let mut fingerprint_refreshes = Vec::new();
         for file in &source_files {
             match cached_files.get(file.as_str()) {
                 Some((secs, nanos, content_hash)) => {
@@ -603,7 +613,12 @@ impl DiskCache {
                             nanos,
                             content_hash,
                         }) => {
-                            self.refresh_file_fingerprint(file, secs, nanos, &content_hash);
+                            fingerprint_refreshes.push(shared_cache::FileFingerprintRefresh {
+                                path: (*file).clone(),
+                                mtime_secs: secs,
+                                mtime_nanos: nanos,
+                                content_hash,
+                            });
                         }
                         Some(shared_cache::FileFreshness::Stale) | None => {
                             stale_current_file_count += 1;
@@ -628,6 +643,8 @@ impl DiskCache {
                 deleted_cached_files.push(cached_path.clone());
             }
         }
+
+        shared_cache::refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
 
         // If nothing stale, full load would have worked
         if stale_source_files.is_empty() && deleted_cached_files.is_empty() {
@@ -937,13 +954,6 @@ impl DiskCache {
         tx.commit()?;
         Ok(())
     }
-
-    fn refresh_file_fingerprint(&self, file: &str, secs: i64, nanos: i64, content_hash: &str) {
-        let _ = self.conn.execute(
-            "UPDATE files SET mtime_secs = ?2, mtime_nanos = ?3, content_hash = ?4 WHERE path = ?1",
-            params![file, secs, nanos, content_hash],
-        );
-    }
 }
 
 fn sql_io_error(error: rusqlite::Error) -> std::io::Error {
@@ -1215,19 +1225,88 @@ mod tests {
     #[test]
     fn load_refreshes_mtime_when_file_content_is_unchanged() {
         let root = temp_repo_root("mtime-only-refresh");
-        let file = root.join("same.rs");
-        write_file(&file, "fn same() {}\n");
-        let files = vec!["same.rs".to_string()];
+        let file_contents = [
+            ("same_a.rs", "fn same_a() {}\n"),
+            ("same_b.rs", "fn same_b() {}\n"),
+            ("same_c.rs", "fn same_c() {}\n"),
+        ];
+        for (file, content) in &file_contents {
+            write_file(&root.join(*file), content);
+        }
+        let files: Vec<String> = file_contents
+            .iter()
+            .map(|(file, _)| (*file).to_string())
+            .collect();
         let cache = save_empty_cache(&root, &files);
-        let before = cached_file_mtime(&cache, "same.rs");
+        let before: Vec<(i64, i64)> = files
+            .iter()
+            .map(|file| cached_file_mtime(&cache, file))
+            .collect();
 
-        rewrite_after_mtime_tick(&file, "fn same() {}\n");
-        let current = shared_cache::file_mtime_parts(&file).unwrap();
-        assert_ne!(before, current);
+        let rewrite_all = || -> Vec<(i64, i64)> {
+            for (file, content) in &file_contents {
+                rewrite_after_mtime_tick(&root.join(*file), content);
+            }
+            file_contents
+                .iter()
+                .map(|(file, _)| shared_cache::file_mtime_parts(&root.join(*file)).unwrap())
+                .collect()
+        };
+        let assert_cached_mtimes = |expected: &[(i64, i64)]| {
+            for (file, expected) in files.iter().zip(expected) {
+                assert_eq!(cached_file_mtime(&cache, file), *expected);
+            }
+        };
 
+        let full_current = rewrite_all();
+        assert!(before
+            .iter()
+            .zip(&full_current)
+            .all(|(before, current)| before != current));
+        assert!(cache.load(&root, &files).is_some());
+        assert_cached_mtimes(&full_current);
+
+        let topology_current = rewrite_all();
         assert!(cache.load_graph_topology(&root, &files).is_some());
+        assert_cached_mtimes(&topology_current);
+
+        let partial_current = rewrite_all();
         assert!(cache.load_partial(&root, &files).is_none());
-        assert_eq!(cached_file_mtime(&cache, "same.rs"), current);
+        assert_cached_mtimes(&partial_current);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cache_loads_ignore_fingerprint_refresh_failure() {
+        let root = temp_repo_root("refresh-failure-cache-hit");
+        write_file(&root.join("same.rs"), "fn same() {}\n");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        let files = vec!["same.rs".to_string(), "stale.rs".to_string()];
+        let cache = save_empty_cache(&root, &files);
+        let before_same = cached_file_mtime(&cache, "same.rs");
+
+        cache
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_fingerprint_refresh
+                 BEFORE UPDATE ON files
+                 BEGIN
+                     SELECT RAISE(FAIL, 'stop refresh');
+                 END;",
+            )
+            .unwrap();
+
+        rewrite_after_mtime_tick(&root.join("same.rs"), "fn same() {}\n");
+        assert!(cache.load(&root, &files).is_some());
+        assert!(cache.load_graph_topology(&root, &files).is_some());
+        assert_eq!(cached_file_mtime(&cache, "same.rs"), before_same);
+
+        rewrite_after_mtime_tick(&root.join("stale.rs"), "fn stale() { 1; }\n");
+        let partial = cache.load_partial(&root, &files).unwrap();
+        assert_eq!(partial.stale_files, vec!["stale.rs"]);
+        assert_eq!(cached_file_mtime(&cache, "same.rs"), before_same);
 
         drop(cache);
         cleanup(root);
@@ -1258,9 +1337,15 @@ mod tests {
             &root.join("b.ts"),
             "export function target() { return 3; }\n",
         );
+        rewrite_after_mtime_tick(
+            &root.join("c.ts"),
+            "export function other() { return 2; }\n",
+        );
+        let current_c = shared_cache::file_mtime_parts(&root.join("c.ts")).unwrap();
         let partial = cache.load_partial(&root, &files).unwrap();
         assert_eq!(partial.stale_files, vec!["b.ts"]);
         assert_eq!(partial.cached_importing_stale_files, vec!["a.ts"]);
+        assert_eq!(cached_file_mtime(&cache, "c.ts"), current_c);
 
         rewrite_after_mtime_tick(
             &root.join("a.ts"),

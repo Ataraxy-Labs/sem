@@ -316,7 +316,7 @@ fn visit_node(
         // EDN map-entry extraction: treat each keyword key–value pair in a top-level
         // map_lit as a named "entry" entity. Values are kept as opaque content and are
         // not recursed into, so nested maps don't leak inner entries as entities.
-        if node_type == "map_lit" && config.extract_map_entries {
+        if node_type == "map_lit" && config.extract_map_entries() {
             let mut cursor = node.walk();
             // Skip comment and dis_expr nodes: they are named children of map_lit
             // in tree-sitter-clojure but are not actual forms. Without this filter,
@@ -335,11 +335,9 @@ fn visit_node(
                     "kwd_lit" | "sym_lit" => node_text(key, source).to_string(),
                     _ => continue,
                 };
-                let content = std::str::from_utf8(
-                    &source[key.start_byte()..value.end_byte()],
-                )
-                .unwrap_or("")
-                .to_string();
+                let content = std::str::from_utf8(&source[key.start_byte()..value.end_byte()])
+                    .unwrap_or("")
+                    .to_string();
                 let struct_hash = compute_structural_hash(value, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, "entry", &name, parent_id),
