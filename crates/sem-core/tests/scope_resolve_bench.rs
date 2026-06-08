@@ -136,12 +136,15 @@ fn get_false_positive_edges() -> Vec<(&'static str, &'static str, &'static str)>
     ]
 }
 
-fn edge_matches(
+fn edge_matches<S>(
     edges: &[(String, String)],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &HashMap<String, EntityInfo, S>,
     from_pat: &str,
     to_pat: &str,
-) -> bool {
+) -> bool
+where
+    S: std::hash::BuildHasher,
+{
     edges.iter().any(|(from, to)| {
         let from_name = entity_map.get(from).map(|e| e.name.as_str()).unwrap_or("");
         let to_name = entity_map.get(to).map(|e| e.name.as_str()).unwrap_or("");
