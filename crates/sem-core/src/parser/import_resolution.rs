@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -167,13 +168,16 @@ fn extension_priority(file_path: &str, extensions: &[&str]) -> usize {
         .unwrap_or(extensions.len())
 }
 
-pub(crate) fn find_import_target<'a>(
+pub(crate) fn find_import_target<'a, S>(
     target_ids: &'a [String],
     source_path: &str,
     file_path: &str,
     extensions: &[&str],
-    entity_map: &HashMap<String, EntityInfo>,
-) -> Option<&'a String> {
+    entity_map: &HashMap<String, EntityInfo, S>,
+) -> Option<&'a String>
+where
+    S: BuildHasher,
+{
     let target_files: Vec<&str> = target_ids
         .iter()
         .filter_map(|id| entity_map.get(id).map(|entity| entity.file_path.as_str()))

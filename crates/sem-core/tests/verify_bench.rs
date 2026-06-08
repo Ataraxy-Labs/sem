@@ -59,25 +59,7 @@ fn build_graph_from_entities(
         })
         .collect();
 
-    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
-    for edge in &edges {
-        dependents
-            .entry(edge.to_entity.clone())
-            .or_default()
-            .push(edge.from_entity.clone());
-        dependencies
-            .entry(edge.from_entity.clone())
-            .or_default()
-            .push(edge.to_entity.clone());
-    }
-
-    EntityGraph {
-        entities: entity_map,
-        edges,
-        dependents,
-        dependencies,
-    }
+    EntityGraph::from_parts(entity_map, edges)
 }
 
 fn has_call_edge(graph: &EntityGraph, from_name: &str, to_name: &str) -> bool {
@@ -123,9 +105,11 @@ fn verify_param_info_extraction() {
     assert_eq!(info.max_params, 2, "ts max_params");
 
     // Rust
-    let info =
-        extract_param_info_ts("fn process(&self, data: Vec<u8>) -> Result<()> {}", "test.rs")
-            .unwrap();
+    let info = extract_param_info_ts(
+        "fn process(&self, data: Vec<u8>) -> Result<()> {}",
+        "test.rs",
+    )
+    .unwrap();
     assert_eq!(info.min_params, 1, "rust self excluded");
     assert_eq!(info.max_params, 1, "rust max_params");
 
@@ -148,7 +132,10 @@ fn verify_arity_mismatches_detected() {
     let mismatches = find_arity_mismatches(&graph, &entities);
 
     // Check that bad callers ARE flagged
-    let flagged_callers: Vec<&str> = mismatches.iter().map(|m| m.caller_entity.as_str()).collect();
+    let flagged_callers: Vec<&str> = mismatches
+        .iter()
+        .map(|m| m.caller_entity.as_str())
+        .collect();
 
     // bad_caller_too_few calls create_user("alice") with 1 arg, expects 3
     assert!(
@@ -188,15 +175,16 @@ fn verify_arity_mismatches_detected() {
         "good_caller should not be flagged: {:?}",
         good_caller_mismatches
             .iter()
-            .map(|m| format!("{}->{}({})", m.caller_entity, m.callee_entity, m.actual_args))
+            .map(|m| format!(
+                "{}->{}({})",
+                m.caller_entity, m.callee_entity, m.actual_args
+            ))
             .collect::<Vec<_>>()
     );
 
     // log_message is variadic, should NOT be flagged
     assert!(
-        !mismatches
-            .iter()
-            .any(|m| m.callee_entity == "log_message"),
+        !mismatches.iter().any(|m| m.callee_entity == "log_message"),
         "variadic function should not be flagged"
     );
 }
@@ -222,12 +210,10 @@ fn verify_broken_callers_from_signature_change() {
 
     // good_caller calls create_user with 3 args, but new signature expects 4
     assert!(
-        broken
-            .iter()
-            .any(|m| m.caller_entity == "good_caller"
-                && m.callee_entity == "create_user"
-                && m.actual_args == 3
-                && m.expected_min == 4),
+        broken.iter().any(|m| m.caller_entity == "good_caller"
+            && m.callee_entity == "create_user"
+            && m.actual_args == 3
+            && m.expected_min == 4),
         "should detect good_caller as broken after signature change: got {:?}",
         broken
             .iter()
