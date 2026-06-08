@@ -366,6 +366,11 @@ fn get_clojure() -> Option<Language> {
     Some(tree_sitter_clojure_orchard::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-d")]
+fn get_d() -> Option<Language> {
+    Some(tree_sitter_d::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -1264,6 +1269,67 @@ static CLOJURE_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_clojure,
+    extract_map_entries: false,
+    scope_resolve: None,
+};
+
+#[cfg(feature = "lang-d")]
+static D_CONFIG: LanguageConfig = LanguageConfig {
+    id: "d",
+    extensions: &[".d", ".di"],
+    entity_node_types: &[
+        "module_declaration",
+        "function_declaration",
+        "class_declaration",
+        "struct_declaration",
+        "interface_declaration",
+        "union_declaration",
+        "enum_declaration",
+        "anonymous_enum_declaration",
+        "template_declaration",
+        "mixin_template_declaration",
+        "constructor",
+        "destructor",
+        "postblit",
+        "alias_declaration",
+        "unittest_declaration",
+        "variable_declaration",
+        "manifest_constant",
+        "auto_declaration",
+    ],
+    container_node_types: &["aggregate_body"],
+    call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
+    suppressed_nested_entities: &[
+        SuppressedNestedEntity {
+            parent_entity_node_type: "function_declaration",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "function_declaration",
+            child_entity_node_type: "auto_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "constructor",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "destructor",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "unittest_declaration",
+            child_entity_node_type: "variable_declaration",
+        },
+        SuppressedNestedEntity {
+            parent_entity_node_type: "unittest_declaration",
+            child_entity_node_type: "auto_declaration",
+        },
+    ],
+    scope_boundary_types: &["function_body", "block_statement"],
+    get_language: get_d,
     extract_map_entries: false,
     scope_resolve: None,
 };
@@ -2556,6 +2622,8 @@ macro_rules! all_configs {
             &CLOJURE_CONFIG,
             #[cfg(feature = "lang-edn")]
             &EDN_CONFIG,
+            #[cfg(feature = "lang-d")]
+            &D_CONFIG,
         ]
     }};
 }
