@@ -8,6 +8,7 @@ All notable changes to sem are documented in this file.
 
 - Graph resolution now uses faster hash collections in hot paths to reduce graph build overhead.
 - Scope resolution caches repeated reference lookups during graph builds to reduce redundant resolver work.
+- Graph builds avoid retaining import scan source text after import extraction, reducing peak memory use.
 
 ### Fixed
 
