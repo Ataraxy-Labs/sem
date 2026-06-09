@@ -20,6 +20,8 @@ pub(crate) enum StripStrategy {
     Clojure,
 }
 
+const CLOJURE_EXTRA_IDENT_CHARS: &[char] = &['-', '?', '!', '*', '='];
+
 #[allow(dead_code)]
 pub struct LanguageConfig {
     pub id: &'static str,
@@ -35,8 +37,6 @@ pub struct LanguageConfig {
     pub get_language: fn() -> Option<Language>,
     pub scope_resolve: Option<&'static ScopeResolveConfig>,
 }
-
-const CLOJURE_EXTRA_IDENT_CHARS: &[char] = &['-', '?', '!', '*', '='];
 
 impl LanguageConfig {
     pub(crate) fn extra_ident_chars(&self) -> &'static [char] {
