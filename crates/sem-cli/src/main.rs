@@ -316,6 +316,22 @@ enum Commands {
     Setup,
     /// Restore default `git diff` behavior
     Unsetup,
+    /// Log in to sem cloud
+    Login {
+        /// API key (omit for interactive prompt, or use --github)
+        #[arg()]
+        key: Option<String>,
+        /// Log in with GitHub
+        #[arg(long)]
+        github: bool,
+        /// API endpoint (default: https://api.sem.sh)
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Log out of sem cloud
+    Logout,
+    /// Show current sem cloud identity
+    Whoami,
     /// Generate shell completions
     Completions {
         /// The shell to generate the completions for
@@ -576,6 +592,33 @@ fn main() {
         }
         Some(Commands::Unsetup) => {
             if let Err(e) = commands::setup::unsetup() {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Login {
+            key,
+            github,
+            endpoint,
+        }) => {
+            let result = if github {
+                commands::cloud::login_github(endpoint)
+            } else {
+                commands::cloud::login(key, endpoint)
+            };
+            if let Err(e) = result {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Logout) => {
+            if let Err(e) = commands::cloud::logout() {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Whoami) => {
+            if let Err(e) = commands::cloud::whoami() {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }
