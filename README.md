@@ -42,6 +42,12 @@ It works in any Git repo with no setup.
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Ataraxy-Labs/sem/main/install.sh | sh
+```
+
+Or via Homebrew:
+
+```bash
 brew install sem-cli
 ```
 
