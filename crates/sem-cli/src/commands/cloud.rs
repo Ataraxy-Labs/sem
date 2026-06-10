@@ -284,7 +284,12 @@ pub fn whoami() -> Result<(), Box<dyn std::error::Error>> {
                     cached.status
                 );
             } else {
-                println!("{} {}", "Repo ID: ".bold(), "not registered".dimmed());
+                println!(
+                    "{} {} {}",
+                    "Repo ID: ".bold(),
+                    "not registered".dimmed(),
+                    "(registers automatically on first sem impact/context/log)".dimmed()
+                );
             }
         }
     }
@@ -417,9 +422,17 @@ pub struct RepoCacheEntry {
 const CLOUD_MIN_ENTITIES: usize = 20_000;
 
 /// Look up the cached entity count for a remote, if known.
+/// Only trusts counts from fully indexed repos within the cache TTL — a
+/// repo registered while still indexing reports 0 entities, and treating
+/// that as "small" would permanently route it away from the cloud.
 fn cached_entity_count(remote_url: &str) -> Option<usize> {
     let normalized = normalize_remote_url(remote_url);
-    load_repo_cache()?.get(&normalized)?.entity_count
+    let cache = load_repo_cache()?;
+    let entry = cache.get(&normalized)?;
+    if entry.status != "ready" || cache_entry_expired(entry) {
+        return None;
+    }
+    entry.entity_count
 }
 
 /// True when the repo is known to be small enough that local graph queries
@@ -551,10 +564,12 @@ impl CloudClient {
     fn resolve_repo(&self, remote_url: &str) -> Result<String, Box<dyn std::error::Error>> {
         let normalized = normalize_remote_url(remote_url);
 
-        // Check cache first
+        // Check cache first. Entries that aren't "ready" yet (still cloning
+        // or indexing) are re-fetched every time so status and entity count
+        // converge once the server finishes.
         if let Some(cache) = load_repo_cache() {
             if let Some(entry) = cache.get(&normalized) {
-                if !cache_entry_expired(entry) {
+                if entry.status == "ready" && !cache_entry_expired(entry) {
                     return Ok(entry.repo_id.clone());
                 }
             }
