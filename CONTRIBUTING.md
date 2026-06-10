@@ -1,5 +1,21 @@
 # Contributing to sem
 
+## Changelog Entries
+
+Every pull request should add a `CHANGELOG.md` entry under `## [Unreleased]`.
+Use the section that best describes the change:
+
+- `Added`
+- `Changed`
+- `Fixed`
+- `Removed`
+- `Security`
+- `Maintenance`
+
+Keep entries concise and user-facing. For maintenance-only work, add a short
+`Maintenance` bullet. CI checks that each pull request adds at least one line to
+`CHANGELOG.md`.
+
 ## Adding a New Language
 
 sem uses [tree-sitter](https://tree-sitter.github.io/tree-sitter/) grammars to extract semantic entities (functions, classes, etc.) from source code. Adding a new language is straightforward: you define a config struct and add a cargo dependency. No parser code needed.

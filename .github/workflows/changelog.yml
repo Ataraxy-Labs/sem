@@ -1,0 +1,41 @@
+name: Changelog
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require changelog entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          changed_changelog="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --paginate \
+            --jq '.[] | select(.filename == "CHANGELOG.md" and .additions > 0) | .filename')"
+
+          if [ -n "$changed_changelog" ]; then
+            echo "CHANGELOG.md includes an added entry."
+            exit 0
+          fi
+
+          cat <<'MSG' >> "$GITHUB_STEP_SUMMARY"
+          ## Changelog entry required
+
+          Please add a `CHANGELOG.md` entry for this PR.
+
+          Add a short bullet under `## [Unreleased]` describing the user-visible or maintenance change.
+          MSG
+
+          echo "::error::Please add a CHANGELOG.md entry for this PR."
+          exit 1
