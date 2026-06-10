@@ -406,6 +406,16 @@ Used by [weave](https://github.com/Ataraxy-Labs/weave) (semantic merge driver) a
 - **xxhash** for structural hashing
 - Plugin system for adding new languages and formats
 
+## Telemetry
+
+sem collects anonymous usage data: the command name (e.g. `diff`, `impact`), CLI version, and operating system. Nothing else — no code, file paths, repo names, or user identity. Events are batched locally and sent in the background, so commands never wait on the network.
+
+Disable it any time:
+
+```bash
+export SEM_NO_TELEMETRY=1   # or DO_NOT_TRACK=1
+```
+
 ## Contributing
 
 Want to add a new language? See [CONTRIBUTING.md](CONTRIBUTING.md) for a step-by-step guide.

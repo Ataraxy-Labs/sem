@@ -2,6 +2,7 @@ mod cache;
 mod commands;
 mod formatters;
 mod stats;
+mod telemetry;
 mod timings;
 
 #[global_allocator]
@@ -335,6 +336,34 @@ enum Commands {
         #[arg(value_enum)]
         shell: clap_complete_command::Shell,
     },
+    /// Flush spooled telemetry (internal; spawned in the background)
+    #[command(name = "__telemetry-flush", hide = true)]
+    TelemetryFlush,
+}
+
+/// Command name recorded in anonymous usage telemetry. Names only — no
+/// arguments, paths, or repo information.
+fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
+    Some(match command {
+        Some(Commands::Diff { .. }) => "diff",
+        Some(Commands::Impact { .. }) => "impact",
+        Some(Commands::Graph { .. }) => "graph",
+        Some(Commands::Blame { .. }) => "blame",
+        Some(Commands::Log { .. }) => "log",
+        Some(Commands::Entities { .. }) => "entities",
+        Some(Commands::Context { .. }) => "context",
+        Some(Commands::Verify { .. }) => "verify",
+        Some(Commands::Stats) => "stats",
+        Some(Commands::Mcp) => "mcp",
+        Some(Commands::Setup) => "setup",
+        Some(Commands::Unsetup) => "unsetup",
+        Some(Commands::Login { .. }) => "login",
+        Some(Commands::Logout) => "logout",
+        Some(Commands::Whoami) => "whoami",
+        Some(Commands::Completions { .. }) => "completions",
+        Some(Commands::TelemetryFlush) => return None,
+        None => "diff",
+    })
 }
 
 /// Resolve --format / --json into a single bool.
@@ -364,6 +393,10 @@ fn apply_color_mode(mode: ColorMode) {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(name) = telemetry_command_name(&cli.command) {
+        telemetry::record(name);
+    }
 
     match cli.command {
         Some(Commands::Diff {
@@ -614,6 +647,9 @@ fn main() {
         }
         Some(Commands::Completions { shell }) => {
             shell.generate(&mut Cli::command(), &mut std::io::stdout());
+        }
+        Some(Commands::TelemetryFlush) => {
+            telemetry::flush();
         }
         None => {
             // Default to diff when no subcommand is given
