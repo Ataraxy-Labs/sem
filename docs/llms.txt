@@ -180,7 +180,7 @@ sem-core can be used as a Rust library dependency:
 
 ```toml
 [dependencies]
-sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.3" }
+sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.10.0" }
 ```
 
 Used by weave (semantic merge driver) and inspect (entity-level code review).

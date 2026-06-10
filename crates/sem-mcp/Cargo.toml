@@ -1,6 +1,6 @@
 [package]
 name = "sem-mcp"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for entity-level semantic code intelligence. 6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context."
@@ -15,7 +15,7 @@ name = "sem-mcp"
 path = "src/main.rs"
 
 [dependencies]
-sem-core = { path = "../sem-core", version = "0.9.0" }
+sem-core = { path = "../sem-core", version = "0.10.0" }
 git2 = "0.20"
 lru = "0.16"
 rmcp = { version = "1", features = ["server", "transport-io"] }
