@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::entity::SemanticEntity;
-use crate::parser::graph::EntityGraph;
+use crate::parser::graph::{EntityAdjacencyMap, EntityGraph};
 
 #[derive(Debug, Clone)]
 pub struct ContextEntry {
@@ -253,7 +253,7 @@ fn add_signature(
 fn collect_reachable_related<'a>(
     graph: &'a EntityGraph,
     entity_id: &str,
-    relationships: &'a HashMap<String, Vec<String>>,
+    relationships: &'a EntityAdjacencyMap,
 ) -> Vec<&'a crate::parser::graph::EntityInfo> {
     const MAX_VISITED: usize = 10_000;
 
@@ -430,11 +430,8 @@ mod tests {
         }
 
         let graph = graph_from_entities(&entities, edges);
-        let result = collect_reachable_related(
-            &graph,
-            "a.py::function::helper_0",
-            &graph.dependencies,
-        );
+        let result =
+            collect_reachable_related(&graph, "a.py::function::helper_0", &graph.dependencies);
 
         assert_eq!(result.len(), 10_000);
     }

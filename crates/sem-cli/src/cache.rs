@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     fn graph_with_edges(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
-        let entity_map = entities
+        let entity_map: HashMap<String, EntityInfo> = entities
             .iter()
             .map(|entity| {
                 (
