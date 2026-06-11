@@ -109,6 +109,7 @@ tree-sitter-haskell = { version = "0.23", optional = true }
 tree-sitter-elm = { version = "5.9", optional = true }
 tree-sitter-clojure-orchard = { version = "0.2.5", optional = true }
 tree-sitter-d = { version = "0.8.2", optional = true }
+rustc-hash = "2"
 
 [dev-dependencies]
 tempfile = "3.24.0"
