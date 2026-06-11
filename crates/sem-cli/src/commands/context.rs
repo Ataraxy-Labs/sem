@@ -18,6 +18,10 @@ pub struct ContextOptions {
 }
 
 pub fn context_command(opts: ContextOptions) {
+    if super::cloud::try_cloud_context(&opts).is_some() {
+        return;
+    }
+
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
         Ok(git) => git.repo_root().to_path_buf(),
         Err(_) => Path::new(&opts.cwd).to_path_buf(),

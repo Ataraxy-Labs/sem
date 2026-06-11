@@ -73,6 +73,10 @@ struct EntityOccurrence {
 }
 
 pub fn log_command(opts: LogOptions) {
+    if super::cloud::try_cloud_log(&opts).is_some() {
+        return;
+    }
+
     let root = Path::new(&opts.cwd);
     let registry = super::create_registry(&opts.cwd);
 

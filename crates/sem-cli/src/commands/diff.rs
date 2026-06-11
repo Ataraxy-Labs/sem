@@ -1382,6 +1382,11 @@ pub fn diff_command(mut opts: DiffOptions) {
         }
     }
 
+    // Note: diff never routes to the cloud. A range diff only parses the
+    // files changed in that range, so the local path beats a network round
+    // trip at any repo size (measured 33ms local vs 249ms cloud on a 147k
+    // entity repo).
+
     let (file_changes, from_stdin) = if opts.stdin {
         // Read FileChange[] from stdin — no git repo needed
         let mut input = String::new();

@@ -54,6 +54,23 @@ impl GitBridge {
         &self.repo_root
     }
 
+    /// Return the URL of the "origin" remote, if one exists.
+    pub fn get_remote_url(&self) -> Option<String> {
+        self.repo
+            .find_remote("origin")
+            .ok()
+            .and_then(|r| r.url().map(String::from))
+    }
+
+    /// Resolve a refspec to its full commit SHA, if valid.
+    pub fn resolve_ref_sha(&self, refspec: &str) -> Option<String> {
+        self.repo
+            .revparse_single(refspec)
+            .ok()
+            .and_then(|obj| obj.peel_to_commit().ok())
+            .map(|c| c.id().to_string())
+    }
+
     pub fn blame_file(&self, file_path: &Path) -> Result<Blame<'_>, GitError> {
         Ok(self.repo.blame_file(file_path, None)?)
     }

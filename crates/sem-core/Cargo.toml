@@ -1,6 +1,6 @@
 [package]
 name = "sem-core"
-version = "0.9.0"
+version = "0.10.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 28 languages via tree-sitter and diffs at the entity level."

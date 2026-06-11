@@ -42,6 +42,30 @@ get_latest_version() {
     fi
 }
 
+verify_checksum() {
+    # Verify the archive against the release checksums.txt when a sha256 tool is
+    # available. Hard-fails on mismatch; skips silently when no tool or no
+    # matching entry exists, so installs still work on minimal systems.
+    archive="$1"
+    sums=$(curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt" 2>/dev/null) || return 0
+    expected=$(printf '%s\n' "$sums" | grep -F "${ARTIFACT}.tar.gz" | awk '{print $1}' | head -1)
+    [ -n "$expected" ] || return 0
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$archive" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+    else
+        warn "no sha256 tool found; skipping checksum verification"
+        return 0
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        error "checksum mismatch for ${ARTIFACT}.tar.gz (expected ${expected}, got ${actual})"
+    fi
+    info "Verified" "checksum"
+}
+
 download_and_install() {
     URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}.tar.gz"
 
@@ -51,6 +75,8 @@ download_and_install() {
     info "Downloading" "${ARTIFACT} ${VERSION}"
     curl -fsSL "$URL" -o "${TMPDIR}/${ARTIFACT}.tar.gz" \
         || error "Download failed. Check https://github.com/${REPO}/releases for available builds."
+
+    verify_checksum "${TMPDIR}/${ARTIFACT}.tar.gz"
 
     tar xzf "${TMPDIR}/${ARTIFACT}.tar.gz" -C "$TMPDIR"
 

@@ -2,6 +2,7 @@ mod cache;
 mod commands;
 mod formatters;
 mod stats;
+mod telemetry;
 mod timings;
 
 #[global_allocator]
@@ -226,11 +227,11 @@ enum Commands {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
-    /// List entities under a file or directory path
+    /// List entities under one or more file or directory paths
     Entities {
-        /// File or directory path to extract entities from (defaults to .)
-        #[arg()]
-        path: Option<String>,
+        /// File or directory paths to extract entities from (defaults to .)
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
 
         /// Output format
         #[arg(long, value_parser = ["terminal", "json"])]
@@ -318,13 +319,10 @@ enum Commands {
     Unsetup,
     /// Log in to sem cloud
     Login {
-        /// API key (omit for interactive prompt, or use --github)
+        /// API key (omit to log in with GitHub)
         #[arg()]
         key: Option<String>,
-        /// Log in with GitHub
-        #[arg(long)]
-        github: bool,
-        /// API endpoint (default: https://api.sem.sh)
+        /// API endpoint
         #[arg(long)]
         endpoint: Option<String>,
     },
@@ -332,12 +330,46 @@ enum Commands {
     Logout,
     /// Show current sem cloud identity
     Whoami,
+    /// Update sem to the latest released version
+    Update,
     /// Generate shell completions
     Completions {
         /// The shell to generate the completions for
         #[arg(value_enum)]
         shell: clap_complete_command::Shell,
     },
+    /// Flush spooled telemetry (internal; spawned in the background)
+    #[command(name = "__telemetry-flush", hide = true)]
+    TelemetryFlush,
+    /// Refresh the cached latest-version info (internal; spawned in the background)
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheck,
+}
+
+/// Command name recorded in anonymous usage telemetry. Names only — no
+/// arguments, paths, or repo information.
+fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
+    Some(match command {
+        Some(Commands::Diff { .. }) => "diff",
+        Some(Commands::Impact { .. }) => "impact",
+        Some(Commands::Graph { .. }) => "graph",
+        Some(Commands::Blame { .. }) => "blame",
+        Some(Commands::Log { .. }) => "log",
+        Some(Commands::Entities { .. }) => "entities",
+        Some(Commands::Context { .. }) => "context",
+        Some(Commands::Verify { .. }) => "verify",
+        Some(Commands::Stats) => "stats",
+        Some(Commands::Mcp) => "mcp",
+        Some(Commands::Setup) => "setup",
+        Some(Commands::Unsetup) => "unsetup",
+        Some(Commands::Login { .. }) => "login",
+        Some(Commands::Logout) => "logout",
+        Some(Commands::Whoami) => "whoami",
+        Some(Commands::Update) => "update",
+        Some(Commands::Completions { .. }) => "completions",
+        Some(Commands::TelemetryFlush) | Some(Commands::UpdateCheck) => return None,
+        None => "diff",
+    })
 }
 
 /// Resolve --format / --json into a single bool.
@@ -367,6 +399,11 @@ fn apply_color_mode(mode: ColorMode) {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(name) = telemetry_command_name(&cli.command) {
+        telemetry::record(name);
+        commands::update::maybe_notify(name);
+    }
 
     match cli.command {
         Some(Commands::Diff {
@@ -514,7 +551,7 @@ fn main() {
             });
         }
         Some(Commands::Entities {
-            path,
+            paths,
             format,
             json,
             no_default_excludes,
@@ -524,7 +561,7 @@ fn main() {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string(),
-                path,
+                paths,
                 json: resolve_json(format, json),
                 no_default_excludes,
             });
@@ -596,16 +633,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Login {
-            key,
-            github,
-            endpoint,
-        }) => {
-            let result = if github {
-                commands::cloud::login_github(endpoint)
-            } else {
-                commands::cloud::login(key, endpoint)
-            };
+        Some(Commands::Login { key, endpoint }) => {
+            let result = commands::cloud::login(key, endpoint);
             if let Err(e) = result {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
@@ -623,8 +652,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Update) => {
+            if let Err(e) = commands::update::run() {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Completions { shell }) => {
             shell.generate(&mut Cli::command(), &mut std::io::stdout());
+        }
+        Some(Commands::TelemetryFlush) => {
+            telemetry::flush();
+        }
+        Some(Commands::UpdateCheck) => {
+            commands::update::background_check();
         }
         None => {
             // Default to diff when no subcommand is given

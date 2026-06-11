@@ -29,6 +29,10 @@ pub enum ImpactMode {
 const LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD: usize = 20_000;
 
 pub fn impact_command(opts: ImpactOptions) {
+    if super::cloud::try_cloud_impact(&opts).is_some() {
+        return;
+    }
+
     let mut timings = Timings::from_env("impact");
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
         Ok(git) => git.repo_root().to_path_buf(),

@@ -7,43 +7,89 @@ use sem_core::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
 
 pub struct EntitiesOptions {
     pub cwd: String,
-    pub path: Option<String>,
+    pub paths: Vec<String>,
     pub json: bool,
     pub no_default_excludes: bool,
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
+    // Normalize to a non-empty list of path args, defaulting to ".".
+    let path_args: Vec<String> = {
+        let cleaned: Vec<String> = opts
+            .paths
+            .iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            vec![".".to_string()]
+        } else {
+            cleaned
+        }
+    };
+
+    // The cloud fast-path only helps the whole-repo single listing.
+    if path_args.len() == 1 && super::cloud::try_cloud_entities(&opts).is_some() {
+        return;
+    }
+
     let root = Path::new(&opts.cwd);
     let registry = super::create_registry(&opts.cwd);
-    let path_arg = opts.path.as_deref().filter(|p| !p.is_empty()).unwrap_or(".");
-    let (path_label, full_path) = resolve_path(root, path_arg);
 
-    let (entities, include_file) = if full_path.is_file() {
-        (
-            extract_file_entities(&full_path, &registry, &path_label).unwrap_or_else(|e| {
-                eprintln!(
-                    "{} Cannot read '{}': {}",
-                    "error:".red().bold(),
-                    path_label,
-                    e
-                );
-                std::process::exit(1);
-            }),
-            false,
-        )
-    } else if full_path.is_dir() {
-        let file_paths = super::files::find_supported_files_in_path(
-            root,
-            &full_path,
-            &registry,
-            &[],
-            opts.no_default_excludes,
-        );
-        (extract_files_entities(root, &file_paths, &registry), true)
-    } else {
-        eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
-        std::process::exit(1);
+    let mut entities: Vec<SemanticEntity> = Vec::new();
+    let mut dir_count = 0usize;
+    for path_arg in &path_args {
+        let (path_label, full_path) = resolve_path(root, path_arg);
+        if full_path.is_file() {
+            let file_entities = extract_file_entities(&full_path, &registry, &path_label)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "{} Cannot read '{}': {}",
+                        "error:".red().bold(),
+                        path_label,
+                        e
+                    );
+                    std::process::exit(1);
+                });
+            entities.extend(file_entities);
+        } else if full_path.is_dir() {
+            dir_count += 1;
+            let file_paths = super::files::find_supported_files_in_path(
+                root,
+                &full_path,
+                &registry,
+                &[],
+                opts.no_default_excludes,
+            );
+            entities.extend(extract_files_entities(root, &file_paths, &registry));
+        } else {
+            eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
+            std::process::exit(1);
+        }
+    }
+
+    // Overlapping paths (e.g. a directory and a file inside it) can surface the
+    // same entity twice; sort and drop exact duplicates by id.
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.entity_type.cmp(&b.entity_type))
+            .then(a.name.cmp(&b.name))
+    });
+    entities.dedup_by(|a, b| a.id == b.id);
+
+    // Show the file column whenever results span more than one file. This keeps
+    // the prior single-file vs directory behavior and covers multi-path input.
+    let distinct_files = {
+        let mut files: Vec<&str> = entities.iter().map(|e| e.file_path.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len()
     };
+    let include_file = dir_count > 0 || distinct_files > 1;
+    let display_label = path_args.join(" ");
 
     if opts.json {
         let output: Vec<_> = entities
@@ -52,11 +98,11 @@ pub fn entities_command(opts: EntitiesOptions) {
             .collect();
         println!("{}", serde_json::to_string(&output).unwrap());
     } else if should_group_by_file(&entities) {
-        print_grouped_entities(&path_label, &entities);
+        print_grouped_entities(&display_label, &entities);
     } else if let Some(file_path) = entities.first().map(|e| e.file_path.as_str()) {
         print_file_entities(file_path, &entities);
     } else {
-        println!("{} {}\n", "entities:".green().bold(), path_label.bold());
+        println!("{} {}\n", "entities:".green().bold(), display_label.bold());
     }
 }
 
