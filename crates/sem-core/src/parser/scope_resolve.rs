@@ -12,12 +12,13 @@
 //! - Uses AST structure, not string matching
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::model::entity::SemanticEntity;
 
@@ -172,7 +173,7 @@ fn find_entity_source_spans<'a>(
     entities: &[&'a SemanticEntity],
     source: &str,
 ) -> HashMap<&'a str, SourceSpan> {
-    let mut spans = HashMap::new();
+    let mut spans = HashMap::default();
     let line_starts = source_line_starts(source);
     for entity in entities {
         if entity.content.is_empty() {
@@ -421,7 +422,7 @@ struct FileEntityLookup<'a> {
 
 impl<'a> FileEntityLookup<'a> {
     fn new(file_entities: &[&'a SemanticEntity]) -> Self {
-        let mut by_name: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::new();
+        let mut by_name: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::default();
         for entity in file_entities {
             by_name
                 .entry(entity.name.as_str())
@@ -469,6 +470,65 @@ struct ScopeLookupCache {
     local_bindings: HashMap<usize, HashMap<String, bool>>,
     types: HashMap<usize, HashMap<String, Option<String>>>,
     enclosing_classes: HashMap<usize, Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionCacheKey<'a> {
+    Call {
+        scope_idx: usize,
+        from_entity_id: &'a str,
+        name: &'a str,
+        argument_labels: Option<&'a [Option<String>]>,
+        allow_cross_file_calls: bool,
+    },
+    MethodCall {
+        scope_idx: usize,
+        from_entity_id: &'a str,
+        receiver: &'a str,
+        method: &'a str,
+        argument_labels: Option<&'a [Option<String>]>,
+        allow_cross_file_calls: bool,
+        allow_implicit_instance_member_receiver: bool,
+    },
+}
+
+fn resolution_cache_key<'a>(
+    ast_ref: &'a AstRef,
+    scope_idx: usize,
+    from_entity_id: &'a str,
+    allow_cross_file_calls: bool,
+    allow_implicit_instance_member_receiver: bool,
+) -> Option<ResolutionCacheKey<'a>> {
+    match &ast_ref.kind {
+        AstRefKind::Call {
+            name,
+            argument_labels,
+        } => Some(ResolutionCacheKey::Call {
+            scope_idx,
+            from_entity_id,
+            name,
+            argument_labels: argument_labels.as_deref(),
+            allow_cross_file_calls,
+        }),
+        AstRefKind::ScopedCall { .. } => None,
+        AstRefKind::MethodCall {
+            receiver,
+            method,
+            argument_labels,
+        } => Some(ResolutionCacheKey::MethodCall {
+            scope_idx,
+            from_entity_id,
+            receiver: normalized_method_receiver(receiver),
+            method,
+            argument_labels: argument_labels.as_deref(),
+            allow_cross_file_calls,
+            allow_implicit_instance_member_receiver,
+        }),
+    }
+}
+
+fn normalized_method_receiver(receiver: &str) -> &str {
+    receiver.trim_start_matches('!').trim_start_matches('~')
 }
 
 pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
@@ -525,8 +585,33 @@ fn compare_entity_ids_by_source(
     }
 }
 
-/// Public API — preserves the original 5-parameter signature for semver compatibility.
+/// Public API that accepts caller-provided entity maps and normalizes them for resolver internals.
 pub fn resolve_with_scopes(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &std::collections::HashMap<String, EntityInfo, impl BuildHasher>,
+    pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+) -> ScopeResult {
+    let entity_map: HashMap<String, EntityInfo> = entity_map
+        .iter()
+        .map(|(id, entity)| (id.clone(), entity.clone()))
+        .collect();
+    let result = resolve_with_scopes_full(
+        root,
+        file_paths,
+        all_entities,
+        &entity_map,
+        pre_parsed,
+        None,
+        None,
+        true,
+    );
+    scope_result_from_full(result)
+}
+
+/// Public API for callers that already hold an Fx-hashed entity map.
+pub fn resolve_with_scopes_fast(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
@@ -543,6 +628,10 @@ pub fn resolve_with_scopes(
         None,
         true,
     );
+    scope_result_from_full(result)
+}
+
+fn scope_result_from_full(result: ScopeResultFull) -> ScopeResult {
     ScopeResult {
         edges: result.edges,
         resolution_log: result.resolution_log,
@@ -609,17 +698,17 @@ fn resolve_with_scopes_full_inner(
 ) -> ScopeResultFull {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
-    let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
     // Use pre-built lookups if provided, otherwise build from scratch.
     let owned_lookups;
     let lookups = if let Some(pb) = pre_built {
         pb
     } else {
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::default();
+        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::default();
 
         for entity in all_entities {
             symbol_table
@@ -686,7 +775,7 @@ fn resolve_with_scopes_full_inner(
     let go_pkg_index = &lookups.go_pkg_index;
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
-    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in all_entities {
         entities_by_file
             .entry(entity.file_path.as_str())
@@ -695,7 +784,7 @@ fn resolve_with_scopes_full_inner(
     }
 
     // Build parent_id indexed entity lookup: parent_id -> Vec<&SemanticEntity>
-    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in all_entities {
         if let Some(ref pid) = entity.parent_id {
             children_by_parent
@@ -706,24 +795,24 @@ fn resolve_with_scopes_full_inner(
     }
 
     // Return type map: function_entity_id -> class_name (if function returns ClassName())
-    let mut return_type_map: HashMap<String, String> = HashMap::new();
+    let mut return_type_map: HashMap<String, String> = HashMap::default();
 
     // Instance attribute types: (class_name, attr_name) -> class_name_of_attr
-    let mut instance_attr_types: HashMap<(String, String), String> = HashMap::new();
+    let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
 
     // __init__ param info: class_name -> (ordered_params, attr_to_param mapping)
     // attr_to_param: attr_name -> param_name (for self.attr = param patterns)
-    let mut init_params: HashMap<String, Vec<String>> = HashMap::new();
-    let mut attr_to_param: HashMap<(String, String), String> = HashMap::new();
+    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
+    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
 
     // Merge pre-parsed trees with disk-parsed trees for missing files
     let mut owned_parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
-    let pre_set: std::collections::HashSet<String> = if let Some(pp) = pre_parsed {
+    let pre_set: HashSet<String> = if let Some(pp) = pre_parsed {
         let set = pp.iter().map(|(fp, _, _)| fp.clone()).collect();
         owned_parsed_files = pp;
         set
     } else {
-        std::collections::HashSet::new()
+        HashSet::default()
     };
     // Parse any files not already in the pre-parsed set
     for file_path in file_paths {
@@ -753,14 +842,14 @@ fn resolve_with_scopes_full_inner(
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
     let content_by_file = OnceLock::new();
     let exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
-        Mutex::new(HashMap::new());
+        Mutex::new(HashMap::default());
     // The default-export table is consulted only while resolving JS/TS imports.
     // When an import table is supplied (the graph-build path), those imports are
     // already resolved and `extract_ts_import`/`extract_ts_re_export` are skipped,
     // so the table is never read — building it would be pure waste on a large repo.
     let ts_default_exports = if pre_built_import_table.is_some() {
         TsDefaultExportTable {
-            exports_by_file: HashMap::new(),
+            exports_by_file: HashMap::default(),
             sorted_files: Vec::new(),
         }
     } else {
@@ -788,7 +877,7 @@ fn resolve_with_scopes_full_inner(
                 .unwrap_or(&[]);
             let file_lookup = FileEntityLookup::new(file_entities);
 
-            let mut local_return_type_map: HashMap<String, String> = HashMap::new();
+            let mut local_return_type_map: HashMap<String, String> = HashMap::default();
             scan_return_types(
                 tree.root_node(),
                 file_path,
@@ -798,9 +887,10 @@ fn resolve_with_scopes_full_inner(
                 config,
             );
 
-            let mut local_instance_attr_types: HashMap<(String, String), String> = HashMap::new();
-            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::new();
-            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::new();
+            let mut local_instance_attr_types: HashMap<(String, String), String> =
+                HashMap::default();
+            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::default();
+            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::default();
             scan_init_self_attrs(
                 tree.root_node(),
                 file_path,
@@ -848,7 +938,7 @@ fn resolve_with_scopes_full_inner(
     {
         build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map)
     } else {
-        HashMap::new()
+        HashMap::default()
     };
 
     // Group the prebuilt import table by importing file once. Otherwise every file
@@ -857,7 +947,7 @@ fn resolve_with_scopes_full_inner(
     // own imports).
     let import_table_by_file: HashMap<&str, Vec<(&str, &str)>> =
         if let Some(import_table) = pre_built_import_table {
-            let mut grouped: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+            let mut grouped: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
             for ((import_file_path, local_name), target_id) in import_table {
                 grouped
                     .entry(import_file_path.as_str())
@@ -866,7 +956,7 @@ fn resolve_with_scopes_full_inner(
             }
             grouped
         } else {
-            HashMap::new()
+            HashMap::default()
         };
 
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
@@ -882,17 +972,17 @@ fn resolve_with_scopes_full_inner(
 
             let mut scopes: Vec<Scope> = vec![Scope {
                 parent: None,
-                defs: HashMap::new(),
-                bindings: HashSet::new(),
-                binding_rows: HashMap::new(),
-                types: HashMap::new(),
-                pending_call_types: HashMap::new(),
+                defs: HashMap::default(),
+                bindings: HashSet::default(),
+                binding_rows: HashMap::default(),
+                types: HashMap::default(),
+                pending_call_types: HashMap::default(),
                 owner_id: None,
                 kind: "module",
             }];
 
-            let mut entity_scope_map: HashMap<String, usize> = HashMap::new();
-            let mut entity_inner_scope: HashMap<String, usize> = HashMap::new();
+            let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
+            let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
 
             if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
                 for (_start, _end, eid) in ranges {
@@ -927,7 +1017,7 @@ fn resolve_with_scopes_full_inner(
                 config,
             );
 
-            let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
+            let mut local_import_table: HashMap<(String, String), String> = HashMap::default();
             if pre_built_import_table.is_some() {
                 if let Some(entries) = import_table_by_file.get(file_path.as_str()) {
                     for (local_name, target_id) in entries {
@@ -977,7 +1067,7 @@ fn resolve_with_scopes_full_inner(
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
-            let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
+            let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
             // Walk the AST once for the entire file, collecting all refs with row positions
             let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
@@ -985,6 +1075,10 @@ fn resolve_with_scopes_full_inner(
             let descendant_ranges_by_entity =
                 build_descendant_ranges_by_entity(&file_entities, entity_map);
             let mut lookup_cache = ScopeLookupCache::default();
+            let mut last_resolution: Option<(
+                ResolutionCacheKey<'_>,
+                Option<(String, RefType, &'static str)>,
+            )> = None;
 
             for entity in &file_entities {
                 if emit_entity_ids
@@ -1070,24 +1164,61 @@ fn resolve_with_scopes_full_inner(
                         // Languages without per-symbol imports (e.g. Swift, Kotlin)
                         // allow cross-file resolution for lowercase function names.
                         let allow_cross_file = config.import_extractor.is_none();
-                        let resolution = resolve_ref(
+                        let cache_key = resolution_cache_key(
                             ast_ref,
                             scope_idx,
-                            &scopes,
-                            &symbol_table,
-                            &class_members,
-                            &owner_members,
-                            &local_import_by_name,
-                            &instance_attr_types,
-                            entity_map,
-                            &swift_call_signatures,
-                            file_path,
-                            &entity.id,
+                            entity.id.as_str(),
                             allow_cross_file,
                             allow_implicit_instance_member_receiver,
-                            &file_lookup,
-                            &mut lookup_cache,
                         );
+                        let resolution = if let Some(cache_key) = cache_key {
+                            if let Some((_, cached)) = last_resolution
+                                .as_ref()
+                                .filter(|(last_key, _)| *last_key == cache_key)
+                            {
+                                cached.clone()
+                            } else {
+                                let resolved = resolve_ref(
+                                    ast_ref,
+                                    scope_idx,
+                                    &scopes,
+                                    &symbol_table,
+                                    &class_members,
+                                    &owner_members,
+                                    &local_import_by_name,
+                                    &instance_attr_types,
+                                    entity_map,
+                                    &swift_call_signatures,
+                                    file_path,
+                                    &entity.id,
+                                    allow_cross_file,
+                                    allow_implicit_instance_member_receiver,
+                                    &file_lookup,
+                                    &mut lookup_cache,
+                                );
+                                last_resolution = Some((cache_key, resolved.clone()));
+                                resolved
+                            }
+                        } else {
+                            resolve_ref(
+                                ast_ref,
+                                scope_idx,
+                                &scopes,
+                                &symbol_table,
+                                &class_members,
+                                &owner_members,
+                                &local_import_by_name,
+                                &instance_attr_types,
+                                entity_map,
+                                &swift_call_signatures,
+                                file_path,
+                                &entity.id,
+                                allow_cross_file,
+                                allow_implicit_instance_member_receiver,
+                                &file_lookup,
+                                &mut lookup_cache,
+                            )
+                        };
 
                         if let Some((target_id, ref_type, method)) = resolution {
                             if target_id != entity.id {
@@ -1142,8 +1273,8 @@ fn resolve_with_scopes_full_inner(
     }
 
     // Deduplicate edges
-    let mut seen: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::with_capacity(all_edges.len());
+    let mut seen: HashSet<(String, String)> =
+        HashSet::with_capacity_and_hasher(all_edges.len(), Default::default());
     let deduped_edges: Vec<(String, String, RefType)> = {
         let mut result = Vec::with_capacity(all_edges.len());
         for edge in all_edges {
@@ -1269,7 +1400,7 @@ fn build_descendant_ranges_by_entity(
     file_entities: &[&SemanticEntity],
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, Vec<(usize, usize)>> {
-    let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
     let mut sorted_entities = file_entities.to_vec();
     sorted_entities.sort_by(|left, right| {
         left.start_line
@@ -1293,7 +1424,7 @@ fn build_descendant_ranges_by_entity(
 
         let child_range = (entity.start_line.saturating_sub(1), entity.end_line);
         let mut current = entity.parent_id.as_deref();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         while let Some(parent_id) = current {
             if !visited.insert(parent_id.to_string()) {
                 break;
@@ -1458,11 +1589,11 @@ fn build_scopes_from_ast(
                     let idx = scopes.len();
                     scopes.push(Scope {
                         parent: Some(current_scope),
-                        defs: HashMap::new(),
-                        bindings: HashSet::new(),
-                        binding_rows: HashMap::new(),
-                        types: HashMap::new(),
-                        pending_call_types: HashMap::new(),
+                        defs: HashMap::default(),
+                        bindings: HashSet::default(),
+                        binding_rows: HashMap::default(),
+                        types: HashMap::default(),
+                        pending_call_types: HashMap::default(),
                         owner_id: Some(ce.id.clone()),
                         kind: "class",
                     });
@@ -1486,11 +1617,11 @@ fn build_scopes_from_ast(
                 let class_scope_idx = scopes.len();
                 scopes.push(Scope {
                     parent: Some(current_scope),
-                    defs: HashMap::new(),
-                    bindings: HashSet::new(),
-                    binding_rows: HashMap::new(),
-                    types: HashMap::new(),
-                    pending_call_types: HashMap::new(),
+                    defs: HashMap::default(),
+                    bindings: HashSet::default(),
+                    binding_rows: HashMap::default(),
+                    types: HashMap::default(),
+                    pending_call_types: HashMap::default(),
                     owner_id: None,
                     kind: "class",
                 });
@@ -1509,11 +1640,11 @@ fn build_scopes_from_ast(
             let mod_scope_idx = scopes.len();
             scopes.push(Scope {
                 parent: Some(current_scope),
-                defs: HashMap::new(),
-                bindings: HashSet::new(),
-                binding_rows: HashMap::new(),
-                types: HashMap::new(),
-                pending_call_types: HashMap::new(),
+                defs: HashMap::default(),
+                bindings: HashSet::default(),
+                binding_rows: HashMap::default(),
+                types: HashMap::default(),
+                pending_call_types: HashMap::default(),
                 owner_id: None,
                 kind: "module",
             });
@@ -1579,11 +1710,11 @@ fn build_scopes_from_ast(
             let func_scope_idx = scopes.len();
             scopes.push(Scope {
                 parent: Some(parent_scope),
-                defs: HashMap::new(),
-                bindings: HashSet::new(),
-                binding_rows: HashMap::new(),
-                types: HashMap::new(),
-                pending_call_types: HashMap::new(),
+                defs: HashMap::default(),
+                bindings: HashSet::default(),
+                binding_rows: HashMap::default(),
+                types: HashMap::default(),
+                pending_call_types: HashMap::default(),
                 owner_id: None,
                 kind: "function",
             });
@@ -2458,7 +2589,7 @@ pub(crate) fn build_go_pkg_index(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, Vec<(String, String)>> {
-    let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::default();
     for (name, target_ids) in symbol_table.iter() {
         for target_id in target_ids {
             if let Some(entity) = entity_map.get(target_id) {
@@ -3375,7 +3506,7 @@ fn extract_init_params(
     func_node: tree_sitter::Node,
     source: &[u8],
 ) -> HashMap<String, Option<String>> {
-    let mut params = HashMap::new();
+    let mut params = HashMap::default();
     if let Some(params_node) = func_node.child_by_field_name("parameters") {
         let mut cursor = params_node.walk();
         for child in params_node.named_children(&mut cursor) {
@@ -3508,7 +3639,7 @@ fn infer_constructor_param_types(
     let local_results: Vec<HashMap<(String, String), String>> = maybe_par_iter!(parsed_files)
         .map(|(_file_path, content, tree)| {
             let source = content.as_bytes();
-            let mut local_attr_types: HashMap<(String, String), String> = HashMap::new();
+            let mut local_attr_types: HashMap<(String, String), String> = HashMap::default();
             scan_constructor_calls(
                 tree.root_node(),
                 source,
@@ -3534,7 +3665,7 @@ fn deterministic_return_types_by_name(
     return_type_map: &HashMap<String, String>,
     symbol_table: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, String> {
-    let mut by_name = HashMap::with_capacity(return_type_map.len());
+    let mut by_name = HashMap::with_capacity_and_hasher(return_type_map.len(), Default::default());
     for (name, target_ids) in symbol_table {
         if let Some(return_type) = target_ids
             .iter()
@@ -3549,7 +3680,8 @@ fn deterministic_return_types_by_name(
 fn build_attr_to_param_index(
     attr_to_param: &HashMap<(String, String), String>,
 ) -> AttrToParamIndex<'_> {
-    let mut index: AttrToParamIndex<'_> = HashMap::with_capacity(attr_to_param.len());
+    let mut index: AttrToParamIndex<'_> =
+        HashMap::with_capacity_and_hasher(attr_to_param.len(), Default::default());
     for ((class_name, attr_name), param_name) in attr_to_param {
         index
             .entry((class_name.as_str(), param_name.as_str()))
@@ -3726,7 +3858,7 @@ fn build_ts_default_export_table(
             })
             .collect();
 
-    let mut default_exports = HashMap::new();
+    let mut default_exports = HashMap::default();
     let mut re_exports = Vec::new();
     for (default_export, file_re_exports) in per_file {
         if let Some((file_path, target_id)) = default_export {
@@ -3806,7 +3938,7 @@ fn build_top_level_entity_index(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> TopLevelEntityIndex {
-    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::default();
 
     for (name, target_ids) in symbol_table {
         for target_id in target_ids {
@@ -4624,6 +4756,7 @@ fn register_ts_namespace_import<'a>(
                     content_by_file
                         .get(candidate_file)
                         .map(|content| js_ts_named_exports_from_content(content))
+                        .map(|names| names.into_iter().collect())
                         .unwrap_or_default(),
                 )
             })
@@ -4779,7 +4912,7 @@ fn build_swift_call_signatures(
     entity_ranges: &HashMap<String, Vec<(usize, usize, String)>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, SwiftCallSignature> {
-    let mut signatures = HashMap::new();
+    let mut signatures = HashMap::default();
 
     for (file_path, content, tree) in parsed_files {
         if !file_path.ends_with(".swift") {
@@ -5588,7 +5721,7 @@ fn resolve_ref(
             argument_labels,
         } => {
             // Strip prefix operators like ! (Swift: `!dog.validate()`)
-            let receiver = raw_receiver.trim_start_matches('!').trim_start_matches('~');
+            let receiver = normalized_method_receiver(raw_receiver);
             if receiver == "self" || receiver == "this" {
                 // self.method() -> find in enclosing class
                 let mut idx = scope_idx;
@@ -6157,8 +6290,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolution_cache_key_includes_resolution_context() {
+        let ast_ref = AstRef {
+            kind: AstRefKind::Call {
+                name: "load".to_string(),
+                argument_labels: Some(vec![Some("id".to_string())]),
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 4,
+        };
+
+        let base = resolution_cache_key(&ast_ref, 1, "entity_a", true, false);
+
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 2, "entity_a", true, false)
+        );
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 1, "entity_b", true, false)
+        );
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 1, "entity_a", false, false)
+        );
+
+        let method_ref = AstRef {
+            kind: AstRefKind::MethodCall {
+                receiver: "client".to_string(),
+                method: "load".to_string(),
+                argument_labels: None,
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 11,
+        };
+
+        assert_ne!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&method_ref, 1, "entity_a", false, false)
+        );
+        assert_ne!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&method_ref, 1, "entity_a", true, true)
+        );
+
+        let prefixed_method_ref = AstRef {
+            kind: AstRefKind::MethodCall {
+                receiver: "!client".to_string(),
+                method: "load".to_string(),
+                argument_labels: None,
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 12,
+        };
+
+        assert_eq!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&prefixed_method_ref, 1, "entity_a", true, false)
+        );
+    }
+
+    #[test]
     fn return_type_name_lookup_uses_symbol_table_order() {
-        let mut return_type_map = HashMap::new();
+        let mut return_type_map = HashMap::default();
         return_type_map.insert(
             "z_backup.py::function::make_conn".to_string(),
             "Backup".to_string(),
@@ -6168,7 +6365,7 @@ mod tests {
             "Primary".to_string(),
         );
 
-        let mut symbol_table = HashMap::new();
+        let mut symbol_table = HashMap::default();
         symbol_table.insert(
             "make_conn".to_string(),
             vec![
@@ -6190,11 +6387,11 @@ mod tests {
         let first_id = "pkg/foo/a.go::function::zeta".to_string();
         let second_id = "pkg/foo/b.go::function::alpha".to_string();
 
-        let mut symbol_table = HashMap::new();
+        let mut symbol_table = HashMap::default();
         symbol_table.insert("zeta".to_string(), vec![first_id.clone()]);
         symbol_table.insert("alpha".to_string(), vec![second_id.clone()]);
 
-        let mut entity_map = HashMap::new();
+        let mut entity_map = HashMap::default();
         entity_map.insert(
             first_id.clone(),
             EntityInfo {

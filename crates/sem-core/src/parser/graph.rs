@@ -7,14 +7,16 @@
 //!
 //! This enables impact analysis: "if I change entity X, what else is affected?"
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
 use std::io::BufRead;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use regex::Regex;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 
 /// Helper macro to select parallel or sequential iteration based on feature flag.
@@ -66,8 +68,8 @@ fn build_child_ranges_by_parent<'a>(
         .iter()
         .map(|entity| (entity.id.as_str(), entity))
         .collect();
-    let mut line_starts_by_parent: HashMap<&'a str, Vec<usize>> = HashMap::new();
-    let mut child_ranges_by_parent: HashMap<&'a str, Vec<ChildRange<'a>>> = HashMap::new();
+    let mut line_starts_by_parent: HashMap<&'a str, Vec<usize>> = HashMap::default();
+    let mut child_ranges_by_parent: HashMap<&'a str, Vec<ChildRange<'a>>> = HashMap::default();
 
     for child in entities {
         let Some(parent_id) = child.parent_id.as_deref() else {
@@ -298,13 +300,13 @@ pub enum RefType {
 #[derive(Debug)]
 pub struct EntityGraph {
     /// All entities indexed by ID
-    pub entities: HashMap<String, EntityInfo>,
+    pub entities: EntityInfoMap,
     /// Edges: from_entity → [(to_entity, ref_type)]
     pub edges: Vec<EntityRef>,
     /// Reverse index: entity_id → entities that reference it
-    pub dependents: HashMap<String, Vec<String>>,
+    pub dependents: EntityAdjacencyMap,
     /// Forward index: entity_id → entities it references
-    pub dependencies: HashMap<String, Vec<String>>,
+    pub dependencies: EntityAdjacencyMap,
 }
 
 /// Metadata describing repairs made during an incremental graph build.
@@ -328,6 +330,9 @@ pub struct EntityInfo {
     pub start_line: usize,
     pub end_line: usize,
 }
+
+pub type EntityInfoMap = StdHashMap<String, EntityInfo>;
+pub type EntityAdjacencyMap = StdHashMap<String, Vec<String>>;
 
 fn sort_symbol_table_targets_by_source(
     symbol_table: &mut HashMap<String, Vec<String>>,
@@ -362,7 +367,8 @@ fn dedupe_resolved_edges(
     combined: Vec<(String, String, RefType)>,
 ) -> Vec<(String, String, RefType)> {
     let mut keep = vec![false; combined.len()];
-    let mut seen_edges: HashSet<(&str, &str)> = HashSet::with_capacity(combined.len());
+    let mut seen_edges: HashSet<(&str, &str)> =
+        HashSet::with_capacity_and_hasher(combined.len(), Default::default());
     for (index, (from_entity, to_entity, _)) in combined.iter().enumerate() {
         if seen_edges.insert((from_entity.as_str(), to_entity.as_str())) {
             keep[index] = true;
@@ -375,6 +381,34 @@ fn dedupe_resolved_edges(
         .enumerate()
         .filter_map(|(index, edge)| keep[index].then_some(edge))
         .collect()
+}
+
+fn sort_resolved_refs(refs: &mut [(String, String, RefType)]) {
+    refs.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| ref_type_sort_key(&left.2).cmp(&ref_type_sort_key(&right.2)))
+    });
+}
+
+fn sort_entity_refs(refs: &mut [EntityRef]) {
+    refs.sort_by(|left, right| {
+        left.from_entity
+            .cmp(&right.from_entity)
+            .then_with(|| left.to_entity.cmp(&right.to_entity))
+            .then_with(|| {
+                ref_type_sort_key(&left.ref_type).cmp(&ref_type_sort_key(&right.ref_type))
+            })
+    });
+}
+
+fn ref_type_sort_key(ref_type: &RefType) -> u8 {
+    match ref_type {
+        RefType::Calls => 0,
+        RefType::Imports => 1,
+        RefType::TypeRef => 2,
+    }
 }
 
 #[derive(Debug)]
@@ -411,7 +445,7 @@ impl FileReferenceIndex {
     fn from_stripped(stripped: &str, extra_ident_chars: &'static [char]) -> Self {
         let mut index = Self {
             tokens: Vec::new(),
-            token_ids: HashMap::new(),
+            token_ids: HashMap::default(),
             lines: Vec::new(),
         };
         let lines = stripped
@@ -424,7 +458,7 @@ impl FileReferenceIndex {
 
     fn dot_chains_in_ranges(&self, ranges: &[(usize, usize)]) -> Vec<(&str, &str)> {
         let mut chains = Vec::new();
-        let mut seen: HashSet<(u32, u32)> = HashSet::new();
+        let mut seen: HashSet<(u32, u32)> = HashSet::default();
         for &(start_line, end_line) in ranges {
             for line in self.line_range(start_line, end_line) {
                 for (receiver, member) in &line.dot_chains {
@@ -444,7 +478,7 @@ impl FileReferenceIndex {
         own_name: &str,
     ) -> Vec<(&str, RefType)> {
         let mut refs = Vec::new();
-        let mut seen: HashMap<u32, u8> = HashMap::new();
+        let mut seen: HashMap<u32, u8> = HashMap::default();
         for &(start_line, end_line) in ranges {
             for line in self.line_range(start_line, end_line) {
                 for word in &line.words {
@@ -511,7 +545,7 @@ impl LineReferenceIndex {
         extra_ident_chars: &'static [char],
     ) -> Option<Self> {
         let mut words = Vec::new();
-        let mut seen_words: HashSet<u32> = HashSet::new();
+        let mut seen_words: HashSet<u32> = HashSet::default();
         let import_like = {
             let trimmed = line.trim();
             trimmed.starts_with("import ")
@@ -717,7 +751,7 @@ fn resolve_references_with_file_indexes<'a>(
     needs_resolution: Option<&HashSet<&'a str>>,
     context: &ReferenceResolutionContext<'a>,
 ) -> Vec<(String, String, RefType)> {
-    let mut entities_by_file: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::new();
+    let mut entities_by_file: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::default();
     for entity in all_entities {
         if needs_resolution
             .as_ref()
@@ -794,7 +828,7 @@ fn resolve_scopes_in_file_chunks(
     HashMap<String, HashSet<String>>,
 ) {
     let mut all_edges = Vec::new();
-    let mut all_consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut all_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
     for chunk in file_paths.chunks(SCOPE_RESOLVE_FILE_CHUNK_SIZE) {
         if !chunk.iter().any(|file_path| {
@@ -1071,9 +1105,10 @@ fn resolve_entity_references(
 
 impl EntityGraph {
     /// Reconstruct an EntityGraph from pre-loaded parts (e.g. from a cache).
-    pub fn from_parts(entities: HashMap<String, EntityInfo>, edges: Vec<EntityRef>) -> Self {
-        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+    pub fn from_parts(entities: EntityInfoMap, mut edges: Vec<EntityRef>) -> Self {
+        sort_entity_refs(&mut edges);
+        let mut dependents: EntityAdjacencyMap = StdHashMap::new();
+        let mut dependencies: EntityAdjacencyMap = StdHashMap::new();
         for edge in &edges {
             dependents
                 .entry(edge.to_entity.clone())
@@ -1138,17 +1173,19 @@ impl EntityGraph {
         // Pass A: Build all lookup structures in a single pass over all_entities.
         // This merges what was previously 6 separate O(E) iterations.
         let mut symbol_table: HashMap<String, Vec<String>> =
-            HashMap::with_capacity(all_entities.len());
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
         let mut entity_map: HashMap<String, EntityInfo> =
-            HashMap::with_capacity(all_entities.len());
-        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
-        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-        let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::default();
+        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
+        let mut class_child_names: HashSet<(&str, &str)> = HashSet::default();
         let child_ranges_by_parent = build_child_ranges_by_parent(&all_entities);
-        let mut class_entity_names: HashSet<&str> = HashSet::new();
-        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::new();
-        let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
-        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        let mut class_entity_names: HashSet<&str> = HashSet::default();
+        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::default();
+        let mut id_to_name: HashMap<&str, &str> =
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
+            HashMap::default();
 
         for entity in &all_entities {
             symbol_table
@@ -1196,10 +1233,10 @@ impl EntityGraph {
 
         // Pass B: Build enclosing_class, class_members, and scope_class_members
         // (depends on id_to_name, class_entity_names, and entity_map from Pass A)
-        let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
-        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut enclosing_class: HashMap<&str, &str> = HashMap::default();
+        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
 
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
@@ -1252,7 +1289,7 @@ impl EntityGraph {
         // Build owned Go package index for scope resolver
         let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
             if file_paths.iter().any(|f| f.ends_with(".go")) {
-                let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::default();
                 for (name, target_ids) in symbol_table.iter() {
                     for target_id in target_ids {
                         if let Some(entity) = entity_map.get(target_id) {
@@ -1288,7 +1325,7 @@ impl EntityGraph {
                 }
                 idx
             } else {
-                HashMap::new()
+                HashMap::default()
             };
 
         let pre_built = scope_resolve::PreBuiltLookups {
@@ -1328,7 +1365,7 @@ impl EntityGraph {
                 &import_table,
             )
         } else {
-            (vec![], HashMap::new())
+            (vec![], HashMap::default())
         };
 
         let imports_by_file = build_imports_by_file(&import_table);
@@ -1359,12 +1396,13 @@ impl EntityGraph {
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
-        let all_resolved = dedupe_resolved_edges(combined);
+        let mut all_resolved = dedupe_resolved_edges(combined);
+        sort_resolved_refs(&mut all_resolved);
 
         // Build edge indexes from resolved references
         let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
-        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
+        let mut dependencies: HashMap<String, Vec<String>> = HashMap::default();
 
         for (from_entity, to_entity, ref_type) in all_resolved {
             dependents
@@ -1383,10 +1421,10 @@ impl EntityGraph {
         }
 
         let graph = EntityGraph {
-            entities: entity_map,
+            entities: entity_map.into_iter().collect(),
             edges,
-            dependents,
-            dependencies,
+            dependents: dependents.into_iter().collect(),
+            dependencies: dependencies.into_iter().collect(),
         };
 
         (graph, all_entities)
@@ -1435,17 +1473,19 @@ impl EntityGraph {
         resolve_go_method_parent_ids(&mut all_entities);
 
         let mut symbol_table: HashMap<String, Vec<String>> =
-            HashMap::with_capacity(all_entities.len());
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
         let mut entity_map: HashMap<String, EntityInfo> =
-            HashMap::with_capacity(all_entities.len());
-        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::new();
-        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-        let mut class_child_names: HashSet<(&str, &str)> = HashSet::new();
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::default();
+        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
+        let mut class_child_names: HashSet<(&str, &str)> = HashSet::default();
         let child_ranges_by_parent = build_child_ranges_by_parent(&all_entities);
-        let mut class_entity_names: HashSet<&str> = HashSet::new();
-        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::new();
-        let mut id_to_name: HashMap<&str, &str> = HashMap::with_capacity(all_entities.len());
-        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        let mut class_entity_names: HashSet<&str> = HashSet::default();
+        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::default();
+        let mut id_to_name: HashMap<&str, &str> =
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
+            HashMap::default();
 
         for entity in &all_entities {
             symbol_table
@@ -1491,10 +1531,10 @@ impl EntityGraph {
             ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
         }
 
-        let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
-        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut enclosing_class: HashMap<&str, &str> = HashMap::default();
+        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
 
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
@@ -1533,9 +1573,9 @@ impl EntityGraph {
         sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
         let symbol_table = Arc::new(symbol_table);
 
-        let mut needs_resolution: HashSet<String> = HashSet::new();
+        let mut needs_resolution: HashSet<String> = HashSet::default();
         let mut resolve_file_paths: Vec<String> = Vec::new();
-        let mut resolve_file_set: HashSet<String> = HashSet::new();
+        let mut resolve_file_set: HashSet<String> = HashSet::default();
         let mut entity_ids: Vec<&String> = entity_map.keys().collect();
         entity_ids.sort_unstable();
         for entity_id in entity_ids {
@@ -1554,10 +1594,10 @@ impl EntityGraph {
         if needs_resolution.is_empty() {
             return (
                 EntityGraph {
-                    entities: entity_map,
+                    entities: entity_map.into_iter().collect(),
                     edges: Vec::new(),
-                    dependents: HashMap::new(),
-                    dependencies: HashMap::new(),
+                    dependents: StdHashMap::new(),
+                    dependencies: StdHashMap::new(),
                 },
                 all_entities,
             );
@@ -1608,7 +1648,7 @@ impl EntityGraph {
             if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
                 scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
             } else {
-                HashMap::new()
+                HashMap::default()
             };
 
         let pre_built = scope_resolve::PreBuiltLookups {
@@ -1634,7 +1674,7 @@ impl EntityGraph {
             );
             (result.edges, result.consumed_words)
         } else {
-            (vec![], HashMap::new())
+            (vec![], HashMap::default())
         };
 
         let imports_by_file = build_imports_by_file(&import_table);
@@ -1670,11 +1710,12 @@ impl EntityGraph {
             .collect();
         combined.extend(export_edges);
         combined.extend(resolved_refs);
-        let all_resolved = dedupe_resolved_edges(combined);
+        let mut all_resolved = dedupe_resolved_edges(combined);
+        sort_resolved_refs(&mut all_resolved);
 
         let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
-        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
+        let mut dependencies: HashMap<String, Vec<String>> = HashMap::default();
 
         for (from_entity, to_entity, ref_type) in all_resolved {
             dependents
@@ -1694,10 +1735,10 @@ impl EntityGraph {
 
         (
             EntityGraph {
-                entities: entity_map,
+                entities: entity_map.into_iter().collect(),
                 edges,
-                dependents,
-                dependencies,
+                dependents: dependents.into_iter().collect(),
+                dependencies: dependencies.into_iter().collect(),
             },
             all_entities,
         )
@@ -1817,8 +1858,8 @@ impl EntityGraph {
             .collect();
 
         // Classify new stale-file entities
-        let mut truly_changed_ids: HashSet<String> = HashSet::new();
-        let mut content_clean_ids: HashSet<String> = HashSet::new();
+        let mut truly_changed_ids: HashSet<String> = HashSet::default();
+        let mut content_clean_ids: HashSet<String> = HashSet::default();
         for entity in all_entities
             .iter()
             .filter(|e| stale_set.contains(e.file_path.as_str()))
@@ -1847,9 +1888,9 @@ impl EntityGraph {
             .collect();
 
         let mut symbol_table: HashMap<String, Vec<String>> =
-            HashMap::with_capacity(all_entities.len());
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
         let mut entity_map: HashMap<String, EntityInfo> =
-            HashMap::with_capacity(all_entities.len());
+            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
 
         for entity in &all_entities {
             symbol_table
@@ -1883,8 +1924,10 @@ impl EntityGraph {
             .collect();
         let current_entity_ids: HashSet<&str> =
             all_entities.iter().map(|e| e.id.as_str()).collect();
-        let mut stale_or_cached_stale_entity_ids: HashSet<&str> =
-            HashSet::with_capacity(stale_entity_ids.len() + stale_cached_entity_ids.len());
+        let mut stale_or_cached_stale_entity_ids: HashSet<&str> = HashSet::with_capacity_and_hasher(
+            stale_entity_ids.len() + stale_cached_entity_ids.len(),
+            Default::default(),
+        );
         stale_or_cached_stale_entity_ids.extend(stale_entity_ids.iter().copied());
         stale_or_cached_stale_entity_ids.extend(stale_cached_entity_ids.iter().copied());
 
@@ -1894,8 +1937,8 @@ impl EntityGraph {
         }) || !deleted_ids.is_empty();
 
         // Find clean entities whose cached outgoing edges are invalidated by stale targets.
-        let mut affected_clean_ids: HashSet<String> = HashSet::new();
-        let mut affected_clean_file_paths: HashSet<&str> = HashSet::new();
+        let mut affected_clean_ids: HashSet<String> = HashSet::default();
+        let mut affected_clean_file_paths: HashSet<&str> = HashSet::default();
         for edge in &cached_edges {
             let to_truly_changed = truly_changed_ids.contains(&edge.to_entity)
                 || deleted_ids.contains(edge.to_entity.as_str());
@@ -1982,8 +2025,8 @@ impl EntityGraph {
             None
         };
 
-        let mut new_stale_entity_ids: HashSet<&str> = HashSet::new();
-        let mut new_stale_names: HashSet<&str> = HashSet::new();
+        let mut new_stale_entity_ids: HashSet<&str> = HashSet::default();
+        let mut new_stale_names: HashSet<&str> = HashSet::default();
         for entity in &all_entities {
             if stale_set.contains(entity.file_path.as_str())
                 && !cached_hashes.contains_key(entity.id.as_str())
@@ -2009,7 +2052,7 @@ impl EntityGraph {
                 .iter()
                 .map(|(file_path, _)| *file_path)
                 .collect();
-            let mut clean_entities_mentioning_new_stale_names: HashSet<&str> = HashSet::new();
+            let mut clean_entities_mentioning_new_stale_names: HashSet<&str> = HashSet::default();
             for entity in all_entities
                 .iter()
                 .filter(|entity| !stale_set.contains(entity.file_path.as_str()))
@@ -2048,7 +2091,7 @@ impl EntityGraph {
                     Some((file_path, tokens))
                 })
                 .collect();
-            let mut new_stale_import_refs_by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+            let mut new_stale_import_refs_by_file: HashMap<&str, Vec<&str>> = HashMap::default();
             for (file_path, local_name) in &new_stale_import_refs {
                 new_stale_import_refs_by_file
                     .entry(*file_path)
@@ -2241,7 +2284,7 @@ impl EntityGraph {
                     .map(|pid| (pid.as_str(), e.id.as_str()))
             })
             .collect();
-        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
         for entity in &all_entities {
             if let Some(pid) = &entity.parent_id {
                 child_line_ranges
@@ -2281,11 +2324,12 @@ impl EntityGraph {
             .map(|e| (e.id.as_str(), e.name.as_str()))
             .collect();
 
-        let mut enclosing_class: HashMap<&str, &str> = HashMap::new();
-        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        let mut enclosing_class: HashMap<&str, &str> = HashMap::default();
+        let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
+            HashMap::default();
 
         for entity in &all_entities {
             scope_entity_ranges
@@ -2367,7 +2411,7 @@ impl EntityGraph {
                 if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
                     scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
                 } else {
-                    HashMap::new()
+                    HashMap::default()
                 };
             let pre_built = scope_resolve::PreBuiltLookups {
                 symbol_table: Arc::clone(&symbol_table),
@@ -2388,7 +2432,7 @@ impl EntityGraph {
             );
             (result.edges, result.consumed_words)
         } else {
-            (vec![], HashMap::new())
+            (vec![], HashMap::default())
         };
 
         let imports_by_file = build_imports_by_file(&import_table);
@@ -2419,14 +2463,14 @@ impl EntityGraph {
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
-        let all_resolved = dedupe_resolved_edges(combined);
+        let mut all_resolved = dedupe_resolved_edges(combined);
+        sort_resolved_refs(&mut all_resolved);
 
         // Build final edge list: kept edges + newly resolved edges
         let mut edges: Vec<EntityRef> = Vec::with_capacity(kept_edges.len() + all_resolved.len());
-        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
-        let mut kept_edge_pairs: HashSet<(&str, &str)> = HashSet::with_capacity(kept_edges.len());
+        let mut kept_edge_pairs: HashSet<(&str, &str)> =
+            HashSet::with_capacity_and_hasher(kept_edges.len(), Default::default());
         for edge in &kept_edges {
             kept_edge_pairs.insert((edge.from_entity.as_str(), edge.to_entity.as_str()));
         }
@@ -2440,29 +2484,11 @@ impl EntityGraph {
         }
         drop(kept_edge_pairs);
 
-        // Add kept cached edges
         for edge in kept_edges {
-            dependents
-                .entry(edge.to_entity.clone())
-                .or_default()
-                .push(edge.from_entity.clone());
-            dependencies
-                .entry(edge.from_entity.clone())
-                .or_default()
-                .push(edge.to_entity.clone());
             edges.push(edge);
         }
 
-        // Add newly resolved edges, dedup against kept edges
         for (from_entity, to_entity, ref_type) in new_edges {
-            dependents
-                .entry(to_entity.clone())
-                .or_default()
-                .push(from_entity.clone());
-            dependencies
-                .entry(from_entity.clone())
-                .or_default()
-                .push(to_entity.clone());
             edges.push(EntityRef {
                 from_entity,
                 to_entity,
@@ -2470,12 +2496,7 @@ impl EntityGraph {
             });
         }
 
-        let graph = EntityGraph {
-            entities: entity_map,
-            edges,
-            dependents,
-            dependencies,
-        };
+        let graph = EntityGraph::from_parts(entity_map.into_iter().collect(), edges);
 
         let mut recomputed_edge_source_ids: Vec<String> = needs_resolution
             .iter()
@@ -2529,7 +2550,7 @@ impl EntityGraph {
         entity_id: &str,
         max_depth: usize,
     ) -> Vec<(&EntityInfo, usize)> {
-        let mut visited: HashSet<&str> = HashSet::new();
+        let mut visited: HashSet<&str> = HashSet::default();
         let mut queue: std::collections::VecDeque<(&str, usize)> =
             std::collections::VecDeque::new();
         let mut result = Vec::new();
@@ -2565,7 +2586,7 @@ impl EntityGraph {
     /// Impact analysis with a cap on maximum nodes visited.
     /// Returns transitive dependents up to the cap. Uses borrowed strings.
     pub fn impact_analysis_capped(&self, entity_id: &str, max_visited: usize) -> Vec<&EntityInfo> {
-        let mut visited: HashSet<&str> = HashSet::new();
+        let mut visited: HashSet<&str> = HashSet::default();
         let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
         let mut result = Vec::new();
 
@@ -2602,7 +2623,7 @@ impl EntityGraph {
     /// Count transitive dependents without collecting them (faster for large graphs).
     /// Uses borrowed strings to avoid allocation overhead.
     pub fn impact_count(&self, entity_id: &str, max_count: usize) -> usize {
-        let mut visited: HashSet<&str> = HashSet::new();
+        let mut visited: HashSet<&str> = HashSet::default();
         let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
         let mut count = 0;
 
@@ -2640,7 +2661,7 @@ impl EntityGraph {
     pub fn filter_test_entities(
         &self,
         entities: &[crate::model::entity::SemanticEntity],
-    ) -> HashSet<String> {
+    ) -> StdHashSet<String> {
         self.filter_test_entities_with_custom_dirs(entities, &[])
     }
 
@@ -2650,8 +2671,8 @@ impl EntityGraph {
         &self,
         entities: &[crate::model::entity::SemanticEntity],
         custom_test_dirs: &[String],
-    ) -> HashSet<String> {
-        let mut test_ids = HashSet::new();
+    ) -> StdHashSet<String> {
+        let mut test_ids = StdHashSet::new();
         for entity in entities {
             if is_test_entity(entity, custom_test_dirs) {
                 test_ids.insert(entity.id.clone());
@@ -2702,7 +2723,7 @@ impl EntityGraph {
         root: &Path,
         registry: &ParserRegistry,
     ) {
-        let mut affected_files: HashSet<String> = HashSet::new();
+        let mut affected_files: HashSet<String> = HashSet::default();
         let mut new_entities: Vec<SemanticEntity> = Vec::new();
 
         for change in changed_files {
@@ -2866,7 +2887,7 @@ impl EntityGraph {
 
     /// Build a symbol table from all current entities.
     fn build_symbol_table(&self) -> HashMap<String, Vec<String>> {
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::default();
         let mut entities = self.entities.values().collect::<Vec<_>>();
         entities.sort_unstable_by(|left, right| {
             left.file_path
@@ -3033,69 +3054,26 @@ struct TsDefaultReExport {
     module_path: String,
 }
 
-fn build_ts_default_export_table(
-    file_paths: &[String],
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
-    content_map: &HashMap<&str, &str>,
-) -> TsDefaultExportTable {
-    // Per-file extraction is independent, so run it in parallel and merge. Each
-    // file contributes at most one default export (last name wins, as below) plus
-    // any default re-export records. Collecting preserves file order, so the merged
-    // result is identical to a sequential scan.
-    let per_file: Vec<(Option<(String, String)>, Vec<TsDefaultReExport>)> =
-        maybe_par_iter!(file_paths)
-            .filter_map(|file_path| {
-                if !is_js_ts_file(file_path) {
-                    return None;
-                }
-                let content = content_map.get(file_path.as_str()).copied()?;
+struct PendingDefaultImport {
+    file_path: String,
+    local_name: String,
+    module_path: String,
+}
 
-                let mut default_export: Option<(String, String)> = None;
-                for name in default_export_names_from_content(content) {
-                    let Some(target_ids) = symbol_table.get(name.as_str()) else {
-                        continue;
-                    };
-                    let target = target_ids.iter().find(|id| {
-                        entity_map.get(*id).map_or(false, |entity| {
-                            entity.file_path == *file_path && entity.parent_id.is_none()
-                        })
-                    });
-                    if let Some(target_id) = target {
-                        default_export = Some((file_path.clone(), target_id.clone()));
-                    }
-                }
+struct PendingNamespaceImport {
+    file_path: String,
+    alias: String,
+    module_path: String,
+}
 
-                let re_exports: Vec<TsDefaultReExport> = default_re_exports_from_content(content)
-                    .into_iter()
-                    .map(|(original_name, module_path)| TsDefaultReExport {
-                        file_path: file_path.clone(),
-                        original_name,
-                        module_path,
-                    })
-                    .collect();
-
-                Some((default_export, re_exports))
-            })
-            .collect();
-
-    let mut default_exports = HashMap::new();
-    let mut re_exports = Vec::new();
-    for (default_export, file_re_exports) in per_file {
-        if let Some((file_path, target_id)) = default_export {
-            default_exports.insert(file_path, target_id);
-        }
-        re_exports.extend(file_re_exports);
-    }
-
-    resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
-
-    let sorted_files = sorted_default_export_files(&default_exports);
-
-    TsDefaultExportTable {
-        exports_by_file: default_exports,
-        sorted_files,
-    }
+struct ImportFileScan {
+    default_export: Option<(String, String)>,
+    default_re_exports: Vec<TsDefaultReExport>,
+    named_exports: Option<(String, HashSet<String>)>,
+    local_imports: Vec<((String, String), String)>,
+    default_imports: Vec<PendingDefaultImport>,
+    namespace_imports: Vec<PendingNamespaceImport>,
+    re_export_imports: Vec<((String, String), String)>,
 }
 
 fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec<String> {
@@ -3107,7 +3085,7 @@ fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec
 fn build_ts_top_level_entity_table(
     entity_map: &HashMap<String, EntityInfo>,
 ) -> TsTopLevelEntityTable {
-    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::default();
     for entity in entity_map.values() {
         if !is_js_ts_file(&entity.file_path) || entity.parent_id.is_some() {
             continue;
@@ -3310,6 +3288,377 @@ fn parse_js_ts_import_specifier(name_part: &str) -> Option<(&str, &str)> {
     Some((original, local))
 }
 
+fn import_source_content<'a>(
+    root: &Path,
+    pre_parsed_content: &HashMap<&'a str, &'a str>,
+    file_path: &str,
+) -> Option<Cow<'a, str>> {
+    if let Some(content) = pre_parsed_content.get(file_path) {
+        Some(Cow::Borrowed(*content))
+    } else {
+        std::fs::read_to_string(root.join(file_path))
+            .ok()
+            .map(Cow::Owned)
+    }
+}
+
+fn same_file_set(left: &[String], right: &[String]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let left_set: HashSet<&str> = left.iter().map(String::as_str).collect();
+    right
+        .iter()
+        .all(|file_path| left_set.contains(file_path.as_str()))
+}
+
+fn scan_import_file(
+    file_path: &str,
+    content: &str,
+    parse_imports: bool,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    clojure_ns_index: &ClojureNsIndex,
+) -> ImportFileScan {
+    let mut scan = ImportFileScan {
+        default_export: None,
+        default_re_exports: Vec::new(),
+        named_exports: None,
+        local_imports: Vec::new(),
+        default_imports: Vec::new(),
+        namespace_imports: Vec::new(),
+        re_export_imports: Vec::new(),
+    };
+
+    let is_js_ts = is_js_ts_file(file_path);
+    if is_js_ts {
+        for name in default_export_names_from_content(content) {
+            let Some(target_ids) = symbol_table.get(name.as_str()) else {
+                continue;
+            };
+            let target = target_ids.iter().find(|id| {
+                entity_map.get(*id).map_or(false, |entity| {
+                    entity.file_path == file_path && entity.parent_id.is_none()
+                })
+            });
+            if let Some(target_id) = target {
+                scan.default_export = Some((file_path.to_string(), target_id.clone()));
+            }
+        }
+
+        scan.default_re_exports = default_re_exports_from_content(content)
+            .into_iter()
+            .map(|(original_name, module_path)| TsDefaultReExport {
+                file_path: file_path.to_string(),
+                original_name,
+                module_path,
+            })
+            .collect();
+        scan.named_exports = Some((
+            file_path.to_string(),
+            js_ts_named_exports_from_content(content)
+                .into_iter()
+                .collect(),
+        ));
+    }
+
+    if !parse_imports {
+        return scan;
+    }
+
+    // Join multi-line Python imports into single logical lines.
+    let mut logical_lines: Vec<String> = Vec::new();
+    let mut current_line = String::new();
+    let mut in_parens = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if in_parens {
+            let clean = trimmed.trim_end_matches(|c: char| c == ')' || c == ',');
+            let clean = clean.split('#').next().unwrap_or(clean).trim();
+            if !clean.is_empty() && clean != "(" {
+                current_line.push_str(", ");
+                current_line.push_str(clean);
+            }
+            if trimmed.contains(')') {
+                in_parens = false;
+                logical_lines.push(std::mem::take(&mut current_line));
+            }
+        } else if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+            if trimmed.contains('(') && !trimmed.contains(')') {
+                in_parens = true;
+                let before_paren = trimmed.split('(').next().unwrap_or(trimmed);
+                current_line = before_paren.trim().to_string();
+                if let Some(after) = trimmed.split('(').nth(1) {
+                    let after = after.trim().trim_end_matches(')').trim();
+                    if !after.is_empty() {
+                        current_line.push(' ');
+                        current_line.push_str(after);
+                    }
+                }
+            } else {
+                logical_lines.push(trimmed.to_string());
+            }
+        }
+    }
+
+    for logical_line in &logical_lines {
+        if let Some(rest) = logical_line.strip_prefix("from ") {
+            let import_match = rest
+                .find(" import ")
+                .map(|pos| (pos, 8))
+                .or_else(|| rest.find(" import,").map(|pos| (pos, 8)));
+            if let Some((import_pos, skip)) = import_match {
+                let module_path = &rest[..import_pos];
+                let names_str = &rest[import_pos + skip..];
+
+                for name_part in names_str.split(',') {
+                    let name_part = name_part.trim();
+                    let imported_name = name_part.split_whitespace().next().unwrap_or(name_part);
+                    let imported_name =
+                        imported_name.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
+                    if imported_name.is_empty() {
+                        continue;
+                    }
+
+                    if let Some(target_ids) = symbol_table.get(imported_name) {
+                        let target = find_import_target(
+                            target_ids,
+                            module_path,
+                            file_path,
+                            &[".py"],
+                            entity_map,
+                        );
+                        if let Some(target_id) = target {
+                            scan.local_imports.push((
+                                (file_path.to_string(), imported_name.to_string()),
+                                target_id.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if is_js_ts {
+        static JS_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r#"import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#,
+            )
+            .unwrap()
+        });
+        static JS_DEFAULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r#"import\s+(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s*,\s*\{[^}]*\})?\s*from\s*['"]([^'"]+)['"]"#,
+            )
+            .unwrap()
+        });
+        static JS_REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+        });
+        static JS_NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]"#)
+                .unwrap()
+        });
+
+        for cap in JS_NAMED_RE.captures_iter(content) {
+            let names_str = cap.get(1).unwrap().as_str();
+            let module_path = cap.get(2).unwrap().as_str();
+
+            for name_part in names_str.split(',') {
+                let Some((original_name, local_name)) = parse_js_ts_import_specifier(name_part)
+                else {
+                    continue;
+                };
+
+                if let Some(target_ids) = symbol_table.get(original_name) {
+                    let target = find_import_target(
+                        target_ids,
+                        module_path,
+                        file_path,
+                        JS_TS_EXTENSIONS,
+                        entity_map,
+                    );
+                    if let Some(target_id) = target {
+                        scan.local_imports.push((
+                            (file_path.to_string(), local_name.to_string()),
+                            target_id.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for cap in JS_DEFAULT_RE.captures_iter(content) {
+            scan.default_imports.push(PendingDefaultImport {
+                file_path: file_path.to_string(),
+                local_name: cap.get(1).unwrap().as_str().to_string(),
+                module_path: cap.get(2).unwrap().as_str().to_string(),
+            });
+        }
+
+        for cap in JS_NAMESPACE_RE.captures_iter(content) {
+            scan.namespace_imports.push(PendingNamespaceImport {
+                file_path: file_path.to_string(),
+                alias: cap.get(1).unwrap().as_str().to_string(),
+                module_path: cap.get(2).unwrap().as_str().to_string(),
+            });
+        }
+
+        for cap in JS_REEXPORT_RE.captures_iter(content) {
+            let names_str = cap.get(1).unwrap().as_str();
+            let module_path = cap.get(2).unwrap().as_str();
+
+            for name_part in names_str.split(',') {
+                let Some((original_name, local_name)) = parse_js_ts_import_specifier(name_part)
+                else {
+                    continue;
+                };
+
+                if original_name == "default" {
+                    scan.default_imports.push(PendingDefaultImport {
+                        file_path: file_path.to_string(),
+                        local_name: local_name.to_string(),
+                        module_path: module_path.to_string(),
+                    });
+                } else if let Some(target_id) =
+                    symbol_table.get(original_name).and_then(|target_ids| {
+                        find_import_target(
+                            target_ids,
+                            module_path,
+                            file_path,
+                            JS_TS_EXTENSIONS,
+                            entity_map,
+                        )
+                        .cloned()
+                    })
+                {
+                    scan.re_export_imports
+                        .push(((file_path.to_string(), local_name.to_string()), target_id));
+                }
+            }
+        }
+    }
+
+    if file_path.ends_with(".rs") {
+        static RUST_USE_SIMPLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*;",
+            )
+            .unwrap()
+        });
+        static RUST_USE_GROUP_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\{([^}]+)\}\s*;").unwrap()
+        });
+        let mut local_import_table: HashMap<(String, String), String> = HashMap::default();
+
+        for cap in RUST_USE_SIMPLE_RE.captures_iter(content) {
+            let full_path_str = cap.get(1).unwrap().as_str();
+            let parts: Vec<&str> = full_path_str.split("::").collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let imported_name = parts[parts.len() - 1];
+            let source_module = if parts.len() >= 2 {
+                parts[parts.len() - 2]
+            } else {
+                parts[0]
+            };
+            resolve_rust_import(
+                file_path,
+                imported_name,
+                source_module,
+                symbol_table,
+                entity_map,
+                &mut local_import_table,
+            );
+        }
+
+        for cap in RUST_USE_GROUP_RE.captures_iter(content) {
+            let module_path = cap.get(1).unwrap().as_str();
+            let names_str = cap.get(2).unwrap().as_str();
+            let source_module = module_path.rsplit("::").next().unwrap_or(module_path);
+
+            for name_part in names_str.split(',') {
+                let name_part = name_part.trim();
+                let (original, local) = if let Some(pos) = name_part.find(" as ") {
+                    (&name_part[..pos], name_part[pos + 4..].trim())
+                } else {
+                    (name_part, name_part)
+                };
+                let original = original.trim();
+                let local = local.trim();
+                if original.is_empty() || local.is_empty() {
+                    continue;
+                }
+
+                resolve_rust_import(
+                    file_path,
+                    original,
+                    source_module,
+                    symbol_table,
+                    entity_map,
+                    &mut local_import_table,
+                );
+                if local != original {
+                    if let Some(target) = local_import_table
+                        .get(&(file_path.to_string(), original.to_string()))
+                        .cloned()
+                    {
+                        local_import_table
+                            .insert((file_path.to_string(), local.to_string()), target);
+                    }
+                }
+            }
+        }
+
+        scan.local_imports.extend(local_import_table);
+    }
+
+    let file_ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    if let Some(file_config) =
+        crate::parser::plugins::code::languages::get_language_config(file_ext)
+    {
+        if file_config.has_slash_qualified_refs() {
+            let clojure_stripped = strip_for_language(file_config.strip_strategy(), content);
+            for cap in CLOJURE_REFER_RE.captures_iter(&clojure_stripped) {
+                let ns_name = cap.get(1).unwrap().as_str();
+                let symbols_str = cap.get(2).unwrap().as_str();
+                for symbol in symbols_str.split_whitespace() {
+                    let symbol =
+                        symbol.trim_matches(|c: char| c == ',' || c == '(' || c == ')');
+                    if symbol.is_empty() {
+                        continue;
+                    }
+                    resolve_clojure_require(
+                        file_path,
+                        ns_name,
+                        symbol,
+                        symbol_table,
+                        entity_map,
+                        &mut scan.local_imports,
+                    );
+                }
+            }
+            for cap in CLOJURE_AS_RE.captures_iter(&clojure_stripped) {
+                let ns_name = cap.get(1).unwrap().as_str();
+                let alias = cap.get(2).unwrap().as_str();
+                resolve_clojure_as(
+                    file_path,
+                    ns_name,
+                    alias,
+                    clojure_ns_index,
+                    &mut scan.local_imports,
+                );
+            }
+        }
+    }
+
+    scan
+}
+
 /// Build import table: maps (file_path, imported_name) → target entity ID.
 ///
 /// Parses `from X import Y` / `import X` / `use X` style statements from entity content
@@ -3339,461 +3688,168 @@ fn build_import_table_with_default_export_paths(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
 ) -> HashMap<(String, String), String> {
-    // Build a content lookup from pre-parsed files to avoid re-reading from disk
-    let mut content_map: HashMap<&str, &str> = HashMap::new();
+    let mut pre_parsed_content_map: HashMap<&str, &str> = HashMap::default();
     if let Some(files) = pre_parsed_content {
-        content_map.extend(
+        pre_parsed_content_map.extend(
             files
                 .iter()
                 .map(|(fp, content, _)| (fp.as_str(), content.as_str())),
         );
     }
-    let mut owned_content: HashMap<String, String> = HashMap::new();
+    let import_source_set: HashSet<&str> = file_paths.iter().map(String::as_str).collect();
+    let clojure_ns_index = build_clojure_ns_index(entity_map);
     let mut content_file_set: HashSet<String> = file_paths.iter().cloned().collect();
-    if file_paths.len() == default_export_file_paths.len() {
+    let mut pre_scanned_files: HashMap<String, ImportFileScan> = HashMap::default();
+    if same_file_set(file_paths, default_export_file_paths) {
         content_file_set.extend(default_export_file_paths.iter().cloned());
-        for file_path in &content_file_set {
-            if file_path.ends_with(".go") || content_map.contains_key(file_path.as_str()) {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(root.join(file_path)) {
-                owned_content.insert(file_path.clone(), content);
-            }
-        }
     } else {
         let mut content_file_queue: Vec<String> = file_paths.to_vec();
         while let Some(file_path) = content_file_queue.pop() {
-            if !file_path.ends_with(".go")
-                && !content_map.contains_key(file_path.as_str())
-                && !owned_content.contains_key(&file_path)
-            {
-                if let Ok(content) = std::fs::read_to_string(root.join(&file_path)) {
-                    owned_content.insert(file_path.clone(), content);
-                }
+            if file_path.ends_with(".go") {
+                continue;
+            }
+            if pre_scanned_files.contains_key(file_path.as_str()) {
+                continue;
             }
 
-            let Some(content) = content_map
-                .get(file_path.as_str())
-                .copied()
-                .or_else(|| owned_content.get(&file_path).map(String::as_str))
+            let Some(content) = import_source_content(root, &pre_parsed_content_map, &file_path)
             else {
                 continue;
             };
             for imported_file in js_ts_import_source_files_from_content(
                 &file_path,
-                content,
+                content.as_ref(),
                 default_export_file_paths,
             ) {
                 if content_file_set.insert(imported_file.clone()) {
                     content_file_queue.push(imported_file);
                 }
             }
+            pre_scanned_files.insert(
+                file_path.clone(),
+                scan_import_file(
+                    &file_path,
+                    content.as_ref(),
+                    import_source_set.contains(file_path.as_str()),
+                    symbol_table,
+                    entity_map,
+                    &clojure_ns_index,
+                ),
+            );
         }
     }
-    content_map.extend(
-        owned_content
-            .iter()
-            .map(|(file_path, content)| (file_path.as_str(), content.as_str())),
-    );
     let mut content_file_paths: Vec<String> = content_file_set.into_iter().collect();
     content_file_paths.sort_unstable();
-    let ts_default_exports =
-        build_ts_default_export_table(&content_file_paths, symbol_table, entity_map, &content_map);
-    let ts_top_level_entities = OnceLock::new();
-    let ts_exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
-        Mutex::new(HashMap::new());
 
-    // Go imports are handled entirely by the scope resolver (which uses an indexed approach).
-    // We no longer need a go_pkg_index here since Go files are skipped below.
+    let mut scans: Vec<ImportFileScan> = if pre_scanned_files.is_empty() {
+        maybe_par_iter!(content_file_paths)
+            .filter_map(|file_path| {
+                if file_path.ends_with(".go") {
+                    return None;
+                }
 
-    let clojure_ns_index = build_clojure_ns_index(entity_map);
-
-    // Process files in parallel, each producing local import entries
-    let per_file_imports: Vec<Vec<((String, String), String)>> = maybe_par_iter!(file_paths)
-        .filter_map(|file_path| {
-            // Go imports are handled entirely by the scope resolver — skip here
+                let content = import_source_content(root, &pre_parsed_content_map, file_path)?;
+                Some(scan_import_file(
+                    file_path,
+                    content.as_ref(),
+                    import_source_set.contains(file_path.as_str()),
+                    symbol_table,
+                    entity_map,
+                    &clojure_ns_index,
+                ))
+            })
+            .collect()
+    } else {
+        let mut scans = Vec::with_capacity(content_file_paths.len());
+        for file_path in &content_file_paths {
             if file_path.ends_with(".go") {
-                return None;
+                continue;
+            }
+            if let Some(scan) = pre_scanned_files.remove(file_path.as_str()) {
+                scans.push(scan);
+                continue;
             }
 
-            let Some(content) = content_map.get(file_path.as_str()).copied() else {
-                return None;
+            let Some(content) = import_source_content(root, &pre_parsed_content_map, file_path)
+            else {
+                continue;
             };
+            scans.push(scan_import_file(
+                file_path,
+                content.as_ref(),
+                import_source_set.contains(file_path.as_str()),
+                symbol_table,
+                entity_map,
+                &clojure_ns_index,
+            ));
+        }
+        scans
+    };
 
-            let mut local_imports: Vec<((String, String), String)> = Vec::new();
+    let mut default_exports = HashMap::default();
+    let mut re_exports = Vec::new();
+    let mut named_exports_by_file: HashMap<String, HashSet<String>> = HashMap::default();
+    for scan in &mut scans {
+        if let Some((file_path, target_id)) = scan.default_export.take() {
+            default_exports.insert(file_path, target_id);
+        }
+        re_exports.append(&mut scan.default_re_exports);
+        if let Some((file_path, named_exports)) = scan.named_exports.take() {
+            named_exports_by_file.insert(file_path, named_exports);
+        }
+    }
+    resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
+    let ts_default_exports = TsDefaultExportTable {
+        sorted_files: sorted_default_export_files(&default_exports),
+        exports_by_file: default_exports,
+    };
+    let ts_top_level_entities = OnceLock::new();
 
-            // Join multi-line imports into single logical lines
-            // e.g. "from .cookies import (\n    foo,\n    bar,\n)" -> "from .cookies import foo, bar"
-            let mut logical_lines: Vec<String> = Vec::new();
-            let mut current_line = String::new();
-            let mut in_parens = false;
-
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if in_parens {
-                    // Strip parentheses and comments
-                    let clean = trimmed.trim_end_matches(|c: char| c == ')' || c == ',');
-                    let clean = clean.split('#').next().unwrap_or(clean).trim();
-                    if !clean.is_empty() && clean != "(" {
-                        current_line.push_str(", ");
-                        current_line.push_str(clean);
-                    }
-                    if trimmed.contains(')') {
-                        in_parens = false;
-                        logical_lines.push(std::mem::take(&mut current_line));
-                    }
-                } else if trimmed.starts_with("from ") && trimmed.contains(" import ") {
-                    if trimmed.contains('(') && !trimmed.contains(')') {
-                        // Multi-line import starts
-                        in_parens = true;
-                        // Take everything before the paren
-                        let before_paren = trimmed.split('(').next().unwrap_or(trimmed);
-                        current_line = before_paren.trim().to_string();
-                        // Also grab anything after the paren on this line
-                        if let Some(after) = trimmed.split('(').nth(1) {
-                            let after = after.trim().trim_end_matches(')').trim();
-                            if !after.is_empty() {
-                                current_line.push(' ');
-                                current_line.push_str(after);
-                            }
-                        }
-                    } else {
-                        logical_lines.push(trimmed.to_string());
-                    }
-                }
+    let mut import_table: HashMap<(String, String), String> = HashMap::default();
+    for scan in scans {
+        for (key, val) in scan.local_imports {
+            import_table.insert(key, val);
+        }
+        for pending in scan.default_imports {
+            if let Some(target_id) = resolve_default_export_target(
+                &ts_default_exports,
+                &pending.module_path,
+                &pending.file_path,
+            ) {
+                import_table.insert((pending.file_path, pending.local_name), target_id);
             }
-
-            for logical_line in &logical_lines {
-                if let Some(rest) = logical_line.strip_prefix("from ") {
-                    // Find " import " or " import," (multi-line imports join with comma)
-                    let import_match = rest.find(" import ")
-                        .map(|pos| (pos, 8))
-                        .or_else(|| rest.find(" import,").map(|pos| (pos, 8)));
-                    if let Some((import_pos, skip)) = import_match {
-                        let module_path = &rest[..import_pos];
-                        let names_str = &rest[import_pos + skip..];
-
-                        for name_part in names_str.split(',') {
-                            let name_part = name_part.trim();
-                            let imported_name = name_part.split_whitespace().next().unwrap_or(name_part);
-                            // Strip trailing parens/punctuation
-                            let imported_name = imported_name.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
-                            if imported_name.is_empty() {
-                                continue;
-                            }
-
-                            if let Some(target_ids) = symbol_table.get(imported_name) {
-                                let target = find_import_target(
-                                    target_ids,
-                                    module_path,
-                                    file_path,
-                                    &[".py"],
-                                    entity_map,
-                                );
-                                if let Some(target_id) = target {
-                                    local_imports.push((
-                                        (file_path.clone(), imported_name.to_string()),
-                                        target_id.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
+        }
+        for pending in scan.namespace_imports {
+            let ts_top_level_entities =
+                ts_top_level_entities.get_or_init(|| build_ts_top_level_entity_table(entity_map));
+            let Some(target_file) = find_import_file(
+                &ts_top_level_entities.sorted_files,
+                &pending.module_path,
+                &pending.file_path,
+                JS_TS_EXTENSIONS,
+            ) else {
+                continue;
+            };
+            let Some(entries) = ts_top_level_entities.entities_by_file.get(target_file) else {
+                continue;
+            };
+            let Some(exported_names) = named_exports_by_file.get(target_file) else {
+                continue;
+            };
+            for (name, target_id) in entries {
+                if !exported_names.contains(name) {
+                    continue;
                 }
+                import_table.insert(
+                    (
+                        pending.file_path.clone(),
+                        format!("{}.{}", pending.alias, name),
+                    ),
+                    target_id.clone(),
+                );
             }
-
-            // JS/TS imports: import { foo, bar as baz } from './module'
-            //                import Foo from './module'
-            let is_js_ts = is_js_ts_file(file_path);
-
-            if is_js_ts {
-                static JS_NAMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(
-                        r#"import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#,
-                    )
-                    .unwrap()
-                });
-                static JS_DEFAULT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(
-                        r#"import\s+(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s*,\s*\{[^}]*\})?\s*from\s*['"]([^'"]+)['"]"#,
-                    )
-                    .unwrap()
-                });
-                static JS_REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#)
-                        .unwrap()
-                });
-                static JS_NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    Regex::new(
-                        r#"import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]"#,
-                    )
-                    .unwrap()
-                });
-
-                for cap in JS_NAMED_RE.captures_iter(content) {
-                    let names_str = cap.get(1).unwrap().as_str();
-                    let module_path = cap.get(2).unwrap().as_str();
-
-                    for name_part in names_str.split(',') {
-                        let Some((original_name, local_name)) =
-                            parse_js_ts_import_specifier(name_part)
-                        else {
-                            continue;
-                        };
-
-                        if let Some(target_ids) = symbol_table.get(original_name) {
-                            let target = find_import_target(
-                                target_ids,
-                                module_path,
-                                file_path,
-                                JS_TS_EXTENSIONS,
-                                entity_map,
-                            );
-                            if let Some(target_id) = target {
-                                local_imports.push((
-                                    (file_path.clone(), local_name.to_string()),
-                                    target_id.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                for cap in JS_DEFAULT_RE.captures_iter(content) {
-                    let local_name = cap.get(1).unwrap().as_str();
-                    let module_path = cap.get(2).unwrap().as_str();
-
-                    if let Some(target_id) =
-                        resolve_default_export_target(&ts_default_exports, module_path, file_path)
-                    {
-                        local_imports.push((
-                            (file_path.clone(), local_name.to_string()),
-                            target_id,
-                        ));
-                    }
-                }
-
-                for cap in JS_NAMESPACE_RE.captures_iter(content) {
-                    let alias = cap.get(1).unwrap().as_str();
-                    let module_path = cap.get(2).unwrap().as_str();
-                    let ts_top_level_entities = ts_top_level_entities
-                        .get_or_init(|| build_ts_top_level_entity_table(entity_map));
-                    let Some(target_file) = find_import_file(
-                        &ts_top_level_entities.sorted_files,
-                        module_path,
-                        file_path,
-                        JS_TS_EXTENSIONS,
-                    ) else {
-                        continue;
-                    };
-                    let Some(entries) = ts_top_level_entities.entities_by_file.get(target_file)
-                    else {
-                        continue;
-                    };
-                    let exported_names = {
-                        let mut cache = ts_exported_names_by_file.lock().unwrap();
-                        cache
-                            .entry(target_file.to_string())
-                            .or_insert_with(|| {
-                                Arc::new(
-                                    content_map
-                                        .get(target_file)
-                                        .map(|content| js_ts_named_exports_from_content(content))
-                                        .unwrap_or_default(),
-                                )
-                            })
-                            .clone()
-                    };
-                    for (name, target_id) in entries {
-                        if !exported_names.contains(name) {
-                            continue;
-                        }
-                        local_imports.push((
-                            (file_path.clone(), format!("{alias}.{name}")),
-                            target_id.clone(),
-                        ));
-                    }
-                }
-
-                for cap in JS_REEXPORT_RE.captures_iter(content) {
-                    let names_str = cap.get(1).unwrap().as_str();
-                    let module_path = cap.get(2).unwrap().as_str();
-
-                    for name_part in names_str.split(',') {
-                        let Some((original_name, local_name)) =
-                            parse_js_ts_import_specifier(name_part)
-                        else {
-                            continue;
-                        };
-
-                        let target_id = if original_name == "default" {
-                            resolve_default_export_target(
-                                &ts_default_exports,
-                                module_path,
-                                file_path,
-                            )
-                        } else {
-                            symbol_table.get(original_name).and_then(|target_ids| {
-                                find_import_target(
-                                    target_ids,
-                                    module_path,
-                                    file_path,
-                                    JS_TS_EXTENSIONS,
-                                    entity_map,
-                                )
-                                .cloned()
-                            })
-                        };
-
-                        if let Some(target_id) = target_id {
-                            local_imports.push((
-                                (file_path.clone(), local_name.to_string()),
-                                target_id,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Rust imports: use crate::module::Name; / use crate::module::{A, B};
-            // Also: use super::module::Name; / use self::module::Name;
-            let is_rust = file_path.ends_with(".rs");
-            if is_rust {
-                static RUST_USE_SIMPLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    // use crate::config::Config;
-                    // use super::types::Entity;
-                    // use config::Config;  (bare module path in binary crates)
-                    Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*;").unwrap()
-                });
-                static RUST_USE_GROUP_RE: LazyLock<Regex> = LazyLock::new(|| {
-                    // use crate::types::{Entity, ParseError};
-                    // use types::{Entity, ParseError};  (bare module path)
-                    Regex::new(r"(?m)^\s*use\s+(?:(?:crate|super|self)::)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\{([^}]+)\}\s*;").unwrap()
-                });
-
-                // Use a local import table for Rust alias resolution
-                let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
-
-                // Build a map: module_name -> list of file paths whose stem matches
-                // For "use crate::config::Config", module is "config", name is "Config"
-                for cap in RUST_USE_SIMPLE_RE.captures_iter(content) {
-                    let full_path_str = cap.get(1).unwrap().as_str();
-                    let parts: Vec<&str> = full_path_str.split("::").collect();
-                    if parts.is_empty() { continue; }
-
-                    // Last part is the imported name, everything before is the module path
-                    let imported_name = parts[parts.len() - 1];
-                    // The module is the second-to-last part, or the first if only one part
-                    let source_module = if parts.len() >= 2 {
-                        parts[parts.len() - 2]
-                    } else {
-                        parts[0]
-                    };
-
-                    resolve_rust_import(
-                        file_path, imported_name, source_module,
-                        symbol_table, entity_map, &mut local_import_table,
-                    );
-                }
-
-                for cap in RUST_USE_GROUP_RE.captures_iter(content) {
-                    let module_path = cap.get(1).unwrap().as_str();
-                    let names_str = cap.get(2).unwrap().as_str();
-
-                    // source_module is the last segment of the module path
-                    let source_module = module_path.rsplit("::").next().unwrap_or(module_path);
-
-                    for name_part in names_str.split(',') {
-                        let name_part = name_part.trim();
-                        // Handle "Name as Alias"
-                        let (original, local) = if let Some(pos) = name_part.find(" as ") {
-                            (&name_part[..pos], name_part[pos + 4..].trim())
-                        } else {
-                            (name_part, name_part)
-                        };
-                        let original = original.trim();
-                        let local = local.trim();
-                        if original.is_empty() || local.is_empty() { continue; }
-
-                        resolve_rust_import(
-                            file_path, original, source_module,
-                            symbol_table, entity_map, &mut local_import_table,
-                        );
-                        // If aliased, also map the local name
-                        if local != original {
-                            if let Some(target) = local_import_table.get(&(file_path.clone(), original.to_string())).cloned() {
-                                local_import_table.insert(
-                                    (file_path.clone(), local.to_string()),
-                                    target,
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Collect all Rust imports into local_imports
-                for (key, val) in local_import_table {
-                    local_imports.push((key, val));
-                }
-            }
-
-            // Go imports are handled by the scope resolver (avoids O(n²) import table explosion).
-            // Skip Go files here entirely.
-
-            // Parse (:require [...]) forms for languages that use slash-qualified refs.
-            // Namespace `foo.bar-baz` maps to file `foo/bar_baz.clj` (dots→slashes, hyphens→underscores).
-            let file_ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-            if let Some(file_config) =
-                crate::parser::plugins::code::languages::get_language_config(file_ext)
-            {
-                if file_config.has_slash_qualified_refs() {
-                    // Strip using the language's own strategy so language-specific syntax (e.g.
-                    // Clojure's `#` for reader macros/gensyms) is preserved correctly.
-                    let clojure_stripped = strip_for_language(file_config.strip_strategy(), content);
-                    for cap in CLOJURE_REFER_RE.captures_iter(&clojure_stripped) {
-                        let ns_name = cap.get(1).unwrap().as_str();
-                        let symbols_str = cap.get(2).unwrap().as_str();
-                        for symbol in symbols_str.split_whitespace() {
-                            let symbol = symbol.trim_matches(|c: char| c == ',' || c == '(' || c == ')');
-                            if symbol.is_empty() {
-                                continue;
-                            }
-                            resolve_clojure_require(
-                                file_path,
-                                ns_name,
-                                symbol,
-                                symbol_table,
-                                entity_map,
-                                &mut local_imports,
-                            );
-                        }
-                    }
-                    // `:as alias` forms: add qualified `alias/name` entries for all entities in the
-                    // namespace. The tokenizer splits `alias/name` at the slash, so reference
-                    // resolution looks up the full qualified token via a separate scan (see
-                    // resolve_entity_references). We store "alias/name" as the import key.
-                    for cap in CLOJURE_AS_RE.captures_iter(&clojure_stripped) {
-                        let ns_name = cap.get(1).unwrap().as_str();
-                        let alias = cap.get(2).unwrap().as_str();
-                        resolve_clojure_as(
-                            file_path,
-                            ns_name,
-                            alias,
-                            &clojure_ns_index,
-                            &mut local_imports,
-                        );
-                    }
-                }
-            }
-
-            Some(local_imports)
-        })
-        .collect();
-
-    // Merge all per-file imports into a single table
-    let mut import_table: HashMap<(String, String), String> = HashMap::new();
-    for local_imports in per_file_imports {
-        for (key, val) in local_imports {
+        }
+        for (key, val) in scan.re_export_imports {
             import_table.insert(key, val);
         }
     }
@@ -3834,7 +3890,7 @@ fn resolve_rust_import(
 type ClojureNsIndex = HashMap<String, Vec<(String, String)>>;
 
 fn build_clojure_ns_index(entity_map: &HashMap<String, EntityInfo>) -> ClojureNsIndex {
-    let mut index: ClojureNsIndex = HashMap::new();
+    let mut index: ClojureNsIndex = HashMap::default();
     for (entity_id, entity_info) in entity_map {
         let fp = &entity_info.file_path;
         if !fp.ends_with(".clj") && !fp.ends_with(".cljs") && !fp.ends_with(".cljc") {
@@ -4151,7 +4207,7 @@ fn extract_dot_chains_with_positions<'a>(
         LazyLock::new(|| Regex::new(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)").unwrap());
 
     let mut chains = Vec::new();
-    let mut seen: HashSet<(&str, &str, usize, usize)> = HashSet::new();
+    let mut seen: HashSet<(&str, &str, usize, usize)> = HashSet::default();
     for cap in DOT_CHAIN_RE.captures_iter(content) {
         let matched = cap.get(0).unwrap();
         let line = line_for_byte(content, matched.start());
@@ -4172,7 +4228,7 @@ fn local_binding_names_filtered<F>(
 where
     F: FnMut(usize, usize, usize) -> bool,
 {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     if !matches!(ext, ".js" | ".jsx" | ".ts" | ".tsx" | ".py" | ".swift") {
         return names;
     }
@@ -4602,7 +4658,7 @@ where
     F: FnMut(usize, usize, usize) -> bool,
 {
     let mut refs = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::default();
     let mut token_start: Option<usize> = None;
     let mut line = 1;
 
@@ -5160,7 +5216,7 @@ export { default as PublicDefault, X as PublicX } from './stale';
             end_line: 7,
             metadata: None,
         };
-        let mut child_line_ranges = HashMap::new();
+        let mut child_line_ranges = HashMap::default();
         child_line_ranges.insert("parent".to_string(), vec![(3, 5)]);
 
         let ranges = direct_reference_line_ranges(&parent, parent.end_line, &child_line_ranges);
@@ -7243,6 +7299,76 @@ export function usePublicCore(): string { return publicCore(); }
                 .any(|d| d.name == "publicCore" && d.file_path == "barrel.ts"),
             "consumer should resolve publicCore through the barrel export. Deps: {:?}",
             consumer_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_js_ts_re_export_alias_overrides_colliding_default_import_name() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "default_source.ts",
+            "\
+export default function Public(): string { return 'default'; }
+",
+        );
+        write_file(
+            root,
+            "named_source.ts",
+            "\
+export function named(): string { return 'named'; }
+",
+        );
+        write_file(
+            root,
+            "barrel.ts",
+            "\
+import Public from './default_source';
+export { named as Public } from './named_source';
+",
+        );
+
+        let (graph, _) = EntityGraph::build(
+            root,
+            &[
+                "default_source.ts".into(),
+                "named_source.ts".into(),
+                "barrel.ts".into(),
+            ],
+            &registry,
+        );
+
+        let public_export = graph
+            .entities
+            .values()
+            .find(|entity| {
+                entity.name == "Public"
+                    && entity.file_path == "barrel.ts"
+                    && entity.entity_type == "export"
+            })
+            .expect("barrel export alias entity should exist");
+        let alias_deps = graph.get_dependencies(&public_export.id);
+        assert!(
+            alias_deps
+                .iter()
+                .any(|d| d.name == "named" && d.file_path == "named_source.ts"),
+            "barrel export alias should prefer the re-export target over the colliding default import. Deps: {:?}",
+            alias_deps
+                .iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !alias_deps
+                .iter()
+                .any(|d| d.name == "Public" && d.file_path == "default_source.ts"),
+            "colliding default import should not win over the re-export alias. Deps: {:?}",
+            alias_deps
                 .iter()
                 .map(|d| (&d.name, &d.file_path))
                 .collect::<Vec<_>>()
