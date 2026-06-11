@@ -515,6 +515,24 @@ pub fn normalize_remote_url(url: &str) -> String {
     normalized
 }
 
+/// True when the user has explicitly opted in to syncing private repos to the
+/// cloud (set `SEM_SYNC_PRIVATE=1`). Off by default so private code is never
+/// uploaded without consent.
+fn private_sync_opted_in() -> bool {
+    std::env::var("SEM_SYNC_PRIVATE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Parse the GitHub `owner`/`repo` from a remote URL, if it is a github.com
+/// remote. Returns `None` for non-GitHub or unparseable remotes.
+fn github_owner_repo(remote_url: &str) -> Option<(String, String)> {
+    let normalized = normalize_remote_url(remote_url);
+    let rest = normalized.split("github.com/").nth(1)?;
+    let mut parts = rest.split('/').filter(|s| !s.is_empty());
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    Some((owner.to_string(), repo.to_string()))
+}
+
 // ─── CloudClient ─────────────────────────────────────────────────────────
 
 pub struct CloudClient {
@@ -619,11 +637,46 @@ impl CloudClient {
         Ok(resp)
     }
 
+    /// Best-effort check that a repo is public, via the unauthenticated GitHub
+    /// API. Returns true only when GitHub confirms `private: false`; private,
+    /// missing, non-GitHub, or unreachable repos all return false, so we never
+    /// auto-sync a private codebase to the cloud.
+    fn repo_is_public(&self, remote_url: &str) -> bool {
+        let Some((owner, repo)) = github_owner_repo(remote_url) else {
+            return false;
+        };
+        match self
+            .agent
+            .get(&format!("https://api.github.com/repos/{owner}/{repo}"))
+            .set("User-Agent", "sem-cli")
+            .set("Accept", "application/vnd.github+json")
+            .call()
+        {
+            Ok(resp) => resp
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("private").and_then(|p| p.as_bool()))
+                .map(|private| !private)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Resolve repo, or register if not found. Returns repo_id only if status is "ready".
     pub fn ensure_repo(&self, remote_url: &str) -> Result<String, Box<dyn std::error::Error>> {
         match self.resolve_repo(remote_url) {
             Ok(id) => Ok(id),
             Err(_) => {
+                // Privacy default: only auto-register repos GitHub confirms are
+                // public. A private repo is synced to the cloud only when the
+                // user opts in via SEM_SYNC_PRIVATE, so private code is never
+                // uploaded silently. Already-registered repos resolve above and
+                // skip this check.
+                if !private_sync_opted_in() && !self.repo_is_public(remote_url) {
+                    return Err(
+                        "private repo not synced (set SEM_SYNC_PRIVATE=1 to opt in)".into(),
+                    );
+                }
                 let repo = self.register_repo(remote_url)?;
                 let normalized = normalize_remote_url(remote_url);
                 let mut cache = load_repo_cache().unwrap_or_default();
@@ -1215,3 +1268,27 @@ fn entity_brief_json(e: &CloudEntityBrief) -> serde_json::Value {
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_owner_repo_parses_remote_forms() {
+        for url in [
+            "https://github.com/Ataraxy-Labs/sem",
+            "https://github.com/Ataraxy-Labs/sem.git",
+            "git@github.com:Ataraxy-Labs/sem.git",
+            "ssh://git@github.com/Ataraxy-Labs/sem",
+        ] {
+            assert_eq!(
+                github_owner_repo(url),
+                Some(("Ataraxy-Labs".to_string(), "sem".to_string())),
+                "failed for {url}"
+            );
+        }
+        // Non-GitHub or unparseable remotes are not auto-synced.
+        assert_eq!(github_owner_repo("https://gitlab.com/a/b"), None);
+        assert_eq!(github_owner_repo("not a url"), None);
+    }
+}
