@@ -1027,8 +1027,14 @@ pub fn try_cloud_context(opts: &ContextOptions) -> Option<()> {
 
 /// Try to run `sem entities` via cloud (whole-repo directory listing only).
 pub fn try_cloud_entities(opts: &EntitiesOptions) -> Option<()> {
-    // Only use cloud for directory (whole-repo) listing, not single files
-    let path_arg = opts.path.as_deref().filter(|p| !p.is_empty()).unwrap_or(".");
+    // Only used for a single path arg (the whole-repo listing case); callers
+    // skip this fast-path entirely when multiple paths are given.
+    let path_arg = opts
+        .paths
+        .iter()
+        .map(|p| p.trim())
+        .find(|p| !p.is_empty())
+        .unwrap_or(".");
     let full_path = if Path::new(path_arg).is_absolute() {
         PathBuf::from(path_arg)
     } else {

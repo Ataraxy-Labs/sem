@@ -227,11 +227,11 @@ enum Commands {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
-    /// List entities under a file or directory path
+    /// List entities under one or more file or directory paths
     Entities {
-        /// File or directory path to extract entities from (defaults to .)
-        #[arg()]
-        path: Option<String>,
+        /// File or directory paths to extract entities from (defaults to .)
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
 
         /// Output format
         #[arg(long, value_parser = ["terminal", "json"])]
@@ -551,7 +551,7 @@ fn main() {
             });
         }
         Some(Commands::Entities {
-            path,
+            paths,
             format,
             json,
             no_default_excludes,
@@ -561,7 +561,7 @@ fn main() {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string(),
-                path,
+                paths,
                 json: resolve_json(format, json),
                 no_default_excludes,
             });
