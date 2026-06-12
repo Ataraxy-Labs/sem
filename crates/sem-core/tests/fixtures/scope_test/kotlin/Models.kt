@@ -29,3 +29,5 @@ class Shelter {
         return animals.size
     }
 }
+
+class Registry(val shelter: Shelter)

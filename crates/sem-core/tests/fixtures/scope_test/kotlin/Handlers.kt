@@ -26,3 +26,8 @@ fun validate(request: Map<String, Any>): Boolean {
     }
     return true
 }
+
+fun handleRegistry(registry: Registry) {
+    val shelter = registry.shelter
+    shelter.add("dog")
+}
