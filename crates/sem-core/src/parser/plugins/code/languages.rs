@@ -1989,9 +1989,12 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     }],
     assignment_recurse_into: &["statements", "block", "function_body"],
 
+    // tree-sitter-kotlin-ng exposes `parameter` children positionally (no
+    // `name`/`type` fields), so fall back to the first identifier child for the
+    // name and let scan_function_params' user_type child-walk find the type.
     param_rules: &[ParamRule {
         node_kind: "parameter",
-        name_field: ParamNameField::Simple("name"),
+        name_field: ParamNameField::WithFallback("name"),
         type_field: "type",
         skip_names: &[],
     }],

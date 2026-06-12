@@ -59,6 +59,10 @@ pub struct Scope {
     /// Unresolved call assignments: var_name -> function_name (from `x = func()`)
     /// These get resolved after return type analysis.
     pending_call_types: HashMap<String, String>,
+    /// Unresolved field-access assignments: var_name -> (object_var, property).
+    /// From `val x = obj.field`; resolved once object types and the global
+    /// class field-type map are both available.
+    pending_field_types: HashMap<String, (String, String)>,
     /// Which entity owns this scope (if any)
     owner_id: Option<String>,
     /// What kind of scope: "module", "class", "function"
@@ -887,6 +891,7 @@ fn resolve_with_scopes_full_inner(
                 binding_rows: HashMap::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
+                pending_field_types: HashMap::new(),
                 owner_id: None,
                 kind: "module",
             }];
@@ -974,6 +979,8 @@ fn resolve_with_scopes_full_inner(
                 &return_type_map,
                 &local_import_by_name,
             );
+            // Resolve `val x = obj.field` accesses against the class field-type map.
+            inject_field_type_bindings(&mut scopes, &instance_attr_types);
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
@@ -1463,6 +1470,7 @@ fn build_scopes_from_ast(
                         binding_rows: HashMap::new(),
                         types: HashMap::new(),
                         pending_call_types: HashMap::new(),
+                        pending_field_types: HashMap::new(),
                         owner_id: Some(ce.id.clone()),
                         kind: "class",
                     });
@@ -1491,6 +1499,7 @@ fn build_scopes_from_ast(
                     binding_rows: HashMap::new(),
                     types: HashMap::new(),
                     pending_call_types: HashMap::new(),
+                    pending_field_types: HashMap::new(),
                     owner_id: None,
                     kind: "class",
                 });
@@ -1514,6 +1523,7 @@ fn build_scopes_from_ast(
                 binding_rows: HashMap::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
+                pending_field_types: HashMap::new(),
                 owner_id: None,
                 kind: "module",
             });
@@ -1584,6 +1594,7 @@ fn build_scopes_from_ast(
                 binding_rows: HashMap::new(),
                 types: HashMap::new(),
                 pending_call_types: HashMap::new(),
+                pending_field_types: HashMap::new(),
                 owner_id: None,
                 kind: "function",
             });
@@ -1975,43 +1986,78 @@ fn scan_ts_var_declaration(
             return;
         }
 
-        // Kotlin: property_declaration > variable_declaration > identifier, then sibling call_expression
+        // Kotlin: property_declaration > variable_declaration > identifier (+ user_type),
+        // then a sibling RHS expression. tree-sitter-kotlin-ng exposes the name and the
+        // type annotation positionally inside variable_declaration (no `name`/`type`
+        // fields on property_declaration), so read them there.
         let mut c = node.walk();
         for child in node.named_children(&mut c) {
-            if child.kind() == "variable_declaration" {
-                let var_name_kt = child
-                    .child_by_field_name("name")
-                    .or_else(|| child.named_child(0).filter(|n| n.kind() == "identifier"))
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("")
-                    .to_string();
-
-                if !var_name_kt.is_empty() {
-                    // Check for type annotation on the property_declaration
-                    if let Some(type_ann) = node.child_by_field_name("type") {
-                        let type_text = extract_base_type(type_ann, source);
-                        if !type_text.is_empty()
-                            && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                        {
-                            scopes[scope_idx]
-                                .types
-                                .insert(var_name_kt.clone(), type_text);
-                            return;
-                        }
-                    }
-                    // Find the value (sibling call_expression or other expression)
-                    let mut c2 = node.walk();
-                    for sibling in node.named_children(&mut c2) {
-                        if sibling.kind() == "call_expression" || sibling.kind() == "new_expression"
-                        {
-                            record_type_from_rhs(sibling, &var_name_kt, scope_idx, scopes, source);
-                            break;
-                        }
-                    }
-                }
+            if child.kind() != "variable_declaration" {
+                continue;
+            }
+            let (var_name_kt, declared_type) = kotlin_positional_name_and_type(child, source);
+            if var_name_kt.is_empty() {
                 break;
             }
+
+            // Explicit `val x: Type = ...` annotation wins.
+            if let Some(type_text) = declared_type {
+                if !type_text.is_empty()
+                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                {
+                    scopes[scope_idx].types.insert(var_name_kt, type_text);
+                    return;
+                }
+            }
+
+            // Otherwise infer from the RHS sibling expression.
+            let mut c2 = node.walk();
+            for sibling in node.named_children(&mut c2) {
+                match sibling.kind() {
+                    "call_expression" | "new_expression" => {
+                        record_type_from_rhs(sibling, &var_name_kt, scope_idx, scopes, source);
+                        break;
+                    }
+                    // `val x = obj.field` — defer until object types and the global
+                    // class field-type map are known (inject_field_type_bindings).
+                    "navigation_expression" => {
+                        if let Some((obj, prop)) = kotlin_navigation_obj_prop(sibling, source) {
+                            scopes[scope_idx]
+                                .pending_field_types
+                                .insert(var_name_kt.clone(), (obj, prop));
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            break;
         }
+    }
+}
+
+/// Extract `(object_identifier, property)` from a kotlin-ng `navigation_expression`
+/// of the simple form `ident.ident`. Returns None for anything more complex
+/// (chained access, calls as the receiver, `this`, etc.).
+fn kotlin_navigation_obj_prop(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, String)> {
+    let mut cursor = node.walk();
+    let idents: Vec<tree_sitter::Node> = node
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "identifier" || c.kind() == "simple_identifier")
+        .collect();
+    // Exactly object + property, both bare identifiers.
+    if node.named_children(&mut node.walk()).count() != idents.len() || idents.len() != 2 {
+        return None;
+    }
+    let obj = idents[0].utf8_text(source).ok()?.to_string();
+    let prop = idents[1].utf8_text(source).ok()?.to_string();
+    if obj.is_empty() || prop.is_empty() {
+        None
+    } else {
+        Some((obj, prop))
     }
 }
 
@@ -2435,6 +2481,30 @@ fn extract_base_type(type_node: tree_sitter::Node, source: &[u8]) -> String {
     text.to_string()
 }
 
+/// kotlin-ng exposes the name/type of `variable_declaration` and `class_parameter`
+/// nodes positionally (an `identifier` followed by an optional `user_type`) rather
+/// than via `name`/`type` fields. Returns (name, base_type) extracted that way.
+fn kotlin_positional_name_and_type(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> (String, Option<String>) {
+    let mut cursor = node.walk();
+    let mut name = String::new();
+    let mut base_type: Option<String> = None;
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "simple_identifier" if name.is_empty() => {
+                name = child.utf8_text(source).unwrap_or("").to_string();
+            }
+            "user_type" | "nullable_type" | "type_reference" if base_type.is_none() => {
+                base_type = Some(extract_base_type(child, source).trim_end_matches('?').to_string());
+            }
+            _ => {}
+        }
+    }
+    (name, base_type)
+}
+
 /// Parse Go receiver type from method content: `func (r *ReceiverType) Name(...)`
 pub fn extract_go_receiver_type(content: &str) -> Option<String> {
     let after_func = content.strip_prefix("func")?.trim_start();
@@ -2524,13 +2594,19 @@ fn scan_return_types(
 
             if let Some(fe) = func_entity {
                 // Try explicit return type annotation first
-                let ret_type = config.return_type_field.and_then(|field| {
-                    node.child_by_field_name(field)
-                        .map(|n| extract_base_type(n, source))
-                        .filter(|t| {
-                            !t.is_empty() && t.chars().next().map_or(false, |c| c.is_uppercase())
-                        })
-                });
+                let ret_type = config
+                    .return_type_field
+                    .and_then(|field| {
+                        node.child_by_field_name(field)
+                            .map(|n| extract_base_type(n, source))
+                            .filter(|t| {
+                                !t.is_empty()
+                                    && t.chars().next().map_or(false, |c| c.is_uppercase())
+                            })
+                    })
+                    // kotlin-ng has no `type` field on the return position; the return
+                    // type is a positional user_type after the parameter list.
+                    .or_else(|| kotlin_positional_return_type(node, source));
 
                 if let Some(rt) = ret_type {
                     return_type_map.insert(fe.id.clone(), rt);
@@ -2547,12 +2623,53 @@ fn scan_return_types(
     }
 }
 
+/// kotlin-ng exposes a function's declared return type as a positional `user_type`
+/// child after the `function_value_parameters` (there is no `type` field). Returns
+/// the base type name when it looks like a class (uppercase initial). Keyed off the
+/// Kotlin-only parameter container, so it is a no-op for other languages.
+fn kotlin_positional_return_type(func_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = func_node.walk();
+    let mut seen_params = false;
+    for child in func_node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_value_parameters" => seen_params = true,
+            "user_type" | "nullable_type" | "type_reference" if seen_params => {
+                let t = extract_base_type(child, source)
+                    .trim_end_matches('?')
+                    .to_string();
+                return (!t.is_empty() && t.chars().next().map_or(false, |c| c.is_uppercase()))
+                    .then_some(t);
+            }
+            "function_body" => break,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Find `return ClassName()` patterns in a function body (heuristic fallback).
 fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            // kotlin-ng wraps returns in `return_expression` and exposes the callee
+            // as the first child of `call_expression` (no `function` field).
+            if child.kind() == "return_expression" {
+                let mut rc = child.walk();
+                for ret_child in child.named_children(&mut rc) {
+                    if ret_child.kind() == "call_expression" {
+                        if let Some(callee) = ret_child.named_child(0) {
+                            if matches!(callee.kind(), "identifier" | "simple_identifier") {
+                                let name = callee.utf8_text(source).unwrap_or("");
+                                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                                    return Some(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if child.kind() == "return_statement" {
                 let mut inner_cursor = child.walk();
                 for ret_child in child.named_children(&mut inner_cursor) {
@@ -2587,9 +2704,9 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
                     }
                 }
             }
-            // Recurse into blocks
+            // Recurse into blocks (function_body wraps the block in kotlin-ng).
             let ck = child.kind();
-            if ck == "block" || ck == "statement_block" {
+            if ck == "block" || ck == "statement_block" || ck == "function_body" {
                 worklist.push(child);
             }
         }
@@ -3109,14 +3226,16 @@ fn scan_kotlin_property_declaration(
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    let field_name = node
-        .child_by_field_name("name")
-        .and_then(|n| n.utf8_text(source).ok())
-        .unwrap_or("");
-    let field_type = node
-        .child_by_field_name("type")
-        .map(|n| extract_base_type(n, source))
+    // kotlin-ng: property_declaration > variable_declaration > identifier + user_type.
+    // The name/type are not exposed as fields on property_declaration, so dive into
+    // the variable_declaration and read them positionally.
+    let mut cursor = node.walk();
+    let (field_name, field_type) = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "variable_declaration")
+        .map(|vd| kotlin_positional_name_and_type(vd, source))
         .unwrap_or_default();
+    let field_type = field_type.unwrap_or_default();
 
     if !field_name.is_empty()
         && !field_type.is_empty()
@@ -3136,42 +3255,46 @@ fn scan_kotlin_primary_constructor(
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    // Look for primary_constructor child, then class_parameter nodes
+    // Look for primary_constructor child, then class_parameter nodes. In
+    // tree-sitter-kotlin-ng the class_parameters are wrapped in a `class_parameters`
+    // node and expose name/type positionally (no `name`/`type` fields), so handle
+    // both the wrapped and the direct layout.
     let mut cursor = class_node.walk();
     for child in class_node.named_children(&mut cursor) {
-        if child.kind() == "primary_constructor" {
-            let mut pc_cursor = child.walk();
-            for param in child.named_children(&mut pc_cursor) {
-                if param.kind() == "class_parameter" {
-                    // Check if this has val/var modifier (makes it a property)
-                    let text = param.utf8_text(source).unwrap_or("");
-                    let has_val_var = text.starts_with("val ")
-                        || text.starts_with("var ")
-                        || text.contains("val ")
-                        || text.contains("var ");
-                    if has_val_var {
-                        let param_name = param
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let param_type = param
-                            .child_by_field_name("type")
-                            .map(|n| extract_base_type(n, source))
-                            .unwrap_or_default();
-                        if !param_name.is_empty()
-                            && !param_type.is_empty()
-                            && param_type
-                                .chars()
-                                .next()
-                                .map_or(false, |c| c.is_uppercase())
-                        {
-                            instance_attr_types.insert(
-                                (class_name.to_string(), param_name.to_string()),
-                                param_type,
-                            );
-                        }
-                    }
+        if child.kind() != "primary_constructor" {
+            continue;
+        }
+        let mut pc_cursor = child.walk();
+        for pc_child in child.named_children(&mut pc_cursor) {
+            let param_holder = if pc_child.kind() == "class_parameters" {
+                pc_child
+            } else {
+                child
+            };
+            let mut p_cursor = param_holder.walk();
+            for param in param_holder.named_children(&mut p_cursor) {
+                if param.kind() != "class_parameter" {
+                    continue;
                 }
+                // Only val/var class parameters become properties.
+                let text = param.utf8_text(source).unwrap_or("");
+                let has_val_var = text.contains("val ") || text.contains("var ");
+                if !has_val_var {
+                    continue;
+                }
+                let (param_name, param_type) = kotlin_positional_name_and_type(param, source);
+                let param_type = param_type.unwrap_or_default();
+                if !param_name.is_empty()
+                    && !param_type.is_empty()
+                    && param_type.chars().next().map_or(false, |c| c.is_uppercase())
+                {
+                    instance_attr_types
+                        .insert((class_name.to_string(), param_name.to_string()), param_type);
+                }
+            }
+            // Avoid double-iterating when there is no class_parameters wrapper.
+            if pc_child.kind() != "class_parameters" {
+                break;
             }
         }
     }
@@ -3678,6 +3801,38 @@ fn inject_return_type_bindings(
 
         for (var_name, ret_type) in resolved {
             scope.types.insert(var_name, ret_type);
+        }
+    }
+}
+
+/// Resolve `val x = obj.field` field-access assignments now that object variable
+/// types (parameters, locals) and the global class field-type map are both
+/// available. A resolved variable can itself be the object of another pending
+/// access (`val a = x.b; val c = a.d`), so iterate to a small fixpoint.
+fn inject_field_type_bindings(
+    scopes: &mut Vec<Scope>,
+    instance_attr_types: &HashMap<(String, String), String>,
+) {
+    for _ in 0..4 {
+        // Collect resolutions under immutable borrows, then apply mutably.
+        let mut resolutions: Vec<(usize, String, String)> = Vec::new();
+        for scope_idx in 0..scopes.len() {
+            for (var, (obj, prop)) in &scopes[scope_idx].pending_field_types {
+                if let Some(obj_type) = lookup_type_in_scopes(scope_idx, scopes, obj) {
+                    if let Some(field_type) =
+                        instance_attr_types.get(&(obj_type, prop.clone()))
+                    {
+                        resolutions.push((scope_idx, var.clone(), field_type.clone()));
+                    }
+                }
+            }
+        }
+        if resolutions.is_empty() {
+            break;
+        }
+        for (scope_idx, var, field_type) in resolutions {
+            scopes[scope_idx].types.insert(var.clone(), field_type);
+            scopes[scope_idx].pending_field_types.remove(&var);
         }
     }
 }
