@@ -187,6 +187,14 @@ enum Status {
         assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
         assert!(names.contains(&"Repository"), "Should find interface Repository, got: {:?}", names);
         assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
+
+        // A field is named by its declarator, not its type: `private String name;`
+        // is the field `name`, not `String`.
+        let field = entities
+            .iter()
+            .find(|e| e.entity_type == "field")
+            .expect("should extract the field entity");
+        assert_eq!(field.name, "name", "field should be named by its declarator, got: {:?}", field.name);
     }
 
     #[test]

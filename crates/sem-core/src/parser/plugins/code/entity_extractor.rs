@@ -1866,6 +1866,21 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
         }
     }
 
+    // Java/C#: field_declaration has its name inside the variable_declarator; the
+    // `type` is a sibling, so the bare 'name' lookup misses and the generic
+    // fallback below would otherwise return the type identifier (e.g. naming
+    // `private Svc svc;` as "Svc" instead of "svc").
+    if node_type == "field_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(decl_name) = child.child_by_field_name("name") {
+                    return Some(node_text(decl_name, source).to_string());
+                }
+            }
+        }
+    }
+
     // For Go var/const/type declarations, name is inside var_spec/const_spec/type_spec child.
     // Grouped forms like `var (...)` wrap specs in var_spec_list/type_spec_list.
     if node_type == "var_declaration"
