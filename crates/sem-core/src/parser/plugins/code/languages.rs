@@ -210,6 +210,10 @@ pub enum InitStrategy {
     StructFields {
         struct_nodes: &'static [&'static str],
     },
+    /// Java/C#: extract field types from typed field declarations in the class body
+    ClassFields {
+        class_nodes: &'static [&'static str],
+    },
     /// No instance attribute tracking
     None,
 }
@@ -1726,7 +1730,9 @@ static JAVA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     self_keywords: &["this"],
 
-    init_strategy: InitStrategy::None,
+    init_strategy: InitStrategy::ClassFields {
+        class_nodes: &["class_declaration", "interface_declaration", "enum_declaration"],
+    },
     import_extractor: None,
     external_method: false,
 

@@ -1861,6 +1861,14 @@ fn scan_ts_var_declaration(
     scopes: &mut Vec<Scope>,
     source: &[u8],
 ) {
+    // Java/C#: the declared type is a `type` field on the declaration node itself
+    // (`Dog d = ...`), shared by every declarator. TS/JS put the annotation on the
+    // declarator instead, so this is None there and the per-declarator check applies.
+    let decl_type = node
+        .child_by_field_name("type")
+        .map(|n| extract_base_type(n, source))
+        .filter(|t| !t.is_empty() && t.chars().next().map_or(false, |c| c.is_uppercase()));
+
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "variable_declarator" {
@@ -1878,7 +1886,7 @@ fn scan_ts_var_declaration(
                 .unwrap_or_else(|| child.start_position().row);
             record_binding(scopes, scope_idx, &var_name, binding_row);
 
-            // Check for explicit type annotation: `const x: Foo = ...`
+            // Check for explicit type annotation: `const x: Foo = ...` (declarator-level)
             if let Some(type_ann) = child.child_by_field_name("type") {
                 let type_text = extract_base_type(type_ann, source);
                 if !type_text.is_empty()
@@ -1887,6 +1895,14 @@ fn scan_ts_var_declaration(
                     scopes[scope_idx].types.insert(var_name.clone(), type_text);
                     continue;
                 }
+            }
+
+            // Declaration-level type annotation (Java/C#): `Dog d = ...`
+            if let Some(type_text) = &decl_type {
+                scopes[scope_idx]
+                    .types
+                    .insert(var_name.clone(), type_text.clone());
+                continue;
             }
 
             // Check RHS value
@@ -2398,6 +2414,15 @@ fn record_type_from_rhs(
                 }
             }
         }
+        // Java/C#: new Foo()
+        "object_creation_expression" => {
+            if let Some(type_node) = rhs.child_by_field_name("type") {
+                let name = extract_base_type(type_node, source);
+                if !name.is_empty() && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    scopes[scope_idx].types.insert(var_name.to_string(), name);
+                }
+            }
+        }
         // Go: Foo{} (composite_literal / struct literal)
         "composite_literal" => {
             if let Some(type_node) = rhs.child_by_field_name("type") {
@@ -2674,6 +2699,18 @@ fn scan_init_self_attrs(
                     }
                 }
             }
+            InitStrategy::ClassFields { class_nodes } => {
+                if class_nodes.contains(&kind) {
+                    let class_name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("")
+                        .to_string();
+                    if !class_name.is_empty() {
+                        scan_java_class_fields(node, &class_name, source, instance_attr_types);
+                    }
+                }
+            }
             InitStrategy::None => {}
         }
 
@@ -2715,6 +2752,50 @@ fn scan_rust_struct_fields(
                             field_type,
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Java/C#: extract field types from `class Foo { private Connection conn; ... }`.
+/// A single field_declaration may declare several names (`private Foo a, b;`), all
+/// sharing the declaration's `type` field.
+fn scan_java_class_fields(
+    class_node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if member.kind() != "field_declaration" {
+            continue;
+        }
+        let field_type = member
+            .child_by_field_name("type")
+            .map(|n| extract_base_type(n, source))
+            .unwrap_or_default();
+        if field_type.is_empty() || !field_type.chars().next().map_or(false, |c| c.is_uppercase()) {
+            continue;
+        }
+        let mut dc = member.walk();
+        for declarator in member.named_children(&mut dc) {
+            if declarator.kind() != "variable_declarator" {
+                continue;
+            }
+            if let Some(name) = declarator
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
+                if !name.is_empty() {
+                    instance_attr_types.insert(
+                        (class_name.to_string(), name.to_string()),
+                        field_type.clone(),
+                    );
                 }
             }
         }
@@ -5725,6 +5806,25 @@ fn resolve_ref(
                         }
                         SwiftOverloadSelection::NoMatch => return None,
                         SwiftOverloadSelection::NotApplicable => {}
+                    }
+                }
+            }
+
+            // Static call: `ClassName.staticMethod()` — the receiver is a class itself,
+            // not a typed variable. Only fires for an uppercase identifier that names a
+            // known class and isn't shadowed by a local binding.
+            if is_simple_identifier_name(receiver)
+                && receiver.chars().next().map_or(false, |c| c.is_uppercase())
+                && !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache)
+            {
+                if let Some(members) = class_members.get(receiver) {
+                    if let SwiftOverloadSelection::Matched(mid) = select_member_candidate(
+                        members,
+                        method,
+                        argument_labels.as_deref(),
+                        swift_call_signatures,
+                    ) {
+                        return Some((mid, RefType::Calls, "static_call"));
                     }
                 }
             }
