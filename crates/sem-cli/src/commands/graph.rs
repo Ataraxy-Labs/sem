@@ -53,6 +53,7 @@ pub fn graph_command(opts: GraphOptions) {
         }
     }
 
+    let prog = crate::progress::Progress::start("Building entity graph");
     let graph = get_or_build_graph_topology_with_timings(
         root,
         &file_paths,
@@ -60,6 +61,11 @@ pub fn graph_command(opts: GraphOptions) {
         opts.no_cache,
         &mut timings,
     );
+    prog.done(&format!(
+        "{} entities, {} files",
+        fmt_count(graph.entities.len()),
+        fmt_count(file_paths.len())
+    ));
 
     if opts.json {
         write_graph_json(&graph).unwrap();
@@ -74,6 +80,20 @@ pub fn graph_command(opts: GraphOptions) {
         );
     }
     timings.finish();
+}
+
+/// Format a count with thousands separators (1234 -> "1,234"), uv-style.
+pub fn fmt_count(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 #[derive(serde::Serialize)]

@@ -29,6 +29,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap_complete_command = "0.6.1"
 mimalloc = "0.1"
 ureq = { version = "2", features = ["json"] }
+indicatif = "0.17"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/sem-{ target }{ archive-suffix }"

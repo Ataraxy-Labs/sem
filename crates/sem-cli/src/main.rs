@@ -1,6 +1,7 @@
 mod cache;
 mod commands;
 mod formatters;
+mod progress;
 mod stats;
 mod telemetry;
 mod timings;

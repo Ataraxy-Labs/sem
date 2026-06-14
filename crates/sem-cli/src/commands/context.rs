@@ -36,7 +36,13 @@ pub fn context_command(opts: ContextOptions) {
         &ext_filter,
         opts.no_default_excludes,
     );
+    let prog = crate::progress::Progress::start("Building entity graph");
     let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
+    prog.done(&format!(
+        "{} entities, {} files",
+        super::graph::fmt_count(graph.entities.len()),
+        super::graph::fmt_count(file_paths.len())
+    ));
 
     let file_path = opts
         .file_path
