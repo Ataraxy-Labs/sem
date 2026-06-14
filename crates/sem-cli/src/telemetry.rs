@@ -38,7 +38,26 @@ struct TelemetryState {
 
 fn telemetry_disabled() -> bool {
     let set = |var: &str| std::env::var(var).is_ok_and(|v| !v.is_empty() && v != "0");
-    set("SEM_NO_TELEMETRY") || set("DO_NOT_TRACK")
+    set("SEM_NO_TELEMETRY") || set("DO_NOT_TRACK") || is_development_build()
+}
+
+/// True when this binary is a development build rather than a real install,
+/// so our own work never pollutes usage data. Catches: debug builds
+/// (`cargo run`, `cargo test`), and any binary run straight out of a Cargo
+/// `target/` directory (`./crates/target/release/sem` during testing).
+/// Installed binaries (cargo-binstall, Homebrew, install.sh, npm) never live
+/// under a `target/{debug,release}/` path.
+fn is_development_build() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            Some(s.contains("/target/release/") || s.contains("/target/debug/"))
+        })
+        .unwrap_or(false)
 }
 
 fn sem_dir() -> Option<PathBuf> {
