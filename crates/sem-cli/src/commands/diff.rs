@@ -1648,6 +1648,13 @@ fn run_diff_pipeline(
     };
 
     if file_changes.is_empty() {
+        // A diff with nothing to compare is still a diff the user performed —
+        // count it so `sem stats` reflects every run, not only the ones that
+        // found changes. Recording a default result bumps total_diffs and
+        // leaves the analyzed/changes counters at zero.
+        let _ = SemLifetimeStats::load()
+            .record_diff(&DiffResult::default(), 0)
+            .save();
         match opts.format {
             OutputFormat::Json => {
                 println!("{}", format_json(&DiffResult::default(), &[]));
