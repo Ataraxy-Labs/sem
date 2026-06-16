@@ -2,10 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_mcp::cache as shared_cache;
+
+const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
+const SQL_PARAM_CHUNK: usize = 500;
 
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
 pub struct PartialCache {
@@ -19,6 +22,39 @@ pub struct PartialCache {
 
 pub struct DiskCache {
     conn: Connection,
+}
+
+#[derive(Clone, Copy)]
+pub enum CachedImpactMode {
+    All,
+    Deps,
+    Dependents,
+    Tests,
+}
+
+pub struct CachedImpactResult {
+    pub entity: EntityInfo,
+    pub dependencies: Vec<EntityInfo>,
+    pub dependents: Vec<EntityInfo>,
+    pub impact: Vec<(EntityInfo, usize)>,
+    pub tests: Vec<EntityInfo>,
+    pub tests_truncated: bool,
+}
+
+#[derive(Debug)]
+pub enum CachedImpactError {
+    CacheReadFailed,
+    MissingEntityQuery,
+    EntityIdNotFound(String),
+    EntityNotFound(String),
+    EntityNotFoundInFile {
+        name: String,
+        file: String,
+    },
+    AmbiguousEntity {
+        name: String,
+        matches: Vec<EntityInfo>,
+    },
 }
 
 impl DiskCache {
@@ -173,7 +209,8 @@ impl DiskCache {
             }
         }
 
-        let test_entity_ids = graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
+        let test_entity_ids =
+            graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
         {
             let mut stmt =
                 tx.prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")?;
@@ -289,6 +326,79 @@ impl DiskCache {
         Some((graph, test_entity_ids))
     }
 
+    /// Query a fresh topology cache directly for impact data without hydrating
+    /// the complete in-memory graph.
+    pub fn query_impact_topology(
+        &self,
+        root: &Path,
+        files: &[String],
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+        mode: CachedImpactMode,
+        depth: usize,
+    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+        if !self.has_fresh_topology_cache(root, files) {
+            return Ok(None);
+        }
+
+        if matches!(mode, CachedImpactMode::All | CachedImpactMode::Tests)
+            && !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_TOPOLOGY])
+        {
+            return Ok(None);
+        }
+
+        let entity = self.find_cached_impact_entity(entity_name, entity_id, file_hint)?;
+        let dependencies = if matches!(mode, CachedImpactMode::All | CachedImpactMode::Deps) {
+            match self.direct_dependencies(&entity.id) {
+                Ok(dependencies) => dependencies,
+                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+            }
+        } else {
+            Vec::new()
+        };
+        let impact = if matches!(mode, CachedImpactMode::All) {
+            match self.impact_entities(&entity.id, depth, None) {
+                Ok(impact) => impact,
+                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+            }
+        } else {
+            Vec::new()
+        };
+        let dependents = if matches!(mode, CachedImpactMode::All) {
+            impact
+                .iter()
+                .filter(|(_, depth)| *depth == 1)
+                .map(|(entity, _)| entity.clone())
+                .collect()
+        } else if matches!(mode, CachedImpactMode::Dependents) {
+            match self.direct_dependents(&entity.id) {
+                Ok(dependents) => dependents,
+                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+            }
+        } else {
+            Vec::new()
+        };
+        let (tests, tests_truncated) =
+            if matches!(mode, CachedImpactMode::All | CachedImpactMode::Tests) {
+                match self.test_impact_entities(&entity.id) {
+                    Ok(tests) => tests,
+                    Err(_) => return Err(CachedImpactError::CacheReadFailed),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+        Ok(Some(CachedImpactResult {
+            entity,
+            dependencies,
+            dependents,
+            impact,
+            tests,
+            tests_truncated,
+        }))
+    }
+
     fn load_graph_topology_rows(&self) -> Option<EntityGraph> {
         let mut entity_stmt = self
             .conn
@@ -318,6 +428,339 @@ impl DiskCache {
 
         let edges = self.load_edges()?;
         Some(EntityGraph::from_parts(entity_map, edges))
+    }
+
+    fn find_cached_impact_entity(
+        &self,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<EntityInfo, CachedImpactError> {
+        if let Some(id) = entity_id {
+            return self
+                .entity_by_id(id)
+                .map_err(|_| CachedImpactError::CacheReadFailed)?
+                .ok_or_else(|| CachedImpactError::EntityIdNotFound(id.to_string()));
+        }
+
+        let name = entity_name.ok_or(CachedImpactError::MissingEntityQuery)?;
+        let mut matching = self
+            .entity_candidates_for_query(name, file_hint)
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+
+        if matching.is_empty() {
+            if let Some(file) = file_hint {
+                let global_matches = self
+                    .entity_candidates_for_query(name, None)
+                    .map_err(|_| CachedImpactError::CacheReadFailed)?;
+                if global_matches.is_empty() {
+                    return Err(CachedImpactError::EntityNotFound(name.to_string()));
+                }
+                return Err(CachedImpactError::EntityNotFoundInFile {
+                    name: name.to_string(),
+                    file: file.to_string(),
+                });
+            }
+            return Err(CachedImpactError::EntityNotFound(name.to_string()));
+        }
+
+        if matching.len() == 1 {
+            return Ok(matching.into_iter().next().unwrap());
+        }
+
+        matching.sort_by_key(|entity| {
+            (
+                entity.file_path.clone(),
+                entity.start_line,
+                entity.id.clone(),
+            )
+        });
+        Err(CachedImpactError::AmbiguousEntity {
+            name: name.to_string(),
+            matches: matching,
+        })
+    }
+
+    fn entity_by_id(&self, id: &str) -> Result<Option<EntityInfo>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE id = ?1",
+                params![id],
+                entity_info_from_row,
+            )
+            .optional()
+    }
+
+    fn entity_candidates_for_query(
+        &self,
+        query: &str,
+        file_hint: Option<&str>,
+    ) -> Result<Vec<EntityInfo>, rusqlite::Error> {
+        let mut by_id = HashMap::<String, EntityInfo>::new();
+
+        if let Some(file_hint) = file_hint {
+            self.add_entity_candidates(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE name = ?1 AND file_path = ?2",
+                &[query, file_hint],
+                &mut by_id,
+            )?;
+        } else {
+            self.add_entity_candidates(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE name = ?1",
+                &[query],
+                &mut by_id,
+            )?;
+        }
+
+        if let Some((entity_type, name)) = split_type_qualified_query(query) {
+            if let Some(file_hint) = file_hint {
+                self.add_entity_candidates(
+                    "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                     FROM entities
+                     WHERE entity_type = ?1 AND name = ?2 AND file_path = ?3",
+                    &[entity_type, name, file_hint],
+                    &mut by_id,
+                )?;
+            } else {
+                self.add_entity_candidates(
+                    "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                     FROM entities WHERE entity_type = ?1 AND name = ?2",
+                    &[entity_type, name],
+                    &mut by_id,
+                )?;
+            }
+        }
+
+        if let Some((parent_name, child_name)) = query.rsplit_once('.') {
+            if let Some(file_hint) = file_hint {
+                self.add_entity_candidates(
+                    "SELECT child.id, child.name, child.entity_type, child.file_path,
+                            child.start_line, child.end_line, child.parent_id
+                     FROM entities child
+                     JOIN entities parent ON child.parent_id = parent.id
+                     WHERE child.name = ?1 AND parent.name = ?2 AND child.file_path = ?3",
+                    &[child_name, parent_name, file_hint],
+                    &mut by_id,
+                )?;
+            } else {
+                self.add_entity_candidates(
+                    "SELECT child.id, child.name, child.entity_type, child.file_path,
+                            child.start_line, child.end_line, child.parent_id
+                     FROM entities child
+                     JOIN entities parent ON child.parent_id = parent.id
+                     WHERE child.name = ?1 AND parent.name = ?2",
+                    &[child_name, parent_name],
+                    &mut by_id,
+                )?;
+            }
+        }
+
+        let mut candidates: Vec<_> = by_id.into_values().collect();
+        candidates.sort_by_key(|entity| {
+            (
+                entity.file_path.clone(),
+                entity.start_line,
+                entity.id.clone(),
+            )
+        });
+        Ok(candidates)
+    }
+
+    fn add_entity_candidates(
+        &self,
+        sql: &str,
+        args: &[&str],
+        by_id: &mut HashMap<String, EntityInfo>,
+    ) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter().copied()), entity_info_from_row)?;
+        for row in rows {
+            let entity = row?;
+            by_id.insert(entity.id.clone(), entity);
+        }
+        Ok(())
+    }
+
+    fn direct_dependencies(&self, entity_id: &str) -> Result<Vec<EntityInfo>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entities.id, entities.name, entities.entity_type, entities.file_path,
+                    entities.start_line, entities.end_line, entities.parent_id
+             FROM edges
+             JOIN entities ON entities.id = edges.to_entity
+             WHERE edges.from_entity = ?1
+             ORDER BY edges.to_entity, edges.ref_type",
+        )?;
+        let rows = stmt.query_map(params![entity_id], entity_info_from_row)?;
+        rows.collect()
+    }
+
+    fn direct_dependents(&self, entity_id: &str) -> Result<Vec<EntityInfo>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entities.id, entities.name, entities.entity_type, entities.file_path,
+                    entities.start_line, entities.end_line, entities.parent_id
+             FROM edges
+             JOIN entities ON entities.id = edges.from_entity
+             WHERE edges.to_entity = ?1
+             ORDER BY edges.from_entity, edges.ref_type",
+        )?;
+        let rows = stmt.query_map(params![entity_id], entity_info_from_row)?;
+        rows.collect()
+    }
+
+    fn impact_entities(
+        &self,
+        entity_id: &str,
+        max_depth: usize,
+        max_count: Option<usize>,
+    ) -> Result<Vec<(EntityInfo, usize)>, rusqlite::Error> {
+        let impact_ids = self.impact_ids(entity_id, max_depth, max_count)?;
+        let ids: Vec<String> = impact_ids.iter().map(|(id, _)| id.clone()).collect();
+        let infos = self.entity_infos_by_id(&ids)?;
+        Ok(impact_ids
+            .into_iter()
+            .filter_map(|(id, depth)| infos.get(&id).cloned().map(|info| (info, depth)))
+            .collect())
+    }
+
+    fn test_impact_entities(
+        &self,
+        entity_id: &str,
+    ) -> Result<(Vec<EntityInfo>, bool), rusqlite::Error> {
+        let mut impact_ids = self.impact_ids(entity_id, 0, Some(CACHED_TEST_IMPACT_LIMIT + 1))?;
+        let tests_truncated = impact_ids.len() > CACHED_TEST_IMPACT_LIMIT;
+        if tests_truncated {
+            impact_ids.truncate(CACHED_TEST_IMPACT_LIMIT);
+        }
+        let ids: Vec<String> = impact_ids.into_iter().map(|(id, _)| id).collect();
+        let test_ids = self.test_ids_from(&ids)?;
+        let ordered_test_ids: Vec<String> = ids
+            .iter()
+            .filter(|id| test_ids.contains(*id))
+            .cloned()
+            .collect();
+        let infos = self.entity_infos_by_id(&ordered_test_ids)?;
+        let tests = ordered_test_ids
+            .into_iter()
+            .filter_map(|id| infos.get(&id).cloned())
+            .collect();
+        Ok((tests, tests_truncated))
+    }
+
+    fn impact_ids(
+        &self,
+        entity_id: &str,
+        max_depth: usize,
+        max_count: Option<usize>,
+    ) -> Result<Vec<(String, usize)>, rusqlite::Error> {
+        let mut visited = HashSet::new();
+        let mut frontier = vec![entity_id.to_string()];
+        let mut result = Vec::new();
+        let mut depth = 0;
+        visited.insert(entity_id.to_string());
+
+        while !frontier.is_empty() {
+            if max_depth > 0 && depth >= max_depth {
+                break;
+            }
+            let next_depth = depth + 1;
+            let mut next_frontier = Vec::new();
+            for dependent_id in self.dependent_ids_for(&frontier)? {
+                if visited.insert(dependent_id.clone()) {
+                    result.push((dependent_id.clone(), next_depth));
+                    next_frontier.push(dependent_id);
+                    if max_count.is_some_and(|limit| result.len() >= limit) {
+                        return Ok(result);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            depth = next_depth;
+        }
+
+        Ok(result)
+    }
+
+    fn dependent_ids_for(&self, entity_ids: &[String]) -> Result<Vec<String>, rusqlite::Error> {
+        let mut dependents = Vec::new();
+        for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT to_entity, from_entity FROM edges WHERE to_entity IN ({placeholders})
+                 ORDER BY to_entity, from_entity, ref_type"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+            let mut by_target = HashMap::<String, Vec<String>>::new();
+            for row in rows {
+                let (target, dependent) = row?;
+                by_target.entry(target).or_default().push(dependent);
+            }
+            for entity_id in chunk {
+                if let Some(ids) = by_target.remove(entity_id) {
+                    dependents.extend(ids);
+                }
+            }
+        }
+        Ok(dependents)
+    }
+
+    fn entity_infos_by_id(
+        &self,
+        entity_ids: &[String],
+    ) -> Result<HashMap<String, EntityInfo>, rusqlite::Error> {
+        let mut infos = HashMap::new();
+        for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(String::as_str)),
+                entity_info_from_row,
+            )?;
+            for row in rows {
+                let entity = row?;
+                infos.insert(entity.id.clone(), entity);
+            }
+        }
+        Ok(infos)
+    }
+
+    fn test_ids_from(&self, entity_ids: &[String]) -> Result<HashSet<String>, rusqlite::Error> {
+        let mut ids = HashSet::new();
+        for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT entity_id FROM entity_flags
+                 WHERE is_test != 0 AND entity_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                    row.get::<_, String>(0)
+                })?;
+            for row in rows {
+                ids.insert(row?);
+            }
+        }
+        Ok(ids)
     }
 
     fn load_test_entity_ids(&self) -> Option<HashSet<String>> {
@@ -957,6 +1400,33 @@ impl DiskCache {
     }
 }
 
+fn entity_info_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityInfo> {
+    Ok(EntityInfo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        entity_type: row.get(2)?,
+        file_path: row.get(3)?,
+        start_line: row.get::<_, i64>(4)? as usize,
+        end_line: row.get::<_, i64>(5)? as usize,
+        parent_id: row.get(6)?,
+    })
+}
+
+fn repeat_vars(len: usize) -> String {
+    std::iter::repeat("?")
+        .take(len)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
+    let (entity_type, name) = query.split_once(' ')?;
+    if entity_type.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((entity_type, name))
+}
+
 fn sql_io_error(error: rusqlite::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, error)
 }
@@ -1218,6 +1688,256 @@ mod tests {
 
         rewrite_after_mtime_tick(&root.join("a.rs"), "fn a() { let _x = 1; }\n");
         assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn query_impact_topology_reads_cached_adjacency_without_graph_load() {
+        let root = temp_repo_root("impact-topology-query");
+        write_file(&root.join("a.rs"), "fn target() {}\n");
+        write_file(&root.join("b.rs"), "fn direct() { target(); }\n");
+        write_file(&root.join("c.rs"), "fn transitive() { direct(); }\n");
+        write_file(
+            &root.join("a_test.rs"),
+            "#[test]\nfn target_test() { target(); }\n",
+        );
+        let files = vec![
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "c.rs".to_string(),
+            "a_test.rs".to_string(),
+        ];
+        let entities = vec![
+            entity("a-id", "a.rs", "target", "fn target() {}"),
+            entity("b-id", "b.rs", "direct", "fn direct() { target(); }"),
+            entity(
+                "c-id",
+                "c.rs",
+                "transitive",
+                "fn transitive() { direct(); }",
+            ),
+            entity(
+                "test-id",
+                "a_test.rs",
+                "target_test",
+                "#[test]\nfn target_test() { target(); }",
+            ),
+        ];
+        let graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("b-id", "a-id"),
+                edge("c-id", "b-id"),
+                edge("test-id", "a-id"),
+            ],
+        );
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save_topology(&root, &files, &graph, &entities, &[])
+            .unwrap();
+
+        let result = cache
+            .query_impact_topology(
+                &root,
+                &files,
+                Some("target"),
+                None,
+                Some("a.rs"),
+                CachedImpactMode::All,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.entity.id, "a-id");
+        assert!(result.dependencies.is_empty());
+        assert_eq!(
+            result
+                .dependents
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-id", "test-id"]
+        );
+        assert_eq!(
+            result
+                .impact
+                .iter()
+                .map(|(entity, depth)| (entity.id.as_str(), *depth))
+                .collect::<Vec<_>>(),
+            vec![("b-id", 1), ("test-id", 1), ("c-id", 2)]
+        );
+        assert_eq!(
+            result
+                .tests
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test-id"]
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cached_test_impact_reports_truncated_traversal() {
+        let root = temp_repo_root("test-impact-truncated");
+        let cache = DiskCache::open(&root).unwrap();
+        let tx = cache.conn.unchecked_transaction().unwrap();
+
+        tx.execute(
+            "INSERT INTO entities
+             (id, name, entity_type, file_path, start_line, end_line, content, content_hash)
+             VALUES (?1, ?2, 'function', ?3, 1, 1, '', '')",
+            rusqlite::params!["root-id", "root", "root.rs"],
+        )
+        .unwrap();
+
+        {
+            let mut entity_stmt = tx
+                .prepare(
+                    "INSERT INTO entities
+                     (id, name, entity_type, file_path, start_line, end_line, content, content_hash)
+                     VALUES (?1, ?2, 'function', ?3, 1, 1, '', '')",
+                )
+                .unwrap();
+            let mut edge_stmt = tx
+                .prepare(
+                    "INSERT INTO edges (from_entity, to_entity, ref_type)
+                     VALUES (?1, 'root-id', 'calls')",
+                )
+                .unwrap();
+            let mut test_stmt = tx
+                .prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")
+                .unwrap();
+
+            for index in 0..=CACHED_TEST_IMPACT_LIMIT {
+                let id = format!("test-{index:05}");
+                entity_stmt
+                    .execute(rusqlite::params![&id, &id, format!("{id}.rs")])
+                    .unwrap();
+                edge_stmt.execute(rusqlite::params![&id]).unwrap();
+                test_stmt.execute(rusqlite::params![&id]).unwrap();
+            }
+        }
+
+        tx.commit().unwrap();
+
+        let (tests, truncated) = cache.test_impact_entities("root-id").unwrap();
+        assert!(truncated);
+        assert_eq!(tests.len(), CACHED_TEST_IMPACT_LIMIT);
+        assert!(tests.iter().any(|entity| entity.id == "test-00000"));
+        assert!(!tests.iter().any(|entity| entity.id == "test-10000"));
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn query_impact_topology_preserves_bfs_frontier_order() {
+        let root = temp_repo_root("impact-topology-bfs-order");
+        let file_contents = [
+            ("root.rs", "fn root() {}\n"),
+            ("b_parent.rs", "fn b_parent() { root(); }\n"),
+            ("c_parent.rs", "fn c_parent() { root(); }\n"),
+            ("z_mid.rs", "fn z_mid() { b_parent(); }\n"),
+            ("a_mid.rs", "fn a_mid() { c_parent(); }\n"),
+            ("z_leaf.rs", "fn z_leaf() { z_mid(); }\n"),
+            ("a_leaf.rs", "fn a_leaf() { a_mid(); }\n"),
+        ];
+        for (file, content) in &file_contents {
+            write_file(&root.join(*file), content);
+        }
+        let files: Vec<String> = file_contents
+            .iter()
+            .map(|(file, _)| (*file).to_string())
+            .collect();
+        let entities = vec![
+            entity("root-id", "root.rs", "root", "fn root() {}"),
+            entity(
+                "b-parent-id",
+                "b_parent.rs",
+                "b_parent",
+                "fn b_parent() { root(); }",
+            ),
+            entity(
+                "c-parent-id",
+                "c_parent.rs",
+                "c_parent",
+                "fn c_parent() { root(); }",
+            ),
+            entity(
+                "z-mid-id",
+                "z_mid.rs",
+                "z_mid",
+                "fn z_mid() { b_parent(); }",
+            ),
+            entity(
+                "a-mid-id",
+                "a_mid.rs",
+                "a_mid",
+                "fn a_mid() { c_parent(); }",
+            ),
+            entity(
+                "z-leaf-id",
+                "z_leaf.rs",
+                "z_leaf",
+                "fn z_leaf() { z_mid(); }",
+            ),
+            entity(
+                "a-leaf-id",
+                "a_leaf.rs",
+                "a_leaf",
+                "fn a_leaf() { a_mid(); }",
+            ),
+        ];
+        let graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("b-parent-id", "root-id"),
+                edge("c-parent-id", "root-id"),
+                edge("z-mid-id", "b-parent-id"),
+                edge("a-mid-id", "c-parent-id"),
+                edge("z-leaf-id", "z-mid-id"),
+                edge("a-leaf-id", "a-mid-id"),
+            ],
+        );
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save_topology(&root, &files, &graph, &entities, &[])
+            .unwrap();
+
+        let result = cache
+            .query_impact_topology(
+                &root,
+                &files,
+                Some("root"),
+                None,
+                Some("root.rs"),
+                CachedImpactMode::All,
+                3,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result
+                .impact
+                .iter()
+                .map(|(entity, depth)| (entity.id.as_str(), *depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b-parent-id", 1),
+                ("c-parent-id", 1),
+                ("z-mid-id", 2),
+                ("a-mid-id", 2),
+                ("z-leaf-id", 3),
+                ("a-leaf-id", 3),
+            ]
+        );
 
         drop(cache);
         cleanup(root);

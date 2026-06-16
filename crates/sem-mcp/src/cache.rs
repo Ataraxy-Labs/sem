@@ -16,9 +16,26 @@ pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
     ("idx_entities_file_path", "entities", "file_path"),
     ("idx_entities_name", "entities", "name"),
+    ("idx_entities_name_file_path", "entities", "name, file_path"),
+    (
+        "idx_entities_type_name_file_path",
+        "entities",
+        "entity_type, name, file_path",
+    ),
     ("idx_entities_parent_id", "entities", "parent_id"),
+    ("idx_entities_parent_id_name", "entities", "parent_id, name"),
     ("idx_edges_from_entity", "edges", "from_entity"),
+    (
+        "idx_edges_from_to_ref",
+        "edges",
+        "from_entity, to_entity, ref_type",
+    ),
     ("idx_edges_to_entity", "edges", "to_entity"),
+    (
+        "idx_edges_to_from_ref",
+        "edges",
+        "to_entity, from_entity, ref_type",
+    ),
     (
         "idx_file_imports_imported_file",
         "file_imports",
