@@ -7,6 +7,7 @@ All notable changes to sem are documented in this file.
 ### Added
 
 - `sem impact` can answer direct dependency queries from a fresh SQL topology cache without rebuilding the entity graph.
+- `sem entities` reports phase timings and listing counters when `SEM_TIMINGS` is enabled.
 
 ### Changed
 

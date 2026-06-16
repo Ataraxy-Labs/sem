@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::timings::Timings;
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
@@ -13,6 +14,8 @@ pub struct EntitiesOptions {
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
+    let mut timings = Timings::from_env("entities");
+
     // Normalize to a non-empty list of path args, defaulting to ".".
     let path_args: Vec<String> = {
         let cleaned: Vec<String> = opts
@@ -27,9 +30,13 @@ pub fn entities_command(opts: EntitiesOptions) {
             cleaned
         }
     };
+    timings.counter("input_paths", path_args.len() as u64);
+    timings.mark("path_args");
 
     // The cloud fast-path only helps the whole-repo single listing.
     if path_args.len() == 1 && super::cloud::try_cloud_entities(&opts).is_some() {
+        timings.mark("cloud_entities");
+        timings.finish();
         return;
     }
 
@@ -38,9 +45,15 @@ pub fn entities_command(opts: EntitiesOptions) {
 
     let mut entities: Vec<SemanticEntity> = Vec::new();
     let mut dir_count = 0usize;
+    let mut file_arg_count = 0usize;
+    let mut processed_file_count = 0usize;
+    let mut discovered_file_count = 0usize;
+    let mut extracted_entities = false;
     for path_arg in &path_args {
         let (path_label, full_path) = resolve_path(root, path_arg);
         if full_path.is_file() {
+            file_arg_count += 1;
+            processed_file_count += 1;
             let file_entities = extract_file_entities(&full_path, &registry, &path_label)
                 .unwrap_or_else(|e| {
                     eprintln!(
@@ -52,6 +65,7 @@ pub fn entities_command(opts: EntitiesOptions) {
                     std::process::exit(1);
                 });
             entities.extend(file_entities);
+            extracted_entities = true;
         } else if full_path.is_dir() {
             dir_count += 1;
             let file_paths = super::files::find_supported_files_in_path(
@@ -61,11 +75,18 @@ pub fn entities_command(opts: EntitiesOptions) {
                 &[],
                 opts.no_default_excludes,
             );
+            discovered_file_count += file_paths.len();
+            processed_file_count += file_paths.len();
+            timings.mark("file_discovery");
             entities.extend(extract_files_entities(root, &file_paths, &registry));
+            extracted_entities = true;
         } else {
             eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
             std::process::exit(1);
         }
+    }
+    if extracted_entities {
+        timings.mark("extract_entities");
     }
 
     // Overlapping paths (e.g. a directory and a file inside it) can surface the
@@ -79,6 +100,7 @@ pub fn entities_command(opts: EntitiesOptions) {
             .then(a.name.cmp(&b.name))
     });
     entities.dedup_by(|a, b| a.id == b.id);
+    timings.mark("sort_dedup");
 
     // Show the file column whenever results span more than one file. This keeps
     // the prior single-file vs directory behavior and covers multi-path input.
@@ -90,13 +112,22 @@ pub fn entities_command(opts: EntitiesOptions) {
     };
     let include_file = dir_count > 0 || distinct_files > 1;
     let display_label = path_args.join(" ");
+    timings.counter("input_files", processed_file_count as u64);
+    timings.counter("input_file_args", file_arg_count as u64);
+    timings.counter("input_dirs", dir_count as u64);
+    timings.counter("processed_files", processed_file_count as u64);
+    timings.counter("discovered_files", discovered_file_count as u64);
+    timings.counter("distinct_files", distinct_files as u64);
+    timings.counter("entities", entities.len() as u64);
 
     if opts.json {
         let output: Vec<_> = entities
             .iter()
             .map(|e| entity_json(e, include_file))
             .collect();
-        println!("{}", serde_json::to_string(&output).unwrap());
+        let serialized = serde_json::to_string(&output).unwrap();
+        timings.counter("json_bytes", serialized.len() as u64);
+        println!("{serialized}");
     } else if should_group_by_file(&entities) {
         print_grouped_entities(&display_label, &entities);
     } else if let Some(file_path) = entities.first().map(|e| e.file_path.as_str()) {
@@ -104,6 +135,8 @@ pub fn entities_command(opts: EntitiesOptions) {
     } else {
         println!("{} {}\n", "entities:".green().bold(), display_label.bold());
     }
+    timings.mark("output_serialization");
+    timings.finish();
 }
 
 fn resolve_path(root: &Path, path_arg: &str) -> (String, PathBuf) {
@@ -205,7 +238,10 @@ fn print_entity_rows(entities: &[SemanticEntity], base_indent: &str) {
 }
 
 fn entities_by_id(entities: &[SemanticEntity]) -> HashMap<&str, &SemanticEntity> {
-    entities.iter().map(|entity| (entity.id.as_str(), entity)).collect()
+    entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect()
 }
 
 fn entity_indent(
@@ -213,7 +249,10 @@ fn entity_indent(
     entities_by_id: &HashMap<&str, &SemanticEntity>,
     base_indent: &str,
 ) -> String {
-    format!("{base_indent}{}", "  ".repeat(entity_depth(entity, entities_by_id)))
+    format!(
+        "{base_indent}{}",
+        "  ".repeat(entity_depth(entity, entities_by_id))
+    )
 }
 
 fn entity_depth(entity: &SemanticEntity, entities_by_id: &HashMap<&str, &SemanticEntity>) -> usize {
