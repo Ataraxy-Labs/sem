@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_core::parser::{
@@ -72,6 +72,17 @@ impl DiskCache {
 
         shared_cache::initialize_schema(&conn)?;
 
+        Ok(Self { conn })
+    }
+
+    pub fn open_existing_readonly(repo_root: &Path) -> Result<Self, rusqlite::Error> {
+        let db_path = shared_cache::cache_db_path(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        if !db_path.exists() {
+            return Err(rusqlite::Error::InvalidPath(db_path));
+        }
+
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self { conn })
     }
 
@@ -1095,6 +1106,75 @@ impl DiskCache {
         Ok(true)
     }
 
+    pub fn query_entities_listing(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Result<Option<Vec<EntityInfo>>, rusqlite::Error> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        if files.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut entities = Vec::new();
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(String::as_str)),
+                entity_info_from_row,
+            )?;
+            entities.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        sort_entity_infos(&mut entities);
+        Ok(Some(entities))
+    }
+
+    fn has_fresh_topology_cache_for_files(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
+            return false;
+        }
+
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
+            return false;
+        }
+
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return false;
+        }
+
+        self.cached_files_are_fresh(
+            root,
+            files
+                .iter()
+                .filter(|file| !shared_cache::is_manifest_file_name(file))
+                .cloned()
+                .collect(),
+        )
+        .unwrap_or(false)
+    }
+
     fn has_fresh_complete_cache(
         &self,
         root: &Path,
@@ -1678,6 +1758,17 @@ fn entity_info_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityInfo>
         end_line: row.get::<_, i64>(5)? as usize,
         parent_id: row.get(6)?,
     })
+}
+
+fn sort_entity_infos(entities: &mut [EntityInfo]) {
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.entity_type.cmp(&b.entity_type))
+            .then(a.name.cmp(&b.name))
+    });
 }
 
 fn repeat_vars(len: usize) -> String {
@@ -3072,6 +3163,18 @@ mod tests {
         assert!(!root.join(".sem").exists());
 
         drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_existing_readonly_does_not_create_missing_cache() {
+        let root = temp_repo_root("readonly-missing");
+        let db_path = shared_cache::cache_db_path(&root).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(DiskCache::open_existing_readonly(&root).is_err());
+        assert!(!db_path.exists());
+
         cleanup(root);
     }
 

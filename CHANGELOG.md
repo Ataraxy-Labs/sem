@@ -15,6 +15,7 @@ All notable changes to sem are documented in this file.
 - `sem impact --deps` narrows cache freshness checks to the queried entity, direct dependencies, and relevant JavaScript/TypeScript imports when the query scope is explicit.
 - Source scans skip default-excluded high-volume paths such as generated source directories, fixture/vendor/benchmark trees, generated file suffixes, CSS module declarations, and asset declarations; pass `--no-default-excludes` to include them.
 - `sem entities` accepts `--file-exts` for large directory scans and avoids duplicate directory-listing post-processing.
+- `sem entities` can list entities from a fresh SQLite topology cache instead of reparsing matching directory scans.
 
 ## [0.13.0] - 2026-06-16
 

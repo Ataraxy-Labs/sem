@@ -1,9 +1,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::timings::Timings;
+use crate::{cache::DiskCache, timings::Timings};
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
+use sem_core::parser::graph::EntityInfo;
 use sem_core::parser::registry::ParserRegistry;
 
 pub struct EntitiesOptions {
@@ -84,8 +85,18 @@ pub fn entities_command(opts: EntitiesOptions) {
             discovered_file_count += file_paths.len();
             processed_file_count += file_paths.len();
             timings.mark("file_discovery");
-            entities.extend(extract_files_entities(root, &file_paths, &registry));
-            extracted_entities = true;
+            if let Some(cached_entities) = try_cached_entities(
+                root,
+                &file_paths,
+                &ext_filter,
+                opts.no_default_excludes,
+                &mut timings,
+            ) {
+                entities.extend(cached_entities);
+            } else {
+                entities.extend(extract_files_entities(root, &file_paths, &registry));
+                extracted_entities = true;
+            }
         } else {
             eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
             std::process::exit(1);
@@ -168,6 +179,58 @@ fn extract_files_entities(
     registry: &ParserRegistry,
 ) -> Vec<SemanticEntity> {
     registry.extract_all_entities(root, file_paths)
+}
+
+fn try_cached_entities(
+    root: &Path,
+    file_paths: &[String],
+    ext_filter: &[String],
+    no_default_excludes: bool,
+    timings: &mut Timings,
+) -> Option<Vec<SemanticEntity>> {
+    let source_scope = super::graph::cache_source_scope(root, ext_filter, no_default_excludes);
+    let cache = match DiskCache::open_existing_readonly(root) {
+        Ok(cache) => {
+            timings.mark("cache_open");
+            cache
+        }
+        Err(_) => {
+            timings.mark("cache_open_failed");
+            return None;
+        }
+    };
+
+    match cache.query_entities_listing(root, file_paths, source_scope) {
+        Ok(Some(entities)) => {
+            timings.counter("cached_entities", entities.len() as u64);
+            timings.mark("cache_entities_query");
+            Some(entities.into_iter().map(entity_info_to_entity).collect())
+        }
+        Ok(None) => {
+            timings.mark("cache_entities_miss");
+            None
+        }
+        Err(_) => {
+            timings.mark("cache_entities_query_failed");
+            None
+        }
+    }
+}
+
+fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
+    SemanticEntity {
+        id: entity.id,
+        file_path: entity.file_path,
+        entity_type: entity.entity_type,
+        name: entity.name,
+        parent_id: entity.parent_id,
+        content: String::new(),
+        content_hash: String::new(),
+        structural_hash: None,
+        start_line: entity.start_line,
+        end_line: entity.end_line,
+        metadata: None,
+    }
 }
 
 fn file_path_for_entity(root: &Path, path: &Path) -> String {
