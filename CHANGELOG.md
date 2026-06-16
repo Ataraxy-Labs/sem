@@ -14,7 +14,7 @@ All notable changes to sem are documented in this file.
 - Scope resolution caches repeated reference lookups during graph builds to reduce redundant resolver work.
 - Graph builds avoid retaining import scan source text after import extraction, reducing peak memory use.
 - `sem context` now prints the full source of the target entity in the terminal. It previously showed only the first line, so reading a function meant falling back to `--json`. Related entities still show a one-line signature so the context map stays scannable.
-- `sem context` and `sem impact` now accept `Class.method` (and `Outer.Inner.method`) to address a method by name, not only the bare method name or a full entity id.
+- `sem context` and `sem impact` (CLI and the `sem_context` / `sem_impact` MCP tools) now accept `Class.method` (and `Outer.Inner.method`) to address a method by name, not only the bare method name or a full entity id.
 
 ### Fixed
 

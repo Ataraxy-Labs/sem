@@ -320,10 +320,25 @@ impl SemServer {
         entity_name: &str,
         rel_path: &str,
     ) -> Result<&'a str, String> {
+        // Match the bare name, or `Class.method` addressing (a child entity
+        // whose parent is named by the qualifier before the final dot). Agents
+        // reach for `Class.method` naturally.
+        let qualified = entity_name.rsplit_once('.');
+        let matches = |e: &sem_core::parser::graph::EntityInfo| {
+            e.name == entity_name
+                || qualified.is_some_and(|(parent_part, child_part)| {
+                    e.name == child_part
+                        && e.parent_id
+                            .as_ref()
+                            .and_then(|pid| graph.entities.get(pid))
+                            .is_some_and(|p| p.name == parent_part)
+                })
+        };
+
         if let Some(entity) = graph
             .entities
             .values()
-            .find(|e| e.name == entity_name && e.file_path == rel_path)
+            .find(|e| matches(e) && e.file_path == rel_path)
         {
             return Ok(entity.id.as_str());
         }
@@ -331,7 +346,7 @@ impl SemServer {
         let mut candidates: Vec<&str> = graph
             .entities
             .values()
-            .filter(|e| e.name == entity_name)
+            .filter(|e| matches(e))
             .map(|e| e.file_path.as_str())
             .collect();
         candidates.sort_unstable();
