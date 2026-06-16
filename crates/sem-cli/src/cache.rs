@@ -5,6 +5,7 @@ use std::path::Path;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::parser::js_ts_import_source_files_from_set;
 use sem_mcp::cache as shared_cache;
 
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
@@ -177,6 +178,7 @@ impl DiskCache {
         }
 
         shared_cache::refresh_manifest_entries(&tx, root)?;
+        shared_cache::refresh_file_import_entries(&tx, root, files, files)?;
 
         {
             let mut stmt = tx.prepare(
@@ -338,7 +340,13 @@ impl DiskCache {
         mode: CachedImpactMode,
         depth: usize,
     ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
-        if !self.has_fresh_topology_cache(root, files) {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
             return Ok(None);
         }
 
@@ -348,6 +356,31 @@ impl DiskCache {
             return Ok(None);
         }
 
+        if matches!(mode, CachedImpactMode::Deps) {
+            return self.query_dependency_impact_topology(
+                root,
+                files,
+                entity_name,
+                entity_id,
+                file_hint,
+            );
+        }
+
+        if !self.has_fresh_cache(root, files) {
+            return Ok(None);
+        }
+
+        self.query_fresh_impact_topology(entity_name, entity_id, file_hint, mode, depth)
+    }
+
+    fn query_fresh_impact_topology(
+        &self,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+        mode: CachedImpactMode,
+        depth: usize,
+    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
         let entity = self.find_cached_impact_entity(entity_name, entity_id, file_hint)?;
         let dependencies = if matches!(mode, CachedImpactMode::All | CachedImpactMode::Deps) {
             match self.direct_dependencies(&entity.id) {
@@ -397,6 +430,183 @@ impl DiskCache {
             tests,
             tests_truncated,
         }))
+    }
+
+    fn query_dependency_impact_topology(
+        &self,
+        root: &Path,
+        files: &[String],
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+        if !self.has_fresh_dependency_impact_scope(root, files)? {
+            return Ok(None);
+        }
+
+        let entity = match self.find_cached_impact_entity(entity_name, entity_id, file_hint) {
+            Ok(entity) => entity,
+            Err(CachedImpactError::CacheReadFailed) => {
+                return Err(CachedImpactError::CacheReadFailed);
+            }
+            Err(_) => return Ok(None),
+        };
+        let dependencies = self
+            .direct_dependencies(&entity.id)
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+
+        if !self.has_fresh_dependency_impact_files(root, files, &entity, &dependencies)? {
+            return Ok(None);
+        }
+
+        Ok(Some(CachedImpactResult {
+            entity,
+            dependencies,
+            dependents: Vec::new(),
+            impact: Vec::new(),
+            tests: Vec::new(),
+        }))
+    }
+
+    fn has_fresh_dependency_impact_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+    ) -> Result<bool, CachedImpactError> {
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return Ok(false);
+        }
+        self.cached_source_file_set_matches(files)
+    }
+
+    fn has_fresh_dependency_impact_files(
+        &self,
+        root: &Path,
+        files: &[String],
+        entity: &EntityInfo,
+        dependencies: &[EntityInfo],
+    ) -> Result<bool, CachedImpactError> {
+        if !self
+            .cached_files_are_fresh(root, HashSet::from([entity.file_path.clone()]))
+            .map_err(|_| CachedImpactError::CacheReadFailed)?
+        {
+            return Ok(false);
+        }
+
+        let mut required_files = HashSet::new();
+        for dependency in dependencies {
+            required_files.insert(dependency.file_path.clone());
+        }
+        let cached_imported_files = self
+            .cached_imported_files(&entity.file_path)
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        let should_scan_current_imports = cached_imported_files.is_empty()
+            && !self
+                .has_file_import_entries()
+                .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        for imported_file in cached_imported_files {
+            required_files.insert(imported_file);
+        }
+        if should_scan_current_imports {
+            for imported_file in current_imported_files(root, files, &entity.file_path)? {
+                required_files.insert(imported_file);
+            }
+        }
+
+        self.cached_files_are_fresh(root, required_files)
+            .map_err(|_| CachedImpactError::CacheReadFailed)
+    }
+
+    fn cached_source_file_set_matches(&self, files: &[String]) -> Result<bool, CachedImpactError> {
+        let current_files: HashSet<&str> = files
+            .iter()
+            .map(String::as_str)
+            .filter(|file| !shared_cache::is_manifest_file_name(file))
+            .collect();
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files")
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        let cached_files: HashSet<String> = rows
+            .filter_map(|row| row.ok())
+            .filter(|path| {
+                !shared_cache::is_cache_manifest_key(path)
+                    && !shared_cache::is_manifest_file_name(path)
+            })
+            .collect();
+
+        Ok(cached_files.len() == current_files.len()
+            && current_files
+                .iter()
+                .all(|file| cached_files.contains(*file)))
+    }
+
+    fn cached_imported_files(&self, file_path: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT imported_file FROM file_imports
+             WHERE importing_file = ?1
+             ORDER BY imported_file",
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    fn has_file_import_entries(&self) -> Result<bool, rusqlite::Error> {
+        self.conn
+            .query_row("SELECT 1 FROM file_imports LIMIT 1", [], |_| Ok(()))
+            .optional()
+            .map(|row| row.is_some())
+    }
+
+    fn cached_files_are_fresh(
+        &self,
+        root: &Path,
+        files: HashSet<String>,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT mtime_secs, mtime_nanos, content_hash
+             FROM files WHERE path = ?1",
+        )?;
+        let mut fingerprint_refreshes = Vec::new();
+
+        for file in files {
+            let cached: Option<(i64, i64, Option<String>)> = stmt
+                .query_row(params![file], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .optional()?;
+            let Some((secs, nanos, content_hash)) = cached else {
+                return Ok(false);
+            };
+            match shared_cache::file_freshness(
+                &root.join(&file),
+                secs,
+                nanos,
+                content_hash.as_deref(),
+            ) {
+                Some(shared_cache::FileFreshness::Fresh) => {}
+                Some(shared_cache::FileFreshness::FreshWithUpdatedFingerprint {
+                    secs,
+                    nanos,
+                    content_hash,
+                }) => {
+                    fingerprint_refreshes.push(shared_cache::FileFingerprintRefresh {
+                        path: file,
+                        mtime_secs: secs,
+                        mtime_nanos: nanos,
+                        content_hash,
+                    });
+                }
+                Some(shared_cache::FileFreshness::Stale) | None => return Ok(false),
+            }
+        }
+
+        shared_cache::refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
+        Ok(true)
     }
 
     fn load_graph_topology_rows(&self) -> Option<EntityGraph> {
@@ -1427,6 +1637,25 @@ fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
     Some((entity_type, name))
 }
 
+fn current_imported_files(
+    root: &Path,
+    files: &[String],
+    file_path: &str,
+) -> Result<Vec<String>, CachedImpactError> {
+    let content = std::fs::read_to_string(root.join(file_path))
+        .map_err(|_| CachedImpactError::CacheReadFailed)?;
+    let candidate_files: HashSet<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|file| !shared_cache::is_manifest_file_name(file))
+        .collect();
+    Ok(js_ts_import_source_files_from_set(
+        file_path,
+        &content,
+        &candidate_files,
+    ))
+}
+
 fn sql_io_error(error: rusqlite::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, error)
 }
@@ -1688,6 +1917,45 @@ mod tests {
 
         rewrite_after_mtime_tick(&root.join("a.rs"), "fn a() { let _x = 1; }\n");
         assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_topology_records_file_imports() {
+        let root = temp_repo_root("topology-file-imports");
+        write_file(
+            &root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        );
+        write_file(
+            &root.join("b.ts"),
+            "import { target } from './a';\nexport function useIt() { return target(); }\n",
+        );
+        let files = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let entities = vec![
+            entity(
+                "a-id",
+                "a.ts",
+                "target",
+                "export function target() { return 1; }",
+            ),
+            entity(
+                "b-id",
+                "b.ts",
+                "useIt",
+                "export function useIt() { return target(); }",
+            ),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save_topology(&root, &files, &graph, &entities, &[])
+            .unwrap();
+
+        assert_eq!(file_import_count(&cache, "b.ts", "a.ts"), 1);
 
         drop(cache);
         cleanup(root);
@@ -2221,6 +2489,33 @@ mod tests {
 
         assert!(cache.load(&root, &files).is_none());
         assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_refreshes_gitattributes_mtime_when_content_is_unchanged() {
+        let root = temp_repo_root("gitattributes-mtime-only-refresh");
+        let files = sample_files(&root);
+        let gitattributes = root.join(".gitattributes");
+        let content = "*.foo linguist-language=javascript\n";
+        write_file(&gitattributes, content);
+        let cache = save_empty_cache(&root, &files);
+        let cache_key = shared_cache::CACHE_MANIFEST_FILES
+            .iter()
+            .find_map(|(file_name, cache_key)| {
+                (*file_name == ".gitattributes").then_some(*cache_key)
+            })
+            .unwrap();
+        let before = cached_file_mtime(&cache, cache_key);
+
+        rewrite_after_mtime_tick(&gitattributes, content);
+        let current = shared_cache::file_mtime_parts(&gitattributes).unwrap();
+
+        assert_ne!(before, current);
+        assert!(cache.load(&root, &files).is_some());
+        assert_eq!(cached_file_mtime(&cache, cache_key), current);
 
         drop(cache);
         cleanup(root);

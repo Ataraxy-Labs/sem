@@ -8,6 +8,10 @@ All notable changes to sem are documented in this file.
 
 - `sem impact` can answer direct dependency queries from a fresh SQL topology cache without rebuilding the entity graph.
 
+### Changed
+
+- `sem impact --deps` can reuse fresh caches when unrelated files change by validating the cached source set, hashes, and import metadata before falling back to a graph rebuild.
+
 ## [0.13.0] - 2026-06-16
 
 ### Fixed

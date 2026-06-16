@@ -24,34 +24,82 @@ pub fn js_ts_import_source_files_from_content<P: AsRef<str>>(
         return Vec::new();
     }
 
-    static FROM_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"\bfrom\s*['"]([^'"]+)['"]"#).unwrap());
-    static SIDE_EFFECT_IMPORT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"\bimport\s*['"]([^'"]+)['"]"#).unwrap());
-
     let mut imported_files = HashSet::new();
-    for cap in FROM_RE.captures_iter(content) {
-        if let Some(source) = cap.get(1).map(|m| m.as_str()) {
-            if let Some(imported_file) =
-                find_import_file(candidate_file_paths, source, file_path, JS_TS_EXTENSIONS)
-            {
-                imported_files.insert(imported_file.to_string());
-            }
-        }
-    }
-    for cap in SIDE_EFFECT_IMPORT_RE.captures_iter(content) {
-        if let Some(source) = cap.get(1).map(|m| m.as_str()) {
-            if let Some(imported_file) =
-                find_import_file(candidate_file_paths, source, file_path, JS_TS_EXTENSIONS)
-            {
-                imported_files.insert(imported_file.to_string());
-            }
+    for source in js_ts_import_sources(content) {
+        if let Some(imported_file) =
+            find_import_file(candidate_file_paths, source, file_path, JS_TS_EXTENSIONS)
+        {
+            imported_files.insert(imported_file.to_string());
         }
     }
 
     let mut imported_files: Vec<String> = imported_files.into_iter().collect();
     sort_import_candidate_files(&mut imported_files, JS_TS_EXTENSIONS);
     imported_files
+}
+
+pub fn js_ts_import_source_files_from_set<S>(
+    file_path: &str,
+    content: &str,
+    candidate_file_paths: &HashSet<&str, S>,
+) -> Vec<String>
+where
+    S: BuildHasher,
+{
+    if !is_js_ts_file(file_path) {
+        return Vec::new();
+    }
+
+    let mut imported_files = HashSet::new();
+    let mut sorted_candidates: Option<Vec<&str>> = None;
+    for source in js_ts_import_sources(content) {
+        if let Some(candidates) = import_file_candidates(file_path, source, JS_TS_EXTENSIONS) {
+            if let Some(imported_file) = candidates
+                .iter()
+                .find(|candidate| candidate_file_paths.contains(candidate.as_str()))
+            {
+                imported_files.insert(imported_file.clone());
+            }
+            continue;
+        }
+
+        let source_module = import_stem(source);
+        let candidates = sorted_candidates.get_or_insert_with(|| {
+            let mut candidates: Vec<&str> = candidate_file_paths.iter().copied().collect();
+            sort_import_candidate_files(&mut candidates, JS_TS_EXTENSIONS);
+            candidates
+        });
+        if let Some(imported_file) = candidates
+            .iter()
+            .find(|path| file_stem(path) == source_module)
+        {
+            imported_files.insert((*imported_file).to_string());
+        }
+    }
+
+    let mut imported_files: Vec<String> = imported_files.into_iter().collect();
+    sort_import_candidate_files(&mut imported_files, JS_TS_EXTENSIONS);
+    imported_files
+}
+
+fn js_ts_import_sources(content: &str) -> Vec<&str> {
+    static FROM_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\bfrom\s*['"]([^'"]+)['"]"#).unwrap());
+    static SIDE_EFFECT_IMPORT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\bimport\s*['"]([^'"]+)['"]"#).unwrap());
+
+    let mut sources = Vec::new();
+    for cap in FROM_RE.captures_iter(content) {
+        if let Some(source) = cap.get(1).map(|m| m.as_str()) {
+            sources.push(source);
+        }
+    }
+    for cap in SIDE_EFFECT_IMPORT_RE.captures_iter(content) {
+        if let Some(source) = cap.get(1).map(|m| m.as_str()) {
+            sources.push(source);
+        }
+    }
+    sources
 }
 
 pub(crate) fn js_ts_named_exports_from_content(content: &str) -> HashSet<String> {

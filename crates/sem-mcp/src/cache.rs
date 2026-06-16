@@ -496,31 +496,50 @@ pub fn source_file_count(files: &[String]) -> usize {
         .count()
 }
 
-fn cached_file_mtime(conn: &Connection, cache_key: &str) -> Option<(i64, i64)> {
+fn cached_file_fingerprint(
+    conn: &Connection,
+    cache_key: &str,
+) -> Option<(i64, i64, Option<String>)> {
     conn.query_row(
-        "SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1",
+        "SELECT mtime_secs, mtime_nanos, content_hash FROM files WHERE path = ?1",
         params![cache_key],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .ok()
 }
 
 pub fn is_manifest_stale(conn: &Connection, root: &Path) -> bool {
-    CACHE_MANIFEST_FILES.iter().any(|(file_name, cache_key)| {
+    let mut fingerprint_refreshes = Vec::new();
+    for (file_name, cache_key) in CACHE_MANIFEST_FILES {
         let full = root.join(file_name);
-        let cached = cached_file_mtime(conn, cache_key);
+        let cached = cached_file_fingerprint(conn, cache_key);
 
         match (full.exists(), cached) {
-            (true, None) | (false, Some(_)) => true,
-            (false, None) => false,
-            (true, Some((secs, nanos))) => match file_mtime_parts(&full) {
-                Some((current_secs, current_nanos)) => {
-                    secs != current_secs || nanos != current_nanos
+            (true, None) | (false, Some(_)) => return true,
+            (false, None) => {}
+            (true, Some((secs, nanos, content_hash))) => {
+                match file_freshness(&full, secs, nanos, content_hash.as_deref()) {
+                    Some(FileFreshness::Fresh) => {}
+                    Some(FileFreshness::FreshWithUpdatedFingerprint {
+                        secs,
+                        nanos,
+                        content_hash,
+                    }) => {
+                        fingerprint_refreshes.push(FileFingerprintRefresh {
+                            path: (*cache_key).to_string(),
+                            mtime_secs: secs,
+                            mtime_nanos: nanos,
+                            content_hash,
+                        });
+                    }
+                    Some(FileFreshness::Stale) | None => return true,
                 }
-                None => true,
-            },
+            }
         }
-    })
+    }
+
+    refresh_file_fingerprints_best_effort(conn, &fingerprint_refreshes);
+    false
 }
 
 pub fn manifest_entry_count(conn: &Connection) -> i64 {
@@ -546,12 +565,12 @@ pub fn refresh_manifest_entries(tx: &Transaction<'_>, root: &Path) -> Result<(),
     }
 
     let mut insert = tx.prepare(
-        "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, NULL)",
+        "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for (file_name, cache_key) in CACHE_MANIFEST_FILES {
         let full = root.join(file_name);
-        if let Some((secs, nanos)) = file_mtime_parts(&full) {
-            insert.execute(params![cache_key, secs, nanos])?;
+        if let Some((secs, nanos, content_hash)) = file_fingerprint(&full) {
+            insert.execute(params![cache_key, secs, nanos, content_hash])?;
         }
     }
 
