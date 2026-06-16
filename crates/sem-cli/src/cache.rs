@@ -5,7 +5,10 @@ use std::path::Path;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
-use sem_core::parser::js_ts_import_source_files_from_set;
+use sem_core::parser::{
+    js_ts_has_default_re_export_from_content,
+    js_ts_import_source_files_from_filesystem_with_unscoped,
+};
 use sem_mcp::cache as shared_cache;
 
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
@@ -77,6 +80,7 @@ impl DiskCache {
         files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -144,6 +148,7 @@ impl DiskCache {
         }
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
+        shared_cache::set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
     }
@@ -155,6 +160,7 @@ impl DiskCache {
         graph: &EntityGraph,
         entities: &[SemanticEntity],
         custom_test_dirs: &[String],
+        source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -222,6 +228,7 @@ impl DiskCache {
         }
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_TOPOLOGY)?;
+        shared_cache::set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
     }
@@ -334,6 +341,7 @@ impl DiskCache {
         &self,
         root: &Path,
         files: &[String],
+        cache_first: bool,
         entity_name: Option<&str>,
         entity_id: Option<&str>,
         file_hint: Option<&str>,
@@ -360,6 +368,7 @@ impl DiskCache {
             return self.query_dependency_impact_topology(
                 root,
                 files,
+                cache_first,
                 entity_name,
                 entity_id,
                 file_hint,
@@ -436,11 +445,20 @@ impl DiskCache {
         &self,
         root: &Path,
         files: &[String],
+        cache_first: bool,
         entity_name: Option<&str>,
         entity_id: Option<&str>,
         file_hint: Option<&str>,
     ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
-        if !self.has_fresh_dependency_impact_scope(root, files)? {
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return Ok(None);
+        }
+
+        if cache_first {
+            if !shared_cache::cache_has_default_source_scope(&self.conn) {
+                return Ok(None);
+            }
+        } else if !self.has_fresh_cache(root, files) {
             return Ok(None);
         }
 
@@ -455,7 +473,7 @@ impl DiskCache {
             .direct_dependencies(&entity.id)
             .map_err(|_| CachedImpactError::CacheReadFailed)?;
 
-        if !self.has_fresh_dependency_impact_files(root, files, &entity, &dependencies)? {
+        if cache_first && !self.has_fresh_dependency_impact_files(root, &entity, &dependencies)? {
             return Ok(None);
         }
 
@@ -465,24 +483,13 @@ impl DiskCache {
             dependents: Vec::new(),
             impact: Vec::new(),
             tests: Vec::new(),
+            tests_truncated: false,
         }))
-    }
-
-    fn has_fresh_dependency_impact_scope(
-        &self,
-        root: &Path,
-        files: &[String],
-    ) -> Result<bool, CachedImpactError> {
-        if shared_cache::is_manifest_stale(&self.conn, root) {
-            return Ok(false);
-        }
-        self.cached_source_file_set_matches(files)
     }
 
     fn has_fresh_dependency_impact_files(
         &self,
         root: &Path,
-        files: &[String],
         entity: &EntityInfo,
         dependencies: &[EntityInfo],
     ) -> Result<bool, CachedImpactError> {
@@ -500,52 +507,27 @@ impl DiskCache {
         let cached_imported_files = self
             .cached_imported_files(&entity.file_path)
             .map_err(|_| CachedImpactError::CacheReadFailed)?;
-        let should_scan_current_imports = cached_imported_files.is_empty()
-            && !self
-                .has_file_import_entries()
-                .map_err(|_| CachedImpactError::CacheReadFailed)?;
-        for imported_file in cached_imported_files {
-            required_files.insert(imported_file);
+        let Some(current_imports) = current_imported_files(root, &entity.file_path)? else {
+            return Ok(false);
+        };
+        if cached_imported_files != current_imports.files {
+            return Ok(false);
         }
-        if should_scan_current_imports {
-            for imported_file in current_imported_files(root, files, &entity.file_path)? {
-                required_files.insert(imported_file);
+        if current_imports.has_default_re_export {
+            return Ok(false);
+        }
+        for imported_file in &cached_imported_files {
+            if file_has_default_re_export(root, imported_file)? {
+                return Ok(false);
             }
+            required_files.insert(imported_file.clone());
         }
 
         self.cached_files_are_fresh(root, required_files)
             .map_err(|_| CachedImpactError::CacheReadFailed)
     }
 
-    fn cached_source_file_set_matches(&self, files: &[String]) -> Result<bool, CachedImpactError> {
-        let current_files: HashSet<&str> = files
-            .iter()
-            .map(String::as_str)
-            .filter(|file| !shared_cache::is_manifest_file_name(file))
-            .collect();
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM files")
-            .map_err(|_| CachedImpactError::CacheReadFailed)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|_| CachedImpactError::CacheReadFailed)?;
-        let cached_files: HashSet<String> = rows
-            .filter_map(|row| row.ok())
-            .filter(|path| {
-                !shared_cache::is_cache_manifest_key(path)
-                    && !shared_cache::is_manifest_file_name(path)
-            })
-            .collect();
-
-        Ok(cached_files.len() == current_files.len()
-            && current_files
-                .iter()
-                .all(|file| cached_files.contains(*file)))
-    }
-
-    fn cached_imported_files(&self, file_path: &str) -> Result<Vec<String>, rusqlite::Error> {
+    fn cached_imported_files(&self, file_path: &str) -> Result<HashSet<String>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT imported_file FROM file_imports
              WHERE importing_file = ?1
@@ -553,13 +535,6 @@ impl DiskCache {
         )?;
         let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
         rows.collect()
-    }
-
-    fn has_file_import_entries(&self) -> Result<bool, rusqlite::Error> {
-        self.conn
-            .query_row("SELECT 1 FROM file_imports LIMIT 1", [], |_| Ok(()))
-            .optional()
-            .map(|row| row.is_some())
     }
 
     fn cached_files_are_fresh(
@@ -1637,23 +1612,39 @@ fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
     Some((entity_type, name))
 }
 
+struct CurrentImports {
+    files: HashSet<String>,
+    has_default_re_export: bool,
+}
+
 fn current_imported_files(
     root: &Path,
-    files: &[String],
     file_path: &str,
-) -> Result<Vec<String>, CachedImpactError> {
+) -> Result<Option<CurrentImports>, CachedImpactError> {
     let content = std::fs::read_to_string(root.join(file_path))
         .map_err(|_| CachedImpactError::CacheReadFailed)?;
-    let candidate_files: HashSet<&str> = files
+    let (files, has_unscoped_imports) =
+        js_ts_import_source_files_from_filesystem_with_unscoped(root, file_path, &content);
+    if has_unscoped_imports || !is_js_ts_cache_freshness_supported(file_path) {
+        return Ok(None);
+    }
+    let files = files.into_iter().collect();
+    Ok(Some(CurrentImports {
+        files,
+        has_default_re_export: js_ts_has_default_re_export_from_content(&content),
+    }))
+}
+
+fn file_has_default_re_export(root: &Path, file_path: &str) -> Result<bool, CachedImpactError> {
+    let content = std::fs::read_to_string(root.join(file_path))
+        .map_err(|_| CachedImpactError::CacheReadFailed)?;
+    Ok(js_ts_has_default_re_export_from_content(&content))
+}
+
+fn is_js_ts_cache_freshness_supported(file_path: &str) -> bool {
+    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
         .iter()
-        .map(String::as_str)
-        .filter(|file| !shared_cache::is_manifest_file_name(file))
-        .collect();
-    Ok(js_ts_import_source_files_from_set(
-        file_path,
-        &content,
-        &candidate_files,
-    ))
+        .any(|extension| file_path.ends_with(extension))
 }
 
 fn sql_io_error(error: rusqlite::Error) -> std::io::Error {
@@ -1827,7 +1818,15 @@ mod tests {
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
         let cache = DiskCache::open(root).unwrap();
-        cache.save(root, files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(
+                root,
+                files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
         assert!(cache.load(root, files).is_some());
         cache
     }
@@ -1844,7 +1843,15 @@ mod tests {
         ];
         let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
         let cache = DiskCache::open(&root).unwrap();
-        cache.save(&root, &files, &graph, &entities).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
 
         let mut output = Vec::new();
         assert!(cache
@@ -1892,7 +1899,14 @@ mod tests {
         );
         let cache = DiskCache::open(&root).unwrap();
         cache
-            .save_topology(&root, &files, &graph, &entities, &[])
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
 
         assert!(cache.load(&root, &files).is_none());
@@ -1952,7 +1966,14 @@ mod tests {
         let cache = DiskCache::open(&root).unwrap();
 
         cache
-            .save_topology(&root, &files, &graph, &entities, &[])
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
 
         assert_eq!(file_import_count(&cache, "b.ts", "a.ts"), 1);
@@ -2003,13 +2024,21 @@ mod tests {
         );
         let cache = DiskCache::open(&root).unwrap();
         cache
-            .save_topology(&root, &files, &graph, &entities, &[])
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
 
         let result = cache
             .query_impact_topology(
                 &root,
                 &files,
+                false,
                 Some("target"),
                 None,
                 Some("a.rs"),
@@ -2175,13 +2204,21 @@ mod tests {
         );
         let cache = DiskCache::open(&root).unwrap();
         cache
-            .save_topology(&root, &files, &graph, &entities, &[])
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
 
         let result = cache
             .query_impact_topology(
                 &root,
                 &files,
+                false,
                 Some("root"),
                 None,
                 Some("root.rs"),
@@ -2318,7 +2355,15 @@ mod tests {
         );
         let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
         let cache = DiskCache::open(&root).unwrap();
-        cache.save(&root, &files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
 
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
 
@@ -2554,6 +2599,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-id", "clean.rs", "clean", "clean old"),
                 ],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2603,6 +2649,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-old-id", "clean.rs", "clean", "clean old"),
                 ],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2666,7 +2713,13 @@ mod tests {
             ],
         );
         cache
-            .save(&root, &files, &initial_graph, &entities)
+            .save(
+                &root,
+                &files,
+                &initial_graph,
+                &entities,
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
         let clean_edge_rowid = edge_rowid(&cache, "clean-id", "other-id").unwrap();
 
@@ -2708,7 +2761,13 @@ mod tests {
         write_gitattributes(&cli_to_mcp);
         let cli_cache = DiskCache::open(&cli_to_mcp).unwrap();
         cli_cache
-            .save(&cli_to_mcp, &cli_to_mcp_files, &empty_graph(), &[])
+            .save(
+                &cli_to_mcp,
+                &cli_to_mcp_files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
         let mcp_cache = shared_cache::DiskCache::open(&cli_to_mcp).unwrap();
         assert!(mcp_cache.load(&cli_to_mcp, &cli_to_mcp_files).is_some());
@@ -2721,7 +2780,13 @@ mod tests {
         write_gitattributes(&mcp_to_cli);
         let mcp_cache = shared_cache::DiskCache::open(&mcp_to_cli).unwrap();
         mcp_cache
-            .save(&mcp_to_cli, &mcp_to_cli_files, &empty_graph(), &[])
+            .save(
+                &mcp_to_cli,
+                &mcp_to_cli_files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
         let cli_cache = DiskCache::open(&mcp_to_cli).unwrap();
         assert!(cli_cache.load(&mcp_to_cli, &mcp_to_cli_files).is_some());
@@ -2739,6 +2804,7 @@ mod tests {
                 &empty_graph(),
                 &[],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
         let mcp_cache = shared_cache::DiskCache::open(&cli_topology_to_mcp).unwrap();

@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::Path};
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
 use sem_core::parser::graph::{EntityGraph, EntityInfo};
+use sem_mcp::cache::CacheSourceScope;
 
 use crate::cache::{CachedImpactError, CachedImpactMode, CachedImpactResult, DiskCache};
 use crate::timings::Timings;
@@ -62,34 +63,32 @@ pub fn impact_command(opts: ImpactOptions) {
     let registry = super::create_registry(&root.to_string_lossy());
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let source_scope =
+        super::graph::cache_source_scope(root, &ext_filter, opts.no_default_excludes);
     let file_hint = opts
         .file_hint
         .as_deref()
         .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+    let cache_first_entity_scope = opts.entity_id.is_some() || file_hint.is_some();
 
-    if !opts.no_cache && matches!(opts.mode, ImpactMode::Deps) {
+    if !opts.no_cache
+        && matches!(opts.mode, ImpactMode::Deps)
+        && matches!(source_scope, CacheSourceScope::Default)
+        && cache_first_entity_scope
+    {
         match DiskCache::open(root) {
             Ok(disk) => {
                 timings.mark("cache_open");
-                if let Some(git_file_paths) = super::files::find_supported_files_from_git_index(
+                if try_cached_impact_query(
+                    &disk,
                     root,
-                    &registry,
-                    &ext_filter,
-                    opts.no_default_excludes,
+                    &[],
+                    &opts,
+                    file_hint.as_deref(),
+                    true,
+                    &mut timings,
                 ) {
-                    timings.mark("git_file_discovery");
-                    if try_cached_impact_query(
-                        &disk,
-                        root,
-                        &git_file_paths,
-                        &opts,
-                        file_hint.as_deref(),
-                        &mut timings,
-                    ) {
-                        return;
-                    }
-                } else {
-                    timings.mark("git_file_discovery_unavailable");
+                    return;
                 }
             }
             Err(_) => {
@@ -116,6 +115,7 @@ pub fn impact_command(opts: ImpactOptions) {
                     &file_paths,
                     &opts,
                     file_hint.as_deref(),
+                    false,
                     &mut timings,
                 ) {
                     return;
@@ -164,6 +164,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     }
@@ -190,6 +191,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     } else {
@@ -198,6 +200,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     }
@@ -224,6 +227,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     },
@@ -297,6 +301,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     },
@@ -340,11 +345,13 @@ fn try_cached_impact_query(
     file_paths: &[String],
     opts: &ImpactOptions,
     file_hint: Option<&str>,
+    cache_first: bool,
     timings: &mut Timings,
 ) -> bool {
     match disk.query_impact_topology(
         root,
         file_paths,
+        cache_first,
         opts.entity_name.as_deref(),
         opts.entity_id.as_deref(),
         file_hint,

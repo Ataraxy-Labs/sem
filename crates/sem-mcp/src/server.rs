@@ -451,7 +451,12 @@ impl SemServer {
 
         // Persist to SQLite (best-effort)
         if let Ok(disk) = cache::DiskCache::open(repo_root) {
-            let _ = disk.save(repo_root, file_paths, &graph, &entities);
+            let source_scope = if repo_root.join(".semignore").exists() {
+                cache::CacheSourceScope::Custom
+            } else {
+                cache::CacheSourceScope::Default
+            };
+            let _ = disk.save(repo_root, file_paths, &graph, &entities, source_scope);
         }
 
         let graph = Arc::new(graph);
@@ -574,10 +579,7 @@ impl SemServer {
     }
 
     /// Whole-repo (graph, entities), kept hot by the file watcher when active.
-    async fn live_graph(
-        &self,
-        repo_root: &Path,
-    ) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
+    async fn live_graph(&self, repo_root: &Path) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
         if self.ensure_live(repo_root).await.is_some() {
             let guard = self.graph_cache.lock().await;
             if let Some(ref cached) = *guard {
@@ -605,7 +607,8 @@ impl SemServer {
             }
         }
         let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
-        self.get_or_build_graph_topology(repo_root, &file_paths).await
+        self.get_or_build_graph_topology(repo_root, &file_paths)
+            .await
     }
 }
 
@@ -929,7 +932,11 @@ impl SemServer {
 
         let output = match mode {
             "tests" => {
-                let tests = graph.test_impact_with_custom_dirs(entity_id, &all_entities, &self.registry.custom_test_dirs);
+                let tests = graph.test_impact_with_custom_dirs(
+                    entity_id,
+                    &all_entities,
+                    &self.registry.custom_test_dirs,
+                );
                 let result: Vec<serde_json::Value> = tests
                     .iter()
                     .map(|d| {
@@ -953,7 +960,11 @@ impl SemServer {
                 let deps = graph.get_dependencies(entity_id);
                 let dependents = graph.get_dependents(entity_id);
                 let impact = graph.impact_analysis(entity_id);
-                let tests = graph.test_impact_with_custom_dirs(entity_id, &all_entities, &self.registry.custom_test_dirs);
+                let tests = graph.test_impact_with_custom_dirs(
+                    entity_id,
+                    &all_entities,
+                    &self.registry.custom_test_dirs,
+                );
 
                 let map_entities =
                     |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {

@@ -9,6 +9,7 @@ use serde::ser::{SerializeMap, Serializer};
 
 use crate::cache::DiskCache;
 use crate::timings::Timings;
+use sem_mcp::cache::CacheSourceScope;
 
 pub struct GraphOptions {
     pub cwd: String,
@@ -29,6 +30,7 @@ pub fn graph_command(opts: GraphOptions) {
     let ext_filter = normalize_exts(&opts.file_exts);
     let file_paths =
         find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
+    let source_scope = cache_source_scope(root, &ext_filter, opts.no_default_excludes);
     timings.mark("file_discovery");
     if opts.json && !opts.no_cache {
         if let Ok(disk) = DiskCache::open(root) {
@@ -59,6 +61,7 @@ pub fn graph_command(opts: GraphOptions) {
         &file_paths,
         &registry,
         opts.no_cache,
+        source_scope,
         &mut timings,
     );
     prog.done(&format!(
@@ -180,6 +183,18 @@ pub fn find_supported_files_with_options(
     )
 }
 
+pub fn cache_source_scope(
+    root: &Path,
+    ext_filter: &[String],
+    no_default_excludes: bool,
+) -> CacheSourceScope {
+    if ext_filter.is_empty() && !no_default_excludes && !root.join(".semignore").exists() {
+        CacheSourceScope::Default
+    } else {
+        CacheSourceScope::Custom
+    }
+}
+
 fn find_supported_files_inner(
     root: &Path,
     registry: &ParserRegistry,
@@ -196,9 +211,17 @@ pub fn get_or_build_graph(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     let mut timings = Timings::disabled("graph");
-    get_or_build_graph_with_timings(root, file_paths, registry, no_cache, &mut timings)
+    get_or_build_graph_with_timings(
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        source_scope,
+        &mut timings,
+    )
 }
 
 pub fn get_or_build_graph_with_timings(
@@ -206,6 +229,7 @@ pub fn get_or_build_graph_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     get_or_build_graph_with_cache_policy(
@@ -214,6 +238,7 @@ pub fn get_or_build_graph_with_timings(
         registry,
         no_cache,
         CacheMissSavePolicy::Full,
+        source_scope,
         timings,
     )
 }
@@ -223,6 +248,7 @@ pub fn get_or_build_graph_with_topology_save_on_miss_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     get_or_build_graph_with_cache_policy(
@@ -231,6 +257,7 @@ pub fn get_or_build_graph_with_topology_save_on_miss_with_timings(
         registry,
         no_cache,
         CacheMissSavePolicy::Topology,
+        source_scope,
         timings,
     )
 }
@@ -248,6 +275,7 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> GraphWithTestData {
     if !no_cache {
@@ -302,7 +330,14 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
 
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
-            let _ = disk.save_topology(root, file_paths, &graph, &entities, &registry.custom_test_dirs);
+            let _ = disk.save_topology(
+                root,
+                file_paths,
+                &graph,
+                &entities,
+                &registry.custom_test_dirs,
+                source_scope,
+            );
             timings.mark("cache_topology_save");
         }
     }
@@ -322,6 +357,7 @@ fn get_or_build_graph_with_cache_policy(
     registry: &ParserRegistry,
     no_cache: bool,
     save_policy: CacheMissSavePolicy,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     if !no_cache {
@@ -372,13 +408,20 @@ fn get_or_build_graph_with_cache_policy(
         match save_policy {
             CacheMissSavePolicy::Full => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save(root, file_paths, &graph, &entities);
+                    let _ = disk.save(root, file_paths, &graph, &entities, source_scope);
                     timings.mark("cache_full_save");
                 }
             }
             CacheMissSavePolicy::Topology => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save_topology(root, file_paths, &graph, &entities, &registry.custom_test_dirs);
+                    let _ = disk.save_topology(
+                        root,
+                        file_paths,
+                        &graph,
+                        &entities,
+                        &registry.custom_test_dirs,
+                        source_scope,
+                    );
                     timings.mark("cache_topology_save");
                 }
             }
@@ -393,6 +436,7 @@ pub fn get_or_build_graph_topology_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> EntityGraph {
     if !no_cache {
@@ -405,8 +449,14 @@ pub fn get_or_build_graph_topology_with_timings(
         }
     }
 
-    let (graph, _entities) =
-        get_or_build_graph_with_timings(root, file_paths, registry, no_cache, timings);
+    let (graph, _entities) = get_or_build_graph_with_timings(
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        source_scope,
+        timings,
+    );
     graph
 }
 
@@ -415,6 +465,7 @@ pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> EntityGraph {
     if !no_cache {
@@ -428,7 +479,12 @@ pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
     }
 
     let (graph, _entities) = get_or_build_graph_with_topology_save_on_miss_with_timings(
-        root, file_paths, registry, no_cache, timings,
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        source_scope,
+        timings,
     );
     graph
 }

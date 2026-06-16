@@ -52,7 +52,16 @@ pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
 pub const CACHE_MANIFEST_FILES: &[(&str, &str)] = &[
     (".semrc", "\0sem-manifest:.semrc"),
     (".gitattributes", "\0sem-manifest:.gitattributes"),
+    (".semignore", "\0sem-manifest:.semignore"),
 ];
+pub const CACHE_SOURCE_SCOPE_KEY: &str = "source_scope";
+pub const CACHE_SOURCE_SCOPE_DEFAULT: &str = "default";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheSourceScope {
+    Default,
+    Custom,
+}
 
 const CACHE_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS files (
@@ -134,6 +143,34 @@ pub fn set_cache_kind(tx: &Transaction<'_>, kind: &str) -> Result<(), rusqlite::
         params![kind],
     )?;
     Ok(())
+}
+
+pub fn set_cache_source_scope(
+    tx: &Transaction<'_>,
+    source_scope: CacheSourceScope,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM cache_metadata WHERE key = ?1",
+        params![CACHE_SOURCE_SCOPE_KEY],
+    )?;
+    if matches!(source_scope, CacheSourceScope::Default) {
+        tx.execute(
+            "INSERT INTO cache_metadata (key, value) VALUES (?1, ?2)",
+            params![CACHE_SOURCE_SCOPE_KEY, CACHE_SOURCE_SCOPE_DEFAULT],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn cache_has_default_source_scope(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM cache_metadata WHERE key = ?1",
+        params![CACHE_SOURCE_SCOPE_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .as_deref()
+        == Some(CACHE_SOURCE_SCOPE_DEFAULT)
 }
 
 pub fn cache_has_kind(conn: &Connection, accepted: &[&str]) -> bool {
@@ -672,6 +709,7 @@ impl DiskCache {
         files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -737,6 +775,7 @@ impl DiskCache {
         }
 
         set_cache_kind(&tx, CACHE_KIND_FULL)?;
+        set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
     }
@@ -1563,7 +1602,9 @@ mod tests {
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
         let cache = DiskCache::open(root).unwrap();
-        cache.save(root, files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(root, files, &empty_graph(), &[], CacheSourceScope::Default)
+            .unwrap();
         assert!(cache.load(root, files).is_some());
         cache
     }
@@ -1634,7 +1675,15 @@ mod tests {
         );
         let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
         let cache = DiskCache::open(&root).unwrap();
-        cache.save(&root, &files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
 
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
 
@@ -1949,6 +1998,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-id", "clean.rs", "clean", "clean old"),
                 ],
+                CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2007,7 +2057,13 @@ mod tests {
             ],
         );
         cache
-            .save(&root, &files, &initial_graph, &entities)
+            .save(
+                &root,
+                &files,
+                &initial_graph,
+                &entities,
+                CacheSourceScope::Default,
+            )
             .unwrap();
 
         let updated_entities = vec![
@@ -2061,6 +2117,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-old-id", "clean.rs", "clean", "clean old"),
                 ],
+                CacheSourceScope::Default,
             )
             .unwrap();
 

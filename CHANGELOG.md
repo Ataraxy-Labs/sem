@@ -11,6 +11,7 @@ All notable changes to sem are documented in this file.
 ### Changed
 
 - `sem impact --deps` can reuse fresh caches when unrelated files change by validating the cached source set, hashes, and import metadata before falling back to a graph rebuild.
+- `sem impact --deps` narrows cache freshness checks to the queried entity, direct dependencies, and relevant JavaScript/TypeScript imports when the query scope is explicit.
 
 ## [0.13.0] - 2026-06-16
 
