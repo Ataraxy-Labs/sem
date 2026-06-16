@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use crate::timings::Timings;
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
+use sem_core::parser::registry::ParserRegistry;
 
 pub struct EntitiesOptions {
     pub cwd: String,
     pub paths: Vec<String>,
     pub json: bool,
     pub no_default_excludes: bool,
+    pub file_exts: Vec<String>,
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
@@ -33,8 +34,13 @@ pub fn entities_command(opts: EntitiesOptions) {
     timings.counter("input_paths", path_args.len() as u64);
     timings.mark("path_args");
 
+    let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+
     // The cloud fast-path only helps the whole-repo single listing.
-    if path_args.len() == 1 && super::cloud::try_cloud_entities(&opts).is_some() {
+    if ext_filter.is_empty()
+        && path_args.len() == 1
+        && super::cloud::try_cloud_entities(&opts).is_some()
+    {
         timings.mark("cloud_entities");
         timings.finish();
         return;
@@ -72,7 +78,7 @@ pub fn entities_command(opts: EntitiesOptions) {
                 root,
                 &full_path,
                 &registry,
-                &[],
+                &ext_filter,
                 opts.no_default_excludes,
             );
             discovered_file_count += file_paths.len();
@@ -161,17 +167,7 @@ fn extract_files_entities(
     file_paths: &[String],
     registry: &ParserRegistry,
 ) -> Vec<SemanticEntity> {
-    let mut entities = registry.extract_all_entities(root, file_paths);
-    resolve_go_method_parent_ids(&mut entities);
-    entities.sort_by(|a, b| {
-        a.file_path
-            .cmp(&b.file_path)
-            .then(a.start_line.cmp(&b.start_line))
-            .then(a.end_line.cmp(&b.end_line))
-            .then(a.entity_type.cmp(&b.entity_type))
-            .then(a.name.cmp(&b.name))
-    });
-    entities
+    registry.extract_all_entities(root, file_paths)
 }
 
 fn file_path_for_entity(root: &Path, path: &Path) -> String {
