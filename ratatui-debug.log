@@ -1,0 +1,8 @@
+[ratatui-demo-diffs] draws=120 avg_ms=0.700 max_ms=5.421 selected=0 scroll=0
+[ratatui-demo-diffs] draws=240 avg_ms=0.666 max_ms=5.421 selected=0 scroll=0
+[ratatui-demo-diffs] draws=360 avg_ms=0.710 max_ms=5.421 selected=0 scroll=0
+[ratatui-demo-diffs] draws=480 avg_ms=0.725 max_ms=5.421 selected=0 scroll=0
+[ratatui-demo-diffs] draws=600 avg_ms=0.745 max_ms=5.421 selected=1524 scroll=1504
+[ratatui-demo-diffs] draws=720 avg_ms=0.758 max_ms=7.995 selected=4 scroll=0
+[ratatui-demo-diffs] draws=840 avg_ms=0.782 max_ms=7.995 selected=109 scroll=100
+[ratatui-demo-diffs] draws=960 avg_ms=0.792 max_ms=7.995 selected=122 scroll=100

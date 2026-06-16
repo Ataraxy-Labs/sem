@@ -107,7 +107,11 @@ pub fn login(
     println!("{} Logged in to {}", "ok".green().bold(), ep);
     println!("  Credentials saved to {}", path.display());
     println!(
-        "  Cloud-accelerated commands are now active for registered repos."
+        "  Logging in changes nothing else: no repo registered, no query sent."
+    );
+    println!(
+        "  Turn cloud on per repo with {}.",
+        "sem cloud enable".bold()
     );
 
     Ok(())
@@ -208,7 +212,11 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
     println!("{} Logged in to {} via GitHub", "ok".green().bold(), ep);
     println!("  Credentials saved to {}", path.display());
     println!(
-        "  Cloud-accelerated commands are now active for registered repos."
+        "  Logging in changes nothing else: no repo registered, no query sent."
+    );
+    println!(
+        "  Turn cloud on per repo with {}.",
+        "sem cloud enable".bold()
     );
 
     Ok(())
@@ -287,8 +295,8 @@ pub fn whoami() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "{} {} {}",
                     "Repo ID: ".bold(),
-                    "not registered".dimmed(),
-                    "(registers automatically on first sem impact/context/log)".dimmed()
+                    "off — local only".dimmed(),
+                    "(turn on with sem cloud enable)".dimmed()
                 );
             }
         }
@@ -415,31 +423,11 @@ pub struct RepoCacheEntry {
     pub entity_count: Option<usize>,
 }
 
-/// Below this entity count, the local SQLite cache answers graph queries
-/// faster than a network round trip — stay local. (Measured: 4.6k entities
-/// load in ~18ms locally vs ~90ms+ for one HTTPS request; 147k entities
-/// take ~500ms locally vs ~115-190ms via cloud.)
-const CLOUD_MIN_ENTITIES: usize = 20_000;
-
-/// Look up the cached entity count for a remote, if known.
-/// Only trusts counts from fully indexed repos within the cache TTL — a
-/// repo registered while still indexing reports 0 entities, and treating
-/// that as "small" would permanently route it away from the cloud.
-fn cached_entity_count(remote_url: &str) -> Option<usize> {
-    let normalized = normalize_remote_url(remote_url);
-    let cache = load_repo_cache()?;
-    let entry = cache.get(&normalized)?;
-    if entry.status != "ready" || cache_entry_expired(entry) {
-        return None;
-    }
-    entry.entity_count
-}
-
-/// True when the repo is known to be small enough that local graph queries
-/// beat the network. Unknown size → not provably small → try cloud.
-fn known_small_repo(remote_url: &str) -> bool {
-    cached_entity_count(remote_url).is_some_and(|n| n < CLOUD_MIN_ENTITIES)
-}
+// Cloud-only routing: once a repo is enabled, EVERY graph command uses the
+// cloud regardless of repo size. There is no size-based "small repo → local"
+// heuristic. Local computation is reached only by an explicit escape hatch
+// (`SEM_LOCAL=1` / `SEM_NO_NETWORK=1`) or as a fallback when the cloud is
+// unreachable — never because a repo happens to be small.
 
 fn repo_cache_path() -> Option<PathBuf> {
     let home = std::env::var("HOME")
@@ -515,11 +503,29 @@ pub fn normalize_remote_url(url: &str) -> String {
     normalized
 }
 
-/// True when the user has explicitly opted in to syncing private repos to the
-/// cloud (set `SEM_SYNC_PRIVATE=1`). Off by default so private code is never
-/// uploaded without consent.
-fn private_sync_opted_in() -> bool {
-    std::env::var("SEM_SYNC_PRIVATE").is_ok_and(|v| !v.is_empty() && v != "0")
+/// Insert/update the local repo cache from a registration or resolution.
+fn cache_repo(remote_url: &str, repo: &CloudRepoResponse) {
+    let normalized = normalize_remote_url(remote_url);
+    let mut cache = load_repo_cache().unwrap_or_default();
+    cache.insert(
+        normalized,
+        RepoCacheEntry {
+            repo_id: repo.id.clone(),
+            status: repo.status.clone(),
+            checked_at: current_timestamp(),
+            entity_count: repo.entity_count,
+        },
+    );
+    save_repo_cache(&cache);
+}
+
+/// Drop a repo's cache entry (e.g. after `sem cloud forget`).
+pub fn evict_repo_cache_for(remote_url: &str) {
+    let normalized = normalize_remote_url(remote_url);
+    if let Some(mut cache) = load_repo_cache() {
+        cache.remove(&normalized);
+        save_repo_cache(&cache);
+    }
 }
 
 /// Parse the GitHub `owner`/`repo` from a remote URL, if it is a github.com
@@ -549,19 +555,42 @@ fn show_cloud_banner() {
     }
 }
 
-/// Returns true if the user has set SEM_LOCAL=1 to force local computation.
+/// Master kill switch: `SEM_NO_NETWORK=1` blocks every network call (cloud,
+/// telemetry upload, update checks).
+pub fn network_disabled() -> bool {
+    std::env::var("SEM_NO_NETWORK").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Returns true if cloud routing is forced off: `SEM_LOCAL=1` or the
+/// `SEM_NO_NETWORK` master kill switch.
 pub fn is_local_forced() -> bool {
-    std::env::var("SEM_LOCAL").ok().is_some_and(|v| v == "1")
+    std::env::var("SEM_LOCAL").ok().is_some_and(|v| v == "1") || network_disabled()
+}
+
+/// Credentials from `~/.sem/credentials.json`, or from `SEM_TOKEN` (+ optional
+/// `SEM_CLOUD_ENDPOINT`) for CI where there's no interactive login.
+fn credentials_or_env() -> Option<CloudCredentials> {
+    if let Ok(token) = std::env::var("SEM_TOKEN") {
+        if !token.is_empty() {
+            let endpoint =
+                std::env::var("SEM_CLOUD_ENDPOINT").unwrap_or_else(|_| default_endpoint());
+            return Some(CloudCredentials {
+                api_key: token,
+                endpoint,
+            });
+        }
+    }
+    load_credentials()
 }
 
 impl CloudClient {
-    /// Create a CloudClient from stored credentials.
-    /// Returns None if not logged in, or if SEM_LOCAL=1 is set.
+    /// Create a CloudClient from stored credentials or `SEM_TOKEN`.
+    /// Returns None if not logged in, or if cloud is forced off.
     pub fn from_credentials() -> Option<Self> {
         if is_local_forced() {
             return None;
         }
-        let creds = load_credentials()?;
+        let creds = credentials_or_env()?;
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(API_TIMEOUT_SECS))
             .build();
@@ -623,25 +652,65 @@ impl CloudClient {
         Err("repo not found".into())
     }
 
-    /// Register a new repo with the cloud. Returns the repo response.
+    /// Register a new repo with the cloud, tagging its visibility so the server
+    /// enforces the public-auto-sync / private-opt-in policy. Returns the response.
     fn register_repo(
         &self,
         remote_url: &str,
+        visibility: &str,
     ) -> Result<CloudRepoResponse, Box<dyn std::error::Error>> {
         let resp: CloudRepoResponse = self
             .agent
             .post(&self.api_url("/v1/repos"))
             .set("Authorization", &self.auth_header())
-            .send_json(serde_json::json!({ "cloneUrl": remote_url }))?
+            .send_json(serde_json::json!({ "cloneUrl": remote_url, "visibility": visibility }))?
             .into_json()?;
         Ok(resp)
     }
 
+    /// Register a repo whose consent was just granted via `sem cloud enable`
+    /// or `sem cloud share`, caching the result. Public entry for the consent
+    /// commands.
+    pub fn register(
+        &self,
+        remote_url: &str,
+        visibility: &str,
+    ) -> Result<CloudRepoResponse, Box<dyn std::error::Error>> {
+        let repo = self.register_repo(remote_url, visibility)?;
+        cache_repo(remote_url, &repo);
+        Ok(repo)
+    }
+
+    /// Every repo indexed under this account (`sem cloud list`).
+    pub fn list_repos(&self) -> Result<Vec<CloudRepoResponse>, Box<dyn std::error::Error>> {
+        let resp = self
+            .agent
+            .get(&self.api_url("/v1/repos"))
+            .set("Authorization", &self.auth_header())
+            .call()?
+            .into_json()?;
+        Ok(resp)
+    }
+
+    /// Resolve and delete a repo from the cloud (`sem cloud forget`). Returns
+    /// Ok(false) when the repo was never registered.
+    pub fn forget_repo(&self, remote_url: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let repo_id = match self.resolve_repo(remote_url) {
+            Ok(id) => id,
+            Err(_) => return Ok(false),
+        };
+        self.agent
+            .delete(&self.api_url(&format!("/v1/repos/{repo_id}")))
+            .set("Authorization", &self.auth_header())
+            .call()?;
+        Ok(true)
+    }
+
     /// Best-effort check that a repo is public, via the unauthenticated GitHub
     /// API. Returns true only when GitHub confirms `private: false`; private,
-    /// missing, non-GitHub, or unreachable repos all return false, so we never
-    /// auto-sync a private codebase to the cloud.
-    fn repo_is_public(&self, remote_url: &str) -> bool {
+    /// missing, non-GitHub, or unreachable repos all return false. Used by
+    /// `sem cloud enable` to steer private repos to the louder `share` flow.
+    pub fn repo_is_public(&self, remote_url: &str) -> bool {
         let Some((owner, repo)) = github_owner_repo(remote_url) else {
             return false;
         };
@@ -662,34 +731,21 @@ impl CloudClient {
         }
     }
 
-    /// Resolve repo, or register if not found. Returns repo_id only if status is "ready".
+    /// Resolve repo, or register if not found. Returns repo_id only if status
+    /// is "ready". Callers gate on explicit consent (`consent::cloud_enabled_for`)
+    /// before reaching here, so registration here is never silent.
     pub fn ensure_repo(&self, remote_url: &str) -> Result<String, Box<dyn std::error::Error>> {
         match self.resolve_repo(remote_url) {
             Ok(id) => Ok(id),
             Err(_) => {
-                // Privacy default: only auto-register repos GitHub confirms are
-                // public. A private repo is synced to the cloud only when the
-                // user opts in via SEM_SYNC_PRIVATE, so private code is never
-                // uploaded silently. Already-registered repos resolve above and
-                // skip this check.
-                if !private_sync_opted_in() && !self.repo_is_public(remote_url) {
-                    return Err(
-                        "private repo not synced (set SEM_SYNC_PRIVATE=1 to opt in)".into(),
-                    );
-                }
-                let repo = self.register_repo(remote_url)?;
-                let normalized = normalize_remote_url(remote_url);
-                let mut cache = load_repo_cache().unwrap_or_default();
-                cache.insert(
-                    normalized,
-                    RepoCacheEntry {
-                        repo_id: repo.id.clone(),
-                        status: repo.status.clone(),
-                        checked_at: current_timestamp(),
-                        entity_count: repo.entity_count,
-                    },
-                );
-                save_repo_cache(&cache);
+                // Visibility follows the recorded consent: `sem cloud share`
+                // marks a repo private; everything else registers as public.
+                let visibility = match super::consent::state_for(remote_url) {
+                    Some(super::consent::ConsentState::Shared) => "private",
+                    _ => "public",
+                };
+                let repo = self.register_repo(remote_url, visibility)?;
+                cache_repo(remote_url, &repo);
 
                 if repo.status == "ready" {
                     Ok(repo.id)
@@ -697,16 +753,6 @@ impl CloudClient {
                     Err(format!("repo status is '{}', not ready yet", repo.status).into())
                 }
             }
-        }
-    }
-
-    /// Evict a cached repo entry (e.g., on 404).
-    #[allow(dead_code)]
-    fn evict_repo_cache(&self, remote_url: &str) {
-        let normalized = normalize_remote_url(remote_url);
-        if let Some(mut cache) = load_repo_cache() {
-            cache.remove(&normalized);
-            save_repo_cache(&cache);
         }
     }
 
@@ -821,6 +867,21 @@ fn cloud_git_context(cwd: &str) -> Option<(GitBridge, String)> {
     Some((git, remote))
 }
 
+/// Cloud answers reflect the last *indexed commit*. When the working tree has
+/// uncommitted changes those answers would be stale, so state-reflecting
+/// commands (impact/context/entities) fall back to a full local computation:
+/// clean tree → cloud, dirty tree → local. `git status --porcelain` empty
+/// means clean; if we can't tell, assume dirty (the safe choice).
+fn working_tree_clean(repo_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| o.status.success() && o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 /// Try to run `sem impact` via cloud. Returns Some(()) on success.
 pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     // --tests needs test classification data the cloud API doesn't expose.
@@ -829,8 +890,13 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     }
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
-    // Small repos answer graph queries faster from the local cache.
-    if known_small_repo(&remote) {
+    // Cloud is off until the user runs `sem cloud enable`/`share` (or SEM_CLOUD=1).
+    // Once enabled, every repo uses the cloud regardless of size.
+    if !super::consent::cloud_enabled_for(&remote) {
+        return None;
+    }
+    // Dirty working tree → the cloud's indexed-commit answer would be stale; go local.
+    if !working_tree_clean(git.repo_root()) {
         return None;
     }
     let repo_id = client.ensure_repo(&remote).ok()?;
@@ -846,6 +912,7 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
         .unwrap_or_default();
     let result = client.impact(&repo_id, entity_name, &file_hint).ok()?;
 
+    super::consent::record_outbound(&remote, "impact", entity_name);
     show_cloud_banner();
 
     let deps_json = || -> Vec<serde_json::Value> {
@@ -994,8 +1061,10 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
 pub fn try_cloud_context(opts: &ContextOptions) -> Option<()> {
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
-    // Small repos answer graph queries faster from the local cache.
-    if known_small_repo(&remote) {
+    if !super::consent::cloud_enabled_for(&remote) {
+        return None;
+    }
+    if !working_tree_clean(git.repo_root()) {
         return None;
     }
     let repo_id = client.ensure_repo(&remote).ok()?;
@@ -1011,6 +1080,7 @@ pub fn try_cloud_context(opts: &ContextOptions) -> Option<()> {
         .context(&repo_id, entity_name, &file_path, opts.budget)
         .ok()?;
 
+    super::consent::record_outbound(&remote, "context", entity_name);
     show_cloud_banner();
 
     if opts.json {
@@ -1099,15 +1169,21 @@ pub fn try_cloud_entities(opts: &EntitiesOptions) -> Option<()> {
 
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
-    // Subdirectory listings parse few files — local wins those (measured
-    // 46ms local vs 138ms cloud). Cloud only pays off for whole-repo
-    // listings of large repos, where local re-parses everything.
+    if !super::consent::cloud_enabled_for(&remote) {
+        return None;
+    }
+    if !working_tree_clean(git.repo_root()) {
+        return None;
+    }
+    // Whole-repo listings go to the cloud (any size). Subdirectory listings
+    // stay local only because the cloud entities endpoint lists the whole repo
+    // — that's a scope limit, not a size one.
     let normalized = super::normalize_repo_relative_path(
         Path::new(&opts.cwd),
         git.repo_root(),
         path_arg,
     );
-    if normalized != "." || known_small_repo(&remote) {
+    if normalized != "." {
         return None;
     }
     let repo_id = client.ensure_repo(&remote).ok()?;
@@ -1122,6 +1198,7 @@ pub fn try_cloud_entities(opts: &EntitiesOptions) -> Option<()> {
             .then(a.name.cmp(&b.name))
     });
 
+    super::consent::record_outbound(&remote, "entities", ".");
     show_cloud_banner();
 
     if opts.json {
@@ -1164,6 +1241,9 @@ pub fn try_cloud_entities(opts: &EntitiesOptions) -> Option<()> {
 pub fn try_cloud_log(opts: &LogOptions) -> Option<()> {
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
+    if !super::consent::cloud_enabled_for(&remote) {
+        return None;
+    }
     let repo_id = client.ensure_repo(&remote).ok()?;
     let file_filter = opts.file_path.as_deref().map(|f| {
         super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f)
@@ -1189,6 +1269,7 @@ pub fn try_cloud_log(opts: &LogOptions) -> Option<()> {
         return None; // Fall back to local if cloud has no history for this entity
     }
 
+    super::consent::record_outbound(&remote, "log", &opts.entity_name);
     show_cloud_banner();
 
     if opts.json {

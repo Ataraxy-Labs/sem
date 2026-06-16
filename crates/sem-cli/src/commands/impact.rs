@@ -51,6 +51,7 @@ pub fn impact_command(opts: ImpactOptions) {
         return;
     }
 
+    let started = std::time::Instant::now();
     let mut timings = Timings::from_env("impact");
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
         Ok(git) => git.repo_root().to_path_buf(),
@@ -258,6 +259,7 @@ pub fn impact_command(opts: ImpactOptions) {
         }
     }
     timings.finish();
+    super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
 }
 
 fn find_entity<'a>(

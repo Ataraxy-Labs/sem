@@ -22,6 +22,7 @@ pub fn context_command(opts: ContextOptions) {
         return;
     }
 
+    let started = std::time::Instant::now();
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
         Ok(git) => git.repo_root().to_path_buf(),
         Err(_) => Path::new(&opts.cwd).to_path_buf(),
@@ -117,6 +118,7 @@ pub fn context_command(opts: ContextOptions) {
             }
         }
     }
+    super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
 }
 
 fn find_entity<'a>(

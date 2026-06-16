@@ -304,6 +304,16 @@ enum Commands {
     Logout,
     /// Show current sem cloud identity
     Whoami,
+    /// Manage cloud acceleration for a repo (off until you enable it)
+    Cloud {
+        #[command(subcommand)]
+        action: CloudAction,
+    },
+    /// Control anonymous usage telemetry (local by default — nothing uploaded)
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
     /// Update sem to the latest released version
     Update,
     /// Generate shell completions
@@ -318,6 +328,38 @@ enum Commands {
     /// Refresh the cached latest-version info (internal; spawned in the background)
     #[command(name = "__update-check", hide = true)]
     UpdateCheck,
+}
+
+#[derive(Subcommand)]
+enum CloudAction {
+    /// Enable cloud queries for this public repo (shows what's sent, asks first)
+    Enable,
+    /// Share this private repo's index with the cloud (extra confirmation)
+    Share,
+    /// List every repo indexed under your account
+    List,
+    /// Show cloud + telemetry state for this repo (offline; sends nothing)
+    Status,
+    /// Print the exact request a cloud query would send
+    Preview,
+    /// Print the local ledger of every outbound cloud request
+    Log,
+    /// Stop offering cloud for this repo (or suppress the tip globally)
+    Never,
+    /// Delete this repo's cloud index and unregister it
+    Forget,
+}
+
+#[derive(Subcommand)]
+enum TelemetryAction {
+    /// Record usage locally and upload it to help improve sem
+    On,
+    /// Record usage locally only; never upload (the default)
+    Local,
+    /// Record nothing
+    Off,
+    /// Show the current mode and what would be sent
+    Preview,
 }
 
 /// Command name recorded in anonymous usage telemetry. Names only — no
@@ -338,6 +380,8 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Login { .. }) => "login",
         Some(Commands::Logout) => "logout",
         Some(Commands::Whoami) => "whoami",
+        Some(Commands::Cloud { .. }) => "cloud",
+        Some(Commands::Telemetry { .. }) => "telemetry",
         Some(Commands::Update) => "update",
         Some(Commands::Completions { .. }) => "completions",
         Some(Commands::TelemetryFlush) | Some(Commands::UpdateCheck) => return None,
@@ -605,6 +649,28 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Cloud { action }) => {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match action {
+                CloudAction::Enable => commands::consent::enable(&cwd),
+                CloudAction::Share => commands::consent::share(&cwd),
+                CloudAction::List => commands::consent::list(&cwd),
+                CloudAction::Status => commands::consent::status(&cwd),
+                CloudAction::Preview => commands::consent::preview(&cwd),
+                CloudAction::Log => commands::consent::log(),
+                CloudAction::Never => commands::consent::never(&cwd),
+                CloudAction::Forget => commands::consent::forget(&cwd),
+            }
+        }
+        Some(Commands::Telemetry { action }) => match action {
+            TelemetryAction::On => telemetry::set_mode("on"),
+            TelemetryAction::Local => telemetry::set_mode("local"),
+            TelemetryAction::Off => telemetry::set_mode("off"),
+            TelemetryAction::Preview => telemetry::preview(),
+        },
         Some(Commands::Update) => {
             if let Err(e) = commands::update::run() {
                 eprintln!("{} {}", "error:".red().bold(), e);
