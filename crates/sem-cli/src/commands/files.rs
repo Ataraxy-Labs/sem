@@ -149,6 +149,7 @@ mod tests {
     fn scan_skips_binary_files_and_default_excludes() {
         let root = temp_dir();
         fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src/generated")).unwrap();
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(
@@ -159,6 +160,26 @@ mod tests {
         fs::write(root.join("src/notes.weird"), "plain text\n").unwrap();
         fs::write(root.join("src/blob.weird"), b"abc\0def").unwrap();
         fs::write(root.join("src/icon.png"), b"\x89PNG\r\n").unwrap();
+        fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedSchema() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/api.generated.ts"),
+            "export function generatedApi() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/styles.module.scss.d.ts"),
+            "declare const styles: Record<string, string>;\nexport default styles;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/logo.svg.d.ts"),
+            "declare const src: string;\nexport default src;\n",
+        )
+        .unwrap();
         fs::write(root.join("dist/generated.js"), "function generated() {}\n").unwrap();
 
         let registry = create_default_registry();
@@ -172,6 +193,10 @@ mod tests {
         let files_with_generated = find_supported_files_in_path(&root, &root, &registry, &[], true);
         assert!(files_with_generated.contains(&"src/main.rs".to_string()));
         assert!(files_with_generated.contains(&"src/run".to_string()));
+        assert!(files_with_generated.contains(&"src/generated/schema.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/api.generated.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/styles.module.scss.d.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/logo.svg.d.ts".to_string()));
         assert!(files_with_generated.contains(&"dist/generated.js".to_string()));
         assert!(!files_with_generated.contains(&"src/notes.weird".to_string()));
         assert!(!files_with_generated.contains(&"src/blob.weird".to_string()));

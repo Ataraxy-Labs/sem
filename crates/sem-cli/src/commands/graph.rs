@@ -36,7 +36,7 @@ pub fn graph_command(opts: GraphOptions) {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
             let stdout = std::io::stdout();
-            match disk.write_graph_json_topology(root, &file_paths, stdout.lock()) {
+            match disk.write_graph_json_topology(root, &file_paths, source_scope, stdout.lock()) {
                 Ok(true) => {
                     timings.mark("cache_topology_json_stream");
                     timings.finish();
@@ -281,12 +281,14 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some((graph, entities)) = disk.load(root, file_paths) {
+            if let Some((graph, entities)) =
+                disk.load_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_full_load");
                 return GraphWithTestData::Full(graph, entities);
             }
-            if let Some((graph, test_entity_ids)) =
-                disk.load_graph_topology_with_test_ids(root, file_paths)
+            if let Some((graph, test_entity_ids)) = disk
+                .load_graph_topology_with_test_ids_and_source_scope(root, file_paths, source_scope)
             {
                 timings.mark("cache_topology_load");
                 return GraphWithTestData::Topology {
@@ -295,7 +297,9 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
                 };
             }
 
-            if let Some(partial) = disk.load_partial(root, file_paths) {
+            if let Some(partial) =
+                disk.load_partial_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_partial_load");
                 let (graph, entities, metadata) =
                     EntityGraph::build_incremental_with_metadata_and_import_candidates(
@@ -318,6 +322,7 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
                     metadata.repaired_clean_entity_ids,
                     &metadata.recomputed_edge_source_ids,
                     &metadata.deleted_entity_ids,
+                    source_scope,
                 );
                 timings.mark("cache_incremental_save");
                 return GraphWithTestData::Full(graph, entities);
@@ -364,13 +369,15 @@ fn get_or_build_graph_with_cache_policy(
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
             // Try full cache hit
-            if let Some(cached) = disk.load(root, file_paths) {
+            if let Some(cached) = disk.load_with_source_scope(root, file_paths, source_scope) {
                 timings.mark("cache_full_load");
                 return cached;
             }
 
             // Try incremental: load clean cached data, rebuild only stale files
-            if let Some(partial) = disk.load_partial(root, file_paths) {
+            if let Some(partial) =
+                disk.load_partial_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_partial_load");
                 let (graph, entities, metadata) =
                     EntityGraph::build_incremental_with_metadata_and_import_candidates(
@@ -393,6 +400,7 @@ fn get_or_build_graph_with_cache_policy(
                     metadata.repaired_clean_entity_ids,
                     &metadata.recomputed_edge_source_ids,
                     &metadata.deleted_entity_ids,
+                    source_scope,
                 );
                 timings.mark("cache_incremental_save");
                 return (graph, entities);
@@ -442,7 +450,9 @@ pub fn get_or_build_graph_topology_with_timings(
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_topology_load");
                 return graph;
             }
@@ -471,7 +481,9 @@ pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_topology_load");
                 return graph;
             }
@@ -494,6 +506,7 @@ pub fn get_or_build_direct_dependency_graph_with_timings<F>(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
     should_resolve: F,
 ) -> EntityGraph
@@ -503,7 +516,9 @@ where
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_topology_load");
                 return graph;
             }

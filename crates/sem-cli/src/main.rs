@@ -157,7 +157,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -183,7 +183,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -241,7 +241,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -279,7 +279,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
