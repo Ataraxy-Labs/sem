@@ -260,6 +260,10 @@ fn entities_uses_fresh_topology_cache() {
         !phase_names.contains(&"extract_entities"),
         "cache hit should not parse files; got {phase_names:?}"
     );
+    assert!(
+        !phase_names.contains(&"sort_dedup"),
+        "streamed cache hit should not materialize and sort entities; got {phase_names:?}"
+    );
 
     let counters = timings["counters"]
         .as_array()
