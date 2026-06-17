@@ -4,7 +4,7 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
-## [0.12.1] - 2026-06-16
+## [0.13.0] - 2026-06-16
 
 ### Fixed
 
