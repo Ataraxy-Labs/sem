@@ -7,11 +7,19 @@ use serde::Deserialize;
 pub struct EntitiesParams {
     #[schemars(description = "Optional path to a file or directory. If omitted, defaults to '.'.")]
     pub path: Option<String>,
+    #[schemars(
+        description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
+    )]
+    pub no_default_excludes: Option<bool>,
 }
 
 impl EntitiesParams {
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref().filter(|p| !p.is_empty())
+    }
+
+    pub fn no_default_excludes(&self) -> bool {
+        self.no_default_excludes.unwrap_or(false)
     }
 }
 
@@ -46,6 +54,10 @@ pub struct ImpactAnalysisParams {
         description = "Analysis mode: 'all' (default, shows deps + dependents + transitive impact + tests), 'deps' (direct dependencies only), 'dependents' (direct dependents only), 'tests' (affected test entities only)"
     )]
     pub mode: Option<String>,
+    #[schemars(
+        description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
+    )]
+    pub no_default_excludes: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -68,6 +80,10 @@ pub struct ContextParams {
     pub entity_name: String,
     #[schemars(description = "Maximum token budget. Defaults to 8000.")]
     pub token_budget: Option<usize>,
+    #[schemars(
+        description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
+    )]
+    pub no_default_excludes: Option<bool>,
 }
 
 #[cfg(test)]
@@ -103,6 +119,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "path": "src/lib.rs" })).unwrap();
 
         assert_eq!(params.path(), Some("src/lib.rs"));
+        assert!(!params.no_default_excludes());
     }
 
     #[test]
@@ -110,6 +127,15 @@ mod tests {
         let params: EntitiesParams = serde_json::from_value(serde_json::json!({})).unwrap();
 
         assert_eq!(params.path(), None);
+        assert!(!params.no_default_excludes());
+    }
+
+    #[test]
+    fn entities_params_accepts_no_default_excludes() {
+        let params: EntitiesParams =
+            serde_json::from_value(serde_json::json!({ "no_default_excludes": true })).unwrap();
+
+        assert!(params.no_default_excludes());
     }
 
     #[test]

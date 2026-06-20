@@ -2,14 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_core::parser::{
     js_ts_has_default_re_export_from_content,
     js_ts_import_source_files_from_filesystem_with_unscoped,
 };
+use sem_core::utils::scan::is_default_excluded;
 use sem_mcp::cache as shared_cache;
+use serde::Serialize;
 
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 const SQL_PARAM_CHUNK: usize = 500;
@@ -45,6 +47,18 @@ pub struct CachedImpactResult {
     pub tests_truncated: bool,
 }
 
+#[derive(Serialize)]
+struct EntityListingJsonRow<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    entity_type: &'a str,
+    start_line: usize,
+    end_line: usize,
+    parent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<&'a str>,
+}
+
 #[derive(Debug)]
 pub enum CachedImpactError {
     CacheReadFailed,
@@ -71,6 +85,17 @@ impl DiskCache {
 
         shared_cache::initialize_schema(&conn)?;
 
+        Ok(Self { conn })
+    }
+
+    pub fn open_existing_readonly(repo_root: &Path) -> Result<Self, rusqlite::Error> {
+        let db_path = shared_cache::cache_db_path(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        if !db_path.exists() {
+            return Err(rusqlite::Error::InvalidPath(db_path));
+        }
+
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self { conn })
     }
 
@@ -233,12 +258,22 @@ impl DiskCache {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn load(
         &self,
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
-        if !self.has_fresh_complete_cache(root, files) {
+        self.load_with_source_scope(root, files, shared_cache::CacheSourceScope::Default)
+    }
+
+    pub fn load_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        if !self.has_fresh_complete_cache(root, files, source_scope) {
             return None;
         }
 
@@ -313,20 +348,48 @@ impl DiskCache {
     }
 
     /// Load only graph topology from a fresh cache.
+    #[cfg(test)]
     pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
-        if !self.has_fresh_topology_cache(root, files) {
+        self.load_graph_topology_with_source_scope(
+            root,
+            files,
+            shared_cache::CacheSourceScope::Default,
+        )
+    }
+
+    pub fn load_graph_topology_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<EntityGraph> {
+        if !self.has_fresh_topology_cache(root, files, source_scope) {
             return None;
         }
 
         self.load_graph_topology_rows()
     }
 
+    #[cfg(test)]
     pub fn load_graph_topology_with_test_ids(
         &self,
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, HashSet<String>)> {
-        if !self.has_fresh_topology_only_cache(root, files) {
+        self.load_graph_topology_with_test_ids_and_source_scope(
+            root,
+            files,
+            shared_cache::CacheSourceScope::Default,
+        )
+    }
+
+    pub fn load_graph_topology_with_test_ids_and_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<(EntityGraph, HashSet<String>)> {
+        if !self.has_fresh_topology_only_cache(root, files, source_scope) {
             return None;
         }
 
@@ -341,6 +404,7 @@ impl DiskCache {
         &self,
         root: &Path,
         files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
         cache_first: bool,
         entity_name: Option<&str>,
         entity_id: Option<&str>,
@@ -368,6 +432,7 @@ impl DiskCache {
             return self.query_dependency_impact_topology(
                 root,
                 files,
+                source_scope,
                 cache_first,
                 entity_name,
                 entity_id,
@@ -375,7 +440,7 @@ impl DiskCache {
             );
         }
 
-        if !self.has_fresh_cache(root, files) {
+        if !self.has_fresh_cache(root, files, source_scope) {
             return Ok(None);
         }
 
@@ -445,6 +510,7 @@ impl DiskCache {
         &self,
         root: &Path,
         files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
         cache_first: bool,
         entity_name: Option<&str>,
         entity_id: Option<&str>,
@@ -458,7 +524,7 @@ impl DiskCache {
             if !shared_cache::cache_has_default_source_scope(&self.conn) {
                 return Ok(None);
             }
-        } else if !self.has_fresh_cache(root, files) {
+        } else if !self.has_fresh_cache(root, files, source_scope) {
             return Ok(None);
         }
 
@@ -965,9 +1031,10 @@ impl DiskCache {
         &self,
         root: &Path,
         files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
         mut writer: W,
     ) -> std::io::Result<bool> {
-        if !self.has_fresh_topology_cache(root, files) {
+        if !self.has_fresh_topology_cache(root, files, source_scope) {
             return Ok(false);
         }
 
@@ -1052,15 +1119,46 @@ impl DiskCache {
         Ok(true)
     }
 
-    fn has_fresh_complete_cache(&self, root: &Path, files: &[String]) -> bool {
-        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
-            return false;
+    pub fn query_entities_listing(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Result<Option<Vec<EntityInfo>>, rusqlite::Error> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
         }
 
-        self.has_fresh_cache(root, files)
+        if files.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut entities = Vec::new();
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(String::as_str)),
+                entity_info_from_row,
+            )?;
+            entities.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        sort_entity_infos(&mut entities);
+        Ok(Some(entities))
     }
 
-    fn has_fresh_topology_cache(&self, root: &Path, files: &[String]) -> bool {
+    fn has_fresh_topology_cache_for_files(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
         if !shared_cache::cache_has_kind(
             &self.conn,
             &[
@@ -1071,18 +1169,140 @@ impl DiskCache {
             return false;
         }
 
-        self.has_fresh_cache(root, files)
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
+            return false;
+        }
+
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return false;
+        }
+
+        self.cached_files_are_fresh(
+            root,
+            files
+                .iter()
+                .filter(|file| !shared_cache::is_manifest_file_name(file))
+                .cloned()
+                .collect(),
+        )
+        .unwrap_or(false)
     }
 
-    fn has_fresh_topology_only_cache(&self, root: &Path, files: &[String]) -> bool {
+    pub fn write_entities_listing_json<W: Write>(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+        include_file: bool,
+        writer: &mut W,
+    ) -> std::io::Result<Option<u64>> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        writer.write_all(b"[")?;
+        let mut first = true;
+        let mut count = 0u64;
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(sql_io_error)?;
+            let mut rows = stmt
+                .query(params_from_iter(chunk.iter().map(String::as_str)))
+                .map_err(sql_io_error)?;
+            while let Some(row) = rows.next().map_err(sql_io_error)? {
+                if first {
+                    first = false;
+                } else {
+                    writer.write_all(b",")?;
+                }
+
+                let name: String = row.get(0).map_err(sql_io_error)?;
+                let entity_type: String = row.get(1).map_err(sql_io_error)?;
+                let file_path: String = row.get(2).map_err(sql_io_error)?;
+                let start_line = row.get::<_, i64>(3).map_err(sql_io_error)? as usize;
+                let end_line = row.get::<_, i64>(4).map_err(sql_io_error)? as usize;
+                let parent_id: Option<String> = row.get(5).map_err(sql_io_error)?;
+                let listing = EntityListingJsonRow {
+                    name: &name,
+                    entity_type: &entity_type,
+                    start_line,
+                    end_line,
+                    parent_id: parent_id.as_deref(),
+                    file: include_file.then_some(file_path.as_str()),
+                };
+                serde_json::to_writer(&mut *writer, &listing).map_err(json_io_error)?;
+                count += 1;
+            }
+        }
+        writer.write_all(b"]\n")?;
+
+        Ok(Some(count))
+    }
+
+    fn has_fresh_complete_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files, source_scope)
+    }
+
+    fn has_fresh_topology_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files, source_scope)
+    }
+
+    fn has_fresh_topology_only_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
         if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_TOPOLOGY]) {
             return false;
         }
 
-        self.has_fresh_cache(root, files)
+        self.has_fresh_cache(root, files, source_scope)
     }
 
-    fn has_fresh_cache(&self, root: &Path, files: &[String]) -> bool {
+    fn has_fresh_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
+            return false;
+        }
+
         if shared_cache::is_manifest_stale(&self.conn, root) {
             return false;
         }
@@ -1181,8 +1401,22 @@ impl DiskCache {
 
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
+    #[cfg(test)]
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        self.load_partial_with_source_scope(root, files, shared_cache::CacheSourceScope::Default)
+    }
+
+    pub fn load_partial_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<PartialCache> {
         if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
+            return None;
+        }
+
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
             return None;
         }
 
@@ -1371,6 +1605,7 @@ impl DiskCache {
         repair_changed_clean_entity_ids: bool,
         recomputed_edge_source_ids: &[String],
         deleted_entity_ids: &[String],
+        source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let source_stale_files: Vec<&String> = stale_files
             .iter()
@@ -1580,6 +1815,7 @@ impl DiskCache {
         }
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
+        shared_cache::set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
     }
@@ -1595,6 +1831,17 @@ fn entity_info_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityInfo>
         end_line: row.get::<_, i64>(5)? as usize,
         parent_id: row.get(6)?,
     })
+}
+
+fn sort_entity_infos(entities: &mut [EntityInfo]) {
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.entity_type.cmp(&b.entity_type))
+            .then(a.name.cmp(&b.name))
+    });
 }
 
 fn repeat_vars(len: usize) -> String {
@@ -1628,7 +1875,10 @@ fn current_imported_files(
     if has_unscoped_imports || !is_js_ts_cache_freshness_supported(file_path) {
         return Ok(None);
     }
-    let files = files.into_iter().collect();
+    let files = files
+        .into_iter()
+        .filter(|file| !is_default_excluded(file))
+        .collect();
     Ok(Some(CurrentImports {
         files,
         has_default_re_export: js_ts_has_default_re_export_from_content(&content),
@@ -1855,7 +2105,12 @@ mod tests {
 
         let mut output = Vec::new();
         assert!(cache
-            .write_graph_json_topology(&root, &files, &mut output)
+            .write_graph_json_topology(
+                &root,
+                &files,
+                shared_cache::CacheSourceScope::Default,
+                &mut output
+            )
             .unwrap());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
 
@@ -1921,7 +2176,12 @@ mod tests {
 
         let mut output = Vec::new();
         assert!(cache
-            .write_graph_json_topology(&root, &files, &mut output)
+            .write_graph_json_topology(
+                &root,
+                &files,
+                shared_cache::CacheSourceScope::Default,
+                &mut output
+            )
             .unwrap());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
@@ -1983,6 +2243,131 @@ mod tests {
     }
 
     #[test]
+    fn cache_reuse_requires_matching_source_scope_and_incremental_preserves_it() {
+        let root = temp_repo_root("source-scope-cache-reuse");
+        write_file(&root.join("a.ts"), "export function a() { return 1; }\n");
+        write_file(&root.join("b.ts"), "export function b() { return a(); }\n");
+        let files = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return a(); }"),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                shared_cache::CacheSourceScope::Custom,
+            )
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Custom)
+            .is_some());
+        assert!(cache
+            .load_partial_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Default)
+            .is_none());
+
+        rewrite_after_mtime_tick(&root.join("b.ts"), "export function b() { return 2; }\n");
+        let partial = cache
+            .load_partial_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Custom)
+            .unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+
+        let updated_entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return 2; }"),
+        ];
+        let updated_graph = graph_with_edges(&updated_entities, vec![]);
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &partial.stale_files,
+                &updated_graph,
+                &updated_entities,
+                false,
+                &["b-id".to_string()],
+                &[],
+                shared_cache::CacheSourceScope::Custom,
+            )
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Custom)
+            .is_some());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cache_first_dependency_impact_ignores_default_excluded_imports() {
+        let root = temp_repo_root("impact-ignores-excluded-imports");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        write_file(
+            &root.join("src/a.ts"),
+            "import { generated } from './generated/client';\nexport function target() { return generated(); }\n",
+        );
+        write_file(
+            &root.join("src/generated/client.ts"),
+            "export function generated() { return 1; }\n",
+        );
+        let files = vec!["src/a.ts".to_string()];
+        let entities = vec![entity(
+            "a-id",
+            "src/a.ts",
+            "target",
+            "export function target() { return generated(); }",
+        )];
+        let graph = graph_with_edges(&entities, vec![]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let result = cache
+            .query_impact_topology(
+                &root,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+                true,
+                Some("target"),
+                None,
+                Some("src/a.ts"),
+                CachedImpactMode::Deps,
+                2,
+            )
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "default-scoped cache-first deps should ignore imports outside the default source set"
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
     fn query_impact_topology_reads_cached_adjacency_without_graph_load() {
         let root = temp_repo_root("impact-topology-query");
         write_file(&root.join("a.rs"), "fn target() {}\n");
@@ -2038,6 +2423,7 @@ mod tests {
             .query_impact_topology(
                 &root,
                 &files,
+                shared_cache::CacheSourceScope::Default,
                 false,
                 Some("target"),
                 None,
@@ -2218,6 +2604,7 @@ mod tests {
             .query_impact_topology(
                 &root,
                 &files,
+                shared_cache::CacheSourceScope::Default,
                 false,
                 Some("root"),
                 None,
@@ -2395,6 +2782,7 @@ mod tests {
                 false,
                 &[],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 0);
@@ -2617,6 +3005,7 @@ mod tests {
                 false,
                 &["stale-id".to_string()],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2667,6 +3056,7 @@ mod tests {
                 true,
                 &[],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2740,6 +3130,7 @@ mod tests {
                 false,
                 &["stale-id".to_string()],
                 &["old-target-id".to_string()],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2845,6 +3236,18 @@ mod tests {
         assert!(!root.join(".sem").exists());
 
         drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_existing_readonly_does_not_create_missing_cache() {
+        let root = temp_repo_root("readonly-missing");
+        let db_path = shared_cache::cache_db_path(&root).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(DiskCache::open_existing_readonly(&root).is_err());
+        assert!(!db_path.exists());
+
         cleanup(root);
     }
 

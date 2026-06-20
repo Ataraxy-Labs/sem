@@ -13,7 +13,7 @@ macro_rules! maybe_par_iter {
         { $slice.iter() }
     }};
 }
-use super::plugin::SemanticParserPlugin;
+use super::plugin::{strip_entity_payloads, SemanticParserPlugin};
 
 pub struct ParserRegistry {
     plugins: Vec<Box<dyn SemanticParserPlugin>>,
@@ -251,6 +251,23 @@ impl ParserRegistry {
         entities
     }
 
+    /// Extract listing-only entities without retaining source content or hashes.
+    pub fn extract_entities_brief(&self, file_path: &str, content: &str) -> Vec<SemanticEntity> {
+        let resolved = self.resolve_file_path(file_path);
+        let detection_path = resolved.as_deref().unwrap_or(file_path);
+
+        let plugin = match self.get_plugin_with_content(detection_path, content) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let mut entities = plugin.extract_entities_brief(content, detection_path);
+        if let Some(ref rp) = resolved {
+            fix_entity_paths(&mut entities, file_path, rp);
+        }
+        entities
+    }
+
     /// Extract entities with tree, transparently handling custom extension mappings.
     pub fn extract_entities_with_tree(
         &self,
@@ -286,6 +303,38 @@ impl ParserRegistry {
             .collect();
         resolve_go_method_parent_ids(&mut entities);
         entities
+    }
+
+    /// Extract listing-only entities from multiple files in parallel.
+    pub fn extract_all_entities_brief(
+        &self,
+        root: &Path,
+        file_paths: &[String],
+    ) -> Vec<SemanticEntity> {
+        let mut entities: Vec<SemanticEntity> = maybe_par_iter!(file_paths)
+            .flat_map(|fp| {
+                let full = root.join(fp);
+                let content = match std::fs::read_to_string(&full) {
+                    Ok(c) => c,
+                    Err(_) => return Vec::new(),
+                };
+                if self.needs_content_for_listing_parent_repair(fp, &content) {
+                    self.extract_entities(fp, &content)
+                } else {
+                    self.extract_entities_brief(fp, &content)
+                }
+            })
+            .collect();
+        resolve_go_method_parent_ids(&mut entities);
+        strip_entity_payloads(&mut entities);
+        entities
+    }
+
+    fn needs_content_for_listing_parent_repair(&self, file_path: &str, content: &str) -> bool {
+        let resolved = self.resolve_file_path(file_path);
+        let detection_path = resolved.as_deref().unwrap_or(file_path);
+        detection_path.ends_with(".go")
+            || detect_ext_from_content(content).as_deref() == Some(".go")
     }
 }
 
@@ -836,6 +885,37 @@ mod tests {
 
         assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
         assert_eq!(run.id, format!("{}::Run", service.id));
+    }
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_brief_go_method_parent_resolves_across_files() {
+        let registry = create_default_registry();
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            &dir,
+            "methods.go",
+            "package demo\n\nfunc (s *Service) Run() {}\n",
+        );
+
+        let entities = registry.extract_all_entities_brief(
+            dir.path(),
+            &["models.go".to_string(), "methods.go".to_string()],
+        );
+        let service = entities
+            .iter()
+            .find(|e| e.name == "Service" && e.file_path == "models.go")
+            .expect("Service type should be extracted");
+        let run = entities
+            .iter()
+            .find(|e| e.name == "Run" && e.file_path == "methods.go")
+            .expect("Run method should be extracted");
+
+        assert_eq!(run.parent_id.as_deref(), Some(service.id.as_str()));
+        assert!(entities.iter().all(|e| e.content.is_empty()));
+        assert!(entities.iter().all(|e| e.content_hash.is_empty()));
+        assert!(entities.iter().all(|e| e.structural_hash.is_none()));
     }
 
     #[cfg(feature = "lang-go")]

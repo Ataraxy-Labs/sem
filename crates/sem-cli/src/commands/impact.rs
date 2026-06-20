@@ -85,6 +85,7 @@ pub fn impact_command(opts: ImpactOptions) {
                     &[],
                     &opts,
                     file_hint.as_deref(),
+                    source_scope,
                     true,
                     &mut timings,
                 ) {
@@ -115,6 +116,7 @@ pub fn impact_command(opts: ImpactOptions) {
                     &file_paths,
                     &opts,
                     file_hint.as_deref(),
+                    source_scope,
                     false,
                     &mut timings,
                 ) {
@@ -141,6 +143,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                             move |entity| {
                                 if let Some(id) = entity_id.as_deref() {
@@ -345,12 +348,14 @@ fn try_cached_impact_query(
     file_paths: &[String],
     opts: &ImpactOptions,
     file_hint: Option<&str>,
+    source_scope: CacheSourceScope,
     cache_first: bool,
     timings: &mut Timings,
 ) -> bool {
     match disk.query_impact_topology(
         root,
         file_paths,
+        source_scope,
         cache_first,
         opts.entity_name.as_deref(),
         opts.entity_id.as_deref(),

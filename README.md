@@ -173,7 +173,7 @@ sem impact authenticateUser --json
 # Disambiguate by file
 sem impact authenticateUser --file src/auth.ts
 
-# Include generated/build directories that repo-wide scans skip by default
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
 sem impact authenticateUser --no-default-excludes
 ```
 
@@ -220,7 +220,7 @@ sem entities src/auth.ts
 sem entities --json
 sem entities src/auth.ts --json
 
-# Include generated/build directories that repo-wide scans skip by default
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
 sem entities --no-default-excludes
 ```
 
@@ -238,7 +238,7 @@ sem context authenticateUser --budget 4000
 # JSON output
 sem context authenticateUser --json
 
-# Include generated/build directories that repo-wide scans skip by default
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
 sem context authenticateUser --no-default-excludes
 ```
 
