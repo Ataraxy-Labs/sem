@@ -51,7 +51,9 @@ fn load_check_state() -> UpdateCheckState {
 }
 
 fn save_check_state(state: &UpdateCheckState) {
-    let Some(path) = check_state_path() else { return };
+    let Some(path) = check_state_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -296,11 +298,7 @@ fn artifact_name() -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("sem-{os}-{arch}.tar.gz"))
 }
 
-fn download(
-    agent: &ureq::Agent,
-    url: &str,
-    dest: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn download(agent: &ureq::Agent, url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let resp = agent.get(url).set("User-Agent", "sem-cli").call()?;
     let mut reader = resp.into_reader().take(MAX_DOWNLOAD_BYTES);
     let mut file = fs::File::create(dest)?;
@@ -328,23 +326,21 @@ fn verify_checksum(agent: &ureq::Agent, tag: &str, artifact: &str, archive: &Pat
         return;
     };
 
-    let actual = ["sha256sum", "shasum"]
-        .iter()
-        .find_map(|tool| {
-            let mut cmd = std::process::Command::new(tool);
-            if *tool == "shasum" {
-                cmd.args(["-a", "256"]);
-            }
-            cmd.arg(archive);
-            let out = cmd.output().ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .next()
-                .map(str::to_lowercase)
-        });
+    let actual = ["sha256sum", "shasum"].iter().find_map(|tool| {
+        let mut cmd = std::process::Command::new(tool);
+        if *tool == "shasum" {
+            cmd.args(["-a", "256"]);
+        }
+        cmd.arg(archive);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_lowercase)
+    });
 
     if let Some(actual) = actual {
         if actual != expected {

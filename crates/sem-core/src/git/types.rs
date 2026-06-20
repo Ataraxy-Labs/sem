@@ -4,10 +4,17 @@ use serde::{Deserialize, Serialize};
 pub enum DiffScope {
     Working,
     Staged,
-    Commit { sha: String },
-    Range { from: String, to: String },
+    Commit {
+        sha: String,
+    },
+    Range {
+        from: String,
+        to: String,
+    },
     /// Compare a ref's tree to the working directory (like `git diff <ref>`)
-    RefToWorking { refspec: String },
+    RefToWorking {
+        refspec: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

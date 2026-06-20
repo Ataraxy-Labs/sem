@@ -1,16 +1,20 @@
-use std::collections::HashMap;
-use std::path::Path;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::path::Path;
 
 use crate::model::entity::{build_entity_id, SemanticEntity};
 
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
         #[cfg(feature = "parallel")]
-        { $slice.par_iter() }
+        {
+            $slice.par_iter()
+        }
         #[cfg(not(feature = "parallel"))]
-        { $slice.iter() }
+        {
+            $slice.iter()
+        }
     }};
 }
 use super::plugin::{strip_entity_payloads, SemanticParserPlugin};
@@ -65,7 +69,11 @@ impl ParserRegistry {
 
     /// Try to detect language from shebang line when extension-based lookup fails.
     /// Call this as a fallback when file content is available.
-    pub fn get_plugin_with_content(&self, file_path: &str, content: &str) -> Option<&dyn SemanticParserPlugin> {
+    pub fn get_plugin_with_content(
+        &self,
+        file_path: &str,
+        content: &str,
+    ) -> Option<&dyn SemanticParserPlugin> {
         // Try extension first
         for ext in get_extensions(file_path) {
             if let Some(&idx) = self.extension_map.get(&ext) {
@@ -113,7 +121,8 @@ impl ParserRegistry {
 
         if let Some(target) = target_ext {
             if let Some(&idx) = self.extension_map.get(target) {
-                self.custom_ext_canonical.insert(ext.clone(), target.to_string());
+                self.custom_ext_canonical
+                    .insert(ext.clone(), target.to_string());
                 self.extension_map.insert(ext, idx);
                 return true;
             }
@@ -286,11 +295,7 @@ impl ParserRegistry {
     }
 
     /// Extract entities from multiple files in parallel.
-    pub fn extract_all_entities(
-        &self,
-        root: &Path,
-        file_paths: &[String],
-    ) -> Vec<SemanticEntity> {
+    pub fn extract_all_entities(&self, root: &Path, file_paths: &[String]) -> Vec<SemanticEntity> {
         let mut entities: Vec<SemanticEntity> = maybe_par_iter!(file_paths)
             .flat_map(|fp| {
                 let full = root.join(fp);
@@ -671,15 +676,21 @@ fn detect_from_content_heuristics(content: &str) -> Option<String> {
 
         // Fortran: program/module/subroutine (case-insensitive)
         let lower = trimmed.to_lowercase();
-        if lower.starts_with("program ") || lower.starts_with("module ")
-            || lower.starts_with("subroutine ") || lower == "implicit none"
+        if lower.starts_with("program ")
+            || lower.starts_with("module ")
+            || lower.starts_with("subroutine ")
+            || lower == "implicit none"
         {
             // "module " could be Ruby, but Ruby uses "module X" without "implicit none"
             // Check for Fortran-specific follow-up
             if lower.starts_with("program ") || lower == "implicit none" {
                 return Some(".f90".to_string());
             }
-            if content.lines().take(20).any(|l| l.trim().to_lowercase() == "implicit none") {
+            if content
+                .lines()
+                .take(20)
+                .any(|l| l.trim().to_lowercase() == "implicit none")
+            {
                 return Some(".f90".to_string());
             }
         }
@@ -693,7 +704,8 @@ fn detect_from_content_heuristics(content: &str) -> Option<String> {
         }
 
         // Ruby: require or module/class without colon (Python uses colon)
-        if trimmed.starts_with("require '") || trimmed.starts_with("require \"")
+        if trimmed.starts_with("require '")
+            || trimmed.starts_with("require \"")
             || trimmed.starts_with("require_relative ")
         {
             return Some(".rb".to_string());
@@ -817,7 +829,8 @@ mod tests {
     #[test]
     fn test_detect_c_from_include() {
         let registry = create_default_registry();
-        let content = "#include <stdio.h>\n\nint main() {\n    printf(\"hello\");\n    return 0;\n}\n";
+        let content =
+            "#include <stdio.h>\n\nint main() {\n    printf(\"hello\");\n    return 0;\n}\n";
         let plugin = registry
             .get_plugin_with_content("main.xyz", content)
             .expect("should detect C");
@@ -839,7 +852,8 @@ mod tests {
     #[test]
     fn test_detect_go_from_package() {
         let registry = create_default_registry();
-        let content = "package main\n\nimport \"fmt\"\n\nfunc hello() {\n    fmt.Println(\"hi\")\n}\n";
+        let content =
+            "package main\n\nimport \"fmt\"\n\nfunc hello() {\n    fmt.Println(\"hi\")\n}\n";
         let plugin = registry
             .get_plugin_with_content("main", content)
             .expect("should detect Go");
@@ -850,7 +864,8 @@ mod tests {
     #[test]
     fn test_detect_rust_from_use_std() {
         let registry = create_default_registry();
-        let content = "use std::collections::HashMap;\n\nfn process() {\n    let m = HashMap::new();\n}\n";
+        let content =
+            "use std::collections::HashMap;\n\nfn process() {\n    let m = HashMap::new();\n}\n";
         let plugin = registry
             .get_plugin_with_content("lib", content)
             .expect("should detect Rust");
@@ -923,13 +938,21 @@ mod tests {
     fn test_go_method_parent_resolution_is_package_directory_scoped() {
         let registry = create_default_registry();
         let dir = TempDir::new().unwrap();
-        write_file(&dir, "alpha/models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            &dir,
+            "alpha/models.go",
+            "package demo\n\ntype Service struct{}\n",
+        );
         write_file(
             &dir,
             "alpha/methods.go",
             "package demo\n\nfunc (s *Service) Run() {}\n",
         );
-        write_file(&dir, "beta/models.go", "package demo\n\ntype Service struct{}\n");
+        write_file(
+            &dir,
+            "beta/models.go",
+            "package demo\n\ntype Service struct{}\n",
+        );
         write_file(
             &dir,
             "beta/methods.go",
@@ -963,8 +986,14 @@ mod tests {
             .find(|e| e.name == "Run" && e.file_path == "beta/methods.go")
             .expect("beta Run method should be extracted");
 
-        assert_eq!(alpha_run.parent_id.as_deref(), Some(alpha_service.id.as_str()));
-        assert_eq!(beta_run.parent_id.as_deref(), Some(beta_service.id.as_str()));
+        assert_eq!(
+            alpha_run.parent_id.as_deref(),
+            Some(alpha_service.id.as_str())
+        );
+        assert_eq!(
+            beta_run.parent_id.as_deref(),
+            Some(beta_service.id.as_str())
+        );
     }
 
     #[test]
@@ -990,7 +1019,11 @@ mod tests {
     #[test]
     fn test_load_semrc_test_dirs_with_extension_mappings() {
         let dir = TempDir::new().unwrap();
-        write_file(&dir, ".semrc", ".inc = php\ntest-dirs = custom-tests\n.xyz = cpp\n");
+        write_file(
+            &dir,
+            ".semrc",
+            ".inc = php\ntest-dirs = custom-tests\n.xyz = cpp\n",
+        );
         let mut registry = create_default_registry();
         registry.load_semrc(dir.path());
         assert_eq!(registry.custom_test_dirs, vec!["custom-tests"]);
@@ -1024,15 +1057,33 @@ mod tests {
         let content = "def hello():\n    print(\"hello world\")\n\nclass Calculator:\n    def multiply(self, a, b):\n        return a * b\n";
         let entities = registry.extract_entities("utils.mypy", content);
 
-        assert!(!entities.is_empty(), "Should extract entities via custom mapping");
-        assert!(entities.iter().any(|e| e.name == "hello"), "Should find hello function");
-        assert!(entities.iter().any(|e| e.name == "Calculator"), "Should find Calculator class");
-        assert!(entities.iter().any(|e| e.name == "multiply"), "Should find multiply method");
+        assert!(
+            !entities.is_empty(),
+            "Should extract entities via custom mapping"
+        );
+        assert!(
+            entities.iter().any(|e| e.name == "hello"),
+            "Should find hello function"
+        );
+        assert!(
+            entities.iter().any(|e| e.name == "Calculator"),
+            "Should find Calculator class"
+        );
+        assert!(
+            entities.iter().any(|e| e.name == "multiply"),
+            "Should find multiply method"
+        );
 
         // File path should preserve the original extension
         for entity in &entities {
-            assert_eq!(entity.file_path, "utils.mypy", "Entity file_path should use original extension");
-            assert!(entity.id.starts_with("utils.mypy::"), "Entity ID should use original file path");
+            assert_eq!(
+                entity.file_path, "utils.mypy",
+                "Entity file_path should use original extension"
+            );
+            assert!(
+                entity.id.starts_with("utils.mypy::"),
+                "Entity ID should use original file path"
+            );
         }
     }
 }

@@ -1763,7 +1763,11 @@ static JAVA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     self_keywords: &["this"],
 
     init_strategy: InitStrategy::ClassFields {
-        class_nodes: &["class_declaration", "interface_declaration", "enum_declaration"],
+        class_nodes: &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ],
     },
     import_extractor: None,
     external_method: false,

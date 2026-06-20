@@ -233,12 +233,31 @@ function helper(x: number): number {
         let entities = plugin.extract_entities(code, "App.vue");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Vue entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Vue entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"template"), "Should find template block, got: {:?}", names);
-        assert!(names.contains(&"script"), "Should find script block, got: {:?}", names);
-        assert!(names.contains(&"style"), "Should find style block, got: {:?}", names);
-        assert!(names.contains(&"helper"), "Should find helper function from script, got: {:?}", names);
+        assert!(
+            names.contains(&"template"),
+            "Should find template block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"script"),
+            "Should find script block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"style"),
+            "Should find style block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "Should find helper function from script, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -267,16 +286,41 @@ class Counter {
         let plugin = VueParserPlugin;
         let entities = plugin.extract_entities(code, "Counter.vue");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Vue setup entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "Vue setup entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"script setup"), "Should find script setup block, got: {:?}", names);
-        assert!(names.contains(&"template"), "Should find template block, got: {:?}", names);
-        assert!(names.contains(&"increment"), "Should find increment function, got: {:?}", names);
-        assert!(names.contains(&"Counter"), "Should find Counter class, got: {:?}", names);
+        assert!(
+            names.contains(&"script setup"),
+            "Should find script setup block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"template"),
+            "Should find template block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"increment"),
+            "Should find increment function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Counter"),
+            "Should find Counter class, got: {:?}",
+            names
+        );
 
         // Functions inside script should be children of the script block
         let increment = entities.iter().find(|e| e.name == "increment").unwrap();
-        assert!(increment.parent_id.is_some(), "increment should be child of script block");
+        assert!(
+            increment.parent_id.is_some(),
+            "increment should be child of script block"
+        );
     }
 
     #[test]

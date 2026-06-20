@@ -4,10 +4,7 @@ use std::collections::{HashMap, HashSet};
 use super::change::{ChangeType, SemanticChange};
 use super::entity::SemanticEntity;
 
-fn parent_name(
-    entity: &SemanticEntity,
-    by_id: &HashMap<&str, &SemanticEntity>,
-) -> Option<String> {
+fn parent_name(entity: &SemanticEntity, by_id: &HashMap<&str, &SemanticEntity>) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     let mut visited: HashSet<&str> = HashSet::new();
     let mut pid = entity.parent_id.as_deref()?;
@@ -79,7 +76,10 @@ fn tokenize_content(content: &str) -> ContentTokens<'_> {
         token_count += 1;
         unique_tokens.insert(token);
     }
-    ContentTokens { token_count, unique_tokens }
+    ContentTokens {
+        token_count,
+        unique_tokens,
+    }
 }
 
 fn jaccard_similarity(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
@@ -166,21 +166,22 @@ fn make_change(
         old_end_line: before_entity.map(|b| b.end_line),
         parent_name: parent_name(primary, by_id),
         file_path: primary.file_path.clone(),
-        old_entity_name: before_entity.and_then(|b| {
-            (b.name != after_entity.name).then(|| b.name.clone())
-        }),
-        old_file_path: before_entity.and_then(|b| {
-            (b.file_path != after_entity.file_path).then(|| b.file_path.clone())
-        }),
+        old_entity_name: before_entity
+            .and_then(|b| (b.name != after_entity.name).then(|| b.name.clone())),
+        old_file_path: before_entity
+            .and_then(|b| (b.file_path != after_entity.file_path).then(|| b.file_path.clone())),
         old_parent_id: before_entity.and_then(|b| {
-            (b.parent_id != after_entity.parent_id).then(|| b.parent_id.clone()).flatten()
+            (b.parent_id != after_entity.parent_id)
+                .then(|| b.parent_id.clone())
+                .flatten()
         }),
         before_content: if change_type == ChangeType::Reordered {
             None
         } else {
             before_entity.map(|b| b.content.clone())
         },
-        after_content: if change_type == ChangeType::Deleted || change_type == ChangeType::Reordered {
+        after_content: if change_type == ChangeType::Deleted || change_type == ChangeType::Reordered
+        {
             None
         } else {
             Some(after_entity.content.clone())
@@ -303,7 +304,14 @@ pub fn match_entities(
                 continue;
             }
 
-            changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author, &combined_by_id));
+            changes.push(make_change(
+                after_entity,
+                classify_match(before_entity, after_entity),
+                Some(before_entity),
+                commit_sha,
+                author,
+                &combined_by_id,
+            ));
         }
     }
 
@@ -421,7 +429,14 @@ pub fn match_entities(
                 continue;
             }
 
-            changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author, &combined_by_id));
+            changes.push(make_change(
+                after_entity,
+                classify_match(before_entity, after_entity),
+                Some(before_entity),
+                commit_sha,
+                author,
+                &combined_by_id,
+            ));
         }
     }
 
@@ -487,7 +502,14 @@ pub fn match_entities(
         if let Some(before_entity) = best_match {
             matched_before.insert(before_entity.id.as_str());
             matched_after.insert(after_entity.id.as_str());
-            changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author, &combined_by_id));
+            changes.push(make_change(
+                after_entity,
+                classify_match(before_entity, after_entity),
+                Some(before_entity),
+                commit_sha,
+                author,
+                &combined_by_id,
+            ));
         }
     }
 
@@ -583,7 +605,14 @@ pub fn match_entities(
                     continue;
                 }
 
-                changes.push(make_change(after_entity, classify_match(matched, after_entity), Some(matched), commit_sha, author, &combined_by_id));
+                changes.push(make_change(
+                    after_entity,
+                    classify_match(matched, after_entity),
+                    Some(matched),
+                    commit_sha,
+                    author,
+                    &combined_by_id,
+                ));
             }
         }
     }
@@ -591,16 +620,45 @@ pub fn match_entities(
     // Phase 6: Intra-file reorder detection
     // For entities that matched by exact ID with identical content (unchanged),
     // check if their relative ordering changed within the file.
-    detect_reorders(before, after, &matched_before, &matched_after, &mut changes, commit_sha, author, &combined_by_id);
+    detect_reorders(
+        before,
+        after,
+        &matched_before,
+        &matched_after,
+        &mut changes,
+        commit_sha,
+        author,
+        &combined_by_id,
+    );
 
     // Remaining unmatched before = deleted
-    for entity in before.iter().filter(|e| !matched_before.contains(e.id.as_str())) {
-        changes.push(make_change(entity, ChangeType::Deleted, Some(entity), commit_sha, author, &combined_by_id));
+    for entity in before
+        .iter()
+        .filter(|e| !matched_before.contains(e.id.as_str()))
+    {
+        changes.push(make_change(
+            entity,
+            ChangeType::Deleted,
+            Some(entity),
+            commit_sha,
+            author,
+            &combined_by_id,
+        ));
     }
 
     // Remaining unmatched after = added
-    for entity in after.iter().filter(|e| !matched_after.contains(e.id.as_str())) {
-        changes.push(make_change(entity, ChangeType::Added, None, commit_sha, author, &combined_by_id));
+    for entity in after
+        .iter()
+        .filter(|e| !matched_after.contains(e.id.as_str()))
+    {
+        changes.push(make_change(
+            entity,
+            ChangeType::Added,
+            None,
+            commit_sha,
+            author,
+            &combined_by_id,
+        ));
     }
 
     MatchResult { changes }
@@ -736,7 +794,11 @@ fn longest_non_decreasing_subsequence_indices(seq: &[(usize, usize)]) -> HashSet
             tails[pos] = seq[i];
             tail_idx[pos] = i;
         }
-        parent[i] = if pos > 0 { Some(tail_idx[pos - 1]) } else { None };
+        parent[i] = if pos > 0 {
+            Some(tail_idx[pos - 1])
+        } else {
+            None
+        };
     }
 
     // Trace back to find actual LIS indices
@@ -912,23 +974,15 @@ mod tests {
 
     #[test]
     fn test_same_signature_file_rename_keeps_duplicate_names_with_parents() {
-        let mut before_alpha_class = make_entity(
-            "old.ts::class::Alpha",
-            "Alpha",
-            "class Alpha {}",
-            "old.ts",
-        );
+        let mut before_alpha_class =
+            make_entity("old.ts::class::Alpha", "Alpha", "class Alpha {}", "old.ts");
         before_alpha_class.entity_type = "class".to_string();
         let mut before_beta_class =
             make_entity("old.ts::class::Beta", "Beta", "class Beta {}", "old.ts");
         before_beta_class.entity_type = "class".to_string();
 
-        let mut after_alpha_class = make_entity(
-            "new.ts::class::Alpha",
-            "Alpha",
-            "class Alpha {}",
-            "new.ts",
-        );
+        let mut after_alpha_class =
+            make_entity("new.ts::class::Alpha", "Alpha", "class Alpha {}", "new.ts");
         after_alpha_class.entity_type = "class".to_string();
         let mut after_beta_class =
             make_entity("new.ts::class::Beta", "Beta", "class Beta {}", "new.ts");
@@ -1157,7 +1211,13 @@ mod tests {
         assert_eq!(result.changes[0].change_type, ChangeType::Modified);
     }
 
-    fn make_entity_with_parent(id: &str, name: &str, content: &str, file_path: &str, parent_id: Option<&str>) -> SemanticEntity {
+    fn make_entity_with_parent(
+        id: &str,
+        name: &str,
+        content: &str,
+        file_path: &str,
+        parent_id: Option<&str>,
+    ) -> SemanticEntity {
         SemanticEntity {
             id: id.to_string(),
             file_path: file_path.to_string(),
@@ -1177,17 +1237,26 @@ mod tests {
     fn test_intra_file_move_between_classes() {
         // Method moves from ClassA to ClassB in the same file
         let before = vec![make_entity_with_parent(
-            "a.rs::class::ClassA::foo", "foo", "fn foo() { do_thing() }",
-            "a.rs", Some("a.rs::class::ClassA"),
+            "a.rs::class::ClassA::foo",
+            "foo",
+            "fn foo() { do_thing() }",
+            "a.rs",
+            Some("a.rs::class::ClassA"),
         )];
         let after = vec![make_entity_with_parent(
-            "a.rs::class::ClassB::foo", "foo", "fn foo() { do_thing() }",
-            "a.rs", Some("a.rs::class::ClassB"),
+            "a.rs::class::ClassB::foo",
+            "foo",
+            "fn foo() { do_thing() }",
+            "a.rs",
+            Some("a.rs::class::ClassB"),
         )];
         let result = match_entities(&before, &after, "a.rs", None, None, None);
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.changes[0].change_type, ChangeType::Moved);
-        assert_eq!(result.changes[0].old_parent_id, Some("a.rs::class::ClassA".to_string()));
+        assert_eq!(
+            result.changes[0].old_parent_id,
+            Some("a.rs::class::ClassA".to_string())
+        );
     }
 
     #[test]
@@ -1196,12 +1265,18 @@ mod tests {
         // Content must be identical (same hash) so Phase 2 catches it
         let body = "fn method(&self) { let x = self.compute(); self.validate(x); self.store(x) }";
         let before = vec![make_entity_with_parent(
-            "a.rs::class::Foo::old_method", "old_method", body,
-            "a.rs", Some("a.rs::class::Foo"),
+            "a.rs::class::Foo::old_method",
+            "old_method",
+            body,
+            "a.rs",
+            Some("a.rs::class::Foo"),
         )];
         let after = vec![make_entity_with_parent(
-            "a.rs::class::Foo::new_method", "new_method", body,
-            "a.rs", Some("a.rs::class::Foo"),
+            "a.rs::class::Foo::new_method",
+            "new_method",
+            body,
+            "a.rs",
+            Some("a.rs::class::Foo"),
         )];
         let result = match_entities(&before, &after, "a.rs", None, None, None);
         assert_eq!(result.changes.len(), 1);
@@ -1209,7 +1284,13 @@ mod tests {
         assert!(result.changes[0].old_parent_id.is_none());
     }
 
-    fn make_entity_at(id: &str, name: &str, content: &str, file_path: &str, line: usize) -> SemanticEntity {
+    fn make_entity_at(
+        id: &str,
+        name: &str,
+        content: &str,
+        file_path: &str,
+        line: usize,
+    ) -> SemanticEntity {
         SemanticEntity {
             id: id.to_string(),
             file_path: file_path.to_string(),
@@ -1243,9 +1324,14 @@ mod tests {
         assert!(result.changes[0].before_content.is_none());
         assert!(result.changes[0].old_start_line.is_some());
         assert!(result.changes[0].old_end_line.is_some());
-        assert_ne!(result.changes[0].old_start_line, Some(result.changes[0].start_line));
+        assert_ne!(
+            result.changes[0].old_start_line,
+            Some(result.changes[0].start_line)
+        );
         // Either beta or gamma is marked, LIS picks the minimum
-        assert!(result.changes[0].entity_name == "beta" || result.changes[0].entity_name == "gamma");
+        assert!(
+            result.changes[0].entity_name == "beta" || result.changes[0].entity_name == "gamma"
+        );
     }
 
     #[test]

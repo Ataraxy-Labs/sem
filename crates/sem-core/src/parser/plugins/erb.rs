@@ -69,16 +69,10 @@ impl SemanticParserPlugin for ErbParserPlugin {
                 }
                 TagKind::BlockClose => {
                     if let Some(opener) = block_stack.pop() {
-                        let block_content =
-                            lines[opener.start_line - 1..tag.end_line].join("\n");
+                        let block_content = lines[opener.start_line - 1..tag.end_line].join("\n");
                         let name = unique_name(&opener.name, &mut name_counts);
                         entities.push(SemanticEntity {
-                            id: build_entity_id(
-                                file_path,
-                                "erb_block",
-                                &name,
-                                Some(&template_id),
-                            ),
+                            id: build_entity_id(file_path, "erb_block", &name, Some(&template_id)),
                             file_path: file_path.to_string(),
                             entity_type: "erb_block".to_string(),
                             name,
@@ -93,16 +87,10 @@ impl SemanticParserPlugin for ErbParserPlugin {
                     }
                 }
                 TagKind::Expression => {
-                    let expr_content =
-                        lines[tag.start_line - 1..tag.end_line].join("\n");
+                    let expr_content = lines[tag.start_line - 1..tag.end_line].join("\n");
                     let name = unique_name(&tag.name, &mut name_counts);
                     entities.push(SemanticEntity {
-                        id: build_entity_id(
-                            file_path,
-                            "erb_expression",
-                            &name,
-                            Some(&template_id),
-                        ),
+                        id: build_entity_id(file_path, "erb_expression", &name, Some(&template_id)),
                         file_path: file_path.to_string(),
                         entity_type: "erb_expression".to_string(),
                         name,
@@ -114,8 +102,7 @@ impl SemanticParserPlugin for ErbParserPlugin {
                         end_line: tag.end_line,
                         metadata: None,
                     });
-                }
-                // No separate Code variant needed; expressions cover all non-block tags
+                } // No separate Code variant needed; expressions cover all non-block tags
             }
         }
 
@@ -144,7 +131,10 @@ struct ErbTag {
 
 fn extract_template_name(file_path: &str) -> String {
     let filename = file_path.rsplit('/').next().unwrap_or(file_path);
-    filename.strip_suffix(".erb").unwrap_or(filename).to_string()
+    filename
+        .strip_suffix(".erb")
+        .unwrap_or(filename)
+        .to_string()
 }
 
 /// Walk the tree-sitter AST and classify each directive node.
@@ -297,7 +287,10 @@ mod tests {
         assert_eq!(entities[0].start_line, 1);
 
         // if block (lines 2-7)
-        let if_block = entities.iter().find(|e| e.name == "if @user.admin?").unwrap();
+        let if_block = entities
+            .iter()
+            .find(|e| e.name == "if @user.admin?")
+            .unwrap();
         assert_eq!(if_block.entity_type, "erb_block");
         assert_eq!(if_block.start_line, 2);
         assert_eq!(if_block.end_line, 7);
@@ -349,8 +342,12 @@ mod tests {
             .iter()
             .filter(|e| e.entity_type == "erb_block")
             .collect();
-        assert_eq!(blocks.len(), 2, "Should have 2 blocks: {:?}",
-            blocks.iter().map(|b| &b.name).collect::<Vec<_>>());
+        assert_eq!(
+            blocks.len(),
+            2,
+            "Should have 2 blocks: {:?}",
+            blocks.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
 
         // Inner block (each) closes first
         let each = blocks.iter().find(|b| b.name.contains("each")).unwrap();
@@ -367,7 +364,10 @@ mod tests {
     fn test_erb_template_name() {
         assert_eq!(extract_template_name("views/best.html.erb"), "best.html");
         assert_eq!(extract_template_name("loading.erb"), "loading");
-        assert_eq!(extract_template_name("app/views/_partial.html.erb"), "_partial.html");
+        assert_eq!(
+            extract_template_name("app/views/_partial.html.erb"),
+            "_partial.html"
+        );
     }
 
     #[test]
@@ -386,8 +386,10 @@ mod tests {
 
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Dash variant: {:?}",
-            names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Dash variant: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
         // <%- if %> ... <%- end if %> should create a block
         let if_block = entities.iter().find(|e| e.name == "if @show").unwrap();

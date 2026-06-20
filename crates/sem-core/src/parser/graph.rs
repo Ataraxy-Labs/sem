@@ -2987,7 +2987,10 @@ fn is_scope_member_container(entity_type: &str) -> bool {
 }
 
 /// Check if an entity looks like a test based on name, file path, and content patterns.
-fn is_test_entity(entity: &crate::model::entity::SemanticEntity, custom_test_dirs: &[String]) -> bool {
+fn is_test_entity(
+    entity: &crate::model::entity::SemanticEntity,
+    custom_test_dirs: &[String],
+) -> bool {
     let name = &entity.name;
     let content = &entity.content;
 
@@ -3004,8 +3007,10 @@ fn is_test_entity(entity: &crate::model::entity::SemanticEntity, custom_test_dir
     }
 
     // File path patterns (shared detection)
-    let in_test_file =
-        crate::parser::test_detect::is_test_path_with_custom_dirs(&entity.file_path, custom_test_dirs);
+    let in_test_file = crate::parser::test_detect::is_test_path_with_custom_dirs(
+        &entity.file_path,
+        custom_test_dirs,
+    );
 
     // Content patterns (test annotations/decorators)
     let has_test_marker = content.contains("#[test]")
@@ -3627,8 +3632,7 @@ fn scan_import_file(
                 let ns_name = cap.get(1).unwrap().as_str();
                 let symbols_str = cap.get(2).unwrap().as_str();
                 for symbol in symbols_str.split_whitespace() {
-                    let symbol =
-                        symbol.trim_matches(|c: char| c == ',' || c == '(' || c == ')');
+                    let symbol = symbol.trim_matches(|c: char| c == ',' || c == '(' || c == ')');
                     if symbol.is_empty() {
                         continue;
                     }
@@ -8833,7 +8837,11 @@ export function caller() {
     #[test]
     fn test_entity_detected_by_path_and_content_marker() {
         // Path match + content marker both required
-        let entity = make_entity("run", "e2e-tests/login.ts", "describe('login', () => { it('works', () => {}) })");
+        let entity = make_entity(
+            "run",
+            "e2e-tests/login.ts",
+            "describe('login', () => { it('works', () => {}) })",
+        );
         assert!(is_test_entity(&entity, &[]));
     }
 
@@ -8852,19 +8860,31 @@ export function caller() {
 
     #[test]
     fn test_entity_detected_in_hyphenated_test_dir() {
-        let entity = make_entity("check", "integration-tests/api.py", "@pytest.mark.slow\ndef check(): pass");
+        let entity = make_entity(
+            "check",
+            "integration-tests/api.py",
+            "@pytest.mark.slow\ndef check(): pass",
+        );
         assert!(is_test_entity(&entity, &[]));
     }
 
     #[test]
     fn test_entity_detected_in_dunder_tests_dir() {
-        let entity = make_entity("render", "__tests__/Button.test.tsx", "test('renders', () => {})");
+        let entity = make_entity(
+            "render",
+            "__tests__/Button.test.tsx",
+            "test('renders', () => {})",
+        );
         assert!(is_test_entity(&entity, &[]));
     }
 
     #[test]
     fn test_entity_detected_with_custom_dir() {
-        let entity = make_entity("verify", "qa/smoke.py", "@pytest.fixture\ndef verify(): pass");
+        let entity = make_entity(
+            "verify",
+            "qa/smoke.py",
+            "@pytest.fixture\ndef verify(): pass",
+        );
         // Without custom dirs: not detected (no name match, "qa" not a built-in)
         assert!(!is_test_entity(&entity, &[]));
         // With custom dirs: detected because path matches + content has @pytest
@@ -8874,7 +8894,11 @@ export function caller() {
 
     #[test]
     fn test_entity_contest_dir_not_false_positive() {
-        let entity = make_entity("solve", "contest/problem_a.py", "def solve(): test('input')");
+        let entity = make_entity(
+            "solve",
+            "contest/problem_a.py",
+            "def solve(): test('input')",
+        );
         assert!(!is_test_entity(&entity, &[]));
     }
 

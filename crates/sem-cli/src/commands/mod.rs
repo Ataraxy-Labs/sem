@@ -366,10 +366,8 @@ mod tests {
     fn normalize_repo_relative_path_returns_normalized_absolute_path_outside_repo() {
         use std::fs;
 
-        let repo_root = std::env::temp_dir().join(format!(
-            "sem-normalize-outside-test-{}",
-            std::process::id()
-        ));
+        let repo_root =
+            std::env::temp_dir().join(format!("sem-normalize-outside-test-{}", std::process::id()));
         let cwd = repo_root.join("sub");
         fs::create_dir_all(&cwd).expect("create cwd");
         let outside_path = cwd.join("../../outside.py");

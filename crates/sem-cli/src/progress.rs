@@ -183,7 +183,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // First call today: due. Second call today: throttled.
         assert!(nudge_due_for(&dir), "first call should be due");
-        assert!(!nudge_due_for(&dir), "second call same day should be throttled");
+        assert!(
+            !nudge_due_for(&dir),
+            "second call same day should be throttled"
+        );
         // Simulate yesterday: nudge becomes due again.
         let yesterday = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

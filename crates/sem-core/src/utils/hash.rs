@@ -126,8 +126,14 @@ fn hash_structural_tokens_excluding(
 /// Trim leading/trailing ASCII whitespace from a byte slice without allocating.
 #[inline]
 fn trim_bytes(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
-    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
     &bytes[start..end]
 }
 

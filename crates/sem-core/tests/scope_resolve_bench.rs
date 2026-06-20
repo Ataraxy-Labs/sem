@@ -1987,7 +1987,11 @@ fn get_kotlin_expected_edges() -> Vec<(&'static str, &'static str, &'static str)
         ("handleTransfer", "count", "shelter.count() on Shelter"),
         ("handleList", "listAnimals", "handler calls service"),
         // Chained field access: registry.shelter (Registry.shelter: Shelter) then shelter.add()
-        ("handleRegistry", "add", "shelter from registry.shelter, then add() on Shelter"),
+        (
+            "handleRegistry",
+            "add",
+            "shelter from registry.shelter, then add() on Shelter",
+        ),
         // Database.kt internal
         (
             "Transaction::execute",

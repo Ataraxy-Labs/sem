@@ -2057,5 +2057,4 @@ function hello() {}
             assert_eq!(c.file_path, "src/routes/+page.svelte");
         }
     }
-
 }

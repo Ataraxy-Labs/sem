@@ -117,11 +117,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Create wrapper directory if needed
     if !dir.exists() {
         fs::create_dir_all(dir)?;
-        println!(
-            "{} Created {}",
-            "✓".green().bold(),
-            dir.display()
-        );
+        println!("{} Created {}", "✓".green().bold(), dir.display());
     }
 
     // Write wrapper script
@@ -350,10 +346,7 @@ fn remove_pre_commit_hook() {
 
     if meaningful.is_empty() {
         let _ = fs::remove_file(&hook_path);
-        println!(
-            "{} Removed sem-only pre-commit hook",
-            "✓".green().bold()
-        );
+        println!("{} Removed sem-only pre-commit hook", "✓".green().bold());
     } else {
         let _ = fs::write(&hook_path, format!("{}\n", result.trim_end()));
         println!(

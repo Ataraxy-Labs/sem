@@ -101,10 +101,7 @@ fn find_toml_sections(lines: &[&str]) -> Vec<TomlSection> {
                 .trim()
                 .to_string();
             if !key.is_empty() {
-                sections.push(TomlSection {
-                    key,
-                    line: i + 1,
-                });
+                sections.push(TomlSection { key, line: i + 1 });
             }
             continue;
         }
@@ -116,10 +113,7 @@ fn find_toml_sections(lines: &[&str]) -> Vec<TomlSection> {
             if let Some(eq_pos) = trimmed.find('=') {
                 let key = trimmed[..eq_pos].trim().to_string();
                 if !key.is_empty() {
-                    sections.push(TomlSection {
-                        key,
-                        line: i + 1,
-                    });
+                    sections.push(TomlSection { key, line: i + 1 });
                 }
             }
         }

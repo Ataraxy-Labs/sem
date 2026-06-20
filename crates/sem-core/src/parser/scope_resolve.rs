@@ -2186,10 +2186,7 @@ fn scan_ts_var_declaration(
 /// Extract `(object_identifier, property)` from a kotlin-ng `navigation_expression`
 /// of the simple form `ident.ident`. Returns None for anything more complex
 /// (chained access, calls as the receiver, `this`, etc.).
-fn kotlin_navigation_obj_prop(
-    node: tree_sitter::Node,
-    source: &[u8],
-) -> Option<(String, String)> {
+fn kotlin_navigation_obj_prop(node: tree_sitter::Node, source: &[u8]) -> Option<(String, String)> {
     let mut cursor = node.walk();
     let idents: Vec<tree_sitter::Node> = node
         .named_children(&mut cursor)
@@ -2653,7 +2650,11 @@ fn kotlin_positional_name_and_type(
                 name = child.utf8_text(source).unwrap_or("").to_string();
             }
             "user_type" | "nullable_type" | "type_reference" if base_type.is_none() => {
-                base_type = Some(extract_base_type(child, source).trim_end_matches('?').to_string());
+                base_type = Some(
+                    extract_base_type(child, source)
+                        .trim_end_matches('?')
+                        .to_string(),
+                );
             }
             _ => {}
         }
@@ -3027,7 +3028,12 @@ fn scan_java_class_fields(
             .child_by_field_name("type")
             .map(|n| extract_base_type(n, source))
             .unwrap_or_default();
-        if field_type.is_empty() || !field_type.chars().next().map_or(false, |c| c.is_uppercase()) {
+        if field_type.is_empty()
+            || !field_type
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_uppercase())
+        {
             continue;
         }
         let mut dc = member.walk();
@@ -3498,7 +3504,10 @@ fn scan_kotlin_primary_constructor(
                 let param_type = param_type.unwrap_or_default();
                 if !param_name.is_empty()
                     && !param_type.is_empty()
-                    && param_type.chars().next().map_or(false, |c| c.is_uppercase())
+                    && param_type
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_uppercase())
                 {
                     instance_attr_types
                         .insert((class_name.to_string(), param_name.to_string()), param_type);
@@ -4032,9 +4041,7 @@ fn inject_field_type_bindings(
         for scope_idx in 0..scopes.len() {
             for (var, (obj, prop)) in &scopes[scope_idx].pending_field_types {
                 if let Some(obj_type) = lookup_type_in_scopes(scope_idx, scopes, obj) {
-                    if let Some(field_type) =
-                        instance_attr_types.get(&(obj_type, prop.clone()))
-                    {
+                    if let Some(field_type) = instance_attr_types.get(&(obj_type, prop.clone())) {
                         resolutions.push((scope_idx, var.clone(), field_type.clone()));
                     }
                 }

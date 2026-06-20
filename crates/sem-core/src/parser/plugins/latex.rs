@@ -90,10 +90,9 @@ impl SemanticParserPlugin for LatexParserPlugin {
             return entities;
         }
 
-        let section_re = Regex::new(
-            r"\\(part|chapter|section|subsection|subsubsection|paragraph)\*?\{",
-        )
-        .unwrap();
+        let section_re =
+            Regex::new(r"\\(part|chapter|section|subsection|subsubsection|paragraph)\*?\{")
+                .unwrap();
         let begin_env_re = Regex::new(r"\\begin\{(\w+)\}").unwrap();
         let end_env_re = Regex::new(r"\\end\{(\w+)\}").unwrap();
         let label_re = Regex::new(r"\\label\{([^}]+)\}").unwrap();
@@ -210,7 +209,6 @@ impl SemanticParserPlugin for LatexParserPlugin {
                     }
                     i += 1;
                 }
-
             }
         }
 
@@ -250,8 +248,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                     if let Some(level) = section_level(cmd) {
                         // Use brace-counting to extract title (handles nested braces)
                         let brace_pos = m.end() - 1; // byte offset of the `{`
-                        let name = extract_braced(line, brace_pos)
-                            .unwrap_or_else(|| cmd.to_string());
+                        let name =
+                            extract_braced(line, brace_pos).unwrap_or_else(|| cmd.to_string());
 
                         // Pop stack until we find an ancestor with a strictly lower level
                         while section_stack.last().map_or(false, |(l, _)| *l >= level) {
@@ -321,9 +319,7 @@ impl SemanticParserPlugin for LatexParserPlugin {
                 file_path: file_path.to_string(),
                 entity_type: "section".to_string(),
                 name: section.name.clone(),
-                parent_id: section
-                    .parent_index
-                    .map(|pi| section_ids[pi].clone()),
+                parent_id: section.parent_index.map(|pi| section_ids[pi].clone()),
                 content_hash: content_hash(&section_content),
                 structural_hash: None,
                 content: section_content,
@@ -361,9 +357,7 @@ impl SemanticParserPlugin for LatexParserPlugin {
             // Check for \begin{env}
             if let Some(caps) = begin_env_re.captures(line) {
                 let env_name = caps[1].to_string();
-                if env_name != "document"
-                    && SIGNIFICANT_ENVIRONMENTS.contains(&env_name.as_str())
-                {
+                if env_name != "document" && SIGNIFICANT_ENVIRONMENTS.contains(&env_name.as_str()) {
                     env_stack.push((env_name, line_num, vec![line.to_string()]));
                     continue;
                 }
@@ -372,9 +366,7 @@ impl SemanticParserPlugin for LatexParserPlugin {
             // Check for \end{env}
             if let Some(caps) = end_env_re.captures(line) {
                 let env_name = caps[1].to_string();
-                if let Some(pos) =
-                    env_stack.iter().rposition(|(name, _, _)| *name == env_name)
-                {
+                if let Some(pos) = env_stack.iter().rposition(|(name, _, _)| *name == env_name) {
                     let (env_type, start_line, mut env_lines) = env_stack.remove(pos);
                     env_lines.push(line.to_string());
 
@@ -429,11 +421,7 @@ impl SemanticParserPlugin for LatexParserPlugin {
 
         for (index, env) in env_entities.iter().enumerate() {
             // Find the deepest (highest-level number) section containing this environment
-            let parent_id = find_parent_section_id(
-                env.start_line,
-                &section_ranges,
-                &section_ids,
-            );
+            let parent_id = find_parent_section_id(env.start_line, &section_ranges, &section_ids);
 
             let mut metadata = HashMap::new();
             metadata.insert("environment_type".to_string(), env.env_type.clone());

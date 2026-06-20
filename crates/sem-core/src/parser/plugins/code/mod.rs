@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use crate::model::entity::SemanticEntity;
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::utils::hash::{content_hash, structural_hash};
-use languages::{get_all_code_extensions, get_language_config};
 use entity_extractor::extract_entities;
+use languages::{get_all_code_extensions, get_language_config};
 
 pub struct CodeParserPlugin;
 
@@ -182,11 +182,26 @@ enum Status {
         let entities = plugin.extract_entities(code, "UserService.java");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Java entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Java entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
-        assert!(names.contains(&"Repository"), "Should find interface Repository, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
+        assert!(
+            names.contains(&"UserService"),
+            "Should find class UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repository"),
+            "Should find interface Repository, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum Status, got: {:?}",
+            names
+        );
 
         // A field is named by its declarator, not its type: `private String name;`
         // is the field `name`, not `String`.
@@ -194,7 +209,11 @@ enum Status {
             .iter()
             .find(|e| e.entity_type == "field")
             .expect("should extract the field entity");
-        assert_eq!(field.name, "name", "field should be named by its declarator, got: {:?}", field.name);
+        assert_eq!(
+            field.name, "name",
+            "field should be named by its declarator, got: {:?}",
+            field.name
+        );
     }
 
     #[test]
@@ -213,11 +232,28 @@ public class Calculator {
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "Calculator.java");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Java nested: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "Java nested: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"Calculator"), "Should find Calculator class");
-        assert!(names.contains(&"add"), "Should find add method, got: {:?}", names);
-        assert!(names.contains(&"subtract"), "Should find subtract method, got: {:?}", names);
+        assert!(
+            names.contains(&"Calculator"),
+            "Should find Calculator class"
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find add method, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"subtract"),
+            "Should find subtract method, got: {:?}",
+            names
+        );
 
         // Methods should have Calculator as parent
         let add = entities.iter().find(|e| e.name == "add").unwrap();
@@ -262,13 +298,36 @@ int main() {
         let entities = plugin.extract_entities(code, "main.c");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("C entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "C entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"greet"), "Should find greet function, got: {:?}", names);
-        assert!(names.contains(&"add"), "Should find add function, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find main function, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find Point struct, got: {:?}", names);
-        assert!(names.contains(&"Color"), "Should find Color enum, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find greet function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find add function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find main function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find Point struct, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "Should find Color enum, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -407,19 +466,69 @@ func helper(x: Int) -> Int {
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "UserService.swift");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Swift entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Swift entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find struct Point, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
-        assert!(names.contains(&"Repository"), "Should find protocol Repository, got: {:?}", names);
-        assert!(names.contains(&"Canvas"), "Should find associatedtype Canvas, got: {:?}", names);
-        assert!(names.contains(&"Handler"), "Should find typealias Handler, got: {:?}", names);
-        assert!(names.contains(&"~~~"), "Should find custom operator ~~~, got: {:?}", names);
-        assert!(names.contains(&"init"), "Should find initializer init, got: {:?}", names);
-        assert!(names.contains(&"deinit"), "Should find deinitializer deinit, got: {:?}", names);
-        assert!(names.contains(&"subscript"), "Should find subscript, got: {:?}", names);
-        assert!(names.contains(&"helper"), "Should find function helper, got: {:?}", names);
+        assert!(
+            names.contains(&"UserService"),
+            "Should find class UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find struct Point, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum Status, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repository"),
+            "Should find protocol Repository, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Canvas"),
+            "Should find associatedtype Canvas, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Handler"),
+            "Should find typealias Handler, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"~~~"),
+            "Should find custom operator ~~~, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"init"),
+            "Should find initializer init, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"deinit"),
+            "Should find deinitializer deinit, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"subscript"),
+            "Should find subscript, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "Should find function helper, got: {:?}",
+            names
+        );
 
         let handler = entities.iter().find(|e| e.name == "Handler").unwrap();
         assert_eq!(handler.entity_type, "type");
@@ -434,12 +543,21 @@ func helper(x: Int) -> Int {
 
         let initializer = entities.iter().find(|e| e.name == "init").unwrap();
         assert_eq!(initializer.entity_type, "init");
-        assert_eq!(initializer.parent_id.as_deref(), Some(user_service.id.as_str()));
-        assert_eq!(initializer.id, "UserService.swift::class::UserService::init");
+        assert_eq!(
+            initializer.parent_id.as_deref(),
+            Some(user_service.id.as_str())
+        );
+        assert_eq!(
+            initializer.id,
+            "UserService.swift::class::UserService::init"
+        );
 
         let deinitializer = entities.iter().find(|e| e.name == "deinit").unwrap();
         assert_eq!(deinitializer.entity_type, "deinit");
-        assert_eq!(deinitializer.parent_id.as_deref(), Some(user_service.id.as_str()));
+        assert_eq!(
+            deinitializer.parent_id.as_deref(),
+            Some(user_service.id.as_str())
+        );
         assert_eq!(
             deinitializer.id,
             "UserService.swift::class::UserService::deinit"
@@ -451,10 +569,7 @@ func helper(x: Int) -> Int {
         let subscript = entities.iter().find(|e| e.name == "subscript").unwrap();
         assert_eq!(subscript.entity_type, "subscript");
         assert_eq!(subscript.parent_id.as_deref(), Some(point.id.as_str()));
-        assert_eq!(
-            subscript.id,
-            "UserService.swift::struct::Point::subscript"
-        );
+        assert_eq!(subscript.id, "UserService.swift::struct::Point::subscript");
 
         let status = entities.iter().find(|e| e.name == "Status").unwrap();
         assert_eq!(status.entity_type, "enum");
@@ -466,10 +581,7 @@ func helper(x: Int) -> Int {
         let canvas = entities.iter().find(|e| e.name == "Canvas").unwrap();
         assert_eq!(canvas.entity_type, "associatedtype");
         assert_eq!(canvas.parent_id.as_deref(), Some(repository.id.as_str()));
-        assert_eq!(
-            canvas.id,
-            "UserService.swift::protocol::Repository::Canvas"
-        );
+        assert_eq!(canvas.id, "UserService.swift::protocol::Repository::Canvas");
     }
 
     #[test]
@@ -488,7 +600,10 @@ struct Point {
             .collect();
 
         assert_eq!(
-            properties.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            properties
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["x", "y"]
         );
         assert!(properties
@@ -570,7 +685,10 @@ struct Constants {
             .filter(|e| e.entity_type == "property")
             .collect();
         assert_eq!(
-            constants_properties.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            constants_properties
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["first", "second", "third"]
         );
         assert_eq!(constants_properties[0].content, "let first: Int");
@@ -673,7 +791,11 @@ class Cache {
             "shifted",
             "closing",
         ] {
-            assert!(!names.contains(&local), "{local} should not be an entity. Got: {:?}", names);
+            assert!(
+                !names.contains(&local),
+                "{local} should not be an entity. Got: {:?}",
+                names
+            );
         }
     }
 
@@ -692,8 +814,16 @@ func outer() {
         assert!(names.contains(&"outer"), "got: {:?}", names);
         assert!(names.contains(&"innerA"), "got: {:?}", names);
         assert!(names.contains(&"innerB"), "got: {:?}", names);
-        assert!(!names.contains(&"a"), "local binding should stay suppressed: {:?}", names);
-        assert!(!names.contains(&"b"), "local binding should stay suppressed: {:?}", names);
+        assert!(
+            !names.contains(&"a"),
+            "local binding should stay suppressed: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"b"),
+            "local binding should stay suppressed: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -887,17 +1017,43 @@ end
         let entities = plugin.extract_entities(code, "accounts.ex");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Elixir entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Elixir entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"MyApp.Accounts"), "Should find module, got: {:?}", names);
-        assert!(names.contains(&"create_user"), "Should find def, got: {:?}", names);
-        assert!(names.contains(&"validate"), "Should find defp, got: {:?}", names);
-        assert!(names.contains(&"is_admin"), "Should find defmacro, got: {:?}", names);
-        assert!(names.contains(&"Printable"), "Should find defprotocol, got: {:?}", names);
+        assert!(
+            names.contains(&"MyApp.Accounts"),
+            "Should find module, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"create_user"),
+            "Should find def, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"validate"),
+            "Should find defp, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"is_admin"),
+            "Should find defmacro, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Printable"),
+            "Should find defprotocol, got: {:?}",
+            names
+        );
 
         // Verify nesting: create_user should have MyApp.Accounts as parent
         let create_user = entities.iter().find(|e| e.name == "create_user").unwrap();
-        assert!(create_user.parent_id.is_some(), "create_user should be nested under module");
+        assert!(
+            create_user.parent_id.is_some(),
+            "create_user should be nested under module"
+        );
     }
 
     #[test]
@@ -945,21 +1101,68 @@ end
                 .collect::<Vec<_>>()
         );
 
-        assert!(!names.contains(&"my.app.core"), "Should not extract ns form as entity, got: {:?}", names);
-        assert!(names.contains(&"my-var"), "Should find def, got: {:?}", names);
-        assert!(names.contains(&"secret"), "Should strip ^:private metadata from name, got: {:?}", names);
-        assert!(names.contains(&"connection"), "Should find defonce, got: {:?}", names);
-        assert!(names.contains(&"greet"), "Should find defn, got: {:?}", names);
-        assert!(names.contains(&"unless"), "Should find defmacro, got: {:?}", names);
-        assert!(names.contains(&"Greeter"), "Should find defprotocol, got: {:?}", names);
-        assert!(names.contains(&"Person"), "Should find defrecord, got: {:?}", names);
-        assert!(names.contains(&"area"), "Should find defmulti, got: {:?}", names);
+        assert!(
+            !names.contains(&"my.app.core"),
+            "Should not extract ns form as entity, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"my-var"),
+            "Should find def, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"secret"),
+            "Should strip ^:private metadata from name, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"connection"),
+            "Should find defonce, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"greet"),
+            "Should find defn, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"unless"),
+            "Should find defmacro, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Greeter"),
+            "Should find defprotocol, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Person"),
+            "Should find defrecord, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"area"),
+            "Should find defmulti, got: {:?}",
+            names
+        );
         // defmethods get dispatch-qualified names so two methods on the same multimethod are distinct
-        assert!(names.contains(&"area/:circle"), "Should find defmethod area :circle, got: {:?}", names);
-        assert!(names.contains(&"area/:rectangle"), "Should find defmethod area :rectangle, got: {:?}", names);
+        assert!(
+            names.contains(&"area/:circle"),
+            "Should find defmethod area :circle, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"area/:rectangle"),
+            "Should find defmethod area :rectangle, got: {:?}",
+            names
+        );
         let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
-        assert!(ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
-            "All entity IDs must be unique, got: {:?}", ids);
+        assert!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
+            "All entity IDs must be unique, got: {:?}",
+            ids
+        );
     }
 
     #[test]
@@ -995,8 +1198,16 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "validators.clj");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"empty?"), "Should extract predicate fn empty?, got: {:?}", names);
-        assert!(names.contains(&"reset!"), "Should extract bang fn reset!, got: {:?}", names);
+        assert!(
+            names.contains(&"empty?"),
+            "Should extract predicate fn empty?, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"reset!"),
+            "Should extract bang fn reset!, got: {:?}",
+            names
+        );
         let empty_entity = entities.iter().find(|e| e.name == "empty?").unwrap();
         let reset_entity = entities.iter().find(|e| e.name == "reset!").unwrap();
         assert_eq!(empty_entity.entity_type, "function");
@@ -1017,8 +1228,16 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "core.clj");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"*db*"), "Should extract dynamic var *db*, got: {:?}", names);
-        assert!(names.contains(&"not="), "Should extract fn not=, got: {:?}", names);
+        assert!(
+            names.contains(&"*db*"),
+            "Should extract dynamic var *db*, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"not="),
+            "Should extract fn not=, got: {:?}",
+            names
+        );
         let db_entity = entities.iter().find(|e| e.name == "*db*").unwrap();
         let noteq_entity = entities.iter().find(|e| e.name == "not=").unwrap();
         assert_eq!(db_entity.entity_type, "var");
@@ -1042,13 +1261,25 @@ end
         let entities = plugin.extract_entities(code, "app.clj");
         let by_name = |name: &str| entities.iter().find(|e| e.name == name);
 
-        assert!(by_name("MyType").is_some(), "Should extract deftype, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert!(
+            by_name("MyType").is_some(),
+            "Should extract deftype, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
         assert_eq!(by_name("MyType").unwrap().entity_type, "type");
 
-        assert!(by_name("IFoo").is_some(), "Should extract definterface, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert!(
+            by_name("IFoo").is_some(),
+            "Should extract definterface, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
         assert_eq!(by_name("IFoo").unwrap().entity_type, "interface");
 
-        assert!(by_name("point").is_some(), "Should extract defstruct, got: {:?}", entities.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert!(
+            by_name("point").is_some(),
+            "Should extract defstruct, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
         assert_eq!(by_name("point").unwrap().entity_type, "struct");
     }
 
@@ -1065,8 +1296,16 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "shared.cljc");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"platform-key"), "Should extract defn from .cljc, got: {:?}", names);
-        assert!(names.contains(&"shared-value"), "Should extract def from .cljc, got: {:?}", names);
+        assert!(
+            names.contains(&"platform-key"),
+            "Should extract defn from .cljc, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"shared-value"),
+            "Should extract def from .cljc, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1086,14 +1325,31 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "app.clj");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"process"), "Should extract defmulti, got: {:?}", names);
-        assert!(names.contains(&"process/nil"), "Should extract defmethod with nil dispatch, got: {:?}", names);
-        assert!(names.contains(&"process/\"string\""), "Should extract defmethod with string dispatch, got: {:?}", names);
-        assert!(names.contains(&"process/42"), "Should extract defmethod with integer dispatch, got: {:?}", names);
+        assert!(
+            names.contains(&"process"),
+            "Should extract defmulti, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"process/nil"),
+            "Should extract defmethod with nil dispatch, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"process/\"string\""),
+            "Should extract defmethod with string dispatch, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"process/42"),
+            "Should extract defmethod with integer dispatch, got: {:?}",
+            names
+        );
         let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
         assert!(
             ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
-            "All entity IDs must be unique, got: {:?}", ids
+            "All entity IDs must be unique, got: {:?}",
+            ids
         );
     }
 
@@ -1116,11 +1372,27 @@ echo "main script"
         let entities = plugin.extract_entities(code, "deploy.sh");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Bash entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Bash entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"greet"), "Should find greet(), got: {:?}", names);
-        assert!(names.contains(&"deploy"), "Should find function deploy, got: {:?}", names);
-        assert_eq!(entities.len(), 2, "Should only find functions, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find greet(), got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"deploy"),
+            "Should find function deploy, got: {:?}",
+            names
+        );
+        assert_eq!(
+            entities.len(),
+            2,
+            "Should only find functions, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1155,8 +1427,15 @@ export class Greeter {
             .collect();
         let ids: Vec<&str> = overloads.iter().map(|entity| entity.id.as_str()).collect();
 
-        assert_eq!(overloads.len(), 2, "expected both overloads, got: {entities:?}");
-        assert_eq!(ids, vec!["over.ts::function::f@L1#1", "over.ts::function::f@L1#2"]);
+        assert_eq!(
+            overloads.len(),
+            2,
+            "expected both overloads, got: {entities:?}"
+        );
+        assert_eq!(
+            ids,
+            vec!["over.ts::function::f@L1#1", "over.ts::function::f@L1#2"]
+        );
     }
 
     #[test]
@@ -1225,7 +1504,14 @@ export async function* streamUsers(): AsyncGenerator<string> {
         let entities = plugin.extract_entities(code, "stream.ts");
         let stream = entities.iter().find(|e| e.name == "streamUsers");
 
-        assert!(stream.is_some(), "Should find generator function, got: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            stream.is_some(),
+            "Should find generator function, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(stream.unwrap().entity_type, "function");
     }
 
@@ -1241,7 +1527,14 @@ export function* ids() {
         let entities = plugin.extract_entities(code, "ids.js");
         let ids = entities.iter().find(|e| e.name == "ids");
 
-        assert!(ids.is_some(), "Should find generator function, got: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            ids.is_some(),
+            "Should find generator function, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(ids.unwrap().entity_type, "function");
     }
 
@@ -1258,10 +1551,24 @@ function outer() {
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "nested.ts");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Nested TS: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "Nested TS: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"outer"), "Should find outer, got: {:?}", names);
-        assert!(names.contains(&"inner"), "Should find inner, got: {:?}", names);
+        assert!(
+            names.contains(&"outer"),
+            "Should find outer, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"inner"),
+            "Should find inner, got: {:?}",
+            names
+        );
 
         let inner = entities.iter().find(|e| e.name == "inner").unwrap();
         assert!(inner.parent_id.is_some(), "inner should have parent_id");
@@ -1372,12 +1679,18 @@ impl Greeting for Cat {
 "#;
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "impls.rs");
-        let impl_entities: Vec<&_> = entities.iter()
+        let impl_entities: Vec<&_> = entities
+            .iter()
             .filter(|e| e.entity_type == "impl")
             .collect();
         let names: Vec<&str> = impl_entities.iter().map(|e| e.name.as_str()).collect();
 
-        assert_eq!(impl_entities.len(), 3, "Should find 3 impl blocks, got: {:?}", names);
+        assert_eq!(
+            impl_entities.len(),
+            3,
+            "Should find 3 impl blocks, got: {:?}",
+            names
+        );
         assert!(names.contains(&"Greeting for Person"), "got: {:?}", names);
         assert!(names.contains(&"Greeting for Robot"), "got: {:?}", names);
         assert!(names.contains(&"Greeting for Cat"), "got: {:?}", names);
@@ -1505,17 +1818,39 @@ resource "aws_instance" "web" {
         let entities = plugin.extract_entities(code, "main.tf");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("HCL entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "HCL entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"region"), "Should find top-level attribute, got: {:?}", names);
-        assert!(names.contains(&"variable.image_id"), "Should find variable block, got: {:?}", names);
-        assert!(names.contains(&"resource.aws_instance.web"), "Should find resource block, got: {:?}", names);
+        assert!(
+            names.contains(&"region"),
+            "Should find top-level attribute, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"variable.image_id"),
+            "Should find variable block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"resource.aws_instance.web"),
+            "Should find resource block, got: {:?}",
+            names
+        );
         assert!(
             names.contains(&"resource.aws_instance.web.lifecycle"),
             "Should find nested lifecycle block with qualified name, got: {:?}",
             names
         );
-        assert!(!names.contains(&"ami"), "Should skip nested attributes inside blocks, got: {:?}", names);
+        assert!(
+            !names.contains(&"ami"),
+            "Should skip nested attributes inside blocks, got: {:?}",
+            names
+        );
         assert!(
             !names.contains(&"create_before_destroy"),
             "Should skip nested attributes inside nested blocks, got: {:?}",
@@ -1526,8 +1861,14 @@ resource "aws_instance" "web" {
             .iter()
             .find(|e| e.name == "resource.aws_instance.web.lifecycle")
             .unwrap();
-        assert!(lifecycle.parent_id.is_some(), "lifecycle should be nested under resource");
-        assert!(types.contains(&"attribute"), "Should preserve attribute entity type for top-level attributes");
+        assert!(
+            lifecycle.parent_id.is_some(),
+            "lifecycle should be nested under resource"
+        );
+        assert!(
+            types.contains(&"attribute"),
+            "Should preserve attribute entity type for top-level attributes"
+        );
     }
 
     #[test]
@@ -1558,7 +1899,13 @@ fun topLevel(x: Int): Int = x * 2
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "App.kt");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Kotlin entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Kotlin entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(names.contains(&"UserService"), "got: {:?}", names);
         assert!(names.contains(&"greet"), "got: {:?}", names);
         assert!(names.contains(&"Repository"), "got: {:?}", names);
@@ -1591,7 +1938,13 @@ fun topLevel(x: Int): Int = x * 2
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "pom.xml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("XML entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "XML entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(names.contains(&"project"), "got: {:?}", names);
         assert!(names.contains(&"dependencies"), "got: {:?}", names);
         assert!(names.contains(&"build"), "got: {:?}", names);
@@ -1885,7 +2238,10 @@ const first = () => 1, second = 2;
             entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
                 panic!(
                     "missing {name}; got: {:?}",
-                    entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>()
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type))
+                        .collect::<Vec<_>>()
                 )
             })
         };
@@ -1959,11 +2315,26 @@ func GetFlags() []FeatureFlag {
         let entities = plugin.extract_entities(code, "flags.go");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Go entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Go entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"FeatureFlag"), "Should find type FeatureFlag, got: {:?}", names);
-        assert!(names.contains(&"standardFeatureFlags"), "Should find var standardFeatureFlags, got: {:?}", names);
-        assert!(names.contains(&"GetFlags"), "Should find func GetFlags, got: {:?}", names);
+        assert!(
+            names.contains(&"FeatureFlag"),
+            "Should find type FeatureFlag, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"standardFeatureFlags"),
+            "Should find var standardFeatureFlags, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"GetFlags"),
+            "Should find func GetFlags, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1986,11 +2357,26 @@ func main() {}
         let entities = plugin.extract_entities(code, "test.go");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Go grouped entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Go grouped entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"flags") || names.contains(&"simple"), "Should find grouped var, got: {:?}", names);
-        assert!(names.contains(&"x"), "Should find grouped const x, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find func main, got: {:?}", names);
+        assert!(
+            names.contains(&"flags") || names.contains(&"simple"),
+            "Should find grouped var, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"x"),
+            "Should find grouped const x, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find func main, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -2061,30 +2447,77 @@ extension type Wrapper(int value) implements int {}
         );
 
         // Top-level declarations
-        assert!(names.contains(&"Calculator"), "Should find class, got: {:?}", names);
-        assert!(names.contains(&"Loggable"), "Should find mixin, got: {:?}", names);
-        assert!(names.contains(&"StringExt"), "Should find extension, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum, got: {:?}", names);
-        assert!(names.contains(&"Callback"), "Should find typedef, got: {:?}", names);
-        assert!(names.contains(&"add"), "Should find top-level function, got: {:?}", names);
-        assert!(names.contains(&"Wrapper"), "Should find extension type, got: {:?}", names);
+        assert!(
+            names.contains(&"Calculator"),
+            "Should find class, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Loggable"),
+            "Should find mixin, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"StringExt"),
+            "Should find extension, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Callback"),
+            "Should find typedef, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find top-level function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Wrapper"),
+            "Should find extension type, got: {:?}",
+            names
+        );
 
         // Class members with correct types
-        let add_method = entities.iter().find(|e| e.name == "add" && e.parent_id.is_some());
-        assert!(add_method.is_some(), "Should find add method inside Calculator");
+        let add_method = entities
+            .iter()
+            .find(|e| e.name == "add" && e.parent_id.is_some());
+        assert!(
+            add_method.is_some(),
+            "Should find add method inside Calculator"
+        );
         assert_eq!(add_method.unwrap().entity_type, "method");
 
         // Named constructor gets distinct name from unnamed constructor
-        let unnamed_ctor = entities.iter().find(|e| e.name == "Calculator" && e.entity_type == "constructor");
+        let unnamed_ctor = entities
+            .iter()
+            .find(|e| e.name == "Calculator" && e.entity_type == "constructor");
         assert!(unnamed_ctor.is_some(), "Should find unnamed constructor");
         let named_ctor = entities.iter().find(|e| e.name == "Calculator.withDefault");
-        assert!(named_ctor.is_some(), "Should find named constructor Calculator.withDefault, got: {:?}", names);
+        assert!(
+            named_ctor.is_some(),
+            "Should find named constructor Calculator.withDefault, got: {:?}",
+            names
+        );
         assert_eq!(named_ctor.unwrap().entity_type, "constructor");
-        assert_ne!(unnamed_ctor.unwrap().id, named_ctor.unwrap().id, "Named and unnamed constructors must have different entity IDs");
+        assert_ne!(
+            unnamed_ctor.unwrap().id,
+            named_ctor.unwrap().id,
+            "Named and unnamed constructors must have different entity IDs"
+        );
 
         // Factory constructor
         let factory_ctor = entities.iter().find(|e| e.name == "Calculator.create");
-        assert!(factory_ctor.is_some(), "Should find factory constructor Calculator.create, got: {:?}", names);
+        assert!(
+            factory_ctor.is_some(),
+            "Should find factory constructor Calculator.create, got: {:?}",
+            names
+        );
         assert_eq!(factory_ctor.unwrap().entity_type, "constructor");
 
         // Getter, setter, operator
@@ -2103,7 +2536,10 @@ extension type Wrapper(int value) implements int {}
         // Mixin members have parent
         let log_method = entities.iter().find(|e| e.name == "log");
         assert!(log_method.is_some(), "Should find log in Loggable");
-        assert!(log_method.unwrap().parent_id.is_some(), "log should have parent_id");
+        assert!(
+            log_method.unwrap().parent_id.is_some(),
+            "log should have parent_id"
+        );
 
         // Entity type mapping
         let callback = entities.iter().find(|e| e.name == "Callback").unwrap();
@@ -2137,10 +2573,22 @@ CREATE TABLE billing.invoices (id INT);
         let by_name = |n: &str| entities.iter().find(|e| e.name == n);
 
         // object_reference names (incl. schema-qualified)
-        assert_eq!(by_name("users").map(|e| e.entity_type.as_str()), Some("table"));
-        assert_eq!(by_name("active_users").map(|e| e.entity_type.as_str()), Some("view"));
-        assert_eq!(by_name("add").map(|e| e.entity_type.as_str()), Some("function"));
-        assert_eq!(by_name("mood").map(|e| e.entity_type.as_str()), Some("type"));
+        assert_eq!(
+            by_name("users").map(|e| e.entity_type.as_str()),
+            Some("table")
+        );
+        assert_eq!(
+            by_name("active_users").map(|e| e.entity_type.as_str()),
+            Some("view")
+        );
+        assert_eq!(
+            by_name("add").map(|e| e.entity_type.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            by_name("mood").map(|e| e.entity_type.as_str()),
+            Some("type")
+        );
         assert_eq!(by_name("mv").map(|e| e.entity_type.as_str()), Some("view"));
         assert_eq!(
             by_name("billing.invoices").map(|e| e.entity_type.as_str()),
@@ -2154,7 +2602,10 @@ CREATE TABLE billing.invoices (id INT);
             Some("index"),
             "index should be named idx_name, not the table it indexes"
         );
-        assert_eq!(by_name("myapp").map(|e| e.entity_type.as_str()), Some("schema"));
+        assert_eq!(
+            by_name("myapp").map(|e| e.entity_type.as_str()),
+            Some("schema")
+        );
     }
 
     #[test]
@@ -2233,7 +2684,10 @@ class Foo {
         let entities_a = plugin.extract_entities(code_a, "a.dart");
         let entities_b = plugin.extract_entities(code_b, "b.dart");
 
-        let ctor_a = entities_a.iter().find(|e| e.name == "Foo.fromJson").unwrap();
+        let ctor_a = entities_a
+            .iter()
+            .find(|e| e.name == "Foo.fromJson")
+            .unwrap();
         let ctor_b = entities_b.iter().find(|e| e.name == "Foo.fromMap").unwrap();
 
         assert_eq!(
@@ -2269,21 +2723,40 @@ set currentValue(int v) {
                 .collect::<Vec<_>>()
         );
 
-        let getter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "getter");
-        assert!(getter.is_some(), "Should find top-level getter, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        let getter = entities
+            .iter()
+            .find(|e| e.name == "currentValue" && e.entity_type == "getter");
+        assert!(
+            getter.is_some(),
+            "Should find top-level getter, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(
             getter.unwrap().content.contains("return _value"),
             "Top-level getter content should include the body"
         );
-        assert!(getter.unwrap().parent_id.is_none(), "Top-level getter should have no parent");
+        assert!(
+            getter.unwrap().parent_id.is_none(),
+            "Top-level getter should have no parent"
+        );
 
         // tree-sitter-dart 0.2.0 parses top-level setters as function_signature
         // (treating `set` as a type_identifier). setter_signature is only
         // produced inside class_member → method_signature.
-        let setter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "function");
-        assert!(setter.is_some(), "Should find top-level setter as function, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        let setter = entities
+            .iter()
+            .find(|e| e.name == "currentValue" && e.entity_type == "function");
+        assert!(
+            setter.is_some(),
+            "Should find top-level setter as function, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(
             setter.unwrap().content.contains("_value = v"),
             "Top-level setter content should include the body"
@@ -2308,14 +2781,28 @@ class Config {
                 .collect::<Vec<_>>()
         );
 
-        let name_field = entities.iter().find(|e| e.name == "name" && e.parent_id.is_some());
-        assert!(name_field.is_some(), "Should find field 'name', got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        let name_field = entities
+            .iter()
+            .find(|e| e.name == "name" && e.parent_id.is_some());
+        assert!(
+            name_field.is_some(),
+            "Should find field 'name', got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(name_field.unwrap().entity_type, "field");
 
         let max_retries = entities.iter().find(|e| e.name == "maxRetries");
-        assert!(max_retries.is_some(), "Should find field 'maxRetries', got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            max_retries.is_some(),
+            "Should find field 'maxRetries', got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(max_retries.unwrap().entity_type, "field");
     }
 
@@ -2341,14 +2828,29 @@ abstract class Shape {
         );
 
         let x_field = entities.iter().find(|e| e.name == "x");
-        assert!(x_field.is_some(), "Should find field 'x' from identifier_list, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            x_field.is_some(),
+            "Should find field 'x' from identifier_list, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(x_field.unwrap().entity_type, "field");
-        assert!(x_field.unwrap().parent_id.is_some(), "field 'x' should be nested under Shape");
+        assert!(
+            x_field.unwrap().parent_id.is_some(),
+            "field 'x' should be nested under Shape"
+        );
 
         let label_field = entities.iter().find(|e| e.name == "label");
-        assert!(label_field.is_some(), "Should find field 'label' from single-element identifier_list, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            label_field.is_some(),
+            "Should find field 'label' from single-element identifier_list, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(label_field.unwrap().entity_type, "field");
     }
 
@@ -2399,10 +2901,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "example.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("color").entity_type, "type");
         assert_eq!(find("point").entity_type, "type");
@@ -2433,10 +2945,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "nested.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml nested: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml nested: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         let outer = find("Outer");
         let x = find("x");
@@ -2448,9 +2970,18 @@ end
         assert_eq!(inner.entity_type, "module");
         assert_eq!(y.entity_type, "value");
 
-        assert!(x.parent_id.as_ref().is_some_and(|p| p == &outer.id), "x should be nested under Outer");
-        assert!(inner.parent_id.as_ref().is_some_and(|p| p == &outer.id), "Inner should be nested under Outer");
-        assert!(y.parent_id.as_ref().is_some_and(|p| p == &inner.id), "y should be nested under Inner");
+        assert!(
+            x.parent_id.as_ref().is_some_and(|p| p == &outer.id),
+            "x should be nested under Outer"
+        );
+        assert!(
+            inner.parent_id.as_ref().is_some_and(|p| p == &outer.id),
+            "Inner should be nested under Outer"
+        );
+        assert!(
+            y.parent_id.as_ref().is_some_and(|p| p == &inner.id),
+            "y should be nested under Inner"
+        );
     }
 
     #[test]
@@ -2470,10 +3001,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "example.mli");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml interface entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml interface entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("t").entity_type, "type");
         assert_eq!(find("create").entity_type, "val");
@@ -2494,10 +3035,20 @@ and pong x = if x <= 0 then 0 else ping (x - 1)
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "mutual.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml mutual let: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml mutual let: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("even").entity_type, "function");
         assert_eq!(find("odd").entity_type, "function");
@@ -2518,10 +3069,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "mutual_mod.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml mutual module: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml mutual module: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         let a = find("A");
         let b = find("B");
@@ -2530,8 +3091,14 @@ end
 
         let x = find("x");
         let y = find("y");
-        assert!(x.parent_id.as_ref().is_some_and(|p| p == &a.id), "x should be nested under A");
-        assert!(y.parent_id.as_ref().is_some_and(|p| p == &b.id), "y should be nested under B");
+        assert!(
+            x.parent_id.as_ref().is_some_and(|p| p == &a.id),
+            "x should be nested under A"
+        );
+        assert!(
+            y.parent_id.as_ref().is_some_and(|p| p == &b.id),
+            "y should be nested under B"
+        );
     }
 
     #[test]
@@ -2546,10 +3113,20 @@ let simple = 42
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "destruct.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml destructured: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml destructured: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("a").entity_type, "value");
         assert_eq!(find("b").entity_type, "value");
@@ -2571,10 +3148,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "classes.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml mutual class: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml mutual class: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("foo").entity_type, "class");
         assert_eq!(find("bar").entity_type, "class");
@@ -2606,8 +3193,12 @@ sub _private_helper {
         assert!(names.contains(&"hello"), "got: {:?}", names);
         assert!(names.contains(&"_private_helper"), "got: {:?}", names);
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("Foo::Bar").entity_type, "package");
         assert_eq!(find("hello").entity_type, "function");
@@ -2644,8 +3235,12 @@ end program main
         assert!(names.contains(&"greet"), "got: {:?}", names);
         assert!(names.contains(&"main"), "got: {:?}", names);
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("math_utils").entity_type, "module");
         assert_eq!(find("add").entity_type, "function");
@@ -2690,16 +3285,41 @@ type UserId = String
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "UserService.scala");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Scala entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Scala entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
-        assert!(names.contains(&"Repository"), "Should find trait Repository, got: {:?}", names);
-        assert!(names.contains(&"getUsers"), "Should find method getUsers, got: {:?}", names);
-        assert!(names.contains(&"createUser"), "Should find method createUser, got: {:?}", names);
+        assert!(
+            names.contains(&"UserService"),
+            "Should find class UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repository"),
+            "Should find trait Repository, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"getUsers"),
+            "Should find method getUsers, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"createUser"),
+            "Should find method createUser, got: {:?}",
+            names
+        );
 
         // Methods should be nested under class
         let get_users = entities.iter().find(|e| e.name == "getUsers").unwrap();
-        assert!(get_users.parent_id.is_some(), "getUsers should have parent_id");
+        assert!(
+            get_users.parent_id.is_some(),
+            "getUsers should have parent_id"
+        );
     }
 
     #[test]
@@ -2732,13 +3352,39 @@ type Predicate[A] = A => Boolean
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "Main.scala");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Scala 3 entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Scala 3 entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"Color"), "Should find enum Color, got: {:?}", names);
-        assert!(names.contains(&"Planet"), "Should find enum Planet, got: {:?}", names);
-        assert!(names.contains(&"Main"), "Should find object Main, got: {:?}", names);
-        assert!(names.contains(&"Greeter"), "Should find trait Greeter, got: {:?}", names);
-        assert!(names.contains(&"Predicate"), "Should find type alias Predicate, got: {:?}", names);
+        assert!(
+            names.contains(&"Color"),
+            "Should find enum Color, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Planet"),
+            "Should find enum Planet, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Main"),
+            "Should find object Main, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Greeter"),
+            "Should find trait Greeter, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Predicate"),
+            "Should find type alias Predicate, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -2787,12 +3433,32 @@ test "basic addition" {
             .map(|e| (e.name.as_str(), e.entity_type.as_str()))
             .collect();
 
-        assert!(names.contains(&"greet"), "Should find greet, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find greet, got: {:?}",
+            names
+        );
         assert!(names.contains(&"add"), "Should find add, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find main, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find Point, got: {:?}", names);
-        assert!(names.contains(&"Color"), "Should find Color, got: {:?}", names);
-        assert!(names.contains(&"Person"), "Should find Person, got: {:?}", names);
+        assert!(
+            names.contains(&"main"),
+            "Should find main, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find Point, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "Should find Color, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Person"),
+            "Should find Person, got: {:?}",
+            names
+        );
 
         assert_eq!(types["greet"], "function");
         assert_eq!(types["add"], "function");
@@ -2815,10 +3481,27 @@ test "basic addition" {
             .map(|e| (e.name.as_str(), e.entity_type.as_str()))
             .collect();
 
-        assert!(names.contains(&":deps"), "Should find :deps, got: {:?}", names);
-        assert!(names.contains(&":paths"), "Should find :paths, got: {:?}", names);
-        assert!(names.contains(&":aliases"), "Should find :aliases, got: {:?}", names);
-        assert_eq!(names.len(), 3, "Should have exactly 3 entries, got: {:?}", names);
+        assert!(
+            names.contains(&":deps"),
+            "Should find :deps, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&":paths"),
+            "Should find :paths, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&":aliases"),
+            "Should find :aliases, got: {:?}",
+            names
+        );
+        assert_eq!(
+            names.len(),
+            3,
+            "Should have exactly 3 entries, got: {:?}",
+            names
+        );
         assert_eq!(types[":deps"], "entry");
         assert_eq!(types[":paths"], "entry");
         assert_eq!(types[":aliases"], "entry");

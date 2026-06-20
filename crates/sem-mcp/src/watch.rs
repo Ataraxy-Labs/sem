@@ -142,10 +142,7 @@ fn repo_relative(root: &Path, path: &Path) -> Option<String> {
 
 /// Skip churny paths so routine git/build activity doesn't force rebuilds.
 fn is_noise(rel: &str) -> bool {
-    rel == ".git"
-        || rel.starts_with(".git/")
-        || rel.contains("/.git/")
-        || is_default_excluded(rel)
+    rel == ".git" || rel.starts_with(".git/") || rel.contains("/.git/") || is_default_excluded(rel)
 }
 
 #[cfg(test)]
@@ -171,8 +168,14 @@ mod tests {
     #[test]
     fn classify_distinguishes_structural_from_content() {
         // Create / remove / rename change the file set -> structural.
-        assert_eq!(classify(&EventKind::Create(CreateKind::File)), (true, false));
-        assert_eq!(classify(&EventKind::Remove(RemoveKind::File)), (true, false));
+        assert_eq!(
+            classify(&EventKind::Create(CreateKind::File)),
+            (true, false)
+        );
+        assert_eq!(
+            classify(&EventKind::Remove(RemoveKind::File)),
+            (true, false)
+        );
         assert_eq!(
             classify(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
             (true, false)

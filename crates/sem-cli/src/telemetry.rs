@@ -149,7 +149,11 @@ pub fn record(command: &str) {
             "os": std::env::consts::OS,
             "ts": now_secs().to_string(),
         });
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&spool) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spool)
+        {
             let _ = writeln!(file, "{event}");
         }
     }
@@ -232,7 +236,11 @@ pub fn flush() {
     } else {
         // Put the events back so they're retried on a later flush. Append
         // (not overwrite) — new events may have spooled meanwhile.
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&spool) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spool)
+        {
             let _ = file.write_all(content.as_bytes());
         }
         let _ = fs::remove_file(&claimed);

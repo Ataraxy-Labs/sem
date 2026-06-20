@@ -77,16 +77,56 @@ unittest {
                 .collect::<Vec<_>>()
         );
 
-        assert!(names.contains(&"Color"), "Should find enum Color, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find struct Point, got: {:?}", names);
-        assert!(names.contains(&"Value"), "Should find union Value, got: {:?}", names);
-        assert!(names.contains(&"Greeter"), "Should find interface Greeter, got: {:?}", names);
-        assert!(names.contains(&"HelloGreeter"), "Should find class HelloGreeter, got: {:?}", names);
-        assert!(names.contains(&"greet"), "Should find method greet, got: {:?}", names);
-        assert!(names.contains(&"Repeat"), "Should find template Repeat, got: {:?}", names);
-        assert!(names.contains(&"Logger"), "Should find mixin template Logger, got: {:?}", names);
-        assert!(names.contains(&"add"), "Should find function add, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find function main, got: {:?}", names);
+        assert!(
+            names.contains(&"Color"),
+            "Should find enum Color, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find struct Point, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Value"),
+            "Should find union Value, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Greeter"),
+            "Should find interface Greeter, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"HelloGreeter"),
+            "Should find class HelloGreeter, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"greet"),
+            "Should find method greet, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repeat"),
+            "Should find template Repeat, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Logger"),
+            "Should find mixin template Logger, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find function add, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find function main, got: {:?}",
+            names
+        );
 
         for entity in &entities {
             assert_eq!(entity.file_path, "hello.d");
@@ -109,8 +149,20 @@ int compute(int x) {
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         eprintln!("D entities (locals): {:?}", names);
 
-        assert!(names.contains(&"compute"), "Should find top-level compute, got: {:?}", names);
-        assert!(!names.contains(&"local"), "Should not extract local variable 'local', got: {:?}", names);
-        assert!(!names.contains(&"another"), "Should not extract local variable 'another', got: {:?}", names);
+        assert!(
+            names.contains(&"compute"),
+            "Should find top-level compute, got: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"local"),
+            "Should not extract local variable 'local', got: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"another"),
+            "Should not extract local variable 'another', got: {:?}",
+            names
+        );
     }
 }

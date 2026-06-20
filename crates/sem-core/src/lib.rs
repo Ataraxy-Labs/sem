@@ -1,5 +1,5 @@
-pub mod model;
+pub mod format;
 pub mod git;
+pub mod model;
 pub mod parser;
 pub mod utils;
-pub mod format;

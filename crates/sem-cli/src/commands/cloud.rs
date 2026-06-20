@@ -106,9 +106,7 @@ pub fn login(
     let path = save_credentials(&creds)?;
     println!("{} Logged in to {}", "ok".green().bold(), ep);
     println!("  Credentials saved to {}", path.display());
-    println!(
-        "  Cloud-accelerated commands are now active for registered repos."
-    );
+    println!("  Cloud-accelerated commands are now active for registered repos.");
 
     Ok(())
 }
@@ -138,7 +136,10 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
 
     let device_resp: DeviceCodeResponse = ureq::post("https://github.com/login/device/code")
         .set("Accept", "application/json")
-        .send_form(&[("client_id", &client_id), ("scope", &"user:email".to_string())])?
+        .send_form(&[
+            ("client_id", &client_id),
+            ("scope", &"user:email".to_string()),
+        ])?
         .into_json()?;
 
     let interval = Duration::from_secs(device_resp.interval.unwrap_or(5));
@@ -164,10 +165,7 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
             .send_form(&[
                 ("client_id", client_id.as_str()),
                 ("device_code", &device_resp.device_code),
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])?
             .into_json()?;
 
@@ -207,9 +205,7 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
     let path = save_credentials(&creds)?;
     println!("{} Logged in to {} via GitHub", "ok".green().bold(), ep);
     println!("  Credentials saved to {}", path.display());
-    println!(
-        "  Cloud-accelerated commands are now active for registered repos."
-    );
+    println!("  Cloud-accelerated commands are now active for registered repos.");
 
     Ok(())
 }
@@ -239,10 +235,7 @@ pub fn logout() -> Result<(), Box<dyn std::error::Error>> {
 
     if path.exists() {
         fs::remove_file(&path)?;
-        println!(
-            "{} Logged out — credentials removed",
-            "ok".green().bold()
-        );
+        println!("{} Logged out — credentials removed", "ok".green().bold());
     } else {
         println!(
             "{} No credentials found — already logged out",
@@ -461,7 +454,10 @@ fn save_repo_cache(cache: &HashMap<String, RepoCacheEntry>) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, serde_json::to_string_pretty(cache).unwrap_or_default());
+    let _ = fs::write(
+        path,
+        serde_json::to_string_pretty(cache).unwrap_or_default(),
+    );
 }
 
 fn current_timestamp() -> String {
@@ -673,9 +669,7 @@ impl CloudClient {
                 // uploaded silently. Already-registered repos resolve above and
                 // skip this check.
                 if !private_sync_opted_in() && !self.repo_is_public(remote_url) {
-                    return Err(
-                        "private repo not synced (set SEM_SYNC_PRIVATE=1 to opt in)".into(),
-                    );
+                    return Err("private repo not synced (set SEM_SYNC_PRIVATE=1 to opt in)".into());
                 }
                 let repo = self.register_repo(remote_url)?;
                 let normalized = normalize_remote_url(remote_url);
@@ -793,7 +787,6 @@ impl CloudClient {
             .into_json()?;
         Ok(resp)
     }
-
 }
 
 /// Minimal percent-encoding for query parameters (no external dep).
@@ -840,9 +833,7 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     let file_hint = opts
         .file_hint
         .as_deref()
-        .map(|f| {
-            super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f)
-        })
+        .map(|f| super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f))
         .unwrap_or_default();
     let result = client.impact(&repo_id, entity_name, &file_hint).ok()?;
 
@@ -851,9 +842,8 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     let deps_json = || -> Vec<serde_json::Value> {
         result.dependencies.iter().map(entity_brief_json).collect()
     };
-    let dependents_json = || -> Vec<serde_json::Value> {
-        result.dependents.iter().map(entity_brief_json).collect()
-    };
+    let dependents_json =
+        || -> Vec<serde_json::Value> { result.dependents.iter().map(entity_brief_json).collect() };
 
     let print_deps_section = || {
         if !result.dependencies.is_empty() {
@@ -1003,9 +993,7 @@ pub fn try_cloud_context(opts: &ContextOptions) -> Option<()> {
     let file_path = opts
         .file_path
         .as_deref()
-        .map(|f| {
-            super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f)
-        })
+        .map(|f| super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f))
         .unwrap_or_default();
     let result = client
         .context(&repo_id, entity_name, &file_path, opts.budget)
@@ -1102,11 +1090,8 @@ pub fn try_cloud_entities(opts: &EntitiesOptions) -> Option<()> {
     // Subdirectory listings parse few files — local wins those (measured
     // 46ms local vs 138ms cloud). Cloud only pays off for whole-repo
     // listings of large repos, where local re-parses everything.
-    let normalized = super::normalize_repo_relative_path(
-        Path::new(&opts.cwd),
-        git.repo_root(),
-        path_arg,
-    );
+    let normalized =
+        super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), path_arg);
     if normalized != "." || known_small_repo(&remote) {
         return None;
     }
@@ -1165,9 +1150,10 @@ pub fn try_cloud_log(opts: &LogOptions) -> Option<()> {
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
     let repo_id = client.ensure_repo(&remote).ok()?;
-    let file_filter = opts.file_path.as_deref().map(|f| {
-        super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f)
-    });
+    let file_filter = opts
+        .file_path
+        .as_deref()
+        .map(|f| super::normalize_repo_relative_path(Path::new(&opts.cwd), git.repo_root(), f));
     // The server filters by file path only; pull a generous window and
     // filter to the requested entity name client-side.
     let result = client
@@ -1219,14 +1205,15 @@ pub fn try_cloud_log(opts: &LogOptions) -> Option<()> {
             .first()
             .map(|e| e.entity_type.as_str())
             .unwrap_or("");
-        let file_path = changes
-            .last()
-            .map(|e| e.file_path.as_str())
-            .unwrap_or("");
+        let file_path = changes.last().map(|e| e.file_path.as_str()).unwrap_or("");
 
         println!(
             "{}",
-            format!("┌─ {} :: {} :: {}", file_path, entity_type, opts.entity_name).bold()
+            format!(
+                "┌─ {} :: {} :: {}",
+                file_path, entity_type, opts.entity_name
+            )
+            .bold()
         );
         println!("│");
 
@@ -1236,10 +1223,7 @@ pub fn try_cloud_log(opts: &LogOptions) -> Option<()> {
             } else {
                 &entry.commit_sha
             };
-            let msg = super::truncate_str(
-                entry.commit_message.as_deref().unwrap_or(""),
-                50,
-            );
+            let msg = super::truncate_str(entry.commit_message.as_deref().unwrap_or(""), 50);
             println!(
                 "│  {}  {}  {}  {}",
                 short_sha.yellow(),
@@ -1267,7 +1251,6 @@ fn entity_brief_json(e: &CloudEntityBrief) -> serde_json::Value {
         "file": e.file_path,
     })
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -38,10 +38,7 @@ impl SemanticParserPlugin for CsvParserPlugin {
 
             let mut metadata = HashMap::new();
             for (j, header) in headers.iter().enumerate() {
-                metadata.insert(
-                    header.clone(),
-                    cells.get(j).cloned().unwrap_or_default(),
-                );
+                metadata.insert(header.clone(), cells.get(j).cloned().unwrap_or_default());
             }
 
             entities.push(SemanticEntity {
