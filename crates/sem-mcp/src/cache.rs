@@ -10,7 +10,7 @@ use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_core::parser::js_ts_import_source_files_from_content;
 use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 5;
+pub const CACHE_SCHEMA_VERSION: i32 = 6;
 pub const CACHE_KIND_FULL: &str = "full";
 pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
@@ -52,7 +52,16 @@ pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
 pub const CACHE_MANIFEST_FILES: &[(&str, &str)] = &[
     (".semrc", "\0sem-manifest:.semrc"),
     (".gitattributes", "\0sem-manifest:.gitattributes"),
+    (".semignore", "\0sem-manifest:.semignore"),
 ];
+pub const CACHE_SOURCE_SCOPE_KEY: &str = "source_scope";
+pub const CACHE_SOURCE_SCOPE_DEFAULT: &str = "default";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheSourceScope {
+    Default,
+    Custom,
+}
 
 const CACHE_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS files (
@@ -134,6 +143,42 @@ pub fn set_cache_kind(tx: &Transaction<'_>, kind: &str) -> Result<(), rusqlite::
         params![kind],
     )?;
     Ok(())
+}
+
+pub fn set_cache_source_scope(
+    tx: &Transaction<'_>,
+    source_scope: CacheSourceScope,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM cache_metadata WHERE key = ?1",
+        params![CACHE_SOURCE_SCOPE_KEY],
+    )?;
+    if matches!(source_scope, CacheSourceScope::Default) {
+        tx.execute(
+            "INSERT INTO cache_metadata (key, value) VALUES (?1, ?2)",
+            params![CACHE_SOURCE_SCOPE_KEY, CACHE_SOURCE_SCOPE_DEFAULT],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn cache_has_default_source_scope(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM cache_metadata WHERE key = ?1",
+        params![CACHE_SOURCE_SCOPE_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .as_deref()
+        == Some(CACHE_SOURCE_SCOPE_DEFAULT)
+}
+
+pub fn cache_has_source_scope(conn: &Connection, source_scope: CacheSourceScope) -> bool {
+    let is_default = cache_has_default_source_scope(conn);
+    match source_scope {
+        CacheSourceScope::Default => is_default,
+        CacheSourceScope::Custom => !is_default,
+    }
 }
 
 pub fn cache_has_kind(conn: &Connection, accepted: &[&str]) -> bool {
@@ -672,6 +717,7 @@ impl DiskCache {
         files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -737,6 +783,7 @@ impl DiskCache {
         }
 
         set_cache_kind(&tx, CACHE_KIND_FULL)?;
+        set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
     }
@@ -747,7 +794,20 @@ impl DiskCache {
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        self.load_with_source_scope(root, files, CacheSourceScope::Default)
+    }
+
+    pub fn load_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: CacheSourceScope,
+    ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
         if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL]) {
+            return None;
+        }
+
+        if !cache_has_source_scope(&self.conn, source_scope) {
             return None;
         }
 
@@ -875,7 +935,20 @@ impl DiskCache {
 
     /// Load only graph topology from a fresh cache.
     pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
+        self.load_graph_topology_with_source_scope(root, files, CacheSourceScope::Default)
+    }
+
+    pub fn load_graph_topology_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: CacheSourceScope,
+    ) -> Option<EntityGraph> {
         if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL, CACHE_KIND_TOPOLOGY]) {
+            return None;
+        }
+
+        if !cache_has_source_scope(&self.conn, source_scope) {
             return None;
         }
 
@@ -995,7 +1068,20 @@ impl DiskCache {
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        self.load_partial_with_source_scope(root, files, CacheSourceScope::Default)
+    }
+
+    pub fn load_partial_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: CacheSourceScope,
+    ) -> Option<PartialCache> {
         if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL]) {
+            return None;
+        }
+
+        if !cache_has_source_scope(&self.conn, source_scope) {
             return None;
         }
 
@@ -1176,6 +1262,7 @@ impl DiskCache {
         stale_files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         self.save_incremental_with_repair_metadata(
             root,
@@ -1186,6 +1273,7 @@ impl DiskCache {
             false,
             &[],
             &[],
+            source_scope,
         )
     }
 
@@ -1200,6 +1288,7 @@ impl DiskCache {
         repair_changed_clean_entity_ids: bool,
         recomputed_edge_source_ids: &[String],
         deleted_entity_ids: &[String],
+        source_scope: CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let source_stale_files: Vec<&String> = stale_files
             .iter()
@@ -1406,6 +1495,7 @@ impl DiskCache {
         }
 
         set_cache_kind(&tx, CACHE_KIND_FULL)?;
+        set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
     }
@@ -1563,7 +1653,9 @@ mod tests {
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
         let cache = DiskCache::open(root).unwrap();
-        cache.save(root, files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(root, files, &empty_graph(), &[], CacheSourceScope::Default)
+            .unwrap();
         assert!(cache.load(root, files).is_some());
         cache
     }
@@ -1634,7 +1726,15 @@ mod tests {
         );
         let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
         let cache = DiskCache::open(&root).unwrap();
-        cache.save(&root, &files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
 
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
 
@@ -1666,6 +1766,7 @@ mod tests {
                 false,
                 &[],
                 &[],
+                CacheSourceScope::Default,
             )
             .unwrap();
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 0);
@@ -1687,6 +1788,69 @@ mod tests {
         }
 
         panic!("mtime did not change for {}", path.display());
+    }
+
+    #[test]
+    fn cache_reuse_requires_matching_source_scope_and_incremental_preserves_it() {
+        let root = temp_repo_root("source-scope-cache-reuse");
+        write_file(&root.join("a.ts"), "export function a() { return 1; }\n");
+        write_file(&root.join("b.ts"), "export function b() { return a(); }\n");
+        let files = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return a(); }"),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save(&root, &files, &graph, &entities, CacheSourceScope::Custom)
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Custom)
+            .is_some());
+        assert!(cache
+            .load_partial_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .is_none());
+
+        rewrite_after_mtime_tick(&root.join("b.ts"), "export function b() { return 2; }\n");
+        let partial = cache
+            .load_partial_with_source_scope(&root, &files, CacheSourceScope::Custom)
+            .unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+
+        let updated_entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return 2; }"),
+        ];
+        let updated_graph = graph_with_edges(&updated_entities, vec![]);
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &partial.stale_files,
+                &updated_graph,
+                &updated_entities,
+                false,
+                &["b-id".to_string()],
+                &[],
+                CacheSourceScope::Custom,
+            )
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Custom)
+            .is_some());
+
+        drop(cache);
+        cleanup(root);
     }
 
     fn read_user_version(cache: &DiskCache) -> i32 {
@@ -1949,6 +2113,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-id", "clean.rs", "clean", "clean old"),
                 ],
+                CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -1963,6 +2128,7 @@ mod tests {
                 &["stale.rs".to_string()],
                 &empty_graph(),
                 &entities,
+                CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2007,7 +2173,13 @@ mod tests {
             ],
         );
         cache
-            .save(&root, &files, &initial_graph, &entities)
+            .save(
+                &root,
+                &files,
+                &initial_graph,
+                &entities,
+                CacheSourceScope::Default,
+            )
             .unwrap();
 
         let updated_entities = vec![
@@ -2030,6 +2202,7 @@ mod tests {
                 &["stale.rs".to_string()],
                 &updated_graph,
                 &updated_entities,
+                CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2061,6 +2234,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-old-id", "clean.rs", "clean", "clean old"),
                 ],
+                CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -2078,6 +2252,7 @@ mod tests {
                 true,
                 &[],
                 &[],
+                CacheSourceScope::Default,
             )
             .unwrap();
 

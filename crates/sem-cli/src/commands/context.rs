@@ -29,6 +29,8 @@ pub fn context_command(opts: ContextOptions) {
     let root = root.as_path();
     let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let source_scope =
+        super::graph::cache_source_scope(root, &ext_filter, opts.no_default_excludes);
 
     let file_paths = super::graph::find_supported_files_with_options(
         root,
@@ -37,7 +39,8 @@ pub fn context_command(opts: ContextOptions) {
         opts.no_default_excludes,
     );
     let prog = crate::progress::Progress::start("Building entity graph");
-    let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
+    let (graph, all_entities) =
+        super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache, source_scope);
     prog.done(&format!(
         "{} entities, {} files",
         super::graph::fmt_count(graph.entities.len()),
@@ -86,7 +89,10 @@ pub fn context_command(opts: ContextOptions) {
         );
 
         if context_result.target_omitted {
-            println!("  {}", "target omitted: signature exceeds token budget".dimmed());
+            println!(
+                "  {}",
+                "target omitted: signature exceeds token budget".dimmed()
+            );
         }
 
         let mut current_role = String::new();
@@ -143,7 +149,10 @@ fn find_entity<'a>(
     }
 
     let name = name.unwrap_or_else(|| {
-        eprintln!("{} Either entity name or --entity-id is required", "error:".red().bold());
+        eprintln!(
+            "{} Either entity name or --entity-id is required",
+            "error:".red().bold()
+        );
         std::process::exit(1);
     });
 
@@ -159,12 +168,21 @@ fn find_entity<'a>(
     }
 
     if let Some(file) = file_hint {
-        let filtered: Vec<_> = matching.iter().filter(|e| e.file_path == file).copied().collect();
+        let filtered: Vec<_> = matching
+            .iter()
+            .filter(|e| e.file_path == file)
+            .copied()
+            .collect();
         if filtered.len() == 1 {
             return filtered[0];
         }
         if filtered.is_empty() {
-            eprintln!("{} Entity '{}' not found in file '{}'", "error:".red().bold(), name, file);
+            eprintln!(
+                "{} Entity '{}' not found in file '{}'",
+                "error:".red().bold(),
+                name,
+                file
+            );
             std::process::exit(1);
         }
         matching = filtered;
@@ -175,7 +193,12 @@ fn find_entity<'a>(
     }
 
     matching.sort_by_key(|e| (&e.file_path, e.start_line));
-    eprintln!("{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:", "error:".red().bold(), name, matching.len());
+    eprintln!(
+        "{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:",
+        "error:".red().bold(),
+        name,
+        matching.len()
+    );
     for m in &matching {
         eprintln!(
             "  {} {} ({}:L{})",
