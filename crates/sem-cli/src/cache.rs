@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
 use sem_core::parser::{
@@ -11,6 +11,7 @@ use sem_core::parser::{
 };
 use sem_core::utils::scan::is_default_excluded;
 use sem_mcp::cache as shared_cache;
+use serde::Serialize;
 
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 const SQL_PARAM_CHUNK: usize = 500;
@@ -46,6 +47,18 @@ pub struct CachedImpactResult {
     pub tests_truncated: bool,
 }
 
+#[derive(Serialize)]
+struct EntityListingJsonRow<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    entity_type: &'a str,
+    start_line: usize,
+    end_line: usize,
+    parent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<&'a str>,
+}
+
 #[derive(Debug)]
 pub enum CachedImpactError {
     CacheReadFailed,
@@ -72,6 +85,17 @@ impl DiskCache {
 
         shared_cache::initialize_schema(&conn)?;
 
+        Ok(Self { conn })
+    }
+
+    pub fn open_existing_readonly(repo_root: &Path) -> Result<Self, rusqlite::Error> {
+        let db_path = shared_cache::cache_db_path(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        if !db_path.exists() {
+            return Err(rusqlite::Error::InvalidPath(db_path));
+        }
+
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self { conn })
     }
 
@@ -1095,6 +1119,135 @@ impl DiskCache {
         Ok(true)
     }
 
+    pub fn query_entities_listing(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Result<Option<Vec<EntityInfo>>, rusqlite::Error> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        if files.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut entities = Vec::new();
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(String::as_str)),
+                entity_info_from_row,
+            )?;
+            entities.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        sort_entity_infos(&mut entities);
+        Ok(Some(entities))
+    }
+
+    fn has_fresh_topology_cache_for_files(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
+            return false;
+        }
+
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
+            return false;
+        }
+
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return false;
+        }
+
+        self.cached_files_are_fresh(
+            root,
+            files
+                .iter()
+                .filter(|file| !shared_cache::is_manifest_file_name(file))
+                .cloned()
+                .collect(),
+        )
+        .unwrap_or(false)
+    }
+
+    pub fn write_entities_listing_json<W: Write>(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+        include_file: bool,
+        writer: &mut W,
+    ) -> std::io::Result<Option<u64>> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        writer.write_all(b"[")?;
+        let mut first = true;
+        let mut count = 0u64;
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(sql_io_error)?;
+            let mut rows = stmt
+                .query(params_from_iter(chunk.iter().map(String::as_str)))
+                .map_err(sql_io_error)?;
+            while let Some(row) = rows.next().map_err(sql_io_error)? {
+                if first {
+                    first = false;
+                } else {
+                    writer.write_all(b",")?;
+                }
+
+                let name: String = row.get(0).map_err(sql_io_error)?;
+                let entity_type: String = row.get(1).map_err(sql_io_error)?;
+                let file_path: String = row.get(2).map_err(sql_io_error)?;
+                let start_line = row.get::<_, i64>(3).map_err(sql_io_error)? as usize;
+                let end_line = row.get::<_, i64>(4).map_err(sql_io_error)? as usize;
+                let parent_id: Option<String> = row.get(5).map_err(sql_io_error)?;
+                let listing = EntityListingJsonRow {
+                    name: &name,
+                    entity_type: &entity_type,
+                    start_line,
+                    end_line,
+                    parent_id: parent_id.as_deref(),
+                    file: include_file.then_some(file_path.as_str()),
+                };
+                serde_json::to_writer(&mut *writer, &listing).map_err(json_io_error)?;
+                count += 1;
+            }
+        }
+        writer.write_all(b"]\n")?;
+
+        Ok(Some(count))
+    }
+
     fn has_fresh_complete_cache(
         &self,
         root: &Path,
@@ -1678,6 +1831,17 @@ fn entity_info_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityInfo>
         end_line: row.get::<_, i64>(5)? as usize,
         parent_id: row.get(6)?,
     })
+}
+
+fn sort_entity_infos(entities: &mut [EntityInfo]) {
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.entity_type.cmp(&b.entity_type))
+            .then(a.name.cmp(&b.name))
+    });
 }
 
 fn repeat_vars(len: usize) -> String {
@@ -3072,6 +3236,18 @@ mod tests {
         assert!(!root.join(".sem").exists());
 
         drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_existing_readonly_does_not_create_missing_cache() {
+        let root = temp_repo_root("readonly-missing");
+        let db_path = shared_cache::cache_db_path(&root).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(DiskCache::open_existing_readonly(&root).is_err());
+        assert!(!db_path.exists());
+
         cleanup(root);
     }
 

@@ -1,10 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::timings::Timings;
+use crate::{cache::DiskCache, timings::Timings};
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
+use sem_core::parser::graph::EntityInfo;
 use sem_core::parser::registry::ParserRegistry;
+use serde::Serialize;
 
 pub struct EntitiesOptions {
     pub cwd: String,
@@ -84,8 +87,37 @@ pub fn entities_command(opts: EntitiesOptions) {
             discovered_file_count += file_paths.len();
             processed_file_count += file_paths.len();
             timings.mark("file_discovery");
-            entities.extend(extract_files_entities(root, &file_paths, &registry));
-            extracted_entities = true;
+            if opts.json
+                && path_args.len() == 1
+                && try_write_cached_entities_json(
+                    root,
+                    &file_paths,
+                    &ext_filter,
+                    opts.no_default_excludes,
+                    &mut timings,
+                )
+            {
+                timings.counter("input_files", processed_file_count as u64);
+                timings.counter("input_file_args", file_arg_count as u64);
+                timings.counter("input_dirs", dir_count as u64);
+                timings.counter("processed_files", processed_file_count as u64);
+                timings.counter("discovered_files", discovered_file_count as u64);
+                timings.mark("output_serialization");
+                timings.finish();
+                return;
+            }
+            if let Some(cached_entities) = try_cached_entities(
+                root,
+                &file_paths,
+                &ext_filter,
+                opts.no_default_excludes,
+                &mut timings,
+            ) {
+                entities.extend(cached_entities);
+            } else {
+                entities.extend(extract_files_entities(root, &file_paths, &registry));
+                extracted_entities = true;
+            }
         } else {
             eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
             std::process::exit(1);
@@ -127,13 +159,11 @@ pub fn entities_command(opts: EntitiesOptions) {
     timings.counter("entities", entities.len() as u64);
 
     if opts.json {
-        let output: Vec<_> = entities
-            .iter()
-            .map(|e| entity_json(e, include_file))
-            .collect();
-        let serialized = serde_json::to_string(&output).unwrap();
-        timings.counter("json_bytes", serialized.len() as u64);
-        println!("{serialized}");
+        let json_bytes = write_entities_json(&entities, include_file).unwrap_or_else(|e| {
+            eprintln!("{} Cannot write JSON output: {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        });
+        timings.counter("json_bytes", json_bytes);
     } else if should_group_by_file(&entities) {
         print_grouped_entities(&display_label, &entities);
     } else if let Some(file_path) = entities.first().map(|e| e.file_path.as_str()) {
@@ -167,7 +197,103 @@ fn extract_files_entities(
     file_paths: &[String],
     registry: &ParserRegistry,
 ) -> Vec<SemanticEntity> {
-    registry.extract_all_entities(root, file_paths)
+    registry.extract_all_entities_brief(root, file_paths)
+}
+
+fn try_cached_entities(
+    root: &Path,
+    file_paths: &[String],
+    ext_filter: &[String],
+    no_default_excludes: bool,
+    timings: &mut Timings,
+) -> Option<Vec<SemanticEntity>> {
+    let source_scope = super::graph::cache_source_scope(root, ext_filter, no_default_excludes);
+    let cache = match DiskCache::open_existing_readonly(root) {
+        Ok(cache) => {
+            timings.mark("cache_open");
+            cache
+        }
+        Err(_) => {
+            timings.mark("cache_open_failed");
+            return None;
+        }
+    };
+
+    match cache.query_entities_listing(root, file_paths, source_scope) {
+        Ok(Some(entities)) => {
+            timings.counter("cached_entities", entities.len() as u64);
+            timings.mark("cache_entities_query");
+            Some(entities.into_iter().map(entity_info_to_entity).collect())
+        }
+        Ok(None) => {
+            timings.mark("cache_entities_miss");
+            None
+        }
+        Err(_) => {
+            timings.mark("cache_entities_query_failed");
+            None
+        }
+    }
+}
+
+fn try_write_cached_entities_json(
+    root: &Path,
+    file_paths: &[String],
+    ext_filter: &[String],
+    no_default_excludes: bool,
+    timings: &mut Timings,
+) -> bool {
+    let source_scope = super::graph::cache_source_scope(root, ext_filter, no_default_excludes);
+    let cache = match DiskCache::open_existing_readonly(root) {
+        Ok(cache) => {
+            timings.mark("cache_open");
+            cache
+        }
+        Err(_) => {
+            timings.mark("cache_open_failed");
+            return false;
+        }
+    };
+
+    let stdout = io::stdout();
+    let mut writer = CountingWriter::new(stdout.lock());
+    match cache.write_entities_listing_json(root, file_paths, source_scope, true, &mut writer) {
+        Ok(Some(entity_count)) => {
+            timings.counter("cached_entities", entity_count);
+            timings.counter("entities", entity_count);
+            timings.counter("json_bytes", writer.bytes());
+            timings.mark("cache_entities_query");
+            true
+        }
+        Ok(None) => {
+            timings.mark("cache_entities_miss");
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "{} Cannot write cached JSON output: {}",
+                "error:".red().bold(),
+                error
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
+    SemanticEntity {
+        id: entity.id,
+        file_path: entity.file_path,
+        entity_type: entity.entity_type,
+        name: entity.name,
+        parent_id: entity.parent_id,
+        content: String::new(),
+        content_hash: String::new(),
+        structural_hash: None,
+        start_line: entity.start_line,
+        end_line: entity.end_line,
+        metadata: None,
+    }
 }
 
 fn file_path_for_entity(root: &Path, path: &Path) -> String {
@@ -180,23 +306,69 @@ fn extract_file_entities(
     file_path: &str,
 ) -> Result<Vec<SemanticEntity>, std::io::Error> {
     let content = std::fs::read_to_string(&full_path)?;
-    Ok(registry.extract_entities(file_path, &content))
+    Ok(registry.extract_entities_brief(file_path, &content))
 }
 
-fn entity_json(entity: &SemanticEntity, include_file: bool) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "name": entity.name,
-        "type": entity.entity_type,
-        "start_line": entity.start_line,
-        "end_line": entity.end_line,
-        "parent_id": entity.parent_id,
-    });
+#[derive(Serialize)]
+struct EntityJsonRow<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    entity_type: &'a str,
+    start_line: usize,
+    end_line: usize,
+    parent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<&'a str>,
+}
 
-    if include_file {
-        value["file"] = serde_json::json!(entity.file_path);
+fn write_entities_json(entities: &[SemanticEntity], include_file: bool) -> io::Result<u64> {
+    let stdout = io::stdout();
+    let mut writer = CountingWriter::new(stdout.lock());
+    writer.write_all(b"[")?;
+    for (index, entity) in entities.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        let row = EntityJsonRow {
+            name: &entity.name,
+            entity_type: &entity.entity_type,
+            start_line: entity.start_line,
+            end_line: entity.end_line,
+            parent_id: entity.parent_id.as_deref(),
+            file: include_file.then_some(entity.file_path.as_str()),
+        };
+        serde_json::to_writer(&mut writer, &row)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    }
+    writer.write_all(b"]\n")?;
+    Ok(writer.bytes())
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, bytes: 0 }
     }
 
-    value
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn print_file_entities(file_path: &str, entities: &[SemanticEntity]) {
