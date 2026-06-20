@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::Path};
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
 use sem_core::parser::graph::{EntityGraph, EntityInfo};
+use sem_mcp::cache::CacheSourceScope;
 
 use crate::cache::{CachedImpactError, CachedImpactMode, CachedImpactResult, DiskCache};
 use crate::timings::Timings;
@@ -62,6 +63,41 @@ pub fn impact_command(opts: ImpactOptions) {
     let registry = super::create_registry(&root.to_string_lossy());
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let source_scope =
+        super::graph::cache_source_scope(root, &ext_filter, opts.no_default_excludes);
+    let file_hint = opts
+        .file_hint
+        .as_deref()
+        .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+    let cache_first_entity_scope = opts.entity_id.is_some() || file_hint.is_some();
+
+    if !opts.no_cache
+        && matches!(opts.mode, ImpactMode::Deps)
+        && matches!(source_scope, CacheSourceScope::Default)
+        && cache_first_entity_scope
+    {
+        match DiskCache::open(root) {
+            Ok(disk) => {
+                timings.mark("cache_open");
+                if try_cached_impact_query(
+                    &disk,
+                    root,
+                    &[],
+                    &opts,
+                    file_hint.as_deref(),
+                    source_scope,
+                    true,
+                    &mut timings,
+                ) {
+                    return;
+                }
+            }
+            Err(_) => {
+                timings.mark("cache_open_failed");
+            }
+        }
+    }
+
     let file_paths = super::graph::find_supported_files_with_options(
         root,
         &registry,
@@ -70,38 +106,21 @@ pub fn impact_command(opts: ImpactOptions) {
     );
     timings.mark("file_discovery");
 
-    let file_hint = opts
-        .file_hint
-        .as_deref()
-        .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
-
     if !opts.no_cache {
         match DiskCache::open(root) {
             Ok(disk) => {
                 timings.mark("cache_open");
-                match disk.query_impact_topology(
+                if try_cached_impact_query(
+                    &disk,
                     root,
                     &file_paths,
-                    opts.entity_name.as_deref(),
-                    opts.entity_id.as_deref(),
+                    &opts,
                     file_hint.as_deref(),
-                    cached_mode_for(opts.mode),
-                    opts.depth,
+                    source_scope,
+                    false,
+                    &mut timings,
                 ) {
-                    Ok(Some(result)) => {
-                        timings.mark("cache_topology_impact_query");
-                        print_cached_result(&result, opts.mode, opts.json, opts.depth);
-                        timings.mark("cli_output_serialization");
-                        timings.finish();
-                        return;
-                    }
-                    Ok(None) => {
-                        timings.mark("cache_topology_impact_miss");
-                    }
-                    Err(CachedImpactError::CacheReadFailed) => {
-                        timings.mark("cache_topology_impact_query_failed");
-                    }
-                    Err(err) => print_cached_error(err),
+                    return;
                 }
             }
             Err(_) => {
@@ -124,6 +143,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                             move |entity| {
                                 if let Some(id) = entity_id.as_deref() {
@@ -147,6 +167,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     }
@@ -173,6 +194,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     } else {
@@ -181,6 +203,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     }
@@ -207,6 +230,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     },
@@ -280,6 +304,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     },
@@ -315,6 +340,46 @@ pub fn impact_command(opts: ImpactOptions) {
         }
     }
     timings.finish();
+}
+
+fn try_cached_impact_query(
+    disk: &DiskCache,
+    root: &Path,
+    file_paths: &[String],
+    opts: &ImpactOptions,
+    file_hint: Option<&str>,
+    source_scope: CacheSourceScope,
+    cache_first: bool,
+    timings: &mut Timings,
+) -> bool {
+    match disk.query_impact_topology(
+        root,
+        file_paths,
+        source_scope,
+        cache_first,
+        opts.entity_name.as_deref(),
+        opts.entity_id.as_deref(),
+        file_hint,
+        cached_mode_for(opts.mode),
+        opts.depth,
+    ) {
+        Ok(Some(result)) => {
+            timings.mark("cache_topology_impact_query");
+            print_cached_result(&result, opts.mode, opts.json, opts.depth);
+            timings.mark("cli_output_serialization");
+            timings.finish();
+            true
+        }
+        Ok(None) => {
+            timings.mark("cache_topology_impact_miss");
+            false
+        }
+        Err(CachedImpactError::CacheReadFailed) => {
+            timings.mark("cache_topology_impact_query_failed");
+            false
+        }
+        Err(err) => print_cached_error(err),
+    }
 }
 
 fn cached_mode_for(mode: ImpactMode) -> CachedImpactMode {
