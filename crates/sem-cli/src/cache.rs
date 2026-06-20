@@ -11,6 +11,7 @@ use sem_core::parser::{
 };
 use sem_core::utils::scan::is_default_excluded;
 use sem_mcp::cache as shared_cache;
+use serde::Serialize;
 
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 const SQL_PARAM_CHUNK: usize = 500;
@@ -44,6 +45,18 @@ pub struct CachedImpactResult {
     pub impact: Vec<(EntityInfo, usize)>,
     pub tests: Vec<EntityInfo>,
     pub tests_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct EntityListingJsonRow<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    entity_type: &'a str,
+    start_line: usize,
+    end_line: usize,
+    parent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -1173,6 +1186,66 @@ impl DiskCache {
                 .collect(),
         )
         .unwrap_or(false)
+    }
+
+    pub fn write_entities_listing_json<W: Write>(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+        include_file: bool,
+        writer: &mut W,
+    ) -> std::io::Result<Option<u64>> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        writer.write_all(b"[")?;
+        let mut first = true;
+        let mut count = 0u64;
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(sql_io_error)?;
+            let mut rows = stmt
+                .query(params_from_iter(chunk.iter().map(String::as_str)))
+                .map_err(sql_io_error)?;
+            while let Some(row) = rows.next().map_err(sql_io_error)? {
+                if first {
+                    first = false;
+                } else {
+                    writer.write_all(b",")?;
+                }
+
+                let name: String = row.get(0).map_err(sql_io_error)?;
+                let entity_type: String = row.get(1).map_err(sql_io_error)?;
+                let file_path: String = row.get(2).map_err(sql_io_error)?;
+                let start_line = row.get::<_, i64>(3).map_err(sql_io_error)? as usize;
+                let end_line = row.get::<_, i64>(4).map_err(sql_io_error)? as usize;
+                let parent_id: Option<String> = row.get(5).map_err(sql_io_error)?;
+                let listing = EntityListingJsonRow {
+                    name: &name,
+                    entity_type: &entity_type,
+                    start_line,
+                    end_line,
+                    parent_id: parent_id.as_deref(),
+                    file: include_file.then_some(file_path.as_str()),
+                };
+                serde_json::to_writer(&mut *writer, &listing).map_err(json_io_error)?;
+                count += 1;
+            }
+        }
+        writer.write_all(b"]\n")?;
+
+        Ok(Some(count))
     }
 
     fn has_fresh_complete_cache(

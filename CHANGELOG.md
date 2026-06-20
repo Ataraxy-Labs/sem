@@ -16,6 +16,8 @@ All notable changes to sem are documented in this file.
 - Source scans skip default-excluded high-volume paths such as generated source directories, fixture/vendor/benchmark trees, generated file suffixes, CSS module declarations, and asset declarations; pass `--no-default-excludes` to include them.
 - `sem entities` accepts `--file-exts` for large directory scans and avoids duplicate directory-listing post-processing.
 - `sem entities` can list entities from a fresh SQLite topology cache instead of reparsing matching directory scans.
+- `sem entities --json` streams rows to stdout instead of materializing an intermediate JSON value array.
+- `sem entities` uses listing-only extraction so local listings do not retain source text or entity hashes.
 
 ## [0.13.0] - 2026-06-16
 
