@@ -157,7 +157,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -183,7 +183,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -241,9 +241,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
+
+        /// Only include files with these extensions (e.g. --file-exts .ts .tsx)
+        #[arg(long, num_args = 1..)]
+        file_exts: Vec<String>,
     },
     /// Show token-budgeted context for an entity
     Context {
@@ -279,7 +283,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -528,6 +532,7 @@ fn main() {
             format,
             json,
             no_default_excludes,
+            file_exts,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -537,6 +542,7 @@ fn main() {
                 paths,
                 json: resolve_json(format, json),
                 no_default_excludes,
+                file_exts,
             });
         }
         Some(Commands::Context {

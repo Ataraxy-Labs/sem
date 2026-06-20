@@ -12,8 +12,13 @@ const DEFAULT_EXCLUDED_FILES: &[&str] = &[
     "flake.lock",
 ];
 
-/// Directory names that are excluded wherever they appear in repo-wide scans.
+/// Directory names excluded wherever they appear in repo-wide scans.
+/// This list includes generated artifacts and high-volume support trees that are
+/// usually not useful for entity lookup or impact analysis by default.
 const DEFAULT_EXCLUDED_ANY_DIRS: &[&str] = &[
+    "__generated__",
+    "_generated",
+    "generated",
     "fixtures",
     "fixture",
     "benchmarks",
@@ -30,7 +35,40 @@ const DEFAULT_EXCLUDED_ANY_DIRS: &[&str] = &[
 const DEFAULT_EXCLUDED_ROOT_DIRS: &[&str] = &["out", "dist", "build", "target"];
 
 /// File suffixes for generated text assets that do not produce useful entities.
-const DEFAULT_EXCLUDED_SUFFIXES: &[&str] = &[".min.js", ".min.css"];
+const DEFAULT_EXCLUDED_SUFFIXES: &[&str] = &[
+    ".min.js",
+    ".min.css",
+    ".generated.ts",
+    ".generated.tsx",
+    ".generated.js",
+    ".generated.jsx",
+    ".generated.mts",
+    ".generated.cts",
+    ".generated.mjs",
+    ".generated.cjs",
+    ".generated.d.ts",
+    ".gen.ts",
+    ".gen.tsx",
+    ".gen.js",
+    ".gen.jsx",
+    ".gen.mts",
+    ".gen.cts",
+    ".gen.mjs",
+    ".gen.cjs",
+    ".gen.d.ts",
+    ".module.css.d.ts",
+    ".module.scss.d.ts",
+    ".module.sass.d.ts",
+    ".module.less.d.ts",
+    ".svg.d.ts",
+    ".png.d.ts",
+    ".jpg.d.ts",
+    ".jpeg.d.ts",
+    ".webp.d.ts",
+    ".gif.d.ts",
+    ".avif.d.ts",
+    ".ico.d.ts",
+];
 
 /// File suffixes that are not useful source text for semantic extraction.
 const BINARY_FILE_SUFFIXES: &[&str] = &[
@@ -171,14 +209,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_excludes_generated_and_build_paths() {
+    fn default_excludes_generated_support_and_build_paths() {
         assert!(is_default_excluded("dist/app.js"));
         assert!(is_default_excluded("site/out/_next/static/chunks/app.js"));
         assert!(is_default_excluded("src/generated.min.js"));
+        assert!(is_default_excluded("src/__generated__/client.ts"));
+        assert!(is_default_excluded("src/_generated/tokens.ts"));
+        assert!(is_default_excluded("src/generated/schema.ts"));
+        assert!(is_default_excluded("src/api.generated.ts"));
+        assert!(is_default_excluded("src/api.generated.d.ts"));
+        assert!(is_default_excluded(
+            "src/components/Button.module.scss.d.ts"
+        ));
+        assert!(is_default_excluded("src/icons/logo.svg.d.ts"));
+        assert!(is_default_excluded("src/fixtures/example.ts"));
+        assert!(is_default_excluded("src/fixture/example.ts"));
+        assert!(is_default_excluded("packages/app/benchmarks/run.ts"));
+        assert!(is_default_excluded("packages/app/vendor/client.ts"));
+        assert!(is_default_excluded("tools/test-harness/main.ts"));
         assert!(is_default_excluded("target/debug/build.rs"));
         assert!(!is_default_excluded("src/app.js"));
+        assert!(!is_default_excluded("src/generated_value.ts"));
         assert!(!is_default_excluded("src/build/mod.rs"));
         assert!(!is_default_excluded("packages/compiler/build/index.ts"));
+        assert!(!is_default_excluded("src/cli/commands/codegen/run.ts"));
         assert!(!is_default_excluded("tools/dist/analyzer.py"));
     }
 
