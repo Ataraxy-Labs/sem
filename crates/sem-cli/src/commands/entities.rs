@@ -197,7 +197,7 @@ fn extract_files_entities(
     file_paths: &[String],
     registry: &ParserRegistry,
 ) -> Vec<SemanticEntity> {
-    registry.extract_all_entities(root, file_paths)
+    registry.extract_all_entities_brief(root, file_paths)
 }
 
 fn try_cached_entities(
@@ -306,7 +306,7 @@ fn extract_file_entities(
     file_path: &str,
 ) -> Result<Vec<SemanticEntity>, std::io::Error> {
     let content = std::fs::read_to_string(&full_path)?;
-    Ok(registry.extract_entities(file_path, &content))
+    Ok(registry.extract_entities_brief(file_path, &content))
 }
 
 #[derive(Serialize)]
