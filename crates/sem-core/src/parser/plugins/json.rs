@@ -14,17 +14,32 @@ impl SemanticParserPlugin for JsonParserPlugin {
     }
 
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Full)
+    }
+
+    fn extract_entities_brief(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Brief)
+    }
+}
+
+impl JsonParserPlugin {
+    fn extract_entities_with_payload(
+        &self,
+        content: &str,
+        file_path: &str,
+        payload_mode: EntityPayloadMode,
+    ) -> Vec<SemanticEntity> {
         let trimmed = content.trim_start();
         if trimmed.starts_with('{') {
-            return extract_entries(content, file_path, JsonContainerKind::Object);
+            return extract_entries(content, file_path, JsonContainerKind::Object, payload_mode);
         }
         if trimmed.starts_with('[') {
-            return extract_entries(content, file_path, JsonContainerKind::Array);
+            return extract_entries(content, file_path, JsonContainerKind::Array, payload_mode);
         }
         if trimmed.is_empty() {
             return Vec::new();
         }
-        vec![document_chunk_entity(content, file_path)]
+        vec![document_chunk_entity(content, file_path, payload_mode)]
     }
 }
 
@@ -32,6 +47,12 @@ impl SemanticParserPlugin for JsonParserPlugin {
 enum JsonContainerKind {
     Object,
     Array,
+}
+
+#[derive(Clone, Copy)]
+enum EntityPayloadMode {
+    Full,
+    Brief,
 }
 
 struct Frame {
@@ -52,6 +73,7 @@ fn extract_entries(
     content: &str,
     file_path: &str,
     container_kind: JsonContainerKind,
+    payload_mode: EntityPayloadMode,
 ) -> Vec<SemanticEntity> {
     let mut entities = Vec::new();
     let root_entries = match container_kind {
@@ -117,6 +139,14 @@ fn extract_entries(
             let entity_id = format!("{}::{}", file_path, pointer);
             let abs_start = frame.line_offset + entry.start_line - 1;
             let abs_end = frame.line_offset + end_line - 1;
+            let (stored_content, content_hash_value, structural_hash_value) = match payload_mode {
+                EntityPayloadMode::Full => (
+                    entity_content.clone(),
+                    content_hash(&entity_content),
+                    Some(content_hash(value_content)),
+                ),
+                EntityPayloadMode::Brief => (String::new(), String::new(), None),
+            };
 
             entities.push(SemanticEntity {
                 id: entity_id.clone(),
@@ -124,9 +154,9 @@ fn extract_entries(
                 entity_type: entry.entity_type.clone(),
                 name: entry.key.clone(),
                 parent_id: frame.parent_entity_id.clone(),
-                content_hash: content_hash(&entity_content),
-                structural_hash: Some(content_hash(value_content)),
-                content: entity_content.clone(),
+                content_hash: content_hash_value,
+                structural_hash: structural_hash_value,
+                content: stored_content,
                 start_line: abs_start,
                 end_line: abs_end,
                 metadata: None,
@@ -155,17 +185,25 @@ fn extract_entries(
     entities
 }
 
-fn document_chunk_entity(content: &str, file_path: &str) -> SemanticEntity {
+fn document_chunk_entity(
+    content: &str,
+    file_path: &str,
+    payload_mode: EntityPayloadMode,
+) -> SemanticEntity {
     let line_count = content.lines().count().max(1);
+    let (stored_content, content_hash_value) = match payload_mode {
+        EntityPayloadMode::Full => (content.to_string(), content_hash(content)),
+        EntityPayloadMode::Brief => (String::new(), String::new()),
+    };
     SemanticEntity {
         id: build_entity_id(file_path, "chunk", "(document)", None),
         file_path: file_path.to_string(),
         entity_type: "chunk".to_string(),
         name: "(document)".to_string(),
         parent_id: None,
-        content_hash: content_hash(content),
+        content_hash: content_hash_value,
         structural_hash: None,
-        content: content.to_string(),
+        content: stored_content,
         start_line: 1,
         end_line: line_count,
         metadata: None,
@@ -624,6 +662,24 @@ mod tests {
     fn find_change<'a>(changes: &'a [SemanticChange], name: &str, kind: ChangeType) -> &'a SemanticChange {
         changes.iter().find(|c| c.entity_name == name && c.change_type == kind)
             .unwrap_or_else(|| panic!("expected {:?} {} in changes; got: {:?}", kind, name, names(changes)))
+    }
+
+    #[test]
+    fn brief_extraction_drops_json_payloads() {
+        let content = r#"{
+  "scripts": {
+    "build": "tsc"
+  }
+}
+"#;
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities_brief(content, "package.json");
+
+        assert!(entities.iter().any(|entity| entity.name == "scripts"));
+        assert!(entities.iter().any(|entity| entity.name == "build"));
+        assert!(entities.iter().all(|entity| entity.content.is_empty()));
+        assert!(entities.iter().all(|entity| entity.content_hash.is_empty()));
+        assert!(entities.iter().all(|entity| entity.structural_hash.is_none()));
     }
 
     #[test]
