@@ -34,11 +34,13 @@ export function resolveReleaseArtifact({
       return 'sem-linux-arm64.tar.gz';
     case 'darwin:arm64':
       return 'sem-darwin-arm64.tar.gz';
+    case 'darwin:x64':
+      return 'sem-darwin-x86_64.tar.gz';
     case 'win32:x64':
       return 'sem-windows-x86_64.tar.gz';
     default:
       throw new Error(
-        `Unsupported platform ${key}. Supported targets: linux/x64, linux/arm64, darwin/arm64, win32/x64.`,
+        `Unsupported platform ${key}. Supported targets: linux/x64, linux/arm64, darwin/x64, darwin/arm64, win32/x64.`,
       );
   }
 }

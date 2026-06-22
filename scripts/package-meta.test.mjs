@@ -19,6 +19,10 @@ test('resolveReleaseArtifact maps supported targets to release assets', () => {
     'sem-darwin-arm64.tar.gz',
   );
   assert.equal(
+    resolveReleaseArtifact({ platform: 'darwin', arch: 'x64' }),
+    'sem-darwin-x86_64.tar.gz',
+  );
+  assert.equal(
     resolveReleaseArtifact({ platform: 'win32', arch: 'x64' }),
     'sem-windows-x86_64.tar.gz',
   );

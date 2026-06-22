@@ -19,6 +19,10 @@ All notable changes to sem are documented in this file.
 - `sem entities --json` streams rows to stdout instead of materializing an intermediate JSON value array.
 - `sem entities` uses listing-only extraction so local listings do not retain source text or entity hashes.
 
+### Fixed
+
+- Intel macOS (`x86_64-apple-darwin`) is now built and published. The release matrix only produced Apple Silicon (`arm64`) macOS binaries, so Intel Mac users got a 404 from `install.sh` and "Unsupported platform darwin:x64" from npm. Added the `x86_64-apple-darwin` target to the release build and the `darwin:x64` mapping to the npm wrapper. Thanks @stark-bit for the report (#374).
+
 ## [0.13.0] - 2026-06-16
 
 ### Fixed
