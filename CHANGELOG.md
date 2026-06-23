@@ -10,6 +10,7 @@ All notable changes to sem are documented in this file.
 - The `sem_entities` MCP tool accepts a `query` parameter for the same intent search, so agents can find code by what it does (not just by name) without falling back to grep. The ranking is shared with the CLI (`sem_core::parser::orient`).
 - `sem orient` down-weights entities in test files so implementation outranks an equivalently-named test. Test functions often match a query strongly by name, but the implementation is almost always what you want; tests stay findable, just below the real code.
 - `sem entities` accepts `--only <kind>` and `--except <kind>` (both repeatable) to filter the listing by entity kind, e.g. `sem entities --only function --only struct` or `sem entities --except import`. The two flags are mutually exclusive. Because entity kinds are language-dependent, an unknown kind reports the kinds actually found in the scanned files rather than guessing a static list. Thanks @aleclarson for the request (#378).
+- `SEM_WIDTH` sets the terminal-diff box width. sem's per-file box was a fixed 55 columns with no TTY attached, so it didn't match the surrounding pane when used as a pager (e.g. `lazygit`). Set `SEM_WIDTH=<columns>` to control it. Thanks @franky47 for the request (#380).
 
 ## [0.13.1] - 2026-06-23
 
