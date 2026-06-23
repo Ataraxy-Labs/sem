@@ -99,6 +99,9 @@ jobs:
             # and being retired, which can leave the build queued indefinitely).
             os: macos-14
             name: sem-darwin-x86_64
+            # Cross-compiling can't find a target-arch OpenSSL, so vendor + build
+            # it from source for x86_64 (same as the Linux arm64 cross-build).
+            vendor_openssl: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: sem-windows-x86_64

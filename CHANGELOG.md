@@ -4,6 +4,12 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-06-23
+
+### Fixed
+
+- Release pipeline: the Intel macOS cross-build failed on `openssl-sys` (no target-arch OpenSSL when cross-compiling on Apple Silicon). It now builds OpenSSL from source via `--features vendored-openssl`, the same approach the Linux arm64 cross-build uses. 0.14.0's binaries never published because of this; 0.14.1 is the first release to ship binaries for every platform, including Intel macOS (#374).
+
 ## [0.14.0] - 2026-06-23
 
 ### Added
