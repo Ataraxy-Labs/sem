@@ -11,6 +11,12 @@ pub struct EntitiesParams {
         description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
     )]
     pub no_default_excludes: Option<bool>,
+    #[schemars(
+        description = "Optional free-text query to find entities by intent across the whole repo (e.g. \"where is the retry logic\"), when you don't know the entity name. Ranks by name/signature relevance and graph centrality; returns file:line and dependent counts. Ignores `path` when set."
+    )]
+    pub query: Option<String>,
+    #[schemars(description = "Max results for `query` mode (default 10).")]
+    pub limit: Option<usize>,
 }
 
 impl EntitiesParams {
@@ -20,6 +26,14 @@ impl EntitiesParams {
 
     pub fn no_default_excludes(&self) -> bool {
         self.no_default_excludes.unwrap_or(false)
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref().map(str::trim).filter(|q| !q.is_empty())
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(10).clamp(1, 100)
     }
 }
 

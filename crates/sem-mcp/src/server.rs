@@ -30,7 +30,8 @@ const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
     Prefer these over grep/find for structural questions:\n\
     - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
     - \"understand X with its real callers and callees\" -> sem_context (not reading whole files)\n\
-    - \"where is X / list the entities here\" -> sem_entities\n\
+    - \"where is X / find the code that does Y\" (you don't know the name) -> sem_entities with a `query` (ranked structural search), not grep\n\
+    - \"list the entities in this file/dir\" -> sem_entities with a `path`\n\
     - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
     Use grep/find only for text/string search, error messages, config keys, \
     discovery by an unknown name, and non-code files. sem is deterministic and \
@@ -700,7 +701,7 @@ impl SemServer {
     // ── Tool 1: Entities ──
 
     #[tool(
-        description = "List semantic entities (functions, classes, etc.) under a file or directory path. Defaults to '.'."
+        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `query` to instead search the whole repo by intent and find the most relevant entities when you don't know the name (prefer this over grep for \"where is X\")."
     )]
     async fn sem_entities(
         &self,
@@ -711,6 +712,35 @@ impl SemServer {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
+
+        // Query mode: rank the whole-repo entity graph by relevance to the
+        // query (structural search), instead of listing a path.
+        if let Some(query) = params.query() {
+            let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+            let hits = sem_core::parser::orient::orient(
+                &all_entities,
+                &graph,
+                query,
+                params.limit(),
+            );
+            let result: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "name": h.name,
+                        "type": h.entity_type,
+                        "file": h.file_path,
+                        "start_line": h.start_line,
+                        "signature": h.signature,
+                        "dependents": h.dependents,
+                        "dependencies": h.dependencies,
+                    })
+                })
+                .collect();
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )]));
+        }
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
         let (entities, include_file) = if abs_path.is_file() {
@@ -1746,6 +1776,8 @@ mod tests {
             .sem_entities(Parameters(EntitiesParams {
                 path: Some(missing_path.display().to_string()),
                 no_default_excludes: None,
+                query: None,
+                limit: None,
             }))
             .await
             .unwrap();
@@ -1769,6 +1801,8 @@ mod tests {
             .sem_entities(Parameters(EntitiesParams {
                 path: Some("src/generated/schema.ts".to_string()),
                 no_default_excludes: None,
+                query: None,
+                limit: None,
             }))
             .await
             .unwrap();
@@ -1778,6 +1812,8 @@ mod tests {
             .sem_entities(Parameters(EntitiesParams {
                 path: Some("src/generated/schema.ts".to_string()),
                 no_default_excludes: Some(true),
+                query: None,
+                limit: None,
             }))
             .await
             .unwrap();

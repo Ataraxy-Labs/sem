@@ -1,23 +1,15 @@
-//! `sem orient <query>` — find the entities most relevant to a query, so an
-//! agent (or human) dropped into an unfamiliar codebase can locate the right
-//! function/class without already knowing its name.
+//! `sem orient <query>` — structural code search. Finds the entities most
+//! relevant to a query so an agent (or human) dropped into an unfamiliar
+//! codebase can locate the right function/class without knowing its name.
 //!
-//! Two-pass ranking, mirroring the cloud `orient` endpoint:
-//!   1. Lexical score over entity name (subtoken + prefix + substring), file
-//!      path, and the signature line.
-//!   2. Re-rank the strongest lexical candidates by graph centrality, so a
-//!      well-named-but-trivial helper loses to a central, widely-used entity.
-//!
-//! This is the structural-discovery counterpart to grep: grep finds text, this
-//! finds the entity and reports how connected it is.
+//! The ranking lives in `sem_core::parser::orient` (shared with the
+//! `sem_entities` MCP tool's query mode); this is the CLI/IO wrapper.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
-use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::EntityGraph;
+use sem_core::parser::orient::{orient, query_terms, OrientHit};
 use serde::Serialize;
 
 pub struct OrientOptions {
@@ -30,90 +22,8 @@ pub struct OrientOptions {
     pub no_default_excludes: bool,
 }
 
-const STOPWORDS: &[&str] = &[
-    "the", "a", "an", "to", "for", "of", "in", "on", "and", "or", "is", "it", "add", "fix", "make",
-    "with", "this", "that", "how", "where", "what", "when", "find", "get", "does", "we", "my",
-];
-
-/// Split a query into meaningful lowercase terms (drops stopwords and very
-/// short tokens).
-fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 3)
-        .map(|t| t.to_lowercase())
-        .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .collect()
-}
-
-/// Split an identifier into lowercase subtokens across camelCase and
-/// snake_case boundaries: `getUserId` -> [get, user, id].
-fn ident_subtokens(name: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut prev_lower = false;
-    for c in name.chars() {
-        if c == '_' || c == '-' || c == '.' {
-            if !cur.is_empty() {
-                tokens.push(std::mem::take(&mut cur));
-            }
-            prev_lower = false;
-            continue;
-        }
-        if c.is_uppercase() && prev_lower && !cur.is_empty() {
-            tokens.push(std::mem::take(&mut cur));
-        }
-        cur.push(c.to_ascii_lowercase());
-        prev_lower = c.is_lowercase();
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
-    }
-    tokens
-}
-
-/// Prefix/stem match so `watch` matches `watcher` and `diff` matches
-/// `difference`, requiring a shared prefix of at least 4 chars.
-fn token_prefix_match(tok: &str, term: &str) -> bool {
-    let shared = tok.len().min(term.len());
-    shared >= 4 && (tok.starts_with(term) || term.starts_with(tok))
-}
-
-fn lexical_score(e: &SemanticEntity, terms: &[String]) -> f64 {
-    let name_lower = e.name.to_lowercase();
-    let name_tokens = ident_subtokens(&e.name);
-    let path_lower = e.file_path.to_lowercase();
-    // Body-aware: the signature line (first line of the entity) often carries
-    // the intent words (parameters, return type).
-    let mut sig_tokens: HashSet<String> = HashSet::new();
-    if let Some(sig) = e.content.lines().next() {
-        for word in sig.split(|c: char| !c.is_alphanumeric()) {
-            for t in ident_subtokens(word) {
-                sig_tokens.insert(t);
-            }
-        }
-    }
-    let mut score = 0.0;
-    for term in terms {
-        if name_tokens.iter().any(|t| t == term) {
-            score += 3.0; // exact name-subtoken hit
-        } else if name_tokens.iter().any(|t| token_prefix_match(t, term)) {
-            score += 2.5; // stem/prefix hit
-        } else if name_lower.contains(term.as_str()) {
-            score += 2.0; // substring of the name
-        }
-        if path_lower.contains(term.as_str()) {
-            score += 1.0; // appears in the file path
-        }
-        if sig_tokens.contains(term) {
-            score += 1.5; // appears in the signature
-        }
-    }
-    score
-}
-
 #[derive(Serialize)]
-struct OrientHit {
+struct OrientHitJson {
     name: String,
     #[serde(rename = "type")]
     entity_type: String,
@@ -125,44 +35,23 @@ struct OrientHit {
     score: f64,
 }
 
-/// Rank entities by lexical relevance, then re-rank the top candidates by graph
-/// centrality. Pure and testable; the command wrapper handles IO.
-fn rank<'a>(
-    entities: &'a [SemanticEntity],
-    graph: &EntityGraph,
-    terms: &[String],
-    limit: usize,
-) -> Vec<(f64, &'a SemanticEntity)> {
-    let mut scored: Vec<(f64, &SemanticEntity)> = entities
-        .iter()
-        .filter_map(|e| {
-            let s = lexical_score(e, terms);
-            (s > 0.0).then_some((s, e))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Re-rank only the strongest lexical candidates by centrality.
-    let cap = (limit * 4).max(20);
-    scored.truncate(cap);
-    let mut hits: Vec<(f64, &SemanticEntity)> = scored
-        .into_iter()
-        .map(|(lexical, e)| {
-            let deps = graph.get_dependencies(&e.id).len();
-            let dependents = graph.get_dependents(&e.id).len();
-            // Saturating centrality boost so a few hot entities don't dominate.
-            let centrality = ((deps + dependents) as f64 + 1.0).ln();
-            (lexical * 10.0 + centrality, e)
-        })
-        .collect();
-    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    hits.truncate(limit);
-    hits
+impl From<&OrientHit> for OrientHitJson {
+    fn from(h: &OrientHit) -> Self {
+        OrientHitJson {
+            name: h.name.clone(),
+            entity_type: h.entity_type.clone(),
+            file: h.file_path.clone(),
+            start_line: h.start_line,
+            signature: h.signature.clone(),
+            dependencies: h.dependencies,
+            dependents: h.dependents,
+            score: h.score,
+        }
+    }
 }
 
 pub fn orient_command(opts: OrientOptions) {
-    let terms = query_terms(&opts.query);
-    if terms.is_empty() {
+    if query_terms(&opts.query).is_empty() {
         eprintln!(
             "{} query has no searchable terms (drop stopwords / use words of 3+ chars)",
             "error:".red().bold()
@@ -194,23 +83,11 @@ pub fn orient_command(opts: OrientOptions) {
         super::graph::fmt_count(file_paths.len())
     ));
 
-    let ranked = rank(&all_entities, &graph, &terms, opts.limit);
+    let hits = orient(&all_entities, &graph, &opts.query, opts.limit);
 
     if opts.json {
-        let hits: Vec<OrientHit> = ranked
-            .iter()
-            .map(|(score, e)| OrientHit {
-                name: e.name.clone(),
-                entity_type: e.entity_type.clone(),
-                file: e.file_path.clone(),
-                start_line: e.start_line,
-                signature: e.content.lines().next().unwrap_or("").trim().to_string(),
-                dependencies: graph.get_dependencies(&e.id).len(),
-                dependents: graph.get_dependents(&e.id).len(),
-                score: *score,
-            })
-            .collect();
-        match serde_json::to_string_pretty(&hits) {
+        let rows: Vec<OrientHitJson> = hits.iter().map(OrientHitJson::from).collect();
+        match serde_json::to_string_pretty(&rows) {
             Ok(s) => println!("{s}"),
             Err(e) => {
                 eprintln!("{} {e}", "error:".red().bold());
@@ -220,7 +97,7 @@ pub fn orient_command(opts: OrientOptions) {
         return;
     }
 
-    if ranked.is_empty() {
+    if hits.is_empty() {
         println!(
             "{} no entities matched {}",
             "orient:".yellow().bold(),
@@ -229,49 +106,20 @@ pub fn orient_command(opts: OrientOptions) {
         return;
     }
 
-    println!(
-        "{} {}\n",
-        "orient:".green().bold(),
-        opts.query.bold()
-    );
-    for (_score, e) in &ranked {
-        let loc = format!("{}:{}", e.file_path, e.start_line);
-        let dependents = graph.get_dependents(&e.id).len();
-        let sig = e.content.lines().next().unwrap_or("").trim();
+    println!("{} {}\n", "orient:".green().bold(), opts.query.bold());
+    for h in &hits {
+        let loc = format!("{}:{}", h.file_path, h.start_line);
         println!(
             "  {} {}  {}",
-            format!("{:<9}", e.entity_type).dimmed(),
-            e.name.bold(),
+            format!("{:<9}", h.entity_type).dimmed(),
+            h.name.bold(),
             loc.dimmed(),
         );
-        if !sig.is_empty() {
-            println!("    {}", sig.dimmed());
+        if !h.signature.is_empty() {
+            println!("    {}", h.signature.dimmed());
         }
-        if dependents > 0 {
-            println!("    {}", format!("{dependents} dependents").cyan());
+        if h.dependents > 0 {
+            println!("    {}", format!("{} dependents", h.dependents).cyan());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn query_terms_drop_stopwords_and_short() {
-        assert_eq!(query_terms("where is the retry logic"), vec!["retry", "logic"]);
-    }
-
-    #[test]
-    fn subtokens_split_camel_and_snake() {
-        assert_eq!(ident_subtokens("getUserId"), vec!["get", "user", "id"]);
-        assert_eq!(ident_subtokens("read_file"), vec!["read", "file"]);
-    }
-
-    #[test]
-    fn prefix_match_handles_stems() {
-        assert!(token_prefix_match("watcher", "watch"));
-        assert!(token_prefix_match("diff", "difference"));
-        assert!(!token_prefix_match("cat", "category")); // shared < 4
     }
 }

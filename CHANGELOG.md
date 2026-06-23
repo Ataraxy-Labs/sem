@@ -7,6 +7,7 @@ All notable changes to sem are documented in this file.
 ### Added
 
 - `sem orient <query>` finds the entities most relevant to a query, structural code search for when you're dropped into an unfamiliar codebase and don't know the symbol name yet (e.g. `sem orient "where is the retry logic"`). Two-pass ranking: lexical score over entity name (subtoken + prefix/stem + substring), file path, and signature line, then a graph-centrality re-rank so a central, widely-used entity outranks a trivially-named helper. Results show the entity, its `file:line`, signature, and dependent count. `--json` and `--limit` supported. This is the structural counterpart to grep: grep finds text, orient finds the entity and how connected it is.
+- The `sem_entities` MCP tool accepts a `query` parameter for the same intent search, so agents can find code by what it does (not just by name) without falling back to grep. The ranking is shared with the CLI (`sem_core::parser::orient`).
 - `sem entities` accepts `--only <kind>` and `--except <kind>` (both repeatable) to filter the listing by entity kind, e.g. `sem entities --only function --only struct` or `sem entities --except import`. The two flags are mutually exclusive. Because entity kinds are language-dependent, an unknown kind reports the kinds actually found in the scanned files rather than guessing a static list. Thanks @aleclarson for the request (#378).
 
 ## [0.13.1] - 2026-06-23
