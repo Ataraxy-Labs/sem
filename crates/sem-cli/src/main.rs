@@ -21,6 +21,7 @@ use commands::entities::{entities_command, EntitiesOptions};
 use commands::graph::{graph_command, GraphOptions};
 use commands::impact::{impact_command, ImpactMode, ImpactOptions};
 use commands::log::{log_command, LogOptions};
+use commands::orient::{orient_command, OrientOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = env!("CARGO_PKG_VERSION"), about = "Semantic version control")]
@@ -260,6 +261,36 @@ enum Commands {
         #[arg(long = "except", value_name = "KIND", conflicts_with = "only_kinds")]
         except_kinds: Vec<String>,
     },
+    /// Find the entities most relevant to a query (structural code search)
+    Orient {
+        /// What you're looking for, e.g. "where is the retry logic"
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+
+        /// Maximum number of results
+        #[arg(long, default_value = "10")]
+        limit: usize,
+
+        /// Output format
+        #[arg(long, value_parser = ["terminal", "json"])]
+        format: Option<String>,
+
+        /// Output as JSON (shorthand for --format json)
+        #[arg(long)]
+        json: bool,
+
+        /// Only include files with these extensions (e.g. --file-exts .ts .tsx)
+        #[arg(long, num_args = 1..)]
+        file_exts: Vec<String>,
+
+        /// Rebuild the entity graph instead of using a cached one
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Include files and directories excluded by default
+        #[arg(long)]
+        no_default_excludes: bool,
+    },
     /// Show token-budgeted context for an entity
     Context {
         /// Name of the entity, optionally as "type name"
@@ -345,6 +376,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Blame { .. }) => "blame",
         Some(Commands::Log { .. }) => "log",
         Some(Commands::Entities { .. }) => "entities",
+        Some(Commands::Orient { .. }) => "orient",
         Some(Commands::Context { .. }) => "context",
         Some(Commands::Stats) => "stats",
         Some(Commands::Mcp) => "mcp",
@@ -558,6 +590,28 @@ fn main() {
                 file_exts,
                 only_kinds,
                 except_kinds,
+            });
+        }
+        Some(Commands::Orient {
+            query,
+            limit,
+            format,
+            json,
+            file_exts,
+            no_cache,
+            no_default_excludes,
+        }) => {
+            orient_command(OrientOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                query: query.join(" "),
+                limit,
+                json: resolve_json(format, json),
+                file_exts,
+                no_cache,
+                no_default_excludes,
             });
         }
         Some(Commands::Context {
