@@ -249,6 +249,16 @@ enum Commands {
         /// Only include files with these extensions (e.g. --file-exts .ts .tsx)
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
+
+        /// List only entities of these kinds (repeatable), e.g. --only function --only struct.
+        /// Kinds are language-dependent; an unknown kind reports the kinds found.
+        #[arg(long = "only", value_name = "KIND")]
+        only_kinds: Vec<String>,
+
+        /// List all entities except these kinds (repeatable), e.g. --except import.
+        /// Cannot be combined with --only.
+        #[arg(long = "except", value_name = "KIND", conflicts_with = "only_kinds")]
+        except_kinds: Vec<String>,
     },
     /// Show token-budgeted context for an entity
     Context {
@@ -534,6 +544,8 @@ fn main() {
             json,
             no_default_excludes,
             file_exts,
+            only_kinds,
+            except_kinds,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -544,6 +556,8 @@ fn main() {
                 json: resolve_json(format, json),
                 no_default_excludes,
                 file_exts,
+                only_kinds,
+                except_kinds,
             });
         }
         Some(Commands::Context {

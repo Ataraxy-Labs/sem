@@ -15,10 +15,24 @@ pub struct EntitiesOptions {
     pub json: bool,
     pub no_default_excludes: bool,
     pub file_exts: Vec<String>,
+    /// Keep only entities whose kind is in this list (empty = no filter).
+    pub only_kinds: Vec<String>,
+    /// Drop entities whose kind is in this list (empty = no filter).
+    pub except_kinds: Vec<String>,
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
     let mut timings = Timings::from_env("entities");
+
+    // --only and --except are mutually exclusive.
+    if !opts.only_kinds.is_empty() && !opts.except_kinds.is_empty() {
+        eprintln!(
+            "{} --only and --except cannot be used together",
+            "error:".red().bold()
+        );
+        std::process::exit(2);
+    }
+    let kind_filter_active = !opts.only_kinds.is_empty() || !opts.except_kinds.is_empty();
 
     // Normalize to a non-empty list of path args, defaulting to ".".
     let path_args: Vec<String> = {
@@ -39,9 +53,11 @@ pub fn entities_command(opts: EntitiesOptions) {
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
 
-    // The cloud fast-path only helps the whole-repo single listing.
+    // The cloud fast-path only helps the whole-repo single listing, and it
+    // can't apply a local kind filter, so skip it when one is active.
     if ext_filter.is_empty()
         && path_args.len() == 1
+        && !kind_filter_active
         && super::cloud::try_cloud_entities(&opts).is_some()
     {
         timings.mark("cloud_entities");
@@ -89,6 +105,7 @@ pub fn entities_command(opts: EntitiesOptions) {
             timings.mark("file_discovery");
             if opts.json
                 && path_args.len() == 1
+                && !kind_filter_active
                 && try_write_cached_entities_json(
                     root,
                     &file_paths,
@@ -140,6 +157,20 @@ pub fn entities_command(opts: EntitiesOptions) {
     entities.dedup_by(|a, b| a.id == b.id);
     timings.mark("sort_dedup");
 
+    // Apply --only / --except kind filters. Entity kinds are language-dependent,
+    // so validate requested kinds against the kinds actually present in this
+    // scan and, on a miss, show the user what kinds exist here.
+    if kind_filter_active {
+        entities = match filter_by_kind(entities, &opts.only_kinds, &opts.except_kinds) {
+            Ok(filtered) => filtered,
+            Err(msg) => {
+                eprintln!("{} {msg}", "error:".red().bold());
+                std::process::exit(2);
+            }
+        };
+        timings.counter("kind_filtered", entities.len() as u64);
+    }
+
     // Show the file column whenever results span more than one file. This keeps
     // the prior single-file vs directory behavior and covers multi-path input.
     let distinct_files = {
@@ -173,6 +204,39 @@ pub fn entities_command(opts: EntitiesOptions) {
     }
     timings.mark("output_serialization");
     timings.finish();
+}
+
+/// Filter entities by the `--only` / `--except` kind lists. Entity kinds are
+/// language-dependent, so a requested kind that matches nothing in `entities`
+/// is an error whose message lists the kinds actually present. Assumes the
+/// caller has already rejected the only+except combination.
+fn filter_by_kind(
+    mut entities: Vec<SemanticEntity>,
+    only: &[String],
+    except: &[String],
+) -> Result<Vec<SemanticEntity>, String> {
+    if only.is_empty() && except.is_empty() {
+        return Ok(entities);
+    }
+    let present: BTreeSet<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+    let requested = if only.is_empty() { except } else { only };
+    if let Some(unknown) = requested.iter().find(|k| !present.contains(k.as_str())) {
+        let valid = present.into_iter().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "unknown entity kind \"{unknown}\"\n\nkinds found here: {}",
+            if valid.is_empty() {
+                "(none)".to_string()
+            } else {
+                valid
+            }
+        ));
+    }
+    if !only.is_empty() {
+        entities.retain(|e| only.iter().any(|k| k == &e.entity_type));
+    } else {
+        entities.retain(|e| !except.iter().any(|k| k == &e.entity_type));
+    }
+    Ok(entities)
 }
 
 fn resolve_path(root: &Path, path_arg: &str) -> (String, PathBuf) {
@@ -470,6 +534,46 @@ mod tests {
             end_line: 1,
             metadata: None,
         }
+    }
+
+    fn kinded(name: &str, kind: &str) -> SemanticEntity {
+        let mut e = entity(name, None);
+        e.entity_type = kind.to_string();
+        e
+    }
+
+    #[test]
+    fn only_keeps_listed_kinds() {
+        let es = vec![
+            kinded("a", "function"),
+            kinded("b", "struct"),
+            kinded("c", "import"),
+        ];
+        let out = filter_by_kind(es, &["function".into(), "struct".into()], &[]).unwrap();
+        let kinds: Vec<&str> = out.iter().map(|e| e.entity_type.as_str()).collect();
+        assert_eq!(kinds, vec!["function", "struct"]);
+    }
+
+    #[test]
+    fn except_drops_listed_kinds() {
+        let es = vec![kinded("a", "function"), kinded("b", "import")];
+        let out = filter_by_kind(es, &[], &["import".into()]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entity_type, "function");
+    }
+
+    #[test]
+    fn unknown_kind_errors_and_lists_present_kinds() {
+        let es = vec![kinded("a", "function"), kinded("b", "struct")];
+        let err = filter_by_kind(es, &["tests".into()], &[]).unwrap_err();
+        assert!(err.contains("unknown entity kind \"tests\""));
+        assert!(err.contains("function") && err.contains("struct"));
+    }
+
+    #[test]
+    fn no_filter_returns_all() {
+        let es = vec![kinded("a", "function"), kinded("b", "struct")];
+        assert_eq!(filter_by_kind(es, &[], &[]).unwrap().len(), 2);
     }
 
     #[test]
