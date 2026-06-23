@@ -167,7 +167,17 @@ pub fn format_terminal(
                 Some(p) => format!("{}::{base_name}", sanitize_terminal_text(p)),
                 None => base_name,
             };
-            let name_label = format!("{:<25}", display_name);
+            // Optionally make the entity name a clickable link to its
+            // definition (file:line). Pad on the visible text so the OSC8
+            // escape (zero-width) doesn't break column alignment.
+            let name_label = if crate::hyperlinks::enabled() {
+                let pad = 25usize.saturating_sub(display_name.chars().count());
+                let linked =
+                    crate::hyperlinks::link(&display_name, &change.file_path, change.start_line);
+                format!("{linked}{}", " ".repeat(pad))
+            } else {
+                format!("{:<25}", display_name)
+            };
 
             push_line(
                 &mut output,

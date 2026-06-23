@@ -25,8 +25,16 @@ use crate::cache;
 use crate::tools::*;
 use crate::watch::{watch_enabled, RepoWatcher};
 
-const MCP_INSTRUCTIONS: &str = "sem MCP server for entity-level semantic code intelligence. \
-                                6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context.";
+const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
+    (functions/classes/methods plus a real cross-file call and import graph). \
+    Prefer these over grep/find for structural questions:\n\
+    - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
+    - \"understand X with its real callers and callees\" -> sem_context (not reading whole files)\n\
+    - \"where is X / list the entities here\" -> sem_entities\n\
+    - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
+    Use grep/find only for text/string search, error messages, config keys, \
+    discovery by an unknown name, and non-code files. sem is deterministic and \
+    cross-file, so it won't hallucinate edges or miss callers the way a text search does.";
 
 const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
 

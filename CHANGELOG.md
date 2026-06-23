@@ -8,9 +8,11 @@ All notable changes to sem are documented in this file.
 
 - `sem impact` can answer direct dependency queries from a fresh SQL topology cache without rebuilding the entity graph.
 - `sem entities` reports phase timings and listing counters when `SEM_TIMINGS` is enabled.
+- Optional OSC8 terminal hyperlinks on entity names in `sem diff`, so a supporting terminal (kitty, WezTerm, iTerm2, Ghostty, ...) renders them clickable and can open the definition at `file:line`. Off by default; enable with `SEM_HYPERLINK` set to an editor preset (`vscode`, `cursor`, `windsurf`, `zed`, `idea`, `file`) or a raw URI template using `{file}` and `{line}` (e.g. `SEM_HYPERLINK="vscode://file/{file}:{line}"`). Strictly TTY-only, so pipes, JSON output, and MCP/agent sessions never see escape codes. Force off with `SEM_NO_HYPERLINKS=1`. Thanks @olejorgenb for the request (#381).
 
 ### Changed
 
+- The `sem mcp` server now sends usage guidance to the agent instead of a bare tool list. The instructions tell the agent to prefer `sem_impact`/`sem_context`/`sem_entities` over grep/find for structural questions (what calls X, understand X, where is X) and to keep grep for text search and non-code files. Availability alone wasn't changing agent behavior; this biases agents toward the entity graph the moment the server connects, with no extra setup.
 - `sem impact --deps` can reuse fresh caches when unrelated files change by validating the cached source set, hashes, and import metadata before falling back to a graph rebuild.
 - `sem impact --deps` narrows cache freshness checks to the queried entity, direct dependencies, and relevant JavaScript/TypeScript imports when the query scope is explicit.
 - Source scans skip default-excluded high-volume paths such as generated source directories, fixture/vendor/benchmark trees, generated file suffixes, CSS module declarations, and asset declarations; pass `--no-default-excludes` to include them.
