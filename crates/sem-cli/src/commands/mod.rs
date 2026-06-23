@@ -7,6 +7,7 @@ pub mod files;
 pub mod graph;
 pub mod impact;
 pub mod log;
+pub mod orient;
 pub mod setup;
 pub mod stats;
 pub mod update;
