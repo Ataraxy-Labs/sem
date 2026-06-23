@@ -302,7 +302,13 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
 
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
-            let _ = disk.save_topology(root, file_paths, &graph, &entities, &registry.custom_test_dirs);
+            let _ = disk.save_topology(
+                root,
+                file_paths,
+                &graph,
+                &entities,
+                &registry.custom_test_dirs,
+            );
             timings.mark("cache_topology_save");
         }
     }
@@ -378,7 +384,13 @@ fn get_or_build_graph_with_cache_policy(
             }
             CacheMissSavePolicy::Topology => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save_topology(root, file_paths, &graph, &entities, &registry.custom_test_dirs);
+                    let _ = disk.save_topology(
+                        root,
+                        file_paths,
+                        &graph,
+                        &entities,
+                        &registry.custom_test_dirs,
+                    );
                     timings.mark("cache_topology_save");
                 }
             }

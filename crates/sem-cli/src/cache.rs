@@ -173,7 +173,8 @@ impl DiskCache {
             }
         }
 
-        let test_entity_ids = graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
+        let test_entity_ids =
+            graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
         {
             let mut stmt =
                 tx.prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")?;

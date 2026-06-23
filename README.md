@@ -20,6 +20,7 @@
   <a href="#install">Install</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#use-with-ai-agents-mcp">Agents (MCP)</a> ·
+  <a href="docs/cloud-consent.html">Cloud consent</a> ·
   <a href="https://github.com/Ataraxy-Labs/sem/releases/latest">Releases</a>
 </p>
 
@@ -34,6 +35,8 @@
 sem is a semantic version control tool that works on top of Git. It parses your code with tree-sitter, extracts every function, class, and method as an entity, and diffs at the entity level instead of lines. This means you see "function `blahh` was modified" instead of "lines x-y changed."
 
 It works in any Git repo with no setup.
+
+Cloud-backed queries are opt-in per repo: logging in does not upload a repo or send a query. See the [cloud consent flow](docs/cloud-consent.html) for the public/private repo states, preview screen, local audit log, and forget controls.
 
 <p align="center">
   <img src="assets/terminal.svg" alt="sem diff" width="800" />

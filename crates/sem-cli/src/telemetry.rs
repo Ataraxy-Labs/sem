@@ -196,7 +196,11 @@ pub fn record(command: &str) {
             "os": std::env::consts::OS,
             "ts": now_secs().to_string(),
         });
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&spool) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spool)
+        {
             let _ = writeln!(file, "{event}");
         }
     }
@@ -274,7 +278,11 @@ pub fn flush() {
     } else {
         // Put the events back for a later flush. Append (not overwrite) — new
         // events may have spooled meanwhile.
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&spool) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spool)
+        {
             let _ = file.write_all(content.as_bytes());
         }
         let _ = fs::remove_file(&claimed);
@@ -285,7 +293,10 @@ pub fn flush() {
 pub fn set_mode(mode: &str) {
     use colored::Colorize;
     let Some(m) = Mode::parse(mode) else {
-        eprintln!("{} unknown mode '{mode}' (use on, local, or off)", "error:".red().bold());
+        eprintln!(
+            "{} unknown mode '{mode}' (use on, local, or off)",
+            "error:".red().bold()
+        );
         return;
     };
     let mut state = load_state();
@@ -296,7 +307,11 @@ pub fn set_mode(mode: &str) {
 
     match m {
         Mode::On => {
-            println!("{} Telemetry is {} — command names are uploaded to help improve sem.", "ok".green().bold(), "on".green());
+            println!(
+                "{} Telemetry is {} — command names are uploaded to help improve sem.",
+                "ok".green().bold(),
+                "on".green()
+            );
             // Send whatever has accumulated locally now.
             if !crate::commands::cloud::network_disabled() {
                 if let Ok(exe) = std::env::current_exe() {
@@ -315,7 +330,11 @@ pub fn set_mode(mode: &str) {
             "local".cyan()
         ),
         Mode::Off => {
-            println!("{} Telemetry is {} — nothing is recorded.", "ok".green().bold(), "off".dimmed());
+            println!(
+                "{} Telemetry is {} — nothing is recorded.",
+                "ok".green().bold(),
+                "off".dimmed()
+            );
             // Drop anything already spooled.
             if let Some(spool) = spool_path() {
                 let _ = fs::remove_file(spool);
@@ -352,5 +371,8 @@ pub fn preview() {
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS
     );
-    println!("{}", "No repo names, paths, file contents, or identifiers are ever included.".dimmed());
+    println!(
+        "{}",
+        "No repo names, paths, file contents, or identifiers are ever included.".dimmed()
+    );
 }

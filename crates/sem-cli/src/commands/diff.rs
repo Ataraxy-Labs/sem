@@ -10,7 +10,9 @@ use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::{collect_binary_file_changes, compute_semantic_diff, DiffResult};
+use sem_core::parser::differ::{
+    collect_binary_file_changes, compute_semantic_diff, BinaryFileChange, DiffResult,
+};
 use sem_core::parser::plugins::code::languages::get_language_config;
 use sem_core::parser::registry::{detect_ext_from_content, ParserRegistry};
 
@@ -1696,6 +1698,8 @@ fn run_diff_pipeline(
 
     println!("{output}");
 
+    maybe_upload_cloud_diff_snapshot(opts, from_stdin, &file_changes, &result, &binary_changes);
+
     if opts.profile {
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!();
@@ -1722,6 +1726,51 @@ fn run_diff_pipeline(
                 + binary_changes.len()
         );
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
+    }
+}
+
+fn maybe_upload_cloud_diff_snapshot(
+    opts: &DiffOptions,
+    from_stdin: bool,
+    file_changes: &[FileChange],
+    result: &DiffResult,
+    binary_changes: &[BinaryFileChange],
+) {
+    if from_stdin || super::cloud::is_local_forced() {
+        return;
+    }
+
+    let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
+        return;
+    };
+    let Some(remote) = git.get_remote_url() else {
+        return;
+    };
+    if !super::consent::cloud_enabled_for(&remote) {
+        return;
+    }
+    let Some(client) = super::cloud::CloudClient::from_credentials() else {
+        return;
+    };
+
+    let head_sha = git.get_head_sha().ok();
+    match client.upload_diff_snapshot(
+        &remote,
+        head_sha.as_deref(),
+        opts.label.as_deref(),
+        file_changes,
+        result,
+        binary_changes,
+    ) {
+        Ok(id) => {
+            let url = client.diff_snapshot_url(&id);
+            super::consent::record_outbound(&remote, "diff", &id);
+            eprintln!("sem cloud diff: {url}");
+        }
+        Err(e) if opts.profile => {
+            eprintln!("\x1b[2m  cloud diff upload skipped: {e}\x1b[0m");
+        }
+        Err(_) => {}
     }
 }
 

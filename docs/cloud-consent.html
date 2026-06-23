@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sem — Cloud consent flow</title>
+  <script>
+    (function () {
+      const saved = localStorage.getItem('sem-doc-theme');
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (saved === 'dark' || (!saved && prefersDark)) {
+        document.documentElement.classList.add('dark');
+      }
+    })();
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+
+    :root {
+      --ivory: #FAF9F5;
+      --white: #FFFFFF;
+      --slate: #141413;
+      --clay: #D97757;
+      --oat: #E3DACC;
+      --olive: #788C5D;
+      --rust: #B04A3F;
+      --gray-150: #F0EEE6;
+      --gray-300: #D1CFC5;
+      --gray-500: #87867F;
+      --gray-700: #3D3D3A;
+      --serif: ui-serif, Georgia, 'Times New Roman', serif;
+      --sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    }
+
+    html.dark {
+      --ivory: #141413;
+      --white: #1f1f1d;
+      --slate: #FAF9F5;
+      --gray-150: #2a2926;
+      --gray-300: #44413b;
+      --gray-500: #a6a39a;
+      --gray-700: #d8d3c8;
+      --clay: #e08a68;
+      --oat: #5a5145;
+      --olive: #9caf78;
+      --rust: #d36a5d;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--slate);
+      background: var(--ivory);
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: inherit; text-decoration-color: var(--gray-500); text-underline-offset: 3px; }
+    a:hover { color: var(--clay); text-decoration-color: var(--clay); }
+    code, pre, .eyebrow, .label, .badge, nav, .state-k, .terminal-title { font-family: var(--mono); }
+    h1, h2, h3 { font-family: var(--serif); font-weight: 500; letter-spacing: -0.01em; }
+
+    .top-nav {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in srgb, var(--ivory) 92%, transparent);
+      backdrop-filter: blur(16px);
+      border-bottom: 1.5px solid var(--gray-300);
+    }
+    .top-nav-inner {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 18px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+    .logo { font-weight: 700; text-decoration: none; }
+    .links { display: flex; gap: 18px; align-items: center; font-size: 13px; color: var(--gray-700); }
+    .theme-toggle {
+      border: 1.5px solid var(--gray-300);
+      background: var(--white);
+      color: var(--slate);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font: 12px var(--mono);
+      cursor: pointer;
+    }
+
+    .page {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 52px 24px 96px;
+      display: grid;
+      grid-template-columns: 190px minmax(0, 1fr);
+      gap: 48px;
+    }
+    .side-nav { position: sticky; top: 92px; align-self: start; }
+    .side-nav .label { color: var(--gray-500); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 14px; }
+    .side-nav a { display: block; padding: 8px 0; color: var(--gray-700); font-size: 13px; text-decoration: none; border-bottom: 1px solid var(--gray-150); }
+    .side-nav a:hover { color: var(--clay); }
+
+    header { padding-bottom: 34px; border-bottom: 1.5px solid var(--gray-300); }
+    .eyebrow { color: var(--clay); font-size: 12px; text-transform: uppercase; letter-spacing: .1em; margin-bottom: 16px; }
+    h1 { font-size: clamp(42px, 7vw, 78px); line-height: .95; margin: 0 0 18px; max-width: 760px; }
+    .lead { color: var(--gray-700); font-size: 18px; max-width: 690px; margin: 0; }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 28px 0 0;
+    }
+    .cell, .panel, .tldr, .canvas, .choice, .step, .callout, .terminal {
+      background: var(--white);
+      border: 1.5px solid var(--gray-300);
+      border-radius: 14px;
+    }
+    .cell { padding: 15px; }
+    .cell .k { font: 11px var(--mono); color: var(--gray-500); text-transform: uppercase; letter-spacing: .08em; }
+    .cell .v { margin-top: 6px; font-size: 15px; font-weight: 650; }
+    .cell .v.ok { color: var(--olive); }
+    .cell .v.warn { color: var(--clay); }
+
+    section { padding: 54px 0; border-bottom: 1.5px solid var(--gray-300); }
+    section:last-child { border-bottom: none; }
+    h2 { font-size: 32px; margin: 0 0 12px; }
+    h3 { font-size: 22px; margin: 0 0 8px; }
+    .section-desc { color: var(--gray-700); max-width: 680px; margin: 0 0 24px; }
+
+    .tldr { border-left: 4px solid var(--clay); padding: 18px 20px; margin-top: 24px; color: var(--gray-700); }
+    .tldr strong { color: var(--slate); }
+
+    .canvas { padding: 24px; overflow-x: auto; }
+    svg.flow { display: block; width: 100%; min-width: 720px; height: auto; }
+    .node rect, .node polygon { fill: var(--white); stroke: var(--gray-300); stroke-width: 2; }
+    .node text { fill: var(--slate); font-family: var(--mono); font-size: 13px; }
+    .node .sub { fill: var(--gray-500); font-size: 11px; }
+    .node.ok rect { stroke: var(--olive); }
+    .node.warn polygon { stroke: var(--clay); }
+    .node.bad rect { stroke: var(--rust); }
+    .edge { stroke: var(--gray-500); stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .edge.ok { stroke: var(--olive); }
+    .edge.bad { stroke: var(--rust); stroke-dasharray: 6 5; }
+    .edge-label { font: 11px var(--mono); fill: var(--gray-500); }
+
+    .choice-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .choice { padding: 20px; }
+    .choice.ok { border-top: 4px solid var(--olive); }
+    .choice.warn { border-top: 4px solid var(--clay); }
+    .choice.bad { border-top: 4px solid var(--rust); }
+    .state-k { color: var(--gray-500); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }
+    .choice p, .step p, .callout p { color: var(--gray-700); margin: 0; }
+
+    .steps { display: grid; gap: 14px; }
+    .step { display: grid; grid-template-columns: 42px 1fr; gap: 16px; padding: 18px; }
+    .badge { width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; background: var(--gray-150); color: var(--clay); font-weight: 700; }
+    .step-loc { font-family: var(--mono); font-size: 13px; color: var(--gray-500); margin-bottom: 6px; }
+
+    .terminal { overflow: hidden; margin-top: 18px; }
+    .terminal-bar { padding: 10px 14px; border-bottom: 1.5px solid var(--gray-300); display: flex; gap: 8px; align-items: center; background: var(--gray-150); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--gray-300); }
+    .terminal-title { color: var(--gray-500); font-size: 12px; margin-left: 6px; }
+    pre {
+      margin: 0;
+      padding: 20px;
+      overflow-x: auto;
+      color: var(--slate);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+    .cmd { color: var(--clay); }
+    .ok-text { color: var(--olive); }
+    .bad-text { color: var(--rust); }
+    .dim { color: var(--gray-500); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; background: var(--white); border: 1.5px solid var(--gray-300); border-radius: 14px; overflow: hidden; }
+    th, td { padding: 13px 16px; text-align: left; border-bottom: 1px solid var(--gray-150); vertical-align: top; }
+    th { font: 11px var(--mono); color: var(--gray-500); text-transform: uppercase; letter-spacing: .08em; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { font-family: var(--mono); color: var(--clay); white-space: nowrap; }
+
+    .callout { display: grid; grid-template-columns: 42px 1fr; gap: 14px; padding: 18px; margin-top: 18px; }
+    .ico { width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; background: color-mix(in srgb, var(--clay) 18%, transparent); color: var(--clay); font: 700 18px var(--mono); }
+
+    @media (max-width: 920px) {
+      .page { grid-template-columns: 1fr; padding-top: 34px; }
+      .side-nav { display: none; }
+      .summary, .choice-grid { grid-template-columns: 1fr; }
+      .links { flex-wrap: wrap; gap: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="top-nav-inner">
+      <a class="logo" href="index.html">sem</a>
+      <div class="links">
+        <a href="agents.html">Agents</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="cloud-consent.html">Cloud</a>
+        <a href="changelog.html">Changelog</a>
+        <a href="details.html">Details</a>
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+        <button class="theme-toggle" type="button" aria-label="Toggle dark mode">Theme</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="page">
+    <aside class="side-nav" aria-label="Page sections">
+      <div class="label">Consent flow</div>
+      <a href="#tldr">TL;DR</a>
+      <a href="#flow">Product flow</a>
+      <a href="#states">States</a>
+      <a href="#copy">What users see</a>
+      <a href="#data">Data boundary</a>
+      <a href="#controls">Controls</a>
+      <a href="#runtime">Runtime routing</a>
+    </aside>
+
+    <main>
+      <header>
+        <div class="eyebrow">sem cloud · product flow</div>
+        <h1>Cloud is off until the repo owner says yes.</h1>
+        <p class="lead">sem can answer graph queries from pre-built cloud indexes, but the CLI keeps login, discovery, public enablement, private sharing, preview, and deletion as separate user-visible states.</p>
+
+        <div class="summary" aria-label="Consent summary">
+          <div class="cell"><div class="k">Default</div><div class="v ok">Local only</div></div>
+          <div class="cell"><div class="k">Public repo</div><div class="v">Enable asks [y/N]</div></div>
+          <div class="cell"><div class="k">Private repo</div><div class="v warn">Type repo name</div></div>
+          <div class="cell"><div class="k">Audit</div><div class="v">Local ledger</div></div>
+        </div>
+
+        <div id="tldr" class="tldr">
+          <strong>Invariant:</strong> logging in does not register a repo, upload an index, or send a query. Cloud routing starts only after <code>sem cloud enable</code> for a public repo, <code>sem cloud share</code> for a private repo, or an explicit CI environment override.
+        </div>
+      </header>
+
+      <section id="flow">
+        <h2>The product flow</h2>
+        <p class="section-desc">The consent boundary is a command surface, not a hidden prompt inside a query. Slow local runs may show a passive tip, but printing the tip sends nothing.</p>
+        <div class="canvas">
+          <svg class="flow" viewBox="0 0 920 500" role="img" aria-labelledby="flow-title flow-desc">
+            <title id="flow-title">sem cloud consent flow</title>
+            <desc id="flow-desc">Login stores credentials only. Enable asks for public repo consent. Share asks for private repo confirmation. Decline and never keep sem local.</desc>
+            <defs>
+              <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                <path d="M0,0 L0,6 L9,3 z" fill="var(--gray-500)"></path>
+              </marker>
+            </defs>
+
+            <g class="node" transform="translate(30 52)">
+              <rect width="150" height="70" rx="12"></rect>
+              <text x="20" y="31">sem login</text>
+              <text class="sub" x="20" y="51">credentials only</text>
+            </g>
+            <path class="edge" d="M180 87 H270"></path>
+
+            <g class="node warn" transform="translate(270 42)">
+              <polygon points="75,0 150,45 75,90 0,45"></polygon>
+              <text x="38" y="41">repo</text>
+              <text x="32" y="59">public?</text>
+            </g>
+            <path class="edge ok" d="M420 87 H515"></path>
+            <text class="edge-label" x="450" y="74">yes</text>
+            <path class="edge bad" d="M345 132 V205"></path>
+            <text class="edge-label" x="357" y="172">no / unknown</text>
+
+            <g class="node ok" transform="translate(515 52)">
+              <rect width="170" height="70" rx="12"></rect>
+              <text x="20" y="31">cloud enable</text>
+              <text class="sub" x="20" y="51">asks [y/N]</text>
+            </g>
+            <path class="edge ok" d="M685 87 H770"></path>
+
+            <g class="node ok" transform="translate(770 52)">
+              <rect width="120" height="70" rx="12"></rect>
+              <text x="18" y="31">enabled</text>
+              <text class="sub" x="18" y="51">public</text>
+            </g>
+
+            <g class="node bad" transform="translate(250 205)">
+              <rect width="190" height="76" rx="12"></rect>
+              <text x="20" y="32">cloud share</text>
+              <text class="sub" x="20" y="53">type repo name</text>
+            </g>
+            <path class="edge ok" d="M440 243 H560"></path>
+            <g class="node ok" transform="translate(560 205)">
+              <rect width="145" height="76" rx="12"></rect>
+              <text x="20" y="32">shared</text>
+              <text class="sub" x="20" y="53">private</text>
+            </g>
+
+            <path class="edge bad" d="M600 122 V155 H154 V330"></path>
+            <path class="edge bad" d="M345 281 V330 H154"></path>
+            <g class="node bad" transform="translate(70 330)">
+              <rect width="168" height="76" rx="12"></rect>
+              <text x="20" y="32">decline / never</text>
+              <text class="sub" x="20" y="53">local only</text>
+            </g>
+
+            <path class="edge ok" d="M830 122 V380 H690"></path>
+            <path class="edge ok" d="M632 281 V380"></path>
+            <g class="node ok" transform="translate(500 340)">
+              <rect width="190" height="80" rx="12"></rect>
+              <text x="20" y="34">impact/context</text>
+              <text class="sub" x="20" y="56">cloud if clean + ready</text>
+            </g>
+
+            <path class="edge" d="M500 380 H360"></path>
+            <g class="node" transform="translate(240 340)">
+              <rect width="120" height="80" rx="12"></rect>
+              <text x="20" y="34">fallback</text>
+              <text class="sub" x="20" y="56">local graph</text>
+            </g>
+          </svg>
+        </div>
+      </section>
+
+      <section id="states">
+        <h2>Consent states</h2>
+        <p class="section-desc">The state machine is intentionally small. It is stored per normalized remote URL in <code>~/.sem/cloud.json</code>.</p>
+        <div class="choice-grid">
+          <article class="choice ok">
+            <div class="state-k">enabled</div>
+            <h3>Public repo</h3>
+            <p><code>sem cloud enable</code> confirms GitHub says the repo is public, then asks before registration.</p>
+          </article>
+          <article class="choice warn">
+            <div class="state-k">shared</div>
+            <h3>Private repo</h3>
+            <p><code>sem cloud share</code> requires typing the repo name and warns that sem can technically read the parsed index.</p>
+          </article>
+          <article class="choice bad">
+            <div class="state-k">never</div>
+            <h3>Stay local</h3>
+            <p><code>sem cloud never</code> records a no-cloud decision for this repo, or suppresses the discovery tip globally outside a repo.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="copy">
+        <h2>What the user sees</h2>
+        <p class="section-desc">The CLI copy makes the data boundary visible before any approving choice.</p>
+        <div class="terminal">
+          <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="terminal-title">sem cloud enable</span></div>
+<pre><span class="cmd">$ sem cloud enable</span>
+Cloud queries send: <strong>this repo's URL + the entity/file names you query, linked to your account.</strong>
+This is <span class="bad-text">not anonymous</span> — it's tied to your sem account.
+
+<span class="ok-text">No query has left this machine yet.</span>
+
+Enable cloud queries for ataraxy-labs/sem? [y/N]</pre>
+        </div>
+        <div class="terminal">
+          <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="terminal-title">sem cloud share</span></div>
+<pre><span class="cmd">$ sem cloud share</span>
+Sharing a <span class="bad-text">PRIVATE</span> repo uploads its parsed index to sem cloud:
+  • <strong>encrypted at rest, isolated</strong> per tenant. <span class="bad-text">NOT end-to-end</span>: sem can technically read it.
+  • undo anytime — delete everything with <strong>sem cloud forget</strong>.
+
+Type the repo name to confirm (ataraxy-labs/private-repo):</pre>
+        </div>
+      </section>
+
+      <section id="data">
+        <h2>Data boundary</h2>
+        <p class="section-desc">The product promise is concrete: show what may leave the machine, what never leaves, and where the user can inspect the ledger.</p>
+        <table>
+          <thead><tr><th>Surface</th><th>When</th><th>Data</th></tr></thead>
+          <tbody>
+            <tr><td>login</td><td>When the user authenticates</td><td>Credentials are saved. No repo is registered and no query is sent.</td></tr>
+            <tr><td>register</td><td>After enable/share consent</td><td>Normalized clone URL and visibility (<code>public</code> or <code>private</code>).</td></tr>
+            <tr><td>impact/context</td><td>Only after active consent and clean working tree</td><td>Repo id, target entity, target file path, and context budget where relevant.</td></tr>
+            <tr><td>preview</td><td>Any time inside a repo</td><td>Sends nothing; prints the exact request shape.</td></tr>
+            <tr><td>log</td><td>Any time</td><td>Reads local <code>~/.sem/cloud-log.jsonl</code>; sends nothing.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout">
+          <div class="ico">!</div>
+          <p><strong>Private repositories are never silently uploaded.</strong> If GitHub does not confirm a repo is public, <code>sem cloud enable</code> stops and points to the louder <code>sem cloud share</code> flow.</p>
+        </div>
+      </section>
+
+      <section id="controls">
+        <h2>User controls</h2>
+        <div class="steps">
+          <div class="step"><div class="badge">1</div><div><div class="step-loc">sem cloud status</div><p>Shows account, endpoint, telemetry mode, this repo's state, and the list of active cloud-enabled repos.</p></div></div>
+          <div class="step"><div class="badge">2</div><div><div class="step-loc">sem cloud preview</div><p>Shows the exact cloud request without sending it. This is the transparency screen for security review.</p></div></div>
+          <div class="step"><div class="badge">3</div><div><div class="step-loc">sem cloud log</div><p>Prints the local outbound ledger: timestamp, normalized repo, request kind, and detail.</p></div></div>
+          <div class="step"><div class="badge">4</div><div><div class="step-loc">sem cloud forget</div><p>Asks for confirmation, deletes the cloud index if possible, clears local consent, evicts repo cache, and records the deletion locally.</p></div></div>
+        </div>
+      </section>
+
+      <section id="runtime">
+        <h2>Runtime routing</h2>
+        <p class="section-desc">Cloud is a fast path, not the only path. If consent is absent, the repo is dirty, network is disabled, or the cloud repo is not ready, sem falls back to local graph computation.</p>
+        <table>
+          <thead><tr><th>Condition</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>no consent</td><td>Local execution. No cloud request.</td></tr>
+            <tr><td>dirty working tree</td><td>Local execution so answers reflect uncommitted changes.</td></tr>
+            <tr><td>SEM_LOCAL=1</td><td>Cloud routing disabled.</td></tr>
+            <tr><td>SEM_NO_NETWORK=1</td><td>Cloud, telemetry upload, and update checks disabled.</td></tr>
+            <tr><td>SEM_CLOUD=1</td><td>CI/code-reviewed opt-in path that treats cloud as enabled.</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    document.querySelector('.theme-toggle').addEventListener('click', function () {
+      const root = document.documentElement;
+      const dark = root.classList.toggle('dark');
+      localStorage.setItem('sem-doc-theme', dark ? 'dark' : 'light');
+    });
+  </script>
+</body>
+</html>

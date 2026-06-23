@@ -22,6 +22,7 @@ bench_*.py
 bench_*.sh
 demo.*
 docs/*.html
+!docs/cloud-consent.html
 hero.svg
 
 # Nixos artifacts

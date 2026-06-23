@@ -238,7 +238,11 @@ pub fn enable(cwd: &str) {
 
     match state_for(&remote) {
         Some(ConsentState::Enabled) => {
-            println!("{} Cloud is already enabled for {}.", "ok".green().bold(), name.bold());
+            println!(
+                "{} Cloud is already enabled for {}.",
+                "ok".green().bold(),
+                name.bold()
+            );
             return;
         }
         Some(ConsentState::Shared) => {
@@ -253,7 +257,10 @@ pub fn enable(cwd: &str) {
     }
 
     let Some(client) = CloudClient::from_credentials() else {
-        eprintln!("{} Cloud is disabled by environment (SEM_LOCAL / SEM_NO_NETWORK).", "error:".red().bold());
+        eprintln!(
+            "{} Cloud is disabled by environment (SEM_LOCAL / SEM_NO_NETWORK).",
+            "error:".red().bold()
+        );
         return;
     };
 
@@ -274,10 +281,12 @@ pub fn enable(cwd: &str) {
 
     println!(
         "Cloud queries send: {} It is stored to serve faster queries.",
-        "this repo's URL + the entity/file names you query, linked to your account."
-            .bold()
+        "this repo's URL + the entity/file names you query, linked to your account.".bold()
     );
-    println!("This is {} — it's tied to your sem account.", "not anonymous".yellow());
+    println!(
+        "This is {} — it's tied to your sem account.",
+        "not anonymous".yellow()
+    );
     println!();
     println!("{}", "No query has left this machine yet.".green());
     println!();
@@ -293,7 +302,11 @@ pub fn enable(cwd: &str) {
     set_state(&remote, ConsentState::Enabled);
     record_outbound(&remote, "register", "public");
 
-    println!("{} Cloud enabled for {}. Registering…", "ok".green().bold(), name.bold());
+    println!(
+        "{} Cloud enabled for {}. Registering…",
+        "ok".green().bold(),
+        name.bold()
+    );
     match client.register(&remote, "public") {
         Ok(repo) => report_repo_status(&repo),
         Err(e) => eprintln!(
@@ -338,19 +351,29 @@ pub fn share(cwd: &str) {
 
     let typed = read_line();
     if typed != name {
-        println!("{} Names didn't match. Staying local. Nothing was sent.", "ok".green().bold());
+        println!(
+            "{} Names didn't match. Staying local. Nothing was sent.",
+            "ok".green().bold()
+        );
         return;
     }
 
     let Some(client) = CloudClient::from_credentials() else {
-        eprintln!("{} Cloud is disabled by environment (SEM_LOCAL / SEM_NO_NETWORK).", "error:".red().bold());
+        eprintln!(
+            "{} Cloud is disabled by environment (SEM_LOCAL / SEM_NO_NETWORK).",
+            "error:".red().bold()
+        );
         return;
     };
 
     set_state(&remote, ConsentState::Shared);
     record_outbound(&remote, "register", "private");
 
-    println!("{} Sharing {}. Registering…", "ok".green().bold(), name.bold());
+    println!(
+        "{} Sharing {}. Registering…",
+        "ok".green().bold(),
+        name.bold()
+    );
     match client.register(&remote, "private") {
         Ok(repo) => report_repo_status(&repo),
         Err(e) => eprintln!(
@@ -361,7 +384,11 @@ pub fn share(cwd: &str) {
 }
 
 fn report_repo_status(repo: &cloud::CloudRepoResponse) {
-    let status = if repo.status.is_empty() { "pending" } else { &repo.status };
+    let status = if repo.status.is_empty() {
+        "pending"
+    } else {
+        &repo.status
+    };
     match status {
         "ready" => println!(
             "  {} indexed — impact/context now answer from the cloud.",
@@ -525,13 +552,20 @@ pub fn preview(cwd: &str) {
     }
     println!();
     println!("  POST {}/v1/repos/<id>/impact", endpoint);
-    println!("  Authorization: Bearer {}   {}", acct, "(your account)".dimmed());
+    println!(
+        "  Authorization: Bearer {}   {}",
+        acct,
+        "(your account)".dimmed()
+    );
     println!("  {{");
     println!("    \"targetEntity\": \"<the entity you query>\",");
     println!("    \"targetFile\":   \"<its file path within the repo>\"");
     println!("  }}");
     println!();
-    println!("On enable, the repo's clone URL ({}) is sent once to register it.", normalize_remote_url(&remote).dimmed());
+    println!(
+        "On enable, the repo's clone URL ({}) is sent once to register it.",
+        normalize_remote_url(&remote).dimmed()
+    );
     println!(
         "{}",
         "No file contents, no environment, no other repos are ever sent.".green()
@@ -629,7 +663,11 @@ pub fn forget(cwd: &str) {
 
     if let Some(client) = CloudClient::from_credentials() {
         match client.forget_repo(&remote) {
-            Ok(true) => println!("{} Deleted {} from the cloud.", "ok".green().bold(), name.bold()),
+            Ok(true) => println!(
+                "{} Deleted {} from the cloud.",
+                "ok".green().bold(),
+                name.bold()
+            ),
             Ok(false) => println!(
                 "{} {} wasn't registered in the cloud.",
                 "ok".green().bold(),

@@ -191,12 +191,21 @@ pub fn impact_command(opts: ImpactOptions) {
                         );
                         timings.mark("entity_lookup");
                         match opts.mode {
-                            ImpactMode::Tests => {
-                                print_tests(&graph, entity, &all_entities, opts.json, &registry.custom_test_dirs)
-                            }
-                            ImpactMode::All => {
-                                print_all(&graph, entity, &all_entities, opts.json, opts.depth, &registry.custom_test_dirs)
-                            }
+                            ImpactMode::Tests => print_tests(
+                                &graph,
+                                entity,
+                                &all_entities,
+                                opts.json,
+                                &registry.custom_test_dirs,
+                            ),
+                            ImpactMode::All => print_all(
+                                &graph,
+                                entity,
+                                &all_entities,
+                                opts.json,
+                                opts.depth,
+                                &registry.custom_test_dirs,
+                            ),
                             _ => unreachable!(),
                         }
                     }
@@ -248,10 +257,21 @@ pub fn impact_command(opts: ImpactOptions) {
                 );
                 timings.mark("entity_lookup");
                 match opts.mode {
-                    ImpactMode::Tests => print_tests(&graph, entity, &all_entities, opts.json, &registry.custom_test_dirs),
-                    ImpactMode::All => {
-                        print_all(&graph, entity, &all_entities, opts.json, opts.depth, &registry.custom_test_dirs)
-                    }
+                    ImpactMode::Tests => print_tests(
+                        &graph,
+                        entity,
+                        &all_entities,
+                        opts.json,
+                        &registry.custom_test_dirs,
+                    ),
+                    ImpactMode::All => print_all(
+                        &graph,
+                        entity,
+                        &all_entities,
+                        opts.json,
+                        opts.depth,
+                        &registry.custom_test_dirs,
+                    ),
                     _ => unreachable!(),
                 }
             }

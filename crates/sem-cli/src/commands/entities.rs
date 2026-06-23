@@ -205,7 +205,10 @@ fn print_entity_rows(entities: &[SemanticEntity], base_indent: &str) {
 }
 
 fn entities_by_id(entities: &[SemanticEntity]) -> HashMap<&str, &SemanticEntity> {
-    entities.iter().map(|entity| (entity.id.as_str(), entity)).collect()
+    entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect()
 }
 
 fn entity_indent(
@@ -213,7 +216,10 @@ fn entity_indent(
     entities_by_id: &HashMap<&str, &SemanticEntity>,
     base_indent: &str,
 ) -> String {
-    format!("{base_indent}{}", "  ".repeat(entity_depth(entity, entities_by_id)))
+    format!(
+        "{base_indent}{}",
+        "  ".repeat(entity_depth(entity, entities_by_id))
+    )
 }
 
 fn entity_depth(entity: &SemanticEntity, entities_by_id: &HashMap<&str, &SemanticEntity>) -> usize {
