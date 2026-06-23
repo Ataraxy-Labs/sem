@@ -14,6 +14,13 @@ use std::collections::HashSet;
 
 use crate::model::entity::SemanticEntity;
 use crate::parser::graph::EntityGraph;
+use crate::parser::test_detect::is_test_path;
+
+/// Multiplier applied to entities in test files. Test functions often have
+/// descriptive names that match a query strongly (e.g. a test literally named
+/// after the behavior), but the implementation is almost always what the user
+/// wants. This keeps tests findable while letting real code outrank them.
+const TEST_PENALTY: f64 = 0.4;
 
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "to", "for", "of", "in", "on", "and", "or", "is", "it", "add", "fix", "make",
@@ -140,6 +147,11 @@ pub fn orient(
             let dependencies = graph.get_dependencies(&e.id).len();
             let dependents = graph.get_dependents(&e.id).len();
             let centrality = ((dependencies + dependents) as f64 + 1.0).ln();
+            let test_factor = if is_test_path(&e.file_path) {
+                TEST_PENALTY
+            } else {
+                1.0
+            };
             OrientHit {
                 id: e.id.clone(),
                 name: e.name.clone(),
@@ -149,7 +161,7 @@ pub fn orient(
                 signature: e.content.lines().next().unwrap_or("").trim().to_string(),
                 dependencies,
                 dependents,
-                score: lexical * 10.0 + centrality,
+                score: (lexical * 10.0 + centrality) * test_factor,
             }
         })
         .collect();
@@ -189,5 +201,40 @@ mod tests {
             dependencies: Default::default(),
         };
         assert!(orient(&[], &g, "the a of", 5).is_empty());
+    }
+
+    fn ent(name: &str, file: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: format!("{file}::function::{name}"),
+            file_path: file.to_string(),
+            entity_type: "function".to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            content: format!("fn {name}() {{}}"),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 1,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn implementation_outranks_equivalently_named_test() {
+        let g = EntityGraph {
+            entities: Default::default(),
+            edges: Default::default(),
+            dependents: Default::default(),
+            dependencies: Default::default(),
+        };
+        // Same name/lexical match; only the file path differs.
+        let entities = vec![
+            ent("parse_config", "tests/config_test.rs"),
+            ent("parse_config", "src/config.rs"),
+        ];
+        let hits = orient(&entities, &g, "parse config", 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].file_path, "src/config.rs"); // impl first
+        assert!(hits[0].score > hits[1].score);
     }
 }
