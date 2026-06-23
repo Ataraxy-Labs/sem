@@ -29,13 +29,16 @@ const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
     (functions/classes/methods plus a real cross-file call and import graph). \
     Prefer these over grep/find for structural questions:\n\
     - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
-    - \"understand X with its real callers and callees\" -> sem_context (not reading whole files)\n\
+    - \"read / understand the function or class X\" -> sem_context (returns X's full source PLUS its callers and callees, addressed by name, not by line range; use this instead of opening the file to read code)\n\
     - \"where is X / find the code that does Y\" (you don't know the name) -> sem_entities with a `query` (ranked structural search), not grep\n\
     - \"list the entities in this file/dir\" -> sem_entities with a `path`\n\
     - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
     Use grep/find only for text/string search, error messages, config keys, \
-    discovery by an unknown name, and non-code files. sem is deterministic and \
-    cross-file, so it won't hallucinate edges or miss callers the way a text search does.";
+    discovery by an unknown name, and non-code files. Open/read a source file \
+    directly only to edit it (editors require reading the file first) or for \
+    non-code/config; to merely understand code, sem_context is faster and arrives \
+    with the dependency context. sem is deterministic and cross-file, so it won't \
+    hallucinate edges or miss callers the way a text search does.";
 
 const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
 

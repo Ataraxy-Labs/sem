@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The `sem mcp` instructions now tell agents to read code with `sem_context` (which returns an entity's full source plus its callers/callees, addressed by name) rather than opening the file, reserving direct file reads for editing and non-code. Reading by entity is robust to line drift and arrives with the dependency context.
+
 ## [0.14.1] - 2026-06-23
 
 ### Fixed
