@@ -6,6 +6,10 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- `self-update` Cargo feature (on by default) gates the built-in `sem update` and the background update-available check. Distro and package-manager builds that own the binary's lifecycle can opt out with `cargo build --no-default-features`; `sem update` then prints a "update through your package manager" message instead of replacing the binary. Thanks @0323pin (pkgsrc/NetBSD) for the request (#390).
+
+### Added
+
 - `sem context --hops N` bounds the related entities to N graph hops from the target (instead of filling to the token budget), so you can ask for "the entity and just its immediate neighborhood." The `sem_context` MCP tool gains the same `hops` parameter. 0 (the default) keeps the existing unbounded, budget-driven behavior.
 
 ### Changed

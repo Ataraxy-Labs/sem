@@ -50,6 +50,12 @@ pkg-url = "{ repo }/releases/download/v{ version }/sem-windows-x86_64.zip"
 pkg-fmt = "zip"
 
 [features]
+default = ["self-update"]
+# Built-in `sem update` (downloads and replaces the binary) and the background
+# update-available check. On by default for the curl/npm installs; distro and
+# package-manager builds that own the binary lifecycle can opt out with
+# `--no-default-features` so the binary never tries to update itself.
+self-update = []
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dev-dependencies]
