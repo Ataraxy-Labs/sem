@@ -309,6 +309,10 @@ enum Commands {
         #[arg(long, default_value = "8000")]
         budget: usize,
 
+        /// Bound related entities to this many graph hops from the target (0 = unbounded)
+        #[arg(long, default_value = "0")]
+        hops: usize,
+
         /// Output format
         #[arg(long, value_parser = ["terminal", "json"])]
         format: Option<String>,
@@ -619,6 +623,7 @@ fn main() {
             entity_id,
             file,
             budget,
+            hops,
             format,
             json,
             file_exts,
@@ -634,6 +639,7 @@ fn main() {
                 entity_id,
                 file_path: file,
                 budget,
+                hops,
                 json: resolve_json(format, json),
                 file_exts,
                 no_cache,

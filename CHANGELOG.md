@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `sem context --hops N` bounds the related entities to N graph hops from the target (instead of filling to the token budget), so you can ask for "the entity and just its immediate neighborhood." The `sem_context` MCP tool gains the same `hops` parameter. 0 (the default) keeps the existing unbounded, budget-driven behavior.
+
 ### Changed
 
 - The `sem mcp` instructions now tell agents to read code with `sem_context` (which returns an entity's full source plus its callers/callees, addressed by name) rather than opening the file, reserving direct file reads for editing and non-code. Reading by entity is robust to line drift and arrives with the dependency context.

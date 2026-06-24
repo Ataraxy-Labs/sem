@@ -95,6 +95,10 @@ pub struct ContextParams {
     #[schemars(description = "Maximum token budget. Defaults to 8000.")]
     pub token_budget: Option<usize>,
     #[schemars(
+        description = "Bound related entities to this many graph hops from the target (0 or omitted = unbounded, fill to the token budget). Use e.g. 1-2 for the immediate neighborhood."
+    )]
+    pub hops: Option<usize>,
+    #[schemars(
         description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
     )]
     pub no_default_excludes: Option<bool>,
