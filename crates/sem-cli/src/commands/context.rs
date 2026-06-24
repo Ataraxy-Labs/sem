@@ -2,7 +2,7 @@ use std::path::Path;
 
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
-use sem_core::parser::context::build_context_result;
+use sem_core::parser::context::build_context_result_bounded;
 use sem_core::parser::graph::EntityGraph;
 
 pub struct ContextOptions {
@@ -11,6 +11,8 @@ pub struct ContextOptions {
     pub entity_id: Option<String>,
     pub file_path: Option<String>,
     pub budget: usize,
+    /// Bound transitive related entities to this many graph hops (0 = unbounded).
+    pub hops: usize,
     pub json: bool,
     pub file_exts: Vec<String>,
     pub no_cache: bool,
@@ -57,7 +59,8 @@ pub fn context_command(opts: ContextOptions) {
         opts.entity_id.as_deref(),
         file_path.as_deref(),
     );
-    let context_result = build_context_result(&graph, &entity.id, &all_entities, opts.budget);
+    let context_result =
+        build_context_result_bounded(&graph, &entity.id, &all_entities, opts.budget, opts.hops);
 
     if opts.json {
         let output = serde_json::json!({

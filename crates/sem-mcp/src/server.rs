@@ -1318,11 +1318,13 @@ impl SemServer {
         };
 
         let budget = params.token_budget.unwrap_or(8000);
-        let context_result = sem_core::parser::context::build_context_result(
+        let hops = params.hops.unwrap_or(0);
+        let context_result = sem_core::parser::context::build_context_result_bounded(
             &graph,
             entity_id,
             &all_entities,
             budget,
+            hops,
         );
 
         let result: Vec<serde_json::Value> = context_result
@@ -2065,6 +2067,7 @@ mod tests {
                 file_path: "src/generated/schema.ts".to_string(),
                 entity_name: "generatedTarget".to_string(),
                 token_budget: Some(2000),
+                hops: None,
                 no_default_excludes: Some(true),
             }))
             .await
@@ -2091,6 +2094,7 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "known_entity".to_string(),
                 token_budget: None,
+                hops: None,
                 no_default_excludes: None,
             }))
             .await
@@ -2115,6 +2119,7 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "nonexistent_zzz".to_string(),
                 token_budget: None,
+                hops: None,
                 no_default_excludes: None,
             }))
             .await

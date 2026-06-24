@@ -54,12 +54,26 @@ pub fn build_context(
     build_context_result(graph, entity_id, all_entities, token_budget).entries
 }
 
-/// Build a context set plus budget metadata for a target entity.
+/// Build a context set plus budget metadata for a target entity. Unbounded
+/// transitive reach (capped only by the token budget).
 pub fn build_context_result(
     graph: &EntityGraph,
     entity_id: &str,
     all_entities: &[SemanticEntity],
     token_budget: usize,
+) -> ContextResult {
+    build_context_result_bounded(graph, entity_id, all_entities, token_budget, 0)
+}
+
+/// Like [`build_context_result`], but bounds transitive related entities to
+/// `max_hops` graph hops from the target (0 = unbounded). Lets callers ask for
+/// "the entity and everything within N hops" instead of "fill the token budget".
+pub fn build_context_result_bounded(
+    graph: &EntityGraph,
+    entity_id: &str,
+    all_entities: &[SemanticEntity],
+    token_budget: usize,
+    max_hops: usize,
 ) -> ContextResult {
     // Build content lookup: entity_id -> SemanticEntity
     let entity_lookup: HashMap<&str, &SemanticEntity> =
@@ -132,7 +146,7 @@ pub fn build_context_result(
     let direct_dependent_ids: HashSet<&str> =
         direct_dependents.iter().map(|d| d.id.as_str()).collect();
 
-    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependencies) {
+    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependencies, max_hops) {
         if direct_dependency_ids.contains(dep_info.id.as_str()) {
             continue;
         }
@@ -146,7 +160,7 @@ pub fn build_context_result(
         );
     }
 
-    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependents) {
+    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependents, max_hops) {
         if direct_dependent_ids.contains(dep_info.id.as_str()) {
             continue;
         }
@@ -249,16 +263,19 @@ fn add_signature(
     }
 }
 
-/// Collect related entities reachable from `entity_id`, excluding the starting entity.
+/// Collect related entities reachable from `entity_id`, excluding the starting
+/// entity. `max_hops` of 0 means unbounded (capped only by MAX_VISITED);
+/// otherwise the BFS stops expanding past that many hops.
 fn collect_reachable_related<'a>(
     graph: &'a EntityGraph,
     entity_id: &str,
     relationships: &'a EntityAdjacencyMap,
+    max_hops: usize,
 ) -> Vec<&'a crate::parser::graph::EntityInfo> {
     const MAX_VISITED: usize = 10_000;
 
     let mut visited: HashSet<&str> = HashSet::new();
-    let mut queue: VecDeque<&str> = VecDeque::new();
+    let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
     let mut result = Vec::new();
 
     let start_key = match graph.entities.get_key_value(entity_id) {
@@ -266,12 +283,15 @@ fn collect_reachable_related<'a>(
         None => return result,
     };
 
-    queue.push_back(start_key);
+    queue.push_back((start_key, 0));
     visited.insert(start_key);
 
-    while let Some(current) = queue.pop_front() {
+    while let Some((current, depth)) = queue.pop_front() {
         if result.len() >= MAX_VISITED {
             break;
+        }
+        if max_hops > 0 && depth >= max_hops {
+            continue;
         }
 
         if let Some(next_ids) = relationships.get(current) {
@@ -283,7 +303,7 @@ fn collect_reachable_related<'a>(
                             return result;
                         }
                     }
-                    queue.push_back(next_id.as_str());
+                    queue.push_back((next_id.as_str(), depth + 1));
                 }
             }
         }
@@ -431,9 +451,32 @@ mod tests {
 
         let graph = graph_from_entities(&entities, edges);
         let result =
-            collect_reachable_related(&graph, "a.py::function::helper_0", &graph.dependencies);
+            collect_reachable_related(&graph, "a.py::function::helper_0", &graph.dependencies, 0);
 
         assert_eq!(result.len(), 10_000);
+    }
+
+    #[test]
+    fn collect_reachable_related_respects_max_hops() {
+        // Chain: a -> b -> c -> d (each depends on the next).
+        let ids = ["a.py::function::a", "a.py::function::b", "a.py::function::c", "a.py::function::d"];
+        let entities: Vec<SemanticEntity> = ids
+            .iter()
+            .map(|id| entity(id, id.rsplit("::").next().unwrap(), "fn x() {}"))
+            .collect();
+        let edges = vec![
+            edge(ids[0], ids[1]),
+            edge(ids[1], ids[2]),
+            edge(ids[2], ids[3]),
+        ];
+        let graph = graph_from_entities(&entities, edges);
+
+        let hop1 = collect_reachable_related(&graph, ids[0], &graph.dependencies, 1);
+        assert_eq!(hop1.len(), 1, "1 hop reaches only b");
+        let hop2 = collect_reachable_related(&graph, ids[0], &graph.dependencies, 2);
+        assert_eq!(hop2.len(), 2, "2 hops reach b and c");
+        let unbounded = collect_reachable_related(&graph, ids[0], &graph.dependencies, 0);
+        assert_eq!(unbounded.len(), 3, "unbounded reaches b, c, d");
     }
 
     fn entity(id: &str, name: &str, content: &str) -> SemanticEntity {
