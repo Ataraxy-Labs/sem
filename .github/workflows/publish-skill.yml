@@ -1,0 +1,32 @@
+name: Publish sem-skill
+
+# Publishes the @ataraxy-labs/sem-skill npm package (the npx installer for the
+# sem agent skill + MCP server). Manual trigger only — the skill versions
+# independently of the sem CLI release, so it isn't tied to the Rust release.
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # prepack syncs the canonical skills/sem/SKILL.md into the package.
+      - name: Check package contents
+        working-directory: agent-skill
+        run: npm pack --dry-run
+
+      - name: Publish
+        working-directory: agent-skill
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
