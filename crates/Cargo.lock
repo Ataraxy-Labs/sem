@@ -1587,12 +1587,22 @@ dependencies = [
  "mimalloc",
  "openssl-sys",
  "rusqlite",
+ "sem-cloud-client",
  "sem-core",
  "sem-mcp",
  "serde",
  "serde_json",
  "similar",
  "tempfile",
+ "ureq",
+]
+
+[[package]]
+name = "sem-cloud-client"
+version = "0.14.1"
+dependencies = [
+ "serde",
+ "serde_json",
  "ureq",
 ]
 
@@ -1658,6 +1668,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "schemars",
+ "sem-cloud-client",
  "sem-core",
  "serde",
  "serde_json",

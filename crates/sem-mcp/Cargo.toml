@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 sem-core = { path = "../sem-core", version = "0.14.1" }
+sem-cloud-client = { path = "../sem-cloud-client", version = "0.14.1" }
 git2 = "0.20"
 lru = "0.16"
 rmcp = { version = "1", features = ["server", "transport-io"] }

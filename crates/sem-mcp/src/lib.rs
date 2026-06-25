@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod cloud;
 pub mod server;
 pub mod tools;
 mod transport;
