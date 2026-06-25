@@ -6,6 +6,10 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- `npx @ataraxy-labs/sem-skill`: one-command setup of sem for coding agents. Installs the sem skill into `~/.claude/skills/` and registers the `sem mcp` server, so an agent uses sem (impact / context / orient / diff) over grep for structural questions without manual setup. Builds on the skill contributed in #376.
+
+### Added
+
 - An agent skill (`skills/sem/SKILL.md`) documenting sem's semantic diff, impact, blame, history, context, and graph workflows for coding agents. Thanks @linhlban150612 for the contribution (#376).
 - `self-update` Cargo feature (on by default) gates the built-in `sem update` and the background update-available check. Distro and package-manager builds that own the binary's lifecycle can opt out with `cargo build --no-default-features`; `sem update` then prints a "update through your package manager" message instead of replacing the binary. Thanks @0323pin (pkgsrc/NetBSD) for the request (#390).
 
