@@ -5359,6 +5359,42 @@ int caller() { return helper(); }
     }
 
     #[test]
+    fn test_rust_self_method_call_resolves_with_separate_struct_and_impl() {
+        // Regression: in idiomatic Rust the `impl` block sits on a different line
+        // than `struct S;`, so the impl'd type wasn't found at the impl's line and
+        // no class scope was created — `self.helper()` then resolved to nothing,
+        // silently dropping self-call edges for essentially all real Rust.
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "svc.rs",
+            "\
+struct Service;
+impl Service {
+    fn helper(&self) -> i32 { 42 }
+    fn run(&self) -> i32 { self.helper() + 1 }
+}
+",
+        );
+
+        let (graph, _) = EntityGraph::build(root, &["svc.rs".into()], &registry);
+
+        let run_id = graph
+            .entities
+            .keys()
+            .find(|id| id.contains("run"))
+            .expect("run entity should exist");
+        let deps = graph.get_dependencies(run_id);
+        assert!(
+            deps.iter().any(|dep| dep.name == "helper"),
+            "run() should depend on helper() via self.helper(). Deps: {:?}",
+            deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_strip_comments_and_strings_preserves_newlines_and_utf8() {
         let content = "\
 const value = \"é\\

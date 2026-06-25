@@ -1621,7 +1621,42 @@ fn build_scopes_from_ast(
 
                 push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
                 continue;
-            } else if !is_impl {
+            } else if is_impl {
+                // The impl'd type is usually defined elsewhere (idiomatic Rust:
+                // `struct S;` then `impl S { ... }` on a later line; likewise a
+                // Swift `extension`), so find_at_line above couldn't locate it at
+                // the impl's own line. Anchor the scope on the impl entity itself
+                // and register its methods, so `self.method()` calls inside the
+                // impl resolve to sibling methods instead of being dropped.
+                let impl_entity = file_lookup
+                    .find_at_line(class_name, line, |entity| entity.entity_type == "impl");
+                let class_scope_idx = scopes.len();
+                scopes.push(Scope {
+                    parent: Some(current_scope),
+                    defs: HashMap::default(),
+                    bindings: HashSet::default(),
+                    binding_rows: HashMap::default(),
+                    types: HashMap::default(),
+                    pending_call_types: HashMap::default(),
+                    pending_field_types: HashMap::default(),
+                    owner_id: impl_entity.map(|ie| ie.id.clone()),
+                    kind: "class",
+                });
+                if let Some(ie) = impl_entity {
+                    entity_scope_map.insert(ie.id.clone(), current_scope);
+                    entity_inner_scope.insert(ie.id.clone(), class_scope_idx);
+                    if let Some(children) = children_by_parent.get(ie.id.as_str()) {
+                        for entity in children {
+                            scopes[class_scope_idx]
+                                .defs
+                                .insert(entity.name.clone(), entity.id.clone());
+                            entity_scope_map.insert(entity.id.clone(), class_scope_idx);
+                        }
+                    }
+                }
+                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
+                continue;
+            } else {
                 let class_scope_idx = scopes.len();
                 scopes.push(Scope {
                     parent: Some(current_scope),
