@@ -1396,6 +1396,49 @@ echo "main script"
     }
 
     #[test]
+    #[cfg(feature = "lang-lua")]
+    fn test_lua_entity_extraction() {
+        let code = r#"local M = {}
+
+function greet(name)
+    return "hello " .. name
+end
+
+local function helper(x)
+    return x * 2
+end
+
+function M.compute(a, b)
+    return helper(a) + helper(b)
+end
+
+function M:method(v)
+    return v
+end
+
+return M
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "demo.lua");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        // global, local, table (dot) and method (colon) forms all extract
+        assert!(names.contains(&"greet"), "global function, got: {:?}", names);
+        assert!(names.contains(&"helper"), "local function, got: {:?}", names);
+        assert!(
+            names.contains(&"M.compute"),
+            "table function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"M:method"),
+            "method function, got: {:?}",
+            names
+        );
+        assert_eq!(entities.len(), 4, "only functions, got: {:?}", names);
+    }
+
+    #[test]
     fn test_typescript_entity_extraction() {
         // Existing language should still work
         let code = r#"

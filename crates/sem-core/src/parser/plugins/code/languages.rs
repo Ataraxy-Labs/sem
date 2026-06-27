@@ -390,6 +390,11 @@ fn get_d() -> Option<Language> {
     Some(tree_sitter_d::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-lua")]
+fn get_lua() -> Option<Language> {
+    Some(tree_sitter_lua::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -1253,6 +1258,21 @@ static D_CONFIG: LanguageConfig = LanguageConfig {
     ],
     scope_boundary_types: &["function_body", "block_statement"],
     get_language: get_d,
+    scope_resolve: None,
+};
+
+#[cfg(feature = "lang-lua")]
+static LUA_CONFIG: LanguageConfig = LanguageConfig {
+    id: "lua",
+    extensions: &[".lua"],
+    // tree-sitter-grammars/tree-sitter-lua: `function_declaration` covers
+    // `function f()`, `local function f()`, `function t.a.b()` and `function t:m()`.
+    entity_node_types: &["function_declaration"],
+    container_node_types: &["block"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_lua,
     scope_resolve: None,
 };
 
@@ -2557,6 +2577,8 @@ macro_rules! all_configs {
             &EDN_CONFIG,
             #[cfg(feature = "lang-d")]
             &D_CONFIG,
+            #[cfg(feature = "lang-lua")]
+            &LUA_CONFIG,
         ]
     }};
 }
