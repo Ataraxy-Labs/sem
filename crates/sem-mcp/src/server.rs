@@ -758,12 +758,8 @@ impl SemServer {
         // query (structural search), instead of listing a path.
         if let Some(query) = params.query() {
             let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
-            let hits = sem_core::parser::orient::orient(
-                &all_entities,
-                &graph,
-                query,
-                params.limit(),
-            );
+            let hits =
+                sem_core::parser::orient::orient(&all_entities, &graph, query, params.limit());
             let result: Vec<serde_json::Value> = hits
                 .iter()
                 .map(|h| {

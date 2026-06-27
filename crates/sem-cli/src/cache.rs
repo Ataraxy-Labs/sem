@@ -134,7 +134,7 @@ impl DiskCache {
         // Insert entities with prepared statement (already in a transaction, so fast)
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for e in entities {
                 let metadata_json = e
@@ -148,6 +148,8 @@ impl DiskCache {
                     e.file_path,
                     e.start_line as i64,
                     e.end_line as i64,
+                    e.start_byte.map(|v| v as i64),
+                    e.end_byte.map(|v| v as i64),
                     e.content,
                     e.content_hash,
                     e.structural_hash,
@@ -279,7 +281,7 @@ impl DiskCache {
 
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
             .ok()?;
         let entities: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -292,6 +294,8 @@ impl DiskCache {
                     file_path: row.get(3)?,
                     start_line: row.get::<_, i64>(4)? as usize,
                     end_line: row.get::<_, i64>(5)? as usize,
+                    start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
+                    end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
                     content: row.get(6)?,
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
@@ -1535,7 +1539,7 @@ impl DiskCache {
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
             .ok()?;
         let mut cached_entities = Vec::new();
         let mut stale_file_entities = Vec::new();
@@ -1549,6 +1553,8 @@ impl DiskCache {
                 file_path: row.get(3).ok()?,
                 start_line: row.get::<_, i64>(4).ok()? as usize,
                 end_line: row.get::<_, i64>(5).ok()? as usize,
+                start_byte: row.get::<_, Option<i64>>(11).ok()?.map(|v| v as usize),
+                end_byte: row.get::<_, Option<i64>>(12).ok()?.map(|v| v as usize),
                 content: row.get(6).ok()?,
                 content_hash: row.get(7).ok()?,
                 structural_hash: row.get(8).ok()?,
@@ -1713,7 +1719,7 @@ impl DiskCache {
 
         {
             let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for e in entities {
                 if !repair_changed_clean_entity_ids
@@ -1733,6 +1739,8 @@ impl DiskCache {
                     e.file_path,
                     e.start_line as i64,
                     e.end_line as i64,
+                    e.start_byte.map(|v| v as i64),
+                    e.end_byte.map(|v| v as i64),
                     e.content,
                     e.content_hash,
                     e.structural_hash,
@@ -1964,6 +1972,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 1,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }

@@ -165,7 +165,11 @@ pub fn orient(
             }
         })
         .collect();
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(limit);
     hits
 }
@@ -176,7 +180,10 @@ mod tests {
 
     #[test]
     fn query_terms_drop_stopwords_and_short() {
-        assert_eq!(query_terms("where is the retry logic"), vec!["retry", "logic"]);
+        assert_eq!(
+            query_terms("where is the retry logic"),
+            vec!["retry", "logic"]
+        );
     }
 
     #[test]
@@ -215,6 +222,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 1,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }

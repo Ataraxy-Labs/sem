@@ -1396,6 +1396,33 @@ echo "main script"
     }
 
     #[test]
+    fn test_entity_byte_offsets_slice_source_exactly() {
+        // Byte offsets must let a consumer slice the exact original bytes of an
+        // entity out of the source given only file_path + the span (#requested
+        // by a sem-core user: pull exact content from git by file + entity id).
+        let code =
+            "import os\n\ndef first(a):\n    return a + 1\n\ndef second(b):\n    return b * 2\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "demo.py");
+        let bytes = code.as_bytes();
+        let funcs: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .collect();
+        assert_eq!(funcs.len(), 2, "expected 2 functions, got {:?}", funcs);
+        for e in funcs {
+            let sb = e.start_byte.expect("function entity must carry start_byte");
+            let eb = e.end_byte.expect("function entity must carry end_byte");
+            let sliced = std::str::from_utf8(&bytes[sb..eb]).unwrap();
+            assert!(
+                sliced.starts_with(&format!("def {}", e.name)),
+                "bytes[{sb}..{eb}] = {sliced:?} should be the body of {}",
+                e.name
+            );
+        }
+    }
+
+    #[test]
     #[cfg(feature = "lang-lua")]
     fn test_lua_entity_extraction() {
         let code = r#"local M = {}
@@ -1423,8 +1450,16 @@ return M
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
 
         // global, local, table (dot) and method (colon) forms all extract
-        assert!(names.contains(&"greet"), "global function, got: {:?}", names);
-        assert!(names.contains(&"helper"), "local function, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "global function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "local function, got: {:?}",
+            names
+        );
         assert!(
             names.contains(&"M.compute"),
             "table function, got: {:?}",

@@ -749,6 +749,8 @@ mod tests {
             structural_hash: None,
             start_line,
             end_line,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }

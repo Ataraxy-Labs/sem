@@ -148,6 +148,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                     content: preamble_content,
                     start_line: p_start + 1,
                     end_line: p_end,
+                    start_byte: None,
+                    end_byte: None,
                     metadata: None,
                 });
 
@@ -200,6 +202,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                                 content: def_content,
                                 start_line: p_start + def_start + 1,
                                 end_line: p_start + def_end + 1,
+                                start_byte: None,
+                                end_byte: None,
                                 metadata: None,
                             });
 
@@ -325,6 +329,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                 content: section_content,
                 start_line: section.start_line,
                 end_line: section.start_line + section.lines.len() - 1,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
         }
@@ -437,6 +443,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                 content: env.content.clone(),
                 start_line: env.start_line,
                 end_line: env.end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: Some(metadata),
             });
         }

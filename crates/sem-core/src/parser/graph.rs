@@ -5218,6 +5218,8 @@ export { default as PublicDefault, X as PublicX } from './stale';
             structural_hash: None,
             start_line: 1,
             end_line: 7,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
         let mut child_line_ranges = HashMap::default();
@@ -8856,6 +8858,8 @@ export function caller() {
             file_path: file_path.to_string(),
             start_line: 1,
             end_line: 5,
+            start_byte: None,
+            end_byte: None,
             content: content.to_string(),
             content_hash: String::new(),
             structural_hash: None,

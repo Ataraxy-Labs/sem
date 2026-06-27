@@ -29,7 +29,10 @@ impl EntitiesParams {
     }
 
     pub fn query(&self) -> Option<&str> {
-        self.query.as_deref().map(str::trim).filter(|q| !q.is_empty())
+        self.query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
     }
 
     pub fn limit(&self) -> usize {

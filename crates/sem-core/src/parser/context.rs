@@ -459,7 +459,12 @@ mod tests {
     #[test]
     fn collect_reachable_related_respects_max_hops() {
         // Chain: a -> b -> c -> d (each depends on the next).
-        let ids = ["a.py::function::a", "a.py::function::b", "a.py::function::c", "a.py::function::d"];
+        let ids = [
+            "a.py::function::a",
+            "a.py::function::b",
+            "a.py::function::c",
+            "a.py::function::d",
+        ];
         let entities: Vec<SemanticEntity> = ids
             .iter()
             .map(|id| entity(id, id.rsplit("::").next().unwrap(), "fn x() {}"))
@@ -491,6 +496,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: content.lines().count(),
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }

@@ -829,6 +829,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 1,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }
@@ -1090,6 +1092,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 10,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
         let method_before = SemanticEntity {
@@ -1103,6 +1107,8 @@ mod tests {
             structural_hash: None,
             start_line: 5,
             end_line: 8,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
 
@@ -1117,6 +1123,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 10,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
         let method_after = SemanticEntity {
@@ -1130,6 +1138,8 @@ mod tests {
             structural_hash: None,
             start_line: 5,
             end_line: 8,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
 
@@ -1158,6 +1168,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 5,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
         let method_before = SemanticEntity {
@@ -1171,6 +1183,8 @@ mod tests {
             structural_hash: None,
             start_line: 2,
             end_line: 4,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
 
@@ -1185,6 +1199,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 6,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
         let method_after = SemanticEntity {
@@ -1198,6 +1214,8 @@ mod tests {
             structural_hash: None,
             start_line: 3,
             end_line: 5,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         };
 
@@ -1229,6 +1247,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 1,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }
@@ -1302,6 +1322,8 @@ mod tests {
             structural_hash: None,
             start_line: line,
             end_line: line + 2,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }

@@ -3,8 +3,8 @@ pub mod differ;
 pub mod graph;
 #[cfg(feature = "git")]
 pub mod hotspot;
-pub mod orient;
 mod import_resolution;
+pub mod orient;
 pub mod plugin;
 pub mod plugins;
 pub mod registry;

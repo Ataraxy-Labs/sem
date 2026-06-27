@@ -52,6 +52,8 @@ impl SemanticParserPlugin for CsvParserPlugin {
                 content: line.to_string(),
                 start_line: i + 1,
                 end_line: i + 1,
+                start_byte: None,
+                end_byte: None,
                 metadata: Some(metadata),
             });
         }

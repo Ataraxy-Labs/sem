@@ -31,6 +31,8 @@ impl SemanticParserPlugin for VueParserPlugin {
                 content: block.full_content.clone(),
                 start_line: block.start_line,
                 end_line: block.end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             };
 

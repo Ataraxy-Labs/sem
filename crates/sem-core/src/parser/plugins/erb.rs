@@ -47,6 +47,8 @@ impl SemanticParserPlugin for ErbParserPlugin {
             structural_hash: None,
             start_line: 1,
             end_line: lines.len(),
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         });
 
@@ -82,6 +84,8 @@ impl SemanticParserPlugin for ErbParserPlugin {
                             structural_hash: None,
                             start_line: opener.start_line,
                             end_line: tag.end_line,
+                            start_byte: None,
+                            end_byte: None,
                             metadata: None,
                         });
                     }
@@ -100,6 +104,8 @@ impl SemanticParserPlugin for ErbParserPlugin {
                         structural_hash: None,
                         start_line: tag.start_line,
                         end_line: tag.end_line,
+                        start_byte: None,
+                        end_byte: None,
                         metadata: None,
                     });
                 } // No separate Code variant needed; expressions cover all non-block tags

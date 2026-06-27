@@ -19,6 +19,17 @@ pub struct SemanticEntity {
     pub structural_hash: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
+    /// Byte offset of the entity's first byte in the source file (inclusive).
+    /// `None` for entities from parsers that don't expose byte spans (most
+    /// non-tree-sitter plugins). Set for code entities, where it equals the
+    /// underlying tree-sitter node's `start_byte()`. Lets a consumer slice the
+    /// exact original bytes out of the file given only `file_path` + this span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    /// Byte offset just past the entity's last byte in the source file
+    /// (exclusive), matching tree-sitter's `end_byte()`. `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 }

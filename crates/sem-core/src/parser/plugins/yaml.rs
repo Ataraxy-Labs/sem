@@ -35,6 +35,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                     content: content.to_string(),
                     start_line: 1,
                     end_line: lines.len(),
+                    start_byte: None,
+                    end_byte: None,
                     metadata: None,
                 }];
             }
@@ -72,6 +74,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                         content: preamble_content,
                         start_line: 1,
                         end_line: preamble_end,
+                        start_byte: None,
+                        end_byte: None,
                         metadata: None,
                     });
                 }
@@ -102,6 +106,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                 content: entity_content,
                 start_line: tk.line,
                 end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
         }

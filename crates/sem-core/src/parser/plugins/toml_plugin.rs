@@ -75,7 +75,11 @@ impl SemanticParserPlugin for TomlParserPlugin {
                     vs,
                 )
             } else {
-                (section.key.clone(), "property".to_string(), entity_content.clone())
+                (
+                    section.key.clone(),
+                    "property".to_string(),
+                    entity_content.clone(),
+                )
             };
 
             let id = build_entity_id(file_path, &entity_type, &name, None);
@@ -90,6 +94,8 @@ impl SemanticParserPlugin for TomlParserPlugin {
                 content: entity_content,
                 start_line: section.line,
                 end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
         }

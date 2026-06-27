@@ -155,6 +155,8 @@ fn extract_entries(
                 content: stored_content,
                 start_line: abs_start,
                 end_line: abs_end,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
 
@@ -202,6 +204,8 @@ fn document_chunk_entity(
         content: stored_content,
         start_line: 1,
         end_line: line_count,
+        start_byte: None,
+        end_byte: None,
         metadata: None,
     }
 }

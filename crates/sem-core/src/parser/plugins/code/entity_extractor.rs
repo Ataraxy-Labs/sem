@@ -292,6 +292,8 @@ fn visit_node(
                     content,
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
+                    start_byte: Some(node.start_byte()),
+                    end_byte: Some(node.end_byte()),
                     metadata: None,
                 };
 
@@ -350,6 +352,8 @@ fn visit_node(
                     content,
                     start_line: key.start_position().row + 1,
                     end_line: value.end_position().row + 1,
+                    start_byte: Some(key.start_byte()),
+                    end_byte: Some(value.end_byte()),
                     metadata: None,
                 };
                 entities.push(entity);
@@ -377,6 +381,8 @@ fn visit_node(
                     content,
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
+                    start_byte: Some(node.start_byte()),
+                    end_byte: Some(node.end_byte()),
                     metadata: None,
                 };
                 entities.push(entity);
@@ -414,6 +420,8 @@ fn visit_node(
                             content: content.clone(),
                             start_line: binding.start_position().row + 1,
                             end_line: binding.end_position().row + 1,
+                            start_byte: Some(binding.start_byte()),
+                            end_byte: Some(binding.end_byte()),
                             metadata: None,
                         };
                         entities.push(entity);
@@ -508,6 +516,8 @@ fn visit_node(
                                     content,
                                     start_line: declarator.start_position().row + 1,
                                     end_line: declarator.end_position().row + 1,
+                                    start_byte: Some(declarator.start_byte()),
+                                    end_byte: Some(declarator.end_byte()),
                                     metadata: None,
                                 };
 
@@ -565,6 +575,8 @@ fn visit_node(
                             content: binding.content,
                             start_line: binding.start_line,
                             end_line: binding.end_line,
+                            start_byte: None,
+                            end_byte: None,
                             metadata: None,
                         });
                     }
@@ -618,6 +630,8 @@ fn visit_node(
                                 content,
                                 start_line: spec.start_position().row + 1,
                                 end_line: spec.end_position().row + 1,
+                                start_byte: Some(spec.start_byte()),
+                                end_byte: Some(spec.end_byte()),
                                 metadata: None,
                             };
                             entities.push(entity);
@@ -649,6 +663,8 @@ fn visit_node(
                     content,
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
+                    start_byte: Some(node.start_byte()),
+                    end_byte: Some(node.end_byte()),
                     metadata: None,
                 };
 
@@ -696,6 +712,8 @@ fn visit_node(
                 content,
                 start_line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
+                start_byte: Some(node.start_byte()),
+                end_byte: Some(node.end_byte()),
                 metadata: None,
             };
 
@@ -765,6 +783,8 @@ fn visit_node(
                         content,
                         start_line,
                         end_line,
+                        start_byte: Some(start_byte),
+                        end_byte: Some(end_byte),
                         metadata: None,
                     };
 
@@ -905,6 +925,8 @@ fn emit_js_ts_re_export_entities(
                     content,
                     start_line: child.start_position().row + 1,
                     end_line: child.end_position().row + 1,
+                    start_byte: Some(child.start_byte()),
+                    end_byte: Some(child.end_byte()),
                     metadata: Some(metadata),
                 });
                 emitted = true;
@@ -1033,6 +1055,8 @@ fn recover_swift_conditional_compilation_containers(
             content,
             start_line: container.start_line,
             end_line: container.end_line,
+            start_byte: Some(container.start_byte),
+            end_byte: Some(container.end_byte),
             metadata: None,
         });
     }
@@ -3333,6 +3357,8 @@ fn extract_ocaml_named_bindings(
                 content,
                 start_line: binding.start_position().row + 1,
                 end_line: binding.end_position().row + 1,
+                start_byte: Some(binding.start_byte()),
+                end_byte: Some(binding.end_byte()),
                 metadata: None,
             };
 

@@ -356,6 +356,8 @@ fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
         structural_hash: None,
         start_line: entity.start_line,
         end_line: entity.end_line,
+        start_byte: None,
+        end_byte: None,
         metadata: None,
     }
 }
@@ -380,6 +382,10 @@ struct EntityJsonRow<'a> {
     entity_type: &'a str,
     start_line: usize,
     end_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_byte: Option<usize>,
     parent_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<&'a str>,
@@ -398,6 +404,8 @@ fn write_entities_json(entities: &[SemanticEntity], include_file: bool) -> io::R
             entity_type: &entity.entity_type,
             start_line: entity.start_line,
             end_line: entity.end_line,
+            start_byte: entity.start_byte,
+            end_byte: entity.end_byte,
             parent_id: entity.parent_id.as_deref(),
             file: include_file.then_some(entity.file_path.as_str()),
         };
@@ -532,6 +540,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 1,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }

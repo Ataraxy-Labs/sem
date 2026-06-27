@@ -130,6 +130,8 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
                 content: section_content,
                 start_line: section.start_line,
                 end_line: section.start_line + section.lines.len() - 1,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
         }
