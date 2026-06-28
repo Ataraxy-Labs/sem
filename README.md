@@ -258,9 +258,26 @@ To disable and go back to normal git diff:
 sem unsetup
 ```
 
+## Cloud acceleration (optional)
+
+sem builds an entity dependency graph to answer `impact`, `context`, and `entities`. On a small or medium repo that's instant. On a very large codebase, building the graph locally can take hundreds of milliseconds to a few seconds.
+
+`sem login` connects sem to sem cloud, which keeps a warm, pre-built graph for your registered repos. When you're logged in, those queries are served from the warm cache instead of rebuilt locally, so they stay fast no matter how big the repo gets.
+
+```bash
+sem login                              # GitHub device flow, one time
+sem impact myFunc --file src/foo.rs    # served from the cloud's warm graph
+```
+
+It is fully optional and transparent:
+
+- Not logged in, or the cloud is unreachable? sem computes locally and prints the exact same output. No failures, no difference in results.
+- `SEM_LOCAL=1` forces local computation even when logged in.
+- Small repos see no change, local is already fast. The win is for large codebases where rebuilding the graph each time is the bottleneck.
+
 ## What it parses
 
-31 programming languages with full entity extraction via tree-sitter:
+32 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -278,6 +295,7 @@ sem unsetup
 | Swift | `.swift` | functions, classes, protocols, structs, enums, properties |
 | Elixir | `.ex` `.exs` | modules, functions, macros, guards, protocols |
 | Bash | `.sh` | functions |
+| Lua | `.lua` | functions (global, local, table, and method forms) |
 | HCL/Terraform | `.hcl` `.tf` `.tfvars` | blocks, attributes (qualified names for nested blocks) |
 | Kotlin | `.kt` `.kts` | classes, interfaces, objects, functions, properties, companion objects |
 | Fortran | `.f90` `.f95` `.f` | functions, subroutines, modules, programs |

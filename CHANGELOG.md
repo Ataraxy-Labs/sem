@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- README: documented the optional cloud acceleration flow (`sem login` serves `impact`/`context`/`entities` from a warm pre-built graph for large repos; local is unchanged and `SEM_LOCAL=1` forces local), and added Lua to the supported-languages table.
+
 ### Added
 
 - Lua support, via the `tree-sitter-lua` grammar (gated behind the `lang-lua` feature in `grammar-all`). Extracts global, `local`, table (`t.f`), and method (`t:f`) functions. Thanks @mmgeorge for the request (#393).
