@@ -6,6 +6,11 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- Lua support, via the `tree-sitter-lua` grammar (gated behind the `lang-lua` feature in `grammar-all`). Extracts global, `local`, table (`t.f`), and method (`t:f`) functions. Thanks @mmgeorge for the request (#393).
+- `SemanticEntity` now carries optional `start_byte`/`end_byte` offsets, populated from the underlying tree-sitter node during code extraction. A consumer can slice the exact original bytes of an entity out of a file given only its `file_path` and span, without re-parsing. Persisted through the entity cache and surfaced in `sem entities --json`. Thanks to Thomas J. for the request.
+
+### Added
+
 - `npx @ataraxy-labs/sem-skill`: one-command setup of sem for coding agents. Installs the sem skill into `~/.claude/skills/` and registers the `sem mcp` server, so an agent uses sem (impact / context / orient / diff) over grep for structural questions without manual setup. Builds on the skill contributed in #376.
 
 ### Added
