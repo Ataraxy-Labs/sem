@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -27,6 +27,84 @@ use super::impact::ImpactOptions;
 use super::log::LogOptions;
 
 const GITHUB_CLIENT_ID: &str = "Ov23lioE75FJYz4Mn7ZH";
+
+// ─── Cloud conversion nudge ─────────────────────────────────────────────────
+
+/// After a `sem diff` that had real entity changes, print one dimmed line
+/// suggesting `sem login` to see what those changes break across repos — a
+/// cross-repo question a local single-repo diff cannot answer. Heavily
+/// guard-railed so it can never become noise:
+///   * silent when there were no entity changes,
+///   * silent unless stderr is an interactive terminal (skips CI, pipes, agents),
+///   * silent when already logged in,
+///   * shown at most once a week (throttled via `~/.sem/.login_hint`).
+///
+/// Printed to stderr so it never pollutes stdout / piped / `--json` output.
+pub fn maybe_suggest_cloud_after_diff(entity_changes: usize) {
+    if entity_changes == 0 {
+        return;
+    }
+    if !io::stderr().is_terminal() {
+        return;
+    }
+    if load_credentials().is_some() {
+        return;
+    }
+    if !login_hint_due() {
+        return;
+    }
+    let noun = if entity_changes == 1 {
+        "entity"
+    } else {
+        "entities"
+    };
+    eprintln!(
+        "{} {} changed. {} to see what they break across your repos.",
+        "↗".cyan(),
+        format!("{entity_changes} {noun}").dimmed(),
+        "sem login".cyan().bold(),
+    );
+    mark_login_hint_shown();
+}
+
+fn login_hint_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".sem").join(".login_hint"))
+}
+
+/// True if the hint hasn't been shown in the last week (or ever).
+fn login_hint_due() -> bool {
+    const THROTTLE_SECS: u64 = 7 * 24 * 3600;
+    let Some(path) = login_hint_path() else {
+        return false;
+    };
+    match fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(last) => now_secs().saturating_sub(last) >= THROTTLE_SECS,
+        None => true,
+    }
+}
+
+fn mark_login_hint_shown() {
+    let Some(path) = login_hint_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(&path, now_secs().to_string());
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // ─── sem login ────────────────────────────────────────────────────────────
 

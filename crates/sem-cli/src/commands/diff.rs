@@ -1729,6 +1729,14 @@ fn run_diff_pipeline(
         );
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
     }
+
+    // Conversion nudge: after an interactive diff with real entity changes,
+    // hint (at most weekly, logged-out only) that the cloud can show what these
+    // changes break across repos — something a local single-repo diff can't.
+    // Only for human terminal output; JSON/plain/markdown (piping, CI) skip it.
+    if matches!(opts.format, OutputFormat::Terminal) {
+        crate::commands::cloud::maybe_suggest_cloud_after_diff(result.changes.len());
+    }
 }
 
 fn retain_non_cosmetic_changes(result: &mut DiffResult) {

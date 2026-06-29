@@ -7,6 +7,7 @@ All notable changes to sem are documented in this file.
 ### Added
 
 - `sem xref` lists cross-repo dependencies across your indexed repos: entities in one repo that depend on entities in another. A single-repo local graph can't see this, so it's a cloud feature (requires `sem login`) and is gated to the team/enterprise tier. Adds `cross_deps()` to the shared cloud client.
+- `sem diff` now prints a one-line hint, when run interactively and logged out, that `sem login` reveals what your changes break across repos (a cross-repo question a local single-repo diff can't answer). It is heavily throttled (at most once a week), shown only on a terminal with real entity changes, and stays completely silent in CI, pipes, `--json`/non-terminal output, and for logged-in users.
 
 ### Documentation
 
