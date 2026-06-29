@@ -354,6 +354,12 @@ enum Commands {
     Logout,
     /// Show current sem cloud identity
     Whoami,
+    /// Show cross-repo dependencies across your indexed repos (requires sem login)
+    Xref {
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Update sem to the latest released version
     Update,
     /// Generate shell completions
@@ -389,6 +395,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Login { .. }) => "login",
         Some(Commands::Logout) => "logout",
         Some(Commands::Whoami) => "whoami",
+        Some(Commands::Xref { .. }) => "xref",
         Some(Commands::Update) => "update",
         Some(Commands::Completions { .. }) => "completions",
         Some(Commands::TelemetryFlush) | Some(Commands::UpdateCheck) => return None,
@@ -682,6 +689,12 @@ fn main() {
         }
         Some(Commands::Whoami) => {
             if let Err(e) = commands::cloud::whoami() {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Xref { json }) => {
+            if let Err(e) = commands::cloud::xref(json) {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }

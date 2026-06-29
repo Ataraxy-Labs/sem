@@ -264,6 +264,66 @@ fn show_cloud_banner() {
     }
 }
 
+/// Show cross-repo dependencies across all of your indexed repos. Cloud-only:
+/// the local CLI only ever sees one repo, so "what in my other repos depends on
+/// this" is a question only the cloud (which holds the graph across all your
+/// repos) can answer. This is a reason to log in.
+pub fn xref(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let client = CloudClient::from_credentials()
+        .ok_or("Not logged in. Cross-repo dependencies are a sem cloud feature. Run: sem login")?;
+    let resp = client.cross_deps()?;
+
+    if json {
+        let edges: Vec<serde_json::Value> = resp
+            .edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "fromRepoId": e.from_repo_id,
+                    "fromEntity": e.from_entity_id,
+                    "toRepoId": e.to_repo_id,
+                    "toEntity": e.to_entity_id,
+                    "refType": e.ref_type,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "edges": edges, "total": resp.total });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if resp.edges.is_empty() {
+        println!("No cross-repo dependencies found.");
+        println!(
+            "{}",
+            "Cross-repo edges appear once you have 2+ repos indexed in sem cloud.".dimmed()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} ({} edges, {}ms)",
+        "Cross-repo dependencies".bold(),
+        resp.total,
+        resp.query_ms
+    );
+    for e in &resp.edges {
+        let kind = if e.ref_type.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", e.ref_type)
+        };
+        println!(
+            "  {} {} {}{}",
+            e.from_entity_id,
+            "→".dimmed(),
+            e.to_entity_id.bold(),
+            kind.dimmed()
+        );
+    }
+    Ok(())
+}
+
 // ─── try_cloud_* helpers ─────────────────────────────────────────────────
 
 /// Attempt to open GitBridge and get remote URL for cloud resolution.

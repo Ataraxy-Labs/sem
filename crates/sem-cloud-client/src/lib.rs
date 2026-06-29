@@ -135,6 +135,30 @@ pub struct CloudRepoResponse {
     pub file_count: Option<usize>,
 }
 
+/// One cross-repo dependency edge: an entity in one of your repos that depends
+/// on an entity in another of your repos. Cloud-only (the local CLI sees one
+/// repo at a time; only the cloud holds the graph across all your repos).
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCrossRepoEdge {
+    pub from_repo_id: String,
+    pub from_entity_id: String,
+    pub to_repo_id: String,
+    pub to_entity_id: String,
+    #[serde(default)]
+    pub ref_type: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCrossDepsResponse {
+    pub edges: Vec<CloudCrossRepoEdge>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub query_ms: u64,
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -537,6 +561,19 @@ impl CloudClient {
         let resp = self
             .agent
             .get(&self.api_url(&url))
+            .set("Authorization", &self.auth_header())
+            .call()?
+            .into_json()?;
+        Ok(resp)
+    }
+
+    /// Cross-repo dependency edges across all of your indexed repos. This is
+    /// cloud-only: it answers "what in my other repos depends on this," which a
+    /// single-repo local graph can't see.
+    pub fn cross_deps(&self) -> Result<CloudCrossDepsResponse, Box<dyn std::error::Error>> {
+        let resp: CloudCrossDepsResponse = self
+            .agent
+            .get(&self.api_url("/v1/cross-deps"))
             .set("Authorization", &self.auth_header())
             .call()?
             .into_json()?;

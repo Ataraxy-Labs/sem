@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `sem xref` lists cross-repo dependencies across your indexed repos: entities in one repo that depend on entities in another. A single-repo local graph can't see this, so it's a cloud feature (requires `sem login`) and is gated to the team/enterprise tier. Adds `cross_deps()` to the shared cloud client.
+
 ### Documentation
 
 - README: documented the optional cloud acceleration flow (`sem login` serves `impact`/`context`/`entities` from a warm pre-built graph for large repos; local is unchanged and `SEM_LOCAL=1` forces local), and added Lua to the supported-languages table.
