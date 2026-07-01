@@ -8,6 +8,10 @@ All notable changes to sem are documented in this file.
 
 - `npx @ataraxy-labs/sem-skill --badge` (opt-in) installs a live sem badge in the Claude Code statusline: it shows how many structural queries ran this session, the last command **and the entity it analyzed**, its latency, a sparkline of recent latencies, and a rotating stat (distinct entities analyzed, top command) (`⊕ sem ×12  impact validateToken 9ms  ▁▂▃▅▂  · 7 entities analyzed`). It is fed by a PostToolUse hook that catches sem via **both** the MCP tools and the `sem` CLI (Bash), and falls back to recent activity so the badge never stalls on "idle". Non-destructive: it backs up settings and never overwrites an existing statusline (it prints how to add the badge yourself instead).
 
+### Fixed
+
+- Impact/dependency resolution now follows type-qualified associated calls (`Type::method()`) when the receiver is a known repo type, so a caller reached only through a static/associated path is no longer dropped from `sem impact`. Previously, e.g., a test helper calling `SemPlugin::detect_changes()` was invisible to the reverse-dependency graph, and its transitive callers were missing from the blast radius. Resolution stays precise: a bare module path (`foo::bar::baz()`) still does not bind to a same-name local function, and common associated names (`Type::new`, `::default`) are not guessed.
+
 ### Performance
 
 - Faster graph hydrate on large repos. The public `EntityGraph` maps now use `rustc-hash` (FxHashMap) instead of std SipHash, matching the build's internal maps, and the SQLite cache sets read pragmas (`mmap_size`, `cache_size`, `temp_store=MEMORY`) on every connection. On a 200K-entity / 800K-edge graph this is about 9% faster to hydrate (0.42s to 0.39s, no overlap across repeats); negligible on small repos. Output is byte-identical.

@@ -5831,6 +5831,40 @@ fn push_method_call_ref(
 }
 
 /// Resolve a single reference against scopes and symbol tables.
+/// Resolve a qualified callee's final name (`Type::NAME`, `module::path::NAME`) to
+/// an entity id, precisely. An explicit import wins; then, when allowed, a same-file
+/// definition; then a globally UNIQUE definition. The qualifier is the disambiguator,
+/// so we never guess among multiple cross-file candidates for a common name
+/// (`new`, `default`, `from`) — those stay unresolved rather than producing a wrong
+/// edge.
+fn resolve_qualified_callee_name(
+    name: &str,
+    import_table_by_name: &HashMap<&str, &str>,
+    file_lookup: &FileEntityLookup<'_>,
+    symbol_table: &HashMap<String, Vec<String>>,
+    from_entity_id: &str,
+    allow_same_file: bool,
+) -> Option<String> {
+    if let Some(target_id) = import_table_by_name.get(name) {
+        if *target_id != from_entity_id {
+            return Some((*target_id).to_string());
+        }
+    }
+    if allow_same_file {
+        if let Some(same_file) = file_lookup.first_id_by_name(name) {
+            if same_file != from_entity_id {
+                return Some(same_file.to_string());
+            }
+        }
+    }
+    if let Some(ids) = symbol_table.get(name) {
+        if ids.len() == 1 && ids[0] != from_entity_id {
+            return Some(ids[0].clone());
+        }
+    }
+    None
+}
+
 fn resolve_ref(
     ast_ref: &AstRef,
     scope_idx: usize,
@@ -6005,7 +6039,28 @@ fn resolve_ref(
             None
         }
 
-        AstRefKind::ScopedCall { .. } => None,
+        AstRefKind::ScopedCall { path, name } => {
+            // `module::path::fn()` or `Enum::Variant::method()`. Resolve only when it
+            // is precise: the last path segment names a repo type that owns `name`, or
+            // the callee name is explicitly imported. We deliberately do NOT bind to a
+            // same-name repo function for a bare module path (`foo::bar::baz()` must
+            // not resolve to a local `baz`, even a unique one) — sem does not track
+            // full module paths, so guessing there would manufacture false edges.
+            let type_hint = path.rsplit("::").next().unwrap_or(path.as_str());
+            if let Some(members) = class_members.get(type_hint) {
+                if let Some((_, target_id)) = members.iter().find(|(member, _)| member == name) {
+                    if target_id != from_entity_id {
+                        return Some((target_id.clone(), RefType::Calls, "scoped_call"));
+                    }
+                }
+            }
+            if let Some(target_id) = import_table_by_name.get(name.as_str()) {
+                if *target_id != from_entity_id {
+                    return Some(((*target_id).to_string(), RefType::Calls, "scoped_call"));
+                }
+            }
+            None
+        }
 
         AstRefKind::MethodCall {
             receiver: raw_receiver,
@@ -6169,6 +6224,23 @@ fn resolve_ref(
                         swift_call_signatures,
                     ) {
                         return Some((mid, RefType::Calls, "static_call"));
+                    }
+                }
+                // `Type::method()` where the impl block is not keyed under `Type` in
+                // class_members (e.g. `impl Trait for Type`), or a free associated fn.
+                // Only when `Type` is itself a known repo entity: resolve the method by
+                // a same-file or globally unique definition (the `Type::` qualifier is
+                // the disambiguator), so `Vec::new()` and friends stay unresolved.
+                if symbol_table.contains_key(receiver) {
+                    if let Some(hit) = resolve_qualified_callee_name(
+                        method,
+                        import_table_by_name,
+                        file_lookup,
+                        symbol_table,
+                        from_entity_id,
+                        true,
+                    ) {
+                        return Some((hit, RefType::Calls, "static_call"));
                     }
                 }
             }
