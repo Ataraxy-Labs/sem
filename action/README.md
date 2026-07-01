@@ -35,10 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Ataraxy-Labs/sem/action@main
+      - uses: Ataraxy-Labs/sem/action@v0.15.1
 ```
 
-That's it. No config, no API keys. The action installs the prebuilt `sem`
+That's it. No config, no API keys. (Pin the tag for stability, or use
+`@main` to track the latest.) The action installs the prebuilt `sem`
 binary (~2s), diffs the PR's base and head at the entity level across 30+
 languages (tree-sitter), and posts the comment.
 

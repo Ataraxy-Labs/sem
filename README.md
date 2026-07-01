@@ -51,6 +51,12 @@ Or via Homebrew:
 brew install sem-cli
 ```
 
+Or via winget on Windows:
+
+```powershell
+winget install AtaraxyLabs.sem
+```
+
 Or install the npm wrapper into `node_modules`:
 
 ```bash
@@ -276,7 +282,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Ataraxy-Labs/sem/action@main
+      - uses: Ataraxy-Labs/sem/action@v0.15.1
 ```
 
 No config, no API keys, never fails your build. See [action/](action/) for details.
