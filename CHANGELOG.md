@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `npx @ataraxy-labs/sem-skill --badge` (opt-in) installs a live sem badge in the Claude Code statusline: it shows how many structural queries ran this session, the last one and its latency, and a sparkline of recent latencies (`⊕ sem ×12  impact 9ms  ▁▂▃▅▂`), fed by a PostToolUse hook that logs each sem MCP call. Non-destructive: it backs up settings and never overwrites an existing statusline (it prints how to add the badge yourself instead).
+
 ### Performance
 
 - Faster graph hydrate on large repos. The public `EntityGraph` maps now use `rustc-hash` (FxHashMap) instead of std SipHash, matching the build's internal maps, and the SQLite cache sets read pragmas (`mmap_size`, `cache_size`, `temp_store=MEMORY`) on every connection. On a 200K-entity / 800K-edge graph this is about 9% faster to hydrate (0.42s to 0.39s, no overlap across repeats); negligible on small repos. Output is byte-identical.

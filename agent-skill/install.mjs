@@ -8,13 +8,84 @@
 // registered MCP server).
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const log = (m) => process.stdout.write(`${m}\n`);
+const wantBadge = process.argv.slice(2).includes('--badge');
+
+// Opt-in: a live sem activity badge in the Claude Code statusline, fed by a
+// PostToolUse hook that logs each sem MCP call. Only runs with --badge, backs
+// up settings, and never overwrites a statusline you already have.
+function installBadge() {
+  const claudeDir = join(homedir(), '.claude');
+  const hooksDir = join(claudeDir, 'hooks');
+  const slDest = join(claudeDir, 'statusline-sem.py');
+  const hookDest = join(hooksDir, 'sem-activity.py');
+  try {
+    mkdirSync(hooksDir, { recursive: true });
+    copyFileSync(join(here, 'badge', 'statusline-sem.py'), slDest);
+    copyFileSync(join(here, 'badge', 'sem-activity.py'), hookDest);
+    log(`  [ok] installed sem badge scripts -> ${claudeDir}`);
+  } catch (e) {
+    log(`  [!]  could not install badge scripts: ${e.message}`);
+    return;
+  }
+
+  const settingsPath = join(claudeDir, 'settings.json');
+  let settings = {};
+  if (existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    } catch {
+      settings = {};
+    }
+    try {
+      copyFileSync(settingsPath, `${settingsPath}.bak-${Date.now()}`);
+    } catch {}
+  }
+
+  // PostToolUse hook: non-destructive, append only if not already present.
+  settings.hooks = settings.hooks || {};
+  const post = (settings.hooks.PostToolUse = settings.hooks.PostToolUse || []);
+  const hasHook = post.some((e) =>
+    (e.hooks || []).some((h) => (h.command || '').includes('sem-activity.py')),
+  );
+  if (!hasHook) {
+    post.push({
+      matcher: 'mcp__sem__.*',
+      hooks: [{ type: 'command', command: `python3 ${hookDest}` }],
+    });
+  }
+
+  // statusLine: destructive slot, so only set it if you have none (or it is
+  // already ours). Otherwise leave yours alone and print how to add the badge.
+  const slCmd = `python3 ${slDest}`;
+  const existingSl = settings.statusLine && settings.statusLine.command;
+  if (!existingSl || existingSl.includes('statusline-sem.py')) {
+    settings.statusLine = { type: 'command', command: slCmd };
+    log('  [ok] enabled the live sem statusline badge');
+  } else {
+    log('  [i]  you already have a statusline; leaving it untouched.');
+    log(`       to add the sem badge, set your statusline to: ${slCmd}`);
+  }
+
+  try {
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    log('  [ok] updated ~/.claude/settings.json (backup saved)');
+  } catch (e) {
+    log(`  [!]  could not write settings.json: ${e.message}`);
+  }
+}
 
 function has(cmd) {
   try {
@@ -72,6 +143,17 @@ if (has('claude')) {
   log('       claude mcp add -s user sem -- sem mcp');
 }
 
+// 4. Optional: the live sem statusline badge.
+if (wantBadge) {
+  log('');
+  installBadge();
+} else {
+  log('');
+  log('  [i]  optional: a live sem activity badge for your statusline');
+  log('       (shows structural queries + latency as you work). Enable with:');
+  log('       npx @ataraxy-labs/sem-skill --badge');
+}
+
 log('\nDone. Your agent will now prefer sem (impact / context / orient / diff)');
 log('over grep for structural code questions. Restart the agent session to load');
-log('the MCP tools.\n');
+log('the MCP tools' + (wantBadge ? ' and show the sem badge' : '') + '.\n');
