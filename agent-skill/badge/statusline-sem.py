@@ -99,38 +99,25 @@ def main():
         life = read_lifetime()
         if life.get("sec"):
             badge = (f"{DIM}⊕ sem idle{RESET} {DIM}·{RESET} "
-                     f"{YELLOW}≈ {fmt_time(life['sec'])} saved{RESET}")
+                     f"{YELLOW}≈ {fmt_time(life['sec'])} · ≈ {fmt_num(life['tok'])} tokens saved{RESET}")
         else:
             badge = f"{DIM}⊕ sem idle{RESET}"
     else:
-        from collections import Counter
         n = len(events)
         last = events[-1]
-        lat = [e["ms"] for e in events[-12:] if isinstance(e.get("ms"), (int, float))]
-        sp = spark(lat)
         last_tool = last.get("tool", "sem")
         last_target = last.get("target", "")
         op = f"{last_tool} {last_target}".strip() if last_target else last_tool
         last_ms = last.get("ms")
         ms_str = f" {last_ms}ms" if isinstance(last_ms, (int, float)) else ""
-        # the savings meter, live in the statusline: rotate the trailing segment
-        # through the estimated grep+read cost this session's sem calls avoided.
-        tally = Counter(e.get("tool") for e in events)
-        targets = {e.get("target") for e in events if e.get("target")}
+        # live tokens + time saved this session, always shown (estimated vs
+        # grep+read, anchored to the measured benchmark).
         sess_rt = sum(rt_saved(e.get("tool")) for e in events)
-        insights = [
-            f"≈ {fmt_time(sess_rt * 10)} saved",
-            f"≈ {sess_rt} grep round-trips saved",
-            f"≈ {fmt_num(sess_rt * 900)} tokens spared",
-            f"{len(targets)} entities analyzed" if targets else TAGLINES[0],
-        ]
-        insight = insights[n % len(insights)]
-        color = YELLOW if insight.startswith("≈") else DIM
+        saved = f"≈ {fmt_time(sess_rt * 10)} · ≈ {fmt_num(sess_rt * 900)} tokens saved"
         badge = (
             f"{GREEN}{BOLD}⊕ sem{RESET} {GREEN}×{n}{RESET}"
             f" {CYAN}{op}{ms_str}{RESET}"
-            + (f" {MAGENTA}{sp}{RESET}" if sp else "")
-            + f" {DIM}·{RESET} {color}{insight}{RESET}"
+            f" {DIM}·{RESET} {YELLOW}{saved}{RESET}"
         )
 
     print(f"{left}  {badge}")

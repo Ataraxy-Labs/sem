@@ -1,6 +1,6 @@
 {
   "name": "@ataraxy-labs/sem-skill",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "One-command setup of sem (entity-level code intelligence) for coding agents: installs the sem skill and registers the sem MCP server.",
   "type": "module",
   "bin": {
