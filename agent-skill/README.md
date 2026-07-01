@@ -34,6 +34,19 @@ it leaves it untouched and just tells you how to add the badge yourself. To
 remove it, delete the `statusLine` key and the `mcp__sem__.*` and `Bash`
 PostToolUse entries from `~/.claude/settings.json`.
 
+The `--badge` install also drops a **live viewer** at `~/.claude/sem-live.py`.
+Run it in a spare terminal pane:
+
+```bash
+python3 ~/.claude/sem-live.py
+```
+
+It redraws an ASCII blast-radius graph every time sem runs (the analyzed entity,
+its direct callers, transitive count), plus a **savings meter** — a running,
+honestly-estimated tally of the grep+read round-trips, time, and tokens sem
+saved you this session, and a lifetime counter that grows across sessions. The
+estimates are anchored to a measured benchmark and labelled `≈`.
+
 It's idempotent, re-run it any time. It needs the sem CLI on PATH
 (`npm i -g @ataraxy-labs/sem` or see the
 [install docs](https://github.com/Ataraxy-Labs/sem#install)); if sem isn't

@@ -31,11 +31,13 @@ function installBadge() {
   const hooksDir = join(claudeDir, 'hooks');
   const slDest = join(claudeDir, 'statusline-sem.py');
   const hookDest = join(hooksDir, 'sem-activity.py');
+  const liveDest = join(claudeDir, 'sem-live.py');
   try {
     mkdirSync(hooksDir, { recursive: true });
     copyFileSync(join(here, 'badge', 'statusline-sem.py'), slDest);
     copyFileSync(join(here, 'badge', 'sem-activity.py'), hookDest);
-    log(`  [ok] installed sem badge scripts -> ${claudeDir}`);
+    copyFileSync(join(here, 'badge', 'sem-live.py'), liveDest);
+    log(`  [ok] installed sem badge + live viewer -> ${claudeDir}`);
   } catch (e) {
     log(`  [!]  could not install badge scripts: ${e.message}`);
     return;
@@ -89,6 +91,10 @@ function installBadge() {
   } catch (e) {
     log(`  [!]  could not write settings.json: ${e.message}`);
   }
+
+  log('');
+  log('  live blast-radius graph + savings meter — run in a spare terminal pane:');
+  log(`    python3 ${liveDest}`);
 }
 
 function has(cmd) {

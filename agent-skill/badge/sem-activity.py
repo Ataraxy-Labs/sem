@@ -29,6 +29,8 @@ def main():
     short = target = None
     ms = None
 
+    file_hint = None
+
     if "mcp__sem__" in tool:
         short = tool.split("__")[-1].replace("sem_", "") or "sem"
         ti = data.get("tool_input") or data.get("toolInput") or {}
@@ -37,6 +39,8 @@ def main():
                 if ti.get(k):
                     target = str(ti[k])
                     break
+            if ti.get("file_path"):
+                file_hint = str(ti["file_path"])
         resp = data.get("tool_response") or data.get("toolResponse") or {}
         if isinstance(resp, str):
             try:
@@ -57,6 +61,9 @@ def main():
             tok = rest.split()[0] if rest else ""
             if tok and not tok.startswith("-"):
                 target = tok.strip("'\"")
+            fm = re.search(r"--file[= ]([^\s]+)", rest)
+            if fm:
+                file_hint = fm.group(1).strip("'\"")
 
     if not short:
         return
@@ -68,6 +75,11 @@ def main():
     }
     if target:
         event["target"] = target[:40]
+    if file_hint:
+        event["file"] = file_hint
+    cwd = data.get("cwd") or data.get("cwd_path") or ""
+    if cwd:
+        event["cwd"] = cwd
     if ms is not None:
         event["ms"] = ms
 
