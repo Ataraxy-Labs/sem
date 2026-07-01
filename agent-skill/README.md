@@ -16,6 +16,20 @@ This:
    `sem_impact` / `sem_context` / `sem_entities` / ... tools are available in
    every session.
 
+### Optional: a live sem badge in your statusline
+
+```bash
+npx @ataraxy-labs/sem-skill --badge
+```
+
+Adds a small badge to your Claude Code statusline that shows sem working in real
+time: how many structural queries this session, the last one and its latency,
+and a sparkline of recent latencies (`⊕ sem ×12  impact 9ms  ▁▂▃▅▂`). It is
+opt-in and non-destructive: it backs up your settings, and if you already have a
+statusline it leaves it untouched and just tells you how to add the badge
+yourself. To remove it, delete the `statusLine` key and the `mcp__sem__.*`
+PostToolUse entry from `~/.claude/settings.json`.
+
 It's idempotent, re-run it any time. It needs the sem CLI on PATH
 (`npm i -g @ataraxy-labs/sem` or see the
 [install docs](https://github.com/Ataraxy-Labs/sem#install)); if sem isn't
