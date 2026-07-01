@@ -1569,7 +1569,7 @@ mod tests {
     }
 
     fn empty_graph() -> EntityGraph {
-        EntityGraph::from_parts(HashMap::new(), Vec::new())
+        EntityGraph::from_parts(EntityInfoMap::default(), Vec::new())
     }
 
     fn entity(id: &str, file_path: &str, name: &str, content: &str) -> SemanticEntity {

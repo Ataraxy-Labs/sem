@@ -8953,7 +8953,7 @@ export function caller() {
             make_entity("run", "qa/smoke.rs", "#[test]\nfn run() {}"),
             make_entity("main", "src/main.rs", "fn main() {}"),
         ];
-        let entity_map: std::collections::HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|e| {
                 (
