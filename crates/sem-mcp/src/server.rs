@@ -51,6 +51,14 @@ const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
 const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
 
 /// Lazily-initialized repo context.
+/// sem_log params after the optional entity has been resolved to a concrete
+/// name (the analytics branch handles the None case before this is built).
+struct ResolvedLogParams {
+    entity_name: String,
+    file_path: Option<String>,
+    limit: Option<usize>,
+}
+
 struct RepoContext {
     git: GitBridge,
     repo_root: PathBuf,
@@ -1205,17 +1213,46 @@ impl SemServer {
     }
 
     // ── Tool 5: Log ──
+    // (entity-path params after the optional entity has been resolved)
 
     #[tool(
-        description = "Entity evolution history: trace how a specific entity changed across git commits, distinguishing logic changes from cosmetic ones"
+        description = "Entity evolution history: trace how a specific entity changed across git commits, distinguishing logic changes from cosmetic ones. Omit entity_name for repo-level history analytics: hotspots (most-changed entities, with author counts) and co-change pairs (entities that repeatedly change in the same commits) — the time axis a snapshot dependency graph can't see."
     )]
     async fn sem_log(
         &self,
         Parameters(params): Parameters<LogParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let start = Instant::now();
         let ctx = match self.get_context(params.file_path.as_deref()).await {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
+        };
+
+        // No entity: repo-level history analytics (hotspots + co-changes).
+        let Some(entity_name) = params.entity_name else {
+            let limit = params.limit.unwrap_or(50);
+            let (rel_file, analytics) = {
+                let rel_file = params.file_path.as_ref().map(|fp| {
+                    let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
+                    rel
+                });
+                let analytics = sem_core::parser::hotspot::compute_history_analytics(
+                    &ctx.git,
+                    &self.registry,
+                    rel_file.as_deref(),
+                    limit,
+                );
+                (rel_file, analytics)
+            };
+            let _ = rel_file;
+            let mut text = crate::render::history_text(&analytics);
+            text.push_str(&format!("{}ms · local\n", start.elapsed().as_millis()));
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        };
+        let params = ResolvedLogParams {
+            entity_name,
+            file_path: params.file_path,
+            limit: params.limit,
         };
 
         // Resolve file path: use provided or auto-detect
@@ -2277,7 +2314,7 @@ mod tests {
 
         let result = server
             .sem_log(Parameters(LogParams {
-                entity_name: "old_entity".to_string(),
+                entity_name: Some("old_entity".to_string()),
                 file_path: Some("old.py".to_string()),
                 limit: Some(10),
             }))

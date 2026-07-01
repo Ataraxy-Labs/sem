@@ -211,6 +211,18 @@ sem log authenticateUser --limit 20
 sem log authenticateUser --json
 ```
 
+With no entity, `sem log` analyzes recent repo history at the entity level:
+**hotspots** (most-changed functions/classes, with author counts) and
+**co-change pairs** (entities that repeatedly change in the same commits —
+"if you touch one, don't forget the other"):
+
+```bash
+sem log                 # repo hotspots + co-change pairs (last 50 commits)
+sem log --limit 200     # deeper history
+sem log --file src/auth.ts   # scoped to one file
+sem log --json          # full data
+```
+
 ### sem entities
 
 List all entities under a file or directory path. No path is the same as `.`.

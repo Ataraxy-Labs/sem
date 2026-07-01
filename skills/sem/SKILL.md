@@ -66,6 +66,7 @@ Unlike `git blame`, this shows who last modified each *function*, not each line.
 ### sem log — how did this evolve?
 
 ```bash
+sem log                           # repo hotspots + co-change pairs (no entity)
 sem log validateToken             # history of a single entity
 sem log validateToken -v          # with content diffs between versions
 sem log validateToken --limit 20

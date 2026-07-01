@@ -80,8 +80,10 @@ pub struct ImpactAnalysisParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LogParams {
-    #[schemars(description = "Name of the entity to trace history for")]
-    pub entity_name: String,
+    #[schemars(
+        description = "Name of the entity to trace history for. Omit for repo-level history analytics: hotspots (most-changed entities) and co-change pairs (entities that change in the same commits)."
+    )]
+    pub entity_name: Option<String>,
     #[schemars(description = "Path to the file containing the entity. If omitted, auto-detects.")]
     pub file_path: Option<String>,
     #[schemars(description = "Maximum number of commits to analyze. Defaults to 50.")]
