@@ -417,6 +417,19 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     if matches!(opts.mode, super::impact::ImpactMode::Tests) {
         return None;
     }
+    // --no-cache means "compute fresh": serving a remote snapshot would violate it.
+    if opts.no_cache {
+        return None;
+    }
+    // A --file hint exists to disambiguate same-named entities, but the cloud
+    // resolves by name with a silent name-only fallback when the file doesn't
+    // match its index — which returns the WRONG entity's graph (repro: weave's
+    // ten `fn run` command handlers; `--file .../apply.rs` came back with
+    // bench.rs's dependencies). Until the server resolves name+file strictly,
+    // file-hinted queries stay local, where disambiguation is exact.
+    if opts.file_hint.is_some() {
+        return None;
+    }
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
     // Small repos answer graph queries faster from the local cache.
@@ -579,6 +592,11 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
 
 /// Try to run `sem context` via cloud.
 pub fn try_cloud_context(opts: &ContextOptions) -> Option<()> {
+    // Same gates as try_cloud_impact: --no-cache means fresh local compute, and
+    // a --file hint needs exact name+file resolution the cloud doesn't do yet.
+    if opts.no_cache || opts.file_path.is_some() {
+        return None;
+    }
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
     // Small repos answer graph queries faster from the local cache.

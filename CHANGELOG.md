@@ -15,6 +15,7 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- Cloud-backed `sem impact` / `sem context` no longer answer queries they can't answer correctly. Two gates added: `--no-cache` now always computes fresh locally (previously the cloud snapshot was served anyway), and **file-hinted queries (`--file`) stay local** — the cloud resolves entities by name with a silent name-only fallback, so for same-named entities (e.g. ten `fn run` command handlers) it could return the *wrong entity's* graph, and a stale cloud index could drop dependents that exist locally. Local resolution disambiguates exactly; the cloud path returns once the server resolves name+file strictly and exposes its indexed commit for a freshness check.
 - Impact/dependency resolution now follows type-qualified associated calls (`Type::method()`) when the receiver is a known repo type, so a caller reached only through a static/associated path is no longer dropped from `sem impact`. Previously, e.g., a test helper calling `SemPlugin::detect_changes()` was invisible to the reverse-dependency graph, and its transitive callers were missing from the blast radius. Resolution stays precise: a bare module path (`foo::bar::baz()`) still does not bind to a same-name local function, and common associated names (`Type::new`, `::default`) are not guessed.
 
 ### Performance
