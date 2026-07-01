@@ -29,6 +29,8 @@ def main():
     short = target = None
     ms = None
 
+    file_hint = None
+
     if "mcp__sem__" in tool:
         short = tool.split("__")[-1].replace("sem_", "") or "sem"
         ti = data.get("tool_input") or data.get("toolInput") or {}
@@ -37,6 +39,8 @@ def main():
                 if ti.get(k):
                     target = str(ti[k])
                     break
+            if ti.get("file_path"):
+                file_hint = str(ti["file_path"])
         resp = data.get("tool_response") or data.get("toolResponse") or {}
         if isinstance(resp, str):
             try:
@@ -57,6 +61,9 @@ def main():
             tok = rest.split()[0] if rest else ""
             if tok and not tok.startswith("-"):
                 target = tok.strip("'\"")
+            fm = re.search(r"--file[= ]([^\s]+)", rest)
+            if fm:
+                file_hint = fm.group(1).strip("'\"")
 
     if not short:
         return
@@ -68,6 +75,11 @@ def main():
     }
     if target:
         event["target"] = target[:40]
+    if file_hint:
+        event["file"] = file_hint
+    cwd = data.get("cwd") or data.get("cwd_path") or ""
+    if cwd:
+        event["cwd"] = cwd
     if ms is not None:
         event["ms"] = ms
 
@@ -75,6 +87,28 @@ def main():
         os.makedirs(os.path.dirname(ACT), exist_ok=True)
         with open(ACT, "a") as f:
             f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+    # Accumulate a persisted lifetime savings tally (single writer: this hook), so
+    # the statusline and viewer can show a number that grows across every session.
+    # Estimate is anchored to the measured 64-entity benchmark; ~10s and ~900
+    # source tokens per avoided grep+read round-trip.
+    try:
+        save = os.path.expanduser("~/.claude/sem-savings.json")
+        rt_per = {"impact": 8, "context": 4, "orient": 5, "diff": 3,
+                  "blame": 3, "log": 3, "entities": 2, "xref": 4}
+        rt = rt_per.get(short, 2)
+        life = {"rt": 0, "sec": 0, "tok": 0, "calls": 0}
+        try:
+            life.update(json.load(open(save)))
+        except Exception:
+            pass
+        life["rt"] += rt
+        life["sec"] += rt * 10
+        life["tok"] += rt * 900
+        life["calls"] += 1
+        json.dump(life, open(save, "w"))
     except Exception:
         pass
 

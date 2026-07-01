@@ -19,6 +19,35 @@ SPARK = "▁▂▃▄▅▆▇█"
 def c(code):
     return f"\033[{code}m"
 RESET, GREEN, DIM, BOLD, CYAN, MAGENTA = c("0"), c("32"), c("2"), c("1"), c("36"), c("35")
+YELLOW = c("33")
+
+SAVE = os.path.expanduser("~/.claude/sem-savings.json")
+# Savings model, anchored to the measured 64-entity closure benchmark (grep+read
+# 17 round-trips / 180s / 35.7k tokens vs sem 2 / 27s / 21.5k). Each avoided
+# round-trip is ~one LLM inference cycle (~10s) and ~900 tokens of source read.
+RT_PER_TOOL = {"impact": 8, "context": 4, "orient": 5, "diff": 3,
+               "blame": 3, "log": 3, "entities": 2, "xref": 4}
+
+def rt_saved(tool):
+    return RT_PER_TOOL.get(tool, 2)
+
+def fmt_time(sec):
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    return f"{sec // 3600}h{(sec % 3600) // 60}m"
+
+def fmt_num(n):
+    n = int(n)
+    return f"{n / 1000:.1f}k".replace(".0k", "k") if n >= 1000 else str(n)
+
+def read_lifetime():
+    try:
+        return json.load(open(SAVE))
+    except Exception:
+        return {}
 
 TAGLINES = [
     "structural, not textual",
@@ -67,33 +96,28 @@ def main():
         left += f" {DIM}· {model}{RESET}"
 
     if not events:
-        badge = f"{DIM}⊕ sem idle{RESET}"
+        life = read_lifetime()
+        if life.get("sec"):
+            badge = (f"{DIM}⊕ sem idle{RESET} {DIM}·{RESET} "
+                     f"{YELLOW}≈ {fmt_time(life['sec'])} · ≈ {fmt_num(life['tok'])} tokens saved{RESET}")
+        else:
+            badge = f"{DIM}⊕ sem idle{RESET}"
     else:
-        from collections import Counter
         n = len(events)
         last = events[-1]
-        lat = [e["ms"] for e in events[-12:] if isinstance(e.get("ms"), (int, float))]
-        sp = spark(lat)
         last_tool = last.get("tool", "sem")
         last_target = last.get("target", "")
         op = f"{last_tool} {last_target}".strip() if last_target else last_tool
         last_ms = last.get("ms")
         ms_str = f" {last_ms}ms" if isinstance(last_ms, (int, float)) else ""
-        # rotate the trailing segment through real stats + a tagline
-        tally = Counter(e.get("tool") for e in events)
-        targets = {e.get("target") for e in events if e.get("target")}
-        top_cmd, top_n = tally.most_common(1)[0]
-        insights = [
-            f"{len(targets)} entities analyzed" if targets else TAGLINES[0],
-            f"{top_cmd} ×{top_n} top",
-            TAGLINES[n % len(TAGLINES)],
-        ]
-        insight = insights[n % len(insights)]
+        # live tokens + time saved this session, always shown (estimated vs
+        # grep+read, anchored to the measured benchmark).
+        sess_rt = sum(rt_saved(e.get("tool")) for e in events)
+        saved = f"≈ {fmt_time(sess_rt * 10)} · ≈ {fmt_num(sess_rt * 900)} tokens saved"
         badge = (
             f"{GREEN}{BOLD}⊕ sem{RESET} {GREEN}×{n}{RESET}"
             f" {CYAN}{op}{ms_str}{RESET}"
-            + (f" {MAGENTA}{sp}{RESET}" if sp else "")
-            + f" {DIM}· {insight}{RESET}"
+            f" {DIM}·{RESET} {YELLOW}{saved}{RESET}"
         )
 
     print(f"{left}  {badge}")
