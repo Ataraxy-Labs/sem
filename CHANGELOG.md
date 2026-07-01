@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Whole-repo commands (`sem graph`) now skip the file-discovery walk when git proves the cache is fresh (HEAD unchanged and the working tree clean), serving the cached topology directly. On a 200K-file repo this is about 9x faster with git fsmonitor and about 4.5x faster without it; small repos and non-git repos are unchanged. The oracle only ever declines to accelerate, never serves stale results, and the `git status` check is time-bounded (`SEM_FRESHNESS_TIMEOUT_MS`) with `SEM_FRESHNESS=scan|git|auto` to override.
+
 ### Added
 
 - `sem xref` lists cross-repo dependencies across your indexed repos: entities in one repo that depend on entities in another. A single-repo local graph can't see this, so it's a cloud feature (requires `sem login`) and is gated to the team/enterprise tier. Adds `cross_deps()` to the shared cloud client.
