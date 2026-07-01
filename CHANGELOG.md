@@ -10,6 +10,7 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- Repository discovery now tolerates Git worktrees that use the `extensions.relativeworktrees` config key, avoiding libgit2's unsupported-extension error when plain `git` can open the checkout.
 - Impact/dependency resolution now follows type-qualified associated calls (`Type::method()`) when the receiver is a known repo type, so a caller reached only through a static/associated path is no longer dropped from `sem impact`. Previously, e.g., a test helper calling `SemPlugin::detect_changes()` was invisible to the reverse-dependency graph, and its transitive callers were missing from the blast radius. Resolution stays precise: a bare module path (`foo::bar::baz()`) still does not bind to a same-name local function, and common associated names (`Type::new`, `::default`) are not guessed.
 
 ### Performance
