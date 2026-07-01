@@ -90,6 +90,28 @@ def main():
     except Exception:
         pass
 
+    # Accumulate a persisted lifetime savings tally (single writer: this hook), so
+    # the statusline and viewer can show a number that grows across every session.
+    # Estimate is anchored to the measured 64-entity benchmark; ~10s and ~900
+    # source tokens per avoided grep+read round-trip.
+    try:
+        save = os.path.expanduser("~/.claude/sem-savings.json")
+        rt_per = {"impact": 8, "context": 4, "orient": 5, "diff": 3,
+                  "blame": 3, "log": 3, "entities": 2, "xref": 4}
+        rt = rt_per.get(short, 2)
+        life = {"rt": 0, "sec": 0, "tok": 0, "calls": 0}
+        try:
+            life.update(json.load(open(save)))
+        except Exception:
+            pass
+        life["rt"] += rt
+        life["sec"] += rt * 10
+        life["tok"] += rt * 900
+        life["calls"] += 1
+        json.dump(life, open(save, "w"))
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()

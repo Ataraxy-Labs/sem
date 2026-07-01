@@ -107,27 +107,14 @@ def fmt_num(n):
 
 
 def update_lifetime(events):
-    """Add newly-seen events to the persisted lifetime tally (monotonic, once each)."""
-    life = {"rt": 0, "sec": 0, "tok": 0, "calls": 0, "last_ts": 0}
-    if os.path.exists(SAVE):
-        try:
-            life.update(json.load(open(SAVE)))
-        except Exception:
-            pass
-    new = [e for e in events if e.get("ts", 0) > life["last_ts"]]
-    for e in new:
-        rt = rt_saved(e.get("tool"))
-        life["rt"] += rt
-        life["sec"] += rt * SEC_PER_RT
-        life["tok"] += rt * TOK_PER_RT
-        life["calls"] += 1
-    if new:
-        life["last_ts"] = max(e.get("ts", 0) for e in new)
-        try:
-            json.dump(life, open(SAVE, "w"))
-        except Exception:
-            pass
-    return life
+    """Read the persisted lifetime tally. The PostToolUse hook is the single writer
+    (it bumps this on every sem call), so the viewer only reads — that keeps the
+    lifetime counter growing from real usage even when the viewer isn't open, and
+    avoids double-counting."""
+    try:
+        return json.load(open(SAVE))
+    except Exception:
+        return {"rt": 0, "sec": 0, "tok": 0, "calls": 0}
 
 
 _graph_cache = {}
