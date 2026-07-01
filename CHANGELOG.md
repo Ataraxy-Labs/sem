@@ -11,6 +11,7 @@ All notable changes to sem are documented in this file.
 
 ### Documentation
 
+- The bundled `/sem` agent skill no longer hardcodes a language count. It said "31 languages", which went stale as grammars were added and disagreed with the README ("32") and the crate description ("28"); it now says "30+ languages" so it can't drift, and an en-dash was replaced with a hyphen.
 - README: documented the optional cloud acceleration flow (`sem login` serves `impact`/`context`/`entities` from a warm pre-built graph for large repos; local is unchanged and `SEM_LOCAL=1` forces local), and added Lua to the supported-languages table.
 
 ### Added

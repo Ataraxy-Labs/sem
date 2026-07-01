@@ -9,9 +9,9 @@ metadata:
 
 # sem — Semantic Version Control
 
-sem extends Git with entity-level operations. Instead of "lines 43–51 changed",
+sem extends Git with entity-level operations. Instead of "lines 43-51 changed",
 it tells you "function `validateToken` was modified in `src/auth.ts`". It parses
-31 languages via tree-sitter and works in any Git repo with no setup.
+30+ languages via tree-sitter and works in any Git repo with no setup.
 
 ## When to reach for sem
 
