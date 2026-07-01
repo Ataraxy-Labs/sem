@@ -258,6 +258,29 @@ To disable and go back to normal git diff:
 sem unsetup
 ```
 
+## Entity-level diffs on every pull request
+
+Add the GitHub Action and every PR gets one sticky comment showing which
+functions, classes, and methods changed — updated in place on each push, and
+calling out cosmetic-only PRs (formatting/comments) explicitly:
+
+```yaml
+# .github/workflows/entity-diff.yml
+name: Entity diff
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  entity-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Ataraxy-Labs/sem/action@main
+```
+
+No config, no API keys, never fails your build. See [action/](action/) for details.
+
 ## Cloud acceleration (optional)
 
 sem builds an entity dependency graph to answer `impact`, `context`, and `entities`. On a small or medium repo that's instant. On a very large codebase, building the graph locally can take hundreds of milliseconds to a few seconds.

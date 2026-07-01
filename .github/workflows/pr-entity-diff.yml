@@ -1,0 +1,16 @@
+name: PR entity diff
+
+# Dogfood: every sem PR gets an entity-level diff comment from our own action.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  entity-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./action
