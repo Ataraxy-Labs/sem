@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-30
+
 ### Changed
 
 - Whole-repo commands (`sem graph`) now skip the file-discovery walk when git proves the cache is fresh (HEAD unchanged and the working tree clean), serving the cached topology directly. On a 200K-file repo this is about 9x faster with git fsmonitor and about 4.5x faster without it; small repos and non-git repos are unchanged. The oracle only ever declines to accelerate, never serves stale results, and the `git status` check is time-bounded (`SEM_FRESHNESS_TIMEOUT_MS`) with `SEM_FRESHNESS=scan|git|auto` to override.
