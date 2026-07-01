@@ -36,6 +36,25 @@ Use the CLI below only in a real terminal, in scripts, or for commands the MCP
 server doesn't expose (`sem graph`, `sem setup`, exotic flags) — and then as a
 single clean one-liner.
 
+## Draw the blast radius in your reply
+
+When an impact result drives your answer (a refactor decision, a "what breaks"
+question), render it as a small ASCII tree in the response — the user should
+see the graph without opening anything:
+
+```
+◉ validateToken · src/auth.ts
+│  8 direct → 23 transitive
+├─▶ refreshToken        src/auth.ts
+├─▶ loginHandler        src/routes/login.ts
+├─▶ SessionMiddleware   src/middleware/session.ts
+╰─▶ … +5 more (12 tests)
+```
+
+Real callers first, tests collapsed into a count, no invented entries — draw
+only what the tool returned. Skip the drawing when impact was incidental to
+the task.
+
 ## When to reach for sem
 
 - User asks "what changed in this commit / PR / branch?"

@@ -38,22 +38,38 @@ fn entity_label(e: &Value) -> String {
     }
 }
 
-/// Group entities by file (first-seen order), one line per file:
-/// `  path: name, name (type), name`
+/// True for names/files that look like tests — used only for display ordering
+/// (tests sink to the bottom), never to drop anything.
+fn looks_like_test(e: &Value) -> bool {
+    let name = get_str(e, "name");
+    let file = get_str(e, "file");
+    name.starts_with("test") || file.contains("/tests/") || file.ends_with("_test.rs")
+}
+
+/// Group entities by file (first-seen order), one branch line per file:
+/// `├─▶ path: name, name (type), name` — non-test files first so the callers
+/// that matter are on top; every name is preserved.
 fn push_grouped(out: &mut String, list: &[Value]) {
     let mut order: Vec<&str> = Vec::new();
-    let mut by_file: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+    let mut by_file: std::collections::HashMap<&str, (Vec<String>, bool)> =
+        std::collections::HashMap::new();
     for e in list {
         let file = get_str(e, "file");
         if !by_file.contains_key(file) {
             order.push(file);
         }
-        by_file.entry(file).or_default().push(entity_label(e));
+        let entry = by_file.entry(file).or_insert_with(|| (Vec::new(), true));
+        entry.0.push(entity_label(e));
+        entry.1 = entry.1 && looks_like_test(e);
     }
-    for file in order {
-        let names = by_file[file].join(", ");
+    // Files whose entries are all tests sink to the bottom (stable otherwise).
+    let mut ordered: Vec<&str> = order.clone();
+    ordered.sort_by_key(|f| by_file[f].1);
+    for (idx, file) in ordered.iter().enumerate() {
+        let (names, _) = &by_file[file];
+        let branch = if idx + 1 == ordered.len() { "╰─▶" } else { "├─▶" };
         let file = if file.is_empty() { "(unknown file)" } else { file };
-        out.push_str(&format!("  {}: {}\n", file, names));
+        out.push_str(&format!("{} {}: {}\n", branch, file, names.join(", ")));
     }
 }
 
@@ -84,7 +100,7 @@ fn footer(v: &Value) -> String {
 pub fn impact_text(v: &Value) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "⊕ {} · {}\n",
+        "◉ {} · {}\n",
         get_str(v, "entity"),
         get_str(v, "file")
     ));
@@ -303,9 +319,9 @@ mod tests {
             "elapsed_ms": 12, "source": "local",
         });
         let text = impact_text(&v);
-        assert!(text.contains("⊕ compute · src/a.rs"));
+        assert!(text.contains("◉ compute · src/a.rs"));
         assert!(text.contains("← 2 dependents · 2 files"));
-        assert!(text.contains("src/c.rs: run"));
+        assert!(text.contains("├─▶ src/c.rs: run") || text.contains("╰─▶ src/c.rs: run"));
         assert!(text.contains("src/b.rs: Config (struct)"));
         assert!(text.contains("⚡ 3 transitively affected · 3 files"));
         // transitive tail shows only what direct dependents didn't already list

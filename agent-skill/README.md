@@ -34,8 +34,10 @@ it leaves it untouched and just tells you how to add the badge yourself. To
 remove it, delete the `statusLine` key and the `mcp__sem__.*` and `Bash`
 PostToolUse entries from `~/.claude/settings.json`.
 
-The `--badge` install also drops a **live viewer** at `~/.claude/sem-live.py`.
-Run it in a spare terminal pane:
+Everything renders inside the session: sem MCP calls show as proper tool
+widgets with compact entity trees, and the statusline badge tracks live
+time/token savings. No extra processes needed. Optionally, for a dedicated
+terminal pane, the install also drops `~/.claude/sem-live.py`:
 
 ```bash
 python3 ~/.claude/sem-live.py
