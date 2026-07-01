@@ -1039,7 +1039,7 @@ impl SemServer {
                 out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
                 out["source"] = serde_json::json!("cloud");
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&out).unwrap_or_default(),
+                    crate::render::impact_text(&out),
                 )]));
             }
         }
@@ -1109,7 +1109,7 @@ impl SemServer {
             output["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
             output["source"] = serde_json::json!("local");
             return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&output).unwrap(),
+                crate::render::impact_text(&output),
             )]));
         }
 
@@ -1200,7 +1200,7 @@ impl SemServer {
         output["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
         output["source"] = serde_json::json!("local");
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap_or_default(),
+            crate::render::impact_text(&output),
         )]))
     }
 
@@ -1375,7 +1375,7 @@ impl SemServer {
                 out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
                 out["source"] = serde_json::json!("cloud");
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&out).unwrap_or_default(),
+                    crate::render::context_text(&out),
                 )]));
             }
         }
@@ -1424,7 +1424,7 @@ impl SemServer {
             .collect();
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
+            crate::render::context_text(&serde_json::json!({
                 "entity": params.entity_name,
                 "file": rel_path,
                 "token_budget": budget,
@@ -1435,8 +1435,7 @@ impl SemServer {
                 "context": result,
                 "elapsed_ms": start.elapsed().as_millis() as u64,
                 "source": "local",
-            }))
-            .unwrap_or_default(),
+            })),
         )]))
     }
 }
