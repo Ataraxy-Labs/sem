@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Entity-level history analytics**: `sem log` with no entity now analyzes recent repo history in one pass and reports **hotspots** (the most-changed code entities, with commit counts, distinct authors, and the last commit that touched each) and **co-change pairs** (entities that repeatedly change in the same commits, with a confidence score — "these two never change apart"). Counts are per commit, code entities only (doc headings, config properties, and lockfile chunks are excluded so the signal is about code), and bulk commits touching >50 entities are excluded from pair-counting to keep quadratic noise out. Same via MCP: `sem_log` without `entity_name`. `--file` scopes to one file; `--json` returns everything. This is the time axis a snapshot dependency graph cannot see: which code churns, and which code moves together.
+
 ### Changed
 
 - `sem_impact` and `sem_context` MCP results now render as a compact entity tree instead of pretty-printed JSON: dependents/dependencies/transitive impact grouped one line per file, every entity name preserved, with the elapsed time and source in a footer. The same information lands in about 15% of the tokens, and the expanded tool widget in agent UIs reads at a glance (`⊕ entity · file`, `← 29 dependents · 10 files`, `⚡ 70 transitively affected`). Context entries keep their verbatim content under a per-entry header.

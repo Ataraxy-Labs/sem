@@ -20,7 +20,7 @@ use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::entities::{entities_command, EntitiesOptions};
 use commands::graph::{graph_command, GraphOptions};
 use commands::impact::{impact_command, ImpactMode, ImpactOptions};
-use commands::log::{log_command, LogOptions};
+use commands::log::{history_command, log_command, HistoryOptions, LogOptions};
 use commands::orient::{orient_command, OrientOptions};
 
 #[derive(Parser)]
@@ -203,11 +203,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Show evolution of an entity through git history
+    /// Show evolution of an entity through git history, or, with no entity,
+    /// the repo's history analytics: hotspots and co-change pairs
     Log {
-        /// Name of the entity to trace
+        /// Name of the entity to trace (omit for repo hotspots + co-changes)
         #[arg()]
-        entity: String,
+        entity: Option<String>,
 
         /// File containing the entity (auto-detected if omitted)
         #[arg(long)]
@@ -569,17 +570,27 @@ fn main() {
             json,
             verbose,
         }) => {
-            log_command(LogOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                entity_name: entity,
-                file_path: file,
-                limit,
-                json: resolve_json(format, json),
-                verbose,
-            });
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match entity {
+                Some(entity) => log_command(LogOptions {
+                    cwd,
+                    entity_name: entity,
+                    file_path: file,
+                    limit,
+                    json: resolve_json(format, json),
+                    verbose,
+                }),
+                // No entity: repo-level history analytics (hotspots + co-changes).
+                None => history_command(HistoryOptions {
+                    cwd,
+                    file_path: file,
+                    limit,
+                    json: resolve_json(format, json),
+                }),
+            }
         }
         Some(Commands::Entities {
             paths,

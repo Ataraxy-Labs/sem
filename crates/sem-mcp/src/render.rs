@@ -216,6 +216,67 @@ pub fn context_text(v: &Value) -> String {
     out
 }
 
+/// Render repo-level history analytics (sem_log with no entity): hotspots and
+/// co-change pairs. Caps mirror the CLI (15 hotspots, 12 pairs) with an
+/// explicit "more" note, so nothing is silently hidden.
+pub fn history_text(a: &sem_core::parser::hotspot::HistoryAnalytics) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "⊕ repo history · last {} commits\n",
+        a.commits_scanned
+    ));
+    if a.hotspots.is_empty() {
+        out.push_str("no entity changes found\n");
+        return out;
+    }
+
+    out.push_str("\nhotspots — most-changed entities\n");
+    for h in a.hotspots.iter().take(15) {
+        out.push_str(&format!(
+            "  {}× {} · {} · {} author{} · last {}\n",
+            h.commits,
+            h.entity_name,
+            h.file_path,
+            h.authors,
+            if h.authors == 1 { "" } else { "s" },
+            h.last_short_sha,
+        ));
+    }
+    if a.hotspots.len() > 15 {
+        out.push_str(&format!("  … {} more\n", a.hotspots.len() - 15));
+    }
+
+    if !a.co_changes.is_empty() {
+        out.push_str("\nco-changes — entities that change together\n");
+        for p in a.co_changes.iter().take(12) {
+            let files = if p.a_file == p.b_file {
+                p.a_file.clone()
+            } else {
+                format!("{} ↔ {}", p.a_file, p.b_file)
+            };
+            out.push_str(&format!(
+                "  {}× {} ↔ {} · {:.0}% · {}\n",
+                p.together,
+                p.a_name,
+                p.b_name,
+                p.confidence * 100.0,
+                files,
+            ));
+        }
+        if a.co_changes.len() > 12 {
+            out.push_str(&format!("  … {} more pairs\n", a.co_changes.len() - 12));
+        }
+    }
+
+    if a.pair_commits_skipped > 0 {
+        out.push_str(&format!(
+            "\nnote: {} bulk commits (>50 entities) excluded from co-change pairing\n",
+            a.pair_commits_skipped
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
