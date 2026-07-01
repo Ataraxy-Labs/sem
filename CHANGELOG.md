@@ -8,6 +8,10 @@ All notable changes to sem are documented in this file.
 
 - `npx @ataraxy-labs/sem-skill --badge` (opt-in) installs a live sem badge in the Claude Code statusline: it shows how many structural queries ran this session, the last command **and the entity it analyzed**, its latency, a sparkline of recent latencies, and a rotating stat (distinct entities analyzed, top command) (`⊕ sem ×12  impact validateToken 9ms  ▁▂▃▅▂  · 7 entities analyzed`). It is fed by a PostToolUse hook that catches sem via **both** the MCP tools and the `sem` CLI (Bash), and falls back to recent activity so the badge never stalls on "idle". Non-destructive: it backs up settings and never overwrites an existing statusline (it prints how to add the badge yourself instead).
 
+### Added
+
+- Live viewer for the `--badge` install: `~/.claude/sem-live.py` (run it in a spare terminal pane). It redraws an ASCII blast-radius graph each time sem runs — the analyzed entity, its direct callers (real ones surfaced, test fan-out collapsed), and the transitive count — plus a **savings meter**: a running, honestly-estimated tally of the grep+read round-trips, time, and tokens sem saved this session, and a lifetime counter persisted across sessions (`~/.claude/sem-savings.json`). Estimates are anchored to a measured benchmark and labelled `≈`. The badge hook now also records `--file` and cwd so the graph can be reconstructed.
+
 ### Fixed
 
 - Impact/dependency resolution now follows type-qualified associated calls (`Type::method()`) when the receiver is a known repo type, so a caller reached only through a static/associated path is no longer dropped from `sem impact`. Previously, e.g., a test helper calling `SemPlugin::detect_changes()` was invisible to the reverse-dependency graph, and its transitive callers were missing from the blast radius. Resolution stays precise: a bare module path (`foo::bar::baz()`) still does not bind to a same-name local function, and common associated names (`Type::new`, `::default`) are not guessed.
