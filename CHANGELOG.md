@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- Faster graph hydrate on large repos. The public `EntityGraph` maps now use `rustc-hash` (FxHashMap) instead of std SipHash, matching the build's internal maps, and the SQLite cache sets read pragmas (`mmap_size`, `cache_size`, `temp_store=MEMORY`) on every connection. On a 200K-entity / 800K-edge graph this is about 9% faster to hydrate (0.42s to 0.39s, no overlap across repeats); negligible on small repos. Output is byte-identical.
+
 ## [0.15.0] - 2026-06-30
 
 ### Changed

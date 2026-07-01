@@ -5,7 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef, RefType};
 use sem_core::parser::{
     js_ts_has_default_re_export_from_content,
     js_ts_import_source_files_from_filesystem_with_unscoped,
@@ -220,6 +220,8 @@ impl DiskCache {
         }
 
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Read-only opens skip initialize_schema, so apply the read pragmas here.
+        shared_cache::apply_performance_pragmas(&conn)?;
         Ok(Self { conn })
     }
 
@@ -455,7 +457,7 @@ impl DiskCache {
             .filter_map(|r| r.ok())
             .collect();
 
-        let entity_map: HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|e| {
                 (
@@ -919,7 +921,7 @@ impl DiskCache {
                 "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id FROM entities",
             )
             .ok()?;
-        let entity_map: HashMap<String, EntityInfo> = entity_stmt
+        let entity_map: EntityInfoMap = entity_stmt
             .query_map([], |row| {
                 let id: String = row.get(0)?;
                 Ok((
@@ -1010,7 +1012,7 @@ impl DiskCache {
         query: &str,
         file_hint: Option<&str>,
     ) -> Result<Vec<EntityInfo>, rusqlite::Error> {
-        let mut by_id = HashMap::<String, EntityInfo>::new();
+        let mut by_id = EntityInfoMap::default();
 
         if let Some(file_hint) = file_hint {
             self.add_entity_candidates(
@@ -1086,7 +1088,7 @@ impl DiskCache {
         &self,
         sql: &str,
         args: &[&str],
-        by_id: &mut HashMap<String, EntityInfo>,
+        by_id: &mut EntityInfoMap,
     ) -> Result<(), rusqlite::Error> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params_from_iter(args.iter().copied()), entity_info_from_row)?;
@@ -1229,8 +1231,8 @@ impl DiskCache {
     fn entity_infos_by_id(
         &self,
         entity_ids: &[String],
-    ) -> Result<HashMap<String, EntityInfo>, rusqlite::Error> {
-        let mut infos = HashMap::new();
+    ) -> Result<EntityInfoMap, rusqlite::Error> {
+        let mut infos = EntityInfoMap::default();
         for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
             if chunk.is_empty() {
                 continue;
@@ -2230,7 +2232,7 @@ mod tests {
     }
 
     fn empty_graph() -> EntityGraph {
-        EntityGraph::from_parts(HashMap::new(), Vec::new())
+        EntityGraph::from_parts(EntityInfoMap::default(), Vec::new())
     }
 
     fn entity(id: &str, file_path: &str, name: &str, content: &str) -> SemanticEntity {
@@ -2273,7 +2275,7 @@ mod tests {
     }
 
     fn graph_with_edges(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
-        let entity_map: HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|entity| {
                 (
