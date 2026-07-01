@@ -9,6 +9,10 @@ All notable changes to sem are documented in this file.
 - `sem xref` lists cross-repo dependencies across your indexed repos: entities in one repo that depend on entities in another. A single-repo local graph can't see this, so it's a cloud feature (requires `sem login`) and is gated to the team/enterprise tier. Adds `cross_deps()` to the shared cloud client.
 - `sem diff` now prints a one-line hint, when run interactively and logged out, that `sem login` reveals what your changes break across repos (a cross-repo question a local single-repo diff can't answer). It is heavily throttled (at most once a week), shown only on a terminal with real entity changes, and stays completely silent in CI, pipes, `--json`/non-terminal output, and for logged-in users.
 
+### Performance
+
+- Cache freshness checks now run the per-file `stat` + content-hash scan in parallel (rayon) instead of sequentially (#351). On touched-file cache hits over large repos, the freshness scan was the dominant remaining cost (~42ms of sequential filesystem/hash work on a 5K-file touched scenario); it now scales across cores. SQLite reads stay serial (the connection isn't shared across threads) and fingerprint-refresh writes remain serial and best-effort — only the pure filesystem+hash work is parallelized, so cache-hit validity is unchanged.
+
 ### Documentation
 
 - The bundled `/sem` agent skill no longer hardcodes a language count. It said "31 languages", which went stale as grammars were added and disagreed with the README ("32") and the crate description ("28"); it now says "30+ languages" so it can't drift, and an en-dash was replaced with a hyphen.

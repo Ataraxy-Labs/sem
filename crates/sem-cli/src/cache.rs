@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
+use rayon::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
@@ -612,12 +613,16 @@ impl DiskCache {
         root: &Path,
         files: HashSet<String>,
     ) -> Result<bool, rusqlite::Error> {
+        // Phase 1 (serial, SQLite): read each file's cached fingerprint. The
+        // rusqlite connection isn't shareable across threads, so all DB reads
+        // happen here. A file missing from the cache means the cache can't be
+        // trusted — bail immediately.
         let mut stmt = self.conn.prepare(
             "SELECT mtime_secs, mtime_nanos, content_hash
              FROM files WHERE path = ?1",
         )?;
-        let mut fingerprint_refreshes = Vec::new();
-
+        let mut cached_meta: Vec<(String, i64, i64, Option<String>)> =
+            Vec::with_capacity(files.len());
         for file in files {
             let cached: Option<(i64, i64, Option<String>)> = stmt
                 .query_row(params![file], |row| {
@@ -627,26 +632,51 @@ impl DiskCache {
             let Some((secs, nanos, content_hash)) = cached else {
                 return Ok(false);
             };
-            match shared_cache::file_freshness(
-                &root.join(&file),
-                secs,
-                nanos,
-                content_hash.as_deref(),
-            ) {
-                Some(shared_cache::FileFreshness::Fresh) => {}
-                Some(shared_cache::FileFreshness::FreshWithUpdatedFingerprint {
+            cached_meta.push((file, secs, nanos, content_hash));
+        }
+
+        // Phase 2 (parallel, no SQLite): the freshness check is an independent
+        // stat() + read() + hash per file — exactly the sequential bottleneck on
+        // touched-file cache hits (issue #351). `file_freshness` is pure, so run
+        // it across rayon's pool. One stale file makes the whole cache stale.
+        enum Outcome {
+            Fresh,
+            Refresh(shared_cache::FileFingerprintRefresh),
+            Stale,
+        }
+        let outcomes: Vec<Outcome> = cached_meta
+            .into_par_iter()
+            .map(|(file, secs, nanos, content_hash)| {
+                match shared_cache::file_freshness(
+                    &root.join(&file),
                     secs,
                     nanos,
-                    content_hash,
-                }) => {
-                    fingerprint_refreshes.push(shared_cache::FileFingerprintRefresh {
+                    content_hash.as_deref(),
+                ) {
+                    Some(shared_cache::FileFreshness::Fresh) => Outcome::Fresh,
+                    Some(shared_cache::FileFreshness::FreshWithUpdatedFingerprint {
+                        secs,
+                        nanos,
+                        content_hash,
+                    }) => Outcome::Refresh(shared_cache::FileFingerprintRefresh {
                         path: file,
                         mtime_secs: secs,
                         mtime_nanos: nanos,
                         content_hash,
-                    });
+                    }),
+                    Some(shared_cache::FileFreshness::Stale) | None => Outcome::Stale,
                 }
-                Some(shared_cache::FileFreshness::Stale) | None => return Ok(false),
+            })
+            .collect();
+
+        // Phase 3 (serial): any stale file fails the cache; otherwise persist the
+        // refreshed fingerprints best-effort (same as before, write stays serial).
+        let mut fingerprint_refreshes = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Fresh => {}
+                Outcome::Refresh(refresh) => fingerprint_refreshes.push(refresh),
+                Outcome::Stale => return Ok(false),
             }
         }
 
