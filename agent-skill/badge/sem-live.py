@@ -193,12 +193,25 @@ def render(events, width):
     lines.append("")
     lines.append(f"  {op}{ms_s}")
 
-    graph = fetch_graph(last) if tool in ("impact", "context") else None
+    # Draw the blast radius of the most recent ANALYZABLE event (impact or
+    # context with a real target), even when later diffs/logs came after it —
+    # otherwise the graph flickers out every time an unrelated command runs.
+    def analyzable(e):
+        return e.get("tool") in ("impact", "context") and e.get("target")
+
+    graph_ev = next((e for e in reversed(events) if analyzable(e)), None)
+    graph = fetch_graph(graph_ev) if graph_ev else None
+    if graph and graph_ev is not last:
+        t = graph_ev.get("tool", "")
+        lines.append(f"  {DIM}last analyzed · {t} {graph_ev.get('target','')}{R}")
     if graph:
         direct, total, entity, file = graph
         lines.append(f"  {DIM}{'─' * (width - 4)}{R}")
         lines.append(f"  {GRN}{B}◉ {entity}{R}   {DIM}{shorten(file)}{R}")
-        lines.append(f"  {DIM}│{R}  {YEL}{len(direct)} direct{R} {DIM}→{R} {YEL}{total} transitive{R}")
+        if not direct:
+            lines.append(f"  {DIM}╰── no callers — nothing in this repo depends on it{R}")
+        else:
+            lines.append(f"  {DIM}│{R}  {YEL}{len(direct)} direct{R} {DIM}→{R} {YEL}{total} transitive{R}")
         # non-test first, so the meaningful callers are on top
         ordered = sorted(direct, key=lambda x: (is_test(x[0], x[1]), x[0]))
         shown = ordered[:9]
@@ -212,8 +225,8 @@ def render(events, width):
             extra = len(ordered) - 9
             note = f"+{extra} more" + (f" ({tests} tests)" if tests else "")
             lines.append(f"  {DIM}╰─▶ … {note}{R}")
-    elif tool in ("impact", "context"):
-        lines.append(f"  {DIM}(no graph — target/file not captured for this call){R}")
+    elif graph_ev:
+        lines.append(f"  {DIM}(no graph — could not resolve {graph_ev.get('target','?')} from {graph_ev.get('cwd','?')}){R}")
 
     # savings meter — the "you're saving so much" panel
     sess_rt = sum(rt_saved(e.get("tool")) for e in events)
