@@ -10,6 +10,8 @@ All notable changes to sem are documented in this file.
 
 ### Changed
 
+- `sem_impact` MCP results now render as a **blast-radius tree** (`◉` header, one `├─▶` branch per file, real callers first, all-test files sunk to the bottom, nothing elided) — expanding the tool widget is the live graph, no separate viewer process needed. The bundled skill also instructs agents to draw the blast radius as a small ASCII tree directly in their reply when an impact result drives the answer.
+
 - `sem_impact` and `sem_context` MCP results now render as a compact entity tree instead of pretty-printed JSON: dependents/dependencies/transitive impact grouped one line per file, every entity name preserved, with the elapsed time and source in a footer. The same information lands in about 15% of the tokens, and the expanded tool widget in agent UIs reads at a glance (`⊕ entity · file`, `← 29 dependents · 10 files`, `⚡ 70 transitively affected`). Context entries keep their verbatim content under a per-entry header.
 
 ## [0.15.1] - 2026-07-01
