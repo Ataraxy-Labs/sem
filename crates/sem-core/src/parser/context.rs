@@ -316,7 +316,6 @@ fn collect_reachable_related<'a>(
 mod tests {
     use super::*;
     use crate::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
-    use std::collections::HashMap;
 
     #[test]
     fn test_estimate_tokens() {
@@ -511,7 +510,7 @@ mod tests {
     }
 
     fn graph_from_entities(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
-        let entity_infos: HashMap<String, EntityInfo> = entities
+        let entity_infos: crate::parser::graph::EntityInfoMap = entities
             .iter()
             .map(|entity| {
                 (

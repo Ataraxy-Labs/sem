@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{params, Connection, Transaction};
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef, RefType};
 use sem_core::parser::js_ts_import_source_files_from_content;
 use sem_core::utils::hash::content_hash_bytes;
 
@@ -114,11 +114,25 @@ DROP TABLE IF EXISTS cache_metadata;
 DROP TABLE IF EXISTS entity_flags;
 ";
 
+/// Per-connection performance pragmas. These are not persisted in the database
+/// file, so they must be re-applied on every connection open (including
+/// read-only opens). `mmap_size` serves reads via memory-mapped I/O, a larger
+/// `cache_size` keeps more pages hot, and `temp_store=MEMORY` keeps temporary
+/// b-trees off disk. This speeds the topology load on large repos.
+pub fn apply_performance_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA mmap_size=268435456;
+         PRAGMA cache_size=-65536;
+         PRAGMA temp_store=MEMORY;",
+    )
+}
+
 pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;",
     )?;
+    apply_performance_pragmas(conn)?;
 
     let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version != CACHE_SCHEMA_VERSION {
@@ -917,7 +931,7 @@ impl DiskCache {
             .collect();
 
         // Build entity map for graph
-        let entity_map: HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|e| {
                 (
@@ -1022,7 +1036,7 @@ impl DiskCache {
                 "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id FROM entities",
             )
             .ok()?;
-        let entity_map: HashMap<String, EntityInfo> = entity_stmt
+        let entity_map: EntityInfoMap = entity_stmt
             .query_map([], |row| {
                 let id: String = row.get(0)?;
                 Ok((
@@ -1555,7 +1569,7 @@ mod tests {
     }
 
     fn empty_graph() -> EntityGraph {
-        EntityGraph::from_parts(HashMap::new(), Vec::new())
+        EntityGraph::from_parts(EntityInfoMap::default(), Vec::new())
     }
 
     fn entity(id: &str, file_path: &str, name: &str, content: &str) -> SemanticEntity {
@@ -1598,7 +1612,7 @@ mod tests {
     }
 
     fn graph_with_edges(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
-        let entity_map: HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|entity| {
                 (

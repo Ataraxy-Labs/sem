@@ -8,7 +8,7 @@
 //! This enables impact analysis: "if I change entity X, what else is affected?"
 
 use std::borrow::Cow;
-use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
+use std::collections::HashSet as StdHashSet;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -331,8 +331,12 @@ pub struct EntityInfo {
     pub end_line: usize,
 }
 
-pub type EntityInfoMap = StdHashMap<String, EntityInfo>;
-pub type EntityAdjacencyMap = StdHashMap<String, Vec<String>>;
+// FxHashMap (rustc-hash), not std SipHash: these graph maps are built and
+// queried on every impact/context/graph call, and Fx hashing is materially
+// faster for short string keys. Output is explicitly sorted elsewhere, so the
+// unspecified iteration order is fine.
+pub type EntityInfoMap = HashMap<String, EntityInfo>;
+pub type EntityAdjacencyMap = HashMap<String, Vec<String>>;
 
 fn sort_symbol_table_targets_by_source(
     symbol_table: &mut HashMap<String, Vec<String>>,
@@ -1107,8 +1111,8 @@ impl EntityGraph {
     /// Reconstruct an EntityGraph from pre-loaded parts (e.g. from a cache).
     pub fn from_parts(entities: EntityInfoMap, mut edges: Vec<EntityRef>) -> Self {
         sort_entity_refs(&mut edges);
-        let mut dependents: EntityAdjacencyMap = StdHashMap::new();
-        let mut dependencies: EntityAdjacencyMap = StdHashMap::new();
+        let mut dependents: EntityAdjacencyMap = EntityAdjacencyMap::default();
+        let mut dependencies: EntityAdjacencyMap = EntityAdjacencyMap::default();
         for edge in &edges {
             dependents
                 .entry(edge.to_entity.clone())
@@ -1596,8 +1600,8 @@ impl EntityGraph {
                 EntityGraph {
                     entities: entity_map.into_iter().collect(),
                     edges: Vec::new(),
-                    dependents: StdHashMap::new(),
-                    dependencies: StdHashMap::new(),
+                    dependents: EntityAdjacencyMap::default(),
+                    dependencies: EntityAdjacencyMap::default(),
                 },
                 all_entities,
             );
@@ -8949,7 +8953,7 @@ export function caller() {
             make_entity("run", "qa/smoke.rs", "#[test]\nfn run() {}"),
             make_entity("main", "src/main.rs", "fn main() {}"),
         ];
-        let entity_map: std::collections::HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|e| {
                 (
