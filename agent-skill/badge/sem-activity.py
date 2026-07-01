@@ -17,7 +17,20 @@ import time
 
 ACT = os.path.expanduser("~/.claude/sem-activity.jsonl")
 SUBCMDS = "diff|impact|context|entities|graph|blame|log|orient|xref|mcp|whoami"
-CLI_RE = re.compile(r"(?:^|[\s;&|(]|/)sem\s+(" + SUBCMDS + r")\b(.*)")
+# `sem` must be in command position (start of line, or right after a shell
+# separator), not merely after whitespace — otherwise prose inside quoted
+# commit messages ("... sem impact recall, ...") logs garbage events.
+CLI_RE = re.compile(
+    r"(?:^|[;&|(]\s*|&&\s*|\|\|\s*|\n\s*)(?:[\w./~-]*/)?sem\s+(" + SUBCMDS + r")\b([^\n;&|)]*)"
+)
+TARGET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
+
+
+def inside_quotes(text, idx):
+    """Cheap heuristic: an odd number of quotes before idx means we're inside
+    a quoted string (a commit message, a PR body), not a real invocation."""
+    prefix = text[:idx]
+    return prefix.count('"') % 2 == 1 or prefix.count("'") % 2 == 1
 
 
 def main():
@@ -53,17 +66,20 @@ def main():
                     ms = round(resp[k])
                     break
     elif tool == "Bash":
-        cmd = (data.get("tool_input") or data.get("toolInput") or {}).get("command", "")
-        m = CLI_RE.search(cmd or "")
-        if m:
+        cmd = (data.get("tool_input") or data.get("toolInput") or {}).get("command", "") or ""
+        for m in CLI_RE.finditer(cmd):
+            if inside_quotes(cmd, m.start()):
+                continue
             short = m.group(1)
             rest = (m.group(2) or "").strip()
             tok = rest.split()[0] if rest else ""
-            if tok and not tok.startswith("-"):
-                target = tok.strip("'\"")
+            tok = tok.strip("'\"")
+            if tok and not tok.startswith("-") and TARGET_RE.match(tok):
+                target = tok
             fm = re.search(r"--file[= ]([^\s]+)", rest)
             if fm:
                 file_hint = fm.group(1).strip("'\"")
+            break
 
     if not short:
         return
