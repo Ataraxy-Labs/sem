@@ -1198,13 +1198,14 @@ fn ensure_relative_worktrees_extension_supported() -> Result<(), GitError> {
 
     EXTENSIONS
         .get_or_init(|| {
-            // Git 2.41 introduced extensions.relativeWorktrees. libgit2 1.9.x
+            // Git 2.48 introduced extensions.relativeWorktrees. libgit2 1.9.x
             // can operate on these repositories, but rejects unknown extension
             // names while opening the repo unless callers opt in first.
             unsafe { git2::opts::set_extensions(&["relativeworktrees"]) }
                 .map_err(|error| error.message().to_string())
         })
         .as_ref()
+        .map(|_| ())
         .map_err(|message| git_command_error(message.clone()))
 }
 
