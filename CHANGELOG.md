@@ -2,6 +2,12 @@
 
 All notable changes to sem are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- `sem_impact` and `sem_context` MCP results now render as a compact entity tree instead of pretty-printed JSON: dependents/dependencies/transitive impact grouped one line per file, every entity name preserved, with the elapsed time and source in a footer. The same information lands in about 15% of the tokens, and the expanded tool widget in agent UIs reads at a glance (`⊕ entity · file`, `← 29 dependents · 10 files`, `⚡ 70 transitively affected`). Context entries keep their verbatim content under a per-entry header.
+
 ## [0.15.1] - 2026-07-01
 
 ### Added
