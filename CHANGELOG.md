@@ -6,7 +6,7 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
-- `npx @ataraxy-labs/sem-skill --badge` (opt-in) installs a live sem badge in the Claude Code statusline: it shows how many structural queries ran this session, the last one and its latency, and a sparkline of recent latencies (`⊕ sem ×12  impact 9ms  ▁▂▃▅▂`), fed by a PostToolUse hook that logs each sem MCP call. Non-destructive: it backs up settings and never overwrites an existing statusline (it prints how to add the badge yourself instead).
+- `npx @ataraxy-labs/sem-skill --badge` (opt-in) installs a live sem badge in the Claude Code statusline: it shows how many structural queries ran this session, the last command **and the entity it analyzed**, its latency, a sparkline of recent latencies, and a rotating stat (distinct entities analyzed, top command) (`⊕ sem ×12  impact validateToken 9ms  ▁▂▃▅▂  · 7 entities analyzed`). It is fed by a PostToolUse hook that catches sem via **both** the MCP tools and the `sem` CLI (Bash), and falls back to recent activity so the badge never stalls on "idle". Non-destructive: it backs up settings and never overwrites an existing statusline (it prints how to add the badge yourself instead).
 
 ### Performance
 

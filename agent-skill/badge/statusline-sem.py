@@ -45,6 +45,8 @@ def main():
     dirname = os.path.basename(cwd.rstrip("/")) or "/"
 
     events = []
+    session_events, recent_events = [], []
+    cutoff = time.time() - 3 * 3600  # "recent" = last few hours
     if os.path.exists(ACT):
         with open(ACT) as f:
             for line in f:
@@ -52,8 +54,13 @@ def main():
                     e = json.loads(line)
                 except Exception:
                     continue
-                if not session_id or e.get("session") == session_id:
-                    events.append(e)
+                if session_id and e.get("session") == session_id:
+                    session_events.append(e)
+                if e.get("ts", 0) >= cutoff:
+                    recent_events.append(e)
+    # prefer this session's activity; fall back to recent so a session-id
+    # mismatch between the hook and the statusline can never strand it on "idle"
+    events = (session_events or recent_events)[-40:]
 
     left = f"{DIM}📁 {dirname}{RESET}"
     if model:
@@ -62,19 +69,31 @@ def main():
     if not events:
         badge = f"{DIM}⊕ sem idle{RESET}"
     else:
+        from collections import Counter
         n = len(events)
         last = events[-1]
         lat = [e["ms"] for e in events[-12:] if isinstance(e.get("ms"), (int, float))]
         sp = spark(lat)
         last_tool = last.get("tool", "sem")
+        last_target = last.get("target", "")
+        op = f"{last_tool} {last_target}".strip() if last_target else last_tool
         last_ms = last.get("ms")
         ms_str = f" {last_ms}ms" if isinstance(last_ms, (int, float)) else ""
-        tag = TAGLINES[n % len(TAGLINES)]
+        # rotate the trailing segment through real stats + a tagline
+        tally = Counter(e.get("tool") for e in events)
+        targets = {e.get("target") for e in events if e.get("target")}
+        top_cmd, top_n = tally.most_common(1)[0]
+        insights = [
+            f"{len(targets)} entities analyzed" if targets else TAGLINES[0],
+            f"{top_cmd} ×{top_n} top",
+            TAGLINES[n % len(TAGLINES)],
+        ]
+        insight = insights[n % len(insights)]
         badge = (
             f"{GREEN}{BOLD}⊕ sem{RESET} {GREEN}×{n}{RESET}"
-            f" {CYAN}{last_tool}{ms_str}{RESET}"
+            f" {CYAN}{op}{ms_str}{RESET}"
             + (f" {MAGENTA}{sp}{RESET}" if sp else "")
-            + f" {DIM}· {tag}{RESET}"
+            + f" {DIM}· {insight}{RESET}"
         )
 
     print(f"{left}  {badge}")

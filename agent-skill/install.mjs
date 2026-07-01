@@ -61,10 +61,14 @@ function installBadge() {
     (e.hooks || []).some((h) => (h.command || '').includes('sem-activity.py')),
   );
   if (!hasHook) {
-    post.push({
-      matcher: 'mcp__sem__.*',
-      hooks: [{ type: 'command', command: `python3 ${hookDest}` }],
-    });
+    // sem is used two ways: the MCP tools and the CLI through Bash. Register
+    // both so the badge lights up whichever path the agent takes.
+    for (const matcher of ['mcp__sem__.*', 'Bash']) {
+      post.push({
+        matcher,
+        hooks: [{ type: 'command', command: `python3 ${hookDest}` }],
+      });
+    }
   }
 
   // statusLine: destructive slot, so only set it if you have none (or it is
