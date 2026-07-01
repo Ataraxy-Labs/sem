@@ -29,6 +29,7 @@ pub struct GitBridge {
 impl GitBridge {
     pub fn open(path: &Path) -> Result<Self, GitError> {
         let cwd = normalize_open_path(path)?;
+        ensure_relative_worktrees_extension_supported()?;
         let repo = match Repository::discover(path) {
             Ok(repo) => repo,
             Err(error) if should_retry_with_command_line_safe_directory(&error, path) => {
@@ -1192,6 +1193,21 @@ fn git_command_error(message: String) -> GitError {
     GitError::Git2(git2::Error::from_str(&message))
 }
 
+fn ensure_relative_worktrees_extension_supported() -> Result<(), GitError> {
+    static EXTENSIONS: OnceLock<Result<(), String>> = OnceLock::new();
+
+    EXTENSIONS
+        .get_or_init(|| {
+            // Git 2.41 introduced extensions.relativeWorktrees. libgit2 1.9.x
+            // can operate on these repositories, but rejects unknown extension
+            // names while opening the repo unless callers opt in first.
+            unsafe { git2::opts::set_extensions(&["relativeworktrees"]) }
+                .map_err(|error| error.message().to_string())
+        })
+        .as_ref()
+        .map_err(|message| git_command_error(message.clone()))
+}
+
 fn map_git_error(error: git2::Error) -> GitError {
     if error.code() == ErrorCode::NotFound {
         GitError::NotARepo
@@ -1438,6 +1454,26 @@ mod tests {
         assert!(blame[0].commit_sha.is_some());
         assert_eq!(blame[1].commit_sha, None);
         assert_eq!(blame[1].author, "Not Committed Yet");
+    }
+
+    #[test]
+    fn open_allows_relative_worktrees_extension() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        drop(repo);
+
+        let config = temp.path().join(".git/config");
+        let contents = fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("repositoryformatversion = 0"));
+        fs::write(
+            &config,
+            contents.replace("repositoryformatversion = 0", "repositoryformatversion = 1")
+                + "\n[extensions]\n\trelativeworktrees = true\n",
+        )
+        .unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        assert_eq!(bridge.repo_root(), fs::canonicalize(temp.path()).unwrap());
     }
 
     #[test]
