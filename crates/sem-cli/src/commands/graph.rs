@@ -26,11 +26,39 @@ pub fn graph_command(opts: GraphOptions) {
         Err(_) => Path::new(&opts.cwd).to_path_buf(),
     };
     let root = root.as_path();
-    let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = normalize_exts(&opts.file_exts);
+    let source_scope = cache_source_scope(root, &ext_filter, opts.no_default_excludes);
+
+    // Oracle fast path: when git proves the cache is fresh, the file walk (the
+    // dominant cost on large repos) is redundant — the cache already holds the
+    // topology. Skip discovery entirely and serve straight from cache.
+    if !opts.no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            if opts.json {
+                if let Some(graph) = disk.oracle_fresh_topology(root, source_scope) {
+                    timings.mark("oracle_fast_path");
+                    write_graph_json(&graph).unwrap();
+                    timings.mark("cli_output_serialization");
+                    timings.finish();
+                    return;
+                }
+            } else if let Some((entities, edges)) = disk.oracle_fresh_counts(root, source_scope) {
+                timings.mark("oracle_fast_path");
+                println!(
+                    "{} {} entities, {} edges",
+                    "⊕".green(),
+                    entities.to_string().bold(),
+                    edges.to_string().bold(),
+                );
+                timings.finish();
+                return;
+            }
+        }
+    }
+
+    let registry = super::create_registry(&root.to_string_lossy());
     let file_paths =
         find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
-    let source_scope = cache_source_scope(root, &ext_filter, opts.no_default_excludes);
     timings.mark("file_discovery");
     if opts.json && !opts.no_cache {
         if let Ok(disk) = DiskCache::open(root) {

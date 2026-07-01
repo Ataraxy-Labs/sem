@@ -16,6 +16,129 @@ use serde::Serialize;
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 const SQL_PARAM_CHUNK: usize = 500;
 
+const META_GIT_HEAD_OID: &str = "git_head_oid";
+const META_GIT_BUILT_CLEAN: &str = "git_built_clean";
+const META_ORACLE_ELIGIBLE: &str = "oracle_eligible";
+
+/// Below this many indexed files, skip the git oracle: the scan is already
+/// cheap and the git call would only add overhead.
+const ORACLE_MIN_FILES: i64 = 2_000;
+
+/// Default cap on the `git status` clean-check. `git status` is normally
+/// 0.1–0.3s, but a cold index after a mass file-touch can make it re-hash
+/// everything and take tens of seconds. Bounding it means the oracle can never
+/// be slower than the scan it replaces — on timeout we fall back to the scan.
+const ORACLE_TIMEOUT_MS: u64 = 1_500;
+
+/// Freshness strategy, set via `SEM_FRESHNESS` (`scan` | `git` | `auto`).
+/// `auto` (default) uses the git oracle for any git repo big enough to benefit;
+/// `git status` rides fsmonitor when it's configured (~10x) and still beats the
+/// scan without it (~4x). `git` forces the oracle, `scan` forces the per-file
+/// walk. The `git status` call is time-bounded so the oracle never regresses.
+#[derive(PartialEq)]
+enum FreshnessMode {
+    Scan,
+    Git,
+    Auto,
+}
+
+fn freshness_mode() -> FreshnessMode {
+    match std::env::var("SEM_FRESHNESS").ok().as_deref() {
+        Some("scan") => FreshnessMode::Scan,
+        Some("git") => FreshnessMode::Git,
+        _ => FreshnessMode::Auto,
+    }
+}
+
+fn git_head_oid(root: &Path) -> Option<String> {
+    Some(
+        git2::Repository::open(root)
+            .ok()?
+            .head()
+            .ok()?
+            .target()?
+            .to_string(),
+    )
+}
+
+/// Clean iff `git status --porcelain` is empty — no modified, deleted, or
+/// untracked paths. Shelled out so it rides git's fsmonitor. Time-bounded: if
+/// git takes longer than the timeout (e.g. a cold index re-hashing after a mass
+/// touch), we abandon it and return None so the caller falls back to the scan,
+/// rather than inheriting git's worst-case latency. Returns None when git is
+/// unavailable or errors, too.
+fn git_working_tree_clean(root: &Path) -> Option<bool> {
+    let timeout = std::time::Duration::from_millis(
+        std::env::var("SEM_FRESHNESS_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ORACLE_TIMEOUT_MS),
+    );
+    let root = root.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Run git on a helper thread; `.output()` drains stdout so a large dirty
+    // status can't deadlock. On timeout we leave the thread to finish in the
+    // background (the process exits fine) and fall back to the scan.
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain"])
+            .output();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) if output.status.success() => {
+            Some(output.stdout.iter().all(u8::is_ascii_whitespace))
+        }
+        _ => None,
+    }
+}
+
+/// The oracle is only safe when every file sem indexed is git-tracked: then a
+/// clean working tree proves those files are at their committed (cached)
+/// content. If sem indexes anything untracked/ignored, git's clean signal
+/// wouldn't cover it, so the repo is ineligible and we always scan.
+fn compute_oracle_eligible(root: &Path, files: &[String]) -> bool {
+    let Ok(repo) = git2::Repository::open(root) else {
+        return false;
+    };
+    let Ok(index) = repo.index() else {
+        return false;
+    };
+    let tracked: HashSet<String> = index
+        .iter()
+        .filter_map(|entry| String::from_utf8(entry.path).ok())
+        .collect();
+    if tracked.is_empty() {
+        return false;
+    }
+    files
+        .iter()
+        .filter(|file| !shared_cache::is_manifest_file_name(file))
+        .all(|file| tracked.contains(file))
+}
+
+/// Record the build-time epoch: HEAD oid, whether the tree was clean at build
+/// (a cache built from a dirty tree can't be trusted by a later clean check),
+/// and whether the repo is oracle-eligible. Best-effort.
+fn store_freshness_epoch(tx: &rusqlite::Transaction<'_>, root: &Path, files: &[String]) {
+    let Some(oid) = git_head_oid(root) else {
+        return;
+    };
+    let built_clean = matches!(git_working_tree_clean(root), Some(true));
+    let eligible = built_clean && compute_oracle_eligible(root, files);
+    let put = |key: &str, val: &str| {
+        let _ = tx.execute(
+            "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES (?1, ?2)",
+            params![key, val],
+        );
+    };
+    put(META_GIT_HEAD_OID, &oid);
+    put(META_GIT_BUILT_CLEAN, if built_clean { "1" } else { "0" });
+    put(META_ORACLE_ELIGIBLE, if eligible { "1" } else { "0" });
+}
+
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
 pub struct PartialCache {
     pub stale_files: Vec<String>,
@@ -176,6 +299,7 @@ impl DiskCache {
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
         shared_cache::set_cache_source_scope(&tx, source_scope)?;
+        store_freshness_epoch(&tx, root, files);
         tx.commit()?;
         Ok(())
     }
@@ -256,6 +380,7 @@ impl DiskCache {
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_TOPOLOGY)?;
         shared_cache::set_cache_source_scope(&tx, source_scope)?;
+        store_freshness_epoch(&tx, root, files);
         tx.commit()?;
         Ok(())
     }
@@ -605,6 +730,109 @@ impl DiskCache {
         )?;
         let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
         rows.collect()
+    }
+
+    fn meta_value(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM cache_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Fast path: prove the whole cache is fresh by asking git what changed,
+    /// skipping the per-file scan. Returns true only when the cache was built
+    /// from a clean, oracle-eligible tree at a HEAD that is still the current
+    /// HEAD and the working tree is still clean. Every uncertain case returns
+    /// false and the caller falls through to the authoritative scan, so this
+    /// can never serve stale results — it can only decline to accelerate.
+    fn git_oracle_says_fresh(&self, root: &Path) -> bool {
+        let mode = freshness_mode();
+        if mode == FreshnessMode::Scan {
+            return false;
+        }
+        // Skip tiny repos in auto mode: the scan is already cheap there, so the
+        // git call would only add overhead. `git` mode forces it regardless.
+        if mode == FreshnessMode::Auto {
+            let file_count: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+                .unwrap_or(0);
+            if file_count < ORACLE_MIN_FILES {
+                return false;
+            }
+        }
+        if self.meta_value(META_ORACLE_ELIGIBLE).as_deref() != Some("1") {
+            return false;
+        }
+        if self.meta_value(META_GIT_BUILT_CLEAN).as_deref() != Some("1") {
+            return false;
+        }
+        let Some(stored_oid) = self.meta_value(META_GIT_HEAD_OID) else {
+            return false;
+        };
+        if git_head_oid(root).as_deref() != Some(stored_oid.as_str()) {
+            return false;
+        }
+        matches!(git_working_tree_clean(root), Some(true))
+    }
+
+    /// Gate for the discovery-skipping fast paths below: a topology cache of the
+    /// right scope that the git oracle proves fresh — without needing a file
+    /// list, so the caller can avoid walking the filesystem at all.
+    fn oracle_cache_fresh(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) && shared_cache::cache_has_source_scope(&self.conn, source_scope)
+            && !shared_cache::is_manifest_stale(&self.conn, root)
+            && self.git_oracle_says_fresh(root)
+    }
+
+    /// Hydrate the cached topology when the oracle proves it fresh, skipping
+    /// file discovery. For `sem graph --json`.
+    pub fn oracle_fresh_topology(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<EntityGraph> {
+        if !self.oracle_cache_fresh(root, source_scope) {
+            return None;
+        }
+        self.load_graph_topology_rows()
+    }
+
+    /// Entity and edge counts straight from SQLite when the oracle proves the
+    /// cache fresh — the summary output needs only counts, so this skips both
+    /// file discovery and hydrating the full graph.
+    pub fn oracle_fresh_counts(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<(usize, usize)> {
+        if !self.oracle_cache_fresh(root, source_scope) {
+            return None;
+        }
+        let entities: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+            .ok()?;
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .ok()?;
+        Some((entities as usize, edges as usize))
     }
 
     fn cached_files_are_fresh(
@@ -1181,6 +1409,10 @@ impl DiskCache {
             return false;
         }
 
+        if self.git_oracle_says_fresh(root) {
+            return true;
+        }
+
         self.cached_files_are_fresh(
             root,
             files
@@ -1309,6 +1541,10 @@ impl DiskCache {
 
         if shared_cache::is_manifest_stale(&self.conn, root) {
             return false;
+        }
+
+        if self.git_oracle_says_fresh(root) {
+            return true;
         }
 
         let cached_count: i64 = match self
@@ -1824,6 +2060,13 @@ impl DiskCache {
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
         shared_cache::set_cache_source_scope(&tx, source_scope)?;
+        // An incremental write leaves the cache reflecting the current working
+        // tree, which may differ from HEAD (uncommitted edits). Refresh the
+        // epoch so `built_clean` reflects reality now — otherwise a later
+        // revert-to-HEAD would let the oracle serve this incremental content as
+        // if it were the committed state. Reflecting the current state keeps
+        // the oracle correct (it disables itself when built dirty).
+        store_freshness_epoch(&tx, root, all_files);
         tx.commit()?;
         Ok(())
     }
