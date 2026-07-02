@@ -7,7 +7,6 @@ All notable changes to sem are documented in this file.
 ### Added
 
 - The `--badge` statusline is now **live at trigger time**: a PreToolUse hook flips the badge to an animated spinner with the entity name the moment the agent calls sem (`⊕ sem ⠹ impact validateToken…`), and the completed state (count, latency, savings) lands when the call finishes. The render hot path never touches the network (teammates presence refreshes in a detached worker; renders measured at ~20ms).
-- **Team presence (opt-in)**: with `sem login` + `~/.sem/team.json` `{"share": true}`, sessions heartbeat the entity being worked on to sem-cloud (`POST /v1/presence`), and the statusline shows teammates live (`👥 maya → resolve_ref · 2m`). Entity claims API (`/v1/claims`, advisory TTL locks) shipped server-side for agents to route around each other. Off by default; nothing leaves the machine without the opt-in file.
 
 ### Fixed
 
