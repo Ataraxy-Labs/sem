@@ -39,10 +39,15 @@ pub struct ContextResult {
     pub omitted: Vec<OmittedTail>,
 }
 
-/// Estimate token count from content. Rough heuristic: ~1.3 tokens per whitespace-separated word.
+/// Estimate token count from content. Code tokenizes near 1 token per ~4
+/// characters; the old words*1.3 heuristic undercounted real tokens 2-3x on
+/// dense code (measured: a context reported as 661 tokens cost ~2,400 real
+/// tokens), silently blowing every budget. Use the max of both estimates so
+/// neither prose nor symbol-dense code slips under.
 fn estimate_tokens(content: &str) -> usize {
-    let words = content.split_whitespace().count();
-    words * 13 / 10
+    let words = content.split_whitespace().count() * 13 / 10;
+    let chars = content.chars().count() / 4;
+    words.max(chars)
 }
 
 /// Extract just the first line (signature) of an entity's content.
@@ -517,9 +522,11 @@ mod tests {
         )];
         let graph = graph_from_entities(&entities, vec![]);
 
-        let result = build_context_result(&graph, "a.py::function::helper_b", &entities, 2);
+        // "def helper_b():" is 15 chars ≈ 3 tokens under the char-aware
+        // estimate (the old word count said 2, undercounting real tokens).
+        let result = build_context_result(&graph, "a.py::function::helper_b", &entities, 3);
 
-        assert_eq!(result.total_tokens, 2);
+        assert_eq!(result.total_tokens, 3);
         assert!(result.truncated);
         assert!(!result.target_omitted);
         assert_eq!(result.entries.len(), 1);
