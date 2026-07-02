@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `sem context` / `sem_context` budget packer no longer starves the target while neighbors feast. Previously a target too big for the budget collapsed to its first line (2 tokens) while a single large dependency could consume the entire budget with its full body. The target now degrades gracefully — full body → head-truncated body (docstring, fields, leading code, with an explicit `… truncated: N more lines` marker) using up to ~70% of the budget → bare signature — and no neighbor may cost more tokens than the target itself did (budget/10 floor), oversized neighbors degrading to signatures. On the same query (a large class, budget 2000) the target went from 2 tokens to 1,398 and the answer-relevant attributes are now in the payload.
+
 ### Added
 
 - **Entity-level history analytics**: `sem log` with no entity now analyzes recent repo history in one pass and reports **hotspots** (the most-changed code entities, with commit counts, distinct authors, and the last commit that touched each) and **co-change pairs** (entities that repeatedly change in the same commits, with a confidence score — "these two never change apart"). Counts are per commit, code entities only (doc headings, config properties, and lockfile chunks are excluded so the signal is about code), and bulk commits touching >50 entities are excluded from pair-counting to keep quadratic noise out. Same via MCP: `sem_log` without `entity_name`. `--file` scopes to one file; `--json` returns everything. This is the time axis a snapshot dependency graph cannot see: which code churns, and which code moves together.

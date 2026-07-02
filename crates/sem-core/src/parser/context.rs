@@ -37,6 +37,41 @@ fn signature_only(content: &str) -> String {
     content.lines().next().unwrap_or("").to_string()
 }
 
+/// Head-truncate content to fit `cap_tokens`, keeping whole leading lines and
+/// appending an explicit truncation marker (which must itself fit the cap).
+/// Returns None when not even the first line plus the marker fits — callers
+/// then fall back to the bare signature.
+fn truncate_head(content: &str, cap_tokens: usize) -> Option<(String, usize)> {
+    let total_lines = content.lines().count();
+    let mut kept = String::new();
+    let mut kept_lines = 0usize;
+    for line in content.lines() {
+        let candidate = if kept.is_empty() {
+            line.to_string()
+        } else {
+            format!("{kept}\n{line}")
+        };
+        let marker = format!(
+            "\n… truncated: {} more lines",
+            total_lines.saturating_sub(kept_lines + 1)
+        );
+        if estimate_tokens(&format!("{candidate}{marker}")) > cap_tokens {
+            break;
+        }
+        kept = candidate;
+        kept_lines += 1;
+    }
+    if kept.is_empty() || kept_lines == total_lines {
+        return None;
+    }
+    let out = format!(
+        "{kept}\n… truncated: {} more lines",
+        total_lines - kept_lines
+    );
+    let tokens = estimate_tokens(&out);
+    Some((out, tokens))
+}
+
 /// Build a context set for a target entity within a token budget.
 ///
 /// Greedy knapsack by priority:
@@ -82,8 +117,11 @@ pub fn build_context_result_bounded(
     let mut result = ContextResult::default();
     let mut included_ids = HashSet::new();
 
-    // 1. Target entity. Keep the budget strict: if even the signature does not fit,
-    // omit the target and return an empty result instead of overspending.
+    // 1. Target entity — it gets the budget FIRST, and degrades gracefully:
+    // full body → head-truncated body (up to ~70% of the budget) → bare
+    // signature → omitted. The target is what the caller asked about; it must
+    // never starve while neighbors feast (previously a too-big target fell
+    // straight to its first line and dependencies consumed the whole budget).
     if let Some(entity) = entity_lookup.get(entity_id) {
         let full_tokens = estimate_tokens(&entity.content);
         if full_tokens <= token_budget {
@@ -99,7 +137,17 @@ pub fn build_context_result_bounded(
             result.truncated = true;
             let sig = signature_only(&entity.content);
             let sig_tokens = estimate_tokens(&sig);
-            if sig_tokens <= token_budget {
+            let head_cap = (token_budget * 7 / 10).max(sig_tokens);
+            if let Some((head, head_tokens)) = truncate_head(&entity.content, head_cap) {
+                push_entry(
+                    &mut result,
+                    entity,
+                    "target",
+                    head,
+                    head_tokens,
+                    &mut included_ids,
+                );
+            } else if sig_tokens <= token_budget {
                 push_entry(
                     &mut result,
                     entity,
@@ -117,6 +165,11 @@ pub fn build_context_result_bounded(
         };
     }
 
+    // No single neighbor may cost more than the target itself did (with a
+    // budget/10 floor so a tiny target still allows useful neighbor bodies).
+    // Oversized neighbors degrade to signatures instead of dominating.
+    let neighbor_full_cap = result.total_tokens.max(token_budget / 10);
+
     let direct_dependencies = graph.get_dependencies(entity_id);
     for dep_info in &direct_dependencies {
         add_full_or_signature(
@@ -125,6 +178,7 @@ pub fn build_context_result_bounded(
             dep_info.id.as_str(),
             "direct_dependency",
             token_budget,
+            neighbor_full_cap,
             &mut included_ids,
         );
     }
@@ -137,6 +191,7 @@ pub fn build_context_result_bounded(
             dep_info.id.as_str(),
             "direct_dependent",
             token_budget,
+            neighbor_full_cap,
             &mut included_ids,
         );
     }
@@ -204,6 +259,7 @@ fn add_full_or_signature(
     entity_id: &str,
     role: &str,
     token_budget: usize,
+    full_cap: usize,
     included_ids: &mut HashSet<String>,
 ) {
     if included_ids.contains(entity_id) {
@@ -215,7 +271,7 @@ fn add_full_or_signature(
     };
 
     let full_tokens = estimate_tokens(&entity.content);
-    if result.total_tokens + full_tokens <= token_budget {
+    if full_tokens <= full_cap && result.total_tokens + full_tokens <= token_budget {
         push_entry(
             result,
             entity,
@@ -529,5 +585,75 @@ mod tests {
             .collect();
 
         EntityGraph::from_parts(entity_infos, edges)
+    }
+
+    #[test]
+    fn big_target_gets_head_truncated_majority_of_budget() {
+        // A target too big for the budget must degrade to a head-truncated
+        // body (with an explicit marker), not collapse to its first line.
+        let body = (0..200)
+            .map(|i| format!("    line_{i} = compute_{i}()"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!("def big_target():\n{body}");
+        let entities = vec![entity("a.py::function::big_target", "big_target", &content)];
+        let graph = graph_from_entities(&entities, vec![]);
+
+        let result = build_context_result(&graph, "a.py::function::big_target", &entities, 100);
+
+        assert!(!result.target_omitted);
+        assert!(result.truncated);
+        assert_eq!(result.entries.len(), 1);
+        let target = &result.entries[0];
+        assert!(target.content.lines().count() > 5, "more than the bare signature");
+        assert!(target.content.contains("… truncated:"), "explicit marker");
+        assert!(
+            target.estimated_tokens >= 50 && target.estimated_tokens <= 100,
+            "target consumes the majority of the budget, got {}",
+            target.estimated_tokens
+        );
+    }
+
+    #[test]
+    fn oversized_neighbor_degrades_to_signature_not_full_body() {
+        // A neighbor may never cost more than the target did: the giant
+        // dependency gets a signature, the small one keeps its full body.
+        let giant_body = (0..300)
+            .map(|i| format!("    g_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entities = vec![
+            entity("a.py::function::small_target", "small_target", "def small_target():\n    return helper() + giant()"),
+            entity("a.py::function::giant", "giant", &format!("def giant():\n{giant_body}")),
+            entity("a.py::function::helper", "helper", "def helper():\n    return 42"),
+        ];
+        let graph = graph_from_entities(
+            &entities,
+            vec![
+                edge("a.py::function::small_target", "a.py::function::giant"),
+                edge("a.py::function::small_target", "a.py::function::helper"),
+            ],
+        );
+
+        let result =
+            build_context_result(&graph, "a.py::function::small_target", &entities, 3000);
+
+        let giant = result
+            .entries
+            .iter()
+            .find(|e| e.entity_name == "giant")
+            .expect("giant included");
+        assert_eq!(
+            giant.content.lines().count(),
+            1,
+            "giant neighbor degraded to signature, got {} lines",
+            giant.content.lines().count()
+        );
+        let helper = result
+            .entries
+            .iter()
+            .find(|e| e.entity_name == "helper")
+            .expect("helper included");
+        assert!(helper.content.contains("return 42"), "small neighbor keeps full body");
     }
 }
