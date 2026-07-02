@@ -1,3 +1,4 @@
+pub mod hook;
 pub mod blame;
 pub mod cloud;
 pub mod context;

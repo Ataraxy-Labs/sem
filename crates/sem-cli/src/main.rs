@@ -203,6 +203,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Internal plumbing for agent-harness hooks (hidden)
+    #[command(hide = true)]
+    Hook {
+        /// Hook kind, e.g. prompt-submit
+        kind: String,
+    },
     /// Show evolution of an entity through git history, or, with no entity,
     /// the repo's history analytics: hotspots and co-change pairs
     Log {
@@ -385,6 +391,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Impact { .. }) => "impact",
         Some(Commands::Graph { .. }) => "graph",
         Some(Commands::Blame { .. }) => "blame",
+        Some(Commands::Hook { .. }) => "hook",
         Some(Commands::Log { .. }) => "log",
         Some(Commands::Entities { .. }) => "entities",
         Some(Commands::Orient { .. }) => "orient",
@@ -561,6 +568,11 @@ fn main() {
                 no_cache,
                 no_default_excludes,
             });
+        }
+        Some(Commands::Hook { kind }) => {
+            if kind == "prompt-submit" {
+                commands::hook::prompt_submit();
+            }
         }
         Some(Commands::Log {
             entity,
