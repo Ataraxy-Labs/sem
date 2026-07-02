@@ -4,6 +4,11 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- The `--badge` statusline is now **live at trigger time**: a PreToolUse hook flips the badge to an animated spinner with the entity name the moment the agent calls sem (`⊕ sem ⠹ impact validateToken…`), and the completed state (count, latency, savings) lands when the call finishes. The render hot path never touches the network (teammates presence refreshes in a detached worker; renders measured at ~20ms).
+- **Team presence (opt-in)**: with `sem login` + `~/.sem/team.json` `{"share": true}`, sessions heartbeat the entity being worked on to sem-cloud (`POST /v1/presence`), and the statusline shows teammates live (`👥 maya → resolve_ref · 2m`). Entity claims API (`/v1/claims`, advisory TTL locks) shipped server-side for agents to route around each other. Off by default; nothing leaves the machine without the opt-in file.
+
 ### Fixed
 
 - The `sem context` / `sem_context` budget packer no longer starves the target while neighbors feast. Previously a target too big for the budget collapsed to its first line (2 tokens) while a single large dependency could consume the entire budget with its full body. The target now degrades gracefully — full body → head-truncated body (docstring, fields, leading code, with an explicit `… truncated: N more lines` marker) using up to ~70% of the budget → bare signature — and no neighbor may cost more tokens than the target itself did (budget/10 floor), oversized neighbors degrading to signatures. On the same query (a large class, budget 2000) the target went from 2 tokens to 1,398 and the answer-relevant attributes are now in the payload.
