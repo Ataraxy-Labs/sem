@@ -14,6 +14,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- The context packer's "not packed" summary line pluralizes roles correctly ("transitive dependencies", not "dependencys").
+
 - The docs site deploys through workflow-based GitHub Pages (`.github/workflows/docs-pages.yml`: upload `/docs` verbatim, deploy) instead of the legacy branch-based Jekyll builder, which began failing repo-wide with zero-duration "Page build failed" errors on commits that didn't touch docs — including on direct build requests via the Pages API. The site is pure static HTML, so the legacy builder added nothing but a failure mode; deploys now also skip entirely on commits that don't change `docs/`.
 
 ### Changed

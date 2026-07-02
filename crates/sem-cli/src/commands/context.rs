@@ -144,11 +144,11 @@ pub fn context_command(opts: ContextOptions) {
                 .omitted
                 .iter()
                 .map(|t| {
-                    let role = t.role.replace('_', " ");
+                    let role = pluralize_role(&t.role);
                     if t.tests > 0 {
-                        format!("+{} {}s ({} tests)", t.entities, role, t.tests)
+                        format!("+{} {} ({} tests)", t.entities, role, t.tests)
                     } else {
-                        format!("+{} {}s", t.entities, role)
+                        format!("+{} {}", t.entities, role)
                     }
                 })
                 .collect();
@@ -233,4 +233,14 @@ fn find_entity<'a>(
         );
     }
     std::process::exit(1);
+}
+
+/// "direct_dependency" -> "direct dependencies", "direct_dependent" -> "direct dependents".
+fn pluralize_role(role: &str) -> String {
+    let spaced = role.replace('_', " ");
+    if let Some(stem) = spaced.strip_suffix('y') {
+        format!("{stem}ies")
+    } else {
+        format!("{spaced}s")
+    }
 }
