@@ -1,0 +1,42 @@
+# Deploys the docs site (static HTML in /docs) to GitHub Pages via the
+# Actions-based flow, replacing the legacy branch-based Jekyll builder.
+#
+# Why: the legacy builder started failing repo-wide with zero-duration
+# "Page build failed" errors (2026-07-02) on commits that didn't touch docs
+# at all, and direct build requests via the Pages API failed identically.
+# The site is pure static HTML — Jekyll added nothing but a failure mode.
+# This workflow uploads /docs verbatim and deploys it, and only runs when
+# docs actually change.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - id: deployment
+        uses: actions/deploy-pages@v4
