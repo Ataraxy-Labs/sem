@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- The sem MCP server is now **local-first and prewarmed**. Cloud-first routing on `sem_impact`/`sem_context` cost a network round-trip on every call before the local answer (and carried the same wrong-entity risk gated in the CLI); it is now behind `SEM_MCP_CLOUD=1` until the server resolves name+file strictly. The server also builds the CWD repo's graph in the background at startup, so the agent's first structural query answers from memory. Measured on an 85K-LOC repo: warm `sem_context` runs in under 1ms wall (faster than a ripgrep scan of the same repo), and the first call dropped from 129ms cold to ~0 with prewarm.
+
 ### Removed
 
 - Team presence was pulled from the `--badge` package before it shipped as a feature (product call: not a feature for now). The statusline no longer shows teammates and the hook sends nothing anywhere; the dormant server endpoints remain unadvertised.

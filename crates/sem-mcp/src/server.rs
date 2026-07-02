@@ -694,6 +694,20 @@ impl SemServer {
         Some(file_paths)
     }
 
+    /// Kick a background graph build for the repo discovered from env/CWD, so
+    /// the first real query hits a warm in-memory graph. Fire-and-forget: any
+    /// failure (not a repo, empty dir) is silently ignored and the first query
+    /// simply builds as before.
+    pub fn spawn_prewarm(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let Ok(repo_root) = Self::discover_repo_root(None) else {
+                return;
+            };
+            let _ = this.live_graph(&repo_root).await;
+        });
+    }
+
     /// Whole-repo (graph, entities), kept hot by the file watcher when active.
     async fn live_graph(&self, repo_root: &Path) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
         if self.ensure_live(repo_root).await.is_some() {
@@ -1040,7 +1054,7 @@ impl SemServer {
         // warm cloud graph instead of a local build. Custom-scope requests
         // (no_default_excludes) stay local since the cloud indexes the default
         // scope; on any miss/error this returns None and the local path runs.
-        if !no_default_excludes {
+        if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
             if let Some(mut out) =
                 crate::cloud::try_impact(&ctx.git, &params.entity_name, &rel_path, mode)
             {
@@ -1402,10 +1416,13 @@ impl SemServer {
         let budget = params.token_budget.unwrap_or(8000);
         let hops = params.hops.unwrap_or(0);
 
-        // Cloud-first: a logged-in agent on a large, registered repo gets the
-        // warm cloud context pack. Hop-bounded or custom-scope requests stay
-        // local; on any miss/error this returns None and the local path runs.
-        if !no_default_excludes {
+        // File-hinted queries stay local (same gate as the CLI, #409): the
+        // cloud resolves by name with a silent name-only fallback, so it can
+        // return the wrong same-named entity, and the attempt costs a network
+        // round-trip (~140ms) before the warm in-memory graph answers in
+        // milliseconds. Cloud returns here once the server resolves name+file
+        // strictly. SEM_MCP_CLOUD=1 opts back in for experiments.
+        if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
             if let Some(mut out) =
                 crate::cloud::try_context(&ctx.git, &params.entity_name, &rel_path, budget, hops)
             {
