@@ -4,7 +4,9 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
-### Changed
+### Performance
+
+- **CLI sidecar fast path**: `sem impact` now answers from the resident `sem mcp` server's warm graph via its unix socket before doing any local work — measured **4.5ms** end-to-end on a 158K-LOC repo, versus 22.4ms for the local cold path and 7.7ms for a ripgrep scan of the same repo: the full blast radius (callers, dependencies, depth-bounded transitive impact, affected tests) is now cheaper than a raw text match. Output is byte-identical to the local path (the sidecar ships serialized `EntityInfo`s that the CLI feeds to its existing printers; verified across all modes and `--json`). The fast path is an accelerator, never a requirement: bounded socket timeouts and silent fallback mean no resident server (or `SEM_NO_SIDECAR=1`, `--no-cache`, custom scopes, `.semignore`, `--entity-id`) just runs the normal local path. Server-side, the new sidecar `impact` op classifies affected tests only among the entities the impact BFS actually reached, instead of walking the whole corpus per call (6.8ms → 0.1ms on a 4.7K-entity graph).
 
 - The GitHub Action's PR-comment footer now tells the reader what to do next — "add it to your repo in 2 minutes", linking to the action's install snippet — instead of only naming the tool. Every entity-diff comment is seen by all of a repo's collaborators; the footer is the loop that turns viewers into installs.
 

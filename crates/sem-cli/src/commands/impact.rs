@@ -50,6 +50,12 @@ fn build_with_spinner<T>(
 }
 
 pub fn impact_command(opts: ImpactOptions) {
+    // A resident server beats the cloud path on both freshness and latency,
+    // so the sidecar goes first.
+    if try_sidecar_impact(&opts) {
+        return;
+    }
+
     if super::cloud::try_cloud_impact(&opts).is_some() {
         return;
     }
@@ -340,6 +346,75 @@ pub fn impact_command(opts: ImpactOptions) {
         }
     }
     timings.finish();
+}
+
+/// The wire shape of the sidecar's `impact` op — real serialized `EntityInfo`s,
+/// so this deserializes into the exact structs the cached-result printers
+/// consume and fast-path output is identical to local output.
+#[derive(serde::Deserialize)]
+struct SidecarImpactResult {
+    entity: EntityInfo,
+    dependencies: Vec<EntityInfo>,
+    dependents: Vec<EntityInfo>,
+    impact: Vec<(EntityInfo, usize)>,
+    tests: Vec<EntityInfo>,
+}
+
+/// Fast path: answer from the resident server's warm graph via its unix
+/// socket, skipping this process's cache open + hydrate. Only for queries the
+/// server can answer with identical semantics: default source scope, resolve
+/// by name. Everything else — and any sidecar miss, error, or ambiguity —
+/// falls back to the normal local path and its richer diagnostics.
+fn try_sidecar_impact(opts: &ImpactOptions) -> bool {
+    if opts.no_cache
+        || opts.no_default_excludes
+        || !opts.file_exts.is_empty()
+        || opts.entity_id.is_some()
+    {
+        return false;
+    }
+    let Some(name) = opts.entity_name.as_deref() else {
+        return false;
+    };
+    let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
+        return false;
+    };
+    let root = git.repo_root().to_path_buf();
+    // A .semignore means this repo's default scope is custom; the resident
+    // server may not share it, so stay local (mirrors cache_source_scope).
+    if root.join(".semignore").exists() {
+        return false;
+    }
+
+    let mut request = serde_json::json!({ "op": "impact", "name": name, "depth": opts.depth });
+    if let Some(file) = opts.file_hint.as_deref() {
+        request["file"] = serde_json::json!(super::normalize_repo_relative_path(
+            Path::new(&opts.cwd),
+            &root,
+            file
+        ));
+    }
+
+    let Some(response) = super::sidecar::query(&root, &request) else {
+        return false;
+    };
+    let Some(result) = response.get("result") else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_value::<SidecarImpactResult>(result.clone()) else {
+        return false;
+    };
+
+    let cached = CachedImpactResult {
+        entity: parsed.entity,
+        dependencies: parsed.dependencies,
+        dependents: parsed.dependents,
+        impact: parsed.impact,
+        tests: parsed.tests,
+        tests_truncated: false,
+    };
+    print_cached_result(&cached, opts.mode, opts.json, opts.depth);
+    true
 }
 
 fn try_cached_impact_query(
