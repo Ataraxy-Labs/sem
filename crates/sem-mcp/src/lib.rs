@@ -22,6 +22,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .init();
 
         let server = server::SemServer::new();
+        // Prewarm: build the CWD repo's graph in the background while the
+        // transport handshakes, so the agent's first structural query answers
+        // from memory instead of paying the cold build.
+        server.spawn_prewarm();
         let transport =
             transport::ResilientStdioTransport::new(tokio::io::stdin(), tokio::io::stdout());
         let service = server.serve(transport).await?;
