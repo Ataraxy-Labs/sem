@@ -1474,6 +1474,43 @@ return M
     }
 
     #[test]
+    #[cfg(feature = "lang-fish")]
+    fn test_fish_entity_extraction() {
+        let code = r#"function greet
+    echo "hello $argv[1]"
+end
+
+# the config.fish pattern: definitions wrapped in a top-level guard
+if status is-interactive
+    function fish_prompt
+        set_color green
+        echo -n (prompt_pwd) '> '
+    end
+end
+
+function notify --on-event fish_command_finished --description "ping on done"
+    greet $argv
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "config.fish");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"greet"), "plain function, got: {:?}", names);
+        assert!(
+            names.contains(&"fish_prompt"),
+            "function inside a top-level if block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"notify"),
+            "function with option flags, got: {:?}",
+            names
+        );
+        assert_eq!(entities.len(), 3, "only functions, got: {:?}", names);
+    }
+
+    #[test]
     fn test_typescript_entity_extraction() {
         // Existing language should still work
         let code = r#"

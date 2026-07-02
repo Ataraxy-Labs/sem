@@ -336,6 +336,7 @@ It is fully optional and transparent:
 | Swift | `.swift` | functions, classes, protocols, structs, enums, properties |
 | Elixir | `.ex` `.exs` | modules, functions, macros, guards, protocols |
 | Bash | `.sh` | functions |
+| Fish | `.fish` | functions |
 | Lua | `.lua` | functions (global, local, table, and method forms) |
 | HCL/Terraform | `.hcl` `.tf` `.tfvars` | blocks, attributes (qualified names for nested blocks) |
 | Kotlin | `.kt` `.kts` | classes, interfaces, objects, functions, properties, companion objects |

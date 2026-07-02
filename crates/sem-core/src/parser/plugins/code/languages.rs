@@ -395,6 +395,11 @@ fn get_lua() -> Option<Language> {
     Some(tree_sitter_lua::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-fish")]
+fn get_fish() -> Option<Language> {
+    Some(tree_sitter_fish::language())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -1274,6 +1279,26 @@ static LUA_CONFIG: LanguageConfig = LanguageConfig {
     scope_boundary_types: &[],
     get_language: get_lua,
     scope_resolve: None,
+};
+
+#[cfg(feature = "lang-fish")]
+static FISH_CONFIG: LanguageConfig = LanguageConfig {
+    id: "fish",
+    extensions: &[".fish"],
+    // ram02z/tree-sitter-fish: `function_definition` covers `function name ... end`.
+    // Fish function bodies have no wrapper node (statements are direct children),
+    // so there is no container to declare: a `function` defined inside another
+    // stays part of the outer entity's content — consistent with fish semantics,
+    // where inner definitions become global at runtime, not lexical children.
+    // Functions inside top-level `if`/`begin` blocks (the config.fish pattern)
+    // are still extracted via the general recursion.
+    entity_node_types: &["function_definition"],
+    container_node_types: &[],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_fish,
+    scope_resolve: Some(&FISH_SCOPE_CONFIG),
 };
 
 // ─── Scope Resolve Configs for Supported Languages ────────────────────────────
@@ -2510,6 +2535,45 @@ static BASH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     ],
 };
 
+// Fish call edges mirror bash: a `command` node's `name` field is the callee.
+// Unlike bash, fish's control-flow keywords (`if`, `for`, `end`, ...) are real
+// syntax rather than commands, so only genuine builtins need excluding.
+#[cfg(feature = "lang-fish")]
+static FISH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
+    class_scope_nodes: &[],
+    impl_scope_nodes: &[],
+    function_scope_nodes: &["function_definition"],
+    class_name_field: ClassNameField::Simple("name"),
+
+    assignment_rules: &[],
+    assignment_recurse_into: &[],
+
+    param_rules: &[],
+
+    return_type_field: None,
+
+    call_nodes: &["command"],
+    call_style: CallNodeStyle::FunctionField("name"),
+    new_expr_nodes: &[],
+    new_expr_type_field: "constructor",
+    composite_literal_nodes: &[],
+    member_access: &[],
+    scoped_call_nodes: &[],
+
+    self_keywords: &[],
+
+    init_strategy: InitStrategy::None,
+    import_extractor: None,
+    external_method: false,
+
+    builtins: &[
+        "echo", "printf", "cd", "ls", "cat", "grep", "sed", "awk", "exit", "return", "source",
+        "eval", "set", "test", "string", "math", "status", "read", "argparse", "count", "type",
+        "functions", "abbr", "alias", "complete", "contains", "set_color", "command", "builtin",
+        "emit", "and", "or", "not",
+    ],
+};
+
 macro_rules! all_configs {
     () => {{
         &[
@@ -2579,6 +2643,8 @@ macro_rules! all_configs {
             &D_CONFIG,
             #[cfg(feature = "lang-lua")]
             &LUA_CONFIG,
+            #[cfg(feature = "lang-fish")]
+            &FISH_CONFIG,
         ]
     }};
 }
