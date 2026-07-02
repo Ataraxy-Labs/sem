@@ -466,6 +466,68 @@ impl SemServer {
         }
     }
 
+    /// Resolve an entity by name across the whole repo (one-call lookup, no
+    /// file hint). Unique match wins; ambiguity returns the candidate files so
+    /// the agent can disambiguate in its next call; no match returns near-name
+    /// suggestions.
+    fn find_entity_repo_wide<'a>(
+        graph: &'a EntityGraph,
+        entity_name: &str,
+    ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
+        let qualified = entity_name.rsplit_once('.');
+        let matches = |e: &sem_core::parser::graph::EntityInfo| {
+            e.name == entity_name
+                || qualified.is_some_and(|(parent_part, child_part)| {
+                    e.name == child_part
+                        && e.parent_id
+                            .as_ref()
+                            .and_then(|pid| graph.entities.get(pid))
+                            .is_some_and(|p| p.name == parent_part)
+                })
+        };
+        let mut hits: Vec<&sem_core::parser::graph::EntityInfo> =
+            graph.entities.values().filter(|e| matches(e)).collect();
+        hits.sort_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)));
+        match hits.len() {
+            1 => Ok(hits[0]),
+            0 => {
+                let lower = entity_name.to_lowercase();
+                let mut near: Vec<&str> = graph
+                    .entities
+                    .values()
+                    .filter(|e| e.name.to_lowercase().contains(&lower))
+                    .map(|e| e.name.as_str())
+                    .collect();
+                near.sort_unstable();
+                near.dedup();
+                near.truncate(5);
+                if near.is_empty() {
+                    Err(format!("Entity '{}' not found in this repo", entity_name))
+                } else {
+                    Err(format!(
+                        "Entity '{}' not found. Near matches: {}",
+                        entity_name,
+                        near.join(", ")
+                    ))
+                }
+            }
+            _ => {
+                let files: Vec<String> = hits
+                    .iter()
+                    .map(|e| e.file_path.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                Err(format!(
+                    "Entity '{}' is ambiguous ({} matches). Pass file_path to pick one: {}",
+                    entity_name,
+                    hits.len(),
+                    files.join(", ")
+                ))
+            }
+        }
+    }
+
     /// Get cached graph or build a new one. Checks: memory cache -> SQLite cache -> fresh build.
     async fn get_or_build_graph(
         &self,
@@ -1401,17 +1463,25 @@ impl SemServer {
         // Time the whole handler so the result carries the real latency the
         // agent waited on — let the speed be felt, not claimed.
         let start = Instant::now();
-        let ctx = match self.get_context(Some(&params.file_path)).await {
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
-        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
-        if let Some(err) = file_path_error(&params.file_path, &abs_path) {
-            return Ok(tool_error(err));
-        }
-        if self.registry.get_plugin(&rel_path).is_none() {
-            return Ok(tool_error(format!("No parser for file: {}", rel_path)));
-        }
+        // With a file hint, validate it up front; without one, the entity is
+        // resolved repo-wide after the graph is available (one-call lookup).
+        let explicit_rel: Option<String> = match params.file_path.as_deref() {
+            Some(fp) => {
+                let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+                if let Some(err) = file_path_error(fp, &abs_path) {
+                    return Ok(tool_error(err));
+                }
+                if self.registry.get_plugin(&rel_path).is_none() {
+                    return Ok(tool_error(format!("No parser for file: {}", rel_path)));
+                }
+                Some(rel_path)
+            }
+            None => None,
+        };
         let no_default_excludes = params.no_default_excludes.unwrap_or(false);
         let budget = params.token_budget.unwrap_or(8000);
         let hops = params.hops.unwrap_or(0);
@@ -1423,14 +1493,16 @@ impl SemServer {
         // milliseconds. Cloud returns here once the server resolves name+file
         // strictly. SEM_MCP_CLOUD=1 opts back in for experiments.
         if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
-            if let Some(mut out) =
-                crate::cloud::try_context(&ctx.git, &params.entity_name, &rel_path, budget, hops)
-            {
+            if let Some(rel_path) = explicit_rel.as_deref() {
+                if let Some(mut out) =
+                    crate::cloud::try_context(&ctx.git, &params.entity_name, rel_path, budget, hops)
+                {
                 out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
                 out["source"] = serde_json::json!("cloud");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::render::context_text(&out),
                 )]));
+                }
             }
         }
 
@@ -1450,10 +1522,19 @@ impl SemServer {
             self.live_graph(&ctx.repo_root).await
         };
 
-        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
-            Ok(entity_id) => entity_id,
-            Err(err) => return Ok(tool_error(err)),
+        let (entity_id, rel_path) = match explicit_rel {
+            Some(rel_path) => {
+                match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
+                    Ok(entity_id) => (entity_id.to_string(), rel_path),
+                    Err(err) => return Ok(tool_error(err)),
+                }
+            }
+            None => match Self::find_entity_repo_wide(&graph, &params.entity_name) {
+                Ok(entity) => (entity.id.clone(), entity.file_path.clone()),
+                Err(err) => return Ok(tool_error(err)),
+            },
         };
+        let entity_id = entity_id.as_str();
         let context_result = sem_core::parser::context::build_context_result_bounded(
             &graph,
             entity_id,
@@ -2200,7 +2281,7 @@ mod tests {
 
         let result = server
             .sem_context(Parameters(ContextParams {
-                file_path: "src/generated/schema.ts".to_string(),
+                file_path: Some("src/generated/schema.ts".to_string()),
                 entity_name: "generatedTarget".to_string(),
                 token_budget: Some(2000),
                 hops: None,
@@ -2227,7 +2308,7 @@ mod tests {
 
         let result = server
             .sem_context(Parameters(ContextParams {
-                file_path: file_path.display().to_string(),
+                file_path: Some(file_path.display().to_string()),
                 entity_name: "known_entity".to_string(),
                 token_budget: None,
                 hops: None,
@@ -2252,7 +2333,7 @@ mod tests {
 
         let result = server
             .sem_context(Parameters(ContextParams {
-                file_path: file_path.display().to_string(),
+                file_path: Some(file_path.display().to_string()),
                 entity_name: "nonexistent_zzz".to_string(),
                 token_budget: None,
                 hops: None,
@@ -2281,7 +2362,7 @@ mod tests {
         // Touch repo A first so it becomes the active repo.
         let a = server
             .sem_context(Parameters(ContextParams {
-                file_path: repo_a.join("a.py").display().to_string(),
+                file_path: Some(repo_a.join("a.py").display().to_string()),
                 entity_name: "alpha_entity".to_string(),
                 token_budget: None,
                 hops: None,
@@ -2294,7 +2375,7 @@ mod tests {
         // A hint into repo B must resolve B's entity, not answer from repo A.
         let b = server
             .sem_context(Parameters(ContextParams {
-                file_path: repo_b.join("b.py").display().to_string(),
+                file_path: Some(repo_b.join("b.py").display().to_string()),
                 entity_name: "beta_entity".to_string(),
                 token_budget: None,
                 hops: None,
