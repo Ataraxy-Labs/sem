@@ -73,6 +73,21 @@ function installBadge() {
     }
   }
 
+  // PreToolUse: fires the moment the agent TRIGGERS sem, so the statusline
+  // flips to a live spinner before the call even completes.
+  const pre = (settings.hooks.PreToolUse = settings.hooks.PreToolUse || []);
+  const hasPre = pre.some((e) =>
+    (e.hooks || []).some((h) => (h.command || '').includes('sem-activity.py')),
+  );
+  if (!hasPre) {
+    for (const matcher of ['mcp__sem__.*', 'Bash']) {
+      pre.push({
+        matcher,
+        hooks: [{ type: 'command', command: `python3 ${hookDest}` }],
+      });
+    }
+  }
+
   // statusLine: destructive slot, so only set it if you have none (or it is
   // already ours). Otherwise leave yours alone and print how to add the badge.
   const slCmd = `python3 ${slDest}`;

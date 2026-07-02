@@ -49,6 +49,63 @@ def read_lifetime():
     except Exception:
         return {}
 
+
+TEAM_CACHE = "/tmp/sem-team-presence.json"
+
+def team_presence(cwd):
+    """Teammates active in this repo right now (opt-in via ~/.sem/team.json).
+    Fetch at most every 30s (disk cache), 0.5s timeout, silent on any failure —
+    a statusline must never block."""
+    try:
+        team = json.load(open(os.path.expanduser("~/.sem/team.json")))
+        creds = json.load(open(os.path.expanduser("~/.sem/credentials.json")))
+        if not (team.get("share") and creds.get("api_key")):
+            return []
+        try:
+            cache = json.load(open(TEAM_CACHE))
+            if time.time() - cache.get("ts", 0) < 30 and cache.get("cwd") == cwd:
+                return cache.get("others", [])
+        except Exception:
+            pass
+        # Cache stale: kick a detached refresher and serve the old cache this
+        # tick. The render path never touches the network.
+        import subprocess, sys as _sys
+        subprocess.Popen(
+            [_sys.executable, os.path.abspath(__file__), "--refresh-team", cwd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            return json.load(open(TEAM_CACHE)).get("others", [])
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def refresh_team(cwd):
+    """Background worker: fetch presence and write the cache (called detached)."""
+    try:
+        creds = json.load(open(os.path.expanduser("~/.sem/credentials.json")))
+        import subprocess, urllib.request, urllib.parse
+        remote = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        if not remote:
+            return
+        remote = remote.removesuffix(".git").replace("git@github.com:", "github.com/")
+        remote = remote.replace("https://", "").replace("http://", "")
+        url = (creds.get("endpoint", "https://sem-cloud.fly.dev")
+               + "/v1/presence?repo=" + urllib.parse.quote(remote, safe=""))
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + creds["api_key"]})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.load(r)
+        others = [a for a in data.get("active", []) if not a.get("you")]
+        json.dump({"ts": time.time(), "cwd": cwd, "others": others}, open(TEAM_CACHE, "w"))
+    except Exception:
+        pass
+
 TAGLINES = [
     "structural, not textual",
     "the graph, not the grep",
@@ -103,24 +160,48 @@ def main():
         else:
             badge = f"{DIM}⊕ sem idle{RESET}"
     else:
-        n = len(events)
+        done = [e for e in events if e.get("phase") != "start"]
+        n = len(done)
         last = events[-1]
-        last_tool = last.get("tool", "sem")
-        last_target = last.get("target", "")
-        op = f"{last_tool} {last_target}".strip() if last_target else last_tool
-        last_ms = last.get("ms")
-        ms_str = f" {last_ms}ms" if isinstance(last_ms, (int, float)) else ""
-        # live tokens + time saved this session, always shown (estimated vs
-        # grep+read, anchored to the measured benchmark).
-        sess_rt = sum(rt_saved(e.get("tool")) for e in events)
+        # In-flight: the newest event is a fresh start with no completion yet —
+        # show it the moment the agent triggers sem, with a live spinner.
+        in_flight = last.get("phase") == "start" and time.time() - last.get("ts", 0) < 120
+        SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        show = last if (in_flight or not done) else done[-1]
+        tool_name = show.get("tool", "sem")
+        tgt = show.get("target", "")
+        op = f"{tool_name} {tgt}".strip() if tgt else tool_name
+        ms = show.get("ms")
+        ms_str = f" {ms}ms" if isinstance(ms, (int, float)) else ""
+        sess_rt = sum(rt_saved(e.get("tool")) for e in done)
         saved = f"≈ {fmt_time(sess_rt * 10)} · ≈ {fmt_num(sess_rt * 900)} tokens saved"
-        badge = (
-            f"{GREEN}{BOLD}⊕ sem{RESET} {GREEN}×{n}{RESET}"
-            f" {CYAN}{op}{ms_str}{RESET}"
-            f" {DIM}·{RESET} {YELLOW}{saved}{RESET}"
-        )
+        if in_flight:
+            spin = SPIN[int(time.time() * 8) % len(SPIN)]
+            badge = (
+                f"{GREEN}{BOLD}⊕ sem{RESET} {YELLOW}{BOLD}{spin} {op}…{RESET}"
+                + (f" {DIM}·{RESET} {YELLOW}{saved}{RESET}" if n else "")
+            )
+        else:
+            badge = (
+                f"{GREEN}{BOLD}⊕ sem{RESET} {GREEN}×{n}{RESET}"
+                f" {CYAN}{op}{ms_str}{RESET}"
+                f" {DIM}·{RESET} {YELLOW}{saved}{RESET}"
+            )
+
+    others = team_presence(cwd)
+    if others:
+        o = others[0]
+        ago = int(o.get("agoSeconds", 0))
+        ago_s = f"{ago // 60}m" if ago >= 60 else f"{ago}s"
+        who = o.get("user", "teammate")
+        what = o.get("entity") or o.get("tool", "")
+        extra = f" +{len(others) - 1}" if len(others) > 1 else ""
+        badge += f" {DIM}·{RESET} \033[35m👥 {who} → {what} · {ago_s}{extra}{RESET}"
 
     print(f"{left}  {badge}")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--refresh-team":
+        refresh_team(sys.argv[2])
+    else:
+        main()

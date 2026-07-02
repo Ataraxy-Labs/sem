@@ -39,6 +39,7 @@ def main():
     except Exception:
         return
     tool = data.get("tool_name") or data.get("toolName") or ""
+    phase = "start" if (data.get("hook_event_name") or "").startswith("Pre") else "done"
     short = target = None
     ms = None
 
@@ -88,6 +89,7 @@ def main():
         "session": data.get("session_id") or data.get("sessionId") or "",
         "ts": int(time.time()),
         "tool": short,
+        "phase": phase,
     }
     if target:
         event["target"] = target[:40]
@@ -103,6 +105,41 @@ def main():
         os.makedirs(os.path.dirname(ACT), exist_ok=True)
         with open(ACT, "a") as f:
             f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+    if phase == "start":
+        return
+
+    # Team presence (opt-in): if ~/.sem/team.json has {"share": true} and the
+    # user is logged in, heartbeat this activity to sem-cloud so teammates'
+    # sessions can see who is working on what. Fire-and-forget: a detached
+    # curl with a 2s cap, never blocking the hook or the session.
+    try:
+        import subprocess
+        team = json.load(open(os.path.expanduser("~/.sem/team.json")))
+        creds = json.load(open(os.path.expanduser("~/.sem/credentials.json")))
+        if team.get("share") and creds.get("api_key") and cwd:
+            remote = subprocess.run(
+                ["git", "-C", cwd, "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=1,
+            ).stdout.strip()
+            if remote:
+                remote = remote.removesuffix(".git")
+                remote = remote.replace("git@github.com:", "github.com/")
+                remote = remote.replace("https://", "").replace("http://", "")
+                payload = json.dumps({
+                    "repo": remote, "tool": short,
+                    "entity": target or "", "file": file_hint or "",
+                })
+                subprocess.Popen(
+                    ["curl", "-s", "-m", "2", "-X", "POST",
+                     creds.get("endpoint", "https://sem-cloud.fly.dev") + "/v1/presence",
+                     "-H", "Authorization: Bearer " + creds["api_key"],
+                     "-H", "Content-Type: application/json", "-d", payload],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
     except Exception:
         pass
 

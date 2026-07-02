@@ -22,8 +22,10 @@ This:
 npx @ataraxy-labs/sem-skill --badge
 ```
 
-Adds a small badge to your Claude Code statusline that shows sem working in real
-time: how many structural queries this session, the last command **and the
+Adds a live badge to your Claude Code statusline. The moment your agent
+triggers sem you see an animated spinner with the entity being analyzed
+(`⊕ sem ⠹ impact validateToken…`), flipping to the result and running savings
+when it completes. It shows in real time: how many structural queries this session, the last command **and the
 entity it analyzed**, its latency, a sparkline of recent latencies, and a
 rotating stat (distinct entities analyzed, top command)
 (`⊕ sem ×12  impact validateToken 9ms  ▁▂▃▅▂  · 7 entities analyzed`). It picks
@@ -33,6 +35,12 @@ non-destructive: it backs up your settings, and if you already have a statusline
 it leaves it untouched and just tells you how to add the badge yourself. To
 remove it, delete the `statusLine` key and the `mcp__sem__.*` and `Bash`
 PostToolUse entries from `~/.claude/settings.json`.
+
+**Team presence (opt-in):** if you are logged in (`sem login`) and create
+`~/.sem/team.json` with `{"share": true}`, your sessions heartbeat which entity
+your agent is working on, and the statusline shows teammates live
+(`👥 maya → resolve_ref · 2m`) so parallel agents stop colliding. Nothing is
+shared unless you opt in.
 
 Everything renders inside the session: sem MCP calls show as proper tool
 widgets with compact entity trees, and the statusline badge tracks live
