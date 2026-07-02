@@ -17,6 +17,10 @@ pub struct EntitiesParams {
     pub query: Option<String>,
     #[schemars(description = "Max results for `query` mode (default 10).")]
     pub limit: Option<usize>,
+    #[schemars(
+        description = "Exact substring to search for inside entity bodies across the whole repo (use instead of grep for strings, error messages, config keys). Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text."
+    )]
+    pub text: Option<String>,
 }
 
 impl EntitiesParams {
@@ -37,6 +41,13 @@ impl EntitiesParams {
 
     pub fn limit(&self) -> usize {
         self.limit.unwrap_or(10).clamp(1, 100)
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        self.text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
     }
 }
 
