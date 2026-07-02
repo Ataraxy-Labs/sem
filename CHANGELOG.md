@@ -4,9 +4,13 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- Team presence was pulled from the `--badge` package before it shipped as a feature (product call: not a feature for now). The statusline no longer shows teammates and the hook sends nothing anywhere; the dormant server endpoints remain unadvertised.
+
 ### Added
 
-- The `--badge` statusline is now **live at trigger time**: a PreToolUse hook flips the badge to an animated spinner with the entity name the moment the agent calls sem (`⊕ sem ⠹ impact validateToken…`), and the completed state (count, latency, savings) lands when the call finishes. The render hot path never touches the network (teammates presence refreshes in a detached worker; renders measured at ~20ms).
+- The `--badge` statusline is now **live at trigger time**: a PreToolUse hook flips the badge to an animated spinner with the entity name the moment the agent calls sem (`⊕ sem ⠹ impact validateToken…`), and the completed state (count, latency, savings) lands when the call finishes. The render hot path never touches the network (renders measured at ~20ms).
 
 ### Fixed
 
