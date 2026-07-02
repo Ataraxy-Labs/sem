@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- Graph build: the scope resolver no longer allocates its debug resolution log (several owned strings per reference, discarded by every production path — only a bench consumed it), and edge dedup is index-based instead of cloning both entity IDs per edge into a hash set. Output is byte-identical (proven edge-for-edge on a 139K-entity build); ~1-3% fewer instructions retired. Groundwork toward #320/#322 — the remaining peak-memory work (entity content sharing, ID interning) is tracked there.
+
 ### Added
 
 - **`sem hook prompt-submit`** (hidden plumbing): the prompt-time prefetch, compiled. Reads a Claude Code UserPromptSubmit event, extracts identifier-shaped tokens from the prompt (backticked, snake_case, CamelCase, qualified — never plain words), resolves them against the resident server's socket sidecar, and prints packed entity context for injection. **10ms end-to-end** (was ~40ms as a Python hook — interpreter startup and a git subprocess, both eliminated: repo root is found by walking to `.git` in-process). Silent on conversational prompts, slash commands, unknown names, or when no server is resident.

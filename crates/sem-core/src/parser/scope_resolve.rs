@@ -1239,29 +1239,33 @@ fn resolve_with_scopes_full_inner(
 
                                 if !is_parent_child {
                                     let reference = ref_description(ast_ref);
-                                    file_edges.push((
-                                        entity.id.clone(),
-                                        target_id.clone(),
-                                        ref_type,
-                                    ));
                                     add_scope_reference_words(entity_consumed, &reference);
-                                    file_log.push(ResolutionEntry {
-                                        from_entity: entity.id.clone(),
-                                        reference,
-                                        resolved_to: Some(target_id),
-                                        method,
-                                    });
+                                    // The debug log allocates several Strings per
+                                    // reference across the whole repo; production
+                                    // builds discard it, so only populate it when
+                                    // a caller asked for the log.
+                                    if emit_local_binding_log {
+                                        file_log.push(ResolutionEntry {
+                                            from_entity: entity.id.clone(),
+                                            reference,
+                                            resolved_to: Some(target_id.clone()),
+                                            method,
+                                        });
+                                    }
+                                    file_edges.push((entity.id.clone(), target_id, ref_type));
                                 }
                             }
                         } else {
                             let reference = ref_description(ast_ref);
                             add_scope_reference_words(entity_consumed, &reference);
-                            file_log.push(ResolutionEntry {
-                                from_entity: entity.id.clone(),
-                                reference,
-                                resolved_to: None,
-                                method: "unresolved",
-                            });
+                            if emit_local_binding_log {
+                                file_log.push(ResolutionEntry {
+                                    from_entity: entity.id.clone(),
+                                    reference,
+                                    resolved_to: None,
+                                    method: "unresolved",
+                                });
+                            }
                         }
                     }
                 }
@@ -1279,19 +1283,33 @@ fn resolve_with_scopes_full_inner(
         }
     }
 
-    // Deduplicate edges
-    let mut seen: HashSet<(String, String)> =
-        HashSet::with_capacity_and_hasher(all_edges.len(), Default::default());
-    let deduped_edges: Vec<(String, String, RefType)> = {
+    // Deduplicate edges keeping the first-inserted (from, to). Index-based:
+    // sorting indices by borrowed keys avoids the two String clones per edge
+    // the old HashSet key paid — millions of allocations on a monorepo.
+    let all_edges = {
+        let mut order: Vec<usize> = (0..all_edges.len()).collect();
+        order.sort_by(|&a, &b| {
+            (&all_edges[a].0, &all_edges[a].1, a).cmp(&(&all_edges[b].0, &all_edges[b].1, b))
+        });
+        let mut keep = vec![false; all_edges.len()];
+        let mut prev: Option<usize> = None;
+        for &i in &order {
+            let dup = prev.is_some_and(|p: usize| {
+                all_edges[p].0 == all_edges[i].0 && all_edges[p].1 == all_edges[i].1
+            });
+            if !dup {
+                keep[i] = true;
+            }
+            prev = Some(i);
+        }
         let mut result = Vec::with_capacity(all_edges.len());
-        for edge in all_edges {
-            if seen.insert((edge.0.clone(), edge.1.clone())) {
+        for (i, edge) in all_edges.into_iter().enumerate() {
+            if keep[i] {
                 result.push(edge);
             }
         }
         result
     };
-    let all_edges = deduped_edges;
 
     ScopeResultFull {
         edges: all_edges,
