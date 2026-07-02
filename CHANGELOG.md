@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **One-call lookup**: `sem_context`'s `file_path` is now optional. With only an `entity_name`, the entity is resolved across the whole repo (unique match proceeds; ambiguity returns a compact candidate list with the files; no match returns near-name suggestions) and the body plus callers/callees comes back in a single round-trip — one agent call where grep needs two (search, then read). Measured 26ms wall on a prewarmed server, name-only, unfamiliar repo.
+
 ### Performance
 
 - The sem MCP server is now **local-first and prewarmed**. Cloud-first routing on `sem_impact`/`sem_context` cost a network round-trip on every call before the local answer (and carried the same wrong-entity risk gated in the CLI); it is now behind `SEM_MCP_CLOUD=1` until the server resolves name+file strictly. The server also builds the CWD repo's graph in the background at startup, so the agent's first structural query answers from memory. Measured on an 85K-LOC repo: warm `sem_context` runs in under 1ms wall (faster than a ripgrep scan of the same repo), and the first call dropped from 129ms cold to ~0 with prewarm.

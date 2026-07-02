@@ -93,8 +93,10 @@ pub struct LogParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextParams {
-    #[schemars(description = "Path to the file containing the entity")]
-    pub file_path: String,
+    #[schemars(
+        description = "Path to the file containing the entity. OPTIONAL: omit it for one-call lookup — the entity_name is resolved across the whole repo (ambiguity returns a compact candidate list)."
+    )]
+    pub file_path: Option<String>,
     #[schemars(description = "Name of the target entity")]
     pub entity_name: String,
     #[schemars(description = "Maximum token budget. Defaults to 8000.")]

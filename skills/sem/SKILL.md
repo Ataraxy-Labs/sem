@@ -26,11 +26,18 @@ because the shell is already open. Map:
 |------|----------|
 | what changed | `sem_diff` |
 | blast radius / what breaks | `sem_impact` |
-| read/understand an entity + its callers | `sem_context` |
+| read/understand an entity + its callers | `sem_context` with just `entity_name` — ONE call, no file needed |
 | find code by intent ("where is X done") | `sem_entities` with `query` |
 | who last touched it | `sem_blame` |
 | how it evolved | `sem_log` with `entity_name` |
 | repo hotspots + co-change pairs | `sem_log` with no `entity_name` |
+
+**One-call lookup:** when you know (or can guess) the entity name, call
+`sem_context` with only `entity_name` — it resolves across the whole repo and
+returns the body plus callers/callees in one round-trip (grep needs two: search,
+then read). Ambiguous names return a compact candidate list; pass `file_path`
+only then. Do not call `sem_entities` first unless you are searching by intent
+with a free-text `query`.
 
 Use the CLI below only in a real terminal, in scripts, or for commands the MCP
 server doesn't expose (`sem graph`, `sem setup`, exotic flags) — and then as a
