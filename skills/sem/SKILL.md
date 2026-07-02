@@ -28,6 +28,7 @@ because the shell is already open. Map:
 | blast radius / what breaks | `sem_impact` |
 | read/understand an entity + its callers | `sem_context` with just `entity_name` — ONE call, no file needed |
 | find code by intent ("where is X done") | `sem_entities` with `query` |
+| find a string / error message / config key | `sem_entities` with `text` — entity-addressed grep, no files read |
 | who last touched it | `sem_blame` |
 | how it evolved | `sem_log` with `entity_name` |
 | repo hotspots + co-change pairs | `sem_log` with no `entity_name` |
@@ -192,6 +193,13 @@ The `sem_entities` MCP tool also takes a `query` argument for the same ranked
 search, and `sem context <entity> --hops N` bounds the context to N graph hops
 (use 1-2 for just the immediate neighborhood). Prefer these over grep for
 "where is the code that does X".
+
+**Never fall back to grep for strings either**: `sem_entities` with `text`
+searches entity bodies across the repo from the warm in-memory graph and
+returns hits addressed by the innermost enclosing entity (file, entity, line,
+matched text) — ready to chain straight into `sem_context`/`sem_impact`. The
+only remaining text-search cases outside sem are non-code files and comments
+between entities.
 
 ## Make the leverage felt
 

@@ -802,6 +802,68 @@ impl SemServer {
         })))
     }
 
+    /// Entity-addressed text search over in-memory entity bodies. For each
+    /// matching line, the innermost (smallest-span) enclosing entity wins, so
+    /// a hit inside a method reports the method, not its class.
+    fn render_text_hits(
+        all_entities: &[SemanticEntity],
+        needle: &str,
+        limit: usize,
+    ) -> String {
+        use std::collections::HashMap;
+        // (file, absolute line) -> (span, entity name, entity type, line text)
+        let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
+        for e in all_entities {
+            if !e.content.contains(needle) {
+                continue;
+            }
+            let span = e.end_line.saturating_sub(e.start_line);
+            for (offset, line) in e.content.lines().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let abs_line = e.start_line + offset;
+                let key = (e.file_path.as_str(), abs_line);
+                match best.get(&key) {
+                    Some((s, ..)) if *s <= span => {}
+                    _ => {
+                        best.insert(key, (span, e.name.as_str(), e.entity_type.as_str(), line));
+                    }
+                }
+            }
+        }
+        if best.is_empty() {
+            return format!(
+                "no entity contains \"{needle}\" (searches code entity bodies; \
+                 comments between entities and non-code files are not covered)"
+            );
+        }
+        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> =
+            best.into_iter().collect();
+        hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
+        let total = hits.len();
+        let files: std::collections::BTreeSet<&str> = hits.iter().map(|(k, _)| k.0).collect();
+        let mut out = format!(
+            "⊕ text \"{needle}\" · {total} hits · {} files\n",
+            files.len()
+        );
+        for (i, ((file, line), (_, name, ty, text))) in hits.iter().take(limit).enumerate() {
+            let branch = if i + 1 == total.min(limit) { "╰─▶" } else { "├─▶" };
+            let label = if *ty == "function" || *ty == "method" {
+                (*name).to_string()
+            } else {
+                format!("{name} ({ty})")
+            };
+            let text = text.trim();
+            let text: String = text.chars().take(90).collect();
+            out.push_str(&format!("{branch} {file}: {label} (L{line}): {text}\n"));
+        }
+        if total > limit {
+            out.push_str(&format!("… {} more (raise limit)\n", total - limit));
+        }
+        out
+    }
+
     /// Kick a background graph build for the repo discovered from env/CWD, so
     /// the first real query hits a warm in-memory graph. Fire-and-forget: any
     /// failure (not a repo, empty dir) is silently ignored and the first query
@@ -883,6 +945,17 @@ impl SemServer {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
+
+        // Text mode: entity-addressed grep. Scan entity bodies in the warm
+        // in-memory graph — no file reads — and return hits addressed by the
+        // innermost enclosing entity, ready for sem_context / sem_impact
+        // chaining. This is the grep killer: same latency class, but hits are
+        // entities, not line numbers in anonymous files.
+        if let Some(needle) = params.text() {
+            let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
+            let text = Self::render_text_hits(&all_entities, needle, params.limit());
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        }
 
         // Query mode: rank the whole-repo entity graph by relevance to the
         // query (structural search), instead of listing a path.
@@ -2046,6 +2119,7 @@ mod tests {
                 no_default_excludes: None,
                 query: None,
                 limit: None,
+                text: None,
             }))
             .await
             .unwrap();
@@ -2071,6 +2145,7 @@ mod tests {
                 no_default_excludes: None,
                 query: None,
                 limit: None,
+                text: None,
             }))
             .await
             .unwrap();
@@ -2082,6 +2157,7 @@ mod tests {
                 no_default_excludes: Some(true),
                 query: None,
                 limit: None,
+                text: None,
             }))
             .await
             .unwrap();
