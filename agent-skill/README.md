@@ -51,6 +51,32 @@ honestly-estimated tally of the grep+read round-trips, time, and tokens sem
 saved you this session, and a lifetime counter that grows across sessions. The
 estimates are anchored to a measured benchmark and labelled `≈`.
 
+### Optional: the sem guard (always sem, never grep/read/sed on code)
+
+```bash
+npx @ataraxy-labs/sem-skill --guard
+```
+
+The skill makes sem the agent's *preference*; the guard makes it the *rule*.
+It installs a PreToolUse hook that denies grep, file reads, and sed/cat on
+code files, with a reason that redirects the agent to the right sem tool
+(`sem_context` to read an entity, `sem_entities` with `text=` or `query=` to
+search, `sem_impact` for blast radius). The agent can't fall back out of habit.
+
+It is calibrated, not a wall:
+
+- **Pre-edit reads still work**: editors require reading a file first, so the
+  second `Read` of the same path always passes.
+- **Non-code files** (markdown, JSON, TOML, YAML, ...) are never touched.
+- **Pipe filtering is fine**: `cargo test | grep FAILED` passes; `grep -rn foo src/`
+  does not.
+- Files outside a git repo pass (sem needs git).
+- Escape hatch: prefix a command with `SEM_GUARD=0`, or set it in your env to
+  disable the guard entirely.
+
+To remove it, delete the `sem-guard.py` PreToolUse entries from
+`~/.claude/settings.json`.
+
 It's idempotent, re-run it any time. It needs the sem CLI on PATH
 (`npm i -g @ataraxy-labs/sem` or see the
 [install docs](https://github.com/Ataraxy-Labs/sem#install)); if sem isn't

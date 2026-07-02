@@ -22,6 +22,64 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const log = (m) => process.stdout.write(`${m}\n`);
 const wantBadge = process.argv.slice(2).includes('--badge');
+const wantGuard = process.argv.slice(2).includes('--guard');
+
+function loadSettings(settingsPath) {
+  let settings = {};
+  if (existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    } catch {
+      settings = {};
+    }
+    try {
+      copyFileSync(settingsPath, `${settingsPath}.bak-${Date.now()}`);
+    } catch {}
+  }
+  return settings;
+}
+
+// Opt-in: the sem guard. A PreToolUse hook that hard-denies grep/read/sed on
+// code files and redirects the agent to the sem MCP tools instead, so sem is
+// the code path, not a suggestion. Read stays available for edits (the second
+// Read of the same file passes) and non-code files are never touched.
+// Escape hatch: SEM_GUARD=0.
+function installGuard() {
+  const claudeDir = join(homedir(), '.claude');
+  const hooksDir = join(claudeDir, 'hooks');
+  const guardDest = join(hooksDir, 'sem-guard.py');
+  try {
+    mkdirSync(hooksDir, { recursive: true });
+    copyFileSync(join(here, 'guard', 'sem-guard.py'), guardDest);
+    log(`  [ok] installed sem guard -> ${guardDest}`);
+  } catch (e) {
+    log(`  [!]  could not install guard script: ${e.message}`);
+    return;
+  }
+
+  const settingsPath = join(claudeDir, 'settings.json');
+  const settings = loadSettings(settingsPath);
+  settings.hooks = settings.hooks || {};
+  const pre = (settings.hooks.PreToolUse = settings.hooks.PreToolUse || []);
+  const hasGuard = pre.some((e) =>
+    (e.hooks || []).some((h) => (h.command || '').includes('sem-guard.py')),
+  );
+  if (!hasGuard) {
+    for (const matcher of ['Grep|Read', 'Bash']) {
+      pre.push({
+        matcher,
+        hooks: [{ type: 'command', command: `python3 ${guardDest}` }],
+      });
+    }
+  }
+  try {
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    log('  [ok] guard registered: grep/read/sed on code now redirect to sem');
+    log('       (pre-edit Reads still pass; disable anytime with SEM_GUARD=0)');
+  } catch (e) {
+    log(`  [!]  could not write settings.json: ${e.message}`);
+  }
+}
 
 // Opt-in: a live sem activity badge in the Claude Code statusline, fed by a
 // PostToolUse hook that logs each sem MCP call. Only runs with --badge, backs
@@ -44,17 +102,7 @@ function installBadge() {
   }
 
   const settingsPath = join(claudeDir, 'settings.json');
-  let settings = {};
-  if (existsSync(settingsPath)) {
-    try {
-      settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
-    } catch {
-      settings = {};
-    }
-    try {
-      copyFileSync(settingsPath, `${settingsPath}.bak-${Date.now()}`);
-    } catch {}
-  }
+  const settings = loadSettings(settingsPath);
 
   // PostToolUse hook: non-destructive, append only if not already present.
   settings.hooks = settings.hooks || {};
@@ -177,6 +225,18 @@ if (wantBadge) {
   log('  [i]  optional: a live sem activity badge for your statusline');
   log('       (shows structural queries + latency as you work). Enable with:');
   log('       npx @ataraxy-labs/sem-skill --badge');
+}
+
+// 5. Optional: the sem guard (grep/read/sed on code hard-redirect to sem).
+if (wantGuard) {
+  log('');
+  installGuard();
+} else {
+  log('');
+  log('  [i]  optional: the sem guard makes the agent ALWAYS use sem on code');
+  log('       (denies grep/read/sed on code files with a redirect to the sem');
+  log('       tools; pre-edit Reads still pass). Enable with:');
+  log('       npx @ataraxy-labs/sem-skill --guard');
 }
 
 log('\nDone. Your agent will now prefer sem (impact / context / orient / diff)');
