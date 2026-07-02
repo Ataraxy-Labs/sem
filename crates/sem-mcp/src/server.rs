@@ -134,7 +134,7 @@ pub struct SemServer {
 }
 
 impl SemServer {
-    fn discover_repo_root(file_path_hint: Option<&str>) -> Result<PathBuf, String> {
+    pub fn discover_repo_root(file_path_hint: Option<&str>) -> Result<PathBuf, String> {
         // Strategy 1: Absolute file path -> GitBridge::open on parent dir
         if let Some(fp) = file_path_hint {
             let p = Path::new(fp);
@@ -754,6 +754,52 @@ impl SemServer {
         slot.last_built_generation = drained.generation;
         slot.built_once = true;
         Some(file_paths)
+    }
+
+    /// One-call entity context from the in-memory graph, for the socket
+    /// sidecar: resolve `name` repo-wide, pack a bounded context, render the
+    /// compact text. Millisecond-fast once the graph is warm.
+    pub async fn quick_context(
+        &self,
+        repo_root: &Path,
+        name: &str,
+        budget: usize,
+        hops: usize,
+    ) -> Result<String, String> {
+        let (graph, all_entities) = self.live_graph(repo_root).await;
+        let entity = Self::find_entity_repo_wide(&graph, name)?;
+        let context_result = sem_core::parser::context::build_context_result_bounded(
+            &graph,
+            &entity.id,
+            &all_entities,
+            budget,
+            hops,
+        );
+        let result: Vec<serde_json::Value> = context_result
+            .entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "entity": e.entity_name,
+                    "type": e.entity_type,
+                    "file": e.file_path,
+                    "role": e.role,
+                    "tokens": e.estimated_tokens,
+                    "content": e.content,
+                })
+            })
+            .collect();
+        Ok(crate::render::context_text(&serde_json::json!({
+            "entity": name,
+            "file": entity.file_path,
+            "token_budget": budget,
+            "tokens_used": context_result.total_tokens,
+            "truncated": context_result.truncated,
+            "target_omitted": context_result.target_omitted,
+            "entries": result.len(),
+            "context": result,
+            "source": "local",
+        })))
     }
 
     /// Kick a background graph build for the repo discovered from env/CWD, so
