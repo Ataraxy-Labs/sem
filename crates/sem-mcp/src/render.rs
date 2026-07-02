@@ -80,6 +80,16 @@ fn file_count(list: &[Value]) -> usize {
     files.len()
 }
 
+/// "direct_dependency" -> "direct dependencies", "direct_dependent" -> "direct dependents".
+fn pluralize_role(role: &str) -> String {
+    let spaced = role.replace('_', " ");
+    if let Some(stem) = spaced.strip_suffix('y') {
+        format!("{stem}ies")
+    } else {
+        format!("{spaced}s")
+    }
+}
+
 fn footer(v: &Value) -> String {
     let mut parts = Vec::new();
     if let Some(ms) = get_u64(v, "elapsed_ms") {
@@ -234,13 +244,13 @@ pub fn context_text(v: &Value) -> String {
         let parts: Vec<String> = omitted
             .iter()
             .map(|t| {
-                let role = get_str(t, "role").replace('_', " ");
+                let role = pluralize_role(get_str(t, "role"));
                 let n = get_u64(t, "entities").unwrap_or(0);
                 let tests = get_u64(t, "tests").unwrap_or(0);
                 if tests > 0 {
-                    format!("+{} {}s ({} tests)", n, role, tests)
+                    format!("+{} {} ({} tests)", n, role, tests)
                 } else {
-                    format!("+{} {}s", n, role)
+                    format!("+{} {}", n, role)
                 }
             })
             .collect();
