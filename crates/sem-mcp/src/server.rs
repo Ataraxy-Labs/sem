@@ -130,6 +130,11 @@ pub struct SemServer {
     graph_cache: Arc<Mutex<Option<CachedGraph>>>,
     topology_cache: Arc<Mutex<Option<CachedTopology>>>,
     watch: Arc<Mutex<WatchSlot>>,
+    /// Attention ledger: per-session record of context fills already emitted
+    /// (key: session\0entity_id, value: fill fingerprint). A re-ask whose
+    /// fingerprint matches collapses to a one-line "unchanged" answer — the
+    /// body is already in the asking model's context window.
+    fill_ledger: Arc<Mutex<LruCache<String, String>>>,
     _tool_router: ToolRouter<Self>,
 }
 
@@ -806,6 +811,7 @@ impl SemServer {
         name: &str,
         budget: usize,
         hops: usize,
+        session: Option<&str>,
     ) -> Result<String, String> {
         let (graph, all_entities) = self.live_graph(repo_root).await;
         let entity = Self::find_entity_repo_wide(&graph, name)?;
@@ -816,6 +822,32 @@ impl SemServer {
             budget,
             hops,
         );
+
+        // Attention ledger: if this session already received this exact fill
+        // (same target content, same packed size), the body is sitting in the
+        // asking model's context window — re-sending it is pure token waste.
+        // Answer with one line instead. Any change to the target (or to the
+        // packed neighborhood's size) misses the fingerprint and re-sends.
+        if let Some(session) = session.filter(|s| !s.is_empty()) {
+            let target_hash = all_entities
+                .iter()
+                .find(|e| e.id == entity.id)
+                .map(|e| e.content_hash.as_str())
+                .unwrap_or("");
+            let fingerprint = format!(
+                "{}:{}:{}",
+                target_hash, context_result.total_tokens, context_result.entries.len()
+            );
+            let key = format!("{session}\u{0}{}", entity.id);
+            let mut ledger = self.fill_ledger.lock().await;
+            if ledger.get(&key) == Some(&fingerprint) {
+                return Ok(format!(
+                    "≡ {} · unchanged since you read it ({}) — already in your context; set SEM_FRESH=1 to re-send\n",
+                    name, entity.file_path
+                ));
+            }
+            ledger.put(key, fingerprint);
+        }
         let result: Vec<serde_json::Value> = context_result
             .entries
             .iter()
@@ -1059,6 +1091,9 @@ impl SemServer {
             graph_cache: Arc::new(Mutex::new(None)),
             topology_cache: Arc::new(Mutex::new(None)),
             watch: Arc::new(Mutex::new(WatchSlot::default())),
+            fill_ledger: Arc::new(Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(10_000).unwrap(),
+            ))),
             _tool_router: Self::tool_router(),
         }
     }
@@ -2260,6 +2295,49 @@ mod tests {
 
         assert_eq!(rel_path, "src/inner/file.py");
         assert!(!rel_path.contains('\\'));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attention_ledger_suppresses_repeated_identical_fill() {
+        let root = temp_git_repo("ledger-repeat");
+        std::fs::write(
+            root.join("app.py"),
+            "def alpha():\n    return 1\n\ndef beta():\n    return alpha()\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let first = server
+            .quick_context(&root, "alpha", 2000, 1, Some("sess-1"))
+            .await
+            .expect("first fill");
+        assert!(first.contains("def alpha()"), "first fill carries the body");
+
+        let second = server
+            .quick_context(&root, "alpha", 2000, 1, Some("sess-1"))
+            .await
+            .expect("second fill");
+        assert!(
+            second.contains("unchanged since you read it"),
+            "repeat in the same session collapses to one line: {second}"
+        );
+        assert!(!second.contains("def alpha()"));
+
+        // A different session gets the full body again.
+        let other = server
+            .quick_context(&root, "alpha", 2000, 1, Some("sess-2"))
+            .await
+            .expect("other session fill");
+        assert!(other.contains("def alpha()"));
+
+        // No session key: never suppressed.
+        let anon = server
+            .quick_context(&root, "alpha", 2000, 1, None)
+            .await
+            .expect("anonymous fill");
+        assert!(anon.contains("def alpha()"));
+
         let _ = std::fs::remove_dir_all(root);
     }
 
