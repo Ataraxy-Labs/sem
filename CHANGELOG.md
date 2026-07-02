@@ -18,6 +18,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- The context packer's token estimator was undercounting real tokens 2-3x on dense code (words x 1.3 vs the ~4 chars/token reality: a context reported as 661 tokens measured ~2,400 real tokens), silently overshooting every budget. It now takes the max of the word- and character-based estimates, so nominal budgets match what the consuming model actually pays.
+
 - The context packer's "not packed" summary line pluralizes roles correctly ("transitive dependencies", not "dependencys").
 
 - Workspace version bumped to 0.16.0: `ContextResult` gained the public `omitted` field (a breaking change for struct-literal constructors, flagged by cargo-semver-checks), and 0.x semantics put breaking changes in the minor version.
