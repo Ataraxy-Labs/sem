@@ -150,7 +150,10 @@ mod tests {
         let c = candidates("why is compute_history_analytics slow in `RepoWatcher` sessions?");
         assert_eq!(
             c,
-            vec!["RepoWatcher".to_string(), "compute_history_analytics".to_string()]
+            vec![
+                "RepoWatcher".to_string(),
+                "compute_history_analytics".to_string()
+            ]
         );
         assert!(candidates("ok great I love this, what should we do next?").is_empty());
     }

@@ -150,7 +150,10 @@ pub fn history_command(opts: HistoryOptions) {
     }
 
     if analytics.commits_scanned == 0 {
-        println!("{}", "no history to analyze (need at least 2 commits)".dimmed());
+        println!(
+            "{}",
+            "no history to analyze (need at least 2 commits)".dimmed()
+        );
         return;
     }
 
@@ -184,7 +187,11 @@ pub fn history_command(opts: HistoryOptions) {
     if analytics.hotspots.len() > 15 {
         println!(
             "  {}",
-            format!("… {} more (use --json for all)", analytics.hotspots.len() - 15).dimmed()
+            format!(
+                "… {} more (use --json for all)",
+                analytics.hotspots.len() - 15
+            )
+            .dimmed()
         );
     }
 

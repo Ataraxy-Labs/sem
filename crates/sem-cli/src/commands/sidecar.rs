@@ -21,7 +21,16 @@ pub fn query(repo_root: &Path, request: &serde_json::Value) -> Option<serde_json
         return None;
     }
     let path = sem_mcp::sidecar::socket_path_for(repo_root)?;
-    let mut stream = UnixStream::connect(&path).ok()?;
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(_) => {
+            // Nobody owns this repo's socket yet: spawn a detached resident
+            // server so the NEXT structural query answers in milliseconds.
+            // This query proceeds locally; the spawn costs it nothing.
+            autospawn_resident(repo_root);
+            return None;
+        }
+    };
     // A warm server replies in milliseconds; a server mid-rebuild might not.
     // Bound the wait so the fast path can never make the CLI slower than
     // just doing the local work.
@@ -49,4 +58,25 @@ pub fn query(repo_root: &Path, request: &serde_json::Value) -> Option<serde_json
 #[cfg(not(unix))]
 pub fn query(_repo_root: &Path, _request: &serde_json::Value) -> Option<serde_json::Value> {
     None
+}
+
+/// Spawn `sem mcp --resident` for this repo, fully detached. The resident
+/// exits on its own if it loses the socket-bind race or goes 30 minutes
+/// without a request, so repeated spawns are safe. `SEM_NO_AUTOWARM=1`
+/// disables it.
+#[cfg(unix)]
+fn autospawn_resident(repo_root: &Path) {
+    if std::env::var_os("SEM_NO_AUTOWARM").is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["mcp", "--resident"])
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }

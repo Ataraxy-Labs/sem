@@ -11,6 +11,7 @@
 //! Response: {"ok":true,"text":"..."} or {"ok":false,"error":"..."}.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,6 +19,41 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use crate::server::SemServer;
+
+/// Unix seconds of the last socket request (or the successful bind). 0 means
+/// this process never bound the socket — resident mode uses that to exit
+/// immediately when it lost the bind race to another server.
+static LAST_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Seconds since the sidecar last served a request. u64::MAX when this
+/// process never successfully bound the socket.
+pub fn idle_secs() -> u64 {
+    match LAST_ACTIVITY.load(Ordering::Relaxed) {
+        0 => u64::MAX,
+        t => now_secs().saturating_sub(t),
+    }
+}
+
+/// True when a live server already answers on this repo's socket.
+#[cfg(unix)]
+pub async fn socket_is_live(repo_root: &Path) -> bool {
+    match socket_path_for(repo_root) {
+        Some(path) => tokio::net::UnixStream::connect(&path).await.is_ok(),
+        None => false,
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn socket_is_live(_repo_root: &Path) -> bool {
+    false
+}
 
 /// FNV-1a, chosen because it is trivially reproducible in any language the
 /// socket's clients are written in (the Python hook implements the same five
@@ -40,7 +76,10 @@ pub fn socket_path_for(repo_root: &Path) -> Option<PathBuf> {
     let home = dirs_home()?;
     let dir = home.join(".sem").join("sock");
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(format!("{:016x}.sock", fnv1a(canonical.to_string_lossy().as_bytes()))))
+    Some(dir.join(format!(
+        "{:016x}.sock",
+        fnv1a(canonical.to_string_lossy().as_bytes())
+    )))
 }
 
 #[cfg(unix)]
@@ -72,6 +111,7 @@ pub fn spawn(server: SemServer, repo_root: PathBuf) {
                 }
             }
         };
+        LAST_ACTIVITY.store(now_secs(), Ordering::Relaxed);
 
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -86,6 +126,7 @@ pub fn spawn(server: SemServer, repo_root: PathBuf) {
                 if reader.read_line(&mut line).await.is_err() {
                     return;
                 }
+                LAST_ACTIVITY.store(now_secs(), Ordering::Relaxed);
                 let resp = handle(&server, &repo_root, line.trim()).await;
                 let _ = write_half.write_all(resp.as_bytes()).await;
                 let _ = write_half.write_all(b"\n").await;
@@ -111,10 +152,7 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
             let Some(name) = parsed.get("name").and_then(|v| v.as_str()) else {
                 return err("missing name");
             };
-            let budget = parsed
-                .get("budget")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(900) as usize;
+            let budget = parsed.get("budget").and_then(|v| v.as_u64()).unwrap_or(900) as usize;
             let hops = parsed.get("hops").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
             match server.quick_context(repo_root, name, budget, hops).await {
                 Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
@@ -129,6 +167,26 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
             let depth = parsed.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
             match server.quick_impact(repo_root, name, file, depth).await {
                 Ok(result) => serde_json::json!({ "ok": true, "result": result }).to_string(),
+                Err(e) => err(&e),
+            }
+        }
+        Some("orient") => {
+            let Some(query) = parsed.get("query").and_then(|v| v.as_str()) else {
+                return err("missing query");
+            };
+            let limit = parsed.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            match server.quick_orient(repo_root, query, limit).await {
+                Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
+                Err(e) => err(&e),
+            }
+        }
+        Some("text") => {
+            let Some(needle) = parsed.get("needle").and_then(|v| v.as_str()) else {
+                return err("missing needle");
+            };
+            let limit = parsed.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            match server.quick_text(repo_root, needle, limit).await {
+                Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
                 Err(e) => err(&e),
             }
         }

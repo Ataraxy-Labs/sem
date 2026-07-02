@@ -759,6 +759,47 @@ impl SemServer {
     /// One-call entity context from the in-memory graph, for the socket
     /// sidecar: resolve `name` repo-wide, pack a bounded context, render the
     /// compact text. Millisecond-fast once the graph is warm.
+    /// Compact lines, not JSON: same information at a fraction of the tokens
+    /// the consuming model has to read. Shared by the MCP query mode and the
+    /// sidecar's `orient` op.
+    fn orient_hits_text(hits: &[sem_core::parser::orient::OrientHit], query: &str) -> String {
+        let mut out = format!("⊕ {} hits · \"{}\"\n", hits.len(), query);
+        for h in hits {
+            let mut sig = h.signature.trim().to_string();
+            if sig.chars().count() > 100 {
+                sig = format!("{}…", sig.chars().take(100).collect::<String>());
+            }
+            out.push_str(&format!(
+                "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
+                h.name, h.entity_type, h.file_path, h.start_line, h.dependents, h.dependencies, sig
+            ));
+        }
+        out
+    }
+
+    /// Sidecar fast path: ranked intent search from the warm graph.
+    pub async fn quick_orient(
+        &self,
+        repo_root: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<String, String> {
+        let (graph, all_entities) = self.live_graph(repo_root).await;
+        let hits = sem_core::parser::orient::orient(&all_entities, &graph, query, limit);
+        Ok(Self::orient_hits_text(&hits, query))
+    }
+
+    /// Sidecar fast path: entity-addressed text search from the warm graph.
+    pub async fn quick_text(
+        &self,
+        repo_root: &Path,
+        needle: &str,
+        limit: usize,
+    ) -> Result<String, String> {
+        let (_, all_entities) = self.live_graph(repo_root).await;
+        Ok(Self::render_text_hits(&all_entities, needle, limit))
+    }
+
     pub async fn quick_context(
         &self,
         repo_root: &Path,
@@ -873,10 +914,8 @@ impl SemServer {
             .map(|(info, depth)| ((*info).clone(), *depth))
             .collect();
 
-        let by_id: std::collections::HashMap<&str, &SemanticEntity> = all_entities
-            .iter()
-            .map(|e| (e.id.as_str(), e))
-            .collect();
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> =
+            all_entities.iter().map(|e| (e.id.as_str(), e)).collect();
         let tests: Vec<sem_core::parser::graph::EntityInfo> = reached
             .iter()
             .filter(|(info, _)| {
@@ -899,11 +938,7 @@ impl SemServer {
     /// Entity-addressed text search over in-memory entity bodies. For each
     /// matching line, the innermost (smallest-span) enclosing entity wins, so
     /// a hit inside a method reports the method, not its class.
-    fn render_text_hits(
-        all_entities: &[SemanticEntity],
-        needle: &str,
-        limit: usize,
-    ) -> String {
+    pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
         use std::collections::HashMap;
         // (file, absolute line) -> (span, entity name, entity type, line text)
         let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
@@ -932,8 +967,7 @@ impl SemServer {
                  comments between entities and non-code files are not covered)"
             );
         }
-        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> =
-            best.into_iter().collect();
+        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> = best.into_iter().collect();
         hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
         let total = hits.len();
         let files: std::collections::BTreeSet<&str> = hits.iter().map(|(k, _)| k.0).collect();
@@ -942,7 +976,11 @@ impl SemServer {
             files.len()
         );
         for (i, ((file, line), (_, name, ty, text))) in hits.iter().take(limit).enumerate() {
-            let branch = if i + 1 == total.min(limit) { "╰─▶" } else { "├─▶" };
+            let branch = if i + 1 == total.min(limit) {
+                "╰─▶"
+            } else {
+                "├─▶"
+            };
             let label = if *ty == "function" || *ty == "method" {
                 (*name).to_string()
             } else {
@@ -1057,21 +1095,9 @@ impl SemServer {
             let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
             let hits =
                 sem_core::parser::orient::orient(&all_entities, &graph, query, params.limit());
-            // Compact lines, not JSON: same information at a fraction of the
-            // tokens the consuming model has to read.
-            let mut out = format!("⊕ {} hits · \"{}\"\n", hits.len(), query);
-            for h in &hits {
-                let mut sig = h.signature.trim().to_string();
-                if sig.chars().count() > 100 {
-                    sig = format!("{}…", sig.chars().take(100).collect::<String>());
-                }
-                out.push_str(&format!(
-                    "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
-                    h.name, h.entity_type, h.file_path, h.start_line, h.dependents,
-                    h.dependencies, sig
-                ));
-            }
-            return Ok(CallToolResult::success(vec![Content::text(out)]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                Self::orient_hits_text(&hits, query),
+            )]));
         }
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
@@ -1727,11 +1753,11 @@ impl SemServer {
                 if let Some(mut out) =
                     crate::cloud::try_context(&ctx.git, &params.entity_name, rel_path, budget, hops)
                 {
-                out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
-                out["source"] = serde_json::json!("cloud");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::render::context_text(&out),
-                )]));
+                    out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
+                    out["source"] = serde_json::json!("cloud");
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        crate::render::context_text(&out),
+                    )]));
                 }
             }
         }

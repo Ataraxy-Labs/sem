@@ -267,6 +267,12 @@ enum Commands {
         /// Cannot be combined with --only.
         #[arg(long = "except", value_name = "KIND", conflicts_with = "only_kinds")]
         except_kinds: Vec<String>,
+
+        /// Search entity bodies for an exact substring instead of listing:
+        /// hits come back entity-addressed (file, innermost entity, line,
+        /// matched text). Use instead of grep for strings in code.
+        #[arg(long, value_name = "SUBSTRING")]
+        text: Option<String>,
     },
     /// Find the entities most relevant to a query (structural code search)
     Orient {
@@ -343,7 +349,14 @@ enum Commands {
     /// Show lifetime diff statistics
     Stats,
     /// Start the MCP server (stdin/stdout transport)
-    Mcp,
+    Mcp {
+        /// Hidden plumbing: serve only the per-repo socket (no stdio MCP),
+        /// spawned detached by the CLI so repeat queries answer in
+        /// milliseconds. Exits when idle or when another server owns the
+        /// repo's socket.
+        #[arg(long, hide = true)]
+        resident: bool,
+    },
     /// Replace `git diff` with `sem diff` globally
     Setup,
     /// Restore default `git diff` behavior
@@ -403,7 +416,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Orient { .. }) => "orient",
         Some(Commands::Context { .. }) => "context",
         Some(Commands::Stats) => "stats",
-        Some(Commands::Mcp) => "mcp",
+        Some(Commands::Mcp { .. }) => "mcp",
         Some(Commands::Setup) => "setup",
         Some(Commands::Unsetup) => "unsetup",
         Some(Commands::Login { .. }) => "login",
@@ -619,6 +632,7 @@ fn main() {
             file_exts,
             only_kinds,
             except_kinds,
+            text,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -631,6 +645,7 @@ fn main() {
                 file_exts,
                 only_kinds,
                 except_kinds,
+                text,
             });
         }
         Some(Commands::Orient {
@@ -686,8 +701,13 @@ fn main() {
         Some(Commands::Stats) => {
             commands::stats::run();
         }
-        Some(Commands::Mcp) => {
-            if let Err(e) = sem_mcp::run() {
+        Some(Commands::Mcp { resident }) => {
+            let result = if resident {
+                sem_mcp::run_resident()
+            } else {
+                sem_mcp::run()
+            };
+            if let Err(e) = result {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }

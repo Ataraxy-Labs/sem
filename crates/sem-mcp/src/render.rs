@@ -67,8 +67,16 @@ fn push_grouped(out: &mut String, list: &[Value]) {
     ordered.sort_by_key(|f| by_file[f].1);
     for (idx, file) in ordered.iter().enumerate() {
         let (names, _) = &by_file[file];
-        let branch = if idx + 1 == ordered.len() { "╰─▶" } else { "├─▶" };
-        let file = if file.is_empty() { "(unknown file)" } else { file };
+        let branch = if idx + 1 == ordered.len() {
+            "╰─▶"
+        } else {
+            "├─▶"
+        };
+        let file = if file.is_empty() {
+            "(unknown file)"
+        } else {
+            file
+        };
         out.push_str(&format!("{} {}: {}\n", branch, file, names.join(", ")));
     }
 }

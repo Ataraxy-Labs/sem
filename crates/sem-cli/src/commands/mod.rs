@@ -1,4 +1,3 @@
-pub mod hook;
 pub mod blame;
 pub mod cloud;
 pub mod context;
@@ -6,6 +5,7 @@ pub mod diff;
 pub mod entities;
 pub mod files;
 pub mod graph;
+pub mod hook;
 pub mod impact;
 pub mod log;
 pub mod orient;

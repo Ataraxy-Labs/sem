@@ -50,6 +50,35 @@ impl From<&OrientHit> for OrientHitJson {
     }
 }
 
+/// Resident-server fast path: ranked hits from the warm graph in
+/// milliseconds. Text output only; --json and custom scopes stay local. A
+/// miss auto-spawns a resident server for next time.
+fn try_sidecar_orient(opts: &OrientOptions) -> bool {
+    if opts.json || opts.no_cache || opts.no_default_excludes || !opts.file_exts.is_empty() {
+        return false;
+    }
+    let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
+        return false;
+    };
+    let root = git.repo_root().to_path_buf();
+    if root.join(".semignore").exists() {
+        return false;
+    }
+    let request = serde_json::json!({
+        "op": "orient",
+        "query": opts.query,
+        "limit": opts.limit,
+    });
+    let Some(response) = super::sidecar::query(&root, &request) else {
+        return false;
+    };
+    let Some(text) = response.get("text").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    print!("{text}");
+    true
+}
+
 pub fn orient_command(opts: OrientOptions) {
     if query_terms(&opts.query).is_empty() {
         eprintln!(
@@ -57,6 +86,10 @@ pub fn orient_command(opts: OrientOptions) {
             "error:".red().bold()
         );
         std::process::exit(2);
+    }
+
+    if try_sidecar_orient(&opts) {
+        return;
     }
 
     let root = match GitBridge::open(Path::new(&opts.cwd)) {

@@ -192,7 +192,12 @@ def handle_bash(inp, cwd):
         if c in SEARCHERS:
             if sep == "|":
                 continue  # filtering piped output is fine
-            args = [t for t in seg[1:] if not t.startswith("-")]
+            REDIR = {">", "<", ">>", "<<", "&>", ">&"}
+            args = [
+                t for t in seg[1:]
+                if not t.startswith("-") and t not in REDIR
+                and not t.isdigit() and not t.startswith("/dev/")
+            ]
             file_args = args[1:] if args else []
             if file_args and all(not is_code(a) and ext_of(a) for a in file_args):
                 continue  # explicitly non-code targets
