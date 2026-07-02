@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- **First-principles page on the docs site** (`docs/first-principles.html`, linked from every page's nav): four charts explaining why the recent latency work changes what an agent can afford to do, not just how fast it runs — the scan-vs-index crossover (a text scan pays per byte; residency removes the index's ~800ms hydrate floor, so the constant-time line wins at every repo size), the ~100ms human-perception threshold every new path now sits under, model turns as the real cost unit (3 → 2 → 1 inference turns per structural answer via one-call lookup, then prompt-time prefetch), and tokens per answer (the measured ~15% entity-tree-vs-JSON ratio). Measured numbers come from this changelog; model curves and turn timings are labeled illustrative on the page. Charts are dependency-free inline SVG with hover tooltips and a table view each.
+
 ### Performance
 
 - **Content-store cache (storage engine layer 1)**: the entity cache no longer duplicates source text per entity. Each file's text is stored once (zstd) in a `file_contents` table, and any entity whose body is provably a byte slice of it (`content == file[start_byte..end_byte]`, verified at save time) stores NULL content and is re-sliced on load; unprovable entities (no spans, normalized endings) keep content inline. On a 139K-entity corpus (fresh cache both sides) this cut the cache 20% (269MB to 216MB; the content layer itself −58%, 80MB to 24MB inline + 10MB zstd), engaged for 77% of entities. Honest costs: warm full-content loads pay ~0.13s extra for decompress+slice on that corpus (0.38s to 0.51s); topology loads and the MCP server's in-memory hot path are unaffected, and cold build time is unchanged within noise (peak RSS ~−5%). Correctness gates: byte-identical graph vs the previous binary on the full corpus, byte-identical entity content round-trip (including multi-byte unicode and nested entities), and incremental saves keep the file store in sync with entity deletes. Cache schema v8 — existing caches rebuild automatically on first use.
