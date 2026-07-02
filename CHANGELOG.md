@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- **Content-store cache (storage engine layer 1)**: the entity cache no longer duplicates source text per entity. Each file's text is stored once (zstd) in a `file_contents` table, and any entity whose body is provably a byte slice of it (`content == file[start_byte..end_byte]`, verified at save time) stores NULL content and is re-sliced on load; unprovable entities (no spans, normalized endings) keep content inline. On a 139K-entity corpus this cut the cache 25% (269MB to 201MB, content layer −58%), engaged for 77% of entities, and made warm loads slightly faster (0.13s to 0.10s — less SQLite IO than the decompression costs). Correctness gates: byte-identical graph vs the previous binary on the full corpus, byte-identical entity content round-trip (including multi-byte unicode and nested entities), and incremental saves keep the file store in sync with entity deletes. Cache schema v8 — existing caches rebuild automatically on first use.
+
 ### Added
 
 - **Entity-addressed text search**: `sem_entities` takes a `text` parameter — an exact substring searched across entity bodies in the warm in-memory graph (no file reads). Hits come back addressed by the innermost enclosing entity (`file: entity (Lline): matched text`), ready to chain into `sem_context`/`sem_impact`, in ~20-30ms warm on an 85K-LOC repo. This retires the main remaining reason agents fell back to grep (strings, error messages, config keys); misses say honestly that comments between entities and non-code files are not covered.
