@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 use crate::server::SemServer;
@@ -21,6 +23,7 @@ use crate::server::SemServer;
 /// socket's clients are written in (the Python hook implements the same five
 /// lines). Unix socket paths cap out around 104 bytes on macOS, so the repo
 /// root is identified by hash rather than by sanitized path.
+#[cfg(unix)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
@@ -31,6 +34,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Socket path for a repo root: ~/.sem/sock/<fnv1a(canonical_root)>.sock
+#[cfg(unix)]
 pub fn socket_path_for(repo_root: &Path) -> Option<PathBuf> {
     let canonical = repo_root.canonicalize().ok()?;
     let home = dirs_home()?;
@@ -39,6 +43,7 @@ pub fn socket_path_for(repo_root: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("{:016x}.sock", fnv1a(canonical.to_string_lossy().as_bytes()))))
 }
 
+#[cfg(unix)]
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -46,6 +51,7 @@ fn dirs_home() -> Option<PathBuf> {
 /// Bind the sidecar for `repo_root`, stealing a stale socket if a previous
 /// server died without cleanup. Returns None (silently) when binding isn't
 /// possible — the sidecar is an accelerator, never a requirement.
+#[cfg(unix)]
 pub fn spawn(server: SemServer, repo_root: PathBuf) {
     tokio::spawn(async move {
         let Some(path) = socket_path_for(&repo_root) else {
@@ -88,6 +94,13 @@ pub fn spawn(server: SemServer, repo_root: PathBuf) {
     });
 }
 
+/// Windows: no unix sockets — the sidecar is an accelerator, not a
+/// requirement, so it simply doesn't exist there. Callers fall back to the
+/// one-shot CLI path.
+#[cfg(not(unix))]
+pub fn spawn(_server: SemServer, _repo_root: PathBuf) {}
+
+#[cfg(unix)]
 async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(req) {
         Ok(v) => v,
@@ -113,6 +126,7 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 fn err(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
 }

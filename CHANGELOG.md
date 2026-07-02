@@ -10,6 +10,7 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- The socket sidecar is unix-only (`cfg(unix)`): Windows builds skip it with a no-op and the prefetch hook falls back silently — the sidecar is an accelerator, never a requirement. (Fixes the Windows build break the sidecar introduced.)
 - **Socket sidecar**: `sem mcp` now exposes the warm in-memory graph on a per-repo unix socket (`~/.sem/sock/<repo-hash>.sock`, one JSON line in, one out). Short-lived local callers — the prompt-prefetch hook, future CLI fast paths — get one-call entity context in single-digit milliseconds instead of paying a fresh process plus SQLite hydrate (~800ms). Stale sockets from dead servers are detected and taken over; the sidecar is a silent accelerator, never a requirement.
 
 ### Added
