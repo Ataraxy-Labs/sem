@@ -367,6 +367,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show where your code is stored: repos indexed on your cloud account and local entity caches
+    Repos {
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Update sem to the latest released version
     Update,
     /// Generate shell completions
@@ -404,6 +410,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Logout) => "logout",
         Some(Commands::Whoami) => "whoami",
         Some(Commands::Xref { .. }) => "xref",
+        Some(Commands::Repos { .. }) => "repos",
         Some(Commands::Update) => "update",
         Some(Commands::Completions { .. }) => "completions",
         Some(Commands::TelemetryFlush) | Some(Commands::UpdateCheck) => return None,
@@ -718,6 +725,12 @@ fn main() {
         }
         Some(Commands::Xref { json }) => {
             if let Err(e) = commands::cloud::xref(json) {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Repos { json }) => {
+            if let Err(e) = commands::repos::run(json) {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }

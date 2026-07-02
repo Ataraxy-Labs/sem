@@ -124,6 +124,9 @@ fn compute_oracle_eligible(root: &Path, files: &[String]) -> bool {
 /// (a cache built from a dirty tree can't be trusted by a later clean check),
 /// and whether the repo is oracle-eligible. Best-effort.
 fn store_freshness_epoch(tx: &rusqlite::Transaction<'_>, root: &Path, files: &[String]) {
+    // Stamp the origin repo even for non-git roots: the cache dir name is a
+    // hash, so this is the only way `sem repos` can label local storage.
+    let _ = shared_cache::set_cache_repo_root(tx, root);
     let Some(oid) = git_head_oid(root) else {
         return;
     };

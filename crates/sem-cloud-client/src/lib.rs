@@ -149,6 +149,32 @@ pub struct CloudCrossRepoEdge {
     pub ref_type: String,
 }
 
+/// One repo on the account, as reported by `GET /v1/repos`. This is the
+/// authoritative server-side view; `~/.sem/repos.json` is only this machine's
+/// best-effort mirror of it.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRepoInfo {
+    pub id: String,
+    pub name: String,
+    pub clone_url: String,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub entity_count: Option<u64>,
+    #[serde(default)]
+    pub file_count: Option<u64>,
+    #[serde(default)]
+    pub last_commit_sha: Option<String>,
+    #[serde(default)]
+    pub last_indexed_at: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudCrossDepsResponse {
@@ -237,6 +263,30 @@ fn repo_cache_path() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
     Some(PathBuf::from(home).join(".sem").join("repos.json"))
+}
+
+/// Overwrite this machine's repo-cache entries with the authoritative
+/// server-side state. Fixes stale entries (a repo registered while still
+/// indexing stays "pending, 0 entities" here forever unless refreshed, and
+/// that stale count mis-routes the local-vs-cloud decision). Best-effort.
+pub fn reconcile_repo_cache(repos: &[CloudRepoInfo]) {
+    let mut cache = load_repo_cache().unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    for repo in repos {
+        cache.insert(
+            normalize_remote_url(&repo.clone_url),
+            RepoCacheEntry {
+                repo_id: repo.id.clone(),
+                status: repo.status.clone(),
+                checked_at: now.clone(),
+                entity_count: repo.entity_count.map(|n| n as usize),
+            },
+        );
+    }
+    save_repo_cache(&cache);
 }
 
 pub fn load_repo_cache() -> Option<HashMap<String, RepoCacheEntry>> {
@@ -561,6 +611,19 @@ impl CloudClient {
         let resp = self
             .agent
             .get(&self.api_url(&url))
+            .set("Authorization", &self.auth_header())
+            .call()?
+            .into_json()?;
+        Ok(resp)
+    }
+
+    /// List every repo indexed on the account (`GET /v1/repos`) — the
+    /// authoritative server-side inventory: status, entity/file counts,
+    /// indexed commit, and any indexing error.
+    pub fn list_repos(&self) -> Result<Vec<CloudRepoInfo>, Box<dyn std::error::Error>> {
+        let resp: Vec<CloudRepoInfo> = self
+            .agent
+            .get(&self.api_url("/v1/repos"))
             .set("Authorization", &self.auth_header())
             .call()?
             .into_json()?;
