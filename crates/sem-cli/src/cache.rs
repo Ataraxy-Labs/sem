@@ -257,33 +257,12 @@ impl DiskCache {
         shared_cache::refresh_manifest_entries(&tx, root)?;
         shared_cache::refresh_file_import_entries(&tx, root, files, files)?;
 
-        // Insert entities with prepared statement (already in a transaction, so fast)
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for e in entities {
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                stmt.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.start_byte.map(|v| v as i64),
-                    e.end_byte.map(|v| v as i64),
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
-        }
+        shared_cache::insert_entities_with_content_store(
+            &tx,
+            root,
+            &entities.iter().collect::<Vec<_>>(),
+            true,
+        )?;
 
         // Insert edges with prepared statement
         {
@@ -424,7 +403,7 @@ impl DiskCache {
                     end_line: row.get::<_, i64>(5)? as usize,
                     start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
                     end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
-                    content: row.get(6)?,
+                    content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
@@ -434,6 +413,21 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+
+        // Reconstruct span-sliced entity bodies from the file-content store.
+        let entities: Vec<SemanticEntity> = {
+            let mut recon = shared_cache::ContentReconstructor::new(&self.conn);
+            entities
+                .into_iter()
+                .map(|mut e| {
+                    if e.content.is_empty() {
+                        e.content =
+                            recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                    }
+                    e
+                })
+                .collect()
+        };
 
         let mut edge_stmt = self
             .conn
@@ -1811,6 +1805,7 @@ impl DiskCache {
             .ok()?;
         let mut cached_entities = Vec::new();
         let mut stale_file_entities = Vec::new();
+        let mut recon = shared_cache::ContentReconstructor::new(&self.conn);
         let mut entity_rows = entity_stmt.query([]).ok()?;
         while let Some(row) = entity_rows.next().ok()? {
             let metadata_json: Option<String> = row.get(10).ok()?;
@@ -1823,12 +1818,17 @@ impl DiskCache {
                 end_line: row.get::<_, i64>(5).ok()? as usize,
                 start_byte: row.get::<_, Option<i64>>(11).ok()?.map(|v| v as usize),
                 end_byte: row.get::<_, Option<i64>>(12).ok()?.map(|v| v as usize),
-                content: row.get(6).ok()?,
+                content: row.get::<_, Option<String>>(6).ok()?.unwrap_or_default(),
                 content_hash: row.get(7).ok()?,
                 structural_hash: row.get(8).ok()?,
                 parent_id: row.get(9).ok()?,
                 metadata: metadata_json.and_then(|j| serde_json::from_str(&j).ok()),
             };
+            let mut entity = entity;
+            if entity.content.is_empty() {
+                entity.content =
+                    recon.content(&entity.file_path, None, entity.start_byte, entity.end_byte);
+            }
             if stale_set.contains(entity.file_path.as_str()) {
                 stale_file_entities.push(entity);
             } else {
@@ -1975,47 +1975,29 @@ impl DiskCache {
 
         if repair_changed_clean_entity_ids {
             tx.execute("DELETE FROM entities", [])?;
+            tx.execute("DELETE FROM file_contents", [])?;
         } else {
             let mut del = tx.prepare("DELETE FROM entities WHERE file_path = ?1")?;
+            let mut del_fc = tx.prepare("DELETE FROM file_contents WHERE path = ?1")?;
             for f in &source_stale_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
             for f in &deleted_cached_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
         }
 
         {
-            let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for e in entities {
-                if !repair_changed_clean_entity_ids
-                    && !source_stale_set.contains(e.file_path.as_str())
-                {
-                    continue;
-                }
-
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                ins.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.start_byte.map(|v| v as i64),
-                    e.end_byte.map(|v| v as i64),
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
+            let to_insert: Vec<&SemanticEntity> = entities
+                .iter()
+                .filter(|e| {
+                    repair_changed_clean_entity_ids
+                        || source_stale_set.contains(e.file_path.as_str())
+                })
+                .collect();
+            shared_cache::insert_entities_with_content_store(&tx, root, &to_insert, true)?;
         }
 
         if repair_changed_clean_entity_ids {

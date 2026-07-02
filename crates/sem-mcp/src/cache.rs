@@ -10,7 +10,7 @@ use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef,
 use sem_core::parser::js_ts_import_source_files_from_content;
 use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 7;
+pub const CACHE_SCHEMA_VERSION: i32 = 8;
 pub const CACHE_KIND_FULL: &str = "full";
 pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS entities (
     end_line INTEGER NOT NULL,
     start_byte INTEGER,
     end_byte INTEGER,
-    content TEXT NOT NULL,
+    content TEXT,
     content_hash TEXT NOT NULL,
     structural_hash TEXT,
     parent_id TEXT,
@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS file_imports (
     importing_file TEXT NOT NULL,
     imported_file TEXT NOT NULL,
     PRIMARY KEY (importing_file, imported_file)
+);
+CREATE TABLE IF NOT EXISTS file_contents (
+    path TEXT PRIMARY KEY,
+    ztext BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS cache_metadata (
     key TEXT PRIMARY KEY,
@@ -110,6 +114,7 @@ DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS entities;
 DROP TABLE IF EXISTS edges;
 DROP TABLE IF EXISTS file_imports;
+DROP TABLE IF EXISTS file_contents;
 DROP TABLE IF EXISTS cache_metadata;
 DROP TABLE IF EXISTS entity_flags;
 ";
@@ -125,6 +130,136 @@ pub fn apply_performance_pragmas(conn: &Connection) -> Result<(), rusqlite::Erro
          PRAGMA cache_size=-65536;
          PRAGMA temp_store=MEMORY;",
     )
+}
+
+/// Entity bodies are not duplicated into the cache when they can be proven
+/// recoverable: the file's text is stored once (zstd) in `file_contents`, and
+/// any entity whose `content` equals `file_text[start_byte..end_byte]`
+/// byte-for-byte stores NULL content and is re-sliced on load. Entities that
+/// fail the proof (no spans, normalized line endings, disk changed since
+/// extraction) keep their content inline — identity by construction, never by
+/// assumption. On a 139K-entity corpus this removes the ~2x source duplication
+/// nested entities cause (#322).
+pub fn compress_file_text(text: &str) -> Option<Vec<u8>> {
+    zstd::encode_all(text.as_bytes(), 3).ok()
+}
+
+pub fn decompress_file_text(blob: &[u8]) -> Option<String> {
+    zstd::decode_all(blob).ok().and_then(|b| String::from_utf8(b).ok())
+}
+
+/// Insert entities using the content store. `replace` selects INSERT OR
+/// REPLACE (incremental saves) vs plain INSERT (full saves). Reads each
+/// referenced file from disk at most once, verifies every span slice against
+/// the entity's content, and stores the compressed file text only when at
+/// least one entity in it proved sliceable.
+pub fn insert_entities_with_content_store(
+    tx: &Transaction<'_>,
+    root: &Path,
+    entities: &[&SemanticEntity],
+    replace: bool,
+) -> Result<(), rusqlite::Error> {
+    let verb = if replace {
+        "INSERT OR REPLACE INTO"
+    } else {
+        "INSERT INTO"
+    };
+    let sql = format!(
+        "{verb} entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let mut file_texts: HashMap<&str, Option<String>> = HashMap::new();
+    let mut files_to_store: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for e in entities {
+        let metadata_json = e
+            .metadata
+            .as_ref()
+            .and_then(|m| serde_json::to_string(m).ok());
+        let text = file_texts
+            .entry(e.file_path.as_str())
+            .or_insert_with(|| std::fs::read_to_string(root.join(&e.file_path)).ok());
+        let sliceable = match (text.as_deref(), e.start_byte, e.end_byte) {
+            (Some(t), Some(sb), Some(eb)) => t.get(sb..eb) == Some(e.content.as_str()),
+            _ => false,
+        };
+        let stored_content: Option<&str> = if sliceable {
+            files_to_store.insert(e.file_path.as_str());
+            None
+        } else {
+            Some(e.content.as_str())
+        };
+        stmt.execute(params![
+            e.id,
+            e.name,
+            e.entity_type,
+            e.file_path,
+            e.start_line as i64,
+            e.end_line as i64,
+            e.start_byte.map(|v| v as i64),
+            e.end_byte.map(|v| v as i64),
+            stored_content,
+            e.content_hash,
+            e.structural_hash,
+            e.parent_id,
+            metadata_json,
+        ])?;
+    }
+
+    let mut fc = tx.prepare("INSERT OR REPLACE INTO file_contents (path, ztext) VALUES (?1, ?2)")?;
+    for path in files_to_store {
+        if let Some(Some(text)) = file_texts.get(path) {
+            if let Some(blob) = compress_file_text(text) {
+                fc.execute(params![path, blob])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load-side counterpart: resolves an entity's content from the inline column
+/// or by slicing the stored file text. Decompresses each file at most once.
+pub struct ContentReconstructor<'c> {
+    conn: &'c Connection,
+    cache: HashMap<String, Option<String>>,
+}
+
+impl<'c> ContentReconstructor<'c> {
+    pub fn new(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            cache: HashMap::new(),
+        }
+    }
+
+    pub fn content(
+        &mut self,
+        file_path: &str,
+        inline: Option<String>,
+        start_byte: Option<usize>,
+        end_byte: Option<usize>,
+    ) -> String {
+        if let Some(c) = inline {
+            return c;
+        }
+        let conn = self.conn;
+        let text = self
+            .cache
+            .entry(file_path.to_string())
+            .or_insert_with(|| {
+                conn.query_row(
+                    "SELECT ztext FROM file_contents WHERE path = ?1",
+                    params![file_path],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .ok()
+                .and_then(|blob| decompress_file_text(&blob))
+            });
+        match (text.as_deref(), start_byte, end_byte) {
+            (Some(t), Some(sb), Some(eb)) => t.get(sb..eb).unwrap_or("").to_string(),
+            _ => String::new(),
+        }
+    }
 }
 
 pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -759,32 +894,7 @@ impl DiskCache {
         refresh_manifest_entries(&tx, root)?;
         refresh_file_import_entries(&tx, root, files, files)?;
 
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for e in entities {
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                stmt.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.start_byte.map(|v| v as i64),
-                    e.end_byte.map(|v| v as i64),
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
-        }
+        insert_entities_with_content_store(&tx, root, &entities.iter().collect::<Vec<_>>(), false)?;
 
         {
             let mut stmt = tx.prepare(
@@ -896,7 +1006,7 @@ impl DiskCache {
                     end_line: row.get::<_, i64>(5)? as usize,
                     start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
                     end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
-                    content: row.get(6)?,
+                    content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
@@ -906,6 +1016,21 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+
+        // Reconstruct span-sliced entity bodies from the file-content store.
+        let entities: Vec<SemanticEntity> = {
+            let mut recon = ContentReconstructor::new(&self.conn);
+            entities
+                .into_iter()
+                .map(|mut e| {
+                    if e.content.is_empty() {
+                        e.content =
+                            recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                    }
+                    e
+                })
+                .collect()
+        };
 
         // Load edges
         let mut edge_stmt = self
@@ -1223,7 +1348,7 @@ impl DiskCache {
                     end_line: row.get::<_, i64>(5)? as usize,
                     start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
                     end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
-                    content: row.get(6)?,
+                    content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
@@ -1233,6 +1358,20 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+
+        let all_cached: Vec<SemanticEntity> = {
+            let mut recon = ContentReconstructor::new(&self.conn);
+            all_cached
+                .into_iter()
+                .map(|mut e| {
+                    if e.content.is_empty() {
+                        e.content =
+                            recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                    }
+                    e
+                })
+                .collect()
+        };
 
         let mut cached_entities = Vec::new();
         let mut stale_file_entities = Vec::new();
@@ -1403,47 +1542,29 @@ impl DiskCache {
 
         if repair_changed_clean_entity_ids {
             tx.execute("DELETE FROM entities", [])?;
+            tx.execute("DELETE FROM file_contents", [])?;
         } else {
             let mut del = tx.prepare("DELETE FROM entities WHERE file_path = ?1")?;
+            let mut del_fc = tx.prepare("DELETE FROM file_contents WHERE path = ?1")?;
             for f in &source_stale_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
             for f in &deleted_cached_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
         }
 
         {
-            let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for e in entities {
-                if !repair_changed_clean_entity_ids
-                    && !source_stale_set.contains(e.file_path.as_str())
-                {
-                    continue;
-                }
-
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                ins.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.start_byte.map(|v| v as i64),
-                    e.end_byte.map(|v| v as i64),
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
+            let to_insert: Vec<&SemanticEntity> = entities
+                .iter()
+                .filter(|e| {
+                    repair_changed_clean_entity_ids
+                        || source_stale_set.contains(e.file_path.as_str())
+                })
+                .collect();
+            insert_entities_with_content_store(&tx, root, &to_insert, true)?;
         }
 
         if repair_changed_clean_entity_ids {
@@ -1668,6 +1789,63 @@ mod tests {
     fn sample_files(root: &Path) -> Vec<String> {
         write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
         vec!["sample.foo".to_string()]
+    }
+
+    #[test]
+    fn content_store_round_trip_is_byte_identical() {
+        let root = temp_repo_root("content-store-roundtrip");
+        // A real source file so the extractor assigns byte spans, including a
+        // multi-byte character to stress slicing, plus a nested class so the
+        // 2x duplication case (class contains method) is exercised.
+        let src = "class Greeter:\n    def hello(self):\n        return \"h\u{00e9}llo\"\n\n\ndef standalone():\n    return 1\n";
+        std::fs::write(root.join("app.py"), src).unwrap();
+
+        let registry = sem_core::parser::plugins::create_default_registry();
+        let files = vec!["app.py".to_string()];
+        let (graph, entities) =
+            sem_core::parser::graph::EntityGraph::build(&root, &files, &registry);
+        assert!(!entities.is_empty());
+        let spanned = entities.iter().filter(|e| e.start_byte.is_some()).count();
+        assert!(spanned > 0, "extractor should assign byte spans");
+
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(&root, &files, &graph, &entities, CacheSourceScope::Default)
+            .unwrap();
+
+        // The store must actually engage: at least one row holds NULL content
+        // and the file text landed in file_contents.
+        let null_rows: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE content IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(null_rows > 0, "no entity used the content store");
+        let stored_files: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored_files, 1);
+
+        // Round trip: every entity's content byte-identical after load.
+        let (_, loaded) = cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .expect("cache should load");
+        assert_eq!(loaded.len(), entities.len());
+        let by_id: HashMap<&str, &SemanticEntity> =
+            entities.iter().map(|e| (e.id.as_str(), e)).collect();
+        for l in &loaded {
+            let orig = by_id.get(l.id.as_str()).expect("entity survived");
+            assert_eq!(
+                l.content, orig.content,
+                "content mismatch for {} after round trip",
+                l.id
+            );
+        }
+        cleanup(root);
     }
 
     fn cleanup(root: std::path::PathBuf) {
