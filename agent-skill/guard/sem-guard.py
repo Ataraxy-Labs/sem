@@ -116,9 +116,12 @@ def handle_read(inp):
     state = load_state()
     key = os.path.abspath(os.path.expanduser(fp))
     if key in state and time.time() - state[key] < RETRY_WINDOW:
-        del state[key]
+        # Active editing window: the retry proved edit intent, so keep this
+        # path readable (refreshed on each read) instead of re-denying every
+        # Read while the file is being worked on.
+        state[key] = time.time()
         save_state(state)
-        return  # second ask: pre-edit Read, allowed
+        return
     state[key] = time.time()
     save_state(state)
     deny(
@@ -209,6 +212,11 @@ def handle_bash(inp, cwd):
 def main():
     data = json.load(sys.stdin)
     if os.environ.get("SEM_GUARD") == "0":
+        return
+    # Session-wide kill switch: hooks inherit the parent process env, so a
+    # mid-session `export SEM_GUARD=0` can't reach them. Touching this file
+    # disables the guard immediately (e.g. for controlled benchmarks).
+    if os.path.exists(os.path.expanduser("~/.claude/hooks/.sem-guard-off")):
         return
     tool = data.get("tool_name", "")
     inp = data.get("tool_input") or {}
