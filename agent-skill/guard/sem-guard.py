@@ -174,14 +174,19 @@ def handle_bash(inp, cwd):
     cmd = inp.get("command") or ""
     if "SEM_GUARD=0" in cmd:
         return
-    try:
-        import shlex
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        tokens = list(lex)
-    except Exception:
-        return
-    segs = split_segments(tokens)
+    import shlex
+    # Analyze line by line: a newline is a command separator, and gluing
+    # lines together would misattribute one line's file args to another
+    # line's command.
+    segs = []
+    for line in cmd.splitlines():
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            tokens = list(lex)
+        except Exception:
+            continue  # unlexable line (e.g. heredoc fragment): skip it
+        segs.extend(split_segments(tokens))
     for sep, seg in segs:
         c = os.path.basename(seg_cmd(seg))
         if c in SEARCHERS:
