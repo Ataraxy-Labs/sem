@@ -6,6 +6,10 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- **Socket sidecar**: `sem mcp` now exposes the warm in-memory graph on a per-repo unix socket (`~/.sem/sock/<repo-hash>.sock`, one JSON line in, one out). Short-lived local callers — the prompt-prefetch hook, future CLI fast paths — get one-call entity context in single-digit milliseconds instead of paying a fresh process plus SQLite hydrate (~800ms). Stale sockets from dead servers are detected and taken over; the sidecar is a silent accelerator, never a requirement.
+
+### Added
+
 - **One-call lookup**: `sem_context`'s `file_path` is now optional. With only an `entity_name`, the entity is resolved across the whole repo (unique match proceeds; ambiguity returns a compact candidate list with the files; no match returns near-name suggestions) and the body plus callers/callees comes back in a single round-trip — one agent call where grep needs two (search, then read). Measured 26ms wall on a prewarmed server, name-only, unfamiliar repo.
 
 ### Performance
