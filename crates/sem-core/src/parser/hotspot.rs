@@ -111,15 +111,10 @@ pub fn compute_history_analytics(
         return empty_analytics();
     }
 
-    type Key = (String, String, String); // (name, type, file)
-    let mut per_entity: HashMap<Key, (usize, std::collections::HashSet<String>, String)> =
-        HashMap::new();
-    let mut pair_counts: HashMap<(Key, Key), usize> = HashMap::new();
-    let mut pair_commits_skipped = 0usize;
     let pathspecs: Vec<String> = file_path.map(|f| vec![f.to_string()]).unwrap_or_default();
 
     let windows: Vec<_> = commits.windows(2).collect();
-    let commits_scanned = windows.len();
+    let mut scanned: Vec<CommitEntityChanges> = Vec::with_capacity(windows.len());
     for window in windows {
         let newer = &window[0];
         let older = &window[1];
@@ -129,24 +124,71 @@ pub fn compute_history_analytics(
         };
         let file_changes = match git.get_changed_files(&scope, &pathspecs) {
             Ok(fc) => fc,
-            Err(_) => continue,
+            Err(_) => {
+                // The commit still counts as scanned, matching the previous
+                // windows(2) accounting where errors skipped only the diff.
+                scanned.push(CommitEntityChanges {
+                    short_sha: newer.short_sha.clone(),
+                    author: newer.author.clone(),
+                    changed: Vec::new(),
+                });
+                continue;
+            }
         };
         let diff = compute_semantic_diff(&file_changes, registry, Some(&newer.sha), None);
+        scanned.push(CommitEntityChanges {
+            short_sha: newer.short_sha.clone(),
+            author: newer.author.clone(),
+            changed: diff
+                .changes
+                .iter()
+                .map(|c| {
+                    (
+                        c.entity_name.clone(),
+                        c.entity_type.clone(),
+                        c.file_path.clone(),
+                    )
+                })
+                .collect(),
+        });
+    }
 
+    aggregate_history_analytics(&scanned, file_path)
+}
+
+/// One scanned commit's entity-level changes, ready for aggregation. Rows can
+/// come from a fresh semantic diff or from the on-disk semantic commit index;
+/// aggregation applies the code-entity and file filters either way.
+#[derive(Debug, Clone)]
+pub struct CommitEntityChanges {
+    pub short_sha: String,
+    pub author: String,
+    /// (entity_name, entity_type, file_path) of every entity the commit changed.
+    pub changed: Vec<(String, String, String)>,
+}
+
+/// Fold per-commit entity changes (newest-first) into hotspots and co-change
+/// pairs. Shared by the live git walk and the semantic commit index so the
+/// two paths cannot drift.
+pub fn aggregate_history_analytics(
+    scanned: &[CommitEntityChanges],
+    file_path: Option<&str>,
+) -> HistoryAnalytics {
+    type Key = (String, String, String); // (name, type, file)
+    let mut per_entity: HashMap<Key, (usize, std::collections::HashSet<String>, String)> =
+        HashMap::new();
+    let mut pair_counts: HashMap<(Key, Key), usize> = HashMap::new();
+    let mut pair_commits_skipped = 0usize;
+
+    for commit in scanned {
         // Distinct entities changed in this commit (orphans and file-filtered
         // changes excluded; a commit counts once per entity).
-        let mut changed: Vec<Key> = diff
-            .changes
+        let mut changed: Vec<Key> = commit
+            .changed
             .iter()
-            .filter(|c| is_code_entity(&c.entity_type))
-            .filter(|c| file_path.map_or(true, |fp| c.file_path == fp))
-            .map(|c| {
-                (
-                    c.entity_name.clone(),
-                    c.entity_type.clone(),
-                    c.file_path.clone(),
-                )
-            })
+            .filter(|(_, ty, _)| is_code_entity(ty))
+            .filter(|(_, _, file)| file_path.map_or(true, |fp| file.as_str() == fp))
+            .cloned()
             .collect();
         changed.sort();
         changed.dedup();
@@ -156,10 +198,10 @@ pub fn compute_history_analytics(
                 .entry(key.clone())
                 .or_insert_with(|| (0, std::collections::HashSet::new(), String::new()));
             entry.0 += 1;
-            entry.1.insert(newer.author.clone());
+            entry.1.insert(commit.author.clone());
             if entry.2.is_empty() {
-                // Commits walk newest-first, so the first sighting is the latest.
-                entry.2 = newer.short_sha.clone();
+                // Commits arrive newest-first, so the first sighting is the latest.
+                entry.2 = commit.short_sha.clone();
             }
         }
 
@@ -224,7 +266,7 @@ pub fn compute_history_analytics(
     });
 
     HistoryAnalytics {
-        commits_scanned,
+        commits_scanned: scanned.len(),
         hotspots,
         co_changes,
         pair_commits_skipped,

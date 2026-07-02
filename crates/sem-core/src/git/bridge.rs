@@ -449,6 +449,12 @@ impl GitBridge {
         Ok(files)
     }
 
+    /// Number of parents of a commit (0 = root, >1 = merge).
+    pub fn commit_parent_count(&self, sha: &str) -> Result<usize, GitError> {
+        let obj = self.repo.revparse_single(sha)?;
+        Ok(obj.peel_to_commit()?.parent_count())
+    }
+
     fn get_commit_diff_files(
         &self,
         sha: &str,

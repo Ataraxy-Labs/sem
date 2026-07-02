@@ -134,17 +134,21 @@ SEARCHERS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}
 READERS = {"cat", "head", "tail", "less", "more"}
 
 
+SEPARATORS = {"|", "||", "&&", ";", ";;", "&"}
+
+
 def split_segments(tokens):
-    segs, cur = [], []
+    """Returns (separator_before, tokens) pairs; first segment has sep None."""
+    segs, cur, sep = [], [], None
     for t in tokens:
-        if t in {"|", "||", "&&", ";", "&"}:
+        if t in SEPARATORS:
             if cur:
-                segs.append(cur)
-            cur = []
+                segs.append((sep, cur))
+            cur, sep = [], t
         else:
             cur.append(t)
     if cur:
-        segs.append(cur)
+        segs.append((sep, cur))
     return segs
 
 
@@ -169,14 +173,16 @@ def handle_bash(inp, cwd):
         return
     try:
         import shlex
-        tokens = shlex.split(cmd, posix=True)
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
     except Exception:
         return
     segs = split_segments(tokens)
-    for i, seg in enumerate(segs):
+    for sep, seg in segs:
         c = os.path.basename(seg_cmd(seg))
         if c in SEARCHERS:
-            if i > 0:
+            if sep == "|":
                 continue  # filtering piped output is fine
             args = [t for t in seg[1:] if not t.startswith("-")]
             file_args = args[1:] if args else []

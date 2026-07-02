@@ -1524,12 +1524,23 @@ impl SemServer {
                     let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
                     rel
                 });
-                let analytics = sem_core::parser::hotspot::compute_history_analytics(
+                // Semantic commit index first (each commit diffed once, ever);
+                // live walk only when the cache is unusable.
+                let analytics = crate::cache::history_analytics_from_store(
+                    &ctx.repo_root,
                     &ctx.git,
                     &self.registry,
                     rel_file.as_deref(),
                     limit,
-                );
+                )
+                .unwrap_or_else(|| {
+                    sem_core::parser::hotspot::compute_history_analytics(
+                        &ctx.git,
+                        &self.registry,
+                        rel_file.as_deref(),
+                        limit,
+                    )
+                });
                 (rel_file, analytics)
             };
             let _ = rel_file;

@@ -94,12 +94,24 @@ pub fn history_command(opts: HistoryOptions) {
     };
 
     let limit = if opts.limit == 0 { 500 } else { opts.limit };
-    let analytics = sem_core::parser::hotspot::compute_history_analytics(
+    // Semantic commit index first: each commit is diffed once, ever; later
+    // queries are lookups plus a delta of new commits. Falls back to the
+    // live walk only when the cache is unusable.
+    let analytics = sem_mcp::cache::history_analytics_from_store(
+        bridge.repo_root(),
         &bridge,
         &registry,
         opts.file_path.as_deref(),
         limit,
-    );
+    )
+    .unwrap_or_else(|| {
+        sem_core::parser::hotspot::compute_history_analytics(
+            &bridge,
+            &registry,
+            opts.file_path.as_deref(),
+            limit,
+        )
+    });
 
     if opts.json {
         let hotspots: Vec<serde_json::Value> = analytics

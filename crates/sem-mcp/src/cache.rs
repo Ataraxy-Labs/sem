@@ -4,13 +4,20 @@ use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use sem_core::git::bridge::GitBridge;
+use sem_core::git::types::{CommitInfo, DiffScope};
 use sem_core::model::entity::SemanticEntity;
+use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef, RefType};
+use sem_core::parser::hotspot::{
+    aggregate_history_analytics, CommitEntityChanges, HistoryAnalytics,
+};
 use sem_core::parser::js_ts_import_source_files_from_content;
+use sem_core::parser::registry::ParserRegistry;
 use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 8;
+pub const CACHE_SCHEMA_VERSION: i32 = 9;
 pub const CACHE_KIND_FULL: &str = "full";
 pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
@@ -45,6 +52,16 @@ pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
         "idx_file_imports_importing_file",
         "file_imports",
         "importing_file",
+    ),
+    (
+        "idx_entity_changes_commit_sha",
+        "entity_changes",
+        "commit_sha",
+    ),
+    (
+        "idx_entity_changes_entity_name",
+        "entity_changes",
+        "entity_name",
     ),
 ];
 
@@ -107,6 +124,23 @@ CREATE TABLE IF NOT EXISTS entity_flags (
     entity_id TEXT PRIMARY KEY,
     is_test INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS commits (
+    sha TEXT PRIMARY KEY,
+    short_sha TEXT NOT NULL,
+    author TEXT NOT NULL,
+    committed_at INTEGER NOT NULL,
+    message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_changes (
+    commit_sha TEXT NOT NULL,
+    entity_name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    old_entity_name TEXT,
+    old_file_path TEXT,
+    structural INTEGER
+);
 ";
 
 const CACHE_RESET_SQL: &str = "
@@ -117,6 +151,8 @@ DROP TABLE IF EXISTS file_imports;
 DROP TABLE IF EXISTS file_contents;
 DROP TABLE IF EXISTS cache_metadata;
 DROP TABLE IF EXISTS entity_flags;
+DROP TABLE IF EXISTS commits;
+DROP TABLE IF EXISTS entity_changes;
 ";
 
 /// Per-connection performance pragmas. These are not persisted in the database
@@ -260,6 +296,46 @@ impl<'c> ContentReconstructor<'c> {
             _ => String::new(),
         }
     }
+}
+
+// ── Semantic commit index (storage engine layer 2) ──
+//
+// History stored as entity deltas: each commit is semantic-diffed against its
+// FIRST PARENT exactly once and persisted as entity-change rows keyed by sha.
+// Every later history query is a lookup plus a diff of only the commits git
+// gained since. Rows are branch-agnostic (sha-keyed), so switching branches
+// never invalidates the index. Merge commits are recorded with no changes:
+// their first-parent diff restates the merged-in commits, which are indexed
+// individually on their own shas.
+
+/// Answer repo history analytics from the semantic commit index, indexing any
+/// commits it has not seen. Returns None when the cache is unusable so callers
+/// can fall back to the live git walk.
+pub fn history_analytics_from_store(
+    repo_root: &Path,
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    file_path: Option<&str>,
+    max_commits: usize,
+) -> Option<HistoryAnalytics> {
+    let commits = git.get_log(max_commits.saturating_add(1)).ok()?;
+    if commits.len() < 2 {
+        return Some(aggregate_history_analytics(&[], file_path));
+    }
+    let mut cache = DiskCache::open(repo_root).ok()?;
+    // The oldest walked commit is the diff baseline only, mirroring the
+    // windows(2) accounting of the live walk.
+    let scan = &commits[..commits.len() - 1];
+    cache.index_commits(git, registry, scan).ok()?;
+    let mut scanned = Vec::with_capacity(scan.len());
+    for info in scan {
+        scanned.push(CommitEntityChanges {
+            short_sha: info.short_sha.clone(),
+            author: info.author.clone(),
+            changed: cache.entity_changes_for(&info.sha).ok()?,
+        });
+    }
+    Some(aggregate_history_analytics(&scanned, file_path))
 }
 
 pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -870,6 +946,103 @@ impl DiskCache {
         initialize_schema(&conn)?;
 
         Ok(Self { conn })
+    }
+
+    /// Index every commit in `commits` that the store has not seen: semantic
+    /// diff against its first parent, persisted as entity-change rows. Merge
+    /// commits are stored with zero changes. Returns the number of commits
+    /// newly indexed.
+    pub fn index_commits(
+        &mut self,
+        git: &GitBridge,
+        registry: &ParserRegistry,
+        commits: &[CommitInfo],
+    ) -> Result<usize, rusqlite::Error> {
+        let mut newly_indexed = 0usize;
+        for info in commits {
+            let exists = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM commits WHERE sha = ?1",
+                    params![info.sha],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                continue;
+            }
+
+            let is_merge = git
+                .commit_parent_count(&info.sha)
+                .map(|n| n > 1)
+                .unwrap_or(false);
+            let changes = if is_merge {
+                Vec::new()
+            } else {
+                let scope = DiffScope::Commit {
+                    sha: info.sha.clone(),
+                };
+                match git.get_changed_files(&scope, &[]) {
+                    Ok(fc) => {
+                        compute_semantic_diff(&fc, registry, Some(&info.sha), Some(&info.author))
+                            .changes
+                    }
+                    Err(_) => Vec::new(),
+                }
+            };
+
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO commits (sha, short_sha, author, committed_at, message)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    info.sha,
+                    info.short_sha,
+                    info.author,
+                    info.date.parse::<i64>().unwrap_or(0),
+                    info.message,
+                ],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO entity_changes
+                     (commit_sha, entity_name, entity_type, file_path, change_type,
+                      old_entity_name, old_file_path, structural)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for c in &changes {
+                    stmt.execute(params![
+                        info.sha,
+                        c.entity_name,
+                        c.entity_type,
+                        c.file_path,
+                        c.change_type.to_string(),
+                        c.old_entity_name,
+                        c.old_file_path,
+                        c.structural_change.map(i64::from),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            newly_indexed += 1;
+        }
+        Ok(newly_indexed)
+    }
+
+    /// (entity_name, entity_type, file_path) rows stored for one commit.
+    pub fn entity_changes_for(
+        &self,
+        sha: &str,
+    ) -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT entity_name, entity_type, file_path
+             FROM entity_changes WHERE commit_sha = ?1",
+        )?;
+        let rows = stmt.query_map(params![sha], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect()
     }
 
     /// Save the current graph + entities to the disk cache.
@@ -1699,6 +1872,114 @@ mod tests {
 
     fn write_file(path: &Path, content: &str) {
         std::fs::write(path, content).unwrap();
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "tester")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "tester")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn commit_py(dir: &Path, content: &str, msg: &str) {
+        write_file(&dir.join("main.py"), content);
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-m", msg, "--no-gpg-sign"]);
+    }
+
+    #[test]
+    fn semantic_commit_index_matches_live_walk_and_is_incremental() {
+        let root = temp_repo_root("commit-index");
+        run_git(&root, &["init", "-q"]);
+        commit_py(
+            &root,
+            "def alpha():\n    return 1\n\ndef beta():\n    return 2\n",
+            "c1",
+        );
+        commit_py(
+            &root,
+            "def alpha():\n    return 10\n\ndef beta():\n    return 20\n",
+            "c2",
+        );
+        commit_py(
+            &root,
+            "def alpha():\n    return 100\n\ndef beta():\n    return 20\n",
+            "c3",
+        );
+
+        let git_bridge = GitBridge::open(&root).unwrap();
+        let registry = sem_core::parser::plugins::create_default_registry();
+
+        let live = sem_core::parser::hotspot::compute_history_analytics(
+            &git_bridge,
+            &registry,
+            None,
+            50,
+        );
+        let stored = history_analytics_from_store(&root, &git_bridge, &registry, None, 50)
+            .expect("store-backed analytics");
+
+        assert_eq!(stored.commits_scanned, live.commits_scanned);
+        assert_eq!(stored.hotspots.len(), live.hotspots.len());
+        for (s, l) in stored.hotspots.iter().zip(live.hotspots.iter()) {
+            assert_eq!(
+                (
+                    s.entity_name.as_str(),
+                    s.commits,
+                    s.authors,
+                    s.last_short_sha.as_str()
+                ),
+                (
+                    l.entity_name.as_str(),
+                    l.commits,
+                    l.authors,
+                    l.last_short_sha.as_str()
+                )
+            );
+        }
+        assert_eq!(stored.co_changes.len(), live.co_changes.len());
+
+        // A second query indexes nothing new.
+        let commits = git_bridge.get_log(50).unwrap();
+        let mut cache = DiskCache::open(&root).unwrap();
+        assert_eq!(
+            cache
+                .index_commits(&git_bridge, &registry, &commits[..commits.len() - 1])
+                .unwrap(),
+            0
+        );
+
+        // A new commit indexes exactly one more.
+        commit_py(
+            &root,
+            "def alpha():\n    return 1000\n\ndef beta():\n    return 20\n",
+            "c4",
+        );
+        let commits = git_bridge.get_log(50).unwrap();
+        assert_eq!(
+            cache
+                .index_commits(&git_bridge, &registry, &commits[..commits.len() - 1])
+                .unwrap(),
+            1
+        );
+        drop(cache);
+
+        let stored2 =
+            history_analytics_from_store(&root, &git_bridge, &registry, None, 50).unwrap();
+        let alpha = stored2
+            .hotspots
+            .iter()
+            .find(|h| h.entity_name == "alpha")
+            .expect("alpha hotspot");
+        assert_eq!(alpha.commits, 3); // c2, c3, c4
     }
 
     fn empty_graph() -> EntityGraph {
