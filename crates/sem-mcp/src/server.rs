@@ -798,6 +798,7 @@ impl SemServer {
             "target_omitted": context_result.target_omitted,
             "entries": result.len(),
             "context": result,
+            "omitted": omitted_tails_json(&context_result),
             "source": "local",
         })))
     }
@@ -1056,23 +1057,21 @@ impl SemServer {
             let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
             let hits =
                 sem_core::parser::orient::orient(&all_entities, &graph, query, params.limit());
-            let result: Vec<serde_json::Value> = hits
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "name": h.name,
-                        "type": h.entity_type,
-                        "file": h.file_path,
-                        "start_line": h.start_line,
-                        "signature": h.signature,
-                        "dependents": h.dependents,
-                        "dependencies": h.dependencies,
-                    })
-                })
-                .collect();
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_default(),
-            )]));
+            // Compact lines, not JSON: same information at a fraction of the
+            // tokens the consuming model has to read.
+            let mut out = format!("⊕ {} hits · \"{}\"\n", hits.len(), query);
+            for h in &hits {
+                let mut sig = h.signature.trim().to_string();
+                if sig.chars().count() > 100 {
+                    sig = format!("{}…", sig.chars().take(100).collect::<String>());
+                }
+                out.push_str(&format!(
+                    "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
+                    h.name, h.entity_type, h.file_path, h.start_line, h.dependents,
+                    h.dependencies, sig
+                ));
+            }
+            return Ok(CallToolResult::success(vec![Content::text(out)]));
         }
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
@@ -1127,27 +1126,35 @@ impl SemServer {
             return Ok(tool_error(format!("Path not found: {}", path)));
         };
 
-        let result: Vec<serde_json::Value> = entities
-            .iter()
-            .map(|e| {
-                let mut value = serde_json::json!({
-                    "id": e.id,
-                    "name": e.name,
-                    "type": e.entity_type,
-                    "start_line": e.start_line,
-                    "end_line": e.end_line,
-                    "parent_id": e.parent_id,
-                });
-                if include_file {
-                    value["file"] = serde_json::json!(e.file_path);
+        // Compact per-line tree instead of JSON: name · type · lines, children
+        // indented under their parent, files as group headers for directory
+        // listings. Same information, ~6x fewer tokens for the reading model.
+        let entity_line = |e: &sem_core::model::entity::SemanticEntity| {
+            let indent = if e.parent_id.is_some() { "  " } else { "" };
+            let lines = if e.end_line > e.start_line {
+                format!("L{}-{}", e.start_line, e.end_line)
+            } else {
+                format!("L{}", e.start_line)
+            };
+            format!("{}{} · {} · {}\n", indent, e.name, e.entity_type, lines)
+        };
+        let mut out = format!("⊕ {} entities · {}\n", entities.len(), rel_path);
+        if include_file {
+            let mut current_file = "";
+            for e in &entities {
+                if e.file_path != current_file {
+                    current_file = &e.file_path;
+                    out.push_str(&format!("\n{}\n", current_file));
                 }
-                value
-            })
-            .collect();
+                out.push_str(&entity_line(e));
+            }
+        } else {
+            for e in &entities {
+                out.push_str(&entity_line(e));
+            }
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap_or_default(),
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
     // ── Tool 2: Diff ──
@@ -1791,11 +1798,30 @@ impl SemServer {
                 "target_omitted": context_result.target_omitted,
                 "entries": result.len(),
                 "context": result,
+                "omitted": omitted_tails_json(&context_result),
                 "elapsed_ms": start.elapsed().as_millis() as u64,
                 "source": "local",
             })),
         )]))
     }
+}
+
+/// Per-role counts of entities the packer deliberately left out (tests,
+/// stub signatures, past-cap transitive tails), for the render footer.
+fn omitted_tails_json(
+    context_result: &sem_core::parser::context::ContextResult,
+) -> Vec<serde_json::Value> {
+    context_result
+        .omitted
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "role": t.role,
+                "entities": t.entities,
+                "tests": t.tests,
+            })
+        })
+        .collect()
 }
 
 #[tool_handler]
@@ -2270,12 +2296,10 @@ mod tests {
             rmcp::model::RawContent::Text(text) => &text.text,
             other => panic!("expected text content, got {other:?}"),
         };
-        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
         assert!(
-            payload.as_array().unwrap().iter().any(|entity| {
-                entity["name"] == "generatedTarget" && entity["type"] == "function"
-            }),
-            "generated target should be returned when default excludes are disabled: {payload}"
+            text.lines()
+                .any(|line| line.contains("generatedTarget") && line.contains("function")),
+            "generated target should be returned when default excludes are disabled: {text}"
         );
 
         let _ = std::fs::remove_dir_all(root);

@@ -229,6 +229,26 @@ pub fn context_text(v: &Value) -> String {
             }
         }
     }
+    let omitted = get_arr(v, "omitted");
+    if !omitted.is_empty() {
+        let parts: Vec<String> = omitted
+            .iter()
+            .map(|t| {
+                let role = get_str(t, "role").replace('_', " ");
+                let n = get_u64(t, "entities").unwrap_or(0);
+                let tests = get_u64(t, "tests").unwrap_or(0);
+                if tests > 0 {
+                    format!("+{} {}s ({} tests)", n, role, tests)
+                } else {
+                    format!("+{} {}s", n, role)
+                }
+            })
+            .collect();
+        out.push_str(&format!(
+            "\n╰ not packed: {} — sem_impact lists them\n",
+            parts.join(" · ")
+        ));
+    }
     out
 }
 

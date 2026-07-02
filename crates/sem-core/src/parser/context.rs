@@ -18,12 +18,25 @@ pub struct ContextEntry {
     pub estimated_tokens: usize,
 }
 
+/// Entities deliberately not packed for a role: tests (their one-line
+/// signature is pure noise; `sem impact --tests` lists them properly) and
+/// past-the-cap transitive tails. The count preserves the signal ("covered
+/// by 39 tests", "81 more transitive dependents") at one line instead of
+/// one line each.
+#[derive(Debug, Clone, Default)]
+pub struct OmittedTail {
+    pub role: String,
+    pub entities: usize,
+    pub tests: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ContextResult {
     pub entries: Vec<ContextEntry>,
     pub total_tokens: usize,
     pub truncated: bool,
     pub target_omitted: bool,
+    pub omitted: Vec<OmittedTail>,
 }
 
 /// Estimate token count from content. Rough heuristic: ~1.3 tokens per whitespace-separated word.
@@ -170,8 +183,25 @@ pub fn build_context_result_bounded(
     // Oversized neighbors degrade to signatures instead of dominating.
     let neighbor_full_cap = result.total_tokens.max(token_budget / 10);
 
+    // Tests are counted, not packed: a related test's one-line signature is
+    // pure noise ("#[test]"), while "covered by 39 tests" is one line of real
+    // signal ("sem impact --tests" lists them properly). The exception is
+    // when the target itself is a test — then its test neighborhood IS the
+    // question. Transitive tiers are additionally capped: past the cap the
+    // marginal signature stops paying for its tokens.
+    const MAX_TRANSITIVE_ENTRIES: usize = 25;
+    let target_is_test = entity_lookup
+        .get(entity_id)
+        .map(|e| is_test_entity(e))
+        .unwrap_or(false);
+    let mut tails: Vec<OmittedTail> = Vec::new();
+
     let direct_dependencies = graph.get_dependencies(entity_id);
     for dep_info in &direct_dependencies {
+        if !target_is_test && lookup_is_test(&entity_lookup, dep_info.id.as_str()) {
+            tally(&mut tails, "direct_dependency", true);
+            continue;
+        }
         add_full_or_signature(
             &mut result,
             &entity_lookup,
@@ -185,6 +215,10 @@ pub fn build_context_result_bounded(
 
     let direct_dependents = graph.get_dependents(entity_id);
     for dep_info in &direct_dependents {
+        if !target_is_test && lookup_is_test(&entity_lookup, dep_info.id.as_str()) {
+            tally(&mut tails, "direct_dependent", true);
+            continue;
+        }
         add_full_or_signature(
             &mut result,
             &entity_lookup,
@@ -201,35 +235,105 @@ pub fn build_context_result_bounded(
     let direct_dependent_ids: HashSet<&str> =
         direct_dependents.iter().map(|d| d.id.as_str()).collect();
 
-    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependencies, max_hops) {
-        if direct_dependency_ids.contains(dep_info.id.as_str()) {
-            continue;
-        }
-        add_signature(
-            &mut result,
-            &entity_lookup,
-            dep_info.id.as_str(),
+    for (role, relationships, direct_ids) in [
+        (
             "transitive_dependency",
-            token_budget,
-            &mut included_ids,
-        );
-    }
-
-    for dep_info in collect_reachable_related(graph, entity_id, &graph.dependents, max_hops) {
-        if direct_dependent_ids.contains(dep_info.id.as_str()) {
-            continue;
-        }
-        add_signature(
-            &mut result,
-            &entity_lookup,
-            dep_info.id.as_str(),
+            &graph.dependencies,
+            &direct_dependency_ids,
+        ),
+        (
             "transitive_dependent",
-            token_budget,
-            &mut included_ids,
-        );
+            &graph.dependents,
+            &direct_dependent_ids,
+        ),
+    ] {
+        let mut packed = 0usize;
+        for dep_info in collect_reachable_related(graph, entity_id, relationships, max_hops) {
+            if direct_ids.contains(dep_info.id.as_str()) {
+                continue;
+            }
+            let Some(entity) = entity_lookup.get(dep_info.id.as_str()) else {
+                continue;
+            };
+            if !target_is_test && is_test_entity(entity) {
+                tally(&mut tails, role, true);
+                continue;
+            }
+            if packed >= MAX_TRANSITIVE_ENTRIES || is_stub_signature(&entity.content) {
+                tally(&mut tails, role, false);
+                continue;
+            }
+            let before = result.entries.len();
+            add_signature(
+                &mut result,
+                &entity_lookup,
+                dep_info.id.as_str(),
+                role,
+                token_budget,
+                &mut included_ids,
+            );
+            if result.entries.len() > before {
+                packed += 1;
+            }
+        }
     }
 
+    result.omitted = tails;
     result
+}
+
+/// A test entity by name, attribute, or location. Used to fold tests into
+/// per-role counts instead of packing their noise signatures.
+fn is_test_entity(entity: &SemanticEntity) -> bool {
+    let head = entity.content.trim_start();
+    entity.name.starts_with("test_")
+        || entity.name == "tests"
+        || head.starts_with("#[test]")
+        || head.starts_with("#[tokio::test]")
+        || head.starts_with("#[cfg(test)]")
+        || entity.file_path.contains("/tests/")
+        || entity.file_path.ends_with("_test.go")
+        || entity.file_path.ends_with(".test.ts")
+        || entity.file_path.ends_with(".test.js")
+        || entity.file_path.ends_with(".spec.ts")
+        || entity.file_path.ends_with(".spec.js")
+        || entity.file_path.ends_with("_test.py")
+        || std::path::Path::new(&entity.file_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.starts_with("test_"))
+}
+
+fn lookup_is_test(entity_lookup: &HashMap<&str, &SemanticEntity>, entity_id: &str) -> bool {
+    entity_lookup
+        .get(entity_id)
+        .is_some_and(|e| is_test_entity(e))
+}
+
+/// A signature line that carries no information on its own (a bare attribute,
+/// decorator, or comment opener) — not worth a packed entry.
+fn is_stub_signature(content: &str) -> bool {
+    let sig = content.lines().next().unwrap_or("").trim();
+    sig.is_empty()
+        || sig.starts_with("#[")
+        || sig.starts_with("@")
+        || sig.starts_with("//")
+        || sig.starts_with("/*")
+}
+
+fn tally(tails: &mut Vec<OmittedTail>, role: &str, is_test: bool) {
+    if let Some(tail) = tails.iter_mut().find(|t| t.role == role) {
+        tail.entities += 1;
+        if is_test {
+            tail.tests += 1;
+        }
+    } else {
+        tails.push(OmittedTail {
+            role: role.to_string(),
+            entities: 1,
+            tests: usize::from(is_test),
+        });
+    }
 }
 
 fn push_entry(

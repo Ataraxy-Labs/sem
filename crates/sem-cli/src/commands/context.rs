@@ -70,6 +70,11 @@ pub fn context_command(opts: ContextOptions) {
             "total_tokens": context_result.total_tokens,
             "truncated": context_result.truncated,
             "target_omitted": context_result.target_omitted,
+            "omitted": context_result.omitted.iter().map(|t| serde_json::json!({
+                "role": t.role,
+                "entities": t.entities,
+                "tests": t.tests,
+            })).collect::<Vec<_>>(),
             "entries": context_result.entries.iter().map(|e| serde_json::json!({
                 "entityId": e.entity_id,
                 "name": e.entity_name,
@@ -132,6 +137,25 @@ pub fn context_command(opts: ContextOptions) {
                     println!("      {}", snippet.dimmed());
                 }
             }
+        }
+
+        if !context_result.omitted.is_empty() {
+            let parts: Vec<String> = context_result
+                .omitted
+                .iter()
+                .map(|t| {
+                    let role = t.role.replace('_', " ");
+                    if t.tests > 0 {
+                        format!("+{} {}s ({} tests)", t.entities, role, t.tests)
+                    } else {
+                        format!("+{} {}s", t.entities, role)
+                    }
+                })
+                .collect();
+            println!(
+                "\n  {}",
+                format!("not packed: {} · sem impact lists them", parts.join(" · ")).dimmed()
+            );
         }
     }
 }
