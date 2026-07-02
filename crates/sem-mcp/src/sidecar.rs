@@ -121,6 +121,17 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
                 Err(e) => err(&e),
             }
         }
+        Some("impact") => {
+            let Some(name) = parsed.get("name").and_then(|v| v.as_str()) else {
+                return err("missing name");
+            };
+            let file = parsed.get("file").and_then(|v| v.as_str());
+            let depth = parsed.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+            match server.quick_impact(repo_root, name, file, depth).await {
+                Ok(result) => serde_json::json!({ "ok": true, "result": result }).to_string(),
+                Err(e) => err(&e),
+            }
+        }
         Some("ping") => serde_json::json!({ "ok": true, "text": "pong" }).to_string(),
         _ => err("unknown op"),
     }

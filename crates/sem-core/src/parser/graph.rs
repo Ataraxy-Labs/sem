@@ -2991,7 +2991,7 @@ fn is_scope_member_container(entity_type: &str) -> bool {
 }
 
 /// Check if an entity looks like a test based on name, file path, and content patterns.
-fn is_test_entity(
+pub fn is_test_entity(
     entity: &crate::model::entity::SemanticEntity,
     custom_test_dirs: &[String],
 ) -> bool {

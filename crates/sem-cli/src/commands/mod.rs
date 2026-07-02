@@ -11,6 +11,7 @@ pub mod log;
 pub mod orient;
 pub mod repos;
 pub mod setup;
+pub mod sidecar;
 pub mod stats;
 
 #[cfg(feature = "self-update")]

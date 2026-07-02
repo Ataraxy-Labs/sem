@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- **CLI sidecar fast path**: `sem impact` now answers from the resident `sem mcp` server's warm graph via its unix socket before doing any local work — measured **4.5ms** end-to-end on a 158K-LOC repo, versus 22.4ms for the local cold path and 7.7ms for a ripgrep scan of the same repo: the full blast radius (callers, dependencies, depth-bounded transitive impact, affected tests) is now cheaper than a raw text match. Output is byte-identical to the local path (the sidecar ships serialized `EntityInfo`s that the CLI feeds to its existing printers; verified across all modes and `--json`). The fast path is an accelerator, never a requirement: bounded socket timeouts and silent fallback mean no resident server (or `SEM_NO_SIDECAR=1`, `--no-cache`, custom scopes, `.semignore`, `--entity-id`) just runs the normal local path. Server-side, the new sidecar `impact` op classifies affected tests only among the entities the impact BFS actually reached, instead of walking the whole corpus per call (6.8ms → 0.1ms on a 4.7K-entity graph).
+
 ### Fixed
 
 - The docs site deploys through workflow-based GitHub Pages (`.github/workflows/docs-pages.yml`: upload `/docs` verbatim, deploy) instead of the legacy branch-based Jekyll builder, which began failing repo-wide with zero-duration "Page build failed" errors on commits that didn't touch docs — including on direct build requests via the Pages API. The site is pure static HTML, so the legacy builder added nothing but a failure mode; deploys now also skip entirely on commits that don't change `docs/`.
