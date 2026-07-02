@@ -8,6 +8,10 @@ All notable changes to sem are documented in this file.
 
 - The docs site deploys through workflow-based GitHub Pages (`.github/workflows/docs-pages.yml`: upload `/docs` verbatim, deploy) instead of the legacy branch-based Jekyll builder, which began failing repo-wide with zero-duration "Page build failed" errors on commits that didn't touch docs — including on direct build requests via the Pages API. The site is pure static HTML, so the legacy builder added nothing but a failure mode; deploys now also skip entirely on commits that don't change `docs/`.
 
+### Changed
+
+- The GitHub Action's PR-comment footer now tells the reader what to do next — "add it to your repo in 2 minutes", linking to the action's install snippet — instead of only naming the tool. Every entity-diff comment is seen by all of a repo's collaborators; the footer is the loop that turns viewers into installs.
+
 ### Added
 
 - **`sem repos`** — where your code is stored, in one command. Two inventories side by side: the **cloud account** (authoritative `GET /v1/repos`: every indexed repo with status, entity/file counts, last-indexed time, indexed commit, and any indexing error rendered inline) and **local storage** (every entity cache under the sem cache root with size on disk, entity count, cache kind, and the repo it was built from). `--json` for scripts. Listing the account also reconciles this machine's `~/.sem/repos.json` mirror with server truth — stale entries (a repo registered mid-index stays "pending, 0 entities" forever otherwise) were silently mis-routing the local-vs-cloud decision for impact/context queries. Caches are now stamped with their repo root at save time (`repo_root` in `cache_metadata`); caches built before this show as unlabeled and self-label on their next rebuild.

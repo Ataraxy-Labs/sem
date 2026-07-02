@@ -86,7 +86,7 @@ runs:
             echo "_No entity-level changes — this PR touches no functions, classes, or methods (formatting, comments, or non-code files only)._"
           fi
           echo ""
-          echo "<sub>functions and classes, not lines · <a href=\"https://github.com/Ataraxy-Labs/sem\">sem</a></sub>"
+          echo "<sub>⊕ entity-level diff by <a href=\"https://github.com/Ataraxy-Labs/sem\">sem</a> · <a href=\"https://github.com/Ataraxy-Labs/sem/tree/main/action\">add it to your repo in 2 minutes</a></sub>"
         } > "$BODY_FILE"
 
         # GitHub comments cap at 65536 chars; truncate but keep the summary line.
@@ -102,7 +102,7 @@ runs:
             echo ""
             echo "${SUMMARY:-}"
             echo ""
-            echo "<sub>functions and classes, not lines · <a href=\"https://github.com/Ataraxy-Labs/sem\">sem</a></sub>"
+            echo "<sub>⊕ entity-level diff by <a href=\"https://github.com/Ataraxy-Labs/sem\">sem</a> · <a href=\"https://github.com/Ataraxy-Labs/sem/tree/main/action\">add it to your repo in 2 minutes</a></sub>"
           } > "$BODY_FILE"
           rm -f "$BODY_FILE.tmp"
         fi
