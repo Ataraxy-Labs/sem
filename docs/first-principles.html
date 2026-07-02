@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>sem — Why fast, from first principles</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0a0a0a;
+      --fg: #e0e0e0;
+      --dim: #999;
+      --dim2: #666;
+      --border: #222;
+      --accent: #fff;
+      --green: #4ade80;
+      --blue: #60a5fa;
+      --surface: #111;
+      --surface2: #141414;
+      --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+      /* chart marks — deeper steps of the site hues, validated against #111 */
+      --mark-green: #16a34a;
+      --mark-blue:  #3b82f6;
+      --mark-gray:  #a3a3a3;
+      --mark-gray2: #636363;
+      --grid: #1e1e1e;
+      --axis: #333;
+    }
+
+    body {
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--fg); text-decoration-color: var(--dim); text-underline-offset: 3px; }
+    a:hover { color: var(--accent); text-decoration-color: var(--accent); }
+
+    .container { max-width: 860px; margin: 0 auto; padding: 0 24px; }
+
+    nav {
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 50;
+      border-bottom: 1px solid var(--border);
+    }
+    nav .nav-inner {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    nav .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); text-decoration: none; }
+    nav .links { display: flex; gap: 20px; font-size: 13px; color: var(--dim); }
+
+    header.page { padding: 56px 0 8px; }
+    header.page h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; color: var(--accent); margin-bottom: 10px; }
+    header.page p { font-size: 14px; color: var(--dim); max-width: 66ch; }
+
+    .kpis {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px; margin: 32px 0 8px;
+    }
+    .tile {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .tile .label { color: var(--dim); font-size: 12px; }
+    .tile .value { font-size: 26px; font-weight: 700; letter-spacing: -1px; color: var(--green); margin-top: 2px; }
+    .tile .note  { color: var(--dim2); font-size: 11.5px; margin-top: 2px; }
+
+    section { padding: 48px 0 8px; }
+    section h2 { font-size: 18px; font-weight: 600; color: var(--accent); margin-bottom: 10px; letter-spacing: -0.5px; }
+    section .principle { font-size: 13.5px; color: var(--dim); margin-bottom: 18px; line-height: 1.7; max-width: 74ch; }
+    section .principle em { color: var(--fg); font-style: normal; }
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      padding: 18px 20px 14px;
+    }
+    .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 0 0 8px; font-size: 12px; color: var(--dim); }
+    .legend .key { display: inline-flex; align-items: center; gap: 7px; }
+    .key .line { width: 16px; height: 2px; border-radius: 1px; }
+    .key .swatch { width: 10px; height: 10px; border-radius: 3px; }
+    .chart { width: 100%; }
+    svg { display: block; width: 100%; height: auto; }
+    svg text { font: 11px var(--mono); fill: var(--dim2); }
+    svg text.dl { fill: var(--dim); font-size: 11.5px; }
+    svg text.dl.strong { fill: var(--fg); font-weight: 600; }
+    .footnote { color: var(--dim2); font-size: 12px; margin: 12px 0 4px; max-width: 74ch; line-height: 1.6; }
+    .footnote code { color: var(--dim); }
+
+    details { margin-top: 8px; }
+    summary { color: var(--dim2); font-size: 12px; cursor: pointer; }
+    table { border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+    th, td { text-align: left; padding: 4px 14px 4px 0; border-bottom: 1px solid var(--border); color: var(--dim); }
+    th { color: var(--dim2); font-weight: 500; }
+    td.num { font-variant-numeric: tabular-nums; }
+
+    .closing {
+      padding: 48px 0 72px; font-size: 13.5px; color: var(--dim); line-height: 1.7; max-width: 74ch;
+    }
+    .closing em { color: var(--green); font-style: normal; }
+
+    #tip {
+      position: fixed; pointer-events: none; z-index: 100; display: none;
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+      color: var(--dim); max-width: 320px; font-family: var(--mono);
+    }
+    #tip .v { color: var(--fg); font-weight: 600; }
+    #tip .row { display: flex; align-items: center; gap: 7px; margin-top: 2px; }
+    #tip .k { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a class="logo" href="index.html">sem</a>
+      <div class="links">
+        <a href="agents.html">Agents</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="changelog.html">Changelog</a>
+        <a href="details.html">Details</a>
+        <a href="first-principles.html">First Principles</a>
+        <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container">
+    <header class="page">
+      <h1>Why fast, from first principles</h1>
+      <p>Four pictures. Each one is a single principle; together they explain why a resident
+      entity graph changes what an agent can afford to do — not just how fast it does it.</p>
+    </header>
+
+    <div class="kpis">
+      <div class="tile"><div class="label">warm structural query</div><div class="value">&lt;1 ms</div><div class="note">resident graph, 85K-LOC repo</div></div>
+      <div class="tile"><div class="label">prompt &rarr; injected context</div><div class="value">10 ms</div><div class="note">compiled hook + socket sidecar</div></div>
+      <div class="tile"><div class="label">retrieval turns per answer</div><div class="value">0</div><div class="note">was 2 in the grep era</div></div>
+      <div class="tile"><div class="label">tokens per impact answer</div><div class="value">&asymp;15%</div><div class="note">entity tree vs pretty JSON</div></div>
+    </div>
+
+    <section>
+      <h2>1 &middot; A scan pays per byte; an index pays once &mdash; residency is what changed</h2>
+      <p class="principle">Text search re-reads the corpus on every question, so its cost grows with repo size.
+      An index answers in near-constant time &mdash; but only if it&rsquo;s already in memory. A fresh process paid
+      ~800&thinsp;ms to hydrate before its first answer, so scanning often won anyway. A resident, prewarmed graph
+      removes that floor: the constant-time line drops below the scan line at <em>every</em> repo size.</p>
+      <div class="card">
+        <div class="legend" id="legendA"></div>
+        <div class="chart" id="chartA"></div>
+        <p class="footnote">Model curves anchored to measured points (&#9679;): warm <code>sem_context</code> &lt;1&thinsp;ms on an 85K-LOC repo
+        (faster than a ripgrep scan of the same repo); fresh process + SQLite hydrate &asymp;800&thinsp;ms. Both axes logarithmic.</p>
+        <details><summary>table view</summary><div id="tableA"></div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>2 &middot; Below ~100&thinsp;ms, latency stops existing</h2>
+      <p class="principle">Humans can&rsquo;t perceive delays under roughly 100&thinsp;ms, so anything below that line is
+      free to run on <em>every</em> event &mdash; every prompt, every save &mdash; without anyone noticing. The old paths sat
+      well above the line, so sem had to be an explicit, occasional call. Every new path sits below it.</p>
+      <div class="card">
+        <div class="legend" id="legendB"></div>
+        <div class="chart" id="chartB"></div>
+        <p class="footnote">Measured values from the changelog; &ldquo;extra model turn&rdquo; is the illustrative cost of answering
+        a retrieval question with another inference round-trip. Logarithmic axis.</p>
+        <details><summary>table view</summary><div id="tableB"></div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>3 &middot; The expensive unit is the model turn, not the millisecond</h2>
+      <p class="principle">An agent&rsquo;s real costs are inference turns &mdash; seconds of thinking and a re-read of the whole
+      context each time. At this scale, tool time is already an invisible sliver (the gaps between segments below).
+      So the only retrieval optimization that still matters is <em>removing turns</em>: one-call lookup removed one,
+      prompt-time prefetch removed the other.</p>
+      <div class="card">
+        <div class="legend" id="legendC"></div>
+        <div class="chart" id="chartC"></div>
+        <p class="footnote">Illustrative timeline with ~6&thinsp;s inference turns; tool segments drawn to true scale &mdash; grep &asymp;0.4&thinsp;s,
+        file read &asymp;0.2&thinsp;s, <code>sem_context</code> 26&thinsp;ms, prefetch 10&thinsp;ms (before the first token).</p>
+        <details><summary>table view</summary><div id="tableC"></div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>4 &middot; Tokens follow turns &mdash; and the payload shrank too</h2>
+      <p class="principle">Every retrieval turn also pays in context: grep hits plus two raw file dumps land in the
+      window whether or not they&rsquo;re relevant. An entity answer carries only the graph neighborhood, and the compact
+      tree rendering cut that payload to ~15% of the JSON it replaced. Cheaper turns <em>and</em> fewer of them.</p>
+      <div class="card">
+        <div class="legend" id="legendD"></div>
+        <div class="chart" id="chartD"></div>
+        <p class="footnote">Grep-era and JSON figures are typical/illustrative; the tree-vs-JSON ratio (~15%) is measured.</p>
+        <details><summary>table view</summary><div id="tableD"></div></details>
+      </div>
+    </section>
+
+    <p class="closing">Read together: indexes beat scans (1), residency made the index answer
+    imperceptibly fast (2), which made speculation free, which removed whole turns from the loop (3), and each
+    remaining answer is a fraction of the tokens (4). That&rsquo;s why <em>ambient context</em> is now possible and wasn&rsquo;t before.</p>
+  </div>
+
+  <div id="tip" role="status"></div>
+
+<script>
+(function () {
+  var css = getComputedStyle(document.documentElement);
+  var C = {
+    green:  css.getPropertyValue('--mark-green').trim(),
+    blue:   css.getPropertyValue('--mark-blue').trim(),
+    grayA:  css.getPropertyValue('--mark-gray').trim(),
+    grayB:  css.getPropertyValue('--mark-gray2').trim(),
+    grid:   css.getPropertyValue('--grid').trim(),
+    axis:   css.getPropertyValue('--axis').trim(),
+    surface:css.getPropertyValue('--surface').trim()
+  };
+  var NS = 'http://www.w3.org/2000/svg';
+  function el(name, attrs, parent) {
+    var n = document.createElementNS(NS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  function txt(node, s) { node.appendChild(document.createTextNode(s)); return node; }
+
+  var tip = document.getElementById('tip');
+  function showTip(x, y, rows) {
+    tip.replaceChildren();
+    rows.forEach(function (r) {
+      var d = document.createElement('div'); d.className = 'row';
+      if (r.color) { var k = document.createElement('span'); k.className = 'k'; k.style.background = r.color; d.appendChild(k); }
+      var v = document.createElement('span'); v.className = 'v'; v.textContent = r.value; d.appendChild(v);
+      var l = document.createElement('span'); l.textContent = r.label; d.appendChild(l);
+      tip.appendChild(d);
+    });
+    tip.style.display = 'block';
+    var w = tip.offsetWidth, h = tip.offsetHeight;
+    var px = Math.min(x + 14, window.innerWidth - w - 8);
+    var py = Math.max(8, y - h - 12);
+    tip.style.left = px + 'px'; tip.style.top = py + 'px';
+  }
+  function hideTip() { tip.style.display = 'none'; }
+
+  function ms(v) {
+    if (v < 1) return (Math.round(v * 10) / 10) + ' ms';
+    if (v < 1000) return Math.round(v) + ' ms';
+    return (Math.round(v / 100) / 10) + ' s';
+  }
+  function legend(id, items) {
+    var box = document.getElementById(id);
+    items.forEach(function (it) {
+      var k = document.createElement('span'); k.className = 'key';
+      var mark = document.createElement('span');
+      mark.className = it.mark === 'rect' ? 'swatch' : 'line';
+      mark.style.background = it.color;
+      k.appendChild(mark);
+      var t = document.createElement('span'); t.textContent = it.label; k.appendChild(t);
+      box.appendChild(k);
+    });
+  }
+  function table(id, headers, rows) {
+    var t = document.createElement('table');
+    var tr = document.createElement('tr');
+    headers.forEach(function (h) { var th = document.createElement('th'); th.textContent = h; tr.appendChild(th); });
+    t.appendChild(tr);
+    rows.forEach(function (r) {
+      var tr = document.createElement('tr');
+      r.forEach(function (c, i) {
+        var td = document.createElement('td'); if (i > 0) td.className = 'num';
+        td.textContent = c; tr.appendChild(td);
+      });
+      t.appendChild(tr);
+    });
+    document.getElementById(id).appendChild(t);
+  }
+
+  /* ---------- Chart 1: scan vs cold index vs resident index (log-log lines) ---------- */
+  (function () {
+    var kloc = [10, 30, 85, 300, 1000, 3000, 10000];
+    var series = [
+      { name: 'Text scan (grep/ripgrep)', color: C.grayA,
+        vals: kloc.map(function (k) { return 0.4 * k; }) },
+      { name: 'Cold graph (process + hydrate)', color: C.grayB,
+        vals: kloc.map(function (k) { return 780 + 0.04 * k; }) },
+      { name: 'Resident graph (sem now)', color: C.green,
+        vals: [0.5, 0.6, 0.9, 1.4, 2.2, 3.5, 6] }
+    ];
+    var anchors = [ { s: 2, i: 2 }, { s: 1, i: 2 } ]; // measured points at 85 KLOC
+
+    var W = 860, H = 380, m = { t: 16, r: 170, b: 44, l: 56 };
+    var pw = W - m.l - m.r, ph = H - m.t - m.b;
+    var x = function (k) { return m.l + pw * (Math.log10(k) - 1) / 3; };          // 10 → 10000
+    var y = function (v) { return m.t + ph * (1 - (Math.log10(v) + 1) / 5.2); };  // 0.1 → ~16k ms
+
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H }, document.getElementById('chartA'));
+    [1, 10, 100, 1000, 10000].forEach(function (v) {
+      el('line', { x1: m.l, x2: m.l + pw, y1: y(v), y2: y(v), stroke: C.grid, 'stroke-width': 1 }, svg);
+      txt(el('text', { x: m.l - 8, y: y(v) + 4, 'text-anchor': 'end' }, svg), ms(v));
+    });
+    [10, 100, 1000, 10000].forEach(function (k) {
+      txt(el('text', { x: x(k), y: m.t + ph + 18, 'text-anchor': 'middle' }, svg),
+          k >= 1000 ? (k / 1000) + 'M LOC' : k + 'K LOC');
+    });
+    el('line', { x1: m.l, x2: m.l + pw, y1: m.t + ph, y2: m.t + ph, stroke: C.axis, 'stroke-width': 1 }, svg);
+    txt(el('text', { x: m.l, y: m.t - 4 }, svg), 'time to answer one structural query');
+
+    series.forEach(function (s) {
+      var d = s.vals.map(function (v, i) { return (i ? 'L' : 'M') + x(kloc[i]) + ' ' + y(v); }).join(' ');
+      el('path', { d: d, fill: 'none', stroke: s.color, 'stroke-width': 2,
+                   'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, svg);
+      var lx = x(kloc[kloc.length - 1]) + 10, ly = y(s.vals[s.vals.length - 1]) + 4;
+      var t = el('text', { x: lx, y: ly, 'class': 'dl' + (s.color === C.green ? ' strong' : '') }, svg);
+      txt(t, s.name.replace(/ \(.*/, ''));
+    });
+    anchors.forEach(function (a) {
+      var s = series[a.s];
+      el('circle', { cx: x(kloc[a.i]), cy: y(s.vals[a.i]), r: 4.5, fill: s.color,
+                     stroke: C.surface, 'stroke-width': 2 }, svg);
+    });
+
+    var hair = el('line', { y1: m.t, y2: m.t + ph, stroke: C.axis, 'stroke-width': 1, opacity: 0 }, svg);
+    svg.addEventListener('pointermove', function (e) {
+      var r = svg.getBoundingClientRect();
+      var mx = (e.clientX - r.left) * W / r.width;
+      if (mx < m.l || mx > m.l + pw) { hair.setAttribute('opacity', 0); hideTip(); return; }
+      var best = 0, bd = 1e9;
+      kloc.forEach(function (k, i) { var d = Math.abs(x(k) - mx); if (d < bd) { bd = d; best = i; } });
+      hair.setAttribute('x1', x(kloc[best])); hair.setAttribute('x2', x(kloc[best]));
+      hair.setAttribute('opacity', 1);
+      var rows = [{ value: kloc[best] >= 1000 ? (kloc[best] / 1000) + 'M LOC' : kloc[best] + 'K LOC', label: 'repo size' }];
+      series.forEach(function (s) { rows.push({ color: s.color, value: ms(s.vals[best]), label: s.name.replace(/ \(.*/, '') }); });
+      showTip(e.clientX, e.clientY, rows);
+    });
+    svg.addEventListener('pointerleave', function () { hair.setAttribute('opacity', 0); hideTip(); });
+
+    legend('legendA', series.map(function (s) { return { label: s.name, color: s.color, mark: 'line' }; }));
+    table('tableA', ['Repo size (KLOC)'].concat(series.map(function (s) { return s.name; })),
+      kloc.map(function (k, i) { return [String(k)].concat(series.map(function (s) { return ms(s.vals[i]); })); }));
+  })();
+
+  /* ---------- Chart 2: latency ladder (log dot plot vs perception threshold) ---------- */
+  (function () {
+    var items = [
+      { label: 'Warm sem_context (resident graph)', v: 0.9, now: true },
+      { label: 'Socket sidecar round-trip',          v: 5,   now: true },
+      { label: 'Prompt-prefetch hook, end to end',   v: 10,  now: true },
+      { label: 'Entity text search (warm)',          v: 25,  now: true },
+      { label: 'One-call name-only lookup',          v: 26,  now: true },
+      { label: 'Python prompt hook (before)',        v: 40,  now: false },
+      { label: 'First MCP call, cold (before prewarm)', v: 129, now: false },
+      { label: 'Fresh process + SQLite hydrate',     v: 800, now: false },
+      { label: 'Answer via an extra model turn',     v: 6000, now: false }
+    ];
+    var W = 860, rowH = 30, m = { t: 26, r: 40, b: 40, l: 302 };
+    var H = m.t + rowH * items.length + m.b;
+    var pw = W - m.l - m.r;
+    var x = function (v) { return m.l + pw * (Math.log10(v) + 0.35) / 4.35; }; // 0.45 → 10^4
+
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H }, document.getElementById('chartB'));
+    [1, 10, 100, 1000, 10000].forEach(function (v) {
+      el('line', { x1: x(v), x2: x(v), y1: m.t, y2: H - m.b, stroke: C.grid, 'stroke-width': 1 }, svg);
+      txt(el('text', { x: x(v), y: H - m.b + 18, 'text-anchor': 'middle' }, svg), ms(v));
+    });
+    el('line', { x1: x(100), x2: x(100), y1: m.t - 6, y2: H - m.b, stroke: C.axis, 'stroke-width': 1 }, svg);
+    txt(el('text', { x: x(100) + 6, y: m.t - 8 }, svg), 'human perception ~100 ms');
+
+    items.forEach(function (it, i) {
+      var cy = m.t + rowH * i + rowH / 2;
+      var color = it.now ? C.green : C.grayA;
+      var t = el('text', { x: m.l - 14, y: cy + 4, 'text-anchor': 'end', 'class': 'dl' }, svg);
+      txt(t, it.label);
+      el('line', { x1: m.l, x2: x(it.v), y1: cy, y2: cy, stroke: C.grid, 'stroke-width': 1 }, svg);
+      el('circle', { cx: x(it.v), cy: cy, r: 5, fill: color, stroke: C.surface, 'stroke-width': 2 }, svg);
+      var vl = el('text', { x: x(it.v) + 11, y: cy + 4, 'class': 'dl' + (it.now ? ' strong' : '') }, svg);
+      txt(vl, ms(it.v));
+      var hit = el('rect', { x: m.l, y: cy - rowH / 2, width: pw + m.r, height: rowH, fill: 'transparent' }, svg);
+      hit.addEventListener('pointermove', function (e) {
+        showTip(e.clientX, e.clientY, [{ color: color, value: ms(it.v), label: it.label }]);
+      });
+      hit.addEventListener('pointerleave', hideTip);
+    });
+
+    legend('legendB', [
+      { label: 'The path now', color: C.green, mark: 'rect' },
+      { label: 'The path before', color: C.grayA, mark: 'rect' }
+    ]);
+    table('tableB', ['Path', 'Latency', 'Era'],
+      items.map(function (it) { return [it.label, ms(it.v), it.now ? 'now' : 'before']; }));
+  })();
+
+  /* ---------- Chart 3: turns timeline (stacked horizontal, true scale) ---------- */
+  (function () {
+    var TURN = 6000;
+    var rows = [
+      { name: 'Grep era — search turn, read turn, answer turn', segs: [
+        { kind: 'infer', v: TURN, label: 'turn 1 · decide + grep' },
+        { kind: 'tool',  v: 400,  label: 'grep (0.4 s)' },
+        { kind: 'infer', v: TURN, label: 'turn 2 · read the file' },
+        { kind: 'tool',  v: 200,  label: 'file read (0.2 s)' },
+        { kind: 'infer', v: TURN, label: 'turn 3 · answer' }
+      ]},
+      { name: 'One-call lookup — a single retrieval turn', segs: [
+        { kind: 'infer', v: TURN, label: 'turn 1 · call sem_context' },
+        { kind: 'tool',  v: 26,   label: 'sem_context (26 ms)' },
+        { kind: 'infer', v: TURN, label: 'turn 2 · answer' }
+      ]},
+      { name: 'Prompt-time prefetch — zero retrieval turns', segs: [
+        { kind: 'tool',  v: 10,   label: 'prefetch (10 ms, before the first token)' },
+        { kind: 'infer', v: TURN, label: 'turn 1 · answer (context already in prompt)' }
+      ]}
+    ];
+    var W = 860, rowH = 62, m = { t: 8, r: 134, b: 30, l: 8 };
+    var H = m.t + rowH * rows.length + m.b;
+    var total = 3 * TURN + 600;
+    var pw = W - m.l - m.r;
+    var x = function (v) { return pw * v / total; };
+    var GAP = 2;
+
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H }, document.getElementById('chartC'));
+    rows.forEach(function (row, ri) {
+      var y0 = m.t + rowH * ri;
+      txt(el('text', { x: m.l, y: y0 + 12, 'class': 'dl' }, svg), row.name);
+      var cx = m.l, barY = y0 + 20, barH = 22;
+      var wall = 0;
+      row.segs.forEach(function (s) {
+        wall += s.v;
+        var w = Math.max(x(s.v) - GAP, s.kind === 'tool' ? 1 : 4);
+        var color = s.kind === 'infer' ? C.blue : C.grayA;
+        el('rect', { x: cx, y: barY, width: w, height: barH, rx: 3, fill: color }, svg);
+        var hitW = Math.max(w, 14);
+        var hit = el('rect', { x: cx - (hitW - w) / 2, y: barY - 4, width: hitW, height: barH + 8,
+                               fill: 'transparent' }, svg);
+        hit.addEventListener('pointermove', function (e) {
+          showTip(e.clientX, e.clientY, [{ color: color, value: ms(s.v), label: s.label }]);
+        });
+        hit.addEventListener('pointerleave', hideTip);
+        cx += x(s.v);
+      });
+      var turns = row.segs.filter(function (s) { return s.kind === 'infer'; }).length;
+      var tl = el('text', { x: cx + 10, y: barY + barH / 2 + 4, 'class': 'dl strong' }, svg);
+      txt(tl, ms(wall) + ' · ' + turns + (turns === 1 ? ' turn' : ' turns'));
+    });
+    txt(el('text', { x: m.l, y: H - 8 }, svg),
+        'wall-clock for one structural question; each blue segment is a full inference pass over the context');
+
+    legend('legendC', [
+      { label: 'Model inference turn', color: C.blue, mark: 'rect' },
+      { label: 'Retrieval tool time (true scale)', color: C.grayA, mark: 'rect' }
+    ]);
+    table('tableC', ['Path', 'Inference turns', 'Tool time', 'Wall-clock'],
+      rows.map(function (row) {
+        var infer = row.segs.filter(function (s) { return s.kind === 'infer'; });
+        var tool = row.segs.filter(function (s) { return s.kind === 'tool'; })
+                      .reduce(function (a, s) { return a + s.v; }, 0);
+        var wall = row.segs.reduce(function (a, s) { return a + s.v; }, 0);
+        return [row.name, String(infer.length), ms(tool), ms(wall)];
+      }));
+  })();
+
+  /* ---------- Chart 4: tokens per answer (emphasis bars) ---------- */
+  (function () {
+    var items = [
+      { label: 'Grep era: hits + two raw file dumps', v: 12000, now: false },
+      { label: 'sem, pretty-printed JSON (before)',   v: 2600,  now: false },
+      { label: 'sem, compact entity tree (now)',      v: 400,   now: true }
+    ];
+    var W = 860, rowH = 44, m = { t: 10, r: 90, b: 34, l: 290 };
+    var H = m.t + rowH * items.length + m.b;
+    var pw = W - m.l - m.r;
+    var x = function (v) { return pw * v / 12000; };
+
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H }, document.getElementById('chartD'));
+    [0, 4000, 8000, 12000].forEach(function (v) {
+      el('line', { x1: m.l + x(v), x2: m.l + x(v), y1: m.t, y2: H - m.b, stroke: C.grid, 'stroke-width': 1 }, svg);
+      txt(el('text', { x: m.l + x(v), y: H - m.b + 18, 'text-anchor': 'middle' }, svg),
+          v === 0 ? '0' : (v / 1000) + 'k tokens');
+    });
+    items.forEach(function (it, i) {
+      var cy = m.t + rowH * i + rowH / 2;
+      var color = it.now ? C.green : C.grayB;
+      txt(el('text', { x: m.l - 14, y: cy + 4, 'text-anchor': 'end', 'class': 'dl' }, svg), it.label);
+      var w = Math.max(x(it.v), 3);
+      var bar = el('path', {
+        d: 'M' + m.l + ' ' + (cy - 11) + ' h' + (w - 4) + ' a4 4 0 0 1 4 4 v14 a4 4 0 0 1 -4 4 h-' + (w - 4) + ' Z',
+        fill: color
+      }, svg);
+      var vl = el('text', { x: m.l + w + 10, y: cy + 4, 'class': 'dl strong' }, svg);
+      txt(vl, it.v >= 1000 ? (it.v / 1000) + 'k' : String(it.v));
+      bar.addEventListener('pointermove', function (e) {
+        showTip(e.clientX, e.clientY, [{ color: color, value: it.v.toLocaleString() + ' tokens', label: it.label }]);
+      });
+      bar.addEventListener('pointerleave', hideTip);
+    });
+    el('line', { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, stroke: C.axis, 'stroke-width': 1 }, svg);
+
+    legend('legendD', [
+      { label: 'Entity tree (sem now)', color: C.green, mark: 'rect' },
+      { label: 'Previous payloads', color: C.grayB, mark: 'rect' }
+    ]);
+    table('tableD', ['Payload', 'Tokens (approx.)'],
+      items.map(function (it) { return [it.label, it.v.toLocaleString()]; }));
+  })();
+})();
+</script>
+</body>
+</html>
