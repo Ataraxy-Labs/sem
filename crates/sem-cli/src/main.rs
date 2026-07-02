@@ -343,7 +343,14 @@ enum Commands {
     /// Show lifetime diff statistics
     Stats,
     /// Start the MCP server (stdin/stdout transport)
-    Mcp,
+    Mcp {
+        /// Hidden plumbing: serve only the per-repo socket (no stdio MCP),
+        /// spawned detached by the CLI so repeat queries answer in
+        /// milliseconds. Exits when idle or when another server owns the
+        /// repo's socket.
+        #[arg(long, hide = true)]
+        resident: bool,
+    },
     /// Replace `git diff` with `sem diff` globally
     Setup,
     /// Restore default `git diff` behavior
@@ -403,7 +410,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Orient { .. }) => "orient",
         Some(Commands::Context { .. }) => "context",
         Some(Commands::Stats) => "stats",
-        Some(Commands::Mcp) => "mcp",
+        Some(Commands::Mcp { .. }) => "mcp",
         Some(Commands::Setup) => "setup",
         Some(Commands::Unsetup) => "unsetup",
         Some(Commands::Login { .. }) => "login",
@@ -686,8 +693,13 @@ fn main() {
         Some(Commands::Stats) => {
             commands::stats::run();
         }
-        Some(Commands::Mcp) => {
-            if let Err(e) = sem_mcp::run() {
+        Some(Commands::Mcp { resident }) => {
+            let result = if resident {
+                sem_mcp::run_resident()
+            } else {
+                sem_mcp::run()
+            };
+            if let Err(e) = result {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }

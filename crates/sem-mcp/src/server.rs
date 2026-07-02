@@ -759,6 +759,37 @@ impl SemServer {
     /// One-call entity context from the in-memory graph, for the socket
     /// sidecar: resolve `name` repo-wide, pack a bounded context, render the
     /// compact text. Millisecond-fast once the graph is warm.
+    /// Compact lines, not JSON: same information at a fraction of the tokens
+    /// the consuming model has to read. Shared by the MCP query mode and the
+    /// sidecar's `orient` op.
+    fn orient_hits_text(hits: &[sem_core::parser::orient::OrientHit], query: &str) -> String {
+        let mut out = format!("⊕ {} hits · \"{}\"\n", hits.len(), query);
+        for h in hits {
+            let mut sig = h.signature.trim().to_string();
+            if sig.chars().count() > 100 {
+                sig = format!("{}…", sig.chars().take(100).collect::<String>());
+            }
+            out.push_str(&format!(
+                "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
+                h.name, h.entity_type, h.file_path, h.start_line, h.dependents,
+                h.dependencies, sig
+            ));
+        }
+        out
+    }
+
+    /// Sidecar fast path: ranked intent search from the warm graph.
+    pub async fn quick_orient(
+        &self,
+        repo_root: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<String, String> {
+        let (graph, all_entities) = self.live_graph(repo_root).await;
+        let hits = sem_core::parser::orient::orient(&all_entities, &graph, query, limit);
+        Ok(Self::orient_hits_text(&hits, query))
+    }
+
     pub async fn quick_context(
         &self,
         repo_root: &Path,
@@ -1057,21 +1088,9 @@ impl SemServer {
             let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
             let hits =
                 sem_core::parser::orient::orient(&all_entities, &graph, query, params.limit());
-            // Compact lines, not JSON: same information at a fraction of the
-            // tokens the consuming model has to read.
-            let mut out = format!("⊕ {} hits · \"{}\"\n", hits.len(), query);
-            for h in &hits {
-                let mut sig = h.signature.trim().to_string();
-                if sig.chars().count() > 100 {
-                    sig = format!("{}…", sig.chars().take(100).collect::<String>());
-                }
-                out.push_str(&format!(
-                    "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
-                    h.name, h.entity_type, h.file_path, h.start_line, h.dependents,
-                    h.dependencies, sig
-                ));
-            }
-            return Ok(CallToolResult::success(vec![Content::text(out)]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                Self::orient_hits_text(&hits, query),
+            )]));
         }
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);

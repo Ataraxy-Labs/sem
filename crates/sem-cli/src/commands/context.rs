@@ -20,6 +20,9 @@ pub struct ContextOptions {
 }
 
 pub fn context_command(opts: ContextOptions) {
+    if try_sidecar_context(&opts) {
+        return;
+    }
     if super::cloud::try_cloud_context(&opts).is_some() {
         return;
     }
@@ -233,6 +236,47 @@ fn find_entity<'a>(
         );
     }
     std::process::exit(1);
+}
+
+/// Resident-server fast path: the sidecar's `context` op answers from the
+/// warm in-memory graph in milliseconds, already packed and rendered.
+/// Mirrors the impact fast path's applicability rules; any miss (no resident
+/// server yet, custom scope, --json, explicit file) runs the local path, and
+/// the miss itself auto-spawns a resident for next time.
+fn try_sidecar_context(opts: &ContextOptions) -> bool {
+    if opts.json
+        || opts.no_cache
+        || opts.no_default_excludes
+        || !opts.file_exts.is_empty()
+        || opts.entity_id.is_some()
+        || opts.file_path.is_some()
+    {
+        return false;
+    }
+    let Some(name) = opts.entity_name.as_deref() else {
+        return false;
+    };
+    let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
+        return false;
+    };
+    let root = git.repo_root().to_path_buf();
+    if root.join(".semignore").exists() {
+        return false;
+    }
+    let request = serde_json::json!({
+        "op": "context",
+        "name": name,
+        "budget": opts.budget,
+        "hops": opts.hops,
+    });
+    let Some(response) = super::sidecar::query(&root, &request) else {
+        return false;
+    };
+    let Some(text) = response.get("text").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    print!("{text}");
+    true
 }
 
 /// "direct_dependency" -> "direct dependencies", "direct_dependent" -> "direct dependents".

@@ -39,3 +39,32 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })
 }
+
+/// Resident mode (`sem mcp --resident`, hidden plumbing): serve ONLY the
+/// per-repo unix socket — no stdio MCP transport — so short-lived CLI calls
+/// answer from a warm in-memory graph in milliseconds. The CLI spawns this
+/// detached on a socket miss; it exits immediately if another server already
+/// owns the repo's socket (bind race, or a live `sem mcp` session), and
+/// retires itself after 30 minutes without a request.
+pub fn run_resident() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let Ok(repo_root) = server::SemServer::discover_repo_root(None) else {
+            return Ok(()); // not a git repo: nothing to serve
+        };
+        if sidecar::socket_is_live(&repo_root).await {
+            return Ok(()); // a live server already owns this repo's socket
+        }
+        let server = server::SemServer::new();
+        server.spawn_prewarm();
+        sidecar::spawn(server.clone(), repo_root);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            // idle_secs is u64::MAX until the socket binds, so a lost bind
+            // race exits at the first tick instead of parking forever.
+            if sidecar::idle_secs() > 30 * 60 {
+                return Ok(());
+            }
+        }
+    })
+}
