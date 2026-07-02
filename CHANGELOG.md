@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Fish shell support, via the `tree-sitter-fish` grammar (gated behind the `lang-fish` feature in `grammar-all`). Extracts functions — including the config.fish pattern of definitions inside a top-level `if status is-interactive` block — and resolves fish call edges (a `command`'s name against repo functions, builtins excluded), so `sem impact` sees which fish functions call which. A `function` defined inside another function stays part of the outer entity's content, matching fish's runtime semantics (inner definitions become global, not lexical children). Previously `.fish` files fell back to generic line-based chunking with an unsupported-language warning. Thanks @thalys for the request (#433).
+
 ### Documentation
 
 - **First-principles page on the docs site** (`docs/first-principles.html`, linked from every page's nav): four charts explaining why the recent latency work changes what an agent can afford to do, not just how fast it runs — the scan-vs-index crossover (a text scan pays per byte; residency removes the index's ~800ms hydrate floor, so the constant-time line wins at every repo size), the ~100ms human-perception threshold every new path now sits under, model turns as the real cost unit (3 → 2 → 1 inference turns per structural answer via one-call lookup, then prompt-time prefetch), and tokens per answer (the measured ~15% entity-tree-vs-JSON ratio). Measured numbers come from this changelog; model curves and turn timings are labeled illustrative on the page. Charts are dependency-free inline SVG with hover tooltips and a table view each.
