@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- The docs site deploys through workflow-based GitHub Pages (`.github/workflows/docs-pages.yml`: upload `/docs` verbatim, deploy) instead of the legacy branch-based Jekyll builder, which began failing repo-wide with zero-duration "Page build failed" errors on commits that didn't touch docs — including on direct build requests via the Pages API. The site is pure static HTML, so the legacy builder added nothing but a failure mode; deploys now also skip entirely on commits that don't change `docs/`.
+
 ### Changed
 
 - The GitHub Action's PR-comment footer now tells the reader what to do next — "add it to your repo in 2 minutes", linking to the action's install snippet — instead of only naming the tool. Every entity-diff comment is seen by all of a repo's collaborators; the footer is the loop that turns viewers into installs.
