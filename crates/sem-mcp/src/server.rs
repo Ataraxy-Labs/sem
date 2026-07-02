@@ -771,8 +771,7 @@ impl SemServer {
             }
             out.push_str(&format!(
                 "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
-                h.name, h.entity_type, h.file_path, h.start_line, h.dependents,
-                h.dependencies, sig
+                h.name, h.entity_type, h.file_path, h.start_line, h.dependents, h.dependencies, sig
             ));
         }
         out
@@ -788,6 +787,17 @@ impl SemServer {
         let (graph, all_entities) = self.live_graph(repo_root).await;
         let hits = sem_core::parser::orient::orient(&all_entities, &graph, query, limit);
         Ok(Self::orient_hits_text(&hits, query))
+    }
+
+    /// Sidecar fast path: entity-addressed text search from the warm graph.
+    pub async fn quick_text(
+        &self,
+        repo_root: &Path,
+        needle: &str,
+        limit: usize,
+    ) -> Result<String, String> {
+        let (_, all_entities) = self.live_graph(repo_root).await;
+        Ok(Self::render_text_hits(&all_entities, needle, limit))
     }
 
     pub async fn quick_context(
@@ -904,10 +914,8 @@ impl SemServer {
             .map(|(info, depth)| ((*info).clone(), *depth))
             .collect();
 
-        let by_id: std::collections::HashMap<&str, &SemanticEntity> = all_entities
-            .iter()
-            .map(|e| (e.id.as_str(), e))
-            .collect();
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> =
+            all_entities.iter().map(|e| (e.id.as_str(), e)).collect();
         let tests: Vec<sem_core::parser::graph::EntityInfo> = reached
             .iter()
             .filter(|(info, _)| {
@@ -930,11 +938,7 @@ impl SemServer {
     /// Entity-addressed text search over in-memory entity bodies. For each
     /// matching line, the innermost (smallest-span) enclosing entity wins, so
     /// a hit inside a method reports the method, not its class.
-    fn render_text_hits(
-        all_entities: &[SemanticEntity],
-        needle: &str,
-        limit: usize,
-    ) -> String {
+    pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
         use std::collections::HashMap;
         // (file, absolute line) -> (span, entity name, entity type, line text)
         let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
@@ -963,8 +967,7 @@ impl SemServer {
                  comments between entities and non-code files are not covered)"
             );
         }
-        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> =
-            best.into_iter().collect();
+        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> = best.into_iter().collect();
         hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
         let total = hits.len();
         let files: std::collections::BTreeSet<&str> = hits.iter().map(|(k, _)| k.0).collect();
@@ -973,7 +976,11 @@ impl SemServer {
             files.len()
         );
         for (i, ((file, line), (_, name, ty, text))) in hits.iter().take(limit).enumerate() {
-            let branch = if i + 1 == total.min(limit) { "╰─▶" } else { "├─▶" };
+            let branch = if i + 1 == total.min(limit) {
+                "╰─▶"
+            } else {
+                "├─▶"
+            };
             let label = if *ty == "function" || *ty == "method" {
                 (*name).to_string()
             } else {
@@ -1746,11 +1753,11 @@ impl SemServer {
                 if let Some(mut out) =
                     crate::cloud::try_context(&ctx.git, &params.entity_name, rel_path, budget, hops)
                 {
-                out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
-                out["source"] = serde_json::json!("cloud");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::render::context_text(&out),
-                )]));
+                    out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
+                    out["source"] = serde_json::json!("cloud");
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        crate::render::context_text(&out),
+                    )]));
                 }
             }
         }

@@ -267,6 +267,12 @@ enum Commands {
         /// Cannot be combined with --only.
         #[arg(long = "except", value_name = "KIND", conflicts_with = "only_kinds")]
         except_kinds: Vec<String>,
+
+        /// Search entity bodies for an exact substring instead of listing:
+        /// hits come back entity-addressed (file, innermost entity, line,
+        /// matched text). Use instead of grep for strings in code.
+        #[arg(long, value_name = "SUBSTRING")]
+        text: Option<String>,
     },
     /// Find the entities most relevant to a query (structural code search)
     Orient {
@@ -626,6 +632,7 @@ fn main() {
             file_exts,
             only_kinds,
             except_kinds,
+            text,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -638,6 +645,7 @@ fn main() {
                 file_exts,
                 only_kinds,
                 except_kinds,
+                text,
             });
         }
         Some(Commands::Orient {

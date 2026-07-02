@@ -76,7 +76,10 @@ pub fn socket_path_for(repo_root: &Path) -> Option<PathBuf> {
     let home = dirs_home()?;
     let dir = home.join(".sem").join("sock");
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(format!("{:016x}.sock", fnv1a(canonical.to_string_lossy().as_bytes()))))
+    Some(dir.join(format!(
+        "{:016x}.sock",
+        fnv1a(canonical.to_string_lossy().as_bytes())
+    )))
 }
 
 #[cfg(unix)]
@@ -123,7 +126,7 @@ pub fn spawn(server: SemServer, repo_root: PathBuf) {
                 if reader.read_line(&mut line).await.is_err() {
                     return;
                 }
-                    LAST_ACTIVITY.store(now_secs(), Ordering::Relaxed);
+                LAST_ACTIVITY.store(now_secs(), Ordering::Relaxed);
                 let resp = handle(&server, &repo_root, line.trim()).await;
                 let _ = write_half.write_all(resp.as_bytes()).await;
                 let _ = write_half.write_all(b"\n").await;
@@ -149,10 +152,7 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
             let Some(name) = parsed.get("name").and_then(|v| v.as_str()) else {
                 return err("missing name");
             };
-            let budget = parsed
-                .get("budget")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(900) as usize;
+            let budget = parsed.get("budget").and_then(|v| v.as_u64()).unwrap_or(900) as usize;
             let hops = parsed.get("hops").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
             match server.quick_context(repo_root, name, budget, hops).await {
                 Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
@@ -176,6 +176,16 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
             };
             let limit = parsed.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             match server.quick_orient(repo_root, query, limit).await {
+                Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
+                Err(e) => err(&e),
+            }
+        }
+        Some("text") => {
+            let Some(needle) = parsed.get("needle").and_then(|v| v.as_str()) else {
+                return err("missing needle");
+            };
+            let limit = parsed.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            match server.quick_text(repo_root, needle, limit).await {
                 Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
                 Err(e) => err(&e),
             }

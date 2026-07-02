@@ -424,8 +424,7 @@ impl DiskCache {
                 .into_iter()
                 .map(|mut e| {
                     if e.content.is_empty() {
-                        e.content =
-                            recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                        e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
                     }
                     e
                 })
@@ -1225,10 +1224,7 @@ impl DiskCache {
         Ok(dependents)
     }
 
-    fn entity_infos_by_id(
-        &self,
-        entity_ids: &[String],
-    ) -> Result<EntityInfoMap, rusqlite::Error> {
+    fn entity_infos_by_id(&self, entity_ids: &[String]) -> Result<EntityInfoMap, rusqlite::Error> {
         let mut infos = EntityInfoMap::default();
         for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
             if chunk.is_empty() {

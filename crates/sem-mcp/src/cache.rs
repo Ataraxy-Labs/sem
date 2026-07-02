@@ -181,7 +181,9 @@ pub fn compress_file_text(text: &str) -> Option<Vec<u8>> {
 }
 
 pub fn decompress_file_text(blob: &[u8]) -> Option<String> {
-    zstd::decode_all(blob).ok().and_then(|b| String::from_utf8(b).ok())
+    zstd::decode_all(blob)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
 }
 
 /// Insert entities using the content store. `replace` selects INSERT OR
@@ -242,7 +244,8 @@ pub fn insert_entities_with_content_store(
         ])?;
     }
 
-    let mut fc = tx.prepare("INSERT OR REPLACE INTO file_contents (path, ztext) VALUES (?1, ?2)")?;
+    let mut fc =
+        tx.prepare("INSERT OR REPLACE INTO file_contents (path, ztext) VALUES (?1, ?2)")?;
     for path in files_to_store {
         if let Some(Some(text)) = file_texts.get(path) {
             if let Some(blob) = compress_file_text(text) {
@@ -279,18 +282,15 @@ impl<'c> ContentReconstructor<'c> {
             return c;
         }
         let conn = self.conn;
-        let text = self
-            .cache
-            .entry(file_path.to_string())
-            .or_insert_with(|| {
-                conn.query_row(
-                    "SELECT ztext FROM file_contents WHERE path = ?1",
-                    params![file_path],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .ok()
-                .and_then(|blob| decompress_file_text(&blob))
-            });
+        let text = self.cache.entry(file_path.to_string()).or_insert_with(|| {
+            conn.query_row(
+                "SELECT ztext FROM file_contents WHERE path = ?1",
+                params![file_path],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+            .and_then(|blob| decompress_file_text(&blob))
+        });
         match (text.as_deref(), start_byte, end_byte) {
             (Some(t), Some(sb), Some(eb)) => t.get(sb..eb).unwrap_or("").to_string(),
             _ => String::new(),
@@ -1209,8 +1209,7 @@ impl DiskCache {
                 .into_iter()
                 .map(|mut e| {
                     if e.content.is_empty() {
-                        e.content =
-                            recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                        e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
                     }
                     e
                 })
@@ -1550,8 +1549,7 @@ impl DiskCache {
                 .into_iter()
                 .map(|mut e| {
                     if e.content.is_empty() {
-                        e.content =
-                            recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                        e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
                     }
                     e
                 })
@@ -1918,12 +1916,8 @@ mod tests {
         let git_bridge = GitBridge::open(&root).unwrap();
         let registry = sem_core::parser::plugins::create_default_registry();
 
-        let live = sem_core::parser::hotspot::compute_history_analytics(
-            &git_bridge,
-            &registry,
-            None,
-            50,
-        );
+        let live =
+            sem_core::parser::hotspot::compute_history_analytics(&git_bridge, &registry, None, 50);
         let stored = history_analytics_from_store(&root, &git_bridge, &registry, None, 50)
             .expect("store-backed analytics");
 

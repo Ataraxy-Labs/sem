@@ -1,8 +1,8 @@
 pub mod cache;
 pub mod cloud;
 pub mod render;
-pub mod sidecar;
 pub mod server;
+pub mod sidecar;
 pub mod tools;
 mod transport;
 pub mod watch;

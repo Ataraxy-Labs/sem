@@ -149,7 +149,10 @@ fn collect_local_caches() -> LocalSection {
     let Some(cache_root) = shared_cache::cache_dir_for_repo(&repo_root)
         .and_then(|dir| dir.parent().map(Path::to_path_buf))
     else {
-        return LocalSection { root: None, caches: Vec::new() };
+        return LocalSection {
+            root: None,
+            caches: Vec::new(),
+        };
     };
 
     let mut caches = Vec::new();
@@ -166,11 +169,20 @@ fn collect_local_caches() -> LocalSection {
                 .map(|m| m.len())
                 .sum();
             let (repo_root, kind, entities) = read_cache_summary(&db);
-            caches.push(LocalCache { dir, repo_root, kind, entities, size_bytes });
+            caches.push(LocalCache {
+                dir,
+                repo_root,
+                kind,
+                entities,
+                size_bytes,
+            });
         }
     }
     caches.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    LocalSection { root: Some(cache_root), caches }
+    LocalSection {
+        root: Some(cache_root),
+        caches,
+    }
 }
 
 /// Read-only peek into one cache.db; every field is best-effort so a locked
@@ -188,14 +200,19 @@ fn read_cache_summary(db: &Path) -> (Option<String>, Option<String>, Option<u64>
         .ok()
     };
     let entities = conn
-        .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get::<_, u64>(0))
+        .query_row("SELECT COUNT(*) FROM entities", [], |row| {
+            row.get::<_, u64>(0)
+        })
         .ok();
     (meta("repo_root"), meta("cache_kind"), entities)
 }
 
 fn print_local(local: &LocalSection) {
     let Some(root) = &local.root else {
-        println!("{} no cache root resolvable on this machine", "local storage:".bold());
+        println!(
+            "{} no cache root resolvable on this machine",
+            "local storage:".bold()
+        );
         return;
     };
     let total: u64 = local.caches.iter().map(|c| c.size_bytes).sum();
@@ -266,7 +283,10 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
-fn print_json(cloud: &CloudSection, local: &LocalSection) -> Result<(), Box<dyn std::error::Error>> {
+fn print_json(
+    cloud: &CloudSection,
+    local: &LocalSection,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cloud_json = match cloud {
         CloudSection::Repos(repos) => serde_json::json!({
             "loggedIn": true,

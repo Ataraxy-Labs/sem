@@ -19,9 +19,22 @@ pub struct EntitiesOptions {
     pub only_kinds: Vec<String>,
     /// Drop entities whose kind is in this list (empty = no filter).
     pub except_kinds: Vec<String>,
+    /// Exact substring to search for inside entity bodies (entity-addressed
+    /// grep replacement). When set, listing flags are ignored.
+    pub text: Option<String>,
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
+    if let Some(needle) = opts
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        text_search(&opts, needle);
+        return;
+    }
+
     let mut timings = Timings::from_env("entities");
 
     // --only and --except are mutually exclusive.
@@ -364,6 +377,54 @@ fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
 
 fn file_path_for_entity(root: &Path, path: &Path) -> String {
     super::files::file_path_for_entity(root, path)
+}
+
+/// Entity-addressed text search: one line per hit (file, innermost entity,
+/// line, matched text) instead of whole bodies — the token-cheap way to
+/// verify a call site or find a string. Sidecar-first (milliseconds from the
+/// warm graph; a miss auto-spawns a resident), local graph fallback.
+const TEXT_SEARCH_LIMIT: usize = 50;
+
+fn text_search(opts: &EntitiesOptions, needle: &str) {
+    use sem_core::git::bridge::GitBridge;
+
+    let root = match GitBridge::open(Path::new(&opts.cwd)) {
+        Ok(git) => git.repo_root().to_path_buf(),
+        Err(_) => Path::new(&opts.cwd).to_path_buf(),
+    };
+    let scope_is_default =
+        opts.file_exts.is_empty() && !opts.no_default_excludes && !root.join(".semignore").exists();
+
+    if scope_is_default {
+        let request = serde_json::json!({
+            "op": "text",
+            "needle": needle,
+            "limit": TEXT_SEARCH_LIMIT,
+        });
+        if let Some(response) = super::sidecar::query(&root, &request) {
+            if let Some(text) = response.get("text").and_then(|v| v.as_str()) {
+                print!("{text}");
+                return;
+            }
+        }
+    }
+
+    let registry = super::create_registry(&root.to_string_lossy());
+    let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let source_scope =
+        super::graph::cache_source_scope(&root, &ext_filter, opts.no_default_excludes);
+    let file_paths = super::graph::find_supported_files_with_options(
+        &root,
+        &registry,
+        &ext_filter,
+        opts.no_default_excludes,
+    );
+    let (_, all_entities) =
+        super::graph::get_or_build_graph(&root, &file_paths, &registry, false, source_scope);
+    print!(
+        "{}",
+        sem_mcp::server::SemServer::render_text_hits(&all_entities, needle, TEXT_SEARCH_LIMIT)
+    );
 }
 
 fn extract_file_entities(
