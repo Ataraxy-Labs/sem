@@ -111,38 +111,6 @@ def main():
     if phase == "start":
         return
 
-    # Team presence (opt-in): if ~/.sem/team.json has {"share": true} and the
-    # user is logged in, heartbeat this activity to sem-cloud so teammates'
-    # sessions can see who is working on what. Fire-and-forget: a detached
-    # curl with a 2s cap, never blocking the hook or the session.
-    try:
-        import subprocess
-        team = json.load(open(os.path.expanduser("~/.sem/team.json")))
-        creds = json.load(open(os.path.expanduser("~/.sem/credentials.json")))
-        if team.get("share") and creds.get("api_key") and cwd:
-            remote = subprocess.run(
-                ["git", "-C", cwd, "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=1,
-            ).stdout.strip()
-            if remote:
-                remote = remote.removesuffix(".git")
-                remote = remote.replace("git@github.com:", "github.com/")
-                remote = remote.replace("https://", "").replace("http://", "")
-                payload = json.dumps({
-                    "repo": remote, "tool": short,
-                    "entity": target or "", "file": file_hint or "",
-                })
-                subprocess.Popen(
-                    ["curl", "-s", "-m", "2", "-X", "POST",
-                     creds.get("endpoint", "https://sem-cloud.fly.dev") + "/v1/presence",
-                     "-H", "Authorization: Bearer " + creds["api_key"],
-                     "-H", "Content-Type: application/json", "-d", payload],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-    except Exception:
-        pass
-
     # Accumulate a persisted lifetime savings tally (single writer: this hook), so
     # the statusline and viewer can show a number that grows across every session.
     # Estimate is anchored to the measured 64-entity benchmark; ~10s and ~900

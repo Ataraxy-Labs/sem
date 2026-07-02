@@ -50,62 +50,6 @@ def read_lifetime():
         return {}
 
 
-TEAM_CACHE = "/tmp/sem-team-presence.json"
-
-def team_presence(cwd):
-    """Teammates active in this repo right now (opt-in via ~/.sem/team.json).
-    Fetch at most every 30s (disk cache), 0.5s timeout, silent on any failure —
-    a statusline must never block."""
-    try:
-        team = json.load(open(os.path.expanduser("~/.sem/team.json")))
-        creds = json.load(open(os.path.expanduser("~/.sem/credentials.json")))
-        if not (team.get("share") and creds.get("api_key")):
-            return []
-        try:
-            cache = json.load(open(TEAM_CACHE))
-            if time.time() - cache.get("ts", 0) < 30 and cache.get("cwd") == cwd:
-                return cache.get("others", [])
-        except Exception:
-            pass
-        # Cache stale: kick a detached refresher and serve the old cache this
-        # tick. The render path never touches the network.
-        import subprocess, sys as _sys
-        subprocess.Popen(
-            [_sys.executable, os.path.abspath(__file__), "--refresh-team", cwd],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        try:
-            return json.load(open(TEAM_CACHE)).get("others", [])
-        except Exception:
-            return []
-    except Exception:
-        return []
-
-
-def refresh_team(cwd):
-    """Background worker: fetch presence and write the cache (called detached)."""
-    try:
-        creds = json.load(open(os.path.expanduser("~/.sem/credentials.json")))
-        import subprocess, urllib.request, urllib.parse
-        remote = subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2,
-        ).stdout.strip()
-        if not remote:
-            return
-        remote = remote.removesuffix(".git").replace("git@github.com:", "github.com/")
-        remote = remote.replace("https://", "").replace("http://", "")
-        url = (creds.get("endpoint", "https://sem-cloud.fly.dev")
-               + "/v1/presence?repo=" + urllib.parse.quote(remote, safe=""))
-        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + creds["api_key"]})
-        with urllib.request.urlopen(req, timeout=3) as r:
-            data = json.load(r)
-        others = [a for a in data.get("active", []) if not a.get("you")]
-        json.dump({"ts": time.time(), "cwd": cwd, "others": others}, open(TEAM_CACHE, "w"))
-    except Exception:
-        pass
-
 TAGLINES = [
     "structural, not textual",
     "the graph, not the grep",
@@ -188,20 +132,7 @@ def main():
                 f" {DIM}·{RESET} {YELLOW}{saved}{RESET}"
             )
 
-    others = team_presence(cwd)
-    if others:
-        o = others[0]
-        ago = int(o.get("agoSeconds", 0))
-        ago_s = f"{ago // 60}m" if ago >= 60 else f"{ago}s"
-        who = o.get("user", "teammate")
-        what = o.get("entity") or o.get("tool", "")
-        extra = f" +{len(others) - 1}" if len(others) > 1 else ""
-        badge += f" {DIM}·{RESET} \033[35m👥 {who} → {what} · {ago_s}{extra}{RESET}"
-
     print(f"{left}  {badge}")
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--refresh-team":
-        refresh_team(sys.argv[2])
-    else:
-        main()
+    main()
