@@ -6,6 +6,10 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- **`sem hook prompt-submit`** (hidden plumbing): the prompt-time prefetch, compiled. Reads a Claude Code UserPromptSubmit event, extracts identifier-shaped tokens from the prompt (backticked, snake_case, CamelCase, qualified — never plain words), resolves them against the resident server's socket sidecar, and prints packed entity context for injection. **10ms end-to-end** (was ~40ms as a Python hook — interpreter startup and a git subprocess, both eliminated: repo root is found by walking to `.git` in-process). Silent on conversational prompts, slash commands, unknown names, or when no server is resident.
+
+### Added
+
 - **Socket sidecar**: `sem mcp` now exposes the warm in-memory graph on a per-repo unix socket (`~/.sem/sock/<repo-hash>.sock`, one JSON line in, one out). Short-lived local callers — the prompt-prefetch hook, future CLI fast paths — get one-call entity context in single-digit milliseconds instead of paying a fresh process plus SQLite hydrate (~800ms). Stale sockets from dead servers are detected and taken over; the sidecar is a silent accelerator, never a requirement.
 
 ### Added

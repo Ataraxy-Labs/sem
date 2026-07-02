@@ -26,6 +26,7 @@ git2 = "0.20"
 ignore = "0.4"
 openssl-sys = { version = "0.9", optional = true }
 serde_json = "1"
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rayon = "1.10"
 clap_complete_command = "0.6.1"
