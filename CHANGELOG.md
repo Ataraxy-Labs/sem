@@ -6,6 +6,8 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- **`sem repos`** — where your code is stored, in one command. Two inventories side by side: the **cloud account** (authoritative `GET /v1/repos`: every indexed repo with status, entity/file counts, last-indexed time, indexed commit, and any indexing error rendered inline) and **local storage** (every entity cache under the sem cache root with size on disk, entity count, cache kind, and the repo it was built from). `--json` for scripts. Listing the account also reconciles this machine's `~/.sem/repos.json` mirror with server truth — stale entries (a repo registered mid-index stays "pending, 0 entities" forever otherwise) were silently mis-routing the local-vs-cloud decision for impact/context queries. Caches are now stamped with their repo root at save time (`repo_root` in `cache_metadata`); caches built before this show as unlabeled and self-label on their next rebuild.
+
 - Fish shell support, via the `tree-sitter-fish` grammar (gated behind the `lang-fish` feature in `grammar-all`). Extracts functions — including the config.fish pattern of definitions inside a top-level `if status is-interactive` block — and resolves fish call edges (a `command`'s name against repo functions, builtins excluded), so `sem impact` sees which fish functions call which. A `function` defined inside another function stays part of the outer entity's content, matching fish's runtime semantics (inner definitions become global, not lexical children). Previously `.fish` files fell back to generic line-based chunking with an unsupported-language warning. Thanks @thalys for the request (#433).
 
 ### Documentation

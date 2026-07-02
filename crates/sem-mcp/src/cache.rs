@@ -288,6 +288,17 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(&schema_sql)
 }
 
+/// Stamp the cache with the repo root it was built from. The cache directory
+/// name is a hash, so without this a cache on disk can't be mapped back to
+/// its repo (used by `sem repos` to label local storage).
+pub fn set_cache_repo_root(tx: &Transaction<'_>, root: &Path) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES ('repo_root', ?1)",
+        params![root.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
 pub fn set_cache_kind(tx: &Transaction<'_>, kind: &str) -> Result<(), rusqlite::Error> {
     tx.execute(
         "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES ('cache_kind', ?1)",
@@ -912,6 +923,7 @@ impl DiskCache {
 
         set_cache_kind(&tx, CACHE_KIND_FULL)?;
         set_cache_source_scope(&tx, source_scope)?;
+        set_cache_repo_root(&tx, root)?;
         tx.commit()?;
         Ok(())
     }
