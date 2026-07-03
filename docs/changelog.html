@@ -129,6 +129,112 @@
 
       <div class="changelog-entry">
         <div class="changelog-title">
+          <span class="changelog-sha">455170d</span>
+          <span class="changelog-tag feat">v0.18.0</span>
+          The verify-phase release
+        </div>
+        <p class="changelog-body">
+          Everything an agent needs to stop running whole test suites for confidence:
+          <code style="color:var(--fg)">sem impact &lt;fn&gt; --tests</code> returns the tests that can
+          reach a function via the call graph, with a clearly-labeled lexical fallback when no edges
+          exist; <code style="color:var(--fg)">sem orient --pack</code> turns raw issue text into a
+          packed briefing of the most-implicated functions plus their neighbors, for prompt-time
+          injection; attribute calls on unknown-type receivers now resolve in dynamic languages when
+          the method name is repo-unique; and <code style="color:var(--fg)">Parent::child</code>
+          qualifiers work everywhere <code style="color:var(--fg)">Parent.child</code> does.
+        </p>
+        <p class="changelog-stats">Measured on paired agent runs: verify loop 2.90s &rarr; 0.59s per iteration when graph edges resolve &bull; see <a href="benchmarks.html" style="color:var(--cyan)">benchmarks</a></p>
+        <div class="changelog-mistake">
+          <strong>Lesson: every feature in this release came from a measured failure.</strong>
+          We benchmarked sem-equipped agents against grep-only agents on real bugs, and each loss was
+          an autopsy: "No tests found" for a function with 56 tests became the lexical fallback;
+          a briefing that packed the wrong entities became IDF term weighting; a hidden caller behind
+          dynamic dispatch became unique-method-name edges. Benchmarks that only produce numbers are
+          half-used; the failures are the roadmap.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">488c5e2</span>
+          <span class="changelog-tag feat">feat</span>
+          Call edges through dynamic dispatch
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--fg)">index.keep_levels(...)</code> on a receiver of unknown type
+          used to produce no graph edge, hiding real dependents. Now, in Python and Ruby, a method
+          name with exactly one definition repo-wide resolves to it: one candidate, one edge; any
+          ambiguity, no edge. Static languages keep precision-first resolution.
+        </p>
+        <p class="changelog-stats">+edge recall in dynamic repos &bull; zero manufactured callers by construction</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: a "missing" edge can be a promise.</strong> Our first version created these
+          edges in every language and broke three tests that deliberately assert no-resolution for
+          shadowed imports and instance properties in TypeScript and Swift. In static languages an
+          unresolved receiver is information; in dynamic languages it is blindness. The type system
+          of the target language belongs in the resolver's policy.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">df44c68</span>
+          <span class="changelog-tag feat">feat</span>
+          Graph-selected test runs, with an honest fallback
+        </div>
+        <p class="changelog-body">
+          <code style="color:var(--fg)">sem impact --tests</code> answers "which tests can reach this
+          function." Empty answers from the fast paths (resident server, disk cache) are no longer
+          authoritative: they fall through to the full graph, which backstops zero call edges with
+          whole-word lexical reachability over test bodies, printed with an explicit
+          "(lexical fallback)" label because it is weaker evidence than a call edge.
+        </p>
+        <p class="changelog-stats">0 selected tests &rarr; 56-test net on the failing case &bull; vs 1,900+ tests in whole-file runs</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">6bcc36d</span>
+          <span class="changelog-tag feat">feat</span>
+          sem orient --pack: briefings from raw issue text
+        </div>
+        <p class="changelog-body">
+          Paste a whole GitHub issue; get back a token-budgeted briefing of the functions it most
+          implicates, bodies plus immediate callers and callees. Ranking is IDF-weighted body-term
+          convergence (a term appearing in half the repo is worth almost nothing), with
+          <code style="color:var(--fg)">&lt;details&gt;</code> environment dumps stripped and one
+          briefing slot reserved for the strongest name-echo match.
+        </p>
+        <p class="changelog-stats">Built for prompt-time injection &bull; the code an agent would forage for arrives at turn zero</p>
+        <div class="changelog-mistake">
+          <strong>Lesson: issue vocabulary lives in bodies, not names.</strong> The function that
+          fixes "self.config.recursive is ignored" usually never has "recursive" in its name. And
+          the inverse trap: when the issue names a surface API (".loc"), the culprit's body never
+          mentions it, which is what the name-echo slot is for. Also: version dumps inside GitHub
+          issues look extremely code-ish to a term extractor. Strip them first.
+        </div>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
+          <span class="changelog-sha">c8a7b9b</span>
+          <span class="changelog-tag fix">fix</span>
+          Reftable repos work
+        </div>
+        <p class="changelog-body">
+          Repos created with <code style="color:var(--fg)">git init --ref-format=reftable</code>
+          (git 2.45+) used to fail every command with libgit2's
+          <code style="color:var(--fg)">unsupported extension name extensions.refstorage</code>.
+          The object database is unchanged in reftable repos, so sem now routes just the ref
+          resolutions through the git CLI while libgit2 keeps doing everything else by OID.
+          Thanks <a href="https://github.com/bengry" style="color:var(--cyan)">@bengry</a>
+          (<a href="https://github.com/Ataraxy-Labs/sem/issues/451" style="color:var(--cyan)">#451</a>).
+        </p>
+        <p class="changelog-stats">Verified identical output vs files-backend repos &bull; diffs, blame, log</p>
+      </div>
+
+      <div class="changelog-entry">
+        <div class="changelog-title">
           <span class="changelog-sha">a1a6fbf</span>
           <span class="changelog-tag feat">feat</span>
           Word-level inline diffs
