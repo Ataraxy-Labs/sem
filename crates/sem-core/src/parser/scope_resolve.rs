@@ -6392,7 +6392,13 @@ fn resolve_ref(
             // one edge; two candidates, no edge (guessing would manufacture
             // false callers). Restricted to entities with a parent (methods),
             // so attribute calls never bind to same-named free functions.
-            if allow_cross_file_calls {
+            // Dynamic languages only: there, receiver types are statically
+            // unknowable and the missing edge is pure blindness; in static
+            // languages an unresolved receiver is deliberate (shadowed
+            // import, instance property) and must stay unresolved.
+            let dynamic_receiver_lang =
+                file_path.ends_with(".py") || file_path.ends_with(".rb");
+            if allow_cross_file_calls && dynamic_receiver_lang {
                 if let Some(target_ids) = symbol_table.get(method.as_str()) {
                     if let [tid] = target_ids.as_slice() {
                         if tid != from_entity_id

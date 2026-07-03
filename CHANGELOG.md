@@ -10,6 +10,9 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- **Unique-method-name call edges (dynamic languages).** Attribute calls on receivers of unknown type (`index.keep_levels(...)`) previously produced no graph edge, hiding real dependents and blinding `--tests`. In Python/Ruby — where receiver types are statically unknowable — a method name with exactly one definition repo-wide now resolves to it: one candidate, one edge; any ambiguity, no edge. Static languages keep precision-first resolution (an unresolved receiver there is deliberate: shadowed import, instance property).
+- **`Parent::child` entity qualifiers.** `sem impact "Dataset::set_index"` and friends now work everywhere `Parent.child` does (graph and cached lookups).
+
 - **`sem impact --tests` lexical fallback + fast-path fallthrough.** Graph edges miss tests that call a target through a module namespace (`xr.where(...)` resolves to no entity), so `--tests` could answer "No tests found" for a function with dozens of tests. Now: an empty tests answer from the sidecar or disk cache is treated as non-authoritative and falls through to the full path, which backstops zero graph edges with lexical reachability — test entities naming the target as a whole word — clearly labeled as weaker evidence. Found live: an agent's graph-selected verify loop (run only the tests that reach your change) went from 0 selected tests to a 56-test net on `xr.where`, versus the 1,900+ tests of whole-file runs.
 - **Sharper `--pack` briefings.** Term ranking is now IDF-weighted (a term appearing in half the repo is worth almost nothing), `<details>` environment dumps in issue text are stripped before extraction, attribute accesses glued to receivers ("d2.loc") also emit their `.attr` suffixes as terms, and one of the three briefing slots goes to the top name-echo orient hit — for bugs where the issue names a surface API the culprit's body never mentions.
 
