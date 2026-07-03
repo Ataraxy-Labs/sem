@@ -14,6 +14,13 @@ use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus
 pub enum GitError {
     #[error("not a git repository")]
     NotARepo,
+    #[error(
+        "this repository uses git's reftable ref storage (extensions.refstorage), which sem's \
+         git backend (libgit2) can't read yet. Workaround: convert the repo's refs back with \
+         `git refs migrate --ref-format=files` (safe and reversible). Tracking: \
+         https://github.com/Ataraxy-Labs/sem/issues/451"
+    )]
+    UnsupportedRefStorage,
     #[error("git error: {0}")]
     Git2(#[from] git2::Error),
     #[error("io error: {0}")]
@@ -1218,6 +1225,13 @@ fn ensure_relative_worktrees_extension_supported() -> Result<(), GitError> {
 fn map_git_error(error: git2::Error) -> GitError {
     if error.code() == ErrorCode::NotFound {
         GitError::NotARepo
+    } else if error.message().contains("extensions.refstorage") {
+        // The repo uses git's reftable ref-storage backend (git 2.45+,
+        // `git init --ref-format=reftable`). libgit2 cannot read reftable refs
+        // at all, so registering the extension would open the repo and then
+        // silently misread it; a clear refusal is the only safe answer until
+        // libgit2 ships reftable support.
+        GitError::UnsupportedRefStorage
     } else {
         GitError::Git2(error)
     }
@@ -1481,6 +1495,40 @@ mod tests {
 
         let bridge = GitBridge::open(temp.path()).unwrap();
         assert_eq!(bridge.repo_root(), fs::canonicalize(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn open_reports_reftable_repos_with_actionable_error() {
+        // Regression for #451: repos using git's reftable ref storage
+        // (git 2.45+, `git init --ref-format=reftable`) carry
+        // extensions.refstorage, which libgit2 rejects with a cryptic
+        // "unsupported extension name" error. sem should refuse clearly,
+        // with the workaround in the message.
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        drop(repo);
+
+        let config = temp.path().join(".git/config");
+        let contents = fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("repositoryformatversion = 0"));
+        fs::write(
+            &config,
+            contents.replace("repositoryformatversion = 0", "repositoryformatversion = 1")
+                + "\n[extensions]\n\trefstorage = reftable\n",
+        )
+        .unwrap();
+
+        let error = match GitBridge::open(temp.path()) {
+            Ok(_) => panic!("open should refuse a reftable repo"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, GitError::UnsupportedRefStorage));
+        let message = error.to_string();
+        assert!(message.contains("reftable"), "message: {message}");
+        assert!(
+            message.contains("git refs migrate --ref-format=files"),
+            "message should carry the workaround: {message}"
+        );
     }
 
     #[test]

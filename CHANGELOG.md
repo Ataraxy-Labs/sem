@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Repos using git's **reftable** ref storage (`git init --ref-format=reftable`, git 2.45+) now fail with a clear, actionable error instead of libgit2's cryptic `unsupported extension name extensions.refstorage`. The message names the incompatibility and gives the safe workaround (`git refs migrate --ref-format=files`) plus the tracking issue. sem deliberately refuses rather than force-opening the repo: libgit2 cannot read reftable refs, so proceeding would produce silently wrong diffs. Real reftable support lands when libgit2 ships it. Thanks @bengry for the report and repro (#451).
+
 ### Added
 
 - **`sem orient --pack <tokens>`: turn-zero briefings from task text.** Feed orient a whole issue or task description and it returns a packed briefing — the top matching functions' bodies plus their immediate callers/callees — sized to the token budget. Ranking is body-term convergence: code-ish terms are extracted from the task text (flags, dotted names, identifiers) and entities are ranked by how many distinct terms their bodies contain, since issue vocabulary lives in bodies, not names. Built for prompt-time injection (the agent-side analog of the prompt-submit prefetch hook): the code an agent would spend its first turns foraging for arrives at turn zero. Honest calibration: on three ground-truth issues it put the exact target function first on two; issues that quote the tool's own output can still poison term extraction.
