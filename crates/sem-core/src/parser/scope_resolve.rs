@@ -6386,6 +6386,33 @@ fn resolve_ref(
                 }
             }
 
+            // Last resort: a repo-wide unique METHOD name is unambiguous even
+            // when the receiver's type is unknown — `index.keep_levels()` can
+            // only mean the one `keep_levels` the repo defines. One candidate,
+            // one edge; two candidates, no edge (guessing would manufacture
+            // false callers). Restricted to entities with a parent (methods),
+            // so attribute calls never bind to same-named free functions.
+            // Dynamic languages only: there, receiver types are statically
+            // unknowable and the missing edge is pure blindness; in static
+            // languages an unresolved receiver is deliberate (shadowed
+            // import, instance property) and must stay unresolved.
+            let dynamic_receiver_lang =
+                file_path.ends_with(".py") || file_path.ends_with(".rb");
+            if allow_cross_file_calls && dynamic_receiver_lang {
+                if let Some(target_ids) = symbol_table.get(method.as_str()) {
+                    if let [tid] = target_ids.as_slice() {
+                        if tid != from_entity_id
+                            && entity_map.get(tid).is_some_and(|e| {
+                                e.parent_id.is_some()
+                                    && matches!(e.entity_type.as_str(), "method" | "function")
+                            })
+                        {
+                            return Some((tid.clone(), RefType::Calls, "unique_method_name"));
+                        }
+                    }
+                }
+            }
+
             None
         }
     }

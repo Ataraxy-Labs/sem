@@ -1045,7 +1045,11 @@ impl DiskCache {
             }
         }
 
-        if let Some((parent_name, child_name)) = query.rsplit_once('.') {
+        // Accept `Parent.child` and `Parent::child` qualifiers alike.
+        let qualified_split = query
+            .rsplit_once("::")
+            .or_else(|| query.rsplit_once('.'));
+        if let Some((parent_name, child_name)) = qualified_split {
             if let Some(file_hint) = file_hint {
                 self.add_entity_candidates(
                     "SELECT child.id, child.name, child.entity_type, child.file_path,
