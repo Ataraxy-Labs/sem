@@ -20,6 +20,9 @@ pub struct OrientOptions {
     pub file_exts: Vec<String>,
     pub no_cache: bool,
     pub no_default_excludes: bool,
+    /// Token budget for a packed briefing: after ranking, pack the top hits'
+    /// bodies plus immediate neighbors into this budget (0 = off).
+    pub pack: usize,
 }
 
 #[derive(Serialize)]
@@ -79,6 +82,36 @@ fn try_sidecar_orient(opts: &OrientOptions) -> bool {
     true
 }
 
+/// Code-ish terms from free task text: identifiers, flags, dotted/underscored
+/// names, and quoted tokens — the vocabulary that survives into code bodies.
+/// Generic English is dropped so convergence counting stays meaningful.
+fn salient_terms(text: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for raw in text.split(|c: char| c.is_whitespace() || "()[]{}<>,;!?".contains(c)) {
+        let t = raw.trim_matches(|c: char| "`'\"*:=#".contains(c));
+        if t.len() < 4 || t.len() > 40 {
+            continue;
+        }
+        let codeish = t.contains('_')
+            || t.contains('-')
+            || (t.contains('.') && !t.ends_with('.'))
+            || t.chars().any(|c| c.is_uppercase()) && t.chars().any(|c| c.is_lowercase());
+        if codeish {
+            out.insert(t.trim_start_matches('-').to_lowercase());
+        }
+    }
+    // Fall back to rare-looking plain words when nothing code-ish was found.
+    if out.is_empty() {
+        for t in query_terms(text) {
+            if t.len() >= 6 {
+                out.insert(t);
+            }
+        }
+    }
+    out.into_iter().take(10).collect()
+}
+
 pub fn orient_command(opts: OrientOptions) {
     if query_terms(&opts.query).is_empty() {
         eprintln!(
@@ -88,7 +121,7 @@ pub fn orient_command(opts: OrientOptions) {
         std::process::exit(2);
     }
 
-    if try_sidecar_orient(&opts) {
+    if opts.pack == 0 && try_sidecar_orient(&opts) {
         return;
     }
 
@@ -117,6 +150,84 @@ pub fn orient_command(opts: OrientOptions) {
     ));
 
     let hits = orient(&all_entities, &graph, &opts.query, opts.limit);
+
+    // Briefing mode: pack the top hits' bodies plus their immediate
+    // neighborhood into the token budget. Designed for prompt-time injection:
+    // the task text goes in, the code an agent would otherwise spend its
+    // first turns foraging for comes out.
+    //
+    // Ranking differs from plain orient: issue text vocabulary lives in
+    // BODIES ("self.config.recursive"), not entity names, so we extract the
+    // code-ish salient terms from the task text, match them against entity
+    // contents, and rank by how many DISTINCT terms converge on an entity.
+    // Name-level orient score breaks ties.
+    if opts.pack > 0 {
+        let salient = salient_terms(&opts.query);
+        let mut scored: Vec<(f64, &sem_core::model::entity::SemanticEntity)> = all_entities
+            .iter()
+            // Functions/methods only: class entities contain every method
+            // body, so they match every term by sheer size and drown the
+            // actual signal. Methods are extracted separately anyway.
+            .filter(|e| {
+                (e.entity_type == "function" || e.entity_type == "method")
+                    && !e.file_path.contains("test")
+            })
+            .filter_map(|e| {
+                let body = e.content.to_lowercase();
+                let matched = salient.iter().filter(|t| body.contains(*t)).count();
+                if matched == 0 {
+                    return None;
+                }
+                let name_hit = hits.iter().position(|h| h.id == e.id);
+                let name_bonus = name_hit.map(|i| (hits.len() - i) as f64).unwrap_or(0.0);
+                let centrality =
+                    ((graph.get_dependents(&e.id).len() + graph.get_dependencies(&e.id).len())
+                        as f64
+                        + 1.0)
+                        .ln();
+                Some((matched as f64 * 10.0 + name_bonus + centrality, e))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<_> = scored
+            .iter()
+            .take(3)
+            .map(|(_, e)| e.id.as_str())
+            .collect();
+        if top.is_empty() {
+            println!("(no entities matched the task text)");
+            return;
+        }
+        let per = opts.pack / top.len();
+        println!(
+            "⊕ briefing · {} entities packed from task text · budget {}\n",
+            top.len(),
+            opts.pack
+        );
+        for id in &top {
+            let ctx = sem_core::parser::context::build_context_result_bounded(
+                &graph,
+                id,
+                &all_entities,
+                per,
+                1,
+            );
+            for e in &ctx.entries {
+                match e.role.as_str() {
+                    "target" => {
+                        println!("── {} · {} · {}", e.entity_name, e.entity_type, e.file_path);
+                        println!("{}\n", e.content);
+                    }
+                    role => {
+                        let sig = e.content.lines().next().unwrap_or("").trim();
+                        println!("   {} {} · {} · {}", role, e.entity_name, e.file_path, sig);
+                    }
+                }
+            }
+            println!();
+        }
+        return;
+    }
 
     if opts.json {
         let rows: Vec<OrientHitJson> = hits.iter().map(OrientHitJson::from).collect();
