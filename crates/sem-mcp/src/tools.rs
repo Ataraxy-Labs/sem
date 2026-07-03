@@ -120,6 +120,10 @@ pub struct ContextParams {
         description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
     )]
     pub no_default_excludes: Option<bool>,
+    #[schemars(
+        description = "Force a full re-send even if this session already received an identical fill for the entity (use when your context was compacted and the earlier body is gone)."
+    )]
+    pub fresh: Option<bool>,
 }
 
 #[cfg(test)]
