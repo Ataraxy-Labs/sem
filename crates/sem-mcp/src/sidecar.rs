@@ -155,7 +155,10 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
             let budget = parsed.get("budget").and_then(|v| v.as_u64()).unwrap_or(900) as usize;
             let hops = parsed.get("hops").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
             let session = parsed.get("session").and_then(|v| v.as_str());
-            match server.quick_context(repo_root, name, budget, hops, session).await {
+            match server
+                .quick_context(repo_root, name, budget, hops, session)
+                .await
+            {
                 Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
                 Err(e) => err(&e),
             }
