@@ -14,6 +14,13 @@ use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus
 pub enum GitError {
     #[error("not a git repository")]
     NotARepo,
+    #[error(
+        "this repository uses git's reftable ref storage (extensions.refstorage), which sem's \
+         git backend (libgit2) can't read yet. Workaround: convert the repo's refs back with \
+         `git refs migrate --ref-format=files` (safe and reversible). Tracking: \
+         https://github.com/Ataraxy-Labs/sem/issues/451"
+    )]
+    UnsupportedRefStorage,
     #[error("git error: {0}")]
     Git2(#[from] git2::Error),
     #[error("io error: {0}")]
@@ -24,12 +31,17 @@ pub struct GitBridge {
     repo: Repository,
     repo_root: PathBuf,
     cwd: PathBuf,
+    /// True when the repo's refs live outside libgit2's reach (git's reftable
+    /// backend, `extensions.refstorage`). Objects, trees, and the index are
+    /// unaffected, so libgit2 keeps doing everything except ref resolution,
+    /// which routes through the git CLI instead.
+    cli_refs: bool,
 }
 
 impl GitBridge {
     pub fn open(path: &Path) -> Result<Self, GitError> {
         let cwd = normalize_open_path(path)?;
-        ensure_relative_worktrees_extension_supported()?;
+        ensure_git_extensions_supported()?;
         let repo = match Repository::discover(path) {
             Ok(repo) => repo,
             Err(error) if should_retry_with_command_line_safe_directory(&error, path) => {
@@ -44,11 +56,83 @@ impl GitBridge {
         };
         let repo_root = repo.workdir().ok_or(GitError::NotARepo)?;
         let repo_root = fs::canonicalize(repo_root)?;
+        let cli_refs = repo
+            .config()
+            .ok()
+            .and_then(|cfg| cfg.get_string("extensions.refstorage").ok())
+            .is_some_and(|value| !value.is_empty() && value != "files");
         Ok(Self {
             repo,
             repo_root,
             cwd,
+            cli_refs,
         })
+    }
+
+    /// Resolve a refspec to an object id via the git CLI. Used when refs live
+    /// in a backend libgit2 can't read (reftable): real git resolves the ref,
+    /// then everything downstream proceeds through libgit2's ODB by OID.
+    fn cli_rev_parse(&self, refspec: &str) -> Result<Oid, GitError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+            .arg(format!("{refspec}^{{object}}"))
+            .output()?;
+        if !output.status.success() {
+            return Err(git_command_error(format!(
+                "cannot resolve '{refspec}' via git rev-parse"
+            )));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(Oid::from_str(text.trim())?)
+    }
+
+    /// revparse_single that works on reftable repos (CLI resolves the ref,
+    /// libgit2 loads the object).
+    fn resolve_object(&self, refspec: &str) -> Result<git2::Object<'_>, GitError> {
+        if self.cli_refs {
+            let oid = self.cli_rev_parse(refspec)?;
+            Ok(self.repo.find_object(oid, None)?)
+        } else {
+            Ok(self.repo.revparse_single(refspec)?)
+        }
+    }
+
+    /// HEAD's commit, reftable-safe.
+    fn head_commit(&self) -> Result<git2::Commit<'_>, GitError> {
+        if self.cli_refs {
+            let oid = self.cli_rev_parse("HEAD")?;
+            Ok(self.repo.find_commit(oid)?)
+        } else {
+            let head = self.repo.head()?;
+            let oid = head
+                .target()
+                .ok_or_else(|| git2::Error::from_str("HEAD has no target"))?;
+            Ok(self.repo.find_commit(oid)?)
+        }
+    }
+
+    /// Whether HEAD resolves to a commit (false in unborn repos), reftable-safe.
+    fn has_head(&self) -> bool {
+        if self.cli_refs {
+            self.cli_rev_parse("HEAD").is_ok()
+        } else {
+            self.repo.head().is_ok()
+        }
+    }
+
+    /// A revwalk starting at HEAD, reftable-safe (`push_head` needs libgit2 to
+    /// read the ref; pushing HEAD's OID walks the identical history).
+    fn revwalk_from_head(&self) -> Result<git2::Revwalk<'_>, GitError> {
+        let mut revwalk = self.repo.revwalk()?;
+        if self.cli_refs {
+            revwalk.push(self.head_commit()?.id())?;
+        } else {
+            revwalk.push_head()?;
+        }
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        Ok(revwalk)
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -65,8 +149,7 @@ impl GitBridge {
 
     /// Resolve a refspec to its full commit SHA, if valid.
     pub fn resolve_ref_sha(&self, refspec: &str) -> Option<String> {
-        self.repo
-            .revparse_single(refspec)
+        self.resolve_object(refspec)
             .ok()
             .and_then(|obj| obj.peel_to_commit().ok())
             .map(|c| c.id().to_string())
@@ -113,11 +196,7 @@ impl GitBridge {
     }
 
     pub fn get_head_sha(&self) -> Result<String, GitError> {
-        let head = self.repo.head()?;
-        let oid = head
-            .target()
-            .ok_or_else(|| git2::Error::from_str("HEAD has no target"))?;
-        Ok(oid.to_string())
+        Ok(self.head_commit()?.id().to_string())
     }
 
     /// Combined detect scope + get files in one call (fast path).
@@ -185,7 +264,7 @@ impl GitBridge {
         staged: bool,
         pathspecs: &[String],
     ) -> Result<Vec<FileChange>, GitError> {
-        let has_head = self.repo.head().is_ok();
+        let has_head = self.has_head();
         let mut command = Command::new("git");
         command
             .arg("-C")
@@ -245,15 +324,15 @@ impl GitBridge {
 
     /// Resolve the merge base between two refs
     pub fn resolve_merge_base(&self, ref1: &str, ref2: &str) -> Result<String, GitError> {
-        let obj1 = self.repo.revparse_single(ref1)?;
-        let obj2 = self.repo.revparse_single(ref2)?;
+        let obj1 = self.resolve_object(ref1)?;
+        let obj2 = self.resolve_object(ref2)?;
         let oid = self.repo.merge_base(obj1.id(), obj2.id())?;
         Ok(oid.to_string())
     }
 
     /// Check if a string resolves to a valid git revision
     pub fn is_valid_rev(&self, refspec: &str) -> bool {
-        self.repo.revparse_single(refspec).is_ok()
+        self.resolve_object(refspec).is_ok()
     }
 
     fn make_diff_opts(&self, pathspecs: &[String]) -> Result<DiffOptions, GitError> {
@@ -303,11 +382,8 @@ impl GitBridge {
             return self.changed_files_via_cli(true, pathspecs);
         }
 
-        let head_tree = match self.repo.head() {
-            Ok(head) => {
-                let commit = head.peel_to_commit()?;
-                Some(commit.tree()?)
-            }
+        let head_tree = match self.head_commit() {
+            Ok(commit) => Some(commit.tree()?),
             Err(_) => None, // No commits yet
         };
 
@@ -451,7 +527,7 @@ impl GitBridge {
 
     /// Number of parents of a commit (0 = root, >1 = merge).
     pub fn commit_parent_count(&self, sha: &str) -> Result<usize, GitError> {
-        let obj = self.repo.revparse_single(sha)?;
+        let obj = self.resolve_object(sha)?;
         Ok(obj.peel_to_commit()?.parent_count())
     }
 
@@ -460,7 +536,7 @@ impl GitBridge {
         sha: &str,
         pathspecs: &[String],
     ) -> Result<Vec<FileChange>, GitError> {
-        let obj = self.repo.revparse_single(sha)?;
+        let obj = self.resolve_object(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
 
@@ -485,8 +561,8 @@ impl GitBridge {
         to: &str,
         pathspecs: &[String],
     ) -> Result<Vec<FileChange>, GitError> {
-        let from_obj = self.repo.revparse_single(from)?;
-        let to_obj = self.repo.revparse_single(to)?;
+        let from_obj = self.resolve_object(from)?;
+        let to_obj = self.resolve_object(to)?;
 
         let from_tree = from_obj.peel_to_commit()?.tree()?;
         let to_tree = to_obj.peel_to_commit()?.tree()?;
@@ -679,7 +755,7 @@ impl GitBridge {
     }
 
     fn resolve_tree(&self, refspec: &str) -> Result<git2::Tree<'_>, GitError> {
-        let obj = self.repo.revparse_single(refspec)?;
+        let obj = self.resolve_object(refspec)?;
         let commit = obj.peel_to_commit()?;
         Ok(commit.tree()?)
     }
@@ -766,9 +842,7 @@ impl GitBridge {
         file_path: &str,
         limit: usize,
     ) -> Result<Vec<CommitInfo>, GitError> {
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        let revwalk = self.revwalk_from_head()?;
 
         let mut commits = Vec::new();
         let path = Path::new(file_path);
@@ -835,9 +909,7 @@ impl GitBridge {
             Err(error) => return Err(error),
         }
 
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        let revwalk = self.revwalk_from_head()?;
 
         let mut results = Vec::new();
         let mut tracked_path = file_path.to_string();
@@ -1016,7 +1088,7 @@ impl GitBridge {
     /// Get all file paths changed in a single commit (vs its parent).
     /// Returns file paths from the new side of each delta.
     pub fn get_commit_changed_files(&self, sha: &str) -> Result<Vec<String>, GitError> {
-        let obj = self.repo.revparse_single(sha)?;
+        let obj = self.resolve_object(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
         let parent_tree = if commit.parent_count() > 0 {
@@ -1199,15 +1271,21 @@ fn git_command_error(message: String) -> GitError {
     GitError::Git2(git2::Error::from_str(&message))
 }
 
-fn ensure_relative_worktrees_extension_supported() -> Result<(), GitError> {
+fn ensure_git_extensions_supported() -> Result<(), GitError> {
     static EXTENSIONS: OnceLock<Result<(), String>> = OnceLock::new();
 
     EXTENSIONS
         .get_or_init(|| {
-            // Git 2.48 introduced extensions.relativeWorktrees. libgit2 1.9.x
-            // can operate on these repositories, but rejects unknown extension
-            // names while opening the repo unless callers opt in first.
-            unsafe { git2::opts::set_extensions(&["relativeworktrees"]) }
+            // libgit2 rejects unknown extension names while opening a repo
+            // unless callers opt in first. set_extensions REPLACES the custom
+            // list, so every tolerated extension must be registered here, in
+            // one place:
+            // - relativeworktrees (git 2.48): libgit2 1.9.x operates on these
+            //   repos fine once the name is tolerated.
+            // - refstorage (git 2.45, reftable): libgit2 can't read reftable
+            //   refs, so GitBridge routes ref resolution through the git CLI
+            //   (see `cli_refs`); objects and the index work unchanged.
+            unsafe { git2::opts::set_extensions(&["relativeworktrees", "refstorage"]) }
                 .map_err(|error| error.message().to_string())
         })
         .as_ref()
@@ -1218,6 +1296,13 @@ fn ensure_relative_worktrees_extension_supported() -> Result<(), GitError> {
 fn map_git_error(error: git2::Error) -> GitError {
     if error.code() == ErrorCode::NotFound {
         GitError::NotARepo
+    } else if error.message().contains("extensions.refstorage") {
+        // The repo uses git's reftable ref-storage backend (git 2.45+,
+        // `git init --ref-format=reftable`). libgit2 cannot read reftable refs
+        // at all, so registering the extension would open the repo and then
+        // silently misread it; a clear refusal is the only safe answer until
+        // libgit2 ships reftable support.
+        GitError::UnsupportedRefStorage
     } else {
         GitError::Git2(error)
     }
@@ -1481,6 +1566,102 @@ mod tests {
 
         let bridge = GitBridge::open(temp.path()).unwrap();
         assert_eq!(bridge.repo_root(), fs::canonicalize(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn open_tolerates_refstorage_extension() {
+        // Regression for #451: the extensions.refstorage key made libgit2
+        // refuse to open the repo outright. The extension is tolerated now,
+        // and ref resolution routes through the git CLI (`cli_refs`).
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        drop(repo);
+
+        let config = temp.path().join(".git/config");
+        let contents = fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("repositoryformatversion = 0"));
+        fs::write(
+            &config,
+            contents.replace("repositoryformatversion = 0", "repositoryformatversion = 1")
+                + "\n[extensions]\n\trefstorage = reftable\n",
+        )
+        .unwrap();
+
+        let bridge = GitBridge::open(temp.path()).expect("open should tolerate refstorage");
+        assert!(bridge.cli_refs);
+    }
+
+    /// End-to-end on a REAL reftable repo. Skips (with a note) when the
+    /// installed git predates `git init --ref-format=reftable` (2.45).
+    #[test]
+    fn reftable_repo_diff_blame_and_head_work_via_cli_refs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+
+        let init = git(&["init", "-q", "--ref-format=reftable"]);
+        if !init.status.success() {
+            eprintln!("git lacks reftable support; skipping");
+            return;
+        }
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        fs::write(root.join("file.py"), "def hello():\n    return 1\n").unwrap();
+        git(&["add", "file.py"]);
+        git(&["commit", "-q", "-m", "init"]);
+        fs::write(root.join("file.py"), "def hello():\n    return 2\n").unwrap();
+
+        let bridge = GitBridge::open(root).expect("open real reftable repo");
+        assert!(bridge.cli_refs);
+
+        // HEAD resolution matches real git.
+        let cli_head = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(bridge.get_head_sha().unwrap(), cli_head);
+        assert!(bridge.is_valid_rev("HEAD"));
+        assert_eq!(bridge.resolve_ref_sha("HEAD").as_deref(), Some(cli_head.as_str()));
+
+        // Working-tree diff sees the modification with correct before/after.
+        let (_, files) = bridge.detect_and_get_files(&[]).unwrap();
+        assert_eq!(files.len(), 1, "files: {files:?}");
+        assert_eq!(files[0].file_path, "file.py");
+        assert!(files[0]
+            .before_content
+            .as_deref()
+            .unwrap_or("")
+            .contains("return 1"));
+        assert!(files[0]
+            .after_content
+            .as_deref()
+            .unwrap_or("")
+            .contains("return 2"));
+
+        // Commit and range diffs resolve refs via the CLI too.
+        git(&["add", "file.py"]);
+        git(&["commit", "-q", "-m", "second"]);
+        let range = bridge
+            .get_changed_files(
+                &DiffScope::Range {
+                    from: "HEAD~1".to_string(),
+                    to: "HEAD".to_string(),
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(range.len(), 1);
+        assert_eq!(range[0].file_path, "file.py");
+
+        // History walk starts from CLI-resolved HEAD.
+        let commits = bridge.get_file_commits("file.py", 0).unwrap();
+        assert_eq!(commits.len(), 2, "commits: {commits:?}");
     }
 
     #[test]

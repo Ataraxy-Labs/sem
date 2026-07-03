@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **sem now works on repos using git's reftable ref storage** (`git init --ref-format=reftable`, git 2.45+). Previously every command died with libgit2's cryptic `unsupported extension name extensions.refstorage`. libgit2 can't read reftable refs, but the object database and index are unchanged, so GitBridge now tolerates the extension and routes just the ref resolutions (`HEAD`, refspecs, revwalk starts) through the git CLI while libgit2 keeps doing everything else by OID. Verified end to end on a real reftable repo: working/staged/commit/range diffs, blame, and per-file history all produce identical results to a files-backend repo. One residual gap: the cache freshness oracle's direct `git2::Repository::open` is `.ok()`-guarded, so on reftable repos it just skips the acceleration (correctness unaffected). Requires `git` on PATH for the ref lookups. Thanks @bengry for the report and clean repro (#451).
+
 ### Added
 
 - **`sem orient --pack <tokens>`: turn-zero briefings from task text.** Feed orient a whole issue or task description and it returns a packed briefing — the top matching functions' bodies plus their immediate callers/callees — sized to the token budget. Ranking is body-term convergence: code-ish terms are extracted from the task text (flags, dotted names, identifiers) and entities are ranked by how many distinct terms their bodies contain, since issue vocabulary lives in bodies, not names. Built for prompt-time injection (the agent-side analog of the prompt-submit prefetch hook): the code an agent would spend its first turns foraging for arrives at turn zero. Honest calibration: on three ground-truth issues it put the exact target function first on two; issues that quote the tool's own output can still poison term extraction.
