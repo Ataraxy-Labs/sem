@@ -1,7 +1,7 @@
 {
   "name": "@ataraxy-labs/sem",
-  "mcpName": "io.github.ataraxy-labs/sem",
-  "version": "0.16.1",
+  "mcpName": "io.github.Ataraxy-Labs/sem",
+  "version": "0.16.2",
   "description": "npm wrapper for the sem CLI. Downloads the matching release binary and exposes the sem command in node_modules/.bin.",
   "license": "MIT OR Apache-2.0",
   "type": "module",
