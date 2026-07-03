@@ -836,7 +836,9 @@ impl SemServer {
                 .unwrap_or("");
             let fingerprint = format!(
                 "{}:{}:{}",
-                target_hash, context_result.total_tokens, context_result.entries.len()
+                target_hash,
+                context_result.total_tokens,
+                context_result.entries.len()
             );
             let key = format!("{session}\u{0}{}", entity.id);
             let mut ledger = self.fill_ledger.lock().await;
@@ -1834,6 +1836,34 @@ impl SemServer {
             hops,
         );
 
+        // Attention ledger (MCP path): this server process serves exactly one
+        // agent session, so a process-constant session key is correct. A
+        // re-ask for an unchanged entity answers with one line — the body is
+        // already in the asking session's context window. `fresh: true`
+        // bypasses (e.g. after context compaction dropped the earlier fill).
+        if !params.fresh.unwrap_or(false) {
+            let target_hash = all_entities
+                .iter()
+                .find(|e| e.id == entity_id)
+                .map(|e| e.content_hash.as_str())
+                .unwrap_or("");
+            let fingerprint = format!(
+                "{}:{}:{}",
+                target_hash,
+                context_result.total_tokens,
+                context_result.entries.len()
+            );
+            let key = format!("mcp\u{0}{entity_id}");
+            let mut ledger = self.fill_ledger.lock().await;
+            if ledger.get(&key) == Some(&fingerprint) {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "≡ {} · unchanged since you read it ({}) — already in your context; pass fresh: true to re-send",
+                    params.entity_name, rel_path
+                ))]));
+            }
+            ledger.put(key, fingerprint);
+        }
+
         let result: Vec<serde_json::Value> = context_result
             .entries
             .iter()
@@ -2032,6 +2062,13 @@ mod tests {
                 .contains(expected_text),
             "expected tool error to contain {expected_text:?}, got {value}"
         );
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        match &result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(text) => text.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
     }
 
     fn assert_tool_success(result: CallToolResult) {
@@ -2295,6 +2332,34 @@ mod tests {
 
         assert_eq!(rel_path, "src/inner/file.py");
         assert!(!rel_path.contains('\\'));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attention_ledger_covers_mcp_context_tool_with_fresh_bypass() {
+        let root = temp_git_repo("ledger-mcp");
+        std::fs::write(root.join("app.py"), "def gamma():\n    return 7\n").unwrap();
+        let server = server_for_repo(&root).await;
+        let params = || ContextParams {
+            file_path: None,
+            entity_name: "gamma".to_string(),
+            token_budget: Some(2000),
+            hops: Some(1),
+            no_default_excludes: None,
+            fresh: None,
+        };
+
+        let first = text_of(server.sem_context(Parameters(params())).await.unwrap());
+        assert!(first.contains("def gamma()"));
+
+        let second = text_of(server.sem_context(Parameters(params())).await.unwrap());
+        assert!(second.contains("unchanged since you read it"), "{second}");
+
+        let mut p3 = params();
+        p3.fresh = Some(true);
+        let third = text_of(server.sem_context(Parameters(p3)).await.unwrap());
+        assert!(third.contains("def gamma()"), "fresh bypasses: {third}");
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2640,6 +2705,7 @@ mod tests {
                 token_budget: Some(2000),
                 hops: None,
                 no_default_excludes: Some(true),
+                fresh: None,
             }))
             .await
             .unwrap();
@@ -2667,6 +2733,7 @@ mod tests {
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
+                fresh: None,
             }))
             .await
             .unwrap();
@@ -2692,6 +2759,7 @@ mod tests {
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
+                fresh: None,
             }))
             .await
             .unwrap();
@@ -2721,6 +2789,7 @@ mod tests {
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
+                fresh: None,
             }))
             .await
             .unwrap();
@@ -2734,6 +2803,7 @@ mod tests {
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
+                fresh: None,
             }))
             .await
             .unwrap();
