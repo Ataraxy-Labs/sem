@@ -152,7 +152,12 @@ pub fn entity_matches_qualified(
     if entity_matches_query(entity, query) {
         return true;
     }
-    if let Some((parent_part, child_part)) = query.rsplit_once('.') {
+    // Accept both `Parent.child` and `Parent::child` — agents reach for
+    // whichever qualifier their working language uses.
+    let split = query
+        .rsplit_once("::")
+        .or_else(|| query.rsplit_once('.'));
+    if let Some((parent_part, child_part)) = split {
         if entity.name == child_part {
             if let Some(pid) = &entity.parent_id {
                 if let Some(parent) = graph.entities.get(pid) {
