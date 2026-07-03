@@ -6,6 +6,8 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- **`sem orient --pack <tokens>`: turn-zero briefings from task text.** Feed orient a whole issue or task description and it returns a packed briefing — the top matching functions' bodies plus their immediate callers/callees — sized to the token budget. Ranking is body-term convergence: code-ish terms are extracted from the task text (flags, dotted names, identifiers) and entities are ranked by how many distinct terms their bodies contain, since issue vocabulary lives in bodies, not names. Built for prompt-time injection (the agent-side analog of the prompt-submit prefetch hook): the code an agent would spend its first turns foraging for arrives at turn zero. Honest calibration: on three ground-truth issues it put the exact target function first on two; issues that quote the tool's own output can still poison term extraction.
+
 - **sem is published to the official MCP registry** as `io.github.Ataraxy-Labs/sem`, so MCP clients that browse the registry (VS Code, Cursor, Claude Code, and others) can discover and install the server directly. The release workflow now publishes each release to the registry via `mcp-publisher` (authenticated with GitHub OIDC, no extra secrets), backed by a `server.json` manifest and an `mcpName` field in the npm wrapper.
 
 ### Performance

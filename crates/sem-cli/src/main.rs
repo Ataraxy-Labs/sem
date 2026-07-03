@@ -303,6 +303,10 @@ enum Commands {
         /// Include files and directories excluded by default
         #[arg(long)]
         no_default_excludes: bool,
+
+        /// Pack a briefing: top hits' bodies + neighbors within this token budget
+        #[arg(long, value_name = "TOKENS", default_value = "0")]
+        pack: usize,
     },
     /// Show token-budgeted context for an entity
     Context {
@@ -656,6 +660,7 @@ fn main() {
             file_exts,
             no_cache,
             no_default_excludes,
+            pack,
         }) => {
             orient_command(OrientOptions {
                 cwd: std::env::current_dir()
@@ -668,6 +673,7 @@ fn main() {
                 file_exts,
                 no_cache,
                 no_default_excludes,
+                pack,
             });
         }
         Some(Commands::Context {
