@@ -87,6 +87,28 @@ fn try_sidecar_orient(opts: &OrientOptions) -> bool {
 /// Generic English is dropped so convergence counting stays meaningful.
 fn salient_terms(text: &str) -> Vec<String> {
     use std::collections::BTreeSet;
+    // GitHub issues bury the signal under environment dumps ("Output of
+    // xr.show_versions()", pip freeze) folded into <details> blocks; their
+    // library names and platform triples look code-ish, so cut them out
+    // before extraction.
+    let mut cleaned = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("<details") {
+            depth += 1;
+            continue;
+        }
+        if l.starts_with("</details") {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 0 {
+            cleaned.push_str(line);
+            cleaned.push('\n');
+        }
+    }
+    let text = cleaned.as_str();
     let mut out: BTreeSet<String> = BTreeSet::new();
     for raw in text.split(|c: char| c.is_whitespace() || "()[]{}<>,;!?".contains(c)) {
         let t = raw.trim_matches(|c: char| "`'\"*:=#".contains(c));
@@ -98,7 +120,19 @@ fn salient_terms(text: &str) -> Vec<String> {
             || (t.contains('.') && !t.ends_with('.'))
             || t.chars().any(|c| c.is_uppercase()) && t.chars().any(|c| c.is_lowercase());
         if codeish {
-            out.insert(t.trim_start_matches('-').to_lowercase());
+            let term = t.trim_start_matches('-').to_lowercase();
+            // Attribute accesses arrive glued to their receiver ("d2.loc",
+            // "self.config.recursive"): the receiver is caller-local noise,
+            // but each ".attr" suffix is spelled identically in the library's
+            // own source. Emit those as terms too; IDF keeps common ones tame.
+            if term.contains('.') {
+                for comp in term.split('.').skip(1) {
+                    if comp.len() >= 3 && comp.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        out.insert(format!(".{comp}"));
+                    }
+                }
+            }
+            out.insert(term);
         }
     }
     // Fall back to rare-looking plain words when nothing code-ish was found.
@@ -159,23 +193,43 @@ pub fn orient_command(opts: OrientOptions) {
     // Ranking differs from plain orient: issue text vocabulary lives in
     // BODIES ("self.config.recursive"), not entity names, so we extract the
     // code-ish salient terms from the task text, match them against entity
-    // contents, and rank by how many DISTINCT terms converge on an entity.
+    // contents, and rank by the IDF-weighted sum of converging terms: a term
+    // appearing in half the repo ("method", "value") is worth almost nothing,
+    // a term appearing in three bodies is worth everything.
     // Name-level orient score breaks ties.
     if opts.pack > 0 {
         let salient = salient_terms(&opts.query);
-        let mut scored: Vec<(f64, &sem_core::model::entity::SemanticEntity)> = all_entities
+        // Functions/methods only: class entities contain every method
+        // body, so they match every term by sheer size and drown the
+        // actual signal. Methods are extracted separately anyway.
+        let candidates: Vec<(&sem_core::model::entity::SemanticEntity, String)> = all_entities
             .iter()
-            // Functions/methods only: class entities contain every method
-            // body, so they match every term by sheer size and drown the
-            // actual signal. Methods are extracted separately anyway.
             .filter(|e| {
                 (e.entity_type == "function" || e.entity_type == "method")
                     && !e.file_path.contains("test")
+                    && !e.file_path.starts_with("ci/")
+                    && !e.file_path.starts_with("doc")
             })
-            .filter_map(|e| {
-                let body = e.content.to_lowercase();
-                let matched = salient.iter().filter(|t| body.contains(*t)).count();
-                if matched == 0 {
+            .map(|e| (e, e.content.to_lowercase()))
+            .collect();
+        let n = candidates.len() as f64;
+        let idf: Vec<f64> = salient
+            .iter()
+            .map(|t| {
+                let df = candidates.iter().filter(|(_, b)| b.contains(t)).count() as f64;
+                ((n + 1.0) / (df + 1.0)).ln()
+            })
+            .collect();
+        let mut scored: Vec<(f64, &sem_core::model::entity::SemanticEntity)> = candidates
+            .iter()
+            .filter_map(|(e, body)| {
+                let term_score: f64 = salient
+                    .iter()
+                    .zip(&idf)
+                    .filter(|(t, _)| body.contains(*t))
+                    .map(|(_, w)| w)
+                    .sum();
+                if term_score <= 0.0 {
                     return None;
                 }
                 let name_hit = hits.iter().position(|h| h.id == e.id);
@@ -185,15 +239,29 @@ pub fn orient_command(opts: OrientOptions) {
                         as f64
                         + 1.0)
                         .ln();
-                Some((matched as f64 * 10.0 + name_bonus + centrality, e))
+                Some((term_score * 3.0 + name_bonus + centrality, *e))
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let top: Vec<_> = scored
-            .iter()
-            .take(3)
-            .map(|(_, e)| e.id.as_str())
-            .collect();
+        // Two slots by body-term convergence, one by entity NAME: when the
+        // issue names the surface API (".loc"), the culprit's body often
+        // never mentions it — but an entity NAMED like a salient term, plus
+        // its 1-hop neighborhood, reaches it. Name must echo a code-ish term
+        // so plain-word junk hits can't claim the slot.
+        let mut top: Vec<&str> = scored.iter().take(2).map(|(_, e)| e.id.as_str()).collect();
+        let name_pick = hits.iter().find(|h| {
+            !top.contains(&h.id.as_str())
+                && !h.file_path.contains("test")
+                && salient.iter().any(|t| {
+                    let stem = t.trim_start_matches('.');
+                    stem.len() >= 3 && h.name.to_lowercase().contains(stem)
+                })
+        });
+        if let Some(h) = name_pick {
+            top.push(h.id.as_str());
+        } else if let Some((_, e)) = scored.get(2) {
+            top.push(e.id.as_str());
+        }
         if top.is_empty() {
             println!("(no entities matched the task text)");
             return;

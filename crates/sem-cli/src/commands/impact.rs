@@ -405,6 +405,13 @@ fn try_sidecar_impact(opts: &ImpactOptions) -> bool {
         return false;
     };
 
+    // An empty tests answer is not authoritative: graph edges miss
+    // namespace-attribute calls ("xr.where"), and the full local path has a
+    // lexical fallback for exactly that. Fall through instead of printing
+    // "No tests found" from the fast path.
+    if matches!(opts.mode, ImpactMode::Tests | ImpactMode::All) && parsed.tests.is_empty() {
+        return false;
+    }
     let cached = CachedImpactResult {
         entity: parsed.entity,
         dependencies: parsed.dependencies,
@@ -440,6 +447,13 @@ fn try_cached_impact_query(
     ) {
         Ok(Some(result)) => {
             timings.mark("cache_topology_impact_query");
+            // Empty tests from the cache is not authoritative (namespace
+            // calls have no edges; older caches lack test flags/content).
+            // Fall through to the full path, which has a lexical fallback.
+            if matches!(opts.mode, ImpactMode::Tests) && result.tests.is_empty() {
+                timings.mark("cache_tests_empty_fallthrough");
+                return false;
+            }
             print_cached_result(&result, opts.mode, opts.json, opts.depth);
             timings.mark("cli_output_serialization");
             timings.finish();
@@ -965,7 +979,62 @@ fn print_tests(
     custom_test_dirs: &[String],
 ) {
     let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
-    print_tests_result(entity, &tests, json);
+    if !tests.is_empty() {
+        print_tests_result(entity, &tests, json);
+        return;
+    }
+    // Graph edges can miss tests that call the target through a module
+    // namespace ("xr.where(...)"): the attribute call resolves to no entity.
+    // Fall back to lexical reachability — test bodies naming the entity as a
+    // word — and say so, since it is weaker evidence than a call edge.
+    let test_ids = graph.filter_test_entities_with_custom_dirs(all_entities, custom_test_dirs);
+    let owned: Vec<EntityInfo> = all_entities
+        .iter()
+        .filter(|e| test_ids.contains(&e.id) && word_hit(&e.content, &entity.name))
+        .map(|e| EntityInfo {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            entity_type: e.entity_type.clone(),
+            file_path: e.file_path.clone(),
+            parent_id: e.parent_id.clone(),
+            start_line: e.start_line,
+            end_line: e.end_line,
+        })
+        .collect();
+    if !owned.is_empty() && !json {
+        println!(
+            "{}",
+            "  (no call-graph edges reach tests; lexical fallback — test bodies naming the entity)"
+                .dimmed()
+        );
+    }
+    let refs: Vec<&EntityInfo> = owned.iter().collect();
+    print_tests_result(entity, &refs, json);
+}
+
+/// True when `name` appears in `body` as a whole word (not as a substring of
+/// a longer identifier).
+pub(crate) fn word_hit(body: &str, name: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = body[start..].find(name) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !body[..abs]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let after = abs + name.len();
+        let after_ok = after >= body.len()
+            || !body[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + name.len();
+    }
+    false
 }
 
 fn print_tests_with_ids(

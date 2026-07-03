@@ -1153,11 +1153,53 @@ impl DiskCache {
             .cloned()
             .collect();
         let infos = self.entity_infos_by_id(&ordered_test_ids)?;
-        let tests = ordered_test_ids
+        let tests: Vec<EntityInfo> = ordered_test_ids
             .into_iter()
             .filter_map(|id| infos.get(&id).cloned())
             .collect();
-        Ok((tests, tests_truncated))
+        if !tests.is_empty() {
+            return Ok((tests, tests_truncated));
+        }
+        // Graph edges miss tests that call the target through a module
+        // namespace ("xr.where(...)"). Fall back to lexical reachability:
+        // test entities whose body names the target as a whole word.
+        let name: String = match self.conn.query_row(
+            "SELECT name FROM entities WHERE id = ?1",
+            [entity_id],
+            |row| row.get(0),
+        ) {
+            Ok(n) => n,
+            Err(_) => return Ok((tests, tests_truncated)),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.name, e.entity_type, e.file_path, e.start_line, e.end_line, e.parent_id
+             FROM entities e
+             JOIN entity_flags f ON f.entity_id = e.id AND f.is_test != 0
+             WHERE e.content LIKE '%' || ?1 || '%'
+             ORDER BY e.file_path, e.start_line",
+        )?;
+        let rows = stmt.query_map([&name], entity_info_from_row)?;
+        let mut lexical: Vec<EntityInfo> = Vec::new();
+        for row in rows {
+            lexical.push(row?);
+        }
+        // Whole-word check needs the body; re-query per candidate is fine at
+        // this scale (fallback fires only when the graph found nothing).
+        let mut confirmed = Vec::new();
+        for info in lexical {
+            let body: String = self
+                .conn
+                .query_row(
+                    "SELECT content FROM entities WHERE id = ?1",
+                    [&info.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+            if crate::commands::impact::word_hit(&body, &name) {
+                confirmed.push(info);
+            }
+        }
+        Ok((confirmed, tests_truncated))
     }
 
     fn impact_ids(
