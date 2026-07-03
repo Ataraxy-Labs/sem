@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **sem is published to the official MCP registry** as `io.github.ataraxy-labs/sem`, so MCP clients that browse the registry (VS Code, Cursor, Claude Code, and others) can discover and install the server directly. The release workflow now publishes each release to the registry via `mcp-publisher` (authenticated with GitHub OIDC, no extra secrets), backed by a `server.json` manifest and an `mcpName` field in the npm wrapper.
+
 ### Performance
 
 - **Attention ledger v1: repeated context fills collapse to one line.** The resident server now keeps a per-session ledger of every `context` fill it has emitted (entity id + content fingerprint). When the same session re-asks for an unchanged entity, the answer is a single `≡ unchanged since you read it` line instead of the full packed body — the body is already sitting in the asking model's context window, so re-sending it is pure token waste. Measured through the CLI socket path: 8,586 bytes first fill, 139 bytes on repeat (98.4% suppressed). Opt-in via `SEM_SESSION=<id>` in the environment; `SEM_FRESH=1` bypasses; anonymous calls are never suppressed. Any change to the target entity misses the fingerprint and re-sends in full. This is the first piece of the attention architecture (docs/attention-architecture.md): space (graph), time (commit index), attention (ledger).
