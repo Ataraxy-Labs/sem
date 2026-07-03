@@ -1,6 +1,6 @@
 [package]
 name = "sem-cli"
-version = "0.16.2"
+version = "0.17.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Semantic version control CLI. Shows what entities changed (functions, classes, methods) instead of lines."
@@ -15,9 +15,9 @@ name = "sem"
 path = "src/main.rs"
 
 [dependencies]
-sem-core = { path = "../sem-core", version = "0.16.2" }
-sem-mcp = { path = "../sem-mcp", version = "0.16.2" }
-sem-cloud-client = { path = "../sem-cloud-client", version = "0.16.2" }
+sem-core = { path = "../sem-core", version = "0.17.0" }
+sem-mcp = { path = "../sem-mcp", version = "0.17.0" }
+sem-cloud-client = { path = "../sem-cloud-client", version = "0.17.0" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
