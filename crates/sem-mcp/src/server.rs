@@ -131,10 +131,11 @@ pub struct SemServer {
     topology_cache: Arc<Mutex<Option<CachedTopology>>>,
     watch: Arc<Mutex<WatchSlot>>,
     /// Attention ledger: per-session record of context fills already emitted
-    /// (key: session\0entity_id, value: fill fingerprint). A re-ask whose
-    /// fingerprint matches collapses to a one-line "unchanged" answer — the
-    /// body is already in the asking model's context window.
-    fill_ledger: Arc<Mutex<LruCache<String, String>>>,
+    /// (key: session\0entity_id). A re-ask whose fingerprint matches collapses
+    /// to a one-line "unchanged" answer; a re-ask for a CHANGED entity answers
+    /// with an entity-level delta against the version the session saw. The
+    /// body (or its previous version) is already in the asking model's context.
+    fill_ledger: Arc<Mutex<LruCache<String, LedgerFill>>>,
     _tool_router: ToolRouter<Self>,
 }
 
@@ -764,6 +765,76 @@ impl SemServer {
     /// One-call entity context from the in-memory graph, for the socket
     /// sidecar: resolve `name` repo-wide, pack a bounded context, render the
     /// compact text. Millisecond-fast once the graph is warm.
+    /// Attention-ledger check shared by the sidecar/CLI and MCP context paths.
+    /// Returns Some(reply) when this session already holds the fill: either a
+    /// one-line "unchanged" answer, or an entity-level delta against the
+    /// version the session saw. None means send the full fill (recorded here).
+    async fn ledger_reply(
+        &self,
+        session: &str,
+        entity_id: &str,
+        name: &str,
+        file_path: &str,
+        target_content: &str,
+        packed_marker: &str,
+        fresh_hint: &str,
+    ) -> Option<String> {
+        const MAX_STORED_CONTENT: usize = 64 * 1024;
+        const MAX_DELTA_LINES: usize = 120;
+
+        let fingerprint = format!("{:016x}:{packed_marker}", fnv1a_hash(target_content));
+        let key = format!("{session}\u{0}{entity_id}");
+        let mut ledger = self.fill_ledger.lock().await;
+        let prev = ledger.get(&key).cloned();
+        let record = LedgerFill {
+            fingerprint: fingerprint.clone(),
+            content: if target_content.len() <= MAX_STORED_CONTENT {
+                target_content.to_string()
+            } else {
+                String::new()
+            },
+        };
+        match prev {
+            Some(prev) if prev.fingerprint == fingerprint => Some(format!(
+                "≡ {name} · unchanged since you read it ({file_path}) — already in your context; {fresh_hint}\n"
+            )),
+            Some(prev) if !prev.content.is_empty() && prev.content != target_content => {
+                // Entity changed: answer with the delta against what the
+                // session saw. Fall back to a full fill when the delta is
+                // bigger than the body would be.
+                let diff = similar::TextDiff::from_lines(prev.content.as_str(), target_content);
+                let mut lines = Vec::new();
+                for change in diff.iter_all_changes() {
+                    match change.tag() {
+                        similar::ChangeTag::Delete => lines.push(format!("- {change}")),
+                        similar::ChangeTag::Insert => lines.push(format!("+ {change}")),
+                        similar::ChangeTag::Equal => {}
+                    }
+                }
+                ledger.put(key, record);
+                if lines.is_empty() || lines.len() > MAX_DELTA_LINES {
+                    return None;
+                }
+                let mut out = format!(
+                    "∆ {name} · changed since you read it ({file_path}) — delta vs the version in your context ({} lines):\n",
+                    lines.len()
+                );
+                for l in &lines {
+                    out.push_str(l);
+                    if !l.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                out.push_str(&format!("(callers/callees not re-packed; {fresh_hint})\n"));
+                Some(out)
+            }
+            _ => {
+                ledger.put(key, record);
+                None
+            }
+        }
+    }
+
     /// Compact lines, not JSON: same information at a fraction of the tokens
     /// the consuming model has to read. Shared by the MCP query mode and the
     /// sidecar's `orient` op.
@@ -823,32 +894,33 @@ impl SemServer {
             hops,
         );
 
-        // Attention ledger: if this session already received this exact fill
-        // (same target content, same packed size), the body is sitting in the
-        // asking model's context window — re-sending it is pure token waste.
-        // Answer with one line instead. Any change to the target (or to the
-        // packed neighborhood's size) misses the fingerprint and re-sends.
+        // Attention ledger: repeats answer as one line, changed entities as a
+        // delta against the version the session saw (delta-fills).
         if let Some(session) = session.filter(|s| !s.is_empty()) {
-            let target_hash = all_entities
+            let target_content = all_entities
                 .iter()
                 .find(|e| e.id == entity.id)
-                .map(|e| e.content_hash.as_str())
+                .map(|e| e.content.as_str())
                 .unwrap_or("");
-            let fingerprint = format!(
-                "{}:{}:{}",
-                target_hash,
+            let packed_marker = format!(
+                "{}:{}",
                 context_result.total_tokens,
                 context_result.entries.len()
             );
-            let key = format!("{session}\u{0}{}", entity.id);
-            let mut ledger = self.fill_ledger.lock().await;
-            if ledger.get(&key) == Some(&fingerprint) {
-                return Ok(format!(
-                    "≡ {} · unchanged since you read it ({}) — already in your context; set SEM_FRESH=1 to re-send\n",
-                    name, entity.file_path
-                ));
+            if let Some(reply) = self
+                .ledger_reply(
+                    session,
+                    &entity.id,
+                    name,
+                    &entity.file_path,
+                    target_content,
+                    &packed_marker,
+                    "set SEM_FRESH=1 for the full re-pack",
+                )
+                .await
+            {
+                return Ok(reply);
             }
-            ledger.put(key, fingerprint);
         }
         let result: Vec<serde_json::Value> = context_result
             .entries
@@ -1836,32 +1908,36 @@ impl SemServer {
             hops,
         );
 
-        // Attention ledger (MCP path): this server process serves exactly one
-        // agent session, so a process-constant session key is correct. A
-        // re-ask for an unchanged entity answers with one line — the body is
-        // already in the asking session's context window. `fresh: true`
-        // bypasses (e.g. after context compaction dropped the earlier fill).
+        // Attention ledger (MCP path): one MCP server process serves exactly
+        // one agent session, so a process-constant session key is correct.
+        // Repeats answer as one line, changed entities as a delta against the
+        // version the session saw. `fresh: true` bypasses (e.g. after context
+        // compaction dropped the earlier fill).
         if !params.fresh.unwrap_or(false) {
-            let target_hash = all_entities
+            let target_content = all_entities
                 .iter()
                 .find(|e| e.id == entity_id)
-                .map(|e| e.content_hash.as_str())
+                .map(|e| e.content.as_str())
                 .unwrap_or("");
-            let fingerprint = format!(
-                "{}:{}:{}",
-                target_hash,
+            let packed_marker = format!(
+                "{}:{}",
                 context_result.total_tokens,
                 context_result.entries.len()
             );
-            let key = format!("mcp\u{0}{entity_id}");
-            let mut ledger = self.fill_ledger.lock().await;
-            if ledger.get(&key) == Some(&fingerprint) {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "≡ {} · unchanged since you read it ({}) — already in your context; pass fresh: true to re-send",
-                    params.entity_name, rel_path
-                ))]));
+            if let Some(reply) = self
+                .ledger_reply(
+                    "mcp",
+                    entity_id,
+                    &params.entity_name,
+                    &rel_path,
+                    target_content,
+                    &packed_marker,
+                    "pass fresh: true for the full re-pack",
+                )
+                .await
+            {
+                return Ok(CallToolResult::success(vec![Content::text(reply)]));
             }
-            ledger.put(key, fingerprint);
         }
 
         let result: Vec<serde_json::Value> = context_result
@@ -1895,6 +1971,22 @@ impl SemServer {
             })),
         )]))
     }
+}
+
+/// One recorded context fill in the attention ledger.
+#[derive(Clone)]
+struct LedgerFill {
+    fingerprint: String,
+    content: String,
+}
+
+fn fnv1a_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// Per-role counts of entities the packer deliberately left out (tests,
@@ -2361,6 +2453,35 @@ mod tests {
         assert!(third.contains("def gamma()"), "fresh bypasses: {third}");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attention_ledger_returns_delta_for_changed_entity() {
+        let server = SemServer::new();
+        let v1 = "def alpha():\n    return 1\n";
+        let v2 = "def alpha():\n    return 2\n";
+
+        let first = server
+            .ledger_reply("s", "id1", "alpha", "a.py", v1, "10:1", "hint")
+            .await;
+        assert!(first.is_none(), "first fill goes out in full");
+
+        let delta = server
+            .ledger_reply("s", "id1", "alpha", "a.py", v2, "11:1", "hint")
+            .await
+            .expect("changed entity answers with a delta");
+        assert!(
+            delta.contains("∆ alpha · changed since you read it"),
+            "{delta}"
+        );
+        assert!(delta.contains("-     return 1"));
+        assert!(delta.contains("+     return 2"));
+
+        let repeat = server
+            .ledger_reply("s", "id1", "alpha", "a.py", v2, "11:1", "hint")
+            .await
+            .expect("repeat after the delta is an unchanged line");
+        assert!(repeat.contains("unchanged since you read it"));
     }
 
     #[tokio::test]

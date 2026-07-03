@@ -1676,6 +1676,7 @@ dependencies = [
  "sem-core",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "tokio",
  "tracing",
