@@ -263,12 +263,22 @@ fn try_sidecar_context(opts: &ContextOptions) -> bool {
     if root.join(".semignore").exists() {
         return false;
     }
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "op": "context",
         "name": name,
         "budget": opts.budget,
         "hops": opts.hops,
     });
+    // Attention ledger opt-in: with SEM_SESSION set, a repeated identical
+    // fill answers as one "unchanged" line instead of the full body (the
+    // body is already in the session's context). SEM_FRESH=1 bypasses.
+    if std::env::var_os("SEM_FRESH").is_none() {
+        if let Ok(session) = std::env::var("SEM_SESSION") {
+            if !session.is_empty() {
+                request["session"] = serde_json::json!(session);
+            }
+        }
+    }
     let Some(response) = super::sidecar::query(&root, &request) else {
         return false;
     };
