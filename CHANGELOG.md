@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **sem is published to the official MCP registry** as `io.github.ataraxy-labs/sem`, so MCP clients that browse the registry (VS Code, Cursor, Claude Code, and others) can discover and install the server directly. The release workflow now publishes each release to the registry via `mcp-publisher` (authenticated with GitHub OIDC, no extra secrets), backed by a `server.json` manifest and an `mcpName` field in the npm wrapper.
+
 ### Performance
 
 - **Attention ledger covers the MCP path.** `sem_context` (the tool agent sessions actually call) now runs through the same per-session fill ledger: an MCP server process serves exactly one session, so re-asks for unchanged entities collapse to one `≡ unchanged since you read it` line automatically — no environment variable needed. New optional `fresh: true` param forces a full re-send (for when context compaction dropped the earlier fill).
