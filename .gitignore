@@ -29,3 +29,5 @@ hero.svg
 .envrc
 .direnv/
 result/
+dhat-heap.json
+.claude/worktrees/

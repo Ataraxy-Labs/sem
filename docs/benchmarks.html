@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>sem — MCP Benchmarks</title>
+  <title>sem — Benchmarks</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -102,6 +102,7 @@
       padding: 16px; background: var(--surface); border-radius: 8px;
       border-left: 3px solid var(--green); margin-top: 20px;
     }
+    .insight.honest { border-left-color: var(--yellow); }
 
     /* Speed pills */
     .speed-row {
@@ -167,6 +168,7 @@
         <a href="cloud-consent.html">Cloud</a>
         <a href="changelog.html">Changelog</a>
         <a href="details.html">Details</a>
+        <a href="first-principles.html">First Principles</a>
         <a href="https://github.com/Ataraxy-Labs/sem">GitHub</a>
         <a href="llms.txt">llms.txt</a>
       </div>
@@ -176,101 +178,214 @@
 
     <!-- Hero -->
     <section id="hero">
-      <h2>sem-mcp performance</h2>
+      <h2>sem vs grep + read, measured</h2>
       <p class="section-desc">
-        6 MCP tools. Entity-level intelligence for agents.<br>
-        Real numbers from sem's own codebase (48 Rust files).
+        Paired agent runs on real bugs from real repos (xarray, pylint, astropy, fsspec, langcodes).
+        Same model, same prompts, same environments. One agent gets only grep, glob, and file reads.
+        The other gets sem. Correctness graded by hidden tests neither agent can see.
+        ~34 paired runs as of July 2026.
       </p>
 
       <div class="speed-row" style="margin-top: 0;">
         <div class="speed-pill">
-          <span class="number">6</span>
-          <span class="label">MCP tools</span>
+          <span class="number">50-65%</span>
+          <span class="label">faster code understanding</span>
         </div>
         <div class="speed-pill">
-          <span class="number">75%</span>
-          <span class="label">fewer tokens</span>
+          <span class="number">4.9x</span>
+          <span class="label">verify loop, best case</span>
         </div>
         <div class="speed-pill">
-          <span class="number">4.7x</span>
-          <span class="label">faster with caching</span>
+          <span class="number">parity</span>
+          <span class="label">tokens</span>
         </div>
         <div class="speed-pill">
-          <span class="number">2.3x</span>
-          <span class="label">agent accuracy</span>
+          <span class="number">same</span>
+          <span class="label">solve rate</span>
         </div>
+      </div>
+
+      <div class="insight honest">
+        The last pill is deliberate. sem does not make an agent smarter: on every paired run
+        both agents resolved or failed the same tasks. What sem changes is how fast the agent
+        gets to the answer and how little it runs to trust it. Every number below says exactly
+        where that holds and where it does not.
       </div>
     </section>
 
-    <!-- Token Efficiency -->
-    <section id="tokens">
-      <h2>Token efficiency</h2>
+    <!-- End to end -->
+    <section id="endtoend">
+      <h2>End-to-end bug fix, wall clock</h2>
       <p class="section-desc">
-        How many tokens does an agent need to understand <code style="color:var(--cyan)">EntityGraph</code> and everything it affects?
+        SWE-bench Verified instance <code style="color:var(--cyan)">pydata/xarray#6721</code>
+        (accessing <code style="color:var(--cyan)">.chunks</code> loaded the whole array into memory).
+        Issue text only, no hints about the fix location. Both agents produced the exact upstream fix
+        and passed the hidden test.
       </p>
 
       <div class="bench-group">
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">Read all 73 source files</span>
-            <span class="value">~32,000 tokens</span>
+            <span class="name">grep + read agent</span>
+            <span class="value">220.6s &middot; 42.8k tokens &middot; 17 tool calls</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar red" data-width="100">32,000</div>
+            <div class="bench-bar blue" data-width="100">220.6s</div>
           </div>
         </div>
-
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_context (8K budget)</span>
-            <span class="value">8,000 tokens &middot; 121 entities packed</span>
+            <span class="name">sem agent (briefing + graph test selection)</span>
+            <span class="value">127.2s &middot; 40.5k tokens &middot; 14 tool calls</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="25">8,000</div>
+            <div class="bench-bar green" data-width="57.7">127.2s</div>
           </div>
         </div>
-
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem_context (4K budget)</span>
-            <span class="value">4,000 tokens &middot; 44 entities packed</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="12.5">4,000</div>
-          </div>
-        </div>
-
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Read just graph.rs</span>
-            <span class="value">~3,906 tokens &middot; 1 file, no cross-file deps</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar blue" data-width="12.2">3,906</div>
-          </div>
-        </div>
-
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem_context (2K budget)</span>
-            <span class="value">1,887 tokens &middot; target entity only</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="5.9">1,887</div>
-          </div>
-        </div>
+        <div class="bench-multiplier">42% faster to the same verified fix.</div>
       </div>
 
       <div class="insight">
-        <code style="color:var(--green)">sem_context</code> packs the target entity + all dependents + transitive signatures into a token budget. The agent gets the blast radius, not the whole repo. At 8K tokens, it fits 121 entities from across the codebase.
+        Where the 93 seconds went: the grep agent ran five whole test files (2,058 tests) to convince
+        itself nothing else broke. The sem agent ran the 6 tests the call graph said could reach the
+        change, plus its own reproduction script.
+      </div>
+
+      <div class="insight honest">
+        This is the best case, not the average. Across all clean pairs, end-to-end wall clock is
+        roughly at parity: sem won this task by 42%, lost another by 16% (its agent chose a bigger
+        fix scope), and older pairs without graph test selection ran 17-23% slower. The wins
+        concentrate where the task is navigation-heavy and the losses were never caused by sem's
+        latency, which stays in the tens of milliseconds.
       </div>
     </section>
 
-    <!-- Impact Precision -->
-    <section id="impact">
-      <h2>Impact precision</h2>
+    <!-- Verify loop -->
+    <section id="verify">
+      <h2>The verify loop</h2>
       <p class="section-desc">
-        "How many things break if <code style="color:var(--cyan)">EntityGraph</code> changes?"
+        Agents spend most of a fix task verifying: run tests, read failures, run again.
+        <code style="color:var(--green)">sem impact &lt;function&gt; --tests</code> walks the reverse
+        call graph and returns only the tests that can reach the changed function.
+        Measured on xarray (6,185 entities, 182 files), medians of 3 runs.
+      </p>
+
+      <div class="metric-vs">
+        <div class="metric-card baseline">
+          <div class="metric-number">2.90s</div>
+          <div class="metric-label">
+            per verify iteration<br>
+            whole test files, 826 tests
+          </div>
+        </div>
+        <div class="metric-card sem">
+          <div class="metric-number">0.59s</div>
+          <div class="metric-label">
+            per verify iteration<br>
+            16 graph-selected tests
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-group">
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Tests the agent runs per iteration, without sem</span>
+            <span class="value">826</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="100">826</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">Tests that can actually reach the change (sem)</span>
+            <span class="value">16 &middot; contained every hidden regression test</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="4" style="min-width: 32px;">16</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">4.9x faster per iteration. The selection was also correct: the 16 included every test the hidden grader ran.</div>
+      </div>
+
+      <div class="insight honest">
+        The multiplier is bimodal, and the deciding variable is whether real call-graph edges reach
+        the tests. When they do: 4.9x. When resolution falls back to lexical matching (namespace
+        calls like <code style="color:var(--fg)">xr.where(...)</code>): 1.2x. v0.18.0 closes part of
+        that gap by resolving repo-unique method names in dynamic languages, where receiver types
+        are statically unknowable. On a repo whose suite takes minutes instead of seconds, the
+        narrowing is worth proportionally more.
+      </div>
+    </section>
+
+    <!-- Understanding -->
+    <section id="understanding">
+      <h2>Code understanding tasks</h2>
+      <p class="section-desc">
+        Structural questions about an unfamiliar repo (who calls this, what breaks if it changes,
+        how did this function evolve), answered by paired agents to completion, correctness checked
+        against programmatic ground truth.
+      </p>
+
+      <div class="bench-group">
+        <h3>6-question structural quiz (pylint codebase)</h3>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">grep + read agent</span>
+            <span class="value">37s &middot; 100% correct</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="100">37s</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem agent</span>
+            <span class="value">13s &middot; 100% correct</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="35.1">13s</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">65% faster, same answers.</div>
+      </div>
+
+      <div class="bench-group">
+        <h3>16-question session, mixed navigation + history</h3>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">grep + read agent</span>
+            <span class="value">22s &middot; 100% correct</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar blue" data-width="100">22s</div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem agent</span>
+            <span class="value">10s &middot; 100% correct</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="45.5">10s</div>
+          </div>
+        </div>
+        <div class="bench-multiplier">55% faster, same answers.</div>
+      </div>
+
+      <div class="insight">
+        This is sem's home terrain. One <code style="color:var(--green)">sem context</code> call
+        returns a function's body plus its callers and callees, addressed by name; the grep agent
+        assembles the same picture from several searches and file reads, one turn each.
+      </div>
+    </section>
+
+    <!-- Impact precision -->
+    <section id="impact">
+      <h2>Questions grep cannot answer</h2>
+      <p class="section-desc">
+        "What is affected if <code style="color:var(--cyan)">EntityGraph</code> changes?"
       </p>
 
       <div class="metric-vs">
@@ -278,116 +393,77 @@
           <div class="metric-number">30</div>
           <div class="metric-label">
             <code style="color:var(--blue)">grep EntityGraph</code><br>
-            string matches (imports, comments, type annotations)
+            string matches: imports, comments, type annotations, no ranking, no transitivity
           </div>
         </div>
         <div class="metric-card sem">
           <div class="metric-number">304</div>
           <div class="metric-label">
-            <code style="color:var(--green)">sem_impact</code><br>
-            entities in the transitive dependency chain
-          </div>
-        </div>
-      </div>
-
-      <div class="bench-group">
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">grep results</span>
-            <span class="value">30 matches</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar blue" data-width="9.9">30</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem_impact (transitive)</span>
-            <span class="value">304 entities</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="100">304</div>
+            <code style="color:var(--green)">sem impact</code><br>
+            entities in the transitive dependency chain, deterministic, cross-file
           </div>
         </div>
       </div>
 
       <div class="insight">
-        grep finds string matches. <code style="color:var(--green)">sem_impact</code> walks the entity dependency graph and finds everything that transitively depends on the target. No hallucination, no false positives, no missed cross-file callers. In 56ms.
+        grep sees text. The graph sees structure: a caller twelve files away that never mentions the
+        target's name still shows up, because the edge is computed from the AST, not from string
+        matching. Resolving this on a 6,185-entity repo takes 264ms cold and ~10ms against a warm
+        session. No LLM anywhere in the pipeline, so the answer is the same every time.
       </div>
     </section>
 
-    <!-- Test Targeting -->
-    <section id="tests">
-      <h2>Test targeting</h2>
+    <!-- Tokens -->
+    <section id="tokens">
+      <h2>Tokens: parity, honestly</h2>
       <p class="section-desc">
-        "Which tests should I run after changing <code style="color:var(--cyan)">EntityGraph</code>?"
+        The claim you will not find here is "N% fewer tokens end to end." Full agent runs carry a
+        20-25k prompt and reasoning floor that no code tool touches, and edits require reading the
+        edit region in both worlds.
       </p>
 
-      <div class="metric-vs">
-        <div class="metric-card baseline">
-          <div class="metric-number">44</div>
-          <div class="metric-label">
-            <code style="color:var(--blue)">cargo test</code><br>
-            run everything
-          </div>
-        </div>
-        <div class="metric-card sem">
-          <div class="metric-number">24</div>
-          <div class="metric-label">
-            <code style="color:var(--green)">sem_impact(mode="tests")</code><br>
-            tests that actually depend on EntityGraph
-          </div>
-        </div>
-      </div>
-
       <div class="bench-group">
+        <h3>What test selection puts into context (xarray fix task)</h3>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">Run all tests</span>
-            <span class="value">44 tests</span>
+            <span class="name">Scanning test files to pick what to run</span>
+            <span class="value">489 KB of test corpus to sift</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar blue" data-width="100">44</div>
+            <div class="bench-bar blue" data-width="100">489 KB</div>
           </div>
         </div>
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_impact(mode="tests")</span>
-            <span class="value">24 tests</span>
+            <span class="name">sem impact --tests output, 4 calls</span>
+            <span class="value">999 bytes</span>
           </div>
           <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="54.5">24</div>
+            <div class="bench-bar green" data-width="0.5" style="min-width: 60px;">999 B</div>
           </div>
         </div>
       </div>
 
-      <div class="insight">
-        Impact analysis filtered to test entities. Agents know exactly which tests matter for their change. 45% fewer tests to run, zero guessing.
+      <div class="insight honest">
+        Measured whole-run token totals are at parity, with instrumented sessions showing a 25-35%
+        reduction in tool-result payloads, floor-bound by the edit-region reads both agents need.
+        If a code-intelligence tool tells you it halves your token bill, ask for their prompt floor.
       </div>
     </section>
 
-    <!-- Agent Accuracy -->
+    <!-- Structured diff comprehension -->
     <section id="accuracy">
-      <h2>Agent accuracy</h2>
+      <h2>Structured diffs, measured comprehension</h2>
       <p class="section-desc">
-        Same questions about code changes, answered by Claude Sonnet 4.5. One gets <code style="color:var(--green)">sem diff</code> JSON, the other gets raw <code style="color:var(--blue)">git diff</code>.
+        Same questions about a code change, answered by the same model. One gets
+        <code style="color:var(--green)">sem diff</code> JSON, the other raw
+        <code style="color:var(--blue)">git diff</code>.
       </p>
-
-      <div style="display: flex; gap: 14px; margin-bottom: 24px; font-size: 12px;">
-        <div style="display: flex; align-items: center; gap: 6px;">
-          <div style="width: 12px; height: 12px; border-radius: 2px; background: var(--green);"></div>
-          <span style="color: var(--dim);">sem diff</span>
-        </div>
-        <div style="display: flex; align-items: center; gap: 6px;">
-          <div style="width: 12px; height: 12px; border-radius: 2px; background: var(--blue);"></div>
-          <span style="color: var(--dim);">git diff</span>
-        </div>
-      </div>
 
       <div class="bench-group">
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">Q1: List added functions (F1)</span>
+            <span class="name">List added functions (F1)</span>
             <span class="value"><span style="color:var(--green)">93%</span> vs <span style="color:var(--blue)">75%</span></span>
           </div>
           <div class="bench-bar-track">
@@ -400,7 +476,7 @@
 
         <div class="bench-row" style="margin-top: 16px;">
           <div class="bench-label">
-            <span class="name">Q2: Files with modified entities (F1)</span>
+            <span class="name">Files with modified entities (F1)</span>
             <span class="value"><span style="color:var(--green)">100%</span> vs <span style="color:var(--blue)">55%</span></span>
           </div>
           <div class="bench-bar-track">
@@ -413,7 +489,7 @@
 
         <div class="bench-row" style="margin-top: 16px;">
           <div class="bench-label">
-            <span class="name">Q3: Entity type counts (accuracy)</span>
+            <span class="name">Entity type counts (accuracy)</span>
             <span class="value"><span style="color:var(--green)">91%</span> vs <span style="color:var(--blue)">13%</span></span>
           </div>
           <div class="bench-bar-track">
@@ -426,7 +502,7 @@
 
         <div class="bench-row" style="margin-top: 16px;">
           <div class="bench-label">
-            <span class="name">Q4: Added/modified/deleted counts (exact)</span>
+            <span class="name">Added/modified/deleted counts (exact)</span>
             <span class="value"><span style="color:var(--green)">100%</span> vs <span style="color:var(--blue)">22%</span></span>
           </div>
           <div class="bench-bar-track">
@@ -436,100 +512,32 @@
             <div class="bench-bar git-bar" data-width="22">22%</div>
           </div>
         </div>
+      </div>
 
-        <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline;">
-          <span style="font-size: 14px; color: var(--accent); font-weight: 600;">Overall average</span>
-          <span style="font-size: 13px;"><span style="color:var(--green)">96%</span> vs <span style="color:var(--blue)">41%</span></span>
-        </div>
-        <div class="bench-multiplier" style="margin-top: 8px;">+131% improvement with structured entity diffs.</div>
+      <div class="insight honest">
+        Scope note: this measures comprehension of a diff, not end-to-end task success. Models
+        summarize a change far more accurately from entity-level input than from raw hunks, which is
+        why <code style="color:var(--green)">sem diff</code> exists, but it does not by itself make
+        an agent fix more bugs. See the solve-rate pill up top.
       </div>
 
       <p style="font-size: 12px; color: var(--dim2); margin-top: 12px;">
-        <a href="agents.html" style="color: var(--dim);">See detailed findings and failure modes &rarr;</a>
+        <a href="agents.html" style="color: var(--dim);">Detailed findings and failure modes &rarr;</a>
       </p>
-    </section>
-
-    <!-- Graph Caching -->
-    <section id="caching">
-      <h2>Graph caching</h2>
-      <p class="section-desc">
-        Agents call multiple graph tools per session. Without caching, each tool rebuilds the entity graph from scratch.
-        With caching, the first call builds it once and every subsequent call reuses it.
-      </p>
-
-      <div class="metric-vs">
-        <div class="metric-card baseline">
-          <div class="metric-number">495ms</div>
-          <div class="metric-label">
-            5 graph calls<br>
-            no caching (separate processes)
-          </div>
-        </div>
-        <div class="metric-card sem">
-          <div class="metric-number">106ms</div>
-          <div class="metric-label">
-            5 graph calls<br>
-            in one session (memory cache)
-          </div>
-        </div>
-      </div>
-
-      <div class="bench-group">
-        <h3>6 tool calls: entities + diff + blame + impact + log + context</h3>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">Without caching (5 rebuilds)</span>
-            <span class="value">495ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar blue" data-width="100">495ms</div>
-          </div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">With caching (1 build + 4 cache hits)</span>
-            <span class="value" style="color: var(--green)">106ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="21.4">106ms</div>
-          </div>
-        </div>
-        <div class="bench-multiplier">4.7x faster. 389ms saved per session.</div>
-      </div>
-
-      <div class="speed-row">
-        <div class="speed-pill">
-          <span class="number">114ms</span>
-          <span class="label">cold start (no cache)</span>
-        </div>
-        <div class="speed-pill">
-          <span class="number">96ms</span>
-          <span class="label">SQLite warm start</span>
-        </div>
-        <div class="speed-pill">
-          <span class="number">21ms</span>
-          <span class="label">avg per call (cached)</span>
-        </div>
-      </div>
-
-      <div class="insight">
-        Two cache layers: in-memory (keyed by file manifest hash) and SQLite under the OS cache directory or <code style="color:var(--green)">SEM_CACHE_DIR</code>.
-        Memory cache serves sequential calls in the same session. SQLite cache survives process restarts.
-        If any file's mtime changes, the cache is invalidated and the graph rebuilds.
-      </div>
     </section>
 
     <!-- Latency -->
     <section id="latency">
-      <h2>Latency (per tool)</h2>
+      <h2>Tool latency</h2>
       <p class="section-desc">
-        Every tool, measured against sem's own codebase (48 Rust files). Single-process cold calls.
+        Cold single-process calls on sem's own codebase. With the resident session server, structural
+        queries answer from a warm graph in single-digit milliseconds.
       </p>
 
       <div class="bench-group" id="latency-bars">
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_entities</span>
+            <span class="name">sem entities</span>
             <span class="value">30ms</span>
           </div>
           <div class="bench-bar-track">
@@ -539,17 +547,7 @@
 
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_diff</span>
-            <span class="value">47ms</span>
-          </div>
-          <div class="bench-bar-track">
-            <div class="bench-bar green" data-width="34.6" style="min-width: 36px;">47ms</div>
-          </div>
-        </div>
-
-        <div class="bench-row">
-          <div class="bench-label">
-            <span class="name">sem_blame</span>
+            <span class="name">sem blame</span>
             <span class="value">40ms</span>
           </div>
           <div class="bench-bar-track">
@@ -559,7 +557,17 @@
 
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_log</span>
+            <span class="name">sem diff</span>
+            <span class="value">47ms</span>
+          </div>
+          <div class="bench-bar-track">
+            <div class="bench-bar green" data-width="34.6" style="min-width: 36px;">47ms</div>
+          </div>
+        </div>
+
+        <div class="bench-row">
+          <div class="bench-label">
+            <span class="name">sem log</span>
             <span class="value">85ms</span>
           </div>
           <div class="bench-bar-track">
@@ -569,7 +577,7 @@
 
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_impact</span>
+            <span class="name">sem impact</span>
             <span class="value">120ms</span>
           </div>
           <div class="bench-bar-track">
@@ -579,29 +587,62 @@
 
         <div class="bench-row">
           <div class="bench-label">
-            <span class="name">sem_context</span>
+            <span class="name">sem context</span>
             <span class="value">136ms</span>
           </div>
           <div class="bench-bar-track">
             <div class="bench-bar yellow" data-width="100" style="min-width: 42px;">136ms</div>
           </div>
         </div>
-
       </div>
 
-      <p style="font-size: 11px; color: var(--dim2); margin-top: 24px;">
-        Cold per-process calls. In a live session with graph caching, graph tools (impact, context) average 21ms after the first call.
+      <div class="speed-row">
+        <div class="speed-pill">
+          <span class="number">264ms</span>
+          <span class="label">impact, 6,185-entity repo, cold</span>
+        </div>
+        <div class="speed-pill">
+          <span class="number">~10ms</span>
+          <span class="label">warm session queries</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Methodology -->
+    <section id="methodology">
+      <h2>Methodology and limits</h2>
+      <p class="section-desc">
+        How these numbers were produced, and what they do not claim.
       </p>
+
+      <div class="insight">
+        <strong style="color:var(--fg)">Setup.</strong> Paired agents, identical model and prompts,
+        real repositories checked out at the buggy commit, tasks taken verbatim from GitHub issues
+        (SWE-bench Verified instances, seeded random order). The grep agent is restricted to grep,
+        glob, and file reads. The sem agent may not use grep for structural questions. Fixes are
+        graded by hidden tests applied after the agent finishes. Session acceleration (prewarm,
+        residency) is disabled during runs on both sides.
+      </div>
+
+      <div class="insight honest" style="margin-top: 12px;">
+        <strong style="color:var(--fg)">What sem does not do.</strong> It does not raise solve rate:
+        correctness stayed with the model in every pair. It does not replace grep for strings, error
+        messages, or config keys, and never will. Dynamic dispatch in Python resolves only when the
+        method name is repo-unique. Briefing and test-selection quality decide whether a given task
+        sees the 5x mode or the 1x mode, and we say so rather than quoting the best number alone.
+      </div>
     </section>
 
     <footer>
       <p style="margin-bottom: 12px; font-size: 13px; color: var(--dim);">
-        All numbers from sem's own codebase. <code style="color:var(--dim)">bench_mcp.sh</code> reproduces everything.
+        Numbers dated July 2026, produced on paired agent runs against public repos.
       </p>
       <p style="margin-bottom: 8px;">
         <a href="agents.html">Agent Accuracy</a>
         &nbsp;&middot;&nbsp;
         <a href="details.html">Details</a>
+        &nbsp;&middot;&nbsp;
+        <a href="first-principles.html">First Principles</a>
         &nbsp;&middot;&nbsp;
         <a href="cloud-consent.html">Cloud Consent</a>
         &nbsp;&middot;&nbsp;

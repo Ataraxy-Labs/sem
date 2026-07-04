@@ -1,6 +1,6 @@
 [package]
 name = "sem-cli"
-version = "0.11.1"
+version = "0.18.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Semantic version control CLI. Shows what entities changed (functions, classes, methods) instead of lines."
@@ -15,8 +15,9 @@ name = "sem"
 path = "src/main.rs"
 
 [dependencies]
-sem-core = { path = "../sem-core", version = "0.11.1" }
-sem-mcp = { path = "../sem-mcp", version = "0.11.1" }
+sem-core = { path = "../sem-core", version = "0.18.0" }
+sem-mcp = { path = "../sem-mcp", version = "0.18.0" }
+sem-cloud-client = { path = "../sem-cloud-client", version = "0.18.0" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
@@ -25,7 +26,9 @@ git2 = "0.20"
 ignore = "0.4"
 openssl-sys = { version = "0.9", optional = true }
 serde_json = "1"
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1.10"
 clap_complete_command = "0.6.1"
 mimalloc = "0.1"
 ureq = { version = "2", features = ["json"] }
@@ -50,6 +53,12 @@ pkg-url = "{ repo }/releases/download/v{ version }/sem-windows-x86_64.zip"
 pkg-fmt = "zip"
 
 [features]
+default = ["self-update"]
+# Built-in `sem update` (downloads and replaces the binary) and the background
+# update-available check. On by default for the curl/npm installs; distro and
+# package-manager builds that own the binary lifecycle can opt out with
+# `--no-default-features` so the binary never tries to update itself.
+self-update = []
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dev-dependencies]

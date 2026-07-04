@@ -45,6 +45,10 @@ pub fn structural_hash_excluding_range(
 /// Zero allocations: hashes directly from source byte slices.
 fn hash_structural_tokens(root: Node, source: &[u8], hasher: &mut Xxh3) {
     let mut worklist = vec![root];
+    // One cursor reused for the whole traversal instead of `node.walk()` per
+    // internal node, and children are pushed in place instead of collected into
+    // a fresh Vec per node — the two per-node allocations the old code paid.
+    let mut cursor = root.walk();
     while let Some(node) = worklist.pop() {
         let kind = node.kind();
 
@@ -70,11 +74,10 @@ fn hash_structural_tokens(root: Node, source: &[u8], hasher: &mut Xxh3) {
             // e.g. `x = foo(bar)` vs `foo(bar) = x` have same leaves but different structure.
             hasher.write(kind.as_bytes());
             hasher.write(b":");
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push(child);
-            }
+            // Push children in source order, then reverse just the appended
+            // slice so `pop()` yields them in source order — identical traversal
+            // (and identical hash) to the previous `children.rev()` push.
+            push_children_reversed(&mut cursor, node, &mut worklist);
         }
     }
 }
@@ -89,6 +92,7 @@ fn hash_structural_tokens_excluding(
     exclude_end: usize,
 ) {
     let mut worklist = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = worklist.pop() {
         let kind = node.kind();
 
@@ -114,20 +118,46 @@ fn hash_structural_tokens_excluding(
         } else {
             hasher.write(kind.as_bytes());
             hasher.write(b":");
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            for child in children.into_iter().rev() {
-                worklist.push(child);
+            push_children_reversed(&mut cursor, node, &mut worklist);
+        }
+    }
+}
+
+/// Push `node`'s children onto `worklist` such that a subsequent `pop()`
+/// sequence yields them in source (first-to-last) order, without allocating a
+/// per-node Vec. Children are appended in source order, then the appended tail
+/// is reversed in place. Equivalent to the previous
+/// `node.children(&mut cursor).collect::<Vec<_>>().into_iter().rev()`.
+#[inline]
+fn push_children_reversed<'a>(
+    cursor: &mut tree_sitter::TreeCursor<'a>,
+    node: Node<'a>,
+    worklist: &mut Vec<Node<'a>>,
+) {
+    let base = worklist.len();
+    cursor.reset(node);
+    if cursor.goto_first_child() {
+        loop {
+            worklist.push(cursor.node());
+            if !cursor.goto_next_sibling() {
+                break;
             }
         }
     }
+    worklist[base..].reverse();
 }
 
 /// Trim leading/trailing ASCII whitespace from a byte slice without allocating.
 #[inline]
 fn trim_bytes(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
-    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
     &bytes[start..end]
 }
 

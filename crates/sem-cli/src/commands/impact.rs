@@ -3,7 +3,9 @@ use std::{collections::HashSet, path::Path};
 use colored::Colorize;
 use sem_core::git::bridge::GitBridge;
 use sem_core::parser::graph::{EntityGraph, EntityInfo};
+use sem_mcp::cache::CacheSourceScope;
 
+use crate::cache::{CachedImpactError, CachedImpactMode, CachedImpactResult, DiskCache};
 use crate::timings::Timings;
 
 pub struct ImpactOptions {
@@ -19,6 +21,7 @@ pub struct ImpactOptions {
     pub no_default_excludes: bool,
 }
 
+#[derive(Clone, Copy)]
 pub enum ImpactMode {
     All,
     Deps,
@@ -47,6 +50,12 @@ fn build_with_spinner<T>(
 }
 
 pub fn impact_command(opts: ImpactOptions) {
+    // A resident server beats the cloud path on both freshness and latency,
+    // so the sidecar goes first.
+    if try_sidecar_impact(&opts) {
+        return;
+    }
+
     if super::cloud::try_cloud_impact(&opts).is_some() {
         return;
     }
@@ -61,6 +70,41 @@ pub fn impact_command(opts: ImpactOptions) {
     let registry = super::create_registry(&root.to_string_lossy());
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let source_scope =
+        super::graph::cache_source_scope(root, &ext_filter, opts.no_default_excludes);
+    let file_hint = opts
+        .file_hint
+        .as_deref()
+        .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+    let cache_first_entity_scope = opts.entity_id.is_some() || file_hint.is_some();
+
+    if !opts.no_cache
+        && matches!(opts.mode, ImpactMode::Deps)
+        && matches!(source_scope, CacheSourceScope::Default)
+        && cache_first_entity_scope
+    {
+        match DiskCache::open(root) {
+            Ok(disk) => {
+                timings.mark("cache_open");
+                if try_cached_impact_query(
+                    &disk,
+                    root,
+                    &[],
+                    &opts,
+                    file_hint.as_deref(),
+                    source_scope,
+                    true,
+                    &mut timings,
+                ) {
+                    return;
+                }
+            }
+            Err(_) => {
+                timings.mark("cache_open_failed");
+            }
+        }
+    }
+
     let file_paths = super::graph::find_supported_files_with_options(
         root,
         &registry,
@@ -69,10 +113,28 @@ pub fn impact_command(opts: ImpactOptions) {
     );
     timings.mark("file_discovery");
 
-    let file_hint = opts
-        .file_hint
-        .as_deref()
-        .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+    if !opts.no_cache {
+        match DiskCache::open(root) {
+            Ok(disk) => {
+                timings.mark("cache_open");
+                if try_cached_impact_query(
+                    &disk,
+                    root,
+                    &file_paths,
+                    &opts,
+                    file_hint.as_deref(),
+                    source_scope,
+                    false,
+                    &mut timings,
+                ) {
+                    return;
+                }
+            }
+            Err(_) => {
+                timings.mark("cache_open_failed");
+            }
+        }
+    }
 
     match opts.mode {
         ImpactMode::Deps => {
@@ -88,6 +150,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                             move |entity| {
                                 if let Some(id) = entity_id.as_deref() {
@@ -111,6 +174,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     }
@@ -137,6 +201,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     } else {
@@ -145,6 +210,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     }
@@ -171,6 +237,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     },
@@ -244,6 +311,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &file_paths,
                             &registry,
                             opts.no_cache,
+                            source_scope,
                             &mut timings,
                         )
                     },
@@ -282,6 +350,138 @@ pub fn impact_command(opts: ImpactOptions) {
     super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
 }
 
+/// The wire shape of the sidecar's `impact` op — real serialized `EntityInfo`s,
+/// so this deserializes into the exact structs the cached-result printers
+/// consume and fast-path output is identical to local output.
+#[derive(serde::Deserialize)]
+struct SidecarImpactResult {
+    entity: EntityInfo,
+    dependencies: Vec<EntityInfo>,
+    dependents: Vec<EntityInfo>,
+    impact: Vec<(EntityInfo, usize)>,
+    tests: Vec<EntityInfo>,
+}
+
+/// Fast path: answer from the resident server's warm graph via its unix
+/// socket, skipping this process's cache open + hydrate. Only for queries the
+/// server can answer with identical semantics: default source scope, resolve
+/// by name. Everything else — and any sidecar miss, error, or ambiguity —
+/// falls back to the normal local path and its richer diagnostics.
+fn try_sidecar_impact(opts: &ImpactOptions) -> bool {
+    if opts.no_cache
+        || opts.no_default_excludes
+        || !opts.file_exts.is_empty()
+        || opts.entity_id.is_some()
+    {
+        return false;
+    }
+    let Some(name) = opts.entity_name.as_deref() else {
+        return false;
+    };
+    let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
+        return false;
+    };
+    let root = git.repo_root().to_path_buf();
+    // A .semignore means this repo's default scope is custom; the resident
+    // server may not share it, so stay local (mirrors cache_source_scope).
+    if root.join(".semignore").exists() {
+        return false;
+    }
+
+    let mut request = serde_json::json!({ "op": "impact", "name": name, "depth": opts.depth });
+    if let Some(file) = opts.file_hint.as_deref() {
+        request["file"] = serde_json::json!(super::normalize_repo_relative_path(
+            Path::new(&opts.cwd),
+            &root,
+            file
+        ));
+    }
+
+    let Some(response) = super::sidecar::query(&root, &request) else {
+        return false;
+    };
+    let Some(result) = response.get("result") else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_value::<SidecarImpactResult>(result.clone()) else {
+        return false;
+    };
+
+    // An empty tests answer is not authoritative: graph edges miss
+    // namespace-attribute calls ("xr.where"), and the full local path has a
+    // lexical fallback for exactly that. Fall through instead of printing
+    // "No tests found" from the fast path.
+    if matches!(opts.mode, ImpactMode::Tests | ImpactMode::All) && parsed.tests.is_empty() {
+        return false;
+    }
+    let cached = CachedImpactResult {
+        entity: parsed.entity,
+        dependencies: parsed.dependencies,
+        dependents: parsed.dependents,
+        impact: parsed.impact,
+        tests: parsed.tests,
+        tests_truncated: false,
+    };
+    print_cached_result(&cached, opts.mode, opts.json, opts.depth);
+    true
+}
+
+fn try_cached_impact_query(
+    disk: &DiskCache,
+    root: &Path,
+    file_paths: &[String],
+    opts: &ImpactOptions,
+    file_hint: Option<&str>,
+    source_scope: CacheSourceScope,
+    cache_first: bool,
+    timings: &mut Timings,
+) -> bool {
+    match disk.query_impact_topology(
+        root,
+        file_paths,
+        source_scope,
+        cache_first,
+        opts.entity_name.as_deref(),
+        opts.entity_id.as_deref(),
+        file_hint,
+        cached_mode_for(opts.mode),
+        opts.depth,
+    ) {
+        Ok(Some(result)) => {
+            timings.mark("cache_topology_impact_query");
+            // Empty tests from the cache is not authoritative (namespace
+            // calls have no edges; older caches lack test flags/content).
+            // Fall through to the full path, which has a lexical fallback.
+            if matches!(opts.mode, ImpactMode::Tests) && result.tests.is_empty() {
+                timings.mark("cache_tests_empty_fallthrough");
+                return false;
+            }
+            print_cached_result(&result, opts.mode, opts.json, opts.depth);
+            timings.mark("cli_output_serialization");
+            timings.finish();
+            true
+        }
+        Ok(None) => {
+            timings.mark("cache_topology_impact_miss");
+            false
+        }
+        Err(CachedImpactError::CacheReadFailed) => {
+            timings.mark("cache_topology_impact_query_failed");
+            false
+        }
+        Err(err) => print_cached_error(err),
+    }
+}
+
+fn cached_mode_for(mode: ImpactMode) -> CachedImpactMode {
+    match mode {
+        ImpactMode::All => CachedImpactMode::All,
+        ImpactMode::Deps => CachedImpactMode::Deps,
+        ImpactMode::Dependents => CachedImpactMode::Dependents,
+        ImpactMode::Tests => CachedImpactMode::Tests,
+    }
+}
+
 fn find_entity<'a>(
     graph: &'a EntityGraph,
     name: Option<&str>,
@@ -308,7 +508,7 @@ fn find_entity<'a>(
     let mut matching: Vec<_> = graph
         .entities
         .values()
-        .filter(|e| super::entity_matches_query(e, name))
+        .filter(|e| super::entity_matches_qualified(graph, e, name))
         .collect();
 
     if matching.is_empty() {
@@ -370,6 +570,10 @@ fn entity_list_json(entities: &[&sem_core::parser::graph::EntityInfo]) -> Vec<se
     entities.iter().map(|e| entity_json(*e)).collect()
 }
 
+fn owned_entity_list_json(entities: &[EntityInfo]) -> Vec<serde_json::Value> {
+    entities.iter().map(entity_json).collect()
+}
+
 fn print_entity_header(e: &sem_core::parser::graph::EntityInfo) {
     println!(
         "{} {} {} ({}:{}–{})",
@@ -380,6 +584,335 @@ fn print_entity_header(e: &sem_core::parser::graph::EntityInfo) {
         e.start_line,
         e.end_line,
     );
+}
+
+fn print_cached_result(result: &CachedImpactResult, mode: ImpactMode, json: bool, depth: usize) {
+    match mode {
+        ImpactMode::Deps => {
+            print_cached_deps(&result.entity, &result.dependencies, json);
+        }
+        ImpactMode::Dependents => {
+            print_cached_dependents(&result.entity, &result.dependents, json);
+        }
+        ImpactMode::Tests => {
+            print_cached_tests(&result.entity, &result.tests, result.tests_truncated, json);
+        }
+        ImpactMode::All => {
+            print_cached_all(result, json, depth);
+        }
+    }
+}
+
+fn print_cached_deps(entity: &EntityInfo, deps: &[EntityInfo], json: bool) {
+    if json {
+        let output = serde_json::json!({
+            "entity": entity_json(entity),
+            "dependencies": owned_entity_list_json(deps),
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        print_entity_header(entity);
+        if deps.is_empty() {
+            println!("\n  {} {}", "✓".green().bold(), "No dependencies.".dimmed());
+        } else {
+            println!("\n  {} {}", "→".blue(), "depends on:".dimmed());
+            for dep in deps {
+                println!(
+                    "    {} {} {} ({})",
+                    "→".blue(),
+                    dep.entity_type.dimmed(),
+                    dep.name.bold(),
+                    dep.file_path.dimmed(),
+                );
+            }
+        }
+        println!();
+    }
+}
+
+fn print_cached_dependents(entity: &EntityInfo, dependents: &[EntityInfo], json: bool) {
+    if json {
+        let output = serde_json::json!({
+            "entity": entity_json(entity),
+            "dependents": owned_entity_list_json(dependents),
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        print_entity_header(entity);
+        if dependents.is_empty() {
+            println!("\n  {} {}", "✓".green().bold(), "No dependents.".dimmed());
+        } else {
+            println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
+            for dep in dependents {
+                println!(
+                    "    {} {} {} ({})",
+                    "←".yellow(),
+                    dep.entity_type.dimmed(),
+                    dep.name.bold(),
+                    dep.file_path.dimmed(),
+                );
+            }
+        }
+        println!();
+    }
+}
+
+fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool, json: bool) {
+    if json {
+        let mut output = serde_json::json!({
+            "entity": entity_json(entity),
+            "tests": owned_entity_list_json(tests),
+        });
+        if truncated {
+            output
+                .as_object_mut()
+                .unwrap()
+                .insert("testsTruncated".to_string(), serde_json::json!(true));
+        }
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        print_entity_header(entity);
+        if tests.is_empty() {
+            println!("\n  {} {}", "✓".green().bold(), "No tests found.".dimmed());
+        } else {
+            println!(
+                "\n  {} {}",
+                "⚡".yellow(),
+                format!("{} tests affected:", tests.len()).bold()
+            );
+            let mut by_file: std::collections::HashMap<&str, Vec<_>> =
+                std::collections::HashMap::new();
+            for test in tests {
+                by_file
+                    .entry(test.file_path.as_str())
+                    .or_default()
+                    .push(test);
+            }
+            let mut files: Vec<_> = by_file.keys().copied().collect();
+            files.sort();
+            for file in files {
+                println!("    {}", file.bold());
+                let mut entities = by_file[file].clone();
+                entities.sort_by_key(|test| test.start_line);
+                for test in entities {
+                    println!(
+                        "      {} {} (L{}–{})",
+                        test.entity_type.dimmed(),
+                        test.name.bold(),
+                        test.start_line,
+                        test.end_line,
+                    );
+                }
+            }
+        }
+        print_cached_tests_truncation_warning(truncated);
+        println!();
+    }
+}
+
+fn print_cached_tests_truncation_warning(truncated: bool) {
+    if truncated {
+        println!(
+            "\n  {} {}",
+            "warning:".yellow().bold(),
+            "Cached test impact reached its traversal limit; results may be incomplete.".yellow()
+        );
+    }
+}
+
+fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
+    if json {
+        let impact_entities: Vec<serde_json::Value> = result
+            .impact
+            .iter()
+            .map(|(entity, depth)| {
+                let mut value = entity_json(entity);
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("depth".to_string(), serde_json::json!(depth));
+                value
+            })
+            .collect();
+        let mut output = serde_json::json!({
+            "entity": entity_json(&result.entity),
+            "dependencies": owned_entity_list_json(&result.dependencies),
+            "dependents": owned_entity_list_json(&result.dependents),
+            "impact": {
+                "depth": depth,
+                "total": result.impact.len(),
+                "entities": impact_entities,
+            },
+            "tests": owned_entity_list_json(&result.tests),
+        });
+        if result.tests_truncated {
+            output
+                .as_object_mut()
+                .unwrap()
+                .insert("testsTruncated".to_string(), serde_json::json!(true));
+        }
+        println!("{}", serde_json::to_string(&output).unwrap());
+        return;
+    }
+
+    print_entity_header(&result.entity);
+
+    if !result.dependencies.is_empty() {
+        println!("\n  {} {}", "→".blue(), "depends on:".dimmed());
+        for dep in &result.dependencies {
+            println!(
+                "    {} {} {} ({})",
+                "→".blue(),
+                dep.entity_type.dimmed(),
+                dep.name.bold(),
+                dep.file_path.dimmed(),
+            );
+        }
+    }
+
+    if !result.dependents.is_empty() {
+        println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
+        for dep in &result.dependents {
+            println!(
+                "    {} {} {} ({})",
+                "←".yellow(),
+                dep.entity_type.dimmed(),
+                dep.name.bold(),
+                dep.file_path.dimmed(),
+            );
+        }
+    }
+
+    if result.impact.is_empty() {
+        println!(
+            "\n  {} {}",
+            "✓".green().bold(),
+            "No other entities are affected by changes to this entity.".dimmed()
+        );
+    } else {
+        let max_depth_seen = result
+            .impact
+            .iter()
+            .map(|(_, depth)| *depth)
+            .max()
+            .unwrap_or(0);
+        let depth_label = if depth == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("depth {}", depth)
+        };
+        println!(
+            "\n  {} {}",
+            "!".red().bold(),
+            format!(
+                "{} entities transitively affected ({}):",
+                result.impact.len(),
+                depth_label
+            )
+            .red(),
+        );
+
+        for current_depth in 1..=max_depth_seen {
+            let at_depth: Vec<_> = result
+                .impact
+                .iter()
+                .filter(|(_, depth)| *depth == current_depth)
+                .map(|(entity, _)| entity)
+                .collect();
+            if at_depth.is_empty() {
+                continue;
+            }
+
+            let label = if current_depth == 1 {
+                "Direct dependents".to_string()
+            } else {
+                format!("Depth {}", current_depth)
+            };
+            println!("\n    {} ({})", label.bold(), at_depth.len());
+            for entity in at_depth {
+                println!(
+                    "      {} {} {} ({}:L{})",
+                    "→".red(),
+                    entity.entity_type.dimmed(),
+                    entity.name.bold(),
+                    entity.file_path.dimmed(),
+                    entity.start_line,
+                );
+            }
+        }
+    }
+
+    if !result.tests.is_empty() {
+        println!(
+            "\n  {} {}",
+            "⚡".yellow(),
+            format!("{} tests affected:", result.tests.len()).bold()
+        );
+        for test in &result.tests {
+            println!(
+                "    {} {} ({})",
+                test.entity_type.dimmed(),
+                test.name.bold(),
+                test.file_path.dimmed(),
+            );
+        }
+    }
+    print_cached_tests_truncation_warning(result.tests_truncated);
+
+    println!();
+}
+
+fn print_cached_error(error: CachedImpactError) -> ! {
+    match error {
+        CachedImpactError::CacheReadFailed => {
+            eprintln!(
+                "{} Failed to read the cached impact graph",
+                "error:".red().bold()
+            );
+        }
+        CachedImpactError::MissingEntityQuery => {
+            eprintln!(
+                "{} Either entity name or --entity-id is required",
+                "error:".red().bold()
+            );
+        }
+        CachedImpactError::EntityIdNotFound(id) => {
+            eprintln!("{} Entity ID '{}' not found", "error:".red().bold(), id);
+        }
+        CachedImpactError::EntityNotFound(name) => {
+            eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
+        }
+        CachedImpactError::EntityNotFoundInFile { name, file } => {
+            eprintln!(
+                "{} Entity '{}' not found in file '{}'",
+                "error:".red().bold(),
+                name,
+                file
+            );
+        }
+        CachedImpactError::AmbiguousEntity { name, mut matches } => {
+            matches.sort_by_key(|entity| {
+                (
+                    entity.file_path.clone(),
+                    entity.start_line,
+                    entity.id.clone(),
+                )
+            });
+            eprintln!(
+                "{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:",
+                "error:".red().bold(),
+                name,
+                matches.len()
+            );
+            for entity in &matches {
+                eprintln!(
+                    "  {} {} ({}:L{})",
+                    entity.entity_type, entity.id, entity.file_path, entity.start_line
+                );
+            }
+        }
+    }
+    std::process::exit(1);
 }
 
 fn print_deps(graph: &EntityGraph, entity: &sem_core::parser::graph::EntityInfo, json: bool) {
@@ -448,7 +981,62 @@ fn print_tests(
     custom_test_dirs: &[String],
 ) {
     let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
-    print_tests_result(entity, &tests, json);
+    if !tests.is_empty() {
+        print_tests_result(entity, &tests, json);
+        return;
+    }
+    // Graph edges can miss tests that call the target through a module
+    // namespace ("xr.where(...)"): the attribute call resolves to no entity.
+    // Fall back to lexical reachability — test bodies naming the entity as a
+    // word — and say so, since it is weaker evidence than a call edge.
+    let test_ids = graph.filter_test_entities_with_custom_dirs(all_entities, custom_test_dirs);
+    let owned: Vec<EntityInfo> = all_entities
+        .iter()
+        .filter(|e| test_ids.contains(&e.id) && word_hit(&e.content, &entity.name))
+        .map(|e| EntityInfo {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            entity_type: e.entity_type.clone(),
+            file_path: e.file_path.clone(),
+            parent_id: e.parent_id.clone(),
+            start_line: e.start_line,
+            end_line: e.end_line,
+        })
+        .collect();
+    if !owned.is_empty() && !json {
+        println!(
+            "{}",
+            "  (no call-graph edges reach tests; lexical fallback — test bodies naming the entity)"
+                .dimmed()
+        );
+    }
+    let refs: Vec<&EntityInfo> = owned.iter().collect();
+    print_tests_result(entity, &refs, json);
+}
+
+/// True when `name` appears in `body` as a whole word (not as a substring of
+/// a longer identifier).
+pub(crate) fn word_hit(body: &str, name: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = body[start..].find(name) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !body[..abs]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let after = abs + name.len();
+        let after_ok = after >= body.len()
+            || !body[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + name.len();
+    }
+    false
 }
 
 fn print_tests_with_ids(

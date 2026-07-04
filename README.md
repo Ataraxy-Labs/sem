@@ -54,6 +54,12 @@ Or via Homebrew:
 brew install sem-cli
 ```
 
+Or via winget on Windows:
+
+```powershell
+winget install AtaraxyLabs.sem
+```
+
 Or install the npm wrapper into `node_modules`:
 
 ```bash
@@ -176,7 +182,7 @@ sem impact authenticateUser --json
 # Disambiguate by file
 sem impact authenticateUser --file src/auth.ts
 
-# Include generated/build directories that repo-wide scans skip by default
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
 sem impact authenticateUser --no-default-excludes
 ```
 
@@ -208,6 +214,18 @@ sem log authenticateUser --limit 20
 sem log authenticateUser --json
 ```
 
+With no entity, `sem log` analyzes recent repo history at the entity level:
+**hotspots** (most-changed functions/classes, with author counts) and
+**co-change pairs** (entities that repeatedly change in the same commits —
+"if you touch one, don't forget the other"):
+
+```bash
+sem log                 # repo hotspots + co-change pairs (last 50 commits)
+sem log --limit 200     # deeper history
+sem log --file src/auth.ts   # scoped to one file
+sem log --json          # full data
+```
+
 ### sem entities
 
 List all entities under a file or directory path. No path is the same as `.`.
@@ -223,7 +241,7 @@ sem entities src/auth.ts
 sem entities --json
 sem entities src/auth.ts --json
 
-# Include generated/build directories that repo-wide scans skip by default
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
 sem entities --no-default-excludes
 ```
 
@@ -241,7 +259,7 @@ sem context authenticateUser --budget 4000
 # JSON output
 sem context authenticateUser --json
 
-# Include generated/build directories that repo-wide scans skip by default
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
 sem context authenticateUser --no-default-excludes
 ```
 
@@ -255,15 +273,57 @@ sem setup
 
 Now `git diff` shows entity-level changes instead of line-level. No prompts, no agent configuration needed. Everything that calls `git diff` gets sem output automatically. Also installs a pre-commit hook that shows entity-level blast radius of staged changes.
 
-To disable and go back to normal git diff:
+On macOS and Linux, `sem setup` also wires sem into your Claude Code sessions (free, local, no login): a **warm resident graph** so structural queries answer in single-digit milliseconds instead of rebuilding each time, and **prompt-time context** so the code an agent would otherwise forage for arrives at the start of the turn. It edits `~/.claude/settings.json` idempotently, backs it up first, and leaves any hooks you already have untouched.
+
+To disable and go back to normal git diff (also removes the session hooks):
 
 ```bash
 sem unsetup
 ```
 
+## Entity-level diffs on every pull request
+
+Add the GitHub Action and every PR gets one sticky comment showing which
+functions, classes, and methods changed — updated in place on each push, and
+calling out cosmetic-only PRs (formatting/comments) explicitly:
+
+```yaml
+# .github/workflows/entity-diff.yml
+name: Entity diff
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  entity-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Ataraxy-Labs/sem/action@v0.15.1
+```
+
+No config, no API keys, never fails your build. See [action/](action/) for details.
+
+## Cloud acceleration (for scale and teams)
+
+Local is always free and, after `sem setup`, always warm — the resident graph keeps your repo hot on your own machine, so day-to-day queries are instant with no login. You do not pay to make your laptop fast.
+
+Cloud is for what a laptop can't do. On a very large monorepo the first local graph build can take a few seconds; a shared team graph shouldn't be rebuilt per developer; and CI wants the graph without checking anything out. `sem login` connects those cases to sem cloud, which keeps a warm, pre-built graph for your registered repos and serves the heavy queries from it (on a large repo like deno, an `impact` query is ~86ms from the cloud vs ~573ms rebuilt locally).
+
+```bash
+sem login                              # GitHub device flow, one time
+sem impact myFunc --file src/foo.rs    # served from the cloud's warm graph
+```
+
+It is fully optional and transparent:
+
+- Not logged in, or the cloud is unreachable? sem computes locally and prints the exact same output. No failures, no difference in results.
+- `SEM_LOCAL=1` forces local computation even when logged in.
+- Small repos see no change, local is already fast. The win is for large codebases where rebuilding the graph each time is the bottleneck.
+
 ## What it parses
 
-31 programming languages with full entity extraction via tree-sitter:
+32 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -281,6 +341,8 @@ sem unsetup
 | Swift | `.swift` | functions, classes, protocols, structs, enums, properties |
 | Elixir | `.ex` `.exs` | modules, functions, macros, guards, protocols |
 | Bash | `.sh` | functions |
+| Fish | `.fish` | functions |
+| Lua | `.lua` | functions (global, local, table, and method forms) |
 | HCL/Terraform | `.hcl` `.tf` `.tfvars` | blocks, attributes (qualified names for nested blocks) |
 | Kotlin | `.kt` `.kts` | classes, interfaces, objects, functions, properties, companion objects |
 | Fortran | `.f90` `.f95` `.f` | functions, subroutines, modules, programs |
@@ -349,6 +411,12 @@ Add it once, then talk to your agent normally. It calls the tools on its own.
 
 ```bash
 claude mcp add sem -- sem mcp
+```
+
+Or one command that also installs the skill, so the agent knows *when* to reach for sem:
+
+```bash
+npx @ataraxy-labs/sem-skill
 ```
 
 **Cursor, Claude Desktop, or any client with an `mcpServers` config:**

@@ -1,6 +1,6 @@
 [package]
 name = "sem-core"
-version = "0.11.1"
+version = "0.18.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 28 languages via tree-sitter and diffs at the entity level."
@@ -34,6 +34,8 @@ grammar-all = [
     "lang-edn",
     "lang-d",
     "lang-sql",
+    "lang-lua",
+    "lang-fish",
 ]
 
 # Individual grammar features
@@ -69,6 +71,8 @@ lang-clojure = ["dep:tree-sitter-clojure-orchard"]
 lang-edn = ["dep:tree-sitter-clojure-orchard"]
 lang-d = ["dep:tree-sitter-d"]
 lang-sql = ["dep:tree-sitter-sequel"]
+lang-lua = ["dep:tree-sitter-lua"]
+lang-fish = ["dep:tree-sitter-fish"]
 
 [dependencies]
 git2 = { version = "0.20", optional = true }
@@ -115,6 +119,9 @@ tree-sitter-haskell = { version = "0.23", optional = true }
 tree-sitter-elm = { version = "5.9", optional = true }
 tree-sitter-clojure-orchard = { version = "0.2.5", optional = true }
 tree-sitter-d = { version = "0.8.2", optional = true }
+tree-sitter-lua = { version = "0.5.0", optional = true }
+tree-sitter-fish = { version = "3.6", optional = true }
+rustc-hash = "2"
 
 [dev-dependencies]
 tempfile = "3.24.0"

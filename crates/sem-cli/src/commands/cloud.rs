@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -65,6 +65,84 @@ pub fn load_credentials() -> Option<CloudCredentials> {
     let path = credentials_path()?;
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+// ─── Cloud conversion nudge ─────────────────────────────────────────────────
+
+/// After a `sem diff` that had real entity changes, print one dimmed line
+/// suggesting `sem login` to see what those changes break across repos — a
+/// cross-repo question a local single-repo diff cannot answer. Heavily
+/// guard-railed so it can never become noise:
+///   * silent when there were no entity changes,
+///   * silent unless stderr is an interactive terminal (skips CI, pipes, agents),
+///   * silent when already logged in,
+///   * shown at most once a week (throttled via `~/.sem/.login_hint`).
+///
+/// Printed to stderr so it never pollutes stdout / piped / `--json` output.
+pub fn maybe_suggest_cloud_after_diff(entity_changes: usize) {
+    if entity_changes == 0 {
+        return;
+    }
+    if !io::stderr().is_terminal() {
+        return;
+    }
+    if load_credentials().is_some() {
+        return;
+    }
+    if !login_hint_due() {
+        return;
+    }
+    let noun = if entity_changes == 1 {
+        "entity"
+    } else {
+        "entities"
+    };
+    eprintln!(
+        "{} {} changed. {} to see what they break across your repos.",
+        "↗".cyan(),
+        format!("{entity_changes} {noun}").dimmed(),
+        "sem login".cyan().bold(),
+    );
+    mark_login_hint_shown();
+}
+
+fn login_hint_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".sem").join(".login_hint"))
+}
+
+/// True if the hint hasn't been shown in the last week (or ever).
+fn login_hint_due() -> bool {
+    const THROTTLE_SECS: u64 = 7 * 24 * 3600;
+    let Some(path) = login_hint_path() else {
+        return false;
+    };
+    match fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(last) => now_secs().saturating_sub(last) >= THROTTLE_SECS,
+        None => true,
+    }
+}
+
+fn mark_login_hint_shown() {
+    let Some(path) = login_hint_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(&path, now_secs().to_string());
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ─── sem login ────────────────────────────────────────────────────────────
@@ -413,6 +491,27 @@ pub struct CloudDiffSnapshotResponse {
     pub id: String,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCrossRepoEdge {
+    pub from_repo_id: String,
+    pub from_entity_id: String,
+    pub to_repo_id: String,
+    pub to_entity_id: String,
+    #[serde(default)]
+    pub ref_type: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCrossDepsResponse {
+    pub edges: Vec<CloudCrossRepoEdge>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub query_ms: u64,
+}
+
 // ─── Repo Cache ──────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -559,8 +658,6 @@ fn show_cloud_banner() {
     }
 }
 
-/// Master kill switch: `SEM_NO_NETWORK=1` blocks every network call (cloud,
-/// telemetry upload, update checks).
 pub fn network_disabled() -> bool {
     std::env::var("SEM_NO_NETWORK").is_ok_and(|v| !v.is_empty() && v != "0")
 }
@@ -883,9 +980,81 @@ impl CloudClient {
             format!("https://ataraxy-labs.com/diffs/{id}")
         }
     }
+
+    /// Cross-repo dependency edges across all of your indexed repos. This is
+    /// cloud-only: it answers "what in my other repos depends on this," which a
+    /// single-repo local graph can't see.
+    pub fn cross_deps(&self) -> Result<CloudCrossDepsResponse, Box<dyn std::error::Error>> {
+        let resp: CloudCrossDepsResponse = self
+            .agent
+            .get(&self.api_url("/v1/cross-deps"))
+            .set("Authorization", &self.auth_header())
+            .call()?
+            .into_json()?;
+        Ok(resp)
+    }
 }
 
-/// Minimal percent-encoding for query parameters (no external dep).
+/// Show cross-repo dependencies across all of your indexed repos. Cloud-only:
+/// the local CLI only ever sees one repo, so "what in my other repos depends on
+/// this" is a question only the cloud (which holds the graph across all your
+/// repos) can answer. This is a reason to log in.
+pub fn xref(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let client = CloudClient::from_credentials()
+        .ok_or("Not logged in. Cross-repo dependencies are a sem cloud feature. Run: sem login")?;
+    let resp = client.cross_deps()?;
+
+    if json {
+        let edges: Vec<serde_json::Value> = resp
+            .edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "fromRepoId": e.from_repo_id,
+                    "fromEntity": e.from_entity_id,
+                    "toRepoId": e.to_repo_id,
+                    "toEntity": e.to_entity_id,
+                    "refType": e.ref_type,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "edges": edges, "total": resp.total });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if resp.edges.is_empty() {
+        println!("No cross-repo dependencies found.");
+        println!(
+            "{}",
+            "Cross-repo edges appear once you have 2+ repos indexed in sem cloud.".dimmed()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} ({} edges, {}ms)",
+        "Cross-repo dependencies".bold(),
+        resp.total,
+        resp.query_ms
+    );
+    for e in &resp.edges {
+        let kind = if e.ref_type.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", e.ref_type)
+        };
+        println!(
+            "  {} {} {}{}",
+            e.from_entity_id,
+            "→".dimmed(),
+            e.to_entity_id.bold(),
+            kind.dimmed()
+        );
+    }
+    Ok(())
+}
+
 fn urlencoding_encode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for byte in s.bytes() {
@@ -929,6 +1098,19 @@ fn working_tree_clean(repo_root: &Path) -> bool {
 pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     // --tests needs test classification data the cloud API doesn't expose.
     if matches!(opts.mode, super::impact::ImpactMode::Tests) {
+        return None;
+    }
+    // --no-cache means "compute fresh": serving a remote snapshot would violate it.
+    if opts.no_cache {
+        return None;
+    }
+    // A --file hint exists to disambiguate same-named entities, but the cloud
+    // resolves by name with a silent name-only fallback when the file doesn't
+    // match its index — which returns the WRONG entity's graph (repro: weave's
+    // ten `fn run` command handlers; `--file .../apply.rs` came back with
+    // bench.rs's dependencies). Until the server resolves name+file strictly,
+    // file-hinted queries stay local, where disambiguation is exact.
+    if opts.file_hint.is_some() {
         return None;
     }
     let client = CloudClient::from_credentials()?;
@@ -1099,6 +1281,11 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
 
 /// Try to run `sem context` via cloud.
 pub fn try_cloud_context(opts: &ContextOptions) -> Option<()> {
+    // Same gates as try_cloud_impact: --no-cache means fresh local compute, and
+    // a --file hint needs exact name+file resolution the cloud doesn't do yet.
+    if opts.no_cache || opts.file_path.is_some() {
+        return None;
+    }
     let client = CloudClient::from_credentials()?;
     let (git, remote) = cloud_git_context(&opts.cwd)?;
     if !super::consent::cloud_enabled_for(&remote) {

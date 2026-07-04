@@ -9,6 +9,7 @@ use serde::ser::{SerializeMap, Serializer};
 
 use crate::cache::DiskCache;
 use crate::timings::Timings;
+use sem_mcp::cache::CacheSourceScope;
 
 pub struct GraphOptions {
     pub cwd: String,
@@ -25,8 +26,37 @@ pub fn graph_command(opts: GraphOptions) {
         Err(_) => Path::new(&opts.cwd).to_path_buf(),
     };
     let root = root.as_path();
-    let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = normalize_exts(&opts.file_exts);
+    let source_scope = cache_source_scope(root, &ext_filter, opts.no_default_excludes);
+
+    // Oracle fast path: when git proves the cache is fresh, the file walk (the
+    // dominant cost on large repos) is redundant — the cache already holds the
+    // topology. Skip discovery entirely and serve straight from cache.
+    if !opts.no_cache {
+        if let Ok(disk) = DiskCache::open(root) {
+            if opts.json {
+                if let Some(graph) = disk.oracle_fresh_topology(root, source_scope) {
+                    timings.mark("oracle_fast_path");
+                    write_graph_json(&graph).unwrap();
+                    timings.mark("cli_output_serialization");
+                    timings.finish();
+                    return;
+                }
+            } else if let Some((entities, edges)) = disk.oracle_fresh_counts(root, source_scope) {
+                timings.mark("oracle_fast_path");
+                println!(
+                    "{} {} entities, {} edges",
+                    "⊕".green(),
+                    entities.to_string().bold(),
+                    edges.to_string().bold(),
+                );
+                timings.finish();
+                return;
+            }
+        }
+    }
+
+    let registry = super::create_registry(&root.to_string_lossy());
     let file_paths =
         find_supported_files_inner(root, &registry, &ext_filter, opts.no_default_excludes);
     timings.mark("file_discovery");
@@ -34,7 +64,7 @@ pub fn graph_command(opts: GraphOptions) {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
             let stdout = std::io::stdout();
-            match disk.write_graph_json_topology(root, &file_paths, stdout.lock()) {
+            match disk.write_graph_json_topology(root, &file_paths, source_scope, stdout.lock()) {
                 Ok(true) => {
                     timings.mark("cache_topology_json_stream");
                     timings.finish();
@@ -59,6 +89,7 @@ pub fn graph_command(opts: GraphOptions) {
         &file_paths,
         &registry,
         opts.no_cache,
+        source_scope,
         &mut timings,
     );
     prog.done(&format!(
@@ -180,6 +211,18 @@ pub fn find_supported_files_with_options(
     )
 }
 
+pub fn cache_source_scope(
+    root: &Path,
+    ext_filter: &[String],
+    no_default_excludes: bool,
+) -> CacheSourceScope {
+    if ext_filter.is_empty() && !no_default_excludes && !root.join(".semignore").exists() {
+        CacheSourceScope::Default
+    } else {
+        CacheSourceScope::Custom
+    }
+}
+
 fn find_supported_files_inner(
     root: &Path,
     registry: &ParserRegistry,
@@ -196,9 +239,17 @@ pub fn get_or_build_graph(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     let mut timings = Timings::disabled("graph");
-    get_or_build_graph_with_timings(root, file_paths, registry, no_cache, &mut timings)
+    get_or_build_graph_with_timings(
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        source_scope,
+        &mut timings,
+    )
 }
 
 pub fn get_or_build_graph_with_timings(
@@ -206,6 +257,7 @@ pub fn get_or_build_graph_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     get_or_build_graph_with_cache_policy(
@@ -214,6 +266,7 @@ pub fn get_or_build_graph_with_timings(
         registry,
         no_cache,
         CacheMissSavePolicy::Full,
+        source_scope,
         timings,
     )
 }
@@ -223,6 +276,7 @@ pub fn get_or_build_graph_with_topology_save_on_miss_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     get_or_build_graph_with_cache_policy(
@@ -231,6 +285,7 @@ pub fn get_or_build_graph_with_topology_save_on_miss_with_timings(
         registry,
         no_cache,
         CacheMissSavePolicy::Topology,
+        source_scope,
         timings,
     )
 }
@@ -248,17 +303,20 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> GraphWithTestData {
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some((graph, entities)) = disk.load(root, file_paths) {
+            if let Some((graph, entities)) =
+                disk.load_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_full_load");
                 return GraphWithTestData::Full(graph, entities);
             }
-            if let Some((graph, test_entity_ids)) =
-                disk.load_graph_topology_with_test_ids(root, file_paths)
+            if let Some((graph, test_entity_ids)) = disk
+                .load_graph_topology_with_test_ids_and_source_scope(root, file_paths, source_scope)
             {
                 timings.mark("cache_topology_load");
                 return GraphWithTestData::Topology {
@@ -267,7 +325,9 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
                 };
             }
 
-            if let Some(partial) = disk.load_partial(root, file_paths) {
+            if let Some(partial) =
+                disk.load_partial_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_partial_load");
                 let (graph, entities, metadata) =
                     EntityGraph::build_incremental_with_metadata_and_import_candidates(
@@ -290,6 +350,7 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
                     metadata.repaired_clean_entity_ids,
                     &metadata.recomputed_edge_source_ids,
                     &metadata.deleted_entity_ids,
+                    source_scope,
                 );
                 timings.mark("cache_incremental_save");
                 return GraphWithTestData::Full(graph, entities);
@@ -308,6 +369,7 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
                 &graph,
                 &entities,
                 &registry.custom_test_dirs,
+                source_scope,
             );
             timings.mark("cache_topology_save");
         }
@@ -328,19 +390,22 @@ fn get_or_build_graph_with_cache_policy(
     registry: &ParserRegistry,
     no_cache: bool,
     save_policy: CacheMissSavePolicy,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> (EntityGraph, Vec<SemanticEntity>) {
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
             // Try full cache hit
-            if let Some(cached) = disk.load(root, file_paths) {
+            if let Some(cached) = disk.load_with_source_scope(root, file_paths, source_scope) {
                 timings.mark("cache_full_load");
                 return cached;
             }
 
             // Try incremental: load clean cached data, rebuild only stale files
-            if let Some(partial) = disk.load_partial(root, file_paths) {
+            if let Some(partial) =
+                disk.load_partial_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_partial_load");
                 let (graph, entities, metadata) =
                     EntityGraph::build_incremental_with_metadata_and_import_candidates(
@@ -363,6 +428,7 @@ fn get_or_build_graph_with_cache_policy(
                     metadata.repaired_clean_entity_ids,
                     &metadata.recomputed_edge_source_ids,
                     &metadata.deleted_entity_ids,
+                    source_scope,
                 );
                 timings.mark("cache_incremental_save");
                 return (graph, entities);
@@ -378,7 +444,7 @@ fn get_or_build_graph_with_cache_policy(
         match save_policy {
             CacheMissSavePolicy::Full => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save(root, file_paths, &graph, &entities);
+                    let _ = disk.save(root, file_paths, &graph, &entities, source_scope);
                     timings.mark("cache_full_save");
                 }
             }
@@ -390,6 +456,7 @@ fn get_or_build_graph_with_cache_policy(
                         &graph,
                         &entities,
                         &registry.custom_test_dirs,
+                        source_scope,
                     );
                     timings.mark("cache_topology_save");
                 }
@@ -405,20 +472,29 @@ pub fn get_or_build_graph_topology_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> EntityGraph {
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_topology_load");
                 return graph;
             }
         }
     }
 
-    let (graph, _entities) =
-        get_or_build_graph_with_timings(root, file_paths, registry, no_cache, timings);
+    let (graph, _entities) = get_or_build_graph_with_timings(
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        source_scope,
+        timings,
+    );
     graph
 }
 
@@ -427,12 +503,15 @@ pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
 ) -> EntityGraph {
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_topology_load");
                 return graph;
             }
@@ -440,7 +519,12 @@ pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
     }
 
     let (graph, _entities) = get_or_build_graph_with_topology_save_on_miss_with_timings(
-        root, file_paths, registry, no_cache, timings,
+        root,
+        file_paths,
+        registry,
+        no_cache,
+        source_scope,
+        timings,
     );
     graph
 }
@@ -450,6 +534,7 @@ pub fn get_or_build_direct_dependency_graph_with_timings<F>(
     file_paths: &[String],
     registry: &ParserRegistry,
     no_cache: bool,
+    source_scope: CacheSourceScope,
     timings: &mut Timings,
     should_resolve: F,
 ) -> EntityGraph
@@ -459,7 +544,9 @@ where
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
             timings.mark("cache_open");
-            if let Some(graph) = disk.load_graph_topology(root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(root, file_paths, source_scope)
+            {
                 timings.mark("cache_topology_load");
                 return graph;
             }

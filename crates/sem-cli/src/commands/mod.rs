@@ -6,11 +6,33 @@ pub mod diff;
 pub mod entities;
 pub mod files;
 pub mod graph;
+pub mod hook;
 pub mod impact;
 pub mod log;
+pub mod orient;
+pub mod repos;
 pub mod setup;
+pub mod sidecar;
 pub mod stats;
+
+#[cfg(feature = "self-update")]
 pub mod update;
+
+/// When built without the `self-update` feature (e.g. distro/package-manager
+/// builds that own the binary's lifecycle), self-update and the background
+/// update check are disabled. These no-op stubs keep the call sites compiling.
+#[cfg(not(feature = "self-update"))]
+pub mod update {
+    pub fn maybe_notify(_command: &str) {}
+    pub fn background_check() {}
+    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "This build of sem has self-update disabled. Update it through the \
+             package manager it was installed with (e.g. pkgsrc, Homebrew, apt)."
+        );
+        Ok(())
+    }
+}
 
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
@@ -116,6 +138,36 @@ pub fn entity_matches_query(entity: &sem_core::parser::graph::EntityInfo, query:
     };
 
     entity.entity_type == entity_type && entity.name == name
+}
+
+/// Like `entity_matches_query`, but also resolves `Class.method` (or
+/// `Outer.Inner.method`) addressing: `entity` matches `Parent.child` when its
+/// own name is `child` and its parent entity is named `Parent`. Needs the graph
+/// to look up the parent. Agents reach for `Class.method` naturally, so every
+/// entity-addressing command should accept it.
+pub fn entity_matches_qualified(
+    graph: &sem_core::parser::graph::EntityGraph,
+    entity: &sem_core::parser::graph::EntityInfo,
+    query: &str,
+) -> bool {
+    if entity_matches_query(entity, query) {
+        return true;
+    }
+    // Accept both `Parent.child` and `Parent::child` — agents reach for
+    // whichever qualifier their working language uses.
+    let split = query
+        .rsplit_once("::")
+        .or_else(|| query.rsplit_once('.'));
+    if let Some((parent_part, child_part)) = split {
+        if entity.name == child_part {
+            if let Some(pid) = &entity.parent_id {
+                if let Some(parent) = graph.entities.get(pid) {
+                    return parent.name == parent_part;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {

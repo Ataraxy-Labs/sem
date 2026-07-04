@@ -2,10 +2,146 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rayon::prelude::*;
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef, RefType};
+use sem_core::parser::{
+    js_ts_has_default_re_export_from_content,
+    js_ts_import_source_files_from_filesystem_with_unscoped,
+};
+use sem_core::utils::scan::is_default_excluded;
 use sem_mcp::cache as shared_cache;
+use serde::Serialize;
+
+const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
+const SQL_PARAM_CHUNK: usize = 500;
+
+const META_GIT_HEAD_OID: &str = "git_head_oid";
+const META_GIT_BUILT_CLEAN: &str = "git_built_clean";
+const META_ORACLE_ELIGIBLE: &str = "oracle_eligible";
+
+/// Below this many indexed files, skip the git oracle: the scan is already
+/// cheap and the git call would only add overhead.
+const ORACLE_MIN_FILES: i64 = 2_000;
+
+/// Default cap on the `git status` clean-check. `git status` is normally
+/// 0.1–0.3s, but a cold index after a mass file-touch can make it re-hash
+/// everything and take tens of seconds. Bounding it means the oracle can never
+/// be slower than the scan it replaces — on timeout we fall back to the scan.
+const ORACLE_TIMEOUT_MS: u64 = 1_500;
+
+/// Freshness strategy, set via `SEM_FRESHNESS` (`scan` | `git` | `auto`).
+/// `auto` (default) uses the git oracle for any git repo big enough to benefit;
+/// `git status` rides fsmonitor when it's configured (~10x) and still beats the
+/// scan without it (~4x). `git` forces the oracle, `scan` forces the per-file
+/// walk. The `git status` call is time-bounded so the oracle never regresses.
+#[derive(PartialEq)]
+enum FreshnessMode {
+    Scan,
+    Git,
+    Auto,
+}
+
+fn freshness_mode() -> FreshnessMode {
+    match std::env::var("SEM_FRESHNESS").ok().as_deref() {
+        Some("scan") => FreshnessMode::Scan,
+        Some("git") => FreshnessMode::Git,
+        _ => FreshnessMode::Auto,
+    }
+}
+
+fn git_head_oid(root: &Path) -> Option<String> {
+    Some(
+        git2::Repository::open(root)
+            .ok()?
+            .head()
+            .ok()?
+            .target()?
+            .to_string(),
+    )
+}
+
+/// Clean iff `git status --porcelain` is empty — no modified, deleted, or
+/// untracked paths. Shelled out so it rides git's fsmonitor. Time-bounded: if
+/// git takes longer than the timeout (e.g. a cold index re-hashing after a mass
+/// touch), we abandon it and return None so the caller falls back to the scan,
+/// rather than inheriting git's worst-case latency. Returns None when git is
+/// unavailable or errors, too.
+fn git_working_tree_clean(root: &Path) -> Option<bool> {
+    let timeout = std::time::Duration::from_millis(
+        std::env::var("SEM_FRESHNESS_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ORACLE_TIMEOUT_MS),
+    );
+    let root = root.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Run git on a helper thread; `.output()` drains stdout so a large dirty
+    // status can't deadlock. On timeout we leave the thread to finish in the
+    // background (the process exits fine) and fall back to the scan.
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain"])
+            .output();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) if output.status.success() => {
+            Some(output.stdout.iter().all(u8::is_ascii_whitespace))
+        }
+        _ => None,
+    }
+}
+
+/// The oracle is only safe when every file sem indexed is git-tracked: then a
+/// clean working tree proves those files are at their committed (cached)
+/// content. If sem indexes anything untracked/ignored, git's clean signal
+/// wouldn't cover it, so the repo is ineligible and we always scan.
+fn compute_oracle_eligible(root: &Path, files: &[String]) -> bool {
+    let Ok(repo) = git2::Repository::open(root) else {
+        return false;
+    };
+    let Ok(index) = repo.index() else {
+        return false;
+    };
+    let tracked: HashSet<String> = index
+        .iter()
+        .filter_map(|entry| String::from_utf8(entry.path).ok())
+        .collect();
+    if tracked.is_empty() {
+        return false;
+    }
+    files
+        .iter()
+        .filter(|file| !shared_cache::is_manifest_file_name(file))
+        .all(|file| tracked.contains(file))
+}
+
+/// Record the build-time epoch: HEAD oid, whether the tree was clean at build
+/// (a cache built from a dirty tree can't be trusted by a later clean check),
+/// and whether the repo is oracle-eligible. Best-effort.
+fn store_freshness_epoch(tx: &rusqlite::Transaction<'_>, root: &Path, files: &[String]) {
+    // Stamp the origin repo even for non-git roots: the cache dir name is a
+    // hash, so this is the only way `sem repos` can label local storage.
+    let _ = shared_cache::set_cache_repo_root(tx, root);
+    let Some(oid) = git_head_oid(root) else {
+        return;
+    };
+    let built_clean = matches!(git_working_tree_clean(root), Some(true));
+    let eligible = built_clean && compute_oracle_eligible(root, files);
+    let put = |key: &str, val: &str| {
+        let _ = tx.execute(
+            "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES (?1, ?2)",
+            params![key, val],
+        );
+    };
+    put(META_GIT_HEAD_OID, &oid);
+    put(META_GIT_BUILT_CLEAN, if built_clean { "1" } else { "0" });
+    put(META_ORACLE_ELIGIBLE, if eligible { "1" } else { "0" });
+}
 
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
 pub struct PartialCache {
@@ -21,6 +157,51 @@ pub struct DiskCache {
     conn: Connection,
 }
 
+#[derive(Clone, Copy)]
+pub enum CachedImpactMode {
+    All,
+    Deps,
+    Dependents,
+    Tests,
+}
+
+pub struct CachedImpactResult {
+    pub entity: EntityInfo,
+    pub dependencies: Vec<EntityInfo>,
+    pub dependents: Vec<EntityInfo>,
+    pub impact: Vec<(EntityInfo, usize)>,
+    pub tests: Vec<EntityInfo>,
+    pub tests_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct EntityListingJsonRow<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    entity_type: &'a str,
+    start_line: usize,
+    end_line: usize,
+    parent_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub enum CachedImpactError {
+    CacheReadFailed,
+    MissingEntityQuery,
+    EntityIdNotFound(String),
+    EntityNotFound(String),
+    EntityNotFoundInFile {
+        name: String,
+        file: String,
+    },
+    AmbiguousEntity {
+        name: String,
+        matches: Vec<EntityInfo>,
+    },
+}
+
 impl DiskCache {
     pub fn open(repo_root: &Path) -> Result<Self, rusqlite::Error> {
         let cache_dir = shared_cache::cache_dir_for_repo(repo_root)
@@ -34,12 +215,26 @@ impl DiskCache {
         Ok(Self { conn })
     }
 
+    pub fn open_existing_readonly(repo_root: &Path) -> Result<Self, rusqlite::Error> {
+        let db_path = shared_cache::cache_db_path(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        if !db_path.exists() {
+            return Err(rusqlite::Error::InvalidPath(db_path));
+        }
+
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Read-only opens skip initialize_schema, so apply the read pragmas here.
+        shared_cache::apply_performance_pragmas(&conn)?;
+        Ok(Self { conn })
+    }
+
     pub fn save(
         &self,
         root: &Path,
         files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -65,31 +260,12 @@ impl DiskCache {
         shared_cache::refresh_manifest_entries(&tx, root)?;
         shared_cache::refresh_file_import_entries(&tx, root, files, files)?;
 
-        // Insert entities with prepared statement (already in a transaction, so fast)
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-            for e in entities {
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                stmt.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
-        }
+        shared_cache::insert_entities_with_content_store(
+            &tx,
+            root,
+            &entities.iter().collect::<Vec<_>>(),
+            true,
+        )?;
 
         // Insert edges with prepared statement
         {
@@ -107,6 +283,8 @@ impl DiskCache {
         }
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
+        shared_cache::set_cache_source_scope(&tx, source_scope)?;
+        store_freshness_epoch(&tx, root, files);
         tx.commit()?;
         Ok(())
     }
@@ -118,6 +296,7 @@ impl DiskCache {
         graph: &EntityGraph,
         entities: &[SemanticEntity],
         custom_test_dirs: &[String],
+        source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -141,6 +320,7 @@ impl DiskCache {
         }
 
         shared_cache::refresh_manifest_entries(&tx, root)?;
+        shared_cache::refresh_file_import_entries(&tx, root, files, files)?;
 
         {
             let mut stmt = tx.prepare(
@@ -184,22 +364,34 @@ impl DiskCache {
         }
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_TOPOLOGY)?;
+        shared_cache::set_cache_source_scope(&tx, source_scope)?;
+        store_freshness_epoch(&tx, root, files);
         tx.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn load(
         &self,
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
-        if !self.has_fresh_complete_cache(root, files) {
+        self.load_with_source_scope(root, files, shared_cache::CacheSourceScope::Default)
+    }
+
+    pub fn load_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        if !self.has_fresh_complete_cache(root, files, source_scope) {
             return None;
         }
 
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
             .ok()?;
         let entities: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -212,7 +404,9 @@ impl DiskCache {
                     file_path: row.get(3)?,
                     start_line: row.get::<_, i64>(4)? as usize,
                     end_line: row.get::<_, i64>(5)? as usize,
-                    content: row.get(6)?,
+                    start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
+                    end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
+                    content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
@@ -222,6 +416,20 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+
+        // Reconstruct span-sliced entity bodies from the file-content store.
+        let entities: Vec<SemanticEntity> = {
+            let mut recon = shared_cache::ContentReconstructor::new(&self.conn);
+            entities
+                .into_iter()
+                .map(|mut e| {
+                    if e.content.is_empty() {
+                        e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                    }
+                    e
+                })
+                .collect()
+        };
 
         let mut edge_stmt = self
             .conn
@@ -245,7 +453,7 @@ impl DiskCache {
             .filter_map(|r| r.ok())
             .collect();
 
-        let entity_map: HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|e| {
                 (
@@ -268,26 +476,438 @@ impl DiskCache {
     }
 
     /// Load only graph topology from a fresh cache.
+    #[cfg(test)]
     pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
-        if !self.has_fresh_topology_cache(root, files) {
+        self.load_graph_topology_with_source_scope(
+            root,
+            files,
+            shared_cache::CacheSourceScope::Default,
+        )
+    }
+
+    pub fn load_graph_topology_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<EntityGraph> {
+        if !self.has_fresh_topology_cache(root, files, source_scope) {
             return None;
         }
 
         self.load_graph_topology_rows()
     }
 
+    #[cfg(test)]
     pub fn load_graph_topology_with_test_ids(
         &self,
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, HashSet<String>)> {
-        if !self.has_fresh_topology_only_cache(root, files) {
+        self.load_graph_topology_with_test_ids_and_source_scope(
+            root,
+            files,
+            shared_cache::CacheSourceScope::Default,
+        )
+    }
+
+    pub fn load_graph_topology_with_test_ids_and_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<(EntityGraph, HashSet<String>)> {
+        if !self.has_fresh_topology_only_cache(root, files, source_scope) {
             return None;
         }
 
         let graph = self.load_graph_topology_rows()?;
         let test_entity_ids = self.load_test_entity_ids()?;
         Some((graph, test_entity_ids))
+    }
+
+    /// Query a fresh topology cache directly for impact data without hydrating
+    /// the complete in-memory graph.
+    pub fn query_impact_topology(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+        cache_first: bool,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+        mode: CachedImpactMode,
+        depth: usize,
+    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
+            return Ok(None);
+        }
+
+        if matches!(mode, CachedImpactMode::All | CachedImpactMode::Tests)
+            && !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_TOPOLOGY])
+        {
+            return Ok(None);
+        }
+
+        if matches!(mode, CachedImpactMode::Deps) {
+            return self.query_dependency_impact_topology(
+                root,
+                files,
+                source_scope,
+                cache_first,
+                entity_name,
+                entity_id,
+                file_hint,
+            );
+        }
+
+        if !self.has_fresh_cache(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        self.query_fresh_impact_topology(entity_name, entity_id, file_hint, mode, depth)
+    }
+
+    fn query_fresh_impact_topology(
+        &self,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+        mode: CachedImpactMode,
+        depth: usize,
+    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+        let entity = self.find_cached_impact_entity(entity_name, entity_id, file_hint)?;
+        let dependencies = if matches!(mode, CachedImpactMode::All | CachedImpactMode::Deps) {
+            match self.direct_dependencies(&entity.id) {
+                Ok(dependencies) => dependencies,
+                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+            }
+        } else {
+            Vec::new()
+        };
+        let impact = if matches!(mode, CachedImpactMode::All) {
+            match self.impact_entities(&entity.id, depth, None) {
+                Ok(impact) => impact,
+                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+            }
+        } else {
+            Vec::new()
+        };
+        let dependents = if matches!(mode, CachedImpactMode::All) {
+            impact
+                .iter()
+                .filter(|(_, depth)| *depth == 1)
+                .map(|(entity, _)| entity.clone())
+                .collect()
+        } else if matches!(mode, CachedImpactMode::Dependents) {
+            match self.direct_dependents(&entity.id) {
+                Ok(dependents) => dependents,
+                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+            }
+        } else {
+            Vec::new()
+        };
+        let (tests, tests_truncated) =
+            if matches!(mode, CachedImpactMode::All | CachedImpactMode::Tests) {
+                match self.test_impact_entities(&entity.id) {
+                    Ok(tests) => tests,
+                    Err(_) => return Err(CachedImpactError::CacheReadFailed),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+        Ok(Some(CachedImpactResult {
+            entity,
+            dependencies,
+            dependents,
+            impact,
+            tests,
+            tests_truncated,
+        }))
+    }
+
+    fn query_dependency_impact_topology(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+        cache_first: bool,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return Ok(None);
+        }
+
+        if cache_first {
+            if !shared_cache::cache_has_default_source_scope(&self.conn) {
+                return Ok(None);
+            }
+        } else if !self.has_fresh_cache(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        let entity = match self.find_cached_impact_entity(entity_name, entity_id, file_hint) {
+            Ok(entity) => entity,
+            Err(CachedImpactError::CacheReadFailed) => {
+                return Err(CachedImpactError::CacheReadFailed);
+            }
+            Err(_) => return Ok(None),
+        };
+        let dependencies = self
+            .direct_dependencies(&entity.id)
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+
+        if cache_first && !self.has_fresh_dependency_impact_files(root, &entity, &dependencies)? {
+            return Ok(None);
+        }
+
+        Ok(Some(CachedImpactResult {
+            entity,
+            dependencies,
+            dependents: Vec::new(),
+            impact: Vec::new(),
+            tests: Vec::new(),
+            tests_truncated: false,
+        }))
+    }
+
+    fn has_fresh_dependency_impact_files(
+        &self,
+        root: &Path,
+        entity: &EntityInfo,
+        dependencies: &[EntityInfo],
+    ) -> Result<bool, CachedImpactError> {
+        if !self
+            .cached_files_are_fresh(root, HashSet::from([entity.file_path.clone()]))
+            .map_err(|_| CachedImpactError::CacheReadFailed)?
+        {
+            return Ok(false);
+        }
+
+        let mut required_files = HashSet::new();
+        for dependency in dependencies {
+            required_files.insert(dependency.file_path.clone());
+        }
+        let cached_imported_files = self
+            .cached_imported_files(&entity.file_path)
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        let Some(current_imports) = current_imported_files(root, &entity.file_path)? else {
+            return Ok(false);
+        };
+        if cached_imported_files != current_imports.files {
+            return Ok(false);
+        }
+        if current_imports.has_default_re_export {
+            return Ok(false);
+        }
+        for imported_file in &cached_imported_files {
+            if file_has_default_re_export(root, imported_file)? {
+                return Ok(false);
+            }
+            required_files.insert(imported_file.clone());
+        }
+
+        self.cached_files_are_fresh(root, required_files)
+            .map_err(|_| CachedImpactError::CacheReadFailed)
+    }
+
+    fn cached_imported_files(&self, file_path: &str) -> Result<HashSet<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT imported_file FROM file_imports
+             WHERE importing_file = ?1
+             ORDER BY imported_file",
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    fn meta_value(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM cache_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Fast path: prove the whole cache is fresh by asking git what changed,
+    /// skipping the per-file scan. Returns true only when the cache was built
+    /// from a clean, oracle-eligible tree at a HEAD that is still the current
+    /// HEAD and the working tree is still clean. Every uncertain case returns
+    /// false and the caller falls through to the authoritative scan, so this
+    /// can never serve stale results — it can only decline to accelerate.
+    fn git_oracle_says_fresh(&self, root: &Path) -> bool {
+        let mode = freshness_mode();
+        if mode == FreshnessMode::Scan {
+            return false;
+        }
+        // Skip tiny repos in auto mode: the scan is already cheap there, so the
+        // git call would only add overhead. `git` mode forces it regardless.
+        if mode == FreshnessMode::Auto {
+            let file_count: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+                .unwrap_or(0);
+            if file_count < ORACLE_MIN_FILES {
+                return false;
+            }
+        }
+        if self.meta_value(META_ORACLE_ELIGIBLE).as_deref() != Some("1") {
+            return false;
+        }
+        if self.meta_value(META_GIT_BUILT_CLEAN).as_deref() != Some("1") {
+            return false;
+        }
+        let Some(stored_oid) = self.meta_value(META_GIT_HEAD_OID) else {
+            return false;
+        };
+        if git_head_oid(root).as_deref() != Some(stored_oid.as_str()) {
+            return false;
+        }
+        matches!(git_working_tree_clean(root), Some(true))
+    }
+
+    /// Gate for the discovery-skipping fast paths below: a topology cache of the
+    /// right scope that the git oracle proves fresh — without needing a file
+    /// list, so the caller can avoid walking the filesystem at all.
+    fn oracle_cache_fresh(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) && shared_cache::cache_has_source_scope(&self.conn, source_scope)
+            && !shared_cache::is_manifest_stale(&self.conn, root)
+            && self.git_oracle_says_fresh(root)
+    }
+
+    /// Hydrate the cached topology when the oracle proves it fresh, skipping
+    /// file discovery. For `sem graph --json`.
+    pub fn oracle_fresh_topology(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<EntityGraph> {
+        if !self.oracle_cache_fresh(root, source_scope) {
+            return None;
+        }
+        self.load_graph_topology_rows()
+    }
+
+    /// Entity and edge counts straight from SQLite when the oracle proves the
+    /// cache fresh — the summary output needs only counts, so this skips both
+    /// file discovery and hydrating the full graph.
+    pub fn oracle_fresh_counts(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<(usize, usize)> {
+        if !self.oracle_cache_fresh(root, source_scope) {
+            return None;
+        }
+        let entities: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+            .ok()?;
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .ok()?;
+        Some((entities as usize, edges as usize))
+    }
+
+    fn cached_files_are_fresh(
+        &self,
+        root: &Path,
+        files: HashSet<String>,
+    ) -> Result<bool, rusqlite::Error> {
+        // Phase 1 (serial, SQLite): read each file's cached fingerprint. The
+        // rusqlite connection isn't shareable across threads, so all DB reads
+        // happen here. A file missing from the cache means the cache can't be
+        // trusted — bail immediately.
+        let mut stmt = self.conn.prepare(
+            "SELECT mtime_secs, mtime_nanos, content_hash
+             FROM files WHERE path = ?1",
+        )?;
+        let mut cached_meta: Vec<(String, i64, i64, Option<String>)> =
+            Vec::with_capacity(files.len());
+        for file in files {
+            let cached: Option<(i64, i64, Option<String>)> = stmt
+                .query_row(params![file], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .optional()?;
+            let Some((secs, nanos, content_hash)) = cached else {
+                return Ok(false);
+            };
+            cached_meta.push((file, secs, nanos, content_hash));
+        }
+
+        // Phase 2 (parallel, no SQLite): the freshness check is an independent
+        // stat() + read() + hash per file — exactly the sequential bottleneck on
+        // touched-file cache hits (issue #351). `file_freshness` is pure, so run
+        // it across rayon's pool. One stale file makes the whole cache stale.
+        enum Outcome {
+            Fresh,
+            Refresh(shared_cache::FileFingerprintRefresh),
+            Stale,
+        }
+        let outcomes: Vec<Outcome> = cached_meta
+            .into_par_iter()
+            .map(|(file, secs, nanos, content_hash)| {
+                match shared_cache::file_freshness(
+                    &root.join(&file),
+                    secs,
+                    nanos,
+                    content_hash.as_deref(),
+                ) {
+                    Some(shared_cache::FileFreshness::Fresh) => Outcome::Fresh,
+                    Some(shared_cache::FileFreshness::FreshWithUpdatedFingerprint {
+                        secs,
+                        nanos,
+                        content_hash,
+                    }) => Outcome::Refresh(shared_cache::FileFingerprintRefresh {
+                        path: file,
+                        mtime_secs: secs,
+                        mtime_nanos: nanos,
+                        content_hash,
+                    }),
+                    Some(shared_cache::FileFreshness::Stale) | None => Outcome::Stale,
+                }
+            })
+            .collect();
+
+        // Phase 3 (serial): any stale file fails the cache; otherwise persist the
+        // refreshed fingerprints best-effort (same as before, write stays serial).
+        let mut fingerprint_refreshes = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Fresh => {}
+                Outcome::Refresh(refresh) => fingerprint_refreshes.push(refresh),
+                Outcome::Stale => return Ok(false),
+            }
+        }
+
+        shared_cache::refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
+        Ok(true)
     }
 
     fn load_graph_topology_rows(&self) -> Option<EntityGraph> {
@@ -297,7 +917,7 @@ impl DiskCache {
                 "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id FROM entities",
             )
             .ok()?;
-        let entity_map: HashMap<String, EntityInfo> = entity_stmt
+        let entity_map: EntityInfoMap = entity_stmt
             .query_map([], |row| {
                 let id: String = row.get(0)?;
                 Ok((
@@ -321,6 +941,382 @@ impl DiskCache {
         Some(EntityGraph::from_parts(entity_map, edges))
     }
 
+    fn find_cached_impact_entity(
+        &self,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+    ) -> Result<EntityInfo, CachedImpactError> {
+        if let Some(id) = entity_id {
+            return self
+                .entity_by_id(id)
+                .map_err(|_| CachedImpactError::CacheReadFailed)?
+                .ok_or_else(|| CachedImpactError::EntityIdNotFound(id.to_string()));
+        }
+
+        let name = entity_name.ok_or(CachedImpactError::MissingEntityQuery)?;
+        let mut matching = self
+            .entity_candidates_for_query(name, file_hint)
+            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+
+        if matching.is_empty() {
+            if let Some(file) = file_hint {
+                let global_matches = self
+                    .entity_candidates_for_query(name, None)
+                    .map_err(|_| CachedImpactError::CacheReadFailed)?;
+                if global_matches.is_empty() {
+                    return Err(CachedImpactError::EntityNotFound(name.to_string()));
+                }
+                return Err(CachedImpactError::EntityNotFoundInFile {
+                    name: name.to_string(),
+                    file: file.to_string(),
+                });
+            }
+            return Err(CachedImpactError::EntityNotFound(name.to_string()));
+        }
+
+        if matching.len() == 1 {
+            return Ok(matching.into_iter().next().unwrap());
+        }
+
+        matching.sort_by_key(|entity| {
+            (
+                entity.file_path.clone(),
+                entity.start_line,
+                entity.id.clone(),
+            )
+        });
+        Err(CachedImpactError::AmbiguousEntity {
+            name: name.to_string(),
+            matches: matching,
+        })
+    }
+
+    fn entity_by_id(&self, id: &str) -> Result<Option<EntityInfo>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE id = ?1",
+                params![id],
+                entity_info_from_row,
+            )
+            .optional()
+    }
+
+    fn entity_candidates_for_query(
+        &self,
+        query: &str,
+        file_hint: Option<&str>,
+    ) -> Result<Vec<EntityInfo>, rusqlite::Error> {
+        let mut by_id = EntityInfoMap::default();
+
+        if let Some(file_hint) = file_hint {
+            self.add_entity_candidates(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE name = ?1 AND file_path = ?2",
+                &[query, file_hint],
+                &mut by_id,
+            )?;
+        } else {
+            self.add_entity_candidates(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE name = ?1",
+                &[query],
+                &mut by_id,
+            )?;
+        }
+
+        if let Some((entity_type, name)) = split_type_qualified_query(query) {
+            if let Some(file_hint) = file_hint {
+                self.add_entity_candidates(
+                    "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                     FROM entities
+                     WHERE entity_type = ?1 AND name = ?2 AND file_path = ?3",
+                    &[entity_type, name, file_hint],
+                    &mut by_id,
+                )?;
+            } else {
+                self.add_entity_candidates(
+                    "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                     FROM entities WHERE entity_type = ?1 AND name = ?2",
+                    &[entity_type, name],
+                    &mut by_id,
+                )?;
+            }
+        }
+
+        // Accept `Parent.child` and `Parent::child` qualifiers alike.
+        let qualified_split = query
+            .rsplit_once("::")
+            .or_else(|| query.rsplit_once('.'));
+        if let Some((parent_name, child_name)) = qualified_split {
+            if let Some(file_hint) = file_hint {
+                self.add_entity_candidates(
+                    "SELECT child.id, child.name, child.entity_type, child.file_path,
+                            child.start_line, child.end_line, child.parent_id
+                     FROM entities child
+                     JOIN entities parent ON child.parent_id = parent.id
+                     WHERE child.name = ?1 AND parent.name = ?2 AND child.file_path = ?3",
+                    &[child_name, parent_name, file_hint],
+                    &mut by_id,
+                )?;
+            } else {
+                self.add_entity_candidates(
+                    "SELECT child.id, child.name, child.entity_type, child.file_path,
+                            child.start_line, child.end_line, child.parent_id
+                     FROM entities child
+                     JOIN entities parent ON child.parent_id = parent.id
+                     WHERE child.name = ?1 AND parent.name = ?2",
+                    &[child_name, parent_name],
+                    &mut by_id,
+                )?;
+            }
+        }
+
+        let mut candidates: Vec<_> = by_id.into_values().collect();
+        candidates.sort_by_key(|entity| {
+            (
+                entity.file_path.clone(),
+                entity.start_line,
+                entity.id.clone(),
+            )
+        });
+        Ok(candidates)
+    }
+
+    fn add_entity_candidates(
+        &self,
+        sql: &str,
+        args: &[&str],
+        by_id: &mut EntityInfoMap,
+    ) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter().copied()), entity_info_from_row)?;
+        for row in rows {
+            let entity = row?;
+            by_id.insert(entity.id.clone(), entity);
+        }
+        Ok(())
+    }
+
+    fn direct_dependencies(&self, entity_id: &str) -> Result<Vec<EntityInfo>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entities.id, entities.name, entities.entity_type, entities.file_path,
+                    entities.start_line, entities.end_line, entities.parent_id
+             FROM edges
+             JOIN entities ON entities.id = edges.to_entity
+             WHERE edges.from_entity = ?1
+             ORDER BY edges.to_entity, edges.ref_type",
+        )?;
+        let rows = stmt.query_map(params![entity_id], entity_info_from_row)?;
+        rows.collect()
+    }
+
+    fn direct_dependents(&self, entity_id: &str) -> Result<Vec<EntityInfo>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entities.id, entities.name, entities.entity_type, entities.file_path,
+                    entities.start_line, entities.end_line, entities.parent_id
+             FROM edges
+             JOIN entities ON entities.id = edges.from_entity
+             WHERE edges.to_entity = ?1
+             ORDER BY edges.from_entity, edges.ref_type",
+        )?;
+        let rows = stmt.query_map(params![entity_id], entity_info_from_row)?;
+        rows.collect()
+    }
+
+    fn impact_entities(
+        &self,
+        entity_id: &str,
+        max_depth: usize,
+        max_count: Option<usize>,
+    ) -> Result<Vec<(EntityInfo, usize)>, rusqlite::Error> {
+        let impact_ids = self.impact_ids(entity_id, max_depth, max_count)?;
+        let ids: Vec<String> = impact_ids.iter().map(|(id, _)| id.clone()).collect();
+        let infos = self.entity_infos_by_id(&ids)?;
+        Ok(impact_ids
+            .into_iter()
+            .filter_map(|(id, depth)| infos.get(&id).cloned().map(|info| (info, depth)))
+            .collect())
+    }
+
+    fn test_impact_entities(
+        &self,
+        entity_id: &str,
+    ) -> Result<(Vec<EntityInfo>, bool), rusqlite::Error> {
+        let mut impact_ids = self.impact_ids(entity_id, 0, Some(CACHED_TEST_IMPACT_LIMIT + 1))?;
+        let tests_truncated = impact_ids.len() > CACHED_TEST_IMPACT_LIMIT;
+        if tests_truncated {
+            impact_ids.truncate(CACHED_TEST_IMPACT_LIMIT);
+        }
+        let ids: Vec<String> = impact_ids.into_iter().map(|(id, _)| id).collect();
+        let test_ids = self.test_ids_from(&ids)?;
+        let ordered_test_ids: Vec<String> = ids
+            .iter()
+            .filter(|id| test_ids.contains(*id))
+            .cloned()
+            .collect();
+        let infos = self.entity_infos_by_id(&ordered_test_ids)?;
+        let tests: Vec<EntityInfo> = ordered_test_ids
+            .into_iter()
+            .filter_map(|id| infos.get(&id).cloned())
+            .collect();
+        if !tests.is_empty() {
+            return Ok((tests, tests_truncated));
+        }
+        // Graph edges miss tests that call the target through a module
+        // namespace ("xr.where(...)"). Fall back to lexical reachability:
+        // test entities whose body names the target as a whole word.
+        let name: String = match self.conn.query_row(
+            "SELECT name FROM entities WHERE id = ?1",
+            [entity_id],
+            |row| row.get(0),
+        ) {
+            Ok(n) => n,
+            Err(_) => return Ok((tests, tests_truncated)),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.name, e.entity_type, e.file_path, e.start_line, e.end_line, e.parent_id
+             FROM entities e
+             JOIN entity_flags f ON f.entity_id = e.id AND f.is_test != 0
+             WHERE e.content LIKE '%' || ?1 || '%'
+             ORDER BY e.file_path, e.start_line",
+        )?;
+        let rows = stmt.query_map([&name], entity_info_from_row)?;
+        let mut lexical: Vec<EntityInfo> = Vec::new();
+        for row in rows {
+            lexical.push(row?);
+        }
+        // Whole-word check needs the body; re-query per candidate is fine at
+        // this scale (fallback fires only when the graph found nothing).
+        let mut confirmed = Vec::new();
+        for info in lexical {
+            let body: String = self
+                .conn
+                .query_row(
+                    "SELECT content FROM entities WHERE id = ?1",
+                    [&info.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+            if crate::commands::impact::word_hit(&body, &name) {
+                confirmed.push(info);
+            }
+        }
+        Ok((confirmed, tests_truncated))
+    }
+
+    fn impact_ids(
+        &self,
+        entity_id: &str,
+        max_depth: usize,
+        max_count: Option<usize>,
+    ) -> Result<Vec<(String, usize)>, rusqlite::Error> {
+        let mut visited = HashSet::new();
+        let mut frontier = vec![entity_id.to_string()];
+        let mut result = Vec::new();
+        let mut depth = 0;
+        visited.insert(entity_id.to_string());
+
+        while !frontier.is_empty() {
+            if max_depth > 0 && depth >= max_depth {
+                break;
+            }
+            let next_depth = depth + 1;
+            let mut next_frontier = Vec::new();
+            for dependent_id in self.dependent_ids_for(&frontier)? {
+                if visited.insert(dependent_id.clone()) {
+                    result.push((dependent_id.clone(), next_depth));
+                    next_frontier.push(dependent_id);
+                    if max_count.is_some_and(|limit| result.len() >= limit) {
+                        return Ok(result);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            depth = next_depth;
+        }
+
+        Ok(result)
+    }
+
+    fn dependent_ids_for(&self, entity_ids: &[String]) -> Result<Vec<String>, rusqlite::Error> {
+        let mut dependents = Vec::new();
+        for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT to_entity, from_entity FROM edges WHERE to_entity IN ({placeholders})
+                 ORDER BY to_entity, from_entity, ref_type"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+            let mut by_target = HashMap::<String, Vec<String>>::new();
+            for row in rows {
+                let (target, dependent) = row?;
+                by_target.entry(target).or_default().push(dependent);
+            }
+            for entity_id in chunk {
+                if let Some(ids) = by_target.remove(entity_id) {
+                    dependents.extend(ids);
+                }
+            }
+        }
+        Ok(dependents)
+    }
+
+    fn entity_infos_by_id(&self, entity_ids: &[String]) -> Result<EntityInfoMap, rusqlite::Error> {
+        let mut infos = EntityInfoMap::default();
+        for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(String::as_str)),
+                entity_info_from_row,
+            )?;
+            for row in rows {
+                let entity = row?;
+                infos.insert(entity.id.clone(), entity);
+            }
+        }
+        Ok(infos)
+    }
+
+    fn test_ids_from(&self, entity_ids: &[String]) -> Result<HashSet<String>, rusqlite::Error> {
+        let mut ids = HashSet::new();
+        for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT entity_id FROM entity_flags
+                 WHERE is_test != 0 AND entity_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                    row.get::<_, String>(0)
+                })?;
+            for row in rows {
+                ids.insert(row?);
+            }
+        }
+        Ok(ids)
+    }
+
     fn load_test_entity_ids(&self) -> Option<HashSet<String>> {
         let mut stmt = self
             .conn
@@ -338,9 +1334,10 @@ impl DiskCache {
         &self,
         root: &Path,
         files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
         mut writer: W,
     ) -> std::io::Result<bool> {
-        if !self.has_fresh_topology_cache(root, files) {
+        if !self.has_fresh_topology_cache(root, files, source_scope) {
             return Ok(false);
         }
 
@@ -425,15 +1422,46 @@ impl DiskCache {
         Ok(true)
     }
 
-    fn has_fresh_complete_cache(&self, root: &Path, files: &[String]) -> bool {
-        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
-            return false;
+    pub fn query_entities_listing(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Result<Option<Vec<EntityInfo>>, rusqlite::Error> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
         }
 
-        self.has_fresh_cache(root, files)
+        if files.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut entities = Vec::new();
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(String::as_str)),
+                entity_info_from_row,
+            )?;
+            entities.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        sort_entity_infos(&mut entities);
+        Ok(Some(entities))
     }
 
-    fn has_fresh_topology_cache(&self, root: &Path, files: &[String]) -> bool {
+    fn has_fresh_topology_cache_for_files(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
         if !shared_cache::cache_has_kind(
             &self.conn,
             &[
@@ -444,20 +1472,150 @@ impl DiskCache {
             return false;
         }
 
-        self.has_fresh_cache(root, files)
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
+            return false;
+        }
+
+        if shared_cache::is_manifest_stale(&self.conn, root) {
+            return false;
+        }
+
+        if self.git_oracle_says_fresh(root) {
+            return true;
+        }
+
+        self.cached_files_are_fresh(
+            root,
+            files
+                .iter()
+                .filter(|file| !shared_cache::is_manifest_file_name(file))
+                .cloned()
+                .collect(),
+        )
+        .unwrap_or(false)
     }
 
-    fn has_fresh_topology_only_cache(&self, root: &Path, files: &[String]) -> bool {
+    pub fn write_entities_listing_json<W: Write>(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+        include_file: bool,
+        writer: &mut W,
+    ) -> std::io::Result<Option<u64>> {
+        if !self.has_fresh_topology_cache_for_files(root, files, source_scope) {
+            return Ok(None);
+        }
+
+        writer.write_all(b"[")?;
+        let mut first = true;
+        let mut count = 0u64;
+        for chunk in files.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT name, entity_type, file_path, start_line, end_line, parent_id
+                 FROM entities
+                 WHERE file_path IN ({placeholders})
+                 ORDER BY file_path, start_line, end_line, entity_type, name"
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(sql_io_error)?;
+            let mut rows = stmt
+                .query(params_from_iter(chunk.iter().map(String::as_str)))
+                .map_err(sql_io_error)?;
+            while let Some(row) = rows.next().map_err(sql_io_error)? {
+                if first {
+                    first = false;
+                } else {
+                    writer.write_all(b",")?;
+                }
+
+                let name: String = row.get(0).map_err(sql_io_error)?;
+                let entity_type: String = row.get(1).map_err(sql_io_error)?;
+                let file_path: String = row.get(2).map_err(sql_io_error)?;
+                let start_line = row.get::<_, i64>(3).map_err(sql_io_error)? as usize;
+                let end_line = row.get::<_, i64>(4).map_err(sql_io_error)? as usize;
+                let parent_id: Option<String> = row.get(5).map_err(sql_io_error)?;
+                let listing = EntityListingJsonRow {
+                    name: &name,
+                    entity_type: &entity_type,
+                    start_line,
+                    end_line,
+                    parent_id: parent_id.as_deref(),
+                    file: include_file.then_some(file_path.as_str()),
+                };
+                serde_json::to_writer(&mut *writer, &listing).map_err(json_io_error)?;
+                count += 1;
+            }
+        }
+        writer.write_all(b"]\n")?;
+
+        Ok(Some(count))
+    }
+
+    fn has_fresh_complete_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files, source_scope)
+    }
+
+    fn has_fresh_topology_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_kind(
+            &self.conn,
+            &[
+                shared_cache::CACHE_KIND_FULL,
+                shared_cache::CACHE_KIND_TOPOLOGY,
+            ],
+        ) {
+            return false;
+        }
+
+        self.has_fresh_cache(root, files, source_scope)
+    }
+
+    fn has_fresh_topology_only_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
         if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_TOPOLOGY]) {
             return false;
         }
 
-        self.has_fresh_cache(root, files)
+        self.has_fresh_cache(root, files, source_scope)
     }
 
-    fn has_fresh_cache(&self, root: &Path, files: &[String]) -> bool {
+    fn has_fresh_cache(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> bool {
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
+            return false;
+        }
+
         if shared_cache::is_manifest_stale(&self.conn, root) {
             return false;
+        }
+
+        if self.git_oracle_says_fresh(root) {
+            return true;
         }
 
         let cached_count: i64 = match self
@@ -554,8 +1712,22 @@ impl DiskCache {
 
     /// Load a partial cache: identify stale files and return clean cached data.
     /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
+    #[cfg(test)]
     pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        self.load_partial_with_source_scope(root, files, shared_cache::CacheSourceScope::Default)
+    }
+
+    pub fn load_partial_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Option<PartialCache> {
         if !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_FULL]) {
+            return None;
+        }
+
+        if !shared_cache::cache_has_source_scope(&self.conn, source_scope) {
             return None;
         }
 
@@ -674,10 +1846,11 @@ impl DiskCache {
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
             .ok()?;
         let mut cached_entities = Vec::new();
         let mut stale_file_entities = Vec::new();
+        let mut recon = shared_cache::ContentReconstructor::new(&self.conn);
         let mut entity_rows = entity_stmt.query([]).ok()?;
         while let Some(row) = entity_rows.next().ok()? {
             let metadata_json: Option<String> = row.get(10).ok()?;
@@ -688,12 +1861,19 @@ impl DiskCache {
                 file_path: row.get(3).ok()?,
                 start_line: row.get::<_, i64>(4).ok()? as usize,
                 end_line: row.get::<_, i64>(5).ok()? as usize,
-                content: row.get(6).ok()?,
+                start_byte: row.get::<_, Option<i64>>(11).ok()?.map(|v| v as usize),
+                end_byte: row.get::<_, Option<i64>>(12).ok()?.map(|v| v as usize),
+                content: row.get::<_, Option<String>>(6).ok()?.unwrap_or_default(),
                 content_hash: row.get(7).ok()?,
                 structural_hash: row.get(8).ok()?,
                 parent_id: row.get(9).ok()?,
                 metadata: metadata_json.and_then(|j| serde_json::from_str(&j).ok()),
             };
+            let mut entity = entity;
+            if entity.content.is_empty() {
+                entity.content =
+                    recon.content(&entity.file_path, None, entity.start_byte, entity.end_byte);
+            }
             if stale_set.contains(entity.file_path.as_str()) {
                 stale_file_entities.push(entity);
             } else {
@@ -744,6 +1924,7 @@ impl DiskCache {
         repair_changed_clean_entity_ids: bool,
         recomputed_edge_source_ids: &[String],
         deleted_entity_ids: &[String],
+        source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let source_stale_files: Vec<&String> = stale_files
             .iter()
@@ -839,45 +2020,29 @@ impl DiskCache {
 
         if repair_changed_clean_entity_ids {
             tx.execute("DELETE FROM entities", [])?;
+            tx.execute("DELETE FROM file_contents", [])?;
         } else {
             let mut del = tx.prepare("DELETE FROM entities WHERE file_path = ?1")?;
+            let mut del_fc = tx.prepare("DELETE FROM file_contents WHERE path = ?1")?;
             for f in &source_stale_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
             for f in &deleted_cached_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
         }
 
         {
-            let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-            for e in entities {
-                if !repair_changed_clean_entity_ids
-                    && !source_stale_set.contains(e.file_path.as_str())
-                {
-                    continue;
-                }
-
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                ins.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
+            let to_insert: Vec<&SemanticEntity> = entities
+                .iter()
+                .filter(|e| {
+                    repair_changed_clean_entity_ids
+                        || source_stale_set.contains(e.file_path.as_str())
+                })
+                .collect();
+            shared_cache::insert_entities_with_content_store(&tx, root, &to_insert, true)?;
         }
 
         if repair_changed_clean_entity_ids {
@@ -953,9 +2118,93 @@ impl DiskCache {
         }
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
+        shared_cache::set_cache_source_scope(&tx, source_scope)?;
+        // An incremental write leaves the cache reflecting the current working
+        // tree, which may differ from HEAD (uncommitted edits). Refresh the
+        // epoch so `built_clean` reflects reality now — otherwise a later
+        // revert-to-HEAD would let the oracle serve this incremental content as
+        // if it were the committed state. Reflecting the current state keeps
+        // the oracle correct (it disables itself when built dirty).
+        store_freshness_epoch(&tx, root, all_files);
         tx.commit()?;
         Ok(())
     }
+}
+
+fn entity_info_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityInfo> {
+    Ok(EntityInfo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        entity_type: row.get(2)?,
+        file_path: row.get(3)?,
+        start_line: row.get::<_, i64>(4)? as usize,
+        end_line: row.get::<_, i64>(5)? as usize,
+        parent_id: row.get(6)?,
+    })
+}
+
+fn sort_entity_infos(entities: &mut [EntityInfo]) {
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.end_line.cmp(&b.end_line))
+            .then(a.entity_type.cmp(&b.entity_type))
+            .then(a.name.cmp(&b.name))
+    });
+}
+
+fn repeat_vars(len: usize) -> String {
+    std::iter::repeat("?")
+        .take(len)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
+    let (entity_type, name) = query.split_once(' ')?;
+    if entity_type.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((entity_type, name))
+}
+
+struct CurrentImports {
+    files: HashSet<String>,
+    has_default_re_export: bool,
+}
+
+fn current_imported_files(
+    root: &Path,
+    file_path: &str,
+) -> Result<Option<CurrentImports>, CachedImpactError> {
+    let content = std::fs::read_to_string(root.join(file_path))
+        .map_err(|_| CachedImpactError::CacheReadFailed)?;
+    let (files, has_unscoped_imports) =
+        js_ts_import_source_files_from_filesystem_with_unscoped(root, file_path, &content);
+    if has_unscoped_imports || !is_js_ts_cache_freshness_supported(file_path) {
+        return Ok(None);
+    }
+    let files = files
+        .into_iter()
+        .filter(|file| !is_default_excluded(file))
+        .collect();
+    Ok(Some(CurrentImports {
+        files,
+        has_default_re_export: js_ts_has_default_re_export_from_content(&content),
+    }))
+}
+
+fn file_has_default_re_export(root: &Path, file_path: &str) -> Result<bool, CachedImpactError> {
+    let content = std::fs::read_to_string(root.join(file_path))
+        .map_err(|_| CachedImpactError::CacheReadFailed)?;
+    Ok(js_ts_has_default_re_export_from_content(&content))
+}
+
+fn is_js_ts_cache_freshness_supported(file_path: &str) -> bool {
+    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| file_path.ends_with(extension))
 }
 
 fn sql_io_error(error: rusqlite::Error) -> std::io::Error {
@@ -1010,7 +2259,7 @@ mod tests {
     }
 
     fn empty_graph() -> EntityGraph {
-        EntityGraph::from_parts(HashMap::new(), Vec::new())
+        EntityGraph::from_parts(EntityInfoMap::default(), Vec::new())
     }
 
     fn entity(id: &str, file_path: &str, name: &str, content: &str) -> SemanticEntity {
@@ -1025,6 +2274,8 @@ mod tests {
             structural_hash: None,
             start_line: 1,
             end_line: 1,
+            start_byte: None,
+            end_byte: None,
             metadata: None,
         }
     }
@@ -1051,7 +2302,7 @@ mod tests {
     }
 
     fn graph_with_edges(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
-        let entity_map = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|entity| {
                 (
@@ -1129,7 +2380,15 @@ mod tests {
 
     fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
         let cache = DiskCache::open(root).unwrap();
-        cache.save(root, files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(
+                root,
+                files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
         assert!(cache.load(root, files).is_some());
         cache
     }
@@ -1146,11 +2405,24 @@ mod tests {
         ];
         let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
         let cache = DiskCache::open(&root).unwrap();
-        cache.save(&root, &files, &graph, &entities).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
 
         let mut output = Vec::new();
         assert!(cache
-            .write_graph_json_topology(&root, &files, &mut output)
+            .write_graph_json_topology(
+                &root,
+                &files,
+                shared_cache::CacheSourceScope::Default,
+                &mut output
+            )
             .unwrap());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
 
@@ -1194,7 +2466,14 @@ mod tests {
         );
         let cache = DiskCache::open(&root).unwrap();
         cache
-            .save_topology(&root, &files, &graph, &entities, &[])
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
 
         assert!(cache.load(&root, &files).is_none());
@@ -1209,7 +2488,12 @@ mod tests {
 
         let mut output = Vec::new();
         assert!(cache
-            .write_graph_json_topology(&root, &files, &mut output)
+            .write_graph_json_topology(
+                &root,
+                &files,
+                shared_cache::CacheSourceScope::Default,
+                &mut output
+            )
             .unwrap());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
@@ -1219,6 +2503,445 @@ mod tests {
 
         rewrite_after_mtime_tick(&root.join("a.rs"), "fn a() { let _x = 1; }\n");
         assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_topology_records_file_imports() {
+        let root = temp_repo_root("topology-file-imports");
+        write_file(
+            &root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        );
+        write_file(
+            &root.join("b.ts"),
+            "import { target } from './a';\nexport function useIt() { return target(); }\n",
+        );
+        let files = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let entities = vec![
+            entity(
+                "a-id",
+                "a.ts",
+                "target",
+                "export function target() { return 1; }",
+            ),
+            entity(
+                "b-id",
+                "b.ts",
+                "useIt",
+                "export function useIt() { return target(); }",
+            ),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        assert_eq!(file_import_count(&cache, "b.ts", "a.ts"), 1);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cache_reuse_requires_matching_source_scope_and_incremental_preserves_it() {
+        let root = temp_repo_root("source-scope-cache-reuse");
+        write_file(&root.join("a.ts"), "export function a() { return 1; }\n");
+        write_file(&root.join("b.ts"), "export function b() { return a(); }\n");
+        let files = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return a(); }"),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                shared_cache::CacheSourceScope::Custom,
+            )
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Custom)
+            .is_some());
+        assert!(cache
+            .load_partial_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Default)
+            .is_none());
+
+        rewrite_after_mtime_tick(&root.join("b.ts"), "export function b() { return 2; }\n");
+        let partial = cache
+            .load_partial_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Custom)
+            .unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+
+        let updated_entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return 2; }"),
+        ];
+        let updated_graph = graph_with_edges(&updated_entities, vec![]);
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &partial.stale_files,
+                &updated_graph,
+                &updated_entities,
+                false,
+                &["b-id".to_string()],
+                &[],
+                shared_cache::CacheSourceScope::Custom,
+            )
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, shared_cache::CacheSourceScope::Custom)
+            .is_some());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cache_first_dependency_impact_ignores_default_excluded_imports() {
+        let root = temp_repo_root("impact-ignores-excluded-imports");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        write_file(
+            &root.join("src/a.ts"),
+            "import { generated } from './generated/client';\nexport function target() { return generated(); }\n",
+        );
+        write_file(
+            &root.join("src/generated/client.ts"),
+            "export function generated() { return 1; }\n",
+        );
+        let files = vec!["src/a.ts".to_string()];
+        let entities = vec![entity(
+            "a-id",
+            "src/a.ts",
+            "target",
+            "export function target() { return generated(); }",
+        )];
+        let graph = graph_with_edges(&entities, vec![]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let result = cache
+            .query_impact_topology(
+                &root,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+                true,
+                Some("target"),
+                None,
+                Some("src/a.ts"),
+                CachedImpactMode::Deps,
+                2,
+            )
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "default-scoped cache-first deps should ignore imports outside the default source set"
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn query_impact_topology_reads_cached_adjacency_without_graph_load() {
+        let root = temp_repo_root("impact-topology-query");
+        write_file(&root.join("a.rs"), "fn target() {}\n");
+        write_file(&root.join("b.rs"), "fn direct() { target(); }\n");
+        write_file(&root.join("c.rs"), "fn transitive() { direct(); }\n");
+        write_file(
+            &root.join("a_test.rs"),
+            "#[test]\nfn target_test() { target(); }\n",
+        );
+        let files = vec![
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "c.rs".to_string(),
+            "a_test.rs".to_string(),
+        ];
+        let entities = vec![
+            entity("a-id", "a.rs", "target", "fn target() {}"),
+            entity("b-id", "b.rs", "direct", "fn direct() { target(); }"),
+            entity(
+                "c-id",
+                "c.rs",
+                "transitive",
+                "fn transitive() { direct(); }",
+            ),
+            entity(
+                "test-id",
+                "a_test.rs",
+                "target_test",
+                "#[test]\nfn target_test() { target(); }",
+            ),
+        ];
+        let graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("b-id", "a-id"),
+                edge("c-id", "b-id"),
+                edge("test-id", "a-id"),
+            ],
+        );
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let result = cache
+            .query_impact_topology(
+                &root,
+                &files,
+                shared_cache::CacheSourceScope::Default,
+                false,
+                Some("target"),
+                None,
+                Some("a.rs"),
+                CachedImpactMode::All,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.entity.id, "a-id");
+        assert!(result.dependencies.is_empty());
+        assert_eq!(
+            result
+                .dependents
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-id", "test-id"]
+        );
+        assert_eq!(
+            result
+                .impact
+                .iter()
+                .map(|(entity, depth)| (entity.id.as_str(), *depth))
+                .collect::<Vec<_>>(),
+            vec![("b-id", 1), ("test-id", 1), ("c-id", 2)]
+        );
+        assert_eq!(
+            result
+                .tests
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test-id"]
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cached_test_impact_reports_truncated_traversal() {
+        let root = temp_repo_root("test-impact-truncated");
+        let cache = DiskCache::open(&root).unwrap();
+        let tx = cache.conn.unchecked_transaction().unwrap();
+
+        tx.execute(
+            "INSERT INTO entities
+             (id, name, entity_type, file_path, start_line, end_line, content, content_hash)
+             VALUES (?1, ?2, 'function', ?3, 1, 1, '', '')",
+            rusqlite::params!["root-id", "root", "root.rs"],
+        )
+        .unwrap();
+
+        {
+            let mut entity_stmt = tx
+                .prepare(
+                    "INSERT INTO entities
+                     (id, name, entity_type, file_path, start_line, end_line, content, content_hash)
+                     VALUES (?1, ?2, 'function', ?3, 1, 1, '', '')",
+                )
+                .unwrap();
+            let mut edge_stmt = tx
+                .prepare(
+                    "INSERT INTO edges (from_entity, to_entity, ref_type)
+                     VALUES (?1, 'root-id', 'calls')",
+                )
+                .unwrap();
+            let mut test_stmt = tx
+                .prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")
+                .unwrap();
+
+            for index in 0..=CACHED_TEST_IMPACT_LIMIT {
+                let id = format!("test-{index:05}");
+                entity_stmt
+                    .execute(rusqlite::params![&id, &id, format!("{id}.rs")])
+                    .unwrap();
+                edge_stmt.execute(rusqlite::params![&id]).unwrap();
+                test_stmt.execute(rusqlite::params![&id]).unwrap();
+            }
+        }
+
+        tx.commit().unwrap();
+
+        let (tests, truncated) = cache.test_impact_entities("root-id").unwrap();
+        assert!(truncated);
+        assert_eq!(tests.len(), CACHED_TEST_IMPACT_LIMIT);
+        assert!(tests.iter().any(|entity| entity.id == "test-00000"));
+        assert!(!tests.iter().any(|entity| entity.id == "test-10000"));
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn query_impact_topology_preserves_bfs_frontier_order() {
+        let root = temp_repo_root("impact-topology-bfs-order");
+        let file_contents = [
+            ("root.rs", "fn root() {}\n"),
+            ("b_parent.rs", "fn b_parent() { root(); }\n"),
+            ("c_parent.rs", "fn c_parent() { root(); }\n"),
+            ("z_mid.rs", "fn z_mid() { b_parent(); }\n"),
+            ("a_mid.rs", "fn a_mid() { c_parent(); }\n"),
+            ("z_leaf.rs", "fn z_leaf() { z_mid(); }\n"),
+            ("a_leaf.rs", "fn a_leaf() { a_mid(); }\n"),
+        ];
+        for (file, content) in &file_contents {
+            write_file(&root.join(*file), content);
+        }
+        let files: Vec<String> = file_contents
+            .iter()
+            .map(|(file, _)| (*file).to_string())
+            .collect();
+        let entities = vec![
+            entity("root-id", "root.rs", "root", "fn root() {}"),
+            entity(
+                "b-parent-id",
+                "b_parent.rs",
+                "b_parent",
+                "fn b_parent() { root(); }",
+            ),
+            entity(
+                "c-parent-id",
+                "c_parent.rs",
+                "c_parent",
+                "fn c_parent() { root(); }",
+            ),
+            entity(
+                "z-mid-id",
+                "z_mid.rs",
+                "z_mid",
+                "fn z_mid() { b_parent(); }",
+            ),
+            entity(
+                "a-mid-id",
+                "a_mid.rs",
+                "a_mid",
+                "fn a_mid() { c_parent(); }",
+            ),
+            entity(
+                "z-leaf-id",
+                "z_leaf.rs",
+                "z_leaf",
+                "fn z_leaf() { z_mid(); }",
+            ),
+            entity(
+                "a-leaf-id",
+                "a_leaf.rs",
+                "a_leaf",
+                "fn a_leaf() { a_mid(); }",
+            ),
+        ];
+        let graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("b-parent-id", "root-id"),
+                edge("c-parent-id", "root-id"),
+                edge("z-mid-id", "b-parent-id"),
+                edge("a-mid-id", "c-parent-id"),
+                edge("z-leaf-id", "z-mid-id"),
+                edge("a-leaf-id", "a-mid-id"),
+            ],
+        );
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save_topology(
+                &root,
+                &files,
+                &graph,
+                &entities,
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let result = cache
+            .query_impact_topology(
+                &root,
+                &files,
+                shared_cache::CacheSourceScope::Default,
+                false,
+                Some("root"),
+                None,
+                Some("root.rs"),
+                CachedImpactMode::All,
+                3,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result
+                .impact
+                .iter()
+                .map(|(entity, depth)| (entity.id.as_str(), *depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b-parent-id", 1),
+                ("c-parent-id", 1),
+                ("z-mid-id", 2),
+                ("a-mid-id", 2),
+                ("z-leaf-id", 3),
+                ("a-leaf-id", 3),
+            ]
+        );
 
         drop(cache);
         cleanup(root);
@@ -1331,7 +3054,15 @@ mod tests {
         );
         let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
         let cache = DiskCache::open(&root).unwrap();
-        cache.save(&root, &files, &empty_graph(), &[]).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
+            .unwrap();
 
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
 
@@ -1363,6 +3094,7 @@ mod tests {
                 false,
                 &[],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
         assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 0);
@@ -1508,6 +3240,33 @@ mod tests {
     }
 
     #[test]
+    fn load_refreshes_gitattributes_mtime_when_content_is_unchanged() {
+        let root = temp_repo_root("gitattributes-mtime-only-refresh");
+        let files = sample_files(&root);
+        let gitattributes = root.join(".gitattributes");
+        let content = "*.foo linguist-language=javascript\n";
+        write_file(&gitattributes, content);
+        let cache = save_empty_cache(&root, &files);
+        let cache_key = shared_cache::CACHE_MANIFEST_FILES
+            .iter()
+            .find_map(|(file_name, cache_key)| {
+                (*file_name == ".gitattributes").then_some(*cache_key)
+            })
+            .unwrap();
+        let before = cached_file_mtime(&cache, cache_key);
+
+        rewrite_after_mtime_tick(&gitattributes, content);
+        let current = shared_cache::file_mtime_parts(&gitattributes).unwrap();
+
+        assert_ne!(before, current);
+        assert!(cache.load(&root, &files).is_some());
+        assert_eq!(cached_file_mtime(&cache, cache_key), current);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
     fn load_invalidates_when_gitattributes_is_removed() {
         let root = temp_repo_root("gitattributes-removed");
         let files = sample_files(&root);
@@ -1540,6 +3299,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-id", "clean.rs", "clean", "clean old"),
                 ],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -1557,6 +3317,7 @@ mod tests {
                 false,
                 &["stale-id".to_string()],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -1589,6 +3350,7 @@ mod tests {
                     entity("stale-id", "stale.rs", "stale", "stale old"),
                     entity("clean-old-id", "clean.rs", "clean", "clean old"),
                 ],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -1606,6 +3368,7 @@ mod tests {
                 true,
                 &[],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -1652,7 +3415,13 @@ mod tests {
             ],
         );
         cache
-            .save(&root, &files, &initial_graph, &entities)
+            .save(
+                &root,
+                &files,
+                &initial_graph,
+                &entities,
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
         let clean_edge_rowid = edge_rowid(&cache, "clean-id", "other-id").unwrap();
 
@@ -1673,6 +3442,7 @@ mod tests {
                 false,
                 &["stale-id".to_string()],
                 &["old-target-id".to_string()],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
 
@@ -1694,7 +3464,13 @@ mod tests {
         write_gitattributes(&cli_to_mcp);
         let cli_cache = DiskCache::open(&cli_to_mcp).unwrap();
         cli_cache
-            .save(&cli_to_mcp, &cli_to_mcp_files, &empty_graph(), &[])
+            .save(
+                &cli_to_mcp,
+                &cli_to_mcp_files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
         let mcp_cache = shared_cache::DiskCache::open(&cli_to_mcp).unwrap();
         assert!(mcp_cache.load(&cli_to_mcp, &cli_to_mcp_files).is_some());
@@ -1707,7 +3483,13 @@ mod tests {
         write_gitattributes(&mcp_to_cli);
         let mcp_cache = shared_cache::DiskCache::open(&mcp_to_cli).unwrap();
         mcp_cache
-            .save(&mcp_to_cli, &mcp_to_cli_files, &empty_graph(), &[])
+            .save(
+                &mcp_to_cli,
+                &mcp_to_cli_files,
+                &empty_graph(),
+                &[],
+                shared_cache::CacheSourceScope::Default,
+            )
             .unwrap();
         let cli_cache = DiskCache::open(&mcp_to_cli).unwrap();
         assert!(cli_cache.load(&mcp_to_cli, &mcp_to_cli_files).is_some());
@@ -1725,6 +3507,7 @@ mod tests {
                 &empty_graph(),
                 &[],
                 &[],
+                shared_cache::CacheSourceScope::Default,
             )
             .unwrap();
         let mcp_cache = shared_cache::DiskCache::open(&cli_topology_to_mcp).unwrap();
@@ -1765,6 +3548,18 @@ mod tests {
         assert!(!root.join(".sem").exists());
 
         drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_existing_readonly_does_not_create_missing_cache() {
+        let root = temp_repo_root("readonly-missing");
+        let db_path = shared_cache::cache_db_path(&root).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(DiskCache::open_existing_readonly(&root).is_err());
+        assert!(!db_path.exists());
+
         cleanup(root);
     }
 

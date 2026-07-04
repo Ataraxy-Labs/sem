@@ -7,11 +7,17 @@ pub struct Timings {
     start: Instant,
     last: Instant,
     entries: Vec<TimingEntry>,
+    counters: Vec<TimingCounter>,
 }
 
 struct TimingEntry {
     name: &'static str,
     duration_ms: f64,
+}
+
+struct TimingCounter {
+    name: &'static str,
+    value: u64,
 }
 
 impl Timings {
@@ -26,6 +32,7 @@ impl Timings {
             start: now,
             last: now,
             entries: Vec::new(),
+            counters: Vec::new(),
         }
     }
 
@@ -38,6 +45,7 @@ impl Timings {
             start: now,
             last: now,
             entries: Vec::new(),
+            counters: Vec::new(),
         }
     }
 
@@ -51,6 +59,13 @@ impl Timings {
             duration_ms: elapsed_ms(now.duration_since(self.last)),
         });
         self.last = now;
+    }
+
+    pub fn counter(&mut self, name: &'static str, value: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.counters.push(TimingCounter { name, value });
     }
 
     pub fn finish(&self) {
@@ -69,16 +84,31 @@ impl Timings {
                     })
                 })
                 .collect::<Vec<_>>();
-            let output = serde_json::json!({
+            let mut output = serde_json::json!({
                 "command": self.command,
                 "phases": phases,
                 "totalMs": total_ms,
             });
+            if !self.counters.is_empty() {
+                output["counters"] = serde_json::json!(self
+                    .counters
+                    .iter()
+                    .map(|counter| {
+                        serde_json::json!({
+                            "name": counter.name,
+                            "value": counter.value,
+                        })
+                    })
+                    .collect::<Vec<_>>());
+            }
             eprintln!("{}", serde_json::to_string(&output).unwrap());
         } else {
             eprintln!("sem timings ({})", self.command);
             for entry in &self.entries {
                 eprintln!("  {:<32} {:>8.3} ms", entry.name, entry.duration_ms);
+            }
+            for counter in &self.counters {
+                eprintln!("  {:<32} {:>8}", counter.name, counter.value);
             }
             eprintln!("  {:<32} {:>8.3} ms", "total", total_ms);
         }

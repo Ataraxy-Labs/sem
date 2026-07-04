@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Ataraxy-Labs/sem",
+  "description": "Entity-level code intelligence: semantic diff, impact analysis, blame, and context for AI agents",
+  "websiteUrl": "https://ataraxy-labs.com",
+  "repository": {
+    "url": "https://github.com/Ataraxy-Labs/sem",
+    "source": "github"
+  },
+  "version": "0.16.2",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@ataraxy-labs/sem",
+      "version": "0.16.2",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

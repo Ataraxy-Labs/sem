@@ -276,8 +276,8 @@ pub fn flush() {
         state.last_flush = now_secs();
         save_state(&state);
     } else {
-        // Put the events back for a later flush. Append (not overwrite) — new
-        // events may have spooled meanwhile.
+        // Put the events back so they're retried on a later flush. Append
+        // (not overwrite) — new events may have spooled meanwhile.
         if let Ok(mut file) = fs::OpenOptions::new()
             .create(true)
             .append(true)

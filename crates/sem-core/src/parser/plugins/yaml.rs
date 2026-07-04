@@ -35,6 +35,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                     content: content.to_string(),
                     start_line: 1,
                     end_line: lines.len(),
+                    start_byte: None,
+                    end_byte: None,
                     metadata: None,
                 }];
             }
@@ -57,8 +59,7 @@ impl SemanticParserPlugin for YamlParserPlugin {
 
         // Capture preamble (comments, document markers) before the first key
         if top_level_keys[0].line > 1 {
-            let preamble_end =
-                trim_trailing_blanks_yaml(&lines, 1, top_level_keys[0].line);
+            let preamble_end = trim_trailing_blanks_yaml(&lines, 1, top_level_keys[0].line);
             if preamble_end >= 1 {
                 let preamble_content = lines[..preamble_end].join("\n");
                 if !preamble_content.trim().is_empty() {
@@ -73,6 +74,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                         content: preamble_content,
                         start_line: 1,
                         end_line: preamble_end,
+                        start_byte: None,
+                        end_byte: None,
                         metadata: None,
                     });
                 }
@@ -103,6 +106,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                 content: entity_content,
                 start_line: tk.line,
                 end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
         }
@@ -132,10 +137,7 @@ fn find_top_level_keys(lines: &[&str]) -> Vec<TopLevelKey> {
         if let Some(colon_pos) = line.find(':') {
             let key = line[..colon_pos].trim().to_string();
             if !key.is_empty() {
-                keys.push(TopLevelKey {
-                    key,
-                    line: i + 1,
-                });
+                keys.push(TopLevelKey { key, line: i + 1 });
             }
         }
     }

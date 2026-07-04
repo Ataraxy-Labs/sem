@@ -611,6 +611,8 @@ impl<'a> SvelteLowerer<'a> {
             content,
             start_line,
             end_line,
+            start_byte: None,
+            end_byte: None,
             metadata,
         }
     }
@@ -747,6 +749,8 @@ fn extract_svelte_module_entities(
         content: content.to_string(),
         start_line: 1,
         end_line: last_line_number(content),
+        start_byte: None,
+        end_byte: None,
         metadata: Some(metadata),
     };
 
@@ -2057,5 +2061,4 @@ function hello() {}
             assert_eq!(c.file_path, "src/routes/+page.svelte");
         }
     }
-
 }

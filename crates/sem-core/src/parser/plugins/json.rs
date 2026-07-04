@@ -14,17 +14,32 @@ impl SemanticParserPlugin for JsonParserPlugin {
     }
 
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Full)
+    }
+
+    fn extract_entities_brief(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Brief)
+    }
+}
+
+impl JsonParserPlugin {
+    fn extract_entities_with_payload(
+        &self,
+        content: &str,
+        file_path: &str,
+        payload_mode: EntityPayloadMode,
+    ) -> Vec<SemanticEntity> {
         let trimmed = content.trim_start();
         if trimmed.starts_with('{') {
-            return extract_entries(content, file_path, JsonContainerKind::Object);
+            return extract_entries(content, file_path, JsonContainerKind::Object, payload_mode);
         }
         if trimmed.starts_with('[') {
-            return extract_entries(content, file_path, JsonContainerKind::Array);
+            return extract_entries(content, file_path, JsonContainerKind::Array, payload_mode);
         }
         if trimmed.is_empty() {
             return Vec::new();
         }
-        vec![document_chunk_entity(content, file_path)]
+        vec![document_chunk_entity(content, file_path, payload_mode)]
     }
 }
 
@@ -32,6 +47,12 @@ impl SemanticParserPlugin for JsonParserPlugin {
 enum JsonContainerKind {
     Object,
     Array,
+}
+
+#[derive(Clone, Copy)]
+enum EntityPayloadMode {
+    Full,
+    Brief,
 }
 
 struct Frame {
@@ -52,6 +73,7 @@ fn extract_entries(
     content: &str,
     file_path: &str,
     container_kind: JsonContainerKind,
+    payload_mode: EntityPayloadMode,
 ) -> Vec<SemanticEntity> {
     let mut entities = Vec::new();
     let root_entries = match container_kind {
@@ -81,8 +103,7 @@ fn extract_entries(
                     entry.content_start_byte,
                     entry.content_end_byte_exclusive,
                     entry.end_line,
-                )
-                {
+                ) {
                     let Some(entity_content) = frame
                         .content
                         .get(start_byte..end_byte)
@@ -94,10 +115,7 @@ fn extract_entries(
                         );
                         continue;
                     };
-                    (
-                        end_line,
-                        entity_content,
-                    )
+                    (end_line, entity_content)
                 } else {
                     let next_boundary = frame
                         .entries
@@ -117,6 +135,14 @@ fn extract_entries(
             let entity_id = format!("{}::{}", file_path, pointer);
             let abs_start = frame.line_offset + entry.start_line - 1;
             let abs_end = frame.line_offset + end_line - 1;
+            let (stored_content, content_hash_value, structural_hash_value) = match payload_mode {
+                EntityPayloadMode::Full => (
+                    entity_content.clone(),
+                    content_hash(&entity_content),
+                    Some(content_hash(value_content)),
+                ),
+                EntityPayloadMode::Brief => (String::new(), String::new(), None),
+            };
 
             entities.push(SemanticEntity {
                 id: entity_id.clone(),
@@ -124,11 +150,13 @@ fn extract_entries(
                 entity_type: entry.entity_type.clone(),
                 name: entry.key.clone(),
                 parent_id: frame.parent_entity_id.clone(),
-                content_hash: content_hash(&entity_content),
-                structural_hash: Some(content_hash(value_content)),
-                content: entity_content.clone(),
+                content_hash: content_hash_value,
+                structural_hash: structural_hash_value,
+                content: stored_content,
                 start_line: abs_start,
                 end_line: abs_end,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
 
@@ -155,19 +183,29 @@ fn extract_entries(
     entities
 }
 
-fn document_chunk_entity(content: &str, file_path: &str) -> SemanticEntity {
+fn document_chunk_entity(
+    content: &str,
+    file_path: &str,
+    payload_mode: EntityPayloadMode,
+) -> SemanticEntity {
     let line_count = content.lines().count().max(1);
+    let (stored_content, content_hash_value) = match payload_mode {
+        EntityPayloadMode::Full => (content.to_string(), content_hash(content)),
+        EntityPayloadMode::Brief => (String::new(), String::new()),
+    };
     SemanticEntity {
         id: build_entity_id(file_path, "chunk", "(document)", None),
         file_path: file_path.to_string(),
         entity_type: "chunk".to_string(),
         name: "(document)".to_string(),
         parent_id: None,
-        content_hash: content_hash(content),
+        content_hash: content_hash_value,
         structural_hash: None,
-        content: content.to_string(),
+        content: stored_content,
         start_line: 1,
         end_line: line_count,
+        start_byte: None,
+        end_byte: None,
         metadata: None,
     }
 }
@@ -618,12 +656,48 @@ mod tests {
     }
 
     fn names(changes: &[SemanticChange]) -> Vec<(String, ChangeType)> {
-        changes.iter().map(|c| (c.entity_name.clone(), c.change_type)).collect()
+        changes
+            .iter()
+            .map(|c| (c.entity_name.clone(), c.change_type))
+            .collect()
     }
 
-    fn find_change<'a>(changes: &'a [SemanticChange], name: &str, kind: ChangeType) -> &'a SemanticChange {
-        changes.iter().find(|c| c.entity_name == name && c.change_type == kind)
-            .unwrap_or_else(|| panic!("expected {:?} {} in changes; got: {:?}", kind, name, names(changes)))
+    fn find_change<'a>(
+        changes: &'a [SemanticChange],
+        name: &str,
+        kind: ChangeType,
+    ) -> &'a SemanticChange {
+        changes
+            .iter()
+            .find(|c| c.entity_name == name && c.change_type == kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {:?} {} in changes; got: {:?}",
+                    kind,
+                    name,
+                    names(changes)
+                )
+            })
+    }
+
+    #[test]
+    fn brief_extraction_drops_json_payloads() {
+        let content = r#"{
+  "scripts": {
+    "build": "tsc"
+  }
+}
+"#;
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities_brief(content, "package.json");
+
+        assert!(entities.iter().any(|entity| entity.name == "scripts"));
+        assert!(entities.iter().any(|entity| entity.name == "build"));
+        assert!(entities.iter().all(|entity| entity.content.is_empty()));
+        assert!(entities.iter().all(|entity| entity.content_hash.is_empty()));
+        assert!(entities
+            .iter()
+            .all(|entity| entity.structural_hash.is_none()));
     }
 
     #[test]
@@ -696,10 +770,7 @@ mod tests {
 
     #[test]
     fn scalar_value_change_reports_modified() {
-        let changes = json_diff(
-            "{\n  \"name\": \"foo\"\n}",
-            "{\n  \"name\": \"bar\"\n}",
-        );
+        let changes = json_diff("{\n  \"name\": \"foo\"\n}", "{\n  \"name\": \"bar\"\n}");
         assert_eq!(names(&changes), vec![("name".into(), ChangeType::Modified)]);
         assert_eq!(changes[0].parent_name, None);
     }
@@ -718,10 +789,7 @@ mod tests {
 
     #[test]
     fn scalar_key_renamed_with_unchanged_value_reports_renamed() {
-        let changes = json_diff(
-            "{\n  \"timeout\": 30\n}",
-            "{\n  \"testTimeout\": 30\n}",
-        );
+        let changes = json_diff("{\n  \"timeout\": 30\n}", "{\n  \"testTimeout\": 30\n}");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].change_type, ChangeType::Renamed);
         assert_eq!(changes[0].entity_name, "testTimeout");
@@ -738,8 +806,11 @@ mod tests {
             "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
             "{\n  \"scripts\": {\n    \"build\": \"webpack\"\n  }\n}",
         );
-        assert!(!changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts should be suppressed; got: {:?}", names(&changes));
+        assert!(
+            !changes.iter().any(|c| c.entity_name == "scripts"),
+            "scripts should be suppressed; got: {:?}",
+            names(&changes)
+        );
         let build = find_change(&changes, "build", ChangeType::Modified);
         assert_eq!(build.parent_name.as_deref(), Some("scripts"));
     }
@@ -750,8 +821,13 @@ mod tests {
             "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
             "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"test\": \"jest\"\n  }\n}",
         );
-        assert!(!changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
-            "scripts should be suppressed; got: {:?}", names(&changes));
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
+            "scripts should be suppressed; got: {:?}",
+            names(&changes)
+        );
         let test = find_change(&changes, "test", ChangeType::Added);
         assert_eq!(test.parent_name.as_deref(), Some("scripts"));
     }
@@ -762,32 +838,37 @@ mod tests {
             "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"test\": \"jest\"\n  }\n}",
             "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
         );
-        assert!(!changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
-            "scripts should be suppressed; got: {:?}", names(&changes));
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
+            "scripts should be suppressed; got: {:?}",
+            names(&changes)
+        );
         let test = find_change(&changes, "test", ChangeType::Deleted);
         assert_eq!(test.parent_name.as_deref(), Some("scripts"));
     }
 
     #[test]
     fn whole_object_added_only_leaf_children_reported() {
-        let changes = json_diff(
-            "{}",
-            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+        let changes = json_diff("{}", "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}");
+        assert!(
+            !changes.iter().any(|c| c.entity_name == "scripts"),
+            "scripts (container) should be suppressed; got: {:?}",
+            names(&changes)
         );
-        assert!(!changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts (container) should be suppressed; got: {:?}", names(&changes));
         let build = find_change(&changes, "build", ChangeType::Added);
         assert_eq!(build.parent_name.as_deref(), Some("scripts"));
     }
 
     #[test]
     fn whole_object_deleted_only_leaf_children_reported() {
-        let changes = json_diff(
-            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
-            "{}",
+        let changes = json_diff("{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}", "{}");
+        assert!(
+            !changes.iter().any(|c| c.entity_name == "scripts"),
+            "scripts (container) should be suppressed; got: {:?}",
+            names(&changes)
         );
-        assert!(!changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts (container) should be suppressed; got: {:?}", names(&changes));
         find_change(&changes, "build", ChangeType::Deleted);
     }
 
@@ -812,7 +893,10 @@ mod tests {
   }
 }"#;
         let changes = json_diff(before, after);
-        assert_eq!(names(&changes), vec![("testTimeout".into(), ChangeType::Modified)]);
+        assert_eq!(
+            names(&changes),
+            vec![("testTimeout".into(), ChangeType::Modified)]
+        );
         assert_eq!(changes[0].parent_name.as_deref(), Some("jest::config"));
     }
 
@@ -865,7 +949,10 @@ mod tests {
   }
 }"#;
         let changes = json_diff(before, after);
-        let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
+        let renames: Vec<_> = changes
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Renamed)
+            .collect();
         assert_eq!(renames.len(), 1);
         assert_eq!(renames[0].entity_name, "start");
         assert_eq!(renames[0].old_entity_name.as_deref(), Some("run"));
@@ -880,8 +967,11 @@ mod tests {
         let changes = json_diff(before, after);
         let tasks = find_change(&changes, "tasks", ChangeType::Renamed);
         assert_eq!(tasks.old_entity_name.as_deref(), Some("scripts"));
-        assert!(!changes.iter().any(|c| c.entity_name == "dev"),
-            "child 'dev' should be suppressed (only moved due to parent rename); got: {:?}", names(&changes));
+        assert!(
+            !changes.iter().any(|c| c.entity_name == "dev"),
+            "child 'dev' should be suppressed (only moved due to parent rename); got: {:?}",
+            names(&changes)
+        );
     }
 
     #[test]
@@ -897,7 +987,10 @@ mod tests {
         let develop = &changes[0];
         assert_eq!(develop.old_entity_name.as_deref(), Some("dev"));
         assert_eq!(develop.parent_name.as_deref(), Some("tasks"));
-        assert!(develop.old_parent_id.is_some(), "child Moved should carry old_parent_id");
+        assert!(
+            develop.old_parent_id.is_some(),
+            "child Moved should carry old_parent_id"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -911,7 +1004,10 @@ mod tests {
             "{\n  \"build\": {\n    \"command\": \"tsc\"\n  }\n}",
         );
         let build = find_change(&changes, "build", ChangeType::Modified);
-        assert_eq!(build.entity_type, "object", "after type should reflect new value");
+        assert_eq!(
+            build.entity_type, "object",
+            "after type should reflect new value"
+        );
         let command = find_change(&changes, "command", ChangeType::Added);
         assert_eq!(command.parent_name.as_deref(), Some("build"));
     }
@@ -923,7 +1019,10 @@ mod tests {
             "{\n  \"config\": \"auto\"\n}",
         );
         let config = find_change(&changes, "config", ChangeType::Modified);
-        assert_eq!(config.entity_type, "property", "after type should reflect new value");
+        assert_eq!(
+            config.entity_type, "property",
+            "after type should reflect new value"
+        );
         find_change(&changes, "watch", ChangeType::Deleted);
     }
 
@@ -966,8 +1065,11 @@ mod tests {
   ]
 }"#;
         let changes = json_diff(before, after);
-        assert_eq!(names(&changes), vec![("deps".into(), ChangeType::Modified)],
-            "array elements have no stable identity; only the array key should change");
+        assert_eq!(
+            names(&changes),
+            vec![("deps".into(), ChangeType::Modified)],
+            "array elements have no stable identity; only the array key should change"
+        );
     }
 
     #[test]
@@ -1109,10 +1211,7 @@ mod tests {
 
     #[test]
     fn null_to_string_value_reports_modified() {
-        let changes = json_diff(
-            "{\n  \"key\": null\n}",
-            "{\n  \"key\": \"value\"\n}",
-        );
+        let changes = json_diff("{\n  \"key\": null\n}", "{\n  \"key\": \"value\"\n}");
         assert_eq!(names(&changes), vec![("key".into(), ChangeType::Modified)]);
     }
 
@@ -1143,7 +1242,6 @@ mod tests {
         let build = find_change(&changes, "build", ChangeType::Modified);
         assert_eq!(build.entity_id, "test.json::/scripts/build");
     }
-
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Phase 3 fuzzy matching
@@ -1179,8 +1277,13 @@ mod tests {
   }
 }"#;
         let changes = json_diff(before, after);
-        assert!(changes.iter().any(|c| c.entity_name == "settings" && c.change_type == ChangeType::Renamed),
-            "expected fuzzy rename of config → settings; got: {:?}", names(&changes));
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.entity_name == "settings" && c.change_type == ChangeType::Renamed),
+            "expected fuzzy rename of config → settings; got: {:?}",
+            names(&changes)
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1209,8 +1312,13 @@ mod tests {
         assert_eq!(build.parent_name.as_deref(), Some("tasks"));
         assert!(build.old_parent_id.is_some());
         find_change(&changes, "test", ChangeType::Added);
-        assert!(!changes.iter().any(|c| c.entity_name == "scripts" || c.entity_name == "tasks"),
-            "parent Deleted/Added should be suppressed; got: {:?}", names(&changes));
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.entity_name == "scripts" || c.entity_name == "tasks"),
+            "parent Deleted/Added should be suppressed; got: {:?}",
+            names(&changes)
+        );
     }
 
     #[test]
@@ -1218,8 +1326,16 @@ mod tests {
         // Arrays are opaque, so the type transition surfaces as a single
         // Modified entry with entity_type reflecting the after value.
         let cases = [
-            ("{\n  \"deps\": \"react\"\n}", "{\n  \"deps\": [\"react\", \"vue\"]\n}", "array"),
-            ("{\n  \"deps\": [\"react\", \"vue\"]\n}", "{\n  \"deps\": \"react\"\n}", "property"),
+            (
+                "{\n  \"deps\": \"react\"\n}",
+                "{\n  \"deps\": [\"react\", \"vue\"]\n}",
+                "array",
+            ),
+            (
+                "{\n  \"deps\": [\"react\", \"vue\"]\n}",
+                "{\n  \"deps\": \"react\"\n}",
+                "property",
+            ),
         ];
         for (before, after, after_type) in cases {
             let changes = json_diff(before, after);
@@ -1259,8 +1375,13 @@ mod tests {
         );
         let timeout = find_change(&changes, "testTimeout", ChangeType::Deleted);
         assert_eq!(timeout.parent_name.as_deref(), Some("jest::config"));
-        assert!(!changes.iter().any(|c| c.entity_name == "jest" || c.entity_name == "config"),
-            "intermediate containers should be suppressed; got: {:?}", names(&changes));
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.entity_name == "jest" || c.entity_name == "config"),
+            "intermediate containers should be suppressed; got: {:?}",
+            names(&changes)
+        );
     }
 
     #[test]
@@ -1315,7 +1436,10 @@ mod tests {
     fn root_scalar_change_reports_document_modified() {
         let changes = json_diff("42", "43");
 
-        assert_eq!(names(&changes), vec![("(document)".into(), ChangeType::Modified)]);
+        assert_eq!(
+            names(&changes),
+            vec![("(document)".into(), ChangeType::Modified)]
+        );
         assert_eq!(changes[0].entity_type, "chunk");
     }
 
@@ -1323,13 +1447,13 @@ mod tests {
     fn malformed_input_does_not_panic() {
         let plugin = JsonParserPlugin;
         let cases = [
-            "{",                                 // unclosed root
-            "{\"a\":",                           // dangling colon
-            "{\"a\": {",                         // unclosed nested object
-            "{\"a\": {] }}",                     // stray ']' inside object value
-            "{\"a\": {\"b\": [}]}",              // mismatched brackets in array
-            "{\"a\": }}}}",                      // multiple stray '}'
-            "{\"a\": {\"b\": 1}, \"c\":",        // truncated mid-object
+            "{",                          // unclosed root
+            "{\"a\":",                    // dangling colon
+            "{\"a\": {",                  // unclosed nested object
+            "{\"a\": {] }}",              // stray ']' inside object value
+            "{\"a\": {\"b\": [}]}",       // mismatched brackets in array
+            "{\"a\": }}}}",               // multiple stray '}'
+            "{\"a\": {\"b\": 1}, \"c\":", // truncated mid-object
         ];
         for input in cases {
             let _ = plugin.extract_entities(input, "test.json");
@@ -1344,7 +1468,10 @@ mod tests {
         );
         find_change(&changes, "dev", ChangeType::Deleted);
         find_change(&changes, "dev", ChangeType::Added);
-        assert!(!changes.iter().any(|c| c.change_type == ChangeType::Renamed),
-            "rename should not be detectable; got: {:?}", names(&changes));
+        assert!(
+            !changes.iter().any(|c| c.change_type == ChangeType::Renamed),
+            "rename should not be detectable; got: {:?}",
+            names(&changes)
+        );
     }
 }

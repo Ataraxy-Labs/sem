@@ -72,6 +72,178 @@ struct EntityOccurrence {
     entity: SemanticEntity,
 }
 
+pub struct HistoryOptions {
+    pub cwd: String,
+    pub file_path: Option<String>,
+    pub limit: usize,
+    pub json: bool,
+}
+
+/// `sem log` with no entity: repo-level history analytics. The time axis a
+/// snapshot dependency graph can't see — which entities churn (hotspots) and
+/// which change together (co-change pairs).
+pub fn history_command(opts: HistoryOptions) {
+    let root = Path::new(&opts.cwd);
+    let registry = super::create_registry(&opts.cwd);
+    let bridge = match GitBridge::open(root) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{} {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let limit = if opts.limit == 0 { 500 } else { opts.limit };
+    // Semantic commit index first: each commit is diffed once, ever; later
+    // queries are lookups plus a delta of new commits. Falls back to the
+    // live walk only when the cache is unusable.
+    let analytics = sem_mcp::cache::history_analytics_from_store(
+        bridge.repo_root(),
+        &bridge,
+        &registry,
+        opts.file_path.as_deref(),
+        limit,
+    )
+    .unwrap_or_else(|| {
+        sem_core::parser::hotspot::compute_history_analytics(
+            &bridge,
+            &registry,
+            opts.file_path.as_deref(),
+            limit,
+        )
+    });
+
+    if opts.json {
+        let hotspots: Vec<serde_json::Value> = analytics
+            .hotspots
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "entity": h.entity_name, "type": h.entity_type,
+                    "file": h.file_path, "commits": h.commits,
+                    "authors": h.authors, "lastSha": h.last_short_sha,
+                })
+            })
+            .collect();
+        let co_changes: Vec<serde_json::Value> = analytics
+            .co_changes
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "a": {"entity": p.a_name, "file": p.a_file, "commits": p.a_commits},
+                    "b": {"entity": p.b_name, "file": p.b_file, "commits": p.b_commits},
+                    "together": p.together, "confidence": p.confidence,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "commitsScanned": analytics.commits_scanned,
+                "hotspots": hotspots,
+                "coChanges": co_changes,
+                "pairCommitsSkipped": analytics.pair_commits_skipped,
+            }))
+            .unwrap_or_default()
+        );
+        return;
+    }
+
+    if analytics.commits_scanned == 0 {
+        println!(
+            "{}",
+            "no history to analyze (need at least 2 commits)".dimmed()
+        );
+        return;
+    }
+
+    println!(
+        "{} {}",
+        "⊕ repo history".green().bold(),
+        format!("· last {} commits", analytics.commits_scanned).dimmed()
+    );
+
+    if analytics.hotspots.is_empty() {
+        println!("\n  {}", "no entity changes found".dimmed());
+        return;
+    }
+
+    println!("\n  {}", "hotspots — most-changed entities".bold());
+    for h in analytics.hotspots.iter().take(15) {
+        let authors = if h.authors == 1 {
+            "1 author".to_string()
+        } else {
+            format!("{} authors", h.authors)
+        };
+        println!(
+            "  {:>3}  {}  {} {} {}",
+            format!("{}×", h.commits).yellow(),
+            truncate_str(&h.entity_name, 40),
+            authors.dimmed(),
+            truncate_str(&h.file_path, 44).dimmed(),
+            format!("last {}", h.last_short_sha).dimmed(),
+        );
+    }
+    if analytics.hotspots.len() > 15 {
+        println!(
+            "  {}",
+            format!(
+                "… {} more (use --json for all)",
+                analytics.hotspots.len() - 15
+            )
+            .dimmed()
+        );
+    }
+
+    if !analytics.co_changes.is_empty() {
+        println!(
+            "\n  {}",
+            "co-changes — entities that change together".bold()
+        );
+        for p in analytics.co_changes.iter().take(12) {
+            let cross_file = p.a_file != p.b_file;
+            let files = if cross_file {
+                format!(
+                    "{} ↔ {}",
+                    truncate_str(&p.a_file, 30),
+                    truncate_str(&p.b_file, 30)
+                )
+            } else {
+                truncate_str(&p.a_file, 44).to_string()
+            };
+            println!(
+                "  {:>3}  {} {} {}  {}",
+                format!("{}×", p.together).yellow(),
+                truncate_str(&p.a_name, 28).cyan(),
+                "↔".dimmed(),
+                truncate_str(&p.b_name, 28).cyan(),
+                format!("{:.0}% · {}", p.confidence * 100.0, files).dimmed(),
+            );
+        }
+        if analytics.co_changes.len() > 12 {
+            println!(
+                "  {}",
+                format!(
+                    "… {} more pairs (use --json for all)",
+                    analytics.co_changes.len() - 12
+                )
+                .dimmed()
+            );
+        }
+    }
+
+    if analytics.pair_commits_skipped > 0 {
+        println!(
+            "\n  {}",
+            format!(
+                "note: {} bulk commits (>50 entities) excluded from co-change pairing",
+                analytics.pair_commits_skipped
+            )
+            .dimmed()
+        );
+    }
+}
+
 pub fn log_command(opts: LogOptions) {
     if super::cloud::try_cloud_log(&opts).is_some() {
         return;

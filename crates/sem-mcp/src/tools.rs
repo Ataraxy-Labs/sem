@@ -7,11 +7,47 @@ use serde::Deserialize;
 pub struct EntitiesParams {
     #[schemars(description = "Optional path to a file or directory. If omitted, defaults to '.'.")]
     pub path: Option<String>,
+    #[schemars(
+        description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
+    )]
+    pub no_default_excludes: Option<bool>,
+    #[schemars(
+        description = "Optional free-text query to find entities by intent across the whole repo (e.g. \"where is the retry logic\"), when you don't know the entity name. Ranks by name/signature relevance and graph centrality; returns file:line and dependent counts. Ignores `path` when set."
+    )]
+    pub query: Option<String>,
+    #[schemars(description = "Max results for `query` mode (default 10).")]
+    pub limit: Option<usize>,
+    #[schemars(
+        description = "Exact substring to search for inside entity bodies across the whole repo (use instead of grep for strings, error messages, config keys). Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text."
+    )]
+    pub text: Option<String>,
 }
 
 impl EntitiesParams {
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref().filter(|p| !p.is_empty())
+    }
+
+    pub fn no_default_excludes(&self) -> bool {
+        self.no_default_excludes.unwrap_or(false)
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        self.query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(10).clamp(1, 100)
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        self.text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
     }
 }
 
@@ -46,13 +82,19 @@ pub struct ImpactAnalysisParams {
         description = "Analysis mode: 'all' (default, shows deps + dependents + transitive impact + tests), 'deps' (direct dependencies only), 'dependents' (direct dependents only), 'tests' (affected test entities only)"
     )]
     pub mode: Option<String>,
+    #[schemars(
+        description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
+    )]
+    pub no_default_excludes: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LogParams {
-    #[schemars(description = "Name of the entity to trace history for")]
-    pub entity_name: String,
+    #[schemars(
+        description = "Name of the entity to trace history for. Omit for repo-level history analytics: hotspots (most-changed entities) and co-change pairs (entities that change in the same commits)."
+    )]
+    pub entity_name: Option<String>,
     #[schemars(description = "Path to the file containing the entity. If omitted, auto-detects.")]
     pub file_path: Option<String>,
     #[schemars(description = "Maximum number of commits to analyze. Defaults to 50.")]
@@ -62,12 +104,26 @@ pub struct LogParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextParams {
-    #[schemars(description = "Path to the file containing the entity")]
-    pub file_path: String,
+    #[schemars(
+        description = "Path to the file containing the entity. OPTIONAL: omit it for one-call lookup — the entity_name is resolved across the whole repo (ambiguity returns a compact candidate list)."
+    )]
+    pub file_path: Option<String>,
     #[schemars(description = "Name of the target entity")]
     pub entity_name: String,
     #[schemars(description = "Maximum token budget. Defaults to 8000.")]
     pub token_budget: Option<usize>,
+    #[schemars(
+        description = "Bound related entities to this many graph hops from the target (0 or omitted = unbounded, fill to the token budget). Use e.g. 1-2 for the immediate neighborhood."
+    )]
+    pub hops: Option<usize>,
+    #[schemars(
+        description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
+    )]
+    pub no_default_excludes: Option<bool>,
+    #[schemars(
+        description = "Force a full re-send even if this session already received an identical fill for the entity (use when your context was compacted and the earlier body is gone)."
+    )]
+    pub fresh: Option<bool>,
 }
 
 #[cfg(test)]
@@ -103,6 +159,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "path": "src/lib.rs" })).unwrap();
 
         assert_eq!(params.path(), Some("src/lib.rs"));
+        assert!(!params.no_default_excludes());
     }
 
     #[test]
@@ -110,6 +167,15 @@ mod tests {
         let params: EntitiesParams = serde_json::from_value(serde_json::json!({})).unwrap();
 
         assert_eq!(params.path(), None);
+        assert!(!params.no_default_excludes());
+    }
+
+    #[test]
+    fn entities_params_accepts_no_default_excludes() {
+        let params: EntitiesParams =
+            serde_json::from_value(serde_json::json!({ "no_default_excludes": true })).unwrap();
+
+        assert!(params.no_default_excludes());
     }
 
     #[test]

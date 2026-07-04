@@ -1,0 +1,124 @@
+name: 'sem — entity-level PR diff'
+description: >-
+  Comment an entity-level semantic diff on every pull request: which functions,
+  classes, and methods were added, modified, or deleted — not raw line noise.
+author: 'Ataraxy Labs'
+branding:
+  icon: 'git-pull-request'
+  color: 'green'
+
+inputs:
+  github-token:
+    description: 'Token used to post the PR comment (needs pull-requests: write)'
+    required: false
+    default: ${{ github.token }}
+  sem-version:
+    description: 'sem release tag to install (e.g. v0.15.0), or "latest"'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install sem
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64)          ARCH=x86_64 ;;
+          aarch64|arm64)   ARCH=arm64 ;;
+          *) echo "::warning::sem: unsupported runner arch $(uname -m); skipping"; exit 0 ;;
+        esac
+        VER='${{ inputs.sem-version }}'
+        if [ "$VER" = "latest" ]; then
+          URL="https://github.com/Ataraxy-Labs/sem/releases/latest/download/sem-linux-${ARCH}.tar.gz"
+        else
+          URL="https://github.com/Ataraxy-Labs/sem/releases/download/${VER}/sem-linux-${ARCH}.tar.gz"
+        fi
+        mkdir -p "$RUNNER_TEMP/sem-bin"
+        curl -fsSL --retry 3 "$URL" | tar -xz -C "$RUNNER_TEMP/sem-bin"
+        chmod +x "$RUNNER_TEMP/sem-bin/sem"
+        echo "$RUNNER_TEMP/sem-bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/sem-bin/sem" --version
+
+    - name: Compute entity-level diff
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -uo pipefail
+        # Shallow checkouts won't have both commits; fetch them explicitly.
+        git fetch --no-tags --force origin "$BASE_SHA" "$HEAD_SHA" >/dev/null 2>&1 || true
+        DIFF_FILE="$RUNNER_TEMP/sem-diff.md"
+        if ! sem diff --from "$BASE_SHA" --to "$HEAD_SHA" --format markdown >"$DIFF_FILE" 2>"$RUNNER_TEMP/sem-diff.err"; then
+          echo "::warning::sem diff failed (not blocking the PR): $(head -c 300 "$RUNNER_TEMP/sem-diff.err")"
+          echo "skip=true" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        echo "skip=false" >> "$GITHUB_ENV"
+
+    - name: Comment on the pull request
+      shell: bash
+      if: env.skip != 'true'
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -uo pipefail
+        MARKER='<!-- sem-entity-diff -->'
+        DIFF_FILE="$RUNNER_TEMP/sem-diff.md"
+        BODY_FILE="$RUNNER_TEMP/sem-comment.md"
+
+        HAS_CHANGES=true
+        if [ ! -s "$DIFF_FILE" ] || ! grep -q '^###' "$DIFF_FILE"; then
+          HAS_CHANGES=false
+        fi
+
+        {
+          echo "$MARKER"
+          echo "## ⊕ Entity-level changes"
+          echo ""
+          if [ "$HAS_CHANGES" = true ]; then
+            cat "$DIFF_FILE"
+          else
+            echo "_No entity-level changes — this PR touches no functions, classes, or methods (formatting, comments, or non-code files only)._"
+          fi
+          echo ""
+          echo "<sub>⊕ entity-level diff by <a href=\"https://github.com/Ataraxy-Labs/sem\">sem</a> · <a href=\"https://github.com/Ataraxy-Labs/sem/tree/main/action\">add it to your repo in 2 minutes</a></sub>"
+        } > "$BODY_FILE"
+
+        # GitHub comments cap at 65536 chars; truncate but keep the summary line.
+        MAX=60000
+        if [ "$(wc -c < "$BODY_FILE")" -gt "$MAX" ]; then
+          SUMMARY=$(grep '^\*\*Summary:' "$DIFF_FILE" | tail -1)
+          head -c "$MAX" "$BODY_FILE" > "$BODY_FILE.tmp"
+          {
+            cat "$BODY_FILE.tmp"
+            echo ""
+            echo ""
+            echo "… _truncated — run \`sem diff\` locally for the full diff._"
+            echo ""
+            echo "${SUMMARY:-}"
+            echo ""
+            echo "<sub>⊕ entity-level diff by <a href=\"https://github.com/Ataraxy-Labs/sem\">sem</a> · <a href=\"https://github.com/Ataraxy-Labs/sem/tree/main/action\">add it to your repo in 2 minutes</a></sub>"
+          } > "$BODY_FILE"
+          rm -f "$BODY_FILE.tmp"
+        fi
+
+        # Sticky comment: update ours if it exists, else create (skip creating
+        # a noise comment when there are no entity changes).
+        CID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null | head -1)
+        if [ -n "${CID:-}" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$CID" -F body=@"$BODY_FILE" >/dev/null \
+            && echo "updated comment $CID" \
+            || echo "::warning::could not update PR comment (token may lack pull-requests: write)"
+        elif [ "$HAS_CHANGES" = true ]; then
+          gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$BODY_FILE" >/dev/null \
+            && echo "created comment" \
+            || echo "::warning::could not create PR comment (token may lack pull-requests: write)"
+        else
+          echo "no entity changes and no prior comment — staying quiet"
+        fi

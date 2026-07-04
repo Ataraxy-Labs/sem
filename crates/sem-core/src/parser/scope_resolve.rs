@@ -12,12 +12,13 @@
 //! - Uses AST structure, not string matching
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::model::entity::SemanticEntity;
 
@@ -59,6 +60,10 @@ pub struct Scope {
     /// Unresolved call assignments: var_name -> function_name (from `x = func()`)
     /// These get resolved after return type analysis.
     pending_call_types: HashMap<String, String>,
+    /// Unresolved field-access assignments: var_name -> (object_var, property).
+    /// From `val x = obj.field`; resolved once object types and the global
+    /// class field-type map are both available.
+    pending_field_types: HashMap<String, (String, String)>,
     /// Which entity owns this scope (if any)
     owner_id: Option<String>,
     /// What kind of scope: "module", "class", "function"
@@ -172,7 +177,7 @@ fn find_entity_source_spans<'a>(
     entities: &[&'a SemanticEntity],
     source: &str,
 ) -> HashMap<&'a str, SourceSpan> {
-    let mut spans = HashMap::new();
+    let mut spans = HashMap::default();
     let line_starts = source_line_starts(source);
     for entity in entities {
         if entity.content.is_empty() {
@@ -421,7 +426,7 @@ struct FileEntityLookup<'a> {
 
 impl<'a> FileEntityLookup<'a> {
     fn new(file_entities: &[&'a SemanticEntity]) -> Self {
-        let mut by_name: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::new();
+        let mut by_name: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::default();
         for entity in file_entities {
             by_name
                 .entry(entity.name.as_str())
@@ -469,6 +474,65 @@ struct ScopeLookupCache {
     local_bindings: HashMap<usize, HashMap<String, bool>>,
     types: HashMap<usize, HashMap<String, Option<String>>>,
     enclosing_classes: HashMap<usize, Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionCacheKey<'a> {
+    Call {
+        scope_idx: usize,
+        from_entity_id: &'a str,
+        name: &'a str,
+        argument_labels: Option<&'a [Option<String>]>,
+        allow_cross_file_calls: bool,
+    },
+    MethodCall {
+        scope_idx: usize,
+        from_entity_id: &'a str,
+        receiver: &'a str,
+        method: &'a str,
+        argument_labels: Option<&'a [Option<String>]>,
+        allow_cross_file_calls: bool,
+        allow_implicit_instance_member_receiver: bool,
+    },
+}
+
+fn resolution_cache_key<'a>(
+    ast_ref: &'a AstRef,
+    scope_idx: usize,
+    from_entity_id: &'a str,
+    allow_cross_file_calls: bool,
+    allow_implicit_instance_member_receiver: bool,
+) -> Option<ResolutionCacheKey<'a>> {
+    match &ast_ref.kind {
+        AstRefKind::Call {
+            name,
+            argument_labels,
+        } => Some(ResolutionCacheKey::Call {
+            scope_idx,
+            from_entity_id,
+            name,
+            argument_labels: argument_labels.as_deref(),
+            allow_cross_file_calls,
+        }),
+        AstRefKind::ScopedCall { .. } => None,
+        AstRefKind::MethodCall {
+            receiver,
+            method,
+            argument_labels,
+        } => Some(ResolutionCacheKey::MethodCall {
+            scope_idx,
+            from_entity_id,
+            receiver: normalized_method_receiver(receiver),
+            method,
+            argument_labels: argument_labels.as_deref(),
+            allow_cross_file_calls,
+            allow_implicit_instance_member_receiver,
+        }),
+    }
+}
+
+fn normalized_method_receiver(receiver: &str) -> &str {
+    receiver.trim_start_matches('!').trim_start_matches('~')
 }
 
 pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
@@ -525,8 +589,33 @@ fn compare_entity_ids_by_source(
     }
 }
 
-/// Public API — preserves the original 5-parameter signature for semver compatibility.
+/// Public API that accepts caller-provided entity maps and normalizes them for resolver internals.
 pub fn resolve_with_scopes(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &std::collections::HashMap<String, EntityInfo, impl BuildHasher>,
+    pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
+) -> ScopeResult {
+    let entity_map: HashMap<String, EntityInfo> = entity_map
+        .iter()
+        .map(|(id, entity)| (id.clone(), entity.clone()))
+        .collect();
+    let result = resolve_with_scopes_full(
+        root,
+        file_paths,
+        all_entities,
+        &entity_map,
+        pre_parsed,
+        None,
+        None,
+        true,
+    );
+    scope_result_from_full(result)
+}
+
+/// Public API for callers that already hold an Fx-hashed entity map.
+pub fn resolve_with_scopes_fast(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
@@ -543,6 +632,10 @@ pub fn resolve_with_scopes(
         None,
         true,
     );
+    scope_result_from_full(result)
+}
+
+fn scope_result_from_full(result: ScopeResultFull) -> ScopeResult {
     ScopeResult {
         edges: result.edges,
         resolution_log: result.resolution_log,
@@ -609,17 +702,17 @@ fn resolve_with_scopes_full_inner(
 ) -> ScopeResultFull {
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
-    let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
     // Use pre-built lookups if provided, otherwise build from scratch.
     let owned_lookups;
     let lookups = if let Some(pb) = pre_built {
         pb
     } else {
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::new();
-        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
+        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::default();
+        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::default();
 
         for entity in all_entities {
             symbol_table
@@ -686,7 +779,7 @@ fn resolve_with_scopes_full_inner(
     let go_pkg_index = &lookups.go_pkg_index;
 
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
-    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in all_entities {
         entities_by_file
             .entry(entity.file_path.as_str())
@@ -695,7 +788,7 @@ fn resolve_with_scopes_full_inner(
     }
 
     // Build parent_id indexed entity lookup: parent_id -> Vec<&SemanticEntity>
-    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in all_entities {
         if let Some(ref pid) = entity.parent_id {
             children_by_parent
@@ -706,24 +799,24 @@ fn resolve_with_scopes_full_inner(
     }
 
     // Return type map: function_entity_id -> class_name (if function returns ClassName())
-    let mut return_type_map: HashMap<String, String> = HashMap::new();
+    let mut return_type_map: HashMap<String, String> = HashMap::default();
 
     // Instance attribute types: (class_name, attr_name) -> class_name_of_attr
-    let mut instance_attr_types: HashMap<(String, String), String> = HashMap::new();
+    let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
 
     // __init__ param info: class_name -> (ordered_params, attr_to_param mapping)
     // attr_to_param: attr_name -> param_name (for self.attr = param patterns)
-    let mut init_params: HashMap<String, Vec<String>> = HashMap::new();
-    let mut attr_to_param: HashMap<(String, String), String> = HashMap::new();
+    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
+    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
 
     // Merge pre-parsed trees with disk-parsed trees for missing files
     let mut owned_parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
-    let pre_set: std::collections::HashSet<String> = if let Some(pp) = pre_parsed {
+    let pre_set: HashSet<String> = if let Some(pp) = pre_parsed {
         let set = pp.iter().map(|(fp, _, _)| fp.clone()).collect();
         owned_parsed_files = pp;
         set
     } else {
-        std::collections::HashSet::new()
+        HashSet::default()
     };
     // Parse any files not already in the pre-parsed set
     for file_path in file_paths {
@@ -753,14 +846,14 @@ fn resolve_with_scopes_full_inner(
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
     let content_by_file = OnceLock::new();
     let exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
-        Mutex::new(HashMap::new());
+        Mutex::new(HashMap::default());
     // The default-export table is consulted only while resolving JS/TS imports.
     // When an import table is supplied (the graph-build path), those imports are
     // already resolved and `extract_ts_import`/`extract_ts_re_export` are skipped,
     // so the table is never read — building it would be pure waste on a large repo.
     let ts_default_exports = if pre_built_import_table.is_some() {
         TsDefaultExportTable {
-            exports_by_file: HashMap::new(),
+            exports_by_file: HashMap::default(),
             sorted_files: Vec::new(),
         }
     } else {
@@ -788,7 +881,7 @@ fn resolve_with_scopes_full_inner(
                 .unwrap_or(&[]);
             let file_lookup = FileEntityLookup::new(file_entities);
 
-            let mut local_return_type_map: HashMap<String, String> = HashMap::new();
+            let mut local_return_type_map: HashMap<String, String> = HashMap::default();
             scan_return_types(
                 tree.root_node(),
                 file_path,
@@ -798,9 +891,10 @@ fn resolve_with_scopes_full_inner(
                 config,
             );
 
-            let mut local_instance_attr_types: HashMap<(String, String), String> = HashMap::new();
-            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::new();
-            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::new();
+            let mut local_instance_attr_types: HashMap<(String, String), String> =
+                HashMap::default();
+            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::default();
+            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::default();
             scan_init_self_attrs(
                 tree.root_node(),
                 file_path,
@@ -848,7 +942,7 @@ fn resolve_with_scopes_full_inner(
     {
         build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map)
     } else {
-        HashMap::new()
+        HashMap::default()
     };
 
     // Group the prebuilt import table by importing file once. Otherwise every file
@@ -857,7 +951,7 @@ fn resolve_with_scopes_full_inner(
     // own imports).
     let import_table_by_file: HashMap<&str, Vec<(&str, &str)>> =
         if let Some(import_table) = pre_built_import_table {
-            let mut grouped: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+            let mut grouped: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
             for ((import_file_path, local_name), target_id) in import_table {
                 grouped
                     .entry(import_file_path.as_str())
@@ -866,7 +960,7 @@ fn resolve_with_scopes_full_inner(
             }
             grouped
         } else {
-            HashMap::new()
+            HashMap::default()
         };
 
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
@@ -882,17 +976,18 @@ fn resolve_with_scopes_full_inner(
 
             let mut scopes: Vec<Scope> = vec![Scope {
                 parent: None,
-                defs: HashMap::new(),
-                bindings: HashSet::new(),
-                binding_rows: HashMap::new(),
-                types: HashMap::new(),
-                pending_call_types: HashMap::new(),
+                defs: HashMap::default(),
+                bindings: HashSet::default(),
+                binding_rows: HashMap::default(),
+                types: HashMap::default(),
+                pending_call_types: HashMap::default(),
+                pending_field_types: HashMap::default(),
                 owner_id: None,
                 kind: "module",
             }];
 
-            let mut entity_scope_map: HashMap<String, usize> = HashMap::new();
-            let mut entity_inner_scope: HashMap<String, usize> = HashMap::new();
+            let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
+            let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
 
             if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
                 for (_start, _end, eid) in ranges {
@@ -927,7 +1022,7 @@ fn resolve_with_scopes_full_inner(
                 config,
             );
 
-            let mut local_import_table: HashMap<(String, String), String> = HashMap::new();
+            let mut local_import_table: HashMap<(String, String), String> = HashMap::default();
             if pre_built_import_table.is_some() {
                 if let Some(entries) = import_table_by_file.get(file_path.as_str()) {
                     for (local_name, target_id) in entries {
@@ -974,10 +1069,12 @@ fn resolve_with_scopes_full_inner(
                 &return_type_map,
                 &local_import_by_name,
             );
+            // Resolve `val x = obj.field` accesses against the class field-type map.
+            inject_field_type_bindings(&mut scopes, &instance_attr_types);
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
-            let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::new();
+            let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
             // Walk the AST once for the entire file, collecting all refs with row positions
             let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
@@ -985,6 +1082,10 @@ fn resolve_with_scopes_full_inner(
             let descendant_ranges_by_entity =
                 build_descendant_ranges_by_entity(&file_entities, entity_map);
             let mut lookup_cache = ScopeLookupCache::default();
+            let mut last_resolution: Option<(
+                ResolutionCacheKey<'_>,
+                Option<(String, RefType, &'static str)>,
+            )> = None;
 
             for entity in &file_entities {
                 if emit_entity_ids
@@ -1070,24 +1171,61 @@ fn resolve_with_scopes_full_inner(
                         // Languages without per-symbol imports (e.g. Swift, Kotlin)
                         // allow cross-file resolution for lowercase function names.
                         let allow_cross_file = config.import_extractor.is_none();
-                        let resolution = resolve_ref(
+                        let cache_key = resolution_cache_key(
                             ast_ref,
                             scope_idx,
-                            &scopes,
-                            &symbol_table,
-                            &class_members,
-                            &owner_members,
-                            &local_import_by_name,
-                            &instance_attr_types,
-                            entity_map,
-                            &swift_call_signatures,
-                            file_path,
-                            &entity.id,
+                            entity.id.as_str(),
                             allow_cross_file,
                             allow_implicit_instance_member_receiver,
-                            &file_lookup,
-                            &mut lookup_cache,
                         );
+                        let resolution = if let Some(cache_key) = cache_key {
+                            if let Some((_, cached)) = last_resolution
+                                .as_ref()
+                                .filter(|(last_key, _)| *last_key == cache_key)
+                            {
+                                cached.clone()
+                            } else {
+                                let resolved = resolve_ref(
+                                    ast_ref,
+                                    scope_idx,
+                                    &scopes,
+                                    &symbol_table,
+                                    &class_members,
+                                    &owner_members,
+                                    &local_import_by_name,
+                                    &instance_attr_types,
+                                    entity_map,
+                                    &swift_call_signatures,
+                                    file_path,
+                                    &entity.id,
+                                    allow_cross_file,
+                                    allow_implicit_instance_member_receiver,
+                                    &file_lookup,
+                                    &mut lookup_cache,
+                                );
+                                last_resolution = Some((cache_key, resolved.clone()));
+                                resolved
+                            }
+                        } else {
+                            resolve_ref(
+                                ast_ref,
+                                scope_idx,
+                                &scopes,
+                                &symbol_table,
+                                &class_members,
+                                &owner_members,
+                                &local_import_by_name,
+                                &instance_attr_types,
+                                entity_map,
+                                &swift_call_signatures,
+                                file_path,
+                                &entity.id,
+                                allow_cross_file,
+                                allow_implicit_instance_member_receiver,
+                                &file_lookup,
+                                &mut lookup_cache,
+                            )
+                        };
 
                         if let Some((target_id, ref_type, method)) = resolution {
                             if target_id != entity.id {
@@ -1101,29 +1239,33 @@ fn resolve_with_scopes_full_inner(
 
                                 if !is_parent_child {
                                     let reference = ref_description(ast_ref);
-                                    file_edges.push((
-                                        entity.id.clone(),
-                                        target_id.clone(),
-                                        ref_type,
-                                    ));
                                     add_scope_reference_words(entity_consumed, &reference);
-                                    file_log.push(ResolutionEntry {
-                                        from_entity: entity.id.clone(),
-                                        reference,
-                                        resolved_to: Some(target_id),
-                                        method,
-                                    });
+                                    // The debug log allocates several Strings per
+                                    // reference across the whole repo; production
+                                    // builds discard it, so only populate it when
+                                    // a caller asked for the log.
+                                    if emit_local_binding_log {
+                                        file_log.push(ResolutionEntry {
+                                            from_entity: entity.id.clone(),
+                                            reference,
+                                            resolved_to: Some(target_id.clone()),
+                                            method,
+                                        });
+                                    }
+                                    file_edges.push((entity.id.clone(), target_id, ref_type));
                                 }
                             }
                         } else {
                             let reference = ref_description(ast_ref);
                             add_scope_reference_words(entity_consumed, &reference);
-                            file_log.push(ResolutionEntry {
-                                from_entity: entity.id.clone(),
-                                reference,
-                                resolved_to: None,
-                                method: "unresolved",
-                            });
+                            if emit_local_binding_log {
+                                file_log.push(ResolutionEntry {
+                                    from_entity: entity.id.clone(),
+                                    reference,
+                                    resolved_to: None,
+                                    method: "unresolved",
+                                });
+                            }
                         }
                     }
                 }
@@ -1141,19 +1283,33 @@ fn resolve_with_scopes_full_inner(
         }
     }
 
-    // Deduplicate edges
-    let mut seen: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::with_capacity(all_edges.len());
-    let deduped_edges: Vec<(String, String, RefType)> = {
+    // Deduplicate edges keeping the first-inserted (from, to). Index-based:
+    // sorting indices by borrowed keys avoids the two String clones per edge
+    // the old HashSet key paid — millions of allocations on a monorepo.
+    let all_edges = {
+        let mut order: Vec<usize> = (0..all_edges.len()).collect();
+        order.sort_by(|&a, &b| {
+            (&all_edges[a].0, &all_edges[a].1, a).cmp(&(&all_edges[b].0, &all_edges[b].1, b))
+        });
+        let mut keep = vec![false; all_edges.len()];
+        let mut prev: Option<usize> = None;
+        for &i in &order {
+            let dup = prev.is_some_and(|p: usize| {
+                all_edges[p].0 == all_edges[i].0 && all_edges[p].1 == all_edges[i].1
+            });
+            if !dup {
+                keep[i] = true;
+            }
+            prev = Some(i);
+        }
         let mut result = Vec::with_capacity(all_edges.len());
-        for edge in all_edges {
-            if seen.insert((edge.0.clone(), edge.1.clone())) {
+        for (i, edge) in all_edges.into_iter().enumerate() {
+            if keep[i] {
                 result.push(edge);
             }
         }
         result
     };
-    let all_edges = deduped_edges;
 
     ScopeResultFull {
         edges: all_edges,
@@ -1269,7 +1425,7 @@ fn build_descendant_ranges_by_entity(
     file_entities: &[&SemanticEntity],
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, Vec<(usize, usize)>> {
-    let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
     let mut sorted_entities = file_entities.to_vec();
     sorted_entities.sort_by(|left, right| {
         left.start_line
@@ -1293,7 +1449,7 @@ fn build_descendant_ranges_by_entity(
 
         let child_range = (entity.start_line.saturating_sub(1), entity.end_line);
         let mut current = entity.parent_id.as_deref();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         while let Some(parent_id) = current {
             if !visited.insert(parent_id.to_string()) {
                 break;
@@ -1458,11 +1614,12 @@ fn build_scopes_from_ast(
                     let idx = scopes.len();
                     scopes.push(Scope {
                         parent: Some(current_scope),
-                        defs: HashMap::new(),
-                        bindings: HashSet::new(),
-                        binding_rows: HashMap::new(),
-                        types: HashMap::new(),
-                        pending_call_types: HashMap::new(),
+                        defs: HashMap::default(),
+                        bindings: HashSet::default(),
+                        binding_rows: HashMap::default(),
+                        types: HashMap::default(),
+                        pending_call_types: HashMap::default(),
+                        pending_field_types: HashMap::default(),
                         owner_id: Some(ce.id.clone()),
                         kind: "class",
                     });
@@ -1482,15 +1639,51 @@ fn build_scopes_from_ast(
 
                 push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
                 continue;
-            } else if !is_impl {
+            } else if is_impl {
+                // The impl'd type is usually defined elsewhere (idiomatic Rust:
+                // `struct S;` then `impl S { ... }` on a later line; likewise a
+                // Swift `extension`), so find_at_line above couldn't locate it at
+                // the impl's own line. Anchor the scope on the impl entity itself
+                // and register its methods, so `self.method()` calls inside the
+                // impl resolve to sibling methods instead of being dropped.
+                let impl_entity = file_lookup
+                    .find_at_line(class_name, line, |entity| entity.entity_type == "impl");
                 let class_scope_idx = scopes.len();
                 scopes.push(Scope {
                     parent: Some(current_scope),
-                    defs: HashMap::new(),
-                    bindings: HashSet::new(),
-                    binding_rows: HashMap::new(),
-                    types: HashMap::new(),
-                    pending_call_types: HashMap::new(),
+                    defs: HashMap::default(),
+                    bindings: HashSet::default(),
+                    binding_rows: HashMap::default(),
+                    types: HashMap::default(),
+                    pending_call_types: HashMap::default(),
+                    pending_field_types: HashMap::default(),
+                    owner_id: impl_entity.map(|ie| ie.id.clone()),
+                    kind: "class",
+                });
+                if let Some(ie) = impl_entity {
+                    entity_scope_map.insert(ie.id.clone(), current_scope);
+                    entity_inner_scope.insert(ie.id.clone(), class_scope_idx);
+                    if let Some(children) = children_by_parent.get(ie.id.as_str()) {
+                        for entity in children {
+                            scopes[class_scope_idx]
+                                .defs
+                                .insert(entity.name.clone(), entity.id.clone());
+                            entity_scope_map.insert(entity.id.clone(), class_scope_idx);
+                        }
+                    }
+                }
+                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
+                continue;
+            } else {
+                let class_scope_idx = scopes.len();
+                scopes.push(Scope {
+                    parent: Some(current_scope),
+                    defs: HashMap::default(),
+                    bindings: HashSet::default(),
+                    binding_rows: HashMap::default(),
+                    types: HashMap::default(),
+                    pending_call_types: HashMap::default(),
+                    pending_field_types: HashMap::default(),
                     owner_id: None,
                     kind: "class",
                 });
@@ -1509,11 +1702,12 @@ fn build_scopes_from_ast(
             let mod_scope_idx = scopes.len();
             scopes.push(Scope {
                 parent: Some(current_scope),
-                defs: HashMap::new(),
-                bindings: HashSet::new(),
-                binding_rows: HashMap::new(),
-                types: HashMap::new(),
-                pending_call_types: HashMap::new(),
+                defs: HashMap::default(),
+                bindings: HashSet::default(),
+                binding_rows: HashMap::default(),
+                types: HashMap::default(),
+                pending_call_types: HashMap::default(),
+                pending_field_types: HashMap::default(),
                 owner_id: None,
                 kind: "module",
             });
@@ -1579,11 +1773,12 @@ fn build_scopes_from_ast(
             let func_scope_idx = scopes.len();
             scopes.push(Scope {
                 parent: Some(parent_scope),
-                defs: HashMap::new(),
-                bindings: HashSet::new(),
-                binding_rows: HashMap::new(),
-                types: HashMap::new(),
-                pending_call_types: HashMap::new(),
+                defs: HashMap::default(),
+                bindings: HashSet::default(),
+                binding_rows: HashMap::default(),
+                types: HashMap::default(),
+                pending_call_types: HashMap::default(),
+                pending_field_types: HashMap::default(),
                 owner_id: None,
                 kind: "function",
             });
@@ -1861,6 +2056,14 @@ fn scan_ts_var_declaration(
     scopes: &mut Vec<Scope>,
     source: &[u8],
 ) {
+    // Java/C#: the declared type is a `type` field on the declaration node itself
+    // (`Dog d = ...`), shared by every declarator. TS/JS put the annotation on the
+    // declarator instead, so this is None there and the per-declarator check applies.
+    let decl_type = node
+        .child_by_field_name("type")
+        .map(|n| extract_base_type(n, source))
+        .filter(|t| !t.is_empty() && t.chars().next().map_or(false, |c| c.is_uppercase()));
+
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "variable_declarator" {
@@ -1878,7 +2081,7 @@ fn scan_ts_var_declaration(
                 .unwrap_or_else(|| child.start_position().row);
             record_binding(scopes, scope_idx, &var_name, binding_row);
 
-            // Check for explicit type annotation: `const x: Foo = ...`
+            // Check for explicit type annotation: `const x: Foo = ...` (declarator-level)
             if let Some(type_ann) = child.child_by_field_name("type") {
                 let type_text = extract_base_type(type_ann, source);
                 if !type_text.is_empty()
@@ -1887,6 +2090,14 @@ fn scan_ts_var_declaration(
                     scopes[scope_idx].types.insert(var_name.clone(), type_text);
                     continue;
                 }
+            }
+
+            // Declaration-level type annotation (Java/C#): `Dog d = ...`
+            if let Some(type_text) = &decl_type {
+                scopes[scope_idx]
+                    .types
+                    .insert(var_name.clone(), type_text.clone());
+                continue;
             }
 
             // Check RHS value
@@ -1975,43 +2186,75 @@ fn scan_ts_var_declaration(
             return;
         }
 
-        // Kotlin: property_declaration > variable_declaration > identifier, then sibling call_expression
+        // Kotlin: property_declaration > variable_declaration > identifier (+ user_type),
+        // then a sibling RHS expression. tree-sitter-kotlin-ng exposes the name and the
+        // type annotation positionally inside variable_declaration (no `name`/`type`
+        // fields on property_declaration), so read them there.
         let mut c = node.walk();
         for child in node.named_children(&mut c) {
-            if child.kind() == "variable_declaration" {
-                let var_name_kt = child
-                    .child_by_field_name("name")
-                    .or_else(|| child.named_child(0).filter(|n| n.kind() == "identifier"))
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("")
-                    .to_string();
-
-                if !var_name_kt.is_empty() {
-                    // Check for type annotation on the property_declaration
-                    if let Some(type_ann) = node.child_by_field_name("type") {
-                        let type_text = extract_base_type(type_ann, source);
-                        if !type_text.is_empty()
-                            && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                        {
-                            scopes[scope_idx]
-                                .types
-                                .insert(var_name_kt.clone(), type_text);
-                            return;
-                        }
-                    }
-                    // Find the value (sibling call_expression or other expression)
-                    let mut c2 = node.walk();
-                    for sibling in node.named_children(&mut c2) {
-                        if sibling.kind() == "call_expression" || sibling.kind() == "new_expression"
-                        {
-                            record_type_from_rhs(sibling, &var_name_kt, scope_idx, scopes, source);
-                            break;
-                        }
-                    }
-                }
+            if child.kind() != "variable_declaration" {
+                continue;
+            }
+            let (var_name_kt, declared_type) = kotlin_positional_name_and_type(child, source);
+            if var_name_kt.is_empty() {
                 break;
             }
+
+            // Explicit `val x: Type = ...` annotation wins.
+            if let Some(type_text) = declared_type {
+                if !type_text.is_empty()
+                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
+                {
+                    scopes[scope_idx].types.insert(var_name_kt, type_text);
+                    return;
+                }
+            }
+
+            // Otherwise infer from the RHS sibling expression.
+            let mut c2 = node.walk();
+            for sibling in node.named_children(&mut c2) {
+                match sibling.kind() {
+                    "call_expression" | "new_expression" => {
+                        record_type_from_rhs(sibling, &var_name_kt, scope_idx, scopes, source);
+                        break;
+                    }
+                    // `val x = obj.field` — defer until object types and the global
+                    // class field-type map are known (inject_field_type_bindings).
+                    "navigation_expression" => {
+                        if let Some((obj, prop)) = kotlin_navigation_obj_prop(sibling, source) {
+                            scopes[scope_idx]
+                                .pending_field_types
+                                .insert(var_name_kt.clone(), (obj, prop));
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            break;
         }
+    }
+}
+
+/// Extract `(object_identifier, property)` from a kotlin-ng `navigation_expression`
+/// of the simple form `ident.ident`. Returns None for anything more complex
+/// (chained access, calls as the receiver, `this`, etc.).
+fn kotlin_navigation_obj_prop(node: tree_sitter::Node, source: &[u8]) -> Option<(String, String)> {
+    let mut cursor = node.walk();
+    let idents: Vec<tree_sitter::Node> = node
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "identifier" || c.kind() == "simple_identifier")
+        .collect();
+    // Exactly object + property, both bare identifiers.
+    if node.named_children(&mut node.walk()).count() != idents.len() || idents.len() != 2 {
+        return None;
+    }
+    let obj = idents[0].utf8_text(source).ok()?.to_string();
+    let prop = idents[1].utf8_text(source).ok()?.to_string();
+    if obj.is_empty() || prop.is_empty() {
+        None
+    } else {
+        Some((obj, prop))
     }
 }
 
@@ -2398,6 +2641,15 @@ fn record_type_from_rhs(
                 }
             }
         }
+        // Java/C#: new Foo()
+        "object_creation_expression" => {
+            if let Some(type_node) = rhs.child_by_field_name("type") {
+                let name = extract_base_type(type_node, source);
+                if !name.is_empty() && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    scopes[scope_idx].types.insert(var_name.to_string(), name);
+                }
+            }
+        }
         // Go: Foo{} (composite_literal / struct literal)
         "composite_literal" => {
             if let Some(type_node) = rhs.child_by_field_name("type") {
@@ -2435,6 +2687,34 @@ fn extract_base_type(type_node: tree_sitter::Node, source: &[u8]) -> String {
     text.to_string()
 }
 
+/// kotlin-ng exposes the name/type of `variable_declaration` and `class_parameter`
+/// nodes positionally (an `identifier` followed by an optional `user_type`) rather
+/// than via `name`/`type` fields. Returns (name, base_type) extracted that way.
+fn kotlin_positional_name_and_type(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> (String, Option<String>) {
+    let mut cursor = node.walk();
+    let mut name = String::new();
+    let mut base_type: Option<String> = None;
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "simple_identifier" if name.is_empty() => {
+                name = child.utf8_text(source).unwrap_or("").to_string();
+            }
+            "user_type" | "nullable_type" | "type_reference" if base_type.is_none() => {
+                base_type = Some(
+                    extract_base_type(child, source)
+                        .trim_end_matches('?')
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    (name, base_type)
+}
+
 /// Parse Go receiver type from method content: `func (r *ReceiverType) Name(...)`
 pub fn extract_go_receiver_type(content: &str) -> Option<String> {
     let after_func = content.strip_prefix("func")?.trim_start();
@@ -2458,7 +2738,7 @@ pub(crate) fn build_go_pkg_index(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, Vec<(String, String)>> {
-    let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::default();
     for (name, target_ids) in symbol_table.iter() {
         for target_id in target_ids {
             if let Some(entity) = entity_map.get(target_id) {
@@ -2524,13 +2804,19 @@ fn scan_return_types(
 
             if let Some(fe) = func_entity {
                 // Try explicit return type annotation first
-                let ret_type = config.return_type_field.and_then(|field| {
-                    node.child_by_field_name(field)
-                        .map(|n| extract_base_type(n, source))
-                        .filter(|t| {
-                            !t.is_empty() && t.chars().next().map_or(false, |c| c.is_uppercase())
-                        })
-                });
+                let ret_type = config
+                    .return_type_field
+                    .and_then(|field| {
+                        node.child_by_field_name(field)
+                            .map(|n| extract_base_type(n, source))
+                            .filter(|t| {
+                                !t.is_empty()
+                                    && t.chars().next().map_or(false, |c| c.is_uppercase())
+                            })
+                    })
+                    // kotlin-ng has no `type` field on the return position; the return
+                    // type is a positional user_type after the parameter list.
+                    .or_else(|| kotlin_positional_return_type(node, source));
 
                 if let Some(rt) = ret_type {
                     return_type_map.insert(fe.id.clone(), rt);
@@ -2547,12 +2833,53 @@ fn scan_return_types(
     }
 }
 
+/// kotlin-ng exposes a function's declared return type as a positional `user_type`
+/// child after the `function_value_parameters` (there is no `type` field). Returns
+/// the base type name when it looks like a class (uppercase initial). Keyed off the
+/// Kotlin-only parameter container, so it is a no-op for other languages.
+fn kotlin_positional_return_type(func_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = func_node.walk();
+    let mut seen_params = false;
+    for child in func_node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_value_parameters" => seen_params = true,
+            "user_type" | "nullable_type" | "type_reference" if seen_params => {
+                let t = extract_base_type(child, source)
+                    .trim_end_matches('?')
+                    .to_string();
+                return (!t.is_empty() && t.chars().next().map_or(false, |c| c.is_uppercase()))
+                    .then_some(t);
+            }
+            "function_body" => break,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Find `return ClassName()` patterns in a function body (heuristic fallback).
 fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            // kotlin-ng wraps returns in `return_expression` and exposes the callee
+            // as the first child of `call_expression` (no `function` field).
+            if child.kind() == "return_expression" {
+                let mut rc = child.walk();
+                for ret_child in child.named_children(&mut rc) {
+                    if ret_child.kind() == "call_expression" {
+                        if let Some(callee) = ret_child.named_child(0) {
+                            if matches!(callee.kind(), "identifier" | "simple_identifier") {
+                                let name = callee.utf8_text(source).unwrap_or("");
+                                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                                    return Some(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if child.kind() == "return_statement" {
                 let mut inner_cursor = child.walk();
                 for ret_child in child.named_children(&mut inner_cursor) {
@@ -2587,9 +2914,9 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
                     }
                 }
             }
-            // Recurse into blocks
+            // Recurse into blocks (function_body wraps the block in kotlin-ng).
             let ck = child.kind();
-            if ck == "block" || ck == "statement_block" {
+            if ck == "block" || ck == "statement_block" || ck == "function_body" {
                 worklist.push(child);
             }
         }
@@ -2674,6 +3001,18 @@ fn scan_init_self_attrs(
                     }
                 }
             }
+            InitStrategy::ClassFields { class_nodes } => {
+                if class_nodes.contains(&kind) {
+                    let class_name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("")
+                        .to_string();
+                    if !class_name.is_empty() {
+                        scan_java_class_fields(node, &class_name, source, instance_attr_types);
+                    }
+                }
+            }
             InitStrategy::None => {}
         }
 
@@ -2715,6 +3054,55 @@ fn scan_rust_struct_fields(
                             field_type,
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Java/C#: extract field types from `class Foo { private Connection conn; ... }`.
+/// A single field_declaration may declare several names (`private Foo a, b;`), all
+/// sharing the declaration's `type` field.
+fn scan_java_class_fields(
+    class_node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if member.kind() != "field_declaration" {
+            continue;
+        }
+        let field_type = member
+            .child_by_field_name("type")
+            .map(|n| extract_base_type(n, source))
+            .unwrap_or_default();
+        if field_type.is_empty()
+            || !field_type
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_uppercase())
+        {
+            continue;
+        }
+        let mut dc = member.walk();
+        for declarator in member.named_children(&mut dc) {
+            if declarator.kind() != "variable_declarator" {
+                continue;
+            }
+            if let Some(name) = declarator
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
+                if !name.is_empty() {
+                    instance_attr_types.insert(
+                        (class_name.to_string(), name.to_string()),
+                        field_type.clone(),
+                    );
                 }
             }
         }
@@ -3109,14 +3497,16 @@ fn scan_kotlin_property_declaration(
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    let field_name = node
-        .child_by_field_name("name")
-        .and_then(|n| n.utf8_text(source).ok())
-        .unwrap_or("");
-    let field_type = node
-        .child_by_field_name("type")
-        .map(|n| extract_base_type(n, source))
+    // kotlin-ng: property_declaration > variable_declaration > identifier + user_type.
+    // The name/type are not exposed as fields on property_declaration, so dive into
+    // the variable_declaration and read them positionally.
+    let mut cursor = node.walk();
+    let (field_name, field_type) = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "variable_declaration")
+        .map(|vd| kotlin_positional_name_and_type(vd, source))
         .unwrap_or_default();
+    let field_type = field_type.unwrap_or_default();
 
     if !field_name.is_empty()
         && !field_type.is_empty()
@@ -3136,42 +3526,49 @@ fn scan_kotlin_primary_constructor(
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    // Look for primary_constructor child, then class_parameter nodes
+    // Look for primary_constructor child, then class_parameter nodes. In
+    // tree-sitter-kotlin-ng the class_parameters are wrapped in a `class_parameters`
+    // node and expose name/type positionally (no `name`/`type` fields), so handle
+    // both the wrapped and the direct layout.
     let mut cursor = class_node.walk();
     for child in class_node.named_children(&mut cursor) {
-        if child.kind() == "primary_constructor" {
-            let mut pc_cursor = child.walk();
-            for param in child.named_children(&mut pc_cursor) {
-                if param.kind() == "class_parameter" {
-                    // Check if this has val/var modifier (makes it a property)
-                    let text = param.utf8_text(source).unwrap_or("");
-                    let has_val_var = text.starts_with("val ")
-                        || text.starts_with("var ")
-                        || text.contains("val ")
-                        || text.contains("var ");
-                    if has_val_var {
-                        let param_name = param
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let param_type = param
-                            .child_by_field_name("type")
-                            .map(|n| extract_base_type(n, source))
-                            .unwrap_or_default();
-                        if !param_name.is_empty()
-                            && !param_type.is_empty()
-                            && param_type
-                                .chars()
-                                .next()
-                                .map_or(false, |c| c.is_uppercase())
-                        {
-                            instance_attr_types.insert(
-                                (class_name.to_string(), param_name.to_string()),
-                                param_type,
-                            );
-                        }
-                    }
+        if child.kind() != "primary_constructor" {
+            continue;
+        }
+        let mut pc_cursor = child.walk();
+        for pc_child in child.named_children(&mut pc_cursor) {
+            let param_holder = if pc_child.kind() == "class_parameters" {
+                pc_child
+            } else {
+                child
+            };
+            let mut p_cursor = param_holder.walk();
+            for param in param_holder.named_children(&mut p_cursor) {
+                if param.kind() != "class_parameter" {
+                    continue;
                 }
+                // Only val/var class parameters become properties.
+                let text = param.utf8_text(source).unwrap_or("");
+                let has_val_var = text.contains("val ") || text.contains("var ");
+                if !has_val_var {
+                    continue;
+                }
+                let (param_name, param_type) = kotlin_positional_name_and_type(param, source);
+                let param_type = param_type.unwrap_or_default();
+                if !param_name.is_empty()
+                    && !param_type.is_empty()
+                    && param_type
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_uppercase())
+                {
+                    instance_attr_types
+                        .insert((class_name.to_string(), param_name.to_string()), param_type);
+                }
+            }
+            // Avoid double-iterating when there is no class_parameters wrapper.
+            if pc_child.kind() != "class_parameters" {
+                break;
             }
         }
     }
@@ -3375,7 +3772,7 @@ fn extract_init_params(
     func_node: tree_sitter::Node,
     source: &[u8],
 ) -> HashMap<String, Option<String>> {
-    let mut params = HashMap::new();
+    let mut params = HashMap::default();
     if let Some(params_node) = func_node.child_by_field_name("parameters") {
         let mut cursor = params_node.walk();
         for child in params_node.named_children(&mut cursor) {
@@ -3508,7 +3905,7 @@ fn infer_constructor_param_types(
     let local_results: Vec<HashMap<(String, String), String>> = maybe_par_iter!(parsed_files)
         .map(|(_file_path, content, tree)| {
             let source = content.as_bytes();
-            let mut local_attr_types: HashMap<(String, String), String> = HashMap::new();
+            let mut local_attr_types: HashMap<(String, String), String> = HashMap::default();
             scan_constructor_calls(
                 tree.root_node(),
                 source,
@@ -3534,7 +3931,7 @@ fn deterministic_return_types_by_name(
     return_type_map: &HashMap<String, String>,
     symbol_table: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, String> {
-    let mut by_name = HashMap::with_capacity(return_type_map.len());
+    let mut by_name = HashMap::with_capacity_and_hasher(return_type_map.len(), Default::default());
     for (name, target_ids) in symbol_table {
         if let Some(return_type) = target_ids
             .iter()
@@ -3549,7 +3946,8 @@ fn deterministic_return_types_by_name(
 fn build_attr_to_param_index(
     attr_to_param: &HashMap<(String, String), String>,
 ) -> AttrToParamIndex<'_> {
-    let mut index: AttrToParamIndex<'_> = HashMap::with_capacity(attr_to_param.len());
+    let mut index: AttrToParamIndex<'_> =
+        HashMap::with_capacity_and_hasher(attr_to_param.len(), Default::default());
     for ((class_name, attr_name), param_name) in attr_to_param {
         index
             .entry((class_name.as_str(), param_name.as_str()))
@@ -3682,6 +4080,36 @@ fn inject_return_type_bindings(
     }
 }
 
+/// Resolve `val x = obj.field` field-access assignments now that object variable
+/// types (parameters, locals) and the global class field-type map are both
+/// available. A resolved variable can itself be the object of another pending
+/// access (`val a = x.b; val c = a.d`), so iterate to a small fixpoint.
+fn inject_field_type_bindings(
+    scopes: &mut Vec<Scope>,
+    instance_attr_types: &HashMap<(String, String), String>,
+) {
+    for _ in 0..4 {
+        // Collect resolutions under immutable borrows, then apply mutably.
+        let mut resolutions: Vec<(usize, String, String)> = Vec::new();
+        for scope_idx in 0..scopes.len() {
+            for (var, (obj, prop)) in &scopes[scope_idx].pending_field_types {
+                if let Some(obj_type) = lookup_type_in_scopes(scope_idx, scopes, obj) {
+                    if let Some(field_type) = instance_attr_types.get(&(obj_type, prop.clone())) {
+                        resolutions.push((scope_idx, var.clone(), field_type.clone()));
+                    }
+                }
+            }
+        }
+        if resolutions.is_empty() {
+            break;
+        }
+        for (scope_idx, var, field_type) in resolutions {
+            scopes[scope_idx].types.insert(var.clone(), field_type);
+            scopes[scope_idx].pending_field_types.remove(&var);
+        }
+    }
+}
+
 fn build_ts_default_export_table(
     parsed_files: &[(String, String, tree_sitter::Tree)],
     symbol_table: &HashMap<String, Vec<String>>,
@@ -3726,7 +4154,7 @@ fn build_ts_default_export_table(
             })
             .collect();
 
-    let mut default_exports = HashMap::new();
+    let mut default_exports = HashMap::default();
     let mut re_exports = Vec::new();
     for (default_export, file_re_exports) in per_file {
         if let Some((file_path, target_id)) = default_export {
@@ -3806,7 +4234,7 @@ fn build_top_level_entity_index(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> TopLevelEntityIndex {
-    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::default();
 
     for (name, target_ids) in symbol_table {
         for target_id in target_ids {
@@ -4624,6 +5052,7 @@ fn register_ts_namespace_import<'a>(
                     content_by_file
                         .get(candidate_file)
                         .map(|content| js_ts_named_exports_from_content(content))
+                        .map(|names| names.into_iter().collect())
                         .unwrap_or_default(),
                 )
             })
@@ -4779,7 +5208,7 @@ fn build_swift_call_signatures(
     entity_ranges: &HashMap<String, Vec<(usize, usize, String)>>,
     entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, SwiftCallSignature> {
-    let mut signatures = HashMap::new();
+    let mut signatures = HashMap::default();
 
     for (file_path, content, tree) in parsed_files {
         if !file_path.ends_with(".swift") {
@@ -5420,6 +5849,40 @@ fn push_method_call_ref(
 }
 
 /// Resolve a single reference against scopes and symbol tables.
+/// Resolve a qualified callee's final name (`Type::NAME`, `module::path::NAME`) to
+/// an entity id, precisely. An explicit import wins; then, when allowed, a same-file
+/// definition; then a globally UNIQUE definition. The qualifier is the disambiguator,
+/// so we never guess among multiple cross-file candidates for a common name
+/// (`new`, `default`, `from`) — those stay unresolved rather than producing a wrong
+/// edge.
+fn resolve_qualified_callee_name(
+    name: &str,
+    import_table_by_name: &HashMap<&str, &str>,
+    file_lookup: &FileEntityLookup<'_>,
+    symbol_table: &HashMap<String, Vec<String>>,
+    from_entity_id: &str,
+    allow_same_file: bool,
+) -> Option<String> {
+    if let Some(target_id) = import_table_by_name.get(name) {
+        if *target_id != from_entity_id {
+            return Some((*target_id).to_string());
+        }
+    }
+    if allow_same_file {
+        if let Some(same_file) = file_lookup.first_id_by_name(name) {
+            if same_file != from_entity_id {
+                return Some(same_file.to_string());
+            }
+        }
+    }
+    if let Some(ids) = symbol_table.get(name) {
+        if ids.len() == 1 && ids[0] != from_entity_id {
+            return Some(ids[0].clone());
+        }
+    }
+    None
+}
+
 fn resolve_ref(
     ast_ref: &AstRef,
     scope_idx: usize,
@@ -5594,7 +6057,28 @@ fn resolve_ref(
             None
         }
 
-        AstRefKind::ScopedCall { .. } => None,
+        AstRefKind::ScopedCall { path, name } => {
+            // `module::path::fn()` or `Enum::Variant::method()`. Resolve only when it
+            // is precise: the last path segment names a repo type that owns `name`, or
+            // the callee name is explicitly imported. We deliberately do NOT bind to a
+            // same-name repo function for a bare module path (`foo::bar::baz()` must
+            // not resolve to a local `baz`, even a unique one) — sem does not track
+            // full module paths, so guessing there would manufacture false edges.
+            let type_hint = path.rsplit("::").next().unwrap_or(path.as_str());
+            if let Some(members) = class_members.get(type_hint) {
+                if let Some((_, target_id)) = members.iter().find(|(member, _)| member == name) {
+                    if target_id != from_entity_id {
+                        return Some((target_id.clone(), RefType::Calls, "scoped_call"));
+                    }
+                }
+            }
+            if let Some(target_id) = import_table_by_name.get(name.as_str()) {
+                if *target_id != from_entity_id {
+                    return Some(((*target_id).to_string(), RefType::Calls, "scoped_call"));
+                }
+            }
+            None
+        }
 
         AstRefKind::MethodCall {
             receiver: raw_receiver,
@@ -5602,7 +6086,7 @@ fn resolve_ref(
             argument_labels,
         } => {
             // Strip prefix operators like ! (Swift: `!dog.validate()`)
-            let receiver = raw_receiver.trim_start_matches('!').trim_start_matches('~');
+            let receiver = normalized_method_receiver(raw_receiver);
             if receiver == "self" || receiver == "this" {
                 // self.method() -> find in enclosing class
                 let mut idx = scope_idx;
@@ -5743,6 +6227,42 @@ fn resolve_ref(
                 }
             }
 
+            // Static call: `ClassName.staticMethod()` — the receiver is a class itself,
+            // not a typed variable. Only fires for an uppercase identifier that names a
+            // known class and isn't shadowed by a local binding.
+            if is_simple_identifier_name(receiver)
+                && receiver.chars().next().map_or(false, |c| c.is_uppercase())
+                && !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache)
+            {
+                if let Some(members) = class_members.get(receiver) {
+                    if let SwiftOverloadSelection::Matched(mid) = select_member_candidate(
+                        members,
+                        method,
+                        argument_labels.as_deref(),
+                        swift_call_signatures,
+                    ) {
+                        return Some((mid, RefType::Calls, "static_call"));
+                    }
+                }
+                // `Type::method()` where the impl block is not keyed under `Type` in
+                // class_members (e.g. `impl Trait for Type`), or a free associated fn.
+                // Only when `Type` is itself a known repo entity: resolve the method by
+                // a same-file or globally unique definition (the `Type::` qualifier is
+                // the disambiguator), so `Vec::new()` and friends stay unresolved.
+                if symbol_table.contains_key(receiver) {
+                    if let Some(hit) = resolve_qualified_callee_name(
+                        method,
+                        import_table_by_name,
+                        file_lookup,
+                        symbol_table,
+                        from_entity_id,
+                        true,
+                    ) {
+                        return Some((hit, RefType::Calls, "static_call"));
+                    }
+                }
+            }
+
             // Inside class methods, unqualified property receivers resolve
             // against the enclosing instance when no local binding shadows them.
             let from_entity_is_container_type =
@@ -5863,6 +6383,33 @@ fn resolve_ref(
             if file_path.ends_with(".go") {
                 if let Some(target_id) = import_table_by_name.get(method.as_str()) {
                     return Some(((*target_id).to_string(), RefType::Calls, "import"));
+                }
+            }
+
+            // Last resort: a repo-wide unique METHOD name is unambiguous even
+            // when the receiver's type is unknown — `index.keep_levels()` can
+            // only mean the one `keep_levels` the repo defines. One candidate,
+            // one edge; two candidates, no edge (guessing would manufacture
+            // false callers). Restricted to entities with a parent (methods),
+            // so attribute calls never bind to same-named free functions.
+            // Dynamic languages only: there, receiver types are statically
+            // unknowable and the missing edge is pure blindness; in static
+            // languages an unresolved receiver is deliberate (shadowed
+            // import, instance property) and must stay unresolved.
+            let dynamic_receiver_lang =
+                file_path.ends_with(".py") || file_path.ends_with(".rb");
+            if allow_cross_file_calls && dynamic_receiver_lang {
+                if let Some(target_ids) = symbol_table.get(method.as_str()) {
+                    if let [tid] = target_ids.as_slice() {
+                        if tid != from_entity_id
+                            && entity_map.get(tid).is_some_and(|e| {
+                                e.parent_id.is_some()
+                                    && matches!(e.entity_type.as_str(), "method" | "function")
+                            })
+                        {
+                            return Some((tid.clone(), RefType::Calls, "unique_method_name"));
+                        }
+                    }
                 }
             }
 
@@ -6171,8 +6718,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolution_cache_key_includes_resolution_context() {
+        let ast_ref = AstRef {
+            kind: AstRefKind::Call {
+                name: "load".to_string(),
+                argument_labels: Some(vec![Some("id".to_string())]),
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 4,
+        };
+
+        let base = resolution_cache_key(&ast_ref, 1, "entity_a", true, false);
+
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 2, "entity_a", true, false)
+        );
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 1, "entity_b", true, false)
+        );
+        assert_ne!(
+            base,
+            resolution_cache_key(&ast_ref, 1, "entity_a", false, false)
+        );
+
+        let method_ref = AstRef {
+            kind: AstRefKind::MethodCall {
+                receiver: "client".to_string(),
+                method: "load".to_string(),
+                argument_labels: None,
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 11,
+        };
+
+        assert_ne!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&method_ref, 1, "entity_a", false, false)
+        );
+        assert_ne!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&method_ref, 1, "entity_a", true, true)
+        );
+
+        let prefixed_method_ref = AstRef {
+            kind: AstRefKind::MethodCall {
+                receiver: "!client".to_string(),
+                method: "load".to_string(),
+                argument_labels: None,
+            },
+            row: 0,
+            start_byte: 0,
+            end_byte: 12,
+        };
+
+        assert_eq!(
+            resolution_cache_key(&method_ref, 1, "entity_a", true, false),
+            resolution_cache_key(&prefixed_method_ref, 1, "entity_a", true, false)
+        );
+    }
+
+    #[test]
     fn return_type_name_lookup_uses_symbol_table_order() {
-        let mut return_type_map = HashMap::new();
+        let mut return_type_map = HashMap::default();
         return_type_map.insert(
             "z_backup.py::function::make_conn".to_string(),
             "Backup".to_string(),
@@ -6182,7 +6793,7 @@ mod tests {
             "Primary".to_string(),
         );
 
-        let mut symbol_table = HashMap::new();
+        let mut symbol_table = HashMap::default();
         symbol_table.insert(
             "make_conn".to_string(),
             vec![
@@ -6204,11 +6815,11 @@ mod tests {
         let first_id = "pkg/foo/a.go::function::zeta".to_string();
         let second_id = "pkg/foo/b.go::function::alpha".to_string();
 
-        let mut symbol_table = HashMap::new();
+        let mut symbol_table = HashMap::default();
         symbol_table.insert("zeta".to_string(), vec![first_id.clone()]);
         symbol_table.insert("alpha".to_string(), vec![second_id.clone()]);
 
-        let mut entity_map = HashMap::new();
+        let mut entity_map = HashMap::default();
         entity_map.insert(
             first_id.clone(),
             EntityInfo {

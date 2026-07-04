@@ -10,7 +10,14 @@ pub fn is_jj_repo(root: &Path) -> bool {
 /// Returns None if jj is not installed, the revset is invalid, or resolution fails.
 pub fn resolve_jj_revset(revset: &str, root: &Path) -> Option<String> {
     let output = Command::new("jj")
-        .args(["log", "--no-graph", "-T", "commit_id ++ \"\\n\"", "-r", revset])
+        .args([
+            "log",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+            "-r",
+            revset,
+        ])
         .current_dir(root)
         .output()
         .ok()?;
@@ -39,10 +46,7 @@ pub fn maybe_resolve_ref(refspec: &str, root: &Path) -> String {
 
     // Skip refs that are already valid hex SHAs (no need to resolve)
     let trimmed = refspec.trim();
-    if trimmed.len() >= 7
-        && trimmed.len() <= 40
-        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if trimmed.len() >= 7 && trimmed.len() <= 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         return refspec.to_string();
     }
 

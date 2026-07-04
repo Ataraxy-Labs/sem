@@ -46,30 +46,56 @@ impl SemanticParserPlugin for TomlParserPlugin {
 
             let entity_content = lines[section.line - 1..end_line].join("\n");
 
-            // Look up in parsed table for content hash
-            let (value_str, entity_type) = if let Some(val) = table.get(&section.key) {
+            // Resolve the display name, entity type, and the value to hash.
+            let (name, entity_type, value_str) = if let Some(idx) = section.array_index {
+                // Array-of-tables entry: give it an index-based identity (key/0,
+                // key/1, ...) and hash only its own element so appending a new
+                // entry reads as an addition, not a modification of the last one.
+                let value_str = table
+                    .get(&section.key)
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.get(idx))
+                    .map(|el| serde_json::to_string_pretty(el).unwrap_or_default())
+                    .unwrap_or_else(|| entity_content.clone());
+                (
+                    format!("{}/{}", section.key, idx),
+                    "array_table".to_string(),
+                    value_str,
+                )
+            } else if let Some(val) = table.get(&section.key) {
                 let is_table = val.is_table();
                 let vs = if is_table {
                     serde_json::to_string_pretty(val).unwrap_or_default()
                 } else {
                     toml_value_to_string(val)
                 };
-                (vs, if is_table { "section" } else { "property" })
+                (
+                    section.key.clone(),
+                    if is_table { "section" } else { "property" }.to_string(),
+                    vs,
+                )
             } else {
-                (entity_content.clone(), "property")
+                (
+                    section.key.clone(),
+                    "property".to_string(),
+                    entity_content.clone(),
+                )
             };
 
+            let id = build_entity_id(file_path, &entity_type, &name, None);
             entities.push(SemanticEntity {
-                id: build_entity_id(file_path, entity_type, &section.key, None),
+                id,
                 file_path: file_path.to_string(),
-                entity_type: entity_type.to_string(),
-                name: section.key.clone(),
+                entity_type,
+                name,
                 parent_id: None,
                 content_hash: content_hash(&value_str),
                 structural_hash: None,
                 content: entity_content,
                 start_line: section.line,
                 end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
         }
@@ -81,11 +107,19 @@ impl SemanticParserPlugin for TomlParserPlugin {
 struct TomlSection {
     key: String,
     line: usize, // 1-based
+    /// `Some(n)` for the nth entry of an array-of-tables (`[[key]]`); `None` for
+    /// a regular table (`[key]`) or a root key-value pair.
+    array_index: Option<usize>,
 }
 
-/// Find top-level entries in TOML: section headers ([name]) and root key-value pairs.
+/// Find top-level entries in TOML: section headers ([name]), array-of-tables
+/// (\[\[name\]\]), and root key-value pairs.
 fn find_toml_sections(lines: &[&str]) -> Vec<TomlSection> {
     let mut sections = Vec::new();
+    // Per-key occurrence counter so repeated `[[key]]` entries get distinct
+    // indexed identities (key/0, key/1, ...) instead of collapsing to one.
+    let mut array_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -93,7 +127,27 @@ fn find_toml_sections(lines: &[&str]) -> Vec<TomlSection> {
             continue;
         }
 
-        // Section header: [package] or [[bin]]
+        // Array-of-tables header: [[bin]]. Must be checked before [table] since
+        // it also starts with '['. Each occurrence is a distinct element.
+        if trimmed.starts_with("[[") {
+            let key = trimmed
+                .trim_start_matches("[[")
+                .trim_end_matches("]]")
+                .trim()
+                .to_string();
+            if !key.is_empty() {
+                let idx = array_counts.entry(key.clone()).or_insert(0);
+                sections.push(TomlSection {
+                    key: key.clone(),
+                    line: i + 1,
+                    array_index: Some(*idx),
+                });
+                *idx += 1;
+            }
+            continue;
+        }
+
+        // Section header: [package]
         if trimmed.starts_with('[') {
             let key = trimmed
                 .trim_start_matches('[')
@@ -104,6 +158,7 @@ fn find_toml_sections(lines: &[&str]) -> Vec<TomlSection> {
                 sections.push(TomlSection {
                     key,
                     line: i + 1,
+                    array_index: None,
                 });
             }
             continue;
@@ -119,6 +174,7 @@ fn find_toml_sections(lines: &[&str]) -> Vec<TomlSection> {
                     sections.push(TomlSection {
                         key,
                         line: i + 1,
+                        array_index: None,
                     });
                 }
             }
@@ -188,5 +244,37 @@ tokio = { version = "1", features = ["full"] }
         assert_eq!(entities[1].name, "dependencies");
         assert_eq!(entities[1].start_line, 5);
         assert_eq!(entities[1].end_line, 7);
+    }
+
+    #[test]
+    fn test_array_of_tables_get_indexed_identities() {
+        // Repeated `[[array]]` entries must get distinct, index-based identities
+        // so appending one reads as an addition rather than a modification of the
+        // previous entry (#362).
+        let content = "[[array]]\nitem = 1\n[[array]]\nitem = 2\n[[array]]\nitem = 3\n";
+        let plugin = TomlParserPlugin;
+        let entities = plugin.extract_entities(content, "a.toml");
+
+        assert_eq!(entities.len(), 3);
+        for (i, e) in entities.iter().enumerate() {
+            assert_eq!(e.name, format!("array/{i}"));
+            assert_eq!(e.entity_type, "array_table");
+        }
+        // Each element hashes independently, so the first two are stable when a
+        // third is appended.
+        let two = plugin.extract_entities("[[array]]\nitem = 1\n[[array]]\nitem = 2\n", "a.toml");
+        assert_eq!(two[0].content_hash, entities[0].content_hash);
+        assert_eq!(two[1].content_hash, entities[1].content_hash);
+    }
+
+    #[test]
+    fn test_table_and_array_of_tables_same_name_do_not_collide() {
+        // `[server]` (table) and `[[server]]` (array-of-tables) previously both
+        // collapsed to id `...::server`; they must now be distinct entities.
+        let content = "[server]\nhost = \"a\"\n[[worker]]\nid = 1\n";
+        let entities = TomlParserPlugin.extract_entities(content, "c.toml");
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.iter().any(|id| id.contains("section::server")));
+        assert!(ids.iter().any(|id| id.contains("array_table::worker/0")));
     }
 }

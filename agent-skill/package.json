@@ -1,0 +1,43 @@
+{
+  "name": "@ataraxy-labs/sem-skill",
+  "version": "0.8.0",
+  "description": "One-command setup of sem (entity-level code intelligence) for coding agents: installs the sem skill and registers the sem MCP server.",
+  "type": "module",
+  "bin": {
+    "sem-skill": "./install.mjs"
+  },
+  "files": [
+    "install.mjs",
+    "SKILL.md",
+    "README.md",
+    "badge/statusline-sem.py",
+    "badge/sem-activity.py",
+    "badge/sem-live.py",
+    "guard/sem-guard.py"
+  ],
+  "keywords": [
+    "sem",
+    "claude-code",
+    "mcp",
+    "skill",
+    "agent",
+    "code-intelligence",
+    "semantic-diff"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/Ataraxy-Labs/sem",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ataraxy-Labs/sem.git",
+    "directory": "agent-skill"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "cp ../skills/sem/SKILL.md ./SKILL.md"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

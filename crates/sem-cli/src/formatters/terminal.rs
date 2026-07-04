@@ -49,6 +49,25 @@ fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
     (del, ins)
 }
 
+/// Default inner width of the per-file box (number of `─` after the corner).
+const DEFAULT_BOX_WIDTH: usize = 55;
+
+/// Resolve the box width. `SEM_WIDTH` overrides the default, which matters when
+/// sem runs without a TTY (e.g. as a `lazygit` pager) where it otherwise falls
+/// back to a fixed width that may not match the surrounding pane. The value is
+/// the total box width in columns; the inner dash budget is one less (the
+/// corner glyph). Clamped to a sane minimum.
+fn resolve_box_width(sem_width: Option<&str>) -> usize {
+    match sem_width.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(w) => w.saturating_sub(1).max(8),
+        None => DEFAULT_BOX_WIDTH,
+    }
+}
+
+fn box_width() -> usize {
+    resolve_box_width(std::env::var("SEM_WIDTH").ok().as_deref())
+}
+
 pub fn format_terminal(
     result: &DiffResult,
     binary_changes: &[BinaryFileChange],
@@ -57,6 +76,8 @@ pub fn format_terminal(
     if !has_reportable_changes(result, binary_changes) {
         return "No semantic changes detected.".dimmed().to_string();
     }
+
+    let box_width = box_width();
 
     let mut output =
         String::with_capacity(estimated_output_capacity(result, binary_changes, verbose));
@@ -82,7 +103,7 @@ pub fn format_terminal(
         }
 
         let header = format!("─ {} ", sanitize_terminal_text(file_path));
-        let pad_len = 55usize.saturating_sub(header.len());
+        let pad_len = box_width.saturating_sub(header.len());
         push_line(
             &mut output,
             format!("┌{header}{}", "─".repeat(pad_len))
@@ -167,7 +188,17 @@ pub fn format_terminal(
                 Some(p) => format!("{}::{base_name}", sanitize_terminal_text(p)),
                 None => base_name,
             };
-            let name_label = format!("{:<25}", display_name);
+            // Optionally make the entity name a clickable link to its
+            // definition (file:line). Pad on the visible text so the OSC8
+            // escape (zero-width) doesn't break column alignment.
+            let name_label = if crate::hyperlinks::enabled() {
+                let pad = 25usize.saturating_sub(display_name.chars().count());
+                let linked =
+                    crate::hyperlinks::link(&display_name, &change.file_path, change.start_line);
+                format!("{linked}{}", " ".repeat(pad))
+            } else {
+                format!("{:<25}", display_name)
+            };
 
             push_line(
                 &mut output,
@@ -337,7 +368,7 @@ pub fn format_terminal(
         push_line(&mut output, "│".dimmed().to_string());
         push_line(
             &mut output,
-            format!("└{}", "─".repeat(55)).dimmed().to_string(),
+            format!("└{}", "─".repeat(box_width)).dimmed().to_string(),
         );
         push_line(&mut output, "");
     }
@@ -470,6 +501,15 @@ pub fn format_terminal(
 mod tests {
     use super::*;
     use sem_core::model::change::SemanticChange;
+
+    #[test]
+    fn box_width_resolves_from_sem_width() {
+        assert_eq!(resolve_box_width(None), DEFAULT_BOX_WIDTH);
+        assert_eq!(resolve_box_width(Some("80")), 79); // total width minus the corner glyph
+        assert_eq!(resolve_box_width(Some("  120 ")), 119);
+        assert_eq!(resolve_box_width(Some("garbage")), DEFAULT_BOX_WIDTH);
+        assert_eq!(resolve_box_width(Some("3")), 8); // clamped to a sane minimum
+    }
 
     #[test]
     fn terminal_source_content_escapes_control_characters() {

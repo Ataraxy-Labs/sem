@@ -93,6 +93,15 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             name: sem-darwin-arm64
+          - target: x86_64-apple-darwin
+            # Cross-compile on Apple Silicon: macOS clang targets x86_64 natively,
+            # and macos-14 runners are plentiful (Intel macos-13 runners are scarce
+            # and being retired, which can leave the build queued indefinitely).
+            os: macos-14
+            name: sem-darwin-x86_64
+            # Cross-compiling can't find a target-arch OpenSSL, so vendor + build
+            # it from source for x86_64 (same as the Linux arm64 cross-build).
+            vendor_openssl: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: sem-windows-x86_64
@@ -192,6 +201,33 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-mcp-registry:
+    needs: [check-version, publish-npm]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mcp-publisher
+        run: curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz mcp-publisher
+
+      - name: Stamp server.json version
+        run: |
+          jq --arg v "${{ needs.check-version.outputs.version }}" \
+            '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+
+      - name: Login to MCP registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP registry
+        # Retry once in case the npm publish hasn't propagated when the
+        # registry validates the package's mcpName field.
+        run: ./mcp-publisher publish || (sleep 60 && ./mcp-publisher publish)
 
   publish-crates:
     needs: [check-version, create-tag]

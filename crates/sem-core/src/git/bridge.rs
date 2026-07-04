@@ -7,13 +7,20 @@ use std::sync::{Mutex, OnceLock};
 use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
 use thiserror::Error;
 
-use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus};
 use super::types::BlameLineInfo;
+use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus};
 
 #[derive(Error, Debug)]
 pub enum GitError {
     #[error("not a git repository")]
     NotARepo,
+    #[error(
+        "this repository uses git's reftable ref storage (extensions.refstorage), which sem's \
+         git backend (libgit2) can't read yet. Workaround: convert the repo's refs back with \
+         `git refs migrate --ref-format=files` (safe and reversible). Tracking: \
+         https://github.com/Ataraxy-Labs/sem/issues/451"
+    )]
+    UnsupportedRefStorage,
     #[error("git error: {0}")]
     Git2(#[from] git2::Error),
     #[error("io error: {0}")]
@@ -24,11 +31,17 @@ pub struct GitBridge {
     repo: Repository,
     repo_root: PathBuf,
     cwd: PathBuf,
+    /// True when the repo's refs live outside libgit2's reach (git's reftable
+    /// backend, `extensions.refstorage`). Objects, trees, and the index are
+    /// unaffected, so libgit2 keeps doing everything except ref resolution,
+    /// which routes through the git CLI instead.
+    cli_refs: bool,
 }
 
 impl GitBridge {
     pub fn open(path: &Path) -> Result<Self, GitError> {
         let cwd = normalize_open_path(path)?;
+        ensure_git_extensions_supported()?;
         let repo = match Repository::discover(path) {
             Ok(repo) => repo,
             Err(error) if should_retry_with_command_line_safe_directory(&error, path) => {
@@ -43,11 +56,83 @@ impl GitBridge {
         };
         let repo_root = repo.workdir().ok_or(GitError::NotARepo)?;
         let repo_root = fs::canonicalize(repo_root)?;
+        let cli_refs = repo
+            .config()
+            .ok()
+            .and_then(|cfg| cfg.get_string("extensions.refstorage").ok())
+            .is_some_and(|value| !value.is_empty() && value != "files");
         Ok(Self {
             repo,
             repo_root,
             cwd,
+            cli_refs,
         })
+    }
+
+    /// Resolve a refspec to an object id via the git CLI. Used when refs live
+    /// in a backend libgit2 can't read (reftable): real git resolves the ref,
+    /// then everything downstream proceeds through libgit2's ODB by OID.
+    fn cli_rev_parse(&self, refspec: &str) -> Result<Oid, GitError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+            .arg(format!("{refspec}^{{object}}"))
+            .output()?;
+        if !output.status.success() {
+            return Err(git_command_error(format!(
+                "cannot resolve '{refspec}' via git rev-parse"
+            )));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(Oid::from_str(text.trim())?)
+    }
+
+    /// revparse_single that works on reftable repos (CLI resolves the ref,
+    /// libgit2 loads the object).
+    fn resolve_object(&self, refspec: &str) -> Result<git2::Object<'_>, GitError> {
+        if self.cli_refs {
+            let oid = self.cli_rev_parse(refspec)?;
+            Ok(self.repo.find_object(oid, None)?)
+        } else {
+            Ok(self.repo.revparse_single(refspec)?)
+        }
+    }
+
+    /// HEAD's commit, reftable-safe.
+    fn head_commit(&self) -> Result<git2::Commit<'_>, GitError> {
+        if self.cli_refs {
+            let oid = self.cli_rev_parse("HEAD")?;
+            Ok(self.repo.find_commit(oid)?)
+        } else {
+            let head = self.repo.head()?;
+            let oid = head
+                .target()
+                .ok_or_else(|| git2::Error::from_str("HEAD has no target"))?;
+            Ok(self.repo.find_commit(oid)?)
+        }
+    }
+
+    /// Whether HEAD resolves to a commit (false in unborn repos), reftable-safe.
+    fn has_head(&self) -> bool {
+        if self.cli_refs {
+            self.cli_rev_parse("HEAD").is_ok()
+        } else {
+            self.repo.head().is_ok()
+        }
+    }
+
+    /// A revwalk starting at HEAD, reftable-safe (`push_head` needs libgit2 to
+    /// read the ref; pushing HEAD's OID walks the identical history).
+    fn revwalk_from_head(&self) -> Result<git2::Revwalk<'_>, GitError> {
+        let mut revwalk = self.repo.revwalk()?;
+        if self.cli_refs {
+            revwalk.push(self.head_commit()?.id())?;
+        } else {
+            revwalk.push_head()?;
+        }
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        Ok(revwalk)
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -64,8 +149,7 @@ impl GitBridge {
 
     /// Resolve a refspec to its full commit SHA, if valid.
     pub fn resolve_ref_sha(&self, refspec: &str) -> Option<String> {
-        self.repo
-            .revparse_single(refspec)
+        self.resolve_object(refspec)
             .ok()
             .and_then(|obj| obj.peel_to_commit().ok())
             .map(|c| c.id().to_string())
@@ -112,17 +196,16 @@ impl GitBridge {
     }
 
     pub fn get_head_sha(&self) -> Result<String, GitError> {
-        let head = self.repo.head()?;
-        let oid = head.target().ok_or_else(|| {
-            git2::Error::from_str("HEAD has no target")
-        })?;
-        Ok(oid.to_string())
+        Ok(self.head_commit()?.id().to_string())
     }
 
     /// Combined detect scope + get files in one call (fast path).
     /// Shows all changes from HEAD to the current working state by default.
     /// Use `--staged` for staged changes only.
-    pub fn detect_and_get_files(&self, pathspecs: &[String]) -> Result<(DiffScope, Vec<FileChange>), GitError> {
+    pub fn detect_and_get_files(
+        &self,
+        pathspecs: &[String],
+    ) -> Result<(DiffScope, Vec<FileChange>), GitError> {
         // Show the full current working state, including staged changes.
         let mut working_files = self.get_working_diff_files(pathspecs)?;
         if !working_files.is_empty() {
@@ -135,15 +218,19 @@ impl GitBridge {
     }
 
     /// Get changed files for a specific scope
-    pub fn get_changed_files(&self, scope: &DiffScope, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
+    pub fn get_changed_files(
+        &self,
+        scope: &DiffScope,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
         let mut files = match scope {
-            DiffScope::Working => {
-                self.get_working_diff_files(pathspecs)?
-            }
+            DiffScope::Working => self.get_working_diff_files(pathspecs)?,
             DiffScope::Staged => self.get_staged_diff_files(pathspecs)?,
             DiffScope::Commit { sha } => self.get_commit_diff_files(sha, pathspecs)?,
             DiffScope::Range { from, to } => self.get_range_diff_files(from, to, pathspecs)?,
-            DiffScope::RefToWorking { refspec } => self.get_ref_to_working_diff_files(refspec, pathspecs)?,
+            DiffScope::RefToWorking { refspec } => {
+                self.get_ref_to_working_diff_files(refspec, pathspecs)?
+            }
         };
 
         // Filter .sem/ files
@@ -177,7 +264,7 @@ impl GitBridge {
         staged: bool,
         pathspecs: &[String],
     ) -> Result<Vec<FileChange>, GitError> {
-        let has_head = self.repo.head().is_ok();
+        let has_head = self.has_head();
         let mut command = Command::new("git");
         command
             .arg("-C")
@@ -227,10 +314,7 @@ impl GitBridge {
                 file.after_content = self.read_index_file(&file.file_path);
             }
             if file.status != FileStatus::Added {
-                let path = file
-                    .old_file_path
-                    .as_deref()
-                    .unwrap_or(&file.file_path);
+                let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
                 file.before_content = self.read_blob_from_tree(&base_tree, path);
             }
         }
@@ -240,15 +324,15 @@ impl GitBridge {
 
     /// Resolve the merge base between two refs
     pub fn resolve_merge_base(&self, ref1: &str, ref2: &str) -> Result<String, GitError> {
-        let obj1 = self.repo.revparse_single(ref1)?;
-        let obj2 = self.repo.revparse_single(ref2)?;
+        let obj1 = self.resolve_object(ref1)?;
+        let obj2 = self.resolve_object(ref2)?;
         let oid = self.repo.merge_base(obj1.id(), obj2.id())?;
         Ok(oid.to_string())
     }
 
     /// Check if a string resolves to a valid git revision
     pub fn is_valid_rev(&self, refspec: &str) -> bool {
-        self.repo.revparse_single(refspec).is_ok()
+        self.resolve_object(refspec).is_ok()
     }
 
     fn make_diff_opts(&self, pathspecs: &[String]) -> Result<DiffOptions, GitError> {
@@ -279,10 +363,9 @@ impl GitBridge {
         };
 
         let repo_root = normalize_lexical(&self.repo_root);
-        let relative =
-            absolute
-                .strip_prefix(&repo_root)
-                .map_err(|_| pathspec_outside_repo_error(spec, &self.repo_root))?;
+        let relative = absolute
+            .strip_prefix(&repo_root)
+            .map_err(|_| pathspec_outside_repo_error(spec, &self.repo_root))?;
 
         if relative.as_os_str().is_empty() {
             Ok(".".to_string())
@@ -299,11 +382,8 @@ impl GitBridge {
             return self.changed_files_via_cli(true, pathspecs);
         }
 
-        let head_tree = match self.repo.head() {
-            Ok(head) => {
-                let commit = head.peel_to_commit()?;
-                Some(commit.tree()?)
-            }
+        let head_tree = match self.head_commit() {
+            Ok(commit) => Some(commit.tree()?),
             Err(_) => None, // No commits yet
         };
 
@@ -325,11 +405,9 @@ impl GitBridge {
         pathspecs: &[String],
     ) -> Result<Vec<FileChange>, GitError> {
         let mut opts = self.make_diff_opts(pathspecs)?;
-        let mut diff = self.repo.diff_tree_to_index(
-            base_tree,
-            Some(&self.repo.index()?),
-            Some(&mut opts),
-        )?;
+        let mut diff =
+            self.repo
+                .diff_tree_to_index(base_tree, Some(&self.repo.index()?), Some(&mut opts))?;
         Self::detect_renames(&mut diff)?;
 
         Ok(self.diff_to_file_changes(&diff))
@@ -380,17 +458,13 @@ impl GitBridge {
             let Some(old_path) = rename.old_file_path.clone() else {
                 continue;
             };
-            let target_pos = files
-                .iter()
-                .position(|file| {
-                    matches!(file.status, FileStatus::Added | FileStatus::Renamed)
-                        && file.file_path == rename.file_path
-                });
+            let target_pos = files.iter().position(|file| {
+                matches!(file.status, FileStatus::Added | FileStatus::Renamed)
+                    && file.file_path == rename.file_path
+            });
             let deleted_pos = files
                 .iter()
-                .position(|file| {
-                    file.status == FileStatus::Deleted && file.file_path == old_path
-                });
+                .position(|file| file.status == FileStatus::Deleted && file.file_path == old_path);
 
             if let (Some(target_pos), Some(deleted_pos)) = (target_pos, deleted_pos) {
                 if files[target_pos].status == FileStatus::Renamed
@@ -401,16 +475,15 @@ impl GitBridge {
 
                 let target_file = files[target_pos].clone();
                 let deleted_file = files[deleted_pos].clone();
-                let displaced_deleted_path =
-                    if target_file.status == FileStatus::Renamed {
-                        target_file
-                            .old_file_path
-                            .as_ref()
-                            .filter(|path| *path != &old_path)
-                            .cloned()
-                    } else {
-                        None
-                    };
+                let displaced_deleted_path = if target_file.status == FileStatus::Renamed {
+                    target_file
+                        .old_file_path
+                        .as_ref()
+                        .filter(|path| *path != &old_path)
+                        .cloned()
+                } else {
+                    None
+                };
 
                 files = files
                     .into_iter()
@@ -452,8 +525,18 @@ impl GitBridge {
         Ok(files)
     }
 
-    fn get_commit_diff_files(&self, sha: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
-        let obj = self.repo.revparse_single(sha)?;
+    /// Number of parents of a commit (0 = root, >1 = merge).
+    pub fn commit_parent_count(&self, sha: &str) -> Result<usize, GitError> {
+        let obj = self.resolve_object(sha)?;
+        Ok(obj.peel_to_commit()?.parent_count())
+    }
+
+    fn get_commit_diff_files(
+        &self,
+        sha: &str,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
+        let obj = self.resolve_object(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
 
@@ -464,41 +547,45 @@ impl GitBridge {
         };
 
         let mut opts = self.make_diff_opts(pathspecs)?;
-        let mut diff = self.repo.diff_tree_to_tree(
-            parent_tree.as_ref(),
-            Some(&tree),
-            Some(&mut opts),
-        )?;
+        let mut diff =
+            self.repo
+                .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
         Self::detect_renames(&mut diff)?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
 
-    fn get_range_diff_files(&self, from: &str, to: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
-        let from_obj = self.repo.revparse_single(from)?;
-        let to_obj = self.repo.revparse_single(to)?;
+    fn get_range_diff_files(
+        &self,
+        from: &str,
+        to: &str,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
+        let from_obj = self.resolve_object(from)?;
+        let to_obj = self.resolve_object(to)?;
 
         let from_tree = from_obj.peel_to_commit()?.tree()?;
         let to_tree = to_obj.peel_to_commit()?.tree()?;
 
         let mut opts = self.make_diff_opts(pathspecs)?;
-        let mut diff = self.repo.diff_tree_to_tree(
-            Some(&from_tree),
-            Some(&to_tree),
-            Some(&mut opts),
-        )?;
+        let mut diff =
+            self.repo
+                .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
         Self::detect_renames(&mut diff)?;
 
         Ok(self.diff_to_file_changes(&diff))
     }
 
-    fn get_ref_to_working_diff_files(&self, refspec: &str, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
+    fn get_ref_to_working_diff_files(
+        &self,
+        refspec: &str,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
         let tree = self.resolve_tree(refspec)?;
         let mut opts = self.make_diff_opts(pathspecs)?;
-        let mut diff = self.repo.diff_tree_to_workdir_with_index(
-            Some(&tree),
-            Some(&mut opts),
-        )?;
+        let mut diff = self
+            .repo
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
         Self::detect_renames(&mut diff)?;
         self.apply_index_rename_map(self.diff_to_file_changes(&diff), Some(&tree), pathspecs)
     }
@@ -599,10 +686,7 @@ impl GitBridge {
                         file.after_content = self.read_working_file(&file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        let path = file
-                            .old_file_path
-                            .as_deref()
-                            .unwrap_or(&file.file_path);
+                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
                         file.before_content = head_tree
                             .as_ref()
                             .and_then(|t| self.read_blob_from_tree(t, path));
@@ -618,10 +702,7 @@ impl GitBridge {
                             .or_else(|| self.read_working_file(&file.file_path));
                     }
                     if file.status != FileStatus::Added {
-                        let path = file
-                            .old_file_path
-                            .as_deref()
-                            .unwrap_or(&file.file_path);
+                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
                         file.before_content = head_tree
                             .as_ref()
                             .and_then(|t| self.read_blob_from_tree(t, path));
@@ -634,14 +715,10 @@ impl GitBridge {
                 let before_tree = self.resolve_tree(&format!("{sha}~1")).ok();
                 for file in files.iter_mut() {
                     if file.status != FileStatus::Deleted {
-                        file.after_content =
-                            self.read_blob_from_tree(&after_tree, &file.file_path);
+                        file.after_content = self.read_blob_from_tree(&after_tree, &file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        let path = file
-                            .old_file_path
-                            .as_deref()
-                            .unwrap_or(&file.file_path);
+                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
                         file.before_content = before_tree
                             .as_ref()
                             .and_then(|t| self.read_blob_from_tree(t, path));
@@ -653,16 +730,11 @@ impl GitBridge {
                 let before_tree = self.resolve_tree(from)?;
                 for file in files.iter_mut() {
                     if file.status != FileStatus::Deleted {
-                        file.after_content =
-                            self.read_blob_from_tree(&after_tree, &file.file_path);
+                        file.after_content = self.read_blob_from_tree(&after_tree, &file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        let path = file
-                            .old_file_path
-                            .as_deref()
-                            .unwrap_or(&file.file_path);
-                        file.before_content =
-                            self.read_blob_from_tree(&before_tree, path);
+                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
+                        file.before_content = self.read_blob_from_tree(&before_tree, path);
                     }
                 }
             }
@@ -673,12 +745,8 @@ impl GitBridge {
                         file.after_content = self.read_working_file(&file.file_path);
                     }
                     if file.status != FileStatus::Added {
-                        let path = file
-                            .old_file_path
-                            .as_deref()
-                            .unwrap_or(&file.file_path);
-                        file.before_content =
-                            self.read_blob_from_tree(&before_tree, path);
+                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
+                        file.before_content = self.read_blob_from_tree(&before_tree, path);
                     }
                 }
             }
@@ -687,7 +755,7 @@ impl GitBridge {
     }
 
     fn resolve_tree(&self, refspec: &str) -> Result<git2::Tree<'_>, GitError> {
-        let obj = self.repo.revparse_single(refspec)?;
+        let obj = self.resolve_object(refspec)?;
         let commit = obj.peel_to_commit()?;
         Ok(commit.tree()?)
     }
@@ -757,19 +825,24 @@ impl GitBridge {
             .map(Self::normalize_line_endings)
     }
 
-
     /// Read file content at a specific git ref (commit SHA, branch, tag, etc.)
-    pub fn read_file_at_ref(&self, refspec: &str, file_path: &str) -> Result<Option<String>, GitError> {
+    pub fn read_file_at_ref(
+        &self,
+        refspec: &str,
+        file_path: &str,
+    ) -> Result<Option<String>, GitError> {
         let tree = self.resolve_tree(refspec)?;
         Ok(self.read_blob_from_tree(&tree, file_path))
     }
 
     /// Get commits that modified a specific file, walking history from HEAD.
     /// Returns commits in reverse chronological order (newest first).
-    pub fn get_file_commits(&self, file_path: &str, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+    pub fn get_file_commits(
+        &self,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, GitError> {
+        let revwalk = self.revwalk_from_head()?;
 
         let mut commits = Vec::new();
         let path = Path::new(file_path);
@@ -784,7 +857,8 @@ impl GitBridge {
 
             // Compare with parent to see if the file changed
             let file_in_parent = if commit.parent_count() > 0 {
-                commit.parent(0)
+                commit
+                    .parent(0)
                     .ok()
                     .and_then(|p| p.tree().ok())
                     .and_then(|t| t.get_path(path).ok().map(|e| e.id()))
@@ -794,10 +868,10 @@ impl GitBridge {
 
             // Include if file changed between parent and this commit
             let changed = match (file_in_commit, file_in_parent) {
-                (Some(cur), Some(prev)) => cur != prev,  // content changed
-                (Some(_), None) => true,                   // file added
-                (None, Some(_)) => true,                   // file deleted
-                (None, None) => false,                     // file not present in either
+                (Some(cur), Some(prev)) => cur != prev, // content changed
+                (Some(_), None) => true,                // file added
+                (None, Some(_)) => true,                // file deleted
+                (None, None) => false,                  // file not present in either
             };
 
             if changed {
@@ -835,9 +909,7 @@ impl GitBridge {
             Err(error) => return Err(error),
         }
 
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        let revwalk = self.revwalk_from_head()?;
 
         let mut results = Vec::new();
         let mut tracked_path = file_path.to_string();
@@ -889,11 +961,9 @@ impl GitBridge {
             let should_check_rename =
                 parent_tree_opt.is_some() && (file_in_parent.is_none() || file_in_commit.is_none());
             if should_check_rename {
-                let mut diff = self.repo.diff_tree_to_tree(
-                    parent_tree_opt.as_ref(),
-                    Some(&tree),
-                    None,
-                )?;
+                let mut diff =
+                    self.repo
+                        .diff_tree_to_tree(parent_tree_opt.as_ref(), Some(&tree), None)?;
                 let mut find_opts = DiffFindOptions::new();
                 find_opts.renames(true);
                 diff.find_similar(Some(&mut find_opts))?;
@@ -1018,7 +1088,7 @@ impl GitBridge {
     /// Get all file paths changed in a single commit (vs its parent).
     /// Returns file paths from the new side of each delta.
     pub fn get_commit_changed_files(&self, sha: &str) -> Result<Vec<String>, GitError> {
-        let obj = self.repo.revparse_single(sha)?;
+        let obj = self.resolve_object(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
         let parent_tree = if commit.parent_count() > 0 {
@@ -1026,7 +1096,9 @@ impl GitBridge {
         } else {
             None
         };
-        let diff = self.repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
         let mut paths = Vec::new();
         for delta in diff.deltas() {
             if let Some(p) = delta.new_file().path().and_then(|p| p.to_str()) {
@@ -1199,9 +1271,38 @@ fn git_command_error(message: String) -> GitError {
     GitError::Git2(git2::Error::from_str(&message))
 }
 
+fn ensure_git_extensions_supported() -> Result<(), GitError> {
+    static EXTENSIONS: OnceLock<Result<(), String>> = OnceLock::new();
+
+    EXTENSIONS
+        .get_or_init(|| {
+            // libgit2 rejects unknown extension names while opening a repo
+            // unless callers opt in first. set_extensions REPLACES the custom
+            // list, so every tolerated extension must be registered here, in
+            // one place:
+            // - relativeworktrees (git 2.48): libgit2 1.9.x operates on these
+            //   repos fine once the name is tolerated.
+            // - refstorage (git 2.45, reftable): libgit2 can't read reftable
+            //   refs, so GitBridge routes ref resolution through the git CLI
+            //   (see `cli_refs`); objects and the index work unchanged.
+            unsafe { git2::opts::set_extensions(&["relativeworktrees", "refstorage"]) }
+                .map_err(|error| error.message().to_string())
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(|message| git_command_error(message.clone()))
+}
+
 fn map_git_error(error: git2::Error) -> GitError {
     if error.code() == ErrorCode::NotFound {
         GitError::NotARepo
+    } else if error.message().contains("extensions.refstorage") {
+        // The repo uses git's reftable ref-storage backend (git 2.45+,
+        // `git init --ref-format=reftable`). libgit2 cannot read reftable refs
+        // at all, so registering the extension would open the repo and then
+        // silently misread it; a clear refusal is the only safe answer until
+        // libgit2 ships reftable support.
+        GitError::UnsupportedRefStorage
     } else {
         GitError::Git2(error)
     }
@@ -1212,12 +1313,15 @@ fn should_retry_with_command_line_safe_directory(error: &git2::Error, path: &Pat
     should_retry_with_safe_directory(error, path, &safe_directories)
 }
 
-fn should_retry_with_safe_directory(error: &git2::Error, path: &Path, safe_directories: &[String]) -> bool {
+fn should_retry_with_safe_directory(
+    error: &git2::Error,
+    path: &Path,
+    safe_directories: &[String],
+) -> bool {
     error.code() == ErrorCode::Owner
         && nearest_git_root(path).is_some_and(|repo_root| {
             safe_directories.iter().any(|safe_directory| {
-                safe_directory == "*"
-                    || paths_match(&repo_root, Path::new(safe_directory))
+                safe_directory == "*" || paths_match(&repo_root, Path::new(safe_directory))
             })
         })
 }
@@ -1241,11 +1345,7 @@ fn command_line_safe_directories() -> Vec<String> {
 }
 
 fn nearest_git_root(path: &Path) -> Option<PathBuf> {
-    let mut current = if path.is_file() {
-        path.parent()?
-    } else {
-        path
-    };
+    let mut current = if path.is_file() { path.parent()? } else { path };
 
     loop {
         if current.join(".git").exists() {
@@ -1449,6 +1549,122 @@ mod tests {
     }
 
     #[test]
+    fn open_allows_relative_worktrees_extension() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        drop(repo);
+
+        let config = temp.path().join(".git/config");
+        let contents = fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("repositoryformatversion = 0"));
+        fs::write(
+            &config,
+            contents.replace("repositoryformatversion = 0", "repositoryformatversion = 1")
+                + "\n[extensions]\n\trelativeworktrees = true\n",
+        )
+        .unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        assert_eq!(bridge.repo_root(), fs::canonicalize(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn open_tolerates_refstorage_extension() {
+        // Regression for #451: the extensions.refstorage key made libgit2
+        // refuse to open the repo outright. The extension is tolerated now,
+        // and ref resolution routes through the git CLI (`cli_refs`).
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        drop(repo);
+
+        let config = temp.path().join(".git/config");
+        let contents = fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("repositoryformatversion = 0"));
+        fs::write(
+            &config,
+            contents.replace("repositoryformatversion = 0", "repositoryformatversion = 1")
+                + "\n[extensions]\n\trefstorage = reftable\n",
+        )
+        .unwrap();
+
+        let bridge = GitBridge::open(temp.path()).expect("open should tolerate refstorage");
+        assert!(bridge.cli_refs);
+    }
+
+    /// End-to-end on a REAL reftable repo. Skips (with a note) when the
+    /// installed git predates `git init --ref-format=reftable` (2.45).
+    #[test]
+    fn reftable_repo_diff_blame_and_head_work_via_cli_refs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+
+        let init = git(&["init", "-q", "--ref-format=reftable"]);
+        if !init.status.success() {
+            eprintln!("git lacks reftable support; skipping");
+            return;
+        }
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        fs::write(root.join("file.py"), "def hello():\n    return 1\n").unwrap();
+        git(&["add", "file.py"]);
+        git(&["commit", "-q", "-m", "init"]);
+        fs::write(root.join("file.py"), "def hello():\n    return 2\n").unwrap();
+
+        let bridge = GitBridge::open(root).expect("open real reftable repo");
+        assert!(bridge.cli_refs);
+
+        // HEAD resolution matches real git.
+        let cli_head = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(bridge.get_head_sha().unwrap(), cli_head);
+        assert!(bridge.is_valid_rev("HEAD"));
+        assert_eq!(bridge.resolve_ref_sha("HEAD").as_deref(), Some(cli_head.as_str()));
+
+        // Working-tree diff sees the modification with correct before/after.
+        let (_, files) = bridge.detect_and_get_files(&[]).unwrap();
+        assert_eq!(files.len(), 1, "files: {files:?}");
+        assert_eq!(files[0].file_path, "file.py");
+        assert!(files[0]
+            .before_content
+            .as_deref()
+            .unwrap_or("")
+            .contains("return 1"));
+        assert!(files[0]
+            .after_content
+            .as_deref()
+            .unwrap_or("")
+            .contains("return 2"));
+
+        // Commit and range diffs resolve refs via the CLI too.
+        git(&["add", "file.py"]);
+        git(&["commit", "-q", "-m", "second"]);
+        let range = bridge
+            .get_changed_files(
+                &DiffScope::Range {
+                    from: "HEAD~1".to_string(),
+                    to: "HEAD".to_string(),
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(range.len(), 1);
+        assert_eq!(range[0].file_path, "file.py");
+
+        // History walk starts from CLI-resolved HEAD.
+        let commits = bridge.get_file_commits("file.py", 0).unwrap();
+        assert_eq!(commits.len(), 2, "commits: {commits:?}");
+    }
+
+    #[test]
     fn sparse_checkout_does_not_report_excluded_files_as_deleted() {
         // Regression for #330: with a cone-mode sparse checkout, libgit2's
         // workdir diff sees sparse-excluded files as absent and reports them
@@ -1458,7 +1674,12 @@ mod tests {
         let repo = Repository::init(temp.path()).unwrap();
         fs::create_dir_all(temp.path().join("keep")).unwrap();
         fs::create_dir_all(temp.path().join("drop")).unwrap();
-        commit_file(&repo, "keep/a.rs", "fn kept() { let x = 1; }\n", "init keep");
+        commit_file(
+            &repo,
+            "keep/a.rs",
+            "fn kept() { let x = 1; }\n",
+            "init keep",
+        );
         commit_file(&repo, "drop/b.rs", "fn dropped() {}\n", "init drop");
 
         let git = |args: &[&str]| {
@@ -1493,7 +1714,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
 
-        commit_file(&repo, "sample.ts", "export function a() {\n  return 1;\n}\n", "init");
+        commit_file(
+            &repo,
+            "sample.ts",
+            "export function a() {\n  return 1;\n}\n",
+            "init",
+        );
         commit_file(
             &repo,
             "sample.ts",
@@ -1513,11 +1739,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         Repository::init(temp.path()).unwrap();
 
-        let owner_error = git2::Error::new(
-            ErrorCode::Owner,
-            ErrorClass::Config,
-            "owner mismatch",
-        );
+        let owner_error = git2::Error::new(ErrorCode::Owner, ErrorClass::Config, "owner mismatch");
         let safe_directories = [temp.path().to_string_lossy().to_string()];
 
         assert!(should_retry_with_safe_directory(
@@ -1533,11 +1755,8 @@ mod tests {
             &other_directories,
         ));
 
-        let not_found_error = git2::Error::new(
-            ErrorCode::NotFound,
-            ErrorClass::Repository,
-            "not found",
-        );
+        let not_found_error =
+            git2::Error::new(ErrorCode::NotFound, ErrorClass::Repository, "not found");
         assert!(!should_retry_with_safe_directory(
             &not_found_error,
             temp.path(),
@@ -1550,7 +1769,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
 
-        commit_file(&repo, "sample.ts", "export function a() {\n  return 1;\n}\n", "init");
+        commit_file(
+            &repo,
+            "sample.ts",
+            "export function a() {\n  return 1;\n}\n",
+            "init",
+        );
         let head_oid = commit_file(
             &repo,
             "sample.ts",
@@ -1560,9 +1784,12 @@ mod tests {
 
         let bridge = GitBridge::open(temp.path()).unwrap();
         let files = bridge
-            .get_changed_files(&DiffScope::Commit {
-                sha: head_oid.to_string(),
-            }, &[])
+            .get_changed_files(
+                &DiffScope::Commit {
+                    sha: head_oid.to_string(),
+                },
+                &[],
+            )
             .unwrap();
 
         assert_eq!(files.len(), 1);
@@ -1788,10 +2015,7 @@ export function foo() {
   return alpha + beta + gamma;
 }
 ";
-        let after = before.replace(
-            "return alpha + beta + gamma;",
-            "return one + two + three;",
-        );
+        let after = before.replace("return alpha + beta + gamma;", "return one + two + three;");
 
         commit_file(&repo, "old.ts", before, "init");
         fs::rename(temp.path().join("old.ts"), temp.path().join("new.ts")).unwrap();
@@ -1903,12 +2127,10 @@ export function bar(y: number) {
             .map(|i| format!("// new filler {i} delta epsilon zeta"))
             .collect::<Vec<_>>()
             .join("\n");
-        let before = format!(
-            "{before_noise}\nexport function foo(x: number) {{\n  return x + 1;\n}}\n"
-        );
-        let after = format!(
-            "{after_noise}\nexport function foo(x: number) {{\n  return x + 42;\n}}\n"
-        );
+        let before =
+            format!("{before_noise}\nexport function foo(x: number) {{\n  return x + 1;\n}}\n");
+        let after =
+            format!("{after_noise}\nexport function foo(x: number) {{\n  return x + 42;\n}}\n");
 
         commit_file(&repo, "a.ts", &before, "init");
 
@@ -1960,12 +2182,10 @@ export function bar(y: number) {
             .map(|i| format!("// new filler {i} delta epsilon zeta"))
             .collect::<Vec<_>>()
             .join("\n");
-        let before = format!(
-            "{before_noise}\nexport function foo(x: number) {{\n  return x + 1;\n}}\n"
-        );
-        let after = format!(
-            "{after_noise}\nexport function foo(x: number) {{\n  return x + 42;\n}}\n"
-        );
+        let before =
+            format!("{before_noise}\nexport function foo(x: number) {{\n  return x + 1;\n}}\n");
+        let after =
+            format!("{after_noise}\nexport function foo(x: number) {{\n  return x + 42;\n}}\n");
 
         commit_file(&repo, "a.ts", &before, "init");
 
@@ -2109,12 +2329,19 @@ export function bar(y: number) {
         let bridge = GitBridge::open(temp.path()).unwrap();
         let files = bridge.get_changed_files(&DiffScope::Working, &[]).unwrap();
 
-        assert_eq!(files.len(), 1, "expected git to detect the CRLF change as modified");
+        assert_eq!(
+            files.len(),
+            1,
+            "expected git to detect the CRLF change as modified"
+        );
 
         let before = files[0].before_content.as_deref().unwrap();
         let after = files[0].after_content.as_deref().unwrap();
 
-        assert_eq!(before, after, "CRLF-only difference should be invisible after normalization");
+        assert_eq!(
+            before, after,
+            "CRLF-only difference should be invisible after normalization"
+        );
     }
 
     #[test]
@@ -2122,7 +2349,10 @@ export function bar(y: number) {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
 
-        repo.config().unwrap().set_str("core.autocrlf", "false").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.autocrlf", "false")
+            .unwrap();
         commit_file(&repo, "sample.rs", "fn a() {}\r\n", "init");
         fs::write(temp.path().join("sample.rs"), "fn a() {}\r\nfn b() {}\r\n").unwrap();
 
@@ -2132,6 +2362,9 @@ export function bar(y: number) {
         assert_eq!(files.len(), 1, "expected git to detect the modification");
 
         let before = files[0].before_content.as_deref().unwrap();
-        assert!(!before.contains('\r'), "before_content read from CRLF blob should be normalized to LF");
+        assert!(
+            !before.contains('\r'),
+            "before_content read from CRLF blob should be normalized to LF"
+        );
     }
 }

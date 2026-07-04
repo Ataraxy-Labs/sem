@@ -39,6 +39,8 @@ impl SemanticParserPlugin for FallbackParserPlugin {
                 content: chunk_content,
                 start_line,
                 end_line,
+                start_byte: None,
+                end_byte: None,
                 metadata: None,
             });
 

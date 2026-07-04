@@ -35,15 +35,42 @@ infix right 5 (|>) = apR
 "#;
 
         let entities = registry.extract_entities("Main.elm", elm_code);
-        assert!(!entities.is_empty(), "Should extract entities from Elm code");
+        assert!(
+            !entities.is_empty(),
+            "Should extract entities from Elm code"
+        );
 
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Model"), "Should find type alias Model, got: {:?}", names);
-        assert!(names.contains(&"Msg"), "Should find type Msg, got: {:?}", names);
-        assert!(names.contains(&"update"), "Should find value update, got: {:?}", names);
-        assert!(names.contains(&"view"), "Should find value view, got: {:?}", names);
-        assert!(names.contains(&"sendMessage"), "Should find port sendMessage, got: {:?}", names);
-        assert!(names.contains(&"|>"), "Should find infix |>, got: {:?}", names);
+        assert!(
+            names.contains(&"Model"),
+            "Should find type alias Model, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Msg"),
+            "Should find type Msg, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"update"),
+            "Should find value update, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"view"),
+            "Should find value view, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"sendMessage"),
+            "Should find port sendMessage, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"|>"),
+            "Should find infix |>, got: {:?}",
+            names
+        );
 
         // Verify file paths are correct
         for entity in &entities {
@@ -65,8 +92,16 @@ greet name =
 
         let entities = registry.extract_entities("Main.elm", elm_code);
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"greet"), "Should find top-level greet, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find top-level greet, got: {:?}",
+            names
+        );
         // "greeting" is a local let binding — should NOT be a top-level entity
-        assert!(!names.contains(&"greeting"), "Should not extract local let binding, got: {:?}", names);
+        assert!(
+            !names.contains(&"greeting"),
+            "Should not extract local let binding, got: {:?}",
+            names
+        );
     }
 }
