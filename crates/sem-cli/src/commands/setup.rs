@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use colored::Colorize;
+use serde_json::{json, Value};
 
 #[cfg(unix)]
 fn wrapper_path() -> PathBuf {
@@ -148,15 +149,303 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Install pre-commit hook if we're in a git repo
     install_pre_commit_hook();
 
+    // Install the session-default hooks for Claude Code: a warm resident graph
+    // and prompt-time context injection, so structural queries are instant and
+    // the code an agent would forage for arrives at turn zero.
+    install_session_hooks();
+
     println!(
         "\n{} Running `git diff` in any repo will now use sem.",
         "Done!".green().bold()
     );
     println!("  Pre-commit hook shows entity-level blast radius of staged changes.");
+    println!("  Claude Code sessions get a warm graph + prompt-time context (free, local).");
     println!("  sem-mcp server available for agent integration.");
     println!("  To revert, run: sem unsetup");
 
     Ok(())
+}
+
+/// Path to Claude Code's user settings file, where session hooks live.
+fn claude_settings_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".claude").join("settings.json")
+}
+
+/// True for the exact hook commands `sem setup` installs. These substrings are
+/// sem-specific (no other tool ships `mcp --resident` or `hook prompt-submit`),
+/// so matching them will not remove a user's unrelated hooks.
+fn is_sem_hook_command(cmd: &str) -> bool {
+    cmd.contains("mcp --resident") || cmd.contains("hook prompt-submit")
+}
+
+/// True if a Claude Code hook entry is one sem installed (any of its `hooks`
+/// commands is a sem hook command).
+fn entry_is_sem_hook(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|arr| {
+            arr.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_sem_hook_command)
+            })
+        })
+}
+
+/// Add the two session hooks to a parsed settings object, preserving every
+/// other key and every user-defined hook. Idempotent: returns the number of
+/// hooks newly added (0 if both were already present).
+fn add_session_hooks(root: &mut Value, resident_cmd: &str, prompt_cmd: &str) -> usize {
+    let Some(obj) = root.as_object_mut() else {
+        return 0;
+    };
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let Some(hooks) = hooks.as_object_mut() else {
+        return 0;
+    };
+    let mut added = 0;
+
+    let session = hooks.entry("SessionStart").or_insert_with(|| json!([]));
+    if let Some(arr) = session.as_array_mut() {
+        if !arr.iter().any(entry_is_sem_hook) {
+            arr.push(json!({
+                "matcher": "",
+                "hooks": [{ "type": "command", "command": resident_cmd }]
+            }));
+            added += 1;
+        }
+    }
+
+    let prompt = hooks.entry("UserPromptSubmit").or_insert_with(|| json!([]));
+    if let Some(arr) = prompt.as_array_mut() {
+        if !arr.iter().any(entry_is_sem_hook) {
+            arr.push(json!({
+                "hooks": [{ "type": "command", "command": prompt_cmd }]
+            }));
+            added += 1;
+        }
+    }
+
+    added
+}
+
+/// Remove only the sem-installed session hooks from a parsed settings object,
+/// leaving every user hook and every other key intact. Empty hook arrays and an
+/// empty `hooks` object are cleaned up so `add` then `remove` round-trips to the
+/// original shape. Returns true if anything changed.
+fn remove_session_hooks(root: &mut Value) -> bool {
+    let Some(obj) = root.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let hooks_empty;
+    {
+        let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+            return false;
+        };
+        for key in ["SessionStart", "UserPromptSubmit"] {
+            let mut now_empty = false;
+            if let Some(arr) = hooks.get_mut(key).and_then(|a| a.as_array_mut()) {
+                let before = arr.len();
+                arr.retain(|e| !entry_is_sem_hook(e));
+                if arr.len() != before {
+                    changed = true;
+                }
+                now_empty = arr.is_empty();
+            }
+            if now_empty {
+                hooks.remove(key);
+                changed = true;
+            }
+        }
+        hooks_empty = hooks.is_empty();
+    }
+    if hooks_empty {
+        obj.remove("hooks");
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(unix)]
+fn install_session_hooks() {
+    let sem = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "sem".to_string());
+    // Detach the resident server so the SessionStart hook returns immediately.
+    let resident = format!("nohup {sem} mcp --resident >/dev/null 2>&1 &");
+    let prompt = format!("{sem} hook prompt-submit");
+
+    let path = claude_settings_path();
+
+    // Read + parse the existing settings. Parse failure means we do NOT touch
+    // the file — a corrupt write here would break the user's Claude Code config.
+    let mut root: Value = if path.exists() {
+        match fs::read_to_string(&path) {
+            Ok(s) if s.trim().is_empty() => json!({}),
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => {
+                    println!(
+                        "{} {} is not valid JSON; leaving it untouched (session hooks skipped)",
+                        "note:".yellow().bold(),
+                        path.display()
+                    );
+                    return;
+                }
+            },
+            Err(_) => return,
+        }
+    } else {
+        json!({})
+    };
+
+    if !root.is_object() {
+        println!(
+            "{} {} is not a JSON object; leaving it untouched (session hooks skipped)",
+            "note:".yellow().bold(),
+            path.display()
+        );
+        return;
+    }
+
+    // Back up before the first modification.
+    if path.exists() {
+        let backup = path.with_extension("json.sem-backup");
+        if !backup.exists() {
+            let _ = fs::copy(&path, &backup);
+        }
+    }
+
+    let added = add_session_hooks(&mut root, &resident, &prompt);
+    if added == 0 {
+        println!(
+            "{} Claude Code session hooks already installed",
+            "✓".green().bold()
+        );
+        return;
+    }
+
+    if let Some(dir) = path.parent() {
+        if !dir.exists() {
+            let _ = fs::create_dir_all(dir);
+        }
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&root) {
+        if fs::write(&path, format!("{s}\n")).is_ok() {
+            println!(
+                "{} Installed Claude Code session hooks (warm graph + prompt-time context) in {}",
+                "✓".green().bold(),
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_session_hooks() {
+    println!(
+        "{} Claude Code session hooks (warm graph + prompt-time context) are not installed on Windows yet; git diff integration is active.",
+        "note:".yellow().bold()
+    );
+}
+
+#[cfg(unix)]
+fn remove_session_hooks_file() {
+    let path = claude_settings_path();
+    if !path.exists() {
+        return;
+    }
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut root: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if !root.is_object() {
+        return;
+    }
+    if remove_session_hooks(&mut root) {
+        if let Ok(s) = serde_json::to_string_pretty(&root) {
+            if fs::write(&path, format!("{s}\n")).is_ok() {
+                println!("{} Removed Claude Code session hooks", "✓".green().bold());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remove_session_hooks_file() {}
+
+#[cfg(test)]
+mod session_hook_tests {
+    use super::*;
+
+    #[test]
+    fn add_is_idempotent_and_preserves_other_keys() {
+        let mut root = json!({
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo hi" }] }
+                ]
+            }
+        });
+        let n = add_session_hooks(&mut root, "nohup sem mcp --resident &", "sem hook prompt-submit");
+        assert_eq!(n, 2, "both hooks added on a fresh config");
+        assert_eq!(root["model"], "opus", "unrelated keys preserved");
+        assert_eq!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo hi");
+        let n2 =
+            add_session_hooks(&mut root, "nohup sem mcp --resident &", "sem hook prompt-submit");
+        assert_eq!(n2, 0, "second install adds nothing (idempotent)");
+    }
+
+    #[test]
+    fn remove_keeps_user_hooks_and_restores_shape() {
+        let mut root = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo hi" }] }
+                ]
+            }
+        });
+        add_session_hooks(&mut root, "nohup sem mcp --resident &", "sem hook prompt-submit");
+        assert!(remove_session_hooks(&mut root));
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo hi",
+            "user hook survives removal"
+        );
+        assert!(
+            root["hooks"].get("SessionStart").is_none(),
+            "sem SessionStart hook removed and empty array cleaned"
+        );
+        assert!(root["hooks"].get("UserPromptSubmit").is_none());
+    }
+
+    #[test]
+    fn add_then_remove_roundtrips_to_no_hooks() {
+        let mut root = json!({});
+        add_session_hooks(&mut root, "a mcp --resident", "a hook prompt-submit");
+        remove_session_hooks(&mut root);
+        assert!(
+            root.as_object().unwrap().get("hooks").is_none(),
+            "empty hooks object removed so shape matches the original"
+        );
+    }
+
+    #[test]
+    fn remove_from_config_without_sem_hooks_is_noop() {
+        let mut root = json!({ "model": "x" });
+        assert!(!remove_session_hooks(&mut root));
+        assert_eq!(root["model"], "x");
+    }
 }
 
 const SEM_HOOK_START: &str = "# === sem pre-commit hook ===";
@@ -287,6 +576,9 @@ pub fn unsetup() -> Result<(), Box<dyn std::error::Error>> {
 
     // Remove pre-commit hook section
     remove_pre_commit_hook();
+
+    // Remove the Claude Code session hooks (leaves any user hooks intact).
+    remove_session_hooks_file();
 
     println!(
         "\n{} git diff restored to default behavior.",

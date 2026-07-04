@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`sem setup` now makes sem a Claude Code session default (macOS/Linux).** Beyond the `git diff` alias, it installs two session hooks into `~/.claude/settings.json`: a warm resident graph (SessionStart runs `sem mcp --resident` detached, so structural queries answer in single-digit ms instead of rebuilding) and prompt-time context injection (`sem hook prompt-submit`). The JSON edit is idempotent, backs up `settings.json` first, refuses to touch a file it can't parse, and preserves every existing user hook and key; `sem unsetup` removes exactly the sem hooks and cleans up empty arrays. Local warmth is free and login-free — cloud (`sem login`) is repositioned in the README as the scale/team/CI upgrade, not the way to get warmth.
+
 ### Documentation
 
 - **Benchmarks page rebuilt on the July 2026 paired-run data.** The docs site's benchmarks page now reports the real agent A/B numbers (grep+read agent vs sem agent on SWE-bench Verified bugs, hidden-test graded): 50-65% faster code understanding, verify loop 2.90s to 0.59s per iteration when call-graph edges resolve (bimodal, 1.2x floor disclosed), token parity stated plainly, and an explicit "what sem does not do" section including the unchanged solve rate. Retired the stale "75% fewer tokens" and "2.3x agent accuracy" hero claims. Changelog page gains entries for v0.17-v0.18 work with the lessons that produced them.
