@@ -6,6 +6,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- **Dot-chain extraction is now linear, not quadratic, in file size.** `extract_dot_chains_with_positions` computed each match's line number by counting newlines from the start of the file every time, so on a large file dense with `a.b` chains the cost was O(matches times filelen). Since the regex yields matches in increasing byte order, it now tracks the line number incrementally and counts only the newlines since the previous match, which is linear overall and produces identical one-based line numbers. Verified byte-for-byte identical graph output on React (34,251 entities, 73,702 edges). No change for typical files; it removes a cliff on very large generated or minified sources.
+
 - **Structural hashing no longer allocates a Vec per AST node.** The two structural-hash walkers (`hash_structural_tokens` and its name-excluding variant) collected every internal node's children into a fresh heap `Vec` (plus a fresh tree-sitter cursor) just to push them in reverse, despite a comment claiming zero allocations. They now reuse a single cursor and push children in place, reversing the appended slice, which is byte-for-byte identical output. On a cold graph build this removes roughly 300k allocations (structural hashing alone dropped from about 319k allocations to 13.5k, measured with dhat on deno). Peak RSS is unchanged and wall time is within noise under mimalloc, but the churn reduction helps memory-constrained and non-mimalloc builds. Hashes are verified identical across 3,337 entities, so rename detection and existing caches are unaffected.
 
 ### Added

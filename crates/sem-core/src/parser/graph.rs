@@ -4216,9 +4216,20 @@ fn extract_dot_chains_with_positions<'a>(
 
     let mut chains = Vec::new();
     let mut seen: HashSet<(&str, &str, usize, usize)> = HashSet::default();
+    // Track the line number incrementally. `captures_iter` yields matches in
+    // strictly increasing byte order, so instead of re-counting newlines from
+    // the start of the file for every match (O(matches * filelen), quadratic on
+    // large files dense with `a.b` chains), we count only the newlines in the
+    // gap since the previous match. Same one-based line numbers, linear total.
+    let mut line = 1usize;
+    let mut scanned = 0usize;
     for cap in DOT_CHAIN_RE.captures_iter(content) {
         let matched = cap.get(0).unwrap();
-        let line = line_for_byte(content, matched.start());
+        line += content[scanned..matched.start()]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        scanned = matched.start();
         let receiver = cap.get(1).unwrap().as_str();
         let member = cap.get(2).unwrap().as_str();
         if seen.insert((receiver, member, line, matched.start())) {
