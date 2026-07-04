@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Structural hashing no longer allocates a Vec per AST node.** The two structural-hash walkers (`hash_structural_tokens` and its name-excluding variant) collected every internal node's children into a fresh heap `Vec` (plus a fresh tree-sitter cursor) just to push them in reverse, despite a comment claiming zero allocations. They now reuse a single cursor and push children in place, reversing the appended slice, which is byte-for-byte identical output. On a cold graph build this removes roughly 300k allocations (structural hashing alone dropped from about 319k allocations to 13.5k, measured with dhat on deno). Peak RSS is unchanged and wall time is within noise under mimalloc, but the churn reduction helps memory-constrained and non-mimalloc builds. Hashes are verified identical across 3,337 entities, so rename detection and existing caches are unaffected.
+
 ### Added
 
 - **`sem setup` now makes sem a Claude Code session default (macOS/Linux).** Beyond the `git diff` alias, it installs two session hooks into `~/.claude/settings.json`: a warm resident graph (SessionStart runs `sem mcp --resident` detached, so structural queries answer in single-digit ms instead of rebuilding) and prompt-time context injection (`sem hook prompt-submit`). The JSON edit is idempotent, backs up `settings.json` first, refuses to touch a file it can't parse, and preserves every existing user hook and key; `sem unsetup` removes exactly the sem hooks and cleans up empty arrays. Local warmth is free and login-free — cloud (`sem login`) is repositioned in the README as the scale/team/CI upgrade, not the way to get warmth.
