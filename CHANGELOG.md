@@ -4,9 +4,16 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-05
+
 ### Changed
 
+- **Indexing now shows a staged loader (Scanning → Parsing → Resolving), not a single "Building entity graph" spinner.** A cold graph build renders each phase sem-core actually reports as a persistent `◆` line — `Scanning files — N found`, `Parsing code — done` — with a live spinner on the current stage, then the existing `✓ N entities · M files in …ms` summary. The phases come from the build itself via a new sem-core build-phase hook (`set_build_phase_hook` / `BuildPhase`), so a warm cache fires nothing and stays instant and silent, exactly as before. TTY-only: agents, pipes, the MCP server, and CI see nothing.
 - **`sem setup` now shows a staged progress loader instead of a flat list of check lines.** Setup runs as a small tree of steps — `git diff → sem diff`, `Claude Code hooks`, `pre-commit hook` — each with a live braille spinner that resolves to a green `◆` (did something), a dim `·` (nothing to do / not applicable, e.g. not in a git repo), or a yellow `⚠` (left a file untouched on purpose, e.g. an unparseable `settings.json`). It ends with a one-line summary and the `sem unsetup` revert hint. Same idempotent behaviour, just legible at a glance.
+
+### Added
+
+- **sem-core: `set_build_phase_hook` / `clear_build_phase_hook` / `BuildPhase`** — an optional per-thread callback invoked at graph-build phase boundaries (parsing, resolving), so a front-end can render staged progress. No-op for every caller that doesn't install a hook.
 
 ## [0.19.0] - 2026-07-05
 

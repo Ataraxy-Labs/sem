@@ -83,7 +83,7 @@ pub fn graph_command(opts: GraphOptions) {
         }
     }
 
-    let prog = crate::progress::Progress::start("Building entity graph");
+    let prog = crate::progress::Progress::start_staged();
     let graph = get_or_build_graph_topology_with_timings(
         root,
         &file_paths,

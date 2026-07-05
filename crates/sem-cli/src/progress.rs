@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use sem_core::parser::graph::{clear_build_phase_hook, set_build_phase_hook, BuildPhase};
 
 /// Don't print a summary for work that finished faster than this — warm-cache
 /// runs should stay silent and instant, like they do today.
@@ -80,6 +81,49 @@ impl Progress {
         }
     }
 
+    /// A CodeGraph-style staged build loader. Instead of one "Building entity
+    /// graph" spinner, the display advances through the real phases sem-core's
+    /// build reports — Scanning (with a file count), Parsing, Resolving — each
+    /// finished stage printed as a persistent `◆` line above the live spinner.
+    /// The stages come from the build itself via [`set_build_phase_hook`], so on
+    /// a warm cache (no rebuild) nothing fires and it stays silent, exactly like
+    /// the plain spinner. No-op off a TTY.
+    pub fn start_staged() -> Self {
+        let bar = if enabled() {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            pb.enable_steady_tick(Duration::from_millis(80));
+            pb.set_message("Building entity graph…");
+
+            let b = pb.clone();
+            set_build_phase_hook(Box::new(move |phase| match phase {
+                BuildPhase::Parsing { files } => {
+                    b.println(format!(
+                        "  {} Scanning files — {} found",
+                        "◆".green(),
+                        crate::commands::graph::fmt_count(files)
+                    ));
+                    b.set_message("Parsing code…");
+                }
+                BuildPhase::Resolving => {
+                    b.println(format!("  {} Parsing code — done", "◆".green()));
+                    b.set_message("Resolving references…");
+                }
+            }));
+            Some(pb)
+        } else {
+            None
+        };
+        Self {
+            bar,
+            started: Instant::now(),
+        }
+    }
+
     /// Update the spinner's message as the work moves through phases.
     /// Reserved for upcoming per-phase messages (Scanning → Parsing → ...).
     #[allow(dead_code)]
@@ -93,6 +137,7 @@ impl Progress {
     /// long enough to be worth reporting. `summary` should read like
     /// "1,240 entities, 86 files".
     pub fn done(self, summary: &str) {
+        clear_build_phase_hook();
         let elapsed = self.started.elapsed();
         if let Some(bar) = self.bar {
             bar.finish_and_clear();
@@ -111,6 +156,7 @@ impl Progress {
     /// Clear the spinner with no summary (e.g. an error path took over).
     #[allow(dead_code)]
     pub fn clear(self) {
+        clear_build_phase_hook();
         if let Some(bar) = self.bar {
             bar.finish_and_clear();
         }

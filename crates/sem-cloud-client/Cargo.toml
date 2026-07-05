@@ -1,6 +1,6 @@
 [package]
 name = "sem-cloud-client"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Shared client for sem-cloud: credentials, repo resolution, caching, and the metered graph API. Used by both the sem CLI and the sem MCP server."

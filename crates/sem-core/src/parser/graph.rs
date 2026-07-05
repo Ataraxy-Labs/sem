@@ -19,6 +19,40 @@ use regex::Regex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 
+/// A phase boundary during a full graph build, reported to an optional per-thread
+/// hook so a CLI can render a staged progress display (scan → parse → resolve).
+/// Only the CLI installs a hook; for every other caller these calls are no-ops.
+#[derive(Clone, Copy, Debug)]
+pub enum BuildPhase {
+    /// About to parse this many files.
+    Parsing { files: usize },
+    /// Done parsing; about to resolve cross-file references into edges.
+    Resolving,
+}
+
+thread_local! {
+    static BUILD_PHASE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(BuildPhase)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a per-thread callback invoked at graph-build phase boundaries.
+pub fn set_build_phase_hook(f: Box<dyn Fn(BuildPhase)>) {
+    BUILD_PHASE_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+/// Remove the phase callback installed by [`set_build_phase_hook`].
+pub fn clear_build_phase_hook() {
+    BUILD_PHASE_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+fn report_build_phase(phase: BuildPhase) {
+    BUILD_PHASE_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(phase);
+        }
+    });
+}
+
 /// Helper macro to select parallel or sequential iteration based on feature flag.
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
@@ -1141,6 +1175,9 @@ impl EntityGraph {
         file_paths: &[String],
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
+        report_build_phase(BuildPhase::Parsing {
+            files: file_paths.len(),
+        });
         let retain_parsed_files = file_paths.len() <= PARSED_FILE_REUSE_LIMIT;
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Small and medium repos reuse parse trees in scope resolution; large repos
@@ -1340,6 +1377,7 @@ impl EntityGraph {
             go_pkg_index: owned_go_pkg_index,
         };
 
+        report_build_phase(BuildPhase::Resolving);
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
             let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
