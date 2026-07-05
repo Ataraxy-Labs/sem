@@ -32,26 +32,25 @@ pub fn prompt_submit() {
         return;
     };
 
+    // Precise path: the prompt names entities (`backticked`, snake_case,
+    // CamelCase). Resolve them by exact name against the resident socket —
+    // cheapest and sharpest when the caller already knows the identifier.
     let names = candidates(prompt);
-    if names.is_empty() {
-        return;
-    }
-
     let mut blocks: Vec<String> = Vec::new();
-    for name in names {
-        if let Some(text) = socket_lookup(&repo_root, &name) {
+    for name in &names {
+        if let Some(text) = socket_lookup(&repo_root, name) {
             blocks.push(text);
         }
     }
-    if blocks.is_empty() {
+    if !blocks.is_empty() {
+        println!(
+            "<sem-prefetch>\nThe prompt references code entities; sem resolved them ahead of time \
+             (entity body + direct callers/callees). Use this instead of searching; verify only if \
+             something looks stale.\n\n{}\n</sem-prefetch>",
+            blocks.join("\n\n")
+        );
         return;
     }
-    println!(
-        "<sem-prefetch>\nThe prompt references code entities; sem resolved them ahead of time \
-         (entity body + direct callers/callees). Use this instead of searching; verify only if \
-         something looks stale.\n\n{}\n</sem-prefetch>",
-        blocks.join("\n\n")
-    );
 }
 
 /// Walk up from `start` to the repo root (the directory holding `.git`).

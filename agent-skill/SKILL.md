@@ -131,10 +131,15 @@ same operations as 6 MCP tools: `sem_entities`, `sem_diff`, `sem_blame`,
 is configured as an MCP server in the agent, prefer these tools over shelling
 out.
 
-## Find code by intent (when you don't know the name)
+## Find code you don't know the name of
+
+sem is deterministic by design — no fuzzy ranking. Locate a candidate name with
+a plain text search (cheap, one pass), then hand it to sem for the structure
+grep can't give:
 
 ```bash
-sem orient "where is the retry logic"   # ranked entities by intent, with file:line
+grep -rn "retry" src/         # find where the concept appears
+sem context retry_handler     # then: full body + callers + callees, by name
 ```
 
 The `sem_entities` MCP tool also takes a `query` argument for the same ranked

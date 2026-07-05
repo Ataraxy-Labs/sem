@@ -10,7 +10,7 @@ npx @ataraxy-labs/sem-skill
 This:
 
 1. Installs the **sem skill** into `~/.claude/skills/sem/` so the agent knows
-   when and how to reach for sem (impact, context, orient, diff, blame, log)
+   when and how to reach for sem (impact, context, diff, blame, log)
    instead of grep for structural code questions.
 2. Registers the **sem MCP server** (`sem mcp`) at user scope, so the
    `sem_impact` / `sem_context` / `sem_entities` / ... tools are available in
