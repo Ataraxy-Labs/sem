@@ -43,7 +43,7 @@ pub fn context_command(opts: ContextOptions) {
         &ext_filter,
         opts.no_default_excludes,
     );
-    let prog = crate::progress::Progress::start("Building entity graph");
+    let prog = crate::progress::Progress::start_staged();
     let (graph, all_entities) =
         super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache, source_scope);
     prog.done(&format!(
