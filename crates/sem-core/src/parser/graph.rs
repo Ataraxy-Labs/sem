@@ -41,9 +41,20 @@ thread_local! {
 pub static GRAPH_PARSE_DONE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Files whose references have been resolved so far in the current full build.
+/// Together with [`GRAPH_PARSE_DONE`] this lets a front-end show one bar over
+/// the whole build (parse pass + resolve pass), so 100% means genuinely done.
+pub static GRAPH_RESOLVE_DONE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Files parsed so far in the current full graph build (see [`GRAPH_PARSE_DONE`]).
 pub fn graph_parse_done() -> usize {
     GRAPH_PARSE_DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Files resolved so far in the current full graph build (see [`GRAPH_RESOLVE_DONE`]).
+pub fn graph_resolve_done() -> usize {
+    GRAPH_RESOLVE_DONE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Install a per-thread callback invoked at graph-build phase boundaries.
@@ -828,6 +839,7 @@ fn resolve_references_with_file_indexes<'a>(
 
     maybe_par_iter!(sorted_file_paths)
         .filter_map(|file_path| {
+            GRAPH_RESOLVE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let entities = entities_by_file.get(file_path.as_str())?;
             let needs_index = entities.iter().any(|entity| {
                 !entity_requires_content_span_filter(entity, context.child_ranges_by_parent)
@@ -1390,6 +1402,7 @@ impl EntityGraph {
             go_pkg_index: owned_go_pkg_index,
         };
 
+        GRAPH_RESOLVE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
         report_build_phase(BuildPhase::Resolving);
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {

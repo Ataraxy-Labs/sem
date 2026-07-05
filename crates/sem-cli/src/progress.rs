@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use sem_core::parser::graph::{
-    clear_build_phase_hook, graph_parse_done, set_build_phase_hook, BuildPhase,
+    clear_build_phase_hook, graph_parse_done, graph_resolve_done, set_build_phase_hook, BuildPhase,
 };
 
 /// The cyan braille spinner used for indeterminate phases.
@@ -133,19 +133,23 @@ impl Progress {
                         "◆".green(),
                         crate::commands::graph::fmt_count(files)
                     ));
-                    // Turn the spinner into a real filling bar for the parse pass,
-                    // fed by sem-core's lock-free per-file counter via a poll thread.
-                    b.set_length(files as u64);
+                    // ONE bar over the WHOLE build so 100% means genuinely done:
+                    // the build is two passes over the file set — parse, then
+                    // resolve — so the bar's length is 2×files and its position is
+                    // (parsed + resolved). It reaches 100% only when resolution
+                    // finishes, not when parsing does. A poll thread advances it
+                    // from sem-core's two lock-free counters for the whole build.
+                    let total = (files as u64) * 2;
+                    b.set_length(total);
                     b.set_position(0);
                     b.set_style(bar_style());
                     b.set_message("Parsing code");
                     let bar = b.clone();
                     let stop = stop_hook.clone();
-                    let total = files as u64;
                     let handle = std::thread::spawn(move || loop {
-                        let done = graph_parse_done() as u64;
-                        bar.set_position(done.min(total));
-                        if stop.load(Ordering::Relaxed) || done >= total {
+                        let pos = (graph_parse_done() + graph_resolve_done()) as u64;
+                        bar.set_position(pos.min(total));
+                        if stop.load(Ordering::Relaxed) || pos >= total {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(50));
@@ -153,18 +157,10 @@ impl Progress {
                     *poll_hook.lock().unwrap() = Some(handle);
                 }
                 BuildPhase::Resolving => {
-                    // Parse done: stop the poll, fill the bar, persist the line.
-                    stop_hook.store(true, Ordering::Relaxed);
-                    if let Some(h) = poll_hook.lock().unwrap().take() {
-                        let _ = h.join();
-                    }
-                    if let Some(len) = b.length() {
-                        b.set_position(len);
-                    }
+                    // Same bar keeps filling into its second pass — only the label
+                    // changes, and the finished parse line is persisted above it.
                     b.println(format!("  {} Parsing code — done", "◆".green()));
-                    // Resolving isn't cleanly countable here — back to a spinner.
-                    b.set_style(spinner_style());
-                    b.set_message("Resolving references…");
+                    b.set_message("Resolving references");
                 }
             }));
             Some(pb)
