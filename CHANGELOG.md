@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-05
+
 ### Removed
 
 - **Removed `sem orient` and all fuzzy/ranked retrieval.** The `orient` command and its `--pack` briefing, the sem-core ranking (lexical scoring, IDF, recall net, structural priming), the `sem_entities query=` intent-search mode, and the resident server's `orient` socket op are all gone. Ranking a natural-language task to the right entity proved unreliable — a 45-task validation showed the ranker's hit-rate (~47%) could not be lifted by heuristics without causing regressions — and it was the only non-deterministic thing in sem. sem is now purely deterministic: `context` (read an entity plus its callers/callees), `impact` (blast radius), `diff`, `entities` (list by path, or `text=` for exact-substring search), `blame`, `log`. To find code whose name you don't know, use a plain text search to get a candidate name, then hand it to `sem context` for the structure grep can't give. The prompt-submit hook keeps its deterministic exact-name prefetch and no longer shells out to the ranker.
