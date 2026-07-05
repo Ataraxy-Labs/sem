@@ -135,15 +135,18 @@ fn salient_terms(text: &str) -> Vec<String> {
             out.insert(term);
         }
     }
-    // Fall back to rare-looking plain words when nothing code-ish was found.
-    if out.is_empty() {
-        for t in query_terms(text) {
-            if t.len() >= 6 {
-                out.insert(t);
-            }
+    // Most issues are plain English ("require a non-empty name for
+    // Blueprints"), and their signal lives in ordinary words, not code-ish
+    // tokens. Keeping only code-ish tokens throws that signal away and leaves
+    // orient matching noise. So always fold in the distinctive plain words too
+    // (>= 4 chars, non-stopword); IDF in the ranker keeps common ones like
+    // "name" tame while rare ones like "blueprint"/"empty" carry the match.
+    for t in query_terms(text) {
+        if t.len() >= 4 {
+            out.insert(t);
         }
     }
-    out.into_iter().take(10).collect()
+    out.into_iter().take(12).collect()
 }
 
 pub fn orient_command(opts: OrientOptions) {
@@ -210,7 +213,15 @@ pub fn orient_command(opts: OrientOptions) {
                     && !e.file_path.starts_with("ci/")
                     && !e.file_path.starts_with("doc")
             })
-            .map(|e| (e, e.content.to_lowercase()))
+            // Match terms against the entity's identity (file path + name),
+            // not just its body. A distinctive query word like "blueprint"
+            // names the file/class where the fix belongs even when the terse
+            // constructor's body never repeats it — the case body-only
+            // matching misses.
+            .map(|e| {
+                let hay = format!("{} {} {}", e.content, e.file_path, e.name).to_lowercase();
+                (e, hay)
+            })
             .collect();
         let n = candidates.len() as f64;
         let idf: Vec<f64> = salient
