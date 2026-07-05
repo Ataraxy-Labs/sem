@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`sem setup` now shows a staged progress loader instead of a flat list of check lines.** Setup runs as a small tree of steps — `git diff → sem diff`, `Claude Code hooks`, `pre-commit hook` — each with a live braille spinner that resolves to a green `◆` (did something), a dim `·` (nothing to do / not applicable, e.g. not in a git repo), or a yellow `⚠` (left a file untouched on purpose, e.g. an unparseable `settings.json`). It ends with a one-line summary and the `sem unsetup` revert hint. Same idempotent behaviour, just legible at a glance.
+
 ## [0.19.0] - 2026-07-05
 
 ### Removed
