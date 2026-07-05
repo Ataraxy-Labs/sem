@@ -6,6 +6,8 @@ All notable changes to sem are documented in this file.
 
 ### Changed
 
+- **The prompt-submit hook now injects code for plain-English tasks, not just ones that name an entity.** `sem hook prompt-submit` used to extract identifier-shaped tokens from the prompt and resolve them by exact name — so it fired only when the user literally typed a `function_name`, and stayed silent for normal tasks like "fix the bug where empty blueprint names don't raise an error". It now falls back to an `orient --pack` briefing (tight, 3 entities) over the whole prompt when no entity is named, so the agent starts with the relevant code in context and skips the search. Fast on a cached repo (~0.05s, hard-capped at 2.5s), gated to coding/navigation prompts (whole-word intent match, so "fundraise" doesn't trip "raise"), and silent on chat.
+
 - **`sem orient --pack` casts a wide candidate net (recall over precision).** Ranking a fuzzy issue to the single right entity is unreliable, so `--pack` no longer bets on it: it packs the top-K candidates (width scales with the token budget) instead of just the top three. If the fix location is anywhere in the net, an agent handed the briefing has it with zero navigation, even when the ranker doesn't put it first — context is cheap, a missed briefing is not. Measured across 9 SWE-bench tasks (requests + flask) on full issue text, the target file lands in the net on 9/9 (was ~4/9) and the exact target function on 5/9 (was 1/9). Larger budgets pack more candidates.
 
 ### Fixed

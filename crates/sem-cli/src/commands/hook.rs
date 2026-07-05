@@ -32,26 +32,108 @@ pub fn prompt_submit() {
         return;
     };
 
+    // Precise path: the prompt names entities (`backticked`, snake_case,
+    // CamelCase). Resolve them by exact name against the resident socket —
+    // cheapest and sharpest when the caller already knows the identifier.
     let names = candidates(prompt);
-    if names.is_empty() {
-        return;
-    }
-
     let mut blocks: Vec<String> = Vec::new();
-    for name in names {
-        if let Some(text) = socket_lookup(&repo_root, &name) {
+    for name in &names {
+        if let Some(text) = socket_lookup(&repo_root, name) {
             blocks.push(text);
         }
     }
-    if blocks.is_empty() {
+    if !blocks.is_empty() {
+        println!(
+            "<sem-prefetch>\nThe prompt references code entities; sem resolved them ahead of time \
+             (entity body + direct callers/callees). Use this instead of searching; verify only if \
+             something looks stale.\n\n{}\n</sem-prefetch>",
+            blocks.join("\n\n")
+        );
         return;
     }
-    println!(
-        "<sem-prefetch>\nThe prompt references code entities; sem resolved them ahead of time \
-         (entity body + direct callers/callees). Use this instead of searching; verify only if \
-         something looks stale.\n\n{}\n</sem-prefetch>",
-        blocks.join("\n\n")
-    );
+
+    // Plain-English fallback: most real tasks ("fix the empty-name bug") name no
+    // entity at all, so the precise path resolves nothing and the hook used to
+    // stay silent. Instead, orient on the whole prompt — a tight, IDF-ranked
+    // briefing of the code most likely relevant — so plain-language tasks skip
+    // the search too. Gated on a substantial prompt; orient self-gates (prints
+    // nothing) when no code matches, so casual chatter injects nothing.
+    if prompt.len() >= 40 && is_code_task(prompt) {
+        if let Some(brief) = orient_fallback(&repo_root, prompt) {
+            println!(
+                "<sem-prefetch>\nsem located the code most likely relevant to this task ahead of \
+                 time (top entities, body + neighbors). Start from these instead of grepping; \
+                 verify only if something looks off.\n\n{}\n</sem-prefetch>",
+                brief
+            );
+        }
+    }
+}
+
+/// Does this prompt look like a coding or code-understanding task? Keeps the
+/// orient fallback from firing on meta/chat ("explain the philosophy", "are we
+/// faster") — which have no code signal — while still catching plain-English
+/// bug reports and navigation questions that name no entity.
+fn is_code_task(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    // Multi-word signals: substring is fine, they're specific.
+    const PHRASES: &[&str] = &[
+        "does not", "doesn't", "not work", "add a ", "add an ", "add support",
+        "should return", "should raise", "should not",
+        "where is", "how does", "which function", "the code that", "where does",
+        "the function", "the method", "the class", "responsible for",
+    ];
+    if PHRASES.iter().any(|s| p.contains(s)) {
+        return true;
+    }
+    // Single-word signals: whole-word match, so "raise" doesn't fire on
+    // "fundraise" or "fail" on "detail".
+    const WORDS: &[&str] = &[
+        "fix", "bug", "error", "errors", "fail", "fails", "crash", "exception",
+        "exceptions", "raise", "raises", "broken", "implement", "refactor",
+        "rename", "handle", "validate", "parse", "regression", "traceback",
+        "throw", "throws", "assert",
+    ];
+    p.split(|c: char| !c.is_alphanumeric())
+        .any(|w| WORDS.contains(&w))
+}
+
+/// Plain-English fallback: run `orient --pack` on the whole prompt to get a
+/// tight briefing of the most relevant code. Fast on a cached repo (tens of
+/// ms); hard-capped so a cold or huge repo can never stall a prompt.
+fn orient_fallback(repo_root: &Path, prompt: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let mut child = std::process::Command::new(exe)
+        .args(["orient", "--pack", "1500", prompt])
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let out = out.trim();
+    // "(no entities matched the task text)" or empty → nothing useful to inject.
+    if out.is_empty() || out.starts_with('(') {
+        return None;
+    }
+    Some(out.to_string())
 }
 
 /// Walk up from `start` to the repo root (the directory holding `.git`).
