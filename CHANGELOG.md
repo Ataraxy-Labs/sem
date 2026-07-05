@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Entity-addressed text search now carries each hit's call-graph neighbourhood — find and comprehend in one call.** `sem entities --text` (and the MCP `sem_entities text=`) already returned the enclosing entity for each substring match instead of a bare `file:line`. Now each hit also shows what that entity calls and who calls it, pulled from the graph (deduped, capped with a `+N` overflow so hub functions stay compact). This is the deterministic answer to "beat grep+read": grep gives you a line and leaves you to chase callers across files by hand; this gives you the location *and* the cross-file relationships in a single call. The lookup is O(1) per hit regardless of repo size, so the advantage over grep+read grows on large codebases — you narrow by relationships, not by opening dozens of files. No ranking, no fuzziness; the same exact matches, now comprehension-ready.
+
 ## [0.19.0] - 2026-07-05
 
 ### Removed

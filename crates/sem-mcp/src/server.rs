@@ -842,8 +842,8 @@ impl SemServer {
         needle: &str,
         limit: usize,
     ) -> Result<String, String> {
-        let (_, all_entities) = self.live_graph(repo_root).await;
-        Ok(Self::render_text_hits(&all_entities, needle, limit))
+        let (graph, all_entities) = self.live_graph(repo_root).await;
+        Ok(Self::render_text_hits(&graph, &all_entities, needle, limit))
     }
 
     pub async fn quick_context(
@@ -1014,10 +1014,22 @@ impl SemServer {
     /// Entity-addressed text search over in-memory entity bodies. For each
     /// matching line, the innermost (smallest-span) enclosing entity wins, so
     /// a hit inside a method reports the method, not its class.
-    pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
+    /// Entity-addressed text search that also carries each hit's graph
+    /// neighbourhood — who calls it, what it calls. This fuses *find* and
+    /// *comprehend* into one call: grep gives you `file:line`, this gives you
+    /// the enclosing entity plus the cross-file relationships that would
+    /// otherwise take a read-chain to reconstruct. The lookup is O(1) per hit
+    /// regardless of repo size, so the advantage over grep+read grows on large
+    /// codebases (narrow by relationships, not by reading dozens of files).
+    pub fn render_text_hits(
+        graph: &EntityGraph,
+        all_entities: &[SemanticEntity],
+        needle: &str,
+        limit: usize,
+    ) -> String {
         use std::collections::HashMap;
-        // (file, absolute line) -> (span, entity name, entity type, line text)
-        let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
+        // (file, absolute line) -> (span, entity, line text)
+        let mut best: HashMap<(&str, usize), (usize, &SemanticEntity, &str)> = HashMap::new();
         for e in all_entities {
             if !e.content.contains(needle) {
                 continue;
@@ -1032,7 +1044,7 @@ impl SemServer {
                 match best.get(&key) {
                     Some((s, ..)) if *s <= span => {}
                     _ => {
-                        best.insert(key, (span, e.name.as_str(), e.entity_type.as_str(), line));
+                        best.insert(key, (span, e, line));
                     }
                 }
             }
@@ -1043,7 +1055,8 @@ impl SemServer {
                  comments between entities and non-code files are not covered)"
             );
         }
-        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> = best.into_iter().collect();
+        let mut hits: Vec<((&str, usize), (usize, &SemanticEntity, &str))> =
+            best.into_iter().collect();
         hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
         let total = hits.len();
         let files: std::collections::BTreeSet<&str> = hits.iter().map(|(k, _)| k.0).collect();
@@ -1051,20 +1064,42 @@ impl SemServer {
             "⊕ text \"{needle}\" · {total} hits · {} files\n",
             files.len()
         );
-        for (i, ((file, line), (_, name, ty, text))) in hits.iter().take(limit).enumerate() {
+        // A few neighbour names, deduped and capped — the "who calls this /
+        // what does it call" grep can't answer without a read-chain.
+        let names = |v: Vec<&sem_core::parser::graph::EntityInfo>| -> String {
+            let mut ns: Vec<&str> = v.iter().map(|d| d.name.as_str()).collect();
+            ns.sort_unstable();
+            ns.dedup();
+            let extra = ns.len().saturating_sub(4);
+            let shown = ns.into_iter().take(4).collect::<Vec<_>>().join(", ");
+            if extra > 0 {
+                format!("{shown}, +{extra}")
+            } else {
+                shown
+            }
+        };
+        for (i, ((file, line), (_, e, text))) in hits.iter().take(limit).enumerate() {
             let branch = if i + 1 == total.min(limit) {
                 "╰─▶"
             } else {
                 "├─▶"
             };
-            let label = if *ty == "function" || *ty == "method" {
-                (*name).to_string()
+            let label = if e.entity_type == "function" || e.entity_type == "method" {
+                e.name.clone()
             } else {
-                format!("{name} ({ty})")
+                format!("{} ({})", e.name, e.entity_type)
             };
-            let text = text.trim();
-            let text: String = text.chars().take(90).collect();
-            out.push_str(&format!("{branch} {file}: {label} (L{line}): {text}\n"));
+            let text: String = text.trim().chars().take(90).collect();
+            let callees = graph.get_dependencies(&e.id);
+            let callers = graph.get_dependents(&e.id);
+            let mut rel = String::new();
+            if !callees.is_empty() {
+                rel.push_str(&format!(" · calls {}", names(callees)));
+            }
+            if !callers.is_empty() {
+                rel.push_str(&format!(" · called by {}", names(callers)));
+            }
+            out.push_str(&format!("{branch} {file}: {label} (L{line}): {text}{rel}\n"));
         }
         if total > limit {
             out.push_str(&format!("… {} more (raise limit)\n", total - limit));
@@ -1145,7 +1180,7 @@ impl SemServer {
     // ── Tool 1: Entities ──
 
     #[tool(
-        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `text` to search entity bodies for an exact substring instead (entity-addressed, grep-style hits ready for sem_context/sem_impact)."
+        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `text` to search entity bodies for an exact substring instead: each hit comes back as its enclosing entity WITH its call-graph neighbourhood (what it calls, who calls it) — find and comprehend in one call, so you rarely need a follow-up read. Prefer this over grep for strings in code, especially on large repos where grep returns line hits you'd otherwise have to chase across files."
     )]
     async fn sem_entities(
         &self,
@@ -1163,8 +1198,8 @@ impl SemServer {
         // chaining. This is the grep killer: same latency class, but hits are
         // entities, not line numbers in anonymous files.
         if let Some(needle) = params.text() {
-            let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
-            let text = Self::render_text_hits(&all_entities, needle, params.limit());
+            let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+            let text = Self::render_text_hits(&graph, &all_entities, needle, params.limit());
             return Ok(CallToolResult::success(vec![Content::text(text)]));
         }
 

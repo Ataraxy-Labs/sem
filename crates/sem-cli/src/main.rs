@@ -267,9 +267,10 @@ enum Commands {
         #[arg(long = "except", value_name = "KIND", conflicts_with = "only_kinds")]
         except_kinds: Vec<String>,
 
-        /// Search entity bodies for an exact substring instead of listing:
-        /// hits come back entity-addressed (file, innermost entity, line,
-        /// matched text). Use instead of grep for strings in code.
+        /// Search entity bodies for an exact substring instead of listing.
+        /// Each hit is its enclosing entity WITH its call-graph neighbourhood
+        /// (what it calls, who calls it) — find and comprehend in one call.
+        /// Use instead of grep for strings in code, especially on large repos.
         #[arg(long, value_name = "SUBSTRING")]
         text: Option<String>,
     },

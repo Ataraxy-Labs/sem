@@ -419,11 +419,16 @@ fn text_search(opts: &EntitiesOptions, needle: &str) {
         &ext_filter,
         opts.no_default_excludes,
     );
-    let (_, all_entities) =
+    let (graph, all_entities) =
         super::graph::get_or_build_graph(&root, &file_paths, &registry, false, source_scope);
     print!(
         "{}",
-        sem_mcp::server::SemServer::render_text_hits(&all_entities, needle, TEXT_SEARCH_LIMIT)
+        sem_mcp::server::SemServer::render_text_hits(
+            &graph,
+            &all_entities,
+            needle,
+            TEXT_SEARCH_LIMIT
+        )
     );
 }
 
