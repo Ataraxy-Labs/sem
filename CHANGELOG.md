@@ -4,13 +4,13 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
-### Changed
+## [0.19.0] - 2026-07-05
 
-- **`sem orient --pack` casts a wide candidate net (recall over precision).** Ranking a fuzzy issue to the single right entity is unreliable, so `--pack` no longer bets on it: it packs the top-K candidates (width scales with the token budget) instead of just the top three. If the fix location is anywhere in the net, an agent handed the briefing has it with zero navigation, even when the ranker doesn't put it first — context is cheap, a missed briefing is not. Measured across 9 SWE-bench tasks (requests + flask) on full issue text, the target file lands in the net on 9/9 (was ~4/9) and the exact target function on 5/9 (was 1/9). Larger budgets pack more candidates.
+### Removed
+
+- **Removed `sem orient` and all fuzzy/ranked retrieval.** The `orient` command and its `--pack` briefing, the sem-core ranking (lexical scoring, IDF, recall net, structural priming), the `sem_entities query=` intent-search mode, and the resident server's `orient` socket op are all gone. Ranking a natural-language task to the right entity proved unreliable — a 45-task validation showed the ranker's hit-rate (~47%) could not be lifted by heuristics without causing regressions — and it was the only non-deterministic thing in sem. sem is now purely deterministic: `context` (read an entity plus its callers/callees), `impact` (blast radius), `diff`, `entities` (list by path, or `text=` for exact-substring search), `blame`, `log`. To find code whose name you don't know, use a plain text search to get a candidate name, then hand it to `sem context` for the structure grep can't give. The prompt-submit hook keeps its deterministic exact-name prefetch and no longer shells out to the ranker.
 
 ### Fixed
-
-- **`sem orient` now understands plain-English tasks, not just code tokens.** Term extraction kept only "code-ish" tokens (underscores, dots, camelCase) and discarded every plain lowercase word, so a normal issue like "require a non-empty name for Blueprints" lost its entire signal (`name`, `empty`, `raise`, `blueprint`) and orient matched noise. It now also folds in distinctive plain words (4+ chars, non-stopword), with IDF keeping common ones like `name` tame, and matches terms against each entity's file path and name rather than its body alone (so `blueprint` identifies `blueprints.py` even when a terse constructor never repeats it). On the flask-5014 task, `orient --pack` now surfaces `Blueprint.__init__` and its name validation, where before it returned unrelated methods. Code-ish queries are unaffected.
 
 - **Dot-chain extraction is now linear, not quadratic, in file size.** `extract_dot_chains_with_positions` computed each match's line number by counting newlines from the start of the file every time, so on a large file dense with `a.b` chains the cost was O(matches times filelen). Since the regex yields matches in increasing byte order, it now tracks the line number incrementally and counts only the newlines since the previous match, which is linear overall and produces identical one-based line numbers. Verified byte-for-byte identical graph output on React (34,251 entities, 73,702 edges). No change for typical files; it removes a cliff on very large generated or minified sources.
 

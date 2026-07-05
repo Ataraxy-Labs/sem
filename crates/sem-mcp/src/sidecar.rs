@@ -174,16 +174,6 @@ async fn handle(server: &SemServer, repo_root: &Path, req: &str) -> String {
                 Err(e) => err(&e),
             }
         }
-        Some("orient") => {
-            let Some(query) = parsed.get("query").and_then(|v| v.as_str()) else {
-                return err("missing query");
-            };
-            let limit = parsed.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            match server.quick_orient(repo_root, query, limit).await {
-                Ok(text) => serde_json::json!({ "ok": true, "text": text }).to_string(),
-                Err(e) => err(&e),
-            }
-        }
         Some("text") => {
             let Some(needle) = parsed.get("needle").and_then(|v| v.as_str()) else {
                 return err("missing needle");
