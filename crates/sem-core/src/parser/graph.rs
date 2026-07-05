@@ -35,6 +35,17 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Files parsed so far in the current full build, bumped lock-free from the
+/// (possibly parallel) parse loop. A front-end reads it to render a live
+/// progress bar; nobody else pays a cost beyond one relaxed atomic add per file.
+pub static GRAPH_PARSE_DONE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Files parsed so far in the current full graph build (see [`GRAPH_PARSE_DONE`]).
+pub fn graph_parse_done() -> usize {
+    GRAPH_PARSE_DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Install a per-thread callback invoked at graph-build phase boundaries.
 pub fn set_build_phase_hook(f: Box<dyn Fn(BuildPhase)>) {
     BUILD_PHASE_HOOK.with(|h| *h.borrow_mut() = Some(f));
@@ -1175,6 +1186,7 @@ impl EntityGraph {
         file_paths: &[String],
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
+        GRAPH_PARSE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
         report_build_phase(BuildPhase::Parsing {
             files: file_paths.len(),
         });
@@ -1187,6 +1199,7 @@ impl EntityGraph {
             Option<(String, String, tree_sitter::Tree)>,
         )> = maybe_par_iter!(file_paths)
             .filter_map(|file_path| {
+                GRAPH_PARSE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 if retain_parsed_files {

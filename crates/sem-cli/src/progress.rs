@@ -4,10 +4,30 @@
 //! pipes, CI, and MCP/agent sessions. Disable explicitly with SEM_NO_PROGRESS.
 
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use sem_core::parser::graph::{clear_build_phase_hook, set_build_phase_hook, BuildPhase};
+use sem_core::parser::graph::{
+    clear_build_phase_hook, graph_parse_done, set_build_phase_hook, BuildPhase,
+};
+
+/// The cyan braille spinner used for indeterminate phases.
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        .unwrap()
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+}
+
+/// A real filling progress bar with a percentage, for a countable phase.
+fn bar_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {spinner:.cyan} {msg} {bar:24.cyan/dim} {percent:>3}%")
+        .unwrap()
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+        .progress_chars("█▉▊▋▌▍▎▏ ")
+}
 
 /// Don't print a summary for work that finished faster than this — warm-cache
 /// runs should stay silent and instant, like they do today.
@@ -52,6 +72,10 @@ fn enabled() -> bool {
 pub struct Progress {
     bar: Option<ProgressBar>,
     started: Instant,
+    /// Stop signal for the staged parse-bar poll thread.
+    stop: Arc<AtomicBool>,
+    /// Handle to the parse-bar poll thread, joined on done/clear.
+    poll: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Progress {
@@ -78,6 +102,8 @@ impl Progress {
         Self {
             bar,
             started: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            poll: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -89,17 +115,17 @@ impl Progress {
     /// a warm cache (no rebuild) nothing fires and it stays silent, exactly like
     /// the plain spinner. No-op off a TTY.
     pub fn start_staged() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let poll: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
         let bar = if enabled() {
             let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                    .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-            );
+            pb.set_style(spinner_style());
             pb.enable_steady_tick(Duration::from_millis(80));
             pb.set_message("Building entity graph…");
 
             let b = pb.clone();
+            let stop_hook = stop.clone();
+            let poll_hook = poll.clone();
             set_build_phase_hook(Box::new(move |phase| match phase {
                 BuildPhase::Parsing { files } => {
                     b.println(format!(
@@ -107,10 +133,37 @@ impl Progress {
                         "◆".green(),
                         crate::commands::graph::fmt_count(files)
                     ));
-                    b.set_message("Parsing code…");
+                    // Turn the spinner into a real filling bar for the parse pass,
+                    // fed by sem-core's lock-free per-file counter via a poll thread.
+                    b.set_length(files as u64);
+                    b.set_position(0);
+                    b.set_style(bar_style());
+                    b.set_message("Parsing code");
+                    let bar = b.clone();
+                    let stop = stop_hook.clone();
+                    let total = files as u64;
+                    let handle = std::thread::spawn(move || loop {
+                        let done = graph_parse_done() as u64;
+                        bar.set_position(done.min(total));
+                        if stop.load(Ordering::Relaxed) || done >= total {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    });
+                    *poll_hook.lock().unwrap() = Some(handle);
                 }
                 BuildPhase::Resolving => {
+                    // Parse done: stop the poll, fill the bar, persist the line.
+                    stop_hook.store(true, Ordering::Relaxed);
+                    if let Some(h) = poll_hook.lock().unwrap().take() {
+                        let _ = h.join();
+                    }
+                    if let Some(len) = b.length() {
+                        b.set_position(len);
+                    }
                     b.println(format!("  {} Parsing code — done", "◆".green()));
+                    // Resolving isn't cleanly countable here — back to a spinner.
+                    b.set_style(spinner_style());
                     b.set_message("Resolving references…");
                 }
             }));
@@ -121,6 +174,8 @@ impl Progress {
         Self {
             bar,
             started: Instant::now(),
+            stop,
+            poll,
         }
     }
 
@@ -138,6 +193,10 @@ impl Progress {
     /// "1,240 entities, 86 files".
     pub fn done(self, summary: &str) {
         clear_build_phase_hook();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.poll.lock().unwrap().take() {
+            let _ = h.join();
+        }
         let elapsed = self.started.elapsed();
         if let Some(bar) = self.bar {
             bar.finish_and_clear();
@@ -157,6 +216,10 @@ impl Progress {
     #[allow(dead_code)]
     pub fn clear(self) {
         clear_build_phase_hook();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.poll.lock().unwrap().take() {
+            let _ = h.join();
+        }
         if let Some(bar) = self.bar {
             bar.finish_and_clear();
         }
