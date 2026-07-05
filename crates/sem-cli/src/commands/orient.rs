@@ -259,7 +259,18 @@ pub fn orient_command(opts: OrientOptions) {
         // never mentions it — but an entity NAMED like a salient term, plus
         // its 1-hop neighborhood, reaches it. Name must echo a code-ish term
         // so plain-word junk hits can't claim the slot.
-        let mut top: Vec<&str> = scored.iter().take(2).map(|(_, e)| e.id.as_str()).collect();
+        // Recall over precision: ranking a fuzzy issue to the single right
+        // entity is unreliable, so cast a wide net. Pack the top candidates (not
+        // just 2) — if the fix location is anywhere in the net, the agent has it
+        // with zero search turns even when it isn't ranked first. Context is
+        // cheap; a missed injection (agent falls back to searching) is not.
+        // Width scales with the token budget: a bigger --pack casts a wider net.
+        let recall = (opts.pack / 500).clamp(3, 12);
+        let mut top: Vec<&str> = scored
+            .iter()
+            .take(recall.saturating_sub(1))
+            .map(|(_, e)| e.id.as_str())
+            .collect();
         let name_pick = hits.iter().find(|h| {
             !top.contains(&h.id.as_str())
                 && !h.file_path.contains("test")
@@ -270,7 +281,7 @@ pub fn orient_command(opts: OrientOptions) {
         });
         if let Some(h) = name_pick {
             top.push(h.id.as_str());
-        } else if let Some((_, e)) = scored.get(2) {
+        } else if let Some((_, e)) = scored.get(recall.saturating_sub(1)) {
             top.push(e.id.as_str());
         }
         if top.is_empty() {
