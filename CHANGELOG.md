@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`sem orient --pack` casts a wide candidate net (recall over precision).** Ranking a fuzzy issue to the single right entity is unreliable, so `--pack` no longer bets on it: it packs the top-K candidates (width scales with the token budget) instead of just the top three. If the fix location is anywhere in the net, an agent handed the briefing has it with zero navigation, even when the ranker doesn't put it first — context is cheap, a missed briefing is not. Measured across 9 SWE-bench tasks (requests + flask) on full issue text, the target file lands in the net on 9/9 (was ~4/9) and the exact target function on 5/9 (was 1/9). Larger budgets pack more candidates.
+
 ### Fixed
 
 - **`sem orient` now understands plain-English tasks, not just code tokens.** Term extraction kept only "code-ish" tokens (underscores, dots, camelCase) and discarded every plain lowercase word, so a normal issue like "require a non-empty name for Blueprints" lost its entire signal (`name`, `empty`, `raise`, `blueprint`) and orient matched noise. It now also folds in distinctive plain words (4+ chars, non-stopword), with IDF keeping common ones like `name` tame, and matches terms against each entity's file path and name rather than its body alone (so `blueprint` identifies `blueprints.py` even when a terse constructor never repeats it). On the flask-5014 task, `orient --pack` now surfaces `Blueprint.__init__` and its name validation, where before it returned unrelated methods. Code-ish queries are unaffected.
