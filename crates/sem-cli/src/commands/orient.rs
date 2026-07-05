@@ -294,6 +294,42 @@ pub fn orient_command(opts: OrientOptions) {
             top.len(),
             opts.pack
         );
+
+        // --- Structural priming: resolved structure before code -------------
+        // Lead with the graph, not the bodies. Each top entity carries its
+        // deterministic blast radius (dependent count) as an attention prior —
+        // where a change ripples — and intra-set call edges sketch a spine the
+        // model can reason along. Only the graph supplies this; linear text
+        // forces the model to reconstruct (and hallucinate) these edges itself.
+        {
+            let name_of = |id: &str| -> (String, String) {
+                all_entities
+                    .iter()
+                    .find(|e| e.id.as_str() == id)
+                    .map(|e| (e.name.clone(), e.file_path.clone()))
+                    .unwrap_or_else(|| (id.to_string(), String::new()))
+            };
+            println!("structural map (⚠ = high blast radius · attend here first):");
+            for id in &top {
+                let (name, file) = name_of(id);
+                let deps = graph.get_dependents(id);
+                let radius = deps.len();
+                let callers: Vec<&str> = deps
+                    .iter()
+                    .filter(|d| top.iter().any(|t| *t == d.id.as_str()))
+                    .map(|d| d.name.as_str())
+                    .collect();
+                let mark = if radius >= 10 { " ⚠" } else { "" };
+                let spine = if callers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · called by {}", callers.join(", "))
+                };
+                println!("  {name} · {file} · {radius} dependents{mark}{spine}");
+            }
+            println!();
+        }
+
         for id in &top {
             let ctx = sem_core::parser::context::build_context_result_bounded(
                 &graph,
