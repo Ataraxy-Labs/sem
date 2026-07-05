@@ -316,6 +316,23 @@ pub fn orient_command(opts: OrientOptions) {
             }
             println!();
         }
+
+        // Related-area index: the ranker's next candidates as one-liners (name ·
+        // file only, cheap). The full bodies above stay focused so the agent
+        // isn't distracted, but when they miss the exact fix location this index
+        // points at the right neighborhood — so on a miss the agent jumps there
+        // instead of grepping blind.
+        let extra: Vec<_> = scored
+            .iter()
+            .filter(|(_, e)| !top.contains(&e.id.as_str()))
+            .take(12)
+            .collect();
+        if !extra.is_empty() {
+            println!("also relevant (by rank):");
+            for (_, e) in extra {
+                println!("   {} · {} · {}", e.name, e.entity_type, e.file_path);
+            }
+        }
         return;
     }
 
