@@ -1294,6 +1294,241 @@ impl DiskCache {
         Ok(infos)
     }
 
+    /// Fetch full entities (with reconstructed source bodies) for a set of ids,
+    /// chunked to stay under SQLite's parameter limit.
+    fn entities_with_content_by_id(&self, ids: &[String]) -> Option<Vec<SemanticEntity>> {
+        let mut entities: Vec<SemanticEntity> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql).ok()?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                    let metadata_json: Option<String> = row.get(10)?;
+                    let metadata = metadata_json.and_then(|j| serde_json::from_str(&j).ok());
+                    Ok(SemanticEntity {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        file_path: row.get(3)?,
+                        start_line: row.get::<_, i64>(4)? as usize,
+                        end_line: row.get::<_, i64>(5)? as usize,
+                        start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
+                        end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
+                        content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        content_hash: row.get(7)?,
+                        structural_hash: row.get(8)?,
+                        parent_id: row.get(9)?,
+                        metadata,
+                    })
+                })
+                .ok()?;
+            for row in rows {
+                if let Ok(e) = row {
+                    entities.push(e);
+                }
+            }
+        }
+        // Reconstruct span-sliced bodies from the file-content store (same as
+        // the full loader), so the packer sees real code, not empty strings.
+        let mut recon = shared_cache::ContentReconstructor::new(&self.conn);
+        for e in entities.iter_mut() {
+            if e.content.is_empty() {
+                e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+            }
+        }
+        Some(entities)
+    }
+
+    /// Edges whose BOTH endpoints are inside the given id set — the adjacency of
+    /// an induced subgraph. Fetched by `from_entity IN (...)` (indexed) and
+    /// filtered to keep only in-set targets.
+    fn edges_among(&self, ids: &HashSet<String>) -> Option<Vec<EntityRef>> {
+        let id_vec: Vec<&String> = ids.iter().collect();
+        let mut edges = Vec::new();
+        for chunk in id_vec.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            let sql = format!(
+                "SELECT from_entity, to_entity, ref_type FROM edges WHERE from_entity IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql).ok()?;
+            let rows = stmt
+                .query_map(
+                    params_from_iter(chunk.iter().map(|s| s.as_str())),
+                    |row| {
+                        let rt: String = row.get(2)?;
+                        let ref_type = match rt.as_str() {
+                            "calls" => RefType::Calls,
+                            "imports" => RefType::Imports,
+                            _ => RefType::TypeRef,
+                        };
+                        Ok(EntityRef {
+                            from_entity: row.get(0)?,
+                            to_entity: row.get(1)?,
+                            ref_type,
+                        })
+                    },
+                )
+                .ok()?;
+            for row in rows {
+                if let Ok(e) = row {
+                    if ids.contains(&e.to_entity) {
+                        edges.push(e);
+                    }
+                }
+            }
+        }
+        Some(edges)
+    }
+
+    /// All immediate neighbours (both callers and callees) of a frontier of
+    /// entities, fetched with chunked `IN (...)` edge queries — a few queries
+    /// per hop instead of two per entity, so a hub's fan-out stays cheap.
+    fn neighbor_ids_batch(&self, ids: &[String]) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(SQL_PARAM_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = repeat_vars(chunk.len());
+            for sql in [
+                format!("SELECT to_entity FROM edges WHERE from_entity IN ({placeholders})"),
+                format!("SELECT from_entity FROM edges WHERE to_entity IN ({placeholders})"),
+            ] {
+                let mut stmt = self.conn.prepare(&sql).ok()?;
+                let rows = stmt
+                    .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .ok()?;
+                for row in rows {
+                    if let Ok(id) = row {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Point-query path for `sem context`: when the git oracle proves the cache
+    /// fresh, build just the k-hop neighbourhood around one entity (with bodies)
+    /// straight from the indexed store — instead of hydrating the whole graph.
+    /// Returns (subgraph, entities-with-bodies, resolved target id). The result
+    /// fed to `build_context_result_bounded` is identical to the full-graph path
+    /// for any bounded `max_hops`; for unbounded (`0`) it declines when the
+    /// fetched neighbourhood might not cover what a full walk would pack.
+    pub fn oracle_context_subgraph(
+        &self,
+        root: &Path,
+        source_scope: shared_cache::CacheSourceScope,
+        entity_name: Option<&str>,
+        entity_id: Option<&str>,
+        file_hint: Option<&str>,
+        budget: usize,
+        max_hops: usize,
+    ) -> Option<(EntityGraph, Vec<SemanticEntity>, String)> {
+        if !self.oracle_cache_fresh(root, source_scope) {
+            return None;
+        }
+
+        // 1. Resolve the target entity by id, or by name (+ optional file hint).
+        let target: EntityInfo = if let Some(id) = entity_id {
+            self.entity_by_id(id).ok()??
+        } else {
+            let name = entity_name?;
+            self.entity_candidates_for_query(name, file_hint)
+                .ok()?
+                .into_iter()
+                .next()?
+        };
+        let target_id = target.id.clone();
+
+        // 2. BFS the neighbourhood with BATCHED edge queries, fetching bodies per
+        //    hop and stopping once we've gathered enough content to cover the
+        //    budget. The packer fills to `budget` from the CLOSEST entities, so
+        //    as long as we hold complete hop levels totalling >= budget tokens,
+        //    the pack is identical to the full-graph path — and a hub entity with
+        //    huge fan-out doesn't explode the fetch (a small budget stops after a
+        //    hop or two regardless of how connected the target is).
+        let hop_cap = if max_hops == 0 { 8 } else { max_hops };
+        const COUNT_CAP: usize = 20_000;
+        let stop_tokens = budget.saturating_mul(2).max(256);
+        let mut visited: HashSet<String> = HashSet::default();
+        visited.insert(target_id.clone());
+        let mut entities = self.entities_with_content_by_id(&[target_id.clone()])?;
+        let mut total_tokens: usize = entities.iter().map(|e| e.content.len() / 4).sum();
+        let mut frontier: Vec<String> = vec![target_id.clone()];
+        let mut exhausted = false;
+        for _ in 0..hop_cap {
+            if total_tokens >= stop_tokens {
+                break;
+            }
+            if frontier.is_empty() {
+                exhausted = true;
+                break;
+            }
+            let neighbors = self.neighbor_ids_batch(&frontier)?;
+            let mut new_ids: Vec<String> = Vec::new();
+            for id in neighbors {
+                if visited.insert(id.clone()) {
+                    new_ids.push(id);
+                }
+            }
+            if visited.len() > COUNT_CAP {
+                return None; // pathological fan-out: let the full path handle it
+            }
+            if new_ids.is_empty() {
+                exhausted = true;
+                break;
+            }
+            let hop_entities = self.entities_with_content_by_id(&new_ids)?;
+            total_tokens += hop_entities
+                .iter()
+                .map(|e| e.content.len() / 4)
+                .sum::<usize>();
+            entities.extend(hop_entities);
+            frontier = new_ids;
+        }
+
+        // Faithfulness guard for unbounded hops: trust the subgraph only if we
+        // gathered enough content to cover the budget, or exhausted the reachable
+        // graph. Otherwise a full walk could pack entities we never fetched.
+        if max_hops == 0 && !exhausted && total_tokens < budget {
+            return None;
+        }
+
+        // 3. Induced-subgraph edges + assembly.
+        let edges = self.edges_among(&visited)?;
+        let entity_map: EntityInfoMap = entities
+            .iter()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    EntityInfo {
+                        id: e.id.clone(),
+                        name: e.name.clone(),
+                        entity_type: e.entity_type.clone(),
+                        file_path: e.file_path.clone(),
+                        start_line: e.start_line,
+                        end_line: e.end_line,
+                        parent_id: e.parent_id.clone(),
+                    },
+                )
+            })
+            .collect();
+        let graph = EntityGraph::from_parts(entity_map, edges);
+        Some((graph, entities, target_id))
+    }
+
     fn test_ids_from(&self, entity_ids: &[String]) -> Result<HashSet<String>, rusqlite::Error> {
         let mut ids = HashSet::new();
         for chunk in entity_ids.chunks(SQL_PARAM_CHUNK) {
