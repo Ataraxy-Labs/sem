@@ -4,7 +4,13 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
-## [0.20.0] - 2026-07-05
+### Fixed
+
+- **`sem diff` now collapses contiguous line chunks on unsupported files into one summary line.** When a file has no grammar, sem falls back to fixed 20-line chunks, so deleting or adding one previously printed a wall of `⊖ chunk lines 1-20 [deleted]` / `21-40` / `41-60` … lines that ate context for no information. Contiguous chunks of the same change type now consolidate to a single line, e.g. `⊖ 13 chunks  lines 1-246  [deleted]`. Verbose mode (`-v`) is unchanged, since it still prints per-chunk content. Thanks @graipher for the report (#466).
+
+### Performance
+
+- **`sem context` now answers from an indexed point query instead of loading the whole graph, so it scales to millions of entities.** It previously hydrated every entity (plus decompressed bodies) just to answer about one, so on a 2.3M-entity repo each call took ~15s. The SQLite cache is already normalized and indexed, so when the git oracle proves the cache fresh (no filesystem walk) `sem context` now builds only the k-hop neighbourhood around the target straight from the store: batched `IN (...)` edge queries, bodies fetched per hop, stopping once there is enough content to cover the token budget so a hub entity's fan-out does not explode the fetch. It reuses the existing packer on that subgraph, so output is byte-for-byte identical to the full-graph path, and falls back to the full load whenever the oracle declines. On the Linux kernel (2.31M entities) `sem context` drops from ~15s to 0.44s per call; on Kubernetes (520k) from ~5s to ~1.2s.
 
 ### Changed
 
