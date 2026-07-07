@@ -1768,6 +1768,9 @@ fn maybe_upload_cloud_diff_snapshot(
     };
 
     let head_sha = git.get_head_sha().ok();
+    // Best-effort: enrich the snapshot with caller/callee relations for changed
+    // entities. Only built here, when an upload is actually happening.
+    let relations = build_changed_entity_relations(opts, result);
     match client.upload_diff_snapshot(
         &remote,
         head_sha.as_deref(),
@@ -1775,6 +1778,7 @@ fn maybe_upload_cloud_diff_snapshot(
         file_changes,
         result,
         binary_changes,
+        &relations,
     ) {
         Ok(id) => {
             let url = client.diff_snapshot_url(&id);
@@ -1786,6 +1790,90 @@ fn maybe_upload_cloud_diff_snapshot(
         }
         Err(_) => {}
     }
+}
+
+/// Build a `{ "<file>::<name>": { callers, callees } }` map of real graph
+/// relations for each changed entity, for the cloud diff snapshot payload.
+///
+/// Best-effort: reuses the cached `get_or_build_graph` path (never forces a full
+/// rebuild when a cache exists) and swallows every failure — including panics —
+/// so it can neither break nor visibly slow `sem diff`. On any failure it
+/// returns an empty object and relations are simply omitted.
+fn build_changed_entity_relations(opts: &DiffOptions, result: &DiffResult) -> serde_json::Value {
+    let build = || -> Option<serde_json::Value> {
+        let git = GitBridge::open(Path::new(&opts.cwd)).ok()?;
+        let root = git.repo_root().to_path_buf();
+        let root = root.as_path();
+        let registry = super::create_registry(&root.to_string_lossy());
+        let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+        let source_scope = super::graph::cache_source_scope(root, &ext_filter, false);
+        let file_paths =
+            super::graph::find_supported_files_with_options(root, &registry, &ext_filter, false);
+        // no_cache = false: reuse the disk cache; do not force a full rebuild.
+        let (graph, _entities) =
+            super::graph::get_or_build_graph(root, &file_paths, &registry, false, source_scope);
+
+        // Set of (file_path, name) for every changed entity — used to flag
+        // whether a related entity is itself in the diff.
+        let changed: HashSet<(&str, &str)> = result
+            .changes
+            .iter()
+            .map(|c| (c.file_path.as_str(), c.entity_name.as_str()))
+            .collect();
+
+        let related_json = |e: &sem_core::parser::graph::EntityInfo| {
+            serde_json::json!({
+                "name": e.name,
+                "file": e.file_path,
+                "entityType": e.entity_type,
+                "inDiff": changed.contains(&(e.file_path.as_str(), e.name.as_str())),
+            })
+        };
+
+        let mut relations = serde_json::Map::new();
+        for change in &result.changes {
+            // Match graph entities by file_path + name; skip when ambiguous.
+            let mut matches = graph
+                .entities
+                .values()
+                .filter(|e| e.file_path == change.file_path && e.name == change.entity_name);
+            let Some(entity) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_some() {
+                continue; // ambiguous — cannot reliably attribute relations
+            }
+
+            let callers: Vec<serde_json::Value> = graph
+                .get_dependents(&entity.id)
+                .into_iter()
+                .take(6)
+                .map(related_json)
+                .collect();
+            let callees: Vec<serde_json::Value> = graph
+                .get_dependencies(&entity.id)
+                .into_iter()
+                .take(6)
+                .map(related_json)
+                .collect();
+
+            if callers.is_empty() && callees.is_empty() {
+                continue;
+            }
+
+            relations.insert(
+                format!("{}::{}", change.file_path, change.entity_name),
+                serde_json::json!({ "callers": callers, "callees": callees }),
+            );
+        }
+
+        Some(serde_json::Value::Object(relations))
+    };
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
 }
 
 fn retain_non_cosmetic_changes(result: &mut DiffResult) {

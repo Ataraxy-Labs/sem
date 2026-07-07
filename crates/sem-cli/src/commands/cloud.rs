@@ -941,6 +941,7 @@ impl CloudClient {
         Ok(resp)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_diff_snapshot(
         &self,
         remote_url: &str,
@@ -949,6 +950,7 @@ impl CloudClient {
         file_changes: &[FileChange],
         diff_result: &DiffResult,
         binary_changes: &[BinaryFileChange],
+        relations: &serde_json::Value,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let resp: CloudDiffSnapshotResponse = self
             .agent
@@ -961,6 +963,7 @@ impl CloudClient {
                 "fileChanges": file_changes,
                 "diffResult": diff_result,
                 "binaryChanges": binary_changes,
+                "relations": relations,
             }))?
             .into_json()?;
         Ok(resp.id)
