@@ -444,7 +444,14 @@ fn get_or_build_graph_with_cache_policy(
         match save_policy {
             CacheMissSavePolicy::Full => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save(root, file_paths, &graph, &entities, source_scope);
+                    let _ = disk.save_with_test_dirs(
+                        root,
+                        file_paths,
+                        &graph,
+                        &entities,
+                        &registry.custom_test_dirs,
+                        source_scope,
+                    );
                     timings.mark("cache_full_save");
                 }
             }

@@ -20,6 +20,9 @@ const SQL_PARAM_CHUNK: usize = 500;
 const META_GIT_HEAD_OID: &str = "git_head_oid";
 const META_GIT_BUILT_CLEAN: &str = "git_built_clean";
 const META_ORACLE_ELIGIBLE: &str = "oracle_eligible";
+/// Set once a cache has computed test flags, so All/Tests-mode impact can trust
+/// the cached `entity_flags` (an empty set then means "no tests", not "unknown").
+const META_TEST_FLAGS: &str = "test_flags_computed";
 
 /// Below this many indexed files, skip the git oracle: the scan is already
 /// cheap and the git call would only add overhead.
@@ -143,6 +146,32 @@ fn store_freshness_epoch(tx: &rusqlite::Transaction<'_>, root: &Path, files: &[S
     put(META_ORACLE_ELIGIBLE, if eligible { "1" } else { "0" });
 }
 
+/// Compute and persist which entities are tests, plus a marker so a later
+/// point query can trust an EMPTY result as "no tests" rather than "not
+/// computed". Shared by the full and topology saves — this is what lets
+/// All/Tests-mode `sem impact` answer from the indexed cache (the "covered by
+/// N tests" field) instead of hydrating the whole graph.
+fn write_test_flags(
+    tx: &rusqlite::Transaction<'_>,
+    graph: &EntityGraph,
+    entities: &[SemanticEntity],
+    custom_test_dirs: &[String],
+) -> Result<(), rusqlite::Error> {
+    let test_entity_ids = graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")?;
+        for entity_id in &test_entity_ids {
+            stmt.execute(params![entity_id])?;
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES (?1, '1')",
+        params![META_TEST_FLAGS],
+    )?;
+    Ok(())
+}
+
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
 pub struct PartialCache {
     pub stale_files: Vec<String>,
@@ -236,6 +265,22 @@ impl DiskCache {
         entities: &[SemanticEntity],
         source_scope: shared_cache::CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
+        self.save_with_test_dirs(root, files, graph, entities, &[], source_scope)
+    }
+
+    /// Full save that also records test flags, so `sem impact` in the default
+    /// (All) mode can be answered from the indexed point-query instead of
+    /// hydrating the whole graph. Previously only `save_topology` wrote test
+    /// flags, so a full cache forced All/Tests-mode impact down the slow path.
+    pub fn save_with_test_dirs(
+        &self,
+        root: &Path,
+        files: &[String],
+        graph: &EntityGraph,
+        entities: &[SemanticEntity],
+        custom_test_dirs: &[String],
+        source_scope: shared_cache::CacheSourceScope,
+    ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute_batch(
@@ -281,6 +326,8 @@ impl DiskCache {
                 stmt.execute(params![edge.from_entity, edge.to_entity, rt])?;
             }
         }
+
+        write_test_flags(&tx, graph, entities, custom_test_dirs)?;
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_FULL)?;
         shared_cache::set_cache_source_scope(&tx, source_scope)?;
@@ -353,15 +400,7 @@ impl DiskCache {
             }
         }
 
-        let test_entity_ids =
-            graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
-        {
-            let mut stmt =
-                tx.prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")?;
-            for entity_id in &test_entity_ids {
-                stmt.execute(params![entity_id])?;
-            }
-        }
+        write_test_flags(&tx, graph, entities, custom_test_dirs)?;
 
         shared_cache::set_cache_kind(&tx, shared_cache::CACHE_KIND_TOPOLOGY)?;
         shared_cache::set_cache_source_scope(&tx, source_scope)?;
@@ -550,8 +589,13 @@ impl DiskCache {
             return Ok(None);
         }
 
+        // All/Tests mode needs test flags for the "covered by N tests" answer.
+        // A topology cache always has them; a full cache has them only if it was
+        // built after test-flag persistence landed (marked in metadata). Older
+        // full caches lack them, so decline and let the full path recompute.
         if matches!(mode, CachedImpactMode::All | CachedImpactMode::Tests)
             && !shared_cache::cache_has_kind(&self.conn, &[shared_cache::CACHE_KIND_TOPOLOGY])
+            && self.meta_value(META_TEST_FLAGS).as_deref() != Some("1")
         {
             return Ok(None);
         }
