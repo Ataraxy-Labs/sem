@@ -1072,11 +1072,17 @@ impl SemServer {
         out
     }
 
-    /// Kick a background graph build for the repo discovered from env/CWD, so
-    /// the first real query hits a warm in-memory graph. Fire-and-forget: any
-    /// failure (not a repo, empty dir) is silently ignored and the first query
-    /// simply builds as before.
+    /// Optionally kick a background graph build so the first whole-graph query
+    /// hits a warm in-memory graph. Opt-in (SEM_PREWARM): proactively holding the
+    /// entire deserialized graph costs GBs on large repos (~5GB on the Linux
+    /// kernel) and is now mostly wasted, since `context` and `impact` answer from
+    /// the indexed cache directly and the CLI's fast paths bypass the resident
+    /// entirely. By default the resident stays light and builds the full graph
+    /// lazily, only when a query that genuinely needs it (graph/diff/text) runs.
     pub fn spawn_prewarm(&self) {
+        if std::env::var_os("SEM_PREWARM").is_none() {
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             let Ok(repo_root) = Self::discover_repo_root(None) else {
