@@ -155,6 +155,20 @@ pub fn login(
         Some(k) => k,
         None => {
             if let Some(creds) = load_credentials() {
+                if creds.api_key.starts_with("gho_") || creds.api_key.starts_with("ghu_") {
+                    let cli_token = exchange_github_token_for_cli(&creds.endpoint, &creds.api_key)?;
+                    let upgraded = CloudCredentials {
+                        api_key: cli_token,
+                        endpoint: creds.endpoint.clone(),
+                    };
+                    let path = save_credentials(&upgraded)?;
+                    println!(
+                        "{} Upgraded the legacy GitHub credential to a revocable CLI session",
+                        "ok".green().bold()
+                    );
+                    println!("  Credentials saved to {}", path.display());
+                    return Ok(());
+                }
                 println!(
                     "{} Already logged in to {}",
                     "ok".green().bold(),
@@ -213,16 +227,40 @@ struct TokenResponse {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CliExchangeResponse {
+    token: String,
+}
+
+fn exchange_github_token_for_cli(
+    endpoint: &str,
+    github_token: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/auth/cli/exchange", endpoint.trim_end_matches('/'));
+    let response: CliExchangeResponse = ureq::post(&url)
+        .set("Accept", "application/json")
+        .send_json(serde_json::json!({ "githubToken": github_token }))?
+        .into_json()?;
+    if !response.token.starts_with("sc_cli_") {
+        return Err("Cloud returned an invalid CLI credential".into());
+    }
+    Ok(response.token)
+}
+
 pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let ep = endpoint.unwrap_or_else(default_endpoint);
     let client_id =
         std::env::var("SEM_GITHUB_CLIENT_ID").unwrap_or_else(|_| GITHUB_CLIENT_ID.into());
 
-    let device_resp: DeviceCodeResponse = ureq::post("https://github.com/login/device/code")
+    let device_code_url = std::env::var("SEM_GITHUB_DEVICE_CODE_URL")
+        .unwrap_or_else(|_| "https://github.com/login/device/code".into());
+    let device_token_url = std::env::var("SEM_GITHUB_DEVICE_TOKEN_URL")
+        .unwrap_or_else(|_| "https://github.com/login/oauth/access_token".into());
+    let device_resp: DeviceCodeResponse = ureq::post(&device_code_url)
         .set("Accept", "application/json")
         .send_form(&[
             ("client_id", &client_id),
-            ("scope", &"user:email".to_string()),
+            ("scope", &"read:user".to_string()),
         ])?
         .into_json()?;
 
@@ -244,7 +282,7 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
     let access_token = loop {
         thread::sleep(interval);
 
-        let resp: TokenResponse = ureq::post("https://github.com/login/oauth/access_token")
+        let resp: TokenResponse = ureq::post(&device_token_url)
             .set("Accept", "application/json")
             .send_form(&[
                 ("client_id", client_id.as_str()),
@@ -281,8 +319,13 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
     };
     eprintln!(" {}", "authorized".green());
 
+    // The GitHub provider token is a one-use identity assertion here. Never
+    // save it and never use it as a general sem-cloud bearer credential.
+    let cli_token = exchange_github_token_for_cli(&ep, &access_token)?;
+    drop(access_token);
+
     let creds = CloudCredentials {
-        api_key: access_token,
+        api_key: cli_token,
         endpoint: ep.clone(),
     };
 
@@ -299,6 +342,9 @@ pub fn login_github(endpoint: Option<String>) -> Result<(), Box<dyn std::error::
 }
 
 fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("SEM_NO_BROWSER").is_ok_and(|value| value == "1") {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).spawn()?;
@@ -318,12 +364,42 @@ fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 // ─── sem logout ──────────────────────────────────────────────────────────
 
+fn revoke_cli_credential(creds: &CloudCredentials) -> Result<(), Box<dyn std::error::Error>> {
+    if !creds.api_key.starts_with("sc_cli_") {
+        return Ok(());
+    }
+    let url = format!("{}/v1/auth/session", creds.endpoint.trim_end_matches('/'));
+    ureq::delete(&url)
+        .set("Authorization", &format!("Bearer {}", creds.api_key))
+        .call()?;
+    Ok(())
+}
+
 pub fn logout() -> Result<(), Box<dyn std::error::Error>> {
     let path = credentials_path().ok_or("Could not determine home directory")?;
 
     if path.exists() {
+        let mut revoked = false;
+        if let Some(creds) = load_credentials() {
+            if creds.api_key.starts_with("sc_cli_") {
+                match revoke_cli_credential(&creds) {
+                    Ok(()) => revoked = true,
+                    Err(error) => eprintln!(
+                        "{} Cloud revocation could not be confirmed ({error}); removing the local credential anyway.",
+                        "warning:".yellow().bold()
+                    ),
+                }
+            }
+        }
         fs::remove_file(&path)?;
-        println!("{} Logged out — credentials removed", "ok".green().bold());
+        if revoked {
+            println!(
+                "{} Logged out — cloud credential revoked and local credentials removed",
+                "ok".green().bold()
+            );
+        } else {
+            println!("{} Logged out — credentials removed", "ok".green().bold());
+        }
     } else {
         println!(
             "{} No credentials found — already logged out",
@@ -1576,6 +1652,63 @@ fn entity_brief_json(e: &CloudEntityBrief) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_provider_token_is_exchanged_for_an_opaque_cli_credential() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /v1/auth/cli/exchange HTTP/1.1"));
+            assert!(request.contains(r#""githubToken":"github-provider-secret""#));
+            assert!(!request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer"));
+
+            let body = r#"{"token":"sc_cli_opaque","expiresAt":"2099-01-01 00:00:00"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let exchanged =
+            exchange_github_token_for_cli(&format!("http://{address}"), "github-provider-secret")
+                .unwrap();
+        assert_eq!(exchanged, "sc_cli_opaque");
+        server.join().unwrap();
+    }
 
     #[test]
     fn github_owner_repo_parses_remote_forms() {
