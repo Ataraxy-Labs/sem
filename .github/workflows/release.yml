@@ -243,7 +243,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish sem-core
-        run: cargo publish -p sem-core || echo "sem-core already published, skipping"
+        run: |
+          VERSION=$(grep '^version' sem-core/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cargo publish -p sem-core || cargo info "sem-core@$VERSION" >/dev/null
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish sem-cloud-client
+        run: |
+          VERSION=$(grep '^version' sem-cloud-client/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cargo publish -p sem-cloud-client || cargo info "sem-cloud-client@$VERSION" >/dev/null
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -251,7 +263,9 @@ jobs:
         run: sleep 30
 
       - name: Publish sem-mcp
-        run: cargo publish -p sem-mcp || echo "sem-mcp already published, skipping"
+        run: |
+          VERSION=$(grep '^version' sem-mcp/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cargo publish -p sem-mcp || cargo info "sem-mcp@$VERSION" >/dev/null
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -259,6 +273,8 @@ jobs:
         run: sleep 30
 
       - name: Publish sem-cli
-        run: cargo publish -p sem-cli || echo "sem-cli already published, skipping"
+        run: |
+          VERSION=$(grep '^version' sem-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cargo publish -p sem-cli || cargo info "sem-cli@$VERSION" >/dev/null
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
