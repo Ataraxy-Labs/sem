@@ -1614,7 +1614,7 @@ fn run_diff_pipeline(
     file_changes: Vec<FileChange>,
     from_stdin: bool,
     opts: &DiffOptions,
-    _parsed: &ParsedArgs,
+    parsed: &ParsedArgs,
     total_start: Instant,
     t0: Instant,
 ) {
@@ -1704,7 +1704,14 @@ fn run_diff_pipeline(
 
     println!("{output}");
 
-    maybe_upload_cloud_diff_snapshot(opts, from_stdin, &file_changes, &result, &binary_changes);
+    maybe_upload_cloud_diff_snapshot(
+        opts,
+        parsed,
+        from_stdin,
+        &file_changes,
+        &result,
+        &binary_changes,
+    );
 
     if opts.profile {
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -1745,6 +1752,7 @@ fn run_diff_pipeline(
 
 fn maybe_upload_cloud_diff_snapshot(
     opts: &DiffOptions,
+    parsed: &ParsedArgs,
     from_stdin: bool,
     file_changes: &[FileChange],
     result: &DiffResult,
@@ -1768,6 +1776,7 @@ fn maybe_upload_cloud_diff_snapshot(
     };
 
     let head_sha = git.get_head_sha().ok();
+    let git_context = build_git_context(&git, opts, parsed);
     // Best-effort: enrich the snapshot with caller/callee relations for changed
     // entities. Only built here, when an upload is actually happening.
     let relations = build_changed_entity_relations(opts, result);
@@ -1775,6 +1784,7 @@ fn maybe_upload_cloud_diff_snapshot(
         &remote,
         head_sha.as_deref(),
         opts.label.as_deref(),
+        &git_context,
         file_changes,
         result,
         binary_changes,
@@ -1785,11 +1795,82 @@ fn maybe_upload_cloud_diff_snapshot(
             super::consent::record_outbound(&remote, "diff", &id);
             eprintln!("sem cloud diff: {url}");
         }
-        Err(e) if opts.profile => {
-            eprintln!("\x1b[2m  cloud diff upload skipped: {e}\x1b[0m");
-        }
-        Err(_) => {}
+        Err(e) => eprintln!(
+            "warning: local diff succeeded, but the private review could not be uploaded: {e}"
+        ),
     }
+}
+
+/// Capture truthful provenance for the exact comparison that produced a
+/// snapshot. Working-tree reviews deliberately say `HEAD → WORKTREE`: their
+/// uploaded changes do not exist at a GitHub commit yet.
+fn build_git_context(
+    git: &GitBridge,
+    opts: &DiffOptions,
+    parsed: &ParsedArgs,
+) -> serde_json::Value {
+    let branch = git.get_current_branch();
+    let head_commit = git.get_head_sha().ok();
+
+    let (scope, base_ref, head_ref, base_sha, comparison_head_sha) =
+        if let Some(commit) = &opts.commit {
+            (
+                "commit",
+                Some(format!("{commit}^")),
+                Some(commit.clone()),
+                git.resolve_ref_sha(&format!("{commit}^")),
+                git.resolve_ref_sha(commit),
+            )
+        } else if let (Some(from), Some(to)) = (&opts.from, &opts.to) {
+            (
+                "range",
+                Some(from.clone()),
+                Some(to.clone()),
+                git.resolve_ref_sha(from),
+                git.resolve_ref_sha(to),
+            )
+        } else {
+            match parsed.scope.as_ref() {
+                Some(ParsedScope::RefToWorking(base)) => (
+                    if opts.staged { "staged" } else { "working" },
+                    Some(base.clone()),
+                    Some(if opts.staged { "INDEX" } else { "WORKTREE" }.into()),
+                    git.resolve_ref_sha(base),
+                    None,
+                ),
+                Some(ParsedScope::Range(from, to)) => (
+                    "range",
+                    Some(from.clone()),
+                    Some(to.clone()),
+                    git.resolve_ref_sha(from),
+                    git.resolve_ref_sha(to),
+                ),
+                Some(ParsedScope::MergeBaseRange(from, to)) => (
+                    "merge-base",
+                    Some(from.clone()),
+                    Some(to.clone()),
+                    git.resolve_merge_base(from, to).ok(),
+                    git.resolve_ref_sha(to),
+                ),
+                Some(ParsedScope::FileCompare { .. }) => ("files", None, None, None, None),
+                None => (
+                    if opts.staged { "staged" } else { "working" },
+                    Some("HEAD".into()),
+                    Some(if opts.staged { "INDEX" } else { "WORKTREE" }.into()),
+                    head_commit.clone(),
+                    None,
+                ),
+            }
+        };
+
+    serde_json::json!({
+        "branch": branch,
+        "scope": scope,
+        "baseRef": base_ref,
+        "headRef": head_ref,
+        "baseSha": base_sha,
+        "headSha": comparison_head_sha,
+    })
 }
 
 /// Build a `{ "<file>::<name>": { callers, callees } }` map of real graph

@@ -147,6 +147,30 @@ impl GitBridge {
             .and_then(|r| r.url().map(String::from))
     }
 
+    /// Return the checked-out local branch name, or `None` for detached HEAD.
+    /// Uses git itself when libgit2 cannot read reftable-backed refs.
+    pub fn get_current_branch(&self) -> Option<String> {
+        if self.cli_refs {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return (!branch.is_empty()).then_some(branch);
+        }
+
+        self.repo
+            .head()
+            .ok()
+            .filter(|head| head.is_branch())
+            .and_then(|head| head.shorthand().map(String::from))
+    }
+
     /// Resolve a refspec to its full commit SHA, if valid.
     pub fn resolve_ref_sha(&self, refspec: &str) -> Option<String> {
         self.resolve_object(refspec)
@@ -1591,6 +1615,24 @@ mod tests {
         assert!(bridge.cli_refs);
     }
 
+    #[test]
+    fn current_branch_reports_the_checked_out_branch() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let oid = commit_file(&repo, "file.rs", "fn main() {}\n", "initial");
+        let commit = repo.find_commit(oid).unwrap();
+        repo.branch("feat/review-context", &commit, true).unwrap();
+        repo.set_head("refs/heads/feat/review-context").unwrap();
+        drop(commit);
+        drop(repo);
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        assert_eq!(
+            bridge.get_current_branch().as_deref(),
+            Some("feat/review-context")
+        );
+    }
+
     /// End-to-end on a REAL reftable repo. Skips (with a note) when the
     /// installed git predates `git init --ref-format=reftable` (2.45).
     #[test]
@@ -1627,7 +1669,10 @@ mod tests {
             .to_string();
         assert_eq!(bridge.get_head_sha().unwrap(), cli_head);
         assert!(bridge.is_valid_rev("HEAD"));
-        assert_eq!(bridge.resolve_ref_sha("HEAD").as_deref(), Some(cli_head.as_str()));
+        assert_eq!(
+            bridge.resolve_ref_sha("HEAD").as_deref(),
+            Some(cli_head.as_str())
+        );
 
         // Working-tree diff sees the modification with correct before/after.
         let (_, files) = bridge.detect_and_get_files(&[]).unwrap();
