@@ -433,6 +433,19 @@ pub fn whoami() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(remote) = git.get_remote_url() {
             let normalized = normalize_remote_url(&remote);
             println!("{} {}", "Remote:  ".bold(), normalized);
+
+            // Registration initially caches `pending`, but indexing may finish
+            // seconds later. Never let a transitional state linger for the
+            // normal 24-hour ready-entry TTL: refresh it before displaying.
+            let needs_refresh = load_repo_cache()
+                .and_then(|cache| cache.get(&normalized).cloned())
+                .is_some_and(|entry| repo_cache_entry_needs_refresh(&entry));
+            if needs_refresh {
+                if let Some(client) = CloudClient::from_credentials() {
+                    let _ = client.resolve_repo(&remote);
+                }
+            }
+
             if let Some(cached) = load_repo_cache().and_then(|c| c.get(&normalized).cloned()) {
                 println!(
                     "{} {} ({})",
@@ -649,6 +662,10 @@ fn cache_entry_expired(entry: &RepoCacheEntry) -> bool {
     now - checked > REPO_CACHE_TTL_SECS
 }
 
+fn repo_cache_entry_needs_refresh(entry: &RepoCacheEntry) -> bool {
+    entry.status != "ready" || cache_entry_expired(entry)
+}
+
 // ─── URL Normalization ───────────────────────────────────────────────────
 
 /// Normalize a git remote URL for matching against cloud repos.
@@ -793,7 +810,7 @@ impl CloudClient {
         // converge once the server finishes.
         if let Some(cache) = load_repo_cache() {
             if let Some(entry) = cache.get(&normalized) {
-                if entry.status == "ready" && !cache_entry_expired(entry) {
+                if !repo_cache_entry_needs_refresh(entry) {
                     return Ok(entry.repo_id.clone());
                 }
             }
@@ -1727,5 +1744,30 @@ mod tests {
         // Non-GitHub or unparseable remotes are not auto-synced.
         assert_eq!(github_owner_repo("https://gitlab.com/a/b"), None);
         assert_eq!(github_owner_repo("not a url"), None);
+    }
+
+    #[test]
+    fn transitional_repo_cache_entries_are_never_treated_as_fresh() {
+        let current = current_timestamp();
+        for status in ["pending", "cloning", "indexing", "error"] {
+            let entry = RepoCacheEntry {
+                repo_id: "repo-1".into(),
+                status: status.into(),
+                checked_at: current.clone(),
+                entity_count: None,
+            };
+            assert!(
+                repo_cache_entry_needs_refresh(&entry),
+                "{status} must be refreshed even when it was just cached"
+            );
+        }
+
+        let ready = RepoCacheEntry {
+            repo_id: "repo-1".into(),
+            status: "ready".into(),
+            checked_at: current,
+            entity_count: Some(10),
+        };
+        assert!(!repo_cache_entry_needs_refresh(&ready));
     }
 }
