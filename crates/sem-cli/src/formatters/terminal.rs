@@ -1,6 +1,6 @@
 use super::{estimated_output_capacity, orphan_summary_parts, push_line};
 use colored::Colorize;
-use sem_core::model::change::ChangeType;
+use sem_core::model::change::{ChangeType, SemanticChange};
 use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
@@ -47,6 +47,44 @@ fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
     }
 
     (del, ins)
+}
+
+/// The colored marker glyph and status tag for a change, e.g. `⊖` / `[deleted]`.
+/// Shared by the per-entity renderer and the consolidated-chunk summary so both
+/// stay in sync.
+fn change_symbol_and_tag(change: &SemanticChange) -> (String, String) {
+    let content_suffix = if change.has_content_change() {
+        if change.structural_change == Some(false) {
+            "+cosmetic"
+        } else {
+            "+modified"
+        }
+    } else {
+        ""
+    };
+    match change.change_type {
+        ChangeType::Added => ("⊕".green().to_string(), "[added]".green().to_string()),
+        ChangeType::Modified => {
+            if change.structural_change == Some(false) {
+                ("~".dimmed().to_string(), "[cosmetic]".dimmed().to_string())
+            } else {
+                ("∆".yellow().to_string(), "[modified]".yellow().to_string())
+            }
+        }
+        ChangeType::Deleted => ("⊖".red().to_string(), "[deleted]".red().to_string()),
+        ChangeType::Moved => (
+            "→".blue().to_string(),
+            format!("[moved{content_suffix}]").blue().to_string(),
+        ),
+        ChangeType::Renamed => (
+            "↻".cyan().to_string(),
+            format!("[renamed{content_suffix}]").cyan().to_string(),
+        ),
+        ChangeType::Reordered => (
+            "↕".magenta().to_string(),
+            format!("[reordered{content_suffix}]").magenta().to_string(),
+        ),
+    }
 }
 
 /// Default inner width of the per-file box (number of `─` after the corner).
@@ -132,47 +170,64 @@ pub fn format_terminal(
             );
         }
 
-        for &idx in indices {
+        let mut cursor = 0usize;
+        while cursor < indices.len() {
+            let idx = indices[cursor];
             let change = &result.changes[idx];
 
             // Orphan changes (module-level) only shown in verbose mode
             if change.entity_type == "orphan" && !verbose {
+                cursor += 1;
                 continue;
             }
 
-            let content_suffix = if change.has_content_change() {
-                if change.structural_change == Some(false) {
-                    "+cosmetic"
-                } else {
-                    "+modified"
-                }
-            } else {
-                ""
-            };
-            let (symbol, tag) = match change.change_type {
-                ChangeType::Added => ("⊕".green().to_string(), "[added]".green().to_string()),
-                ChangeType::Modified => {
-                    let is_cosmetic = change.structural_change == Some(false);
-                    if is_cosmetic {
-                        ("~".dimmed().to_string(), "[cosmetic]".dimmed().to_string())
+            // Collapse a run of contiguous, same-type line chunks (how
+            // unsupported/binary-ish files are split when no grammar applies)
+            // into one summary line, e.g. `⊖ 13 chunks  lines 1-246  [deleted]`.
+            // Only in non-verbose mode, where per-chunk content isn't printed
+            // anyway, so nothing is hidden.
+            if !verbose && change.entity_type == "chunk" {
+                let mut run_end = cursor + 1;
+                while run_end < indices.len() {
+                    let next = &result.changes[indices[run_end]];
+                    let prev = &result.changes[indices[run_end - 1]];
+                    let contiguous = next.start_line <= prev.end_line.saturating_add(1);
+                    if next.entity_type == "chunk"
+                        && next.change_type == change.change_type
+                        && contiguous
+                    {
+                        run_end += 1;
                     } else {
-                        ("∆".yellow().to_string(), "[modified]".yellow().to_string())
+                        break;
                     }
                 }
-                ChangeType::Deleted => ("⊖".red().to_string(), "[deleted]".red().to_string()),
-                ChangeType::Moved => (
-                    "→".blue().to_string(),
-                    format!("[moved{content_suffix}]").blue().to_string(),
-                ),
-                ChangeType::Renamed => (
-                    "↻".cyan().to_string(),
-                    format!("[renamed{content_suffix}]").cyan().to_string(),
-                ),
-                ChangeType::Reordered => (
-                    "↕".magenta().to_string(),
-                    format!("[reordered{content_suffix}]").magenta().to_string(),
-                ),
-            };
+                if run_end - cursor > 1 {
+                    let count = run_end - cursor;
+                    let first = &result.changes[indices[cursor]];
+                    let last = &result.changes[indices[run_end - 1]];
+                    let (symbol, tag) = change_symbol_and_tag(change);
+                    let type_label = format!("{:<10}", format!("{count} chunks"));
+                    let name_label = format!(
+                        "{:<25}",
+                        format!("lines {}-{}", first.start_line, last.end_line)
+                    );
+                    push_line(
+                        &mut output,
+                        format!(
+                            "{}  {} {} {} {}",
+                            "│".dimmed(),
+                            symbol,
+                            type_label.dimmed(),
+                            name_label.bold(),
+                            tag,
+                        ),
+                    );
+                    cursor = run_end;
+                    continue;
+                }
+            }
+
+            let (symbol, tag) = change_symbol_and_tag(change);
 
             let type_label = format!("{:<10}", sanitize_terminal_text(&change.entity_type));
             let base_name = if let Some(ref old_name) = change.old_entity_name {
@@ -363,6 +418,8 @@ pub fn format_terminal(
                     );
                 }
             }
+
+            cursor += 1;
         }
 
         push_line(&mut output, "│".dimmed().to_string());
@@ -560,5 +617,75 @@ mod tests {
             output.contains("used line-based chunking (unsupported file extension)"),
             "{output}"
         );
+    }
+
+    fn deleted_chunk(start: usize, end: usize) -> SemanticChange {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("change::conf.txt::chunk::{start}"),
+            "entityId": format!("conf.txt::chunk::{start}"),
+            "changeType": "deleted",
+            "entityType": "chunk",
+            "entityName": format!("lines {start}-{end}"),
+            "entityLine": start,
+            "startLine": start,
+            "endLine": end,
+            "filePath": "conf.txt"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn contiguous_chunks_consolidate_into_one_summary_line() {
+        colored::control::set_override(false);
+        // Three contiguous deleted chunks (how an unsupported file is split).
+        let result = DiffResult {
+            changes: vec![
+                deleted_chunk(1, 20),
+                deleted_chunk(21, 40),
+                deleted_chunk(41, 60),
+            ],
+            file_count: 1,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 3,
+            moved_count: 0,
+            renamed_count: 0,
+            reordered_count: 0,
+            orphan_count: 0,
+            total_entities_before: 3,
+            total_entities_after: 0,
+        };
+
+        let output = format_terminal(&result, &[], false);
+
+        // Collapsed to a single "3 chunks / lines 1-60" line, not three lines.
+        assert!(output.contains("3 chunks"), "{output}");
+        assert!(output.contains("lines 1-60"), "{output}");
+        assert!(!output.contains("lines 1-20"), "{output}");
+        assert_eq!(output.matches("[deleted]").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn single_chunk_is_not_relabeled_as_a_run() {
+        colored::control::set_override(false);
+        let result = DiffResult {
+            changes: vec![deleted_chunk(1, 12)],
+            file_count: 1,
+            added_count: 0,
+            modified_count: 0,
+            deleted_count: 1,
+            moved_count: 0,
+            renamed_count: 0,
+            reordered_count: 0,
+            orphan_count: 0,
+            total_entities_before: 1,
+            total_entities_after: 0,
+        };
+
+        let output = format_terminal(&result, &[], false);
+
+        // A lone chunk keeps its own range and is not pluralized.
+        assert!(output.contains("lines 1-12"), "{output}");
+        assert!(!output.contains("chunks"), "{output}");
     }
 }

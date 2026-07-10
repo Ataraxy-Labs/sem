@@ -4,7 +4,6 @@ pub mod graph;
 #[cfg(feature = "git")]
 pub mod hotspot;
 mod import_resolution;
-pub mod orient;
 pub mod plugin;
 pub mod plugins;
 pub mod registry;

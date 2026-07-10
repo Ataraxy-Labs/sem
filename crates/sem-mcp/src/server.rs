@@ -31,7 +31,7 @@ const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
     Prefer these over grep/find for structural questions:\n\
     - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
     - \"read / understand the function or class X\" -> sem_context (returns X's full source PLUS its callers and callees, addressed by name, not by line range; use this instead of opening the file to read code)\n\
-    - \"where is X / find the code that does Y\" (you don't know the name) -> sem_entities with a `query` (ranked structural search), not grep\n\
+    - \"find where a string/symbol appears\" -> sem_entities with `text` (exact-substring search over entity bodies; hits are entities, not line numbers)\n\
     - \"list the entities in this file/dir\" -> sem_entities with a `path`\n\
     - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
     Use grep/find only for text/string search, error messages, config keys, \
@@ -835,36 +835,6 @@ impl SemServer {
         }
     }
 
-    /// Compact lines, not JSON: same information at a fraction of the tokens
-    /// the consuming model has to read. Shared by the MCP query mode and the
-    /// sidecar's `orient` op.
-    fn orient_hits_text(hits: &[sem_core::parser::orient::OrientHit], query: &str) -> String {
-        let mut out = format!("⊕ {} hits · \"{}\"\n", hits.len(), query);
-        for h in hits {
-            let mut sig = h.signature.trim().to_string();
-            if sig.chars().count() > 100 {
-                sig = format!("{}…", sig.chars().take(100).collect::<String>());
-            }
-            out.push_str(&format!(
-                "{} · {} · {}:{} · {} dependents, {} deps\n  {}\n",
-                h.name, h.entity_type, h.file_path, h.start_line, h.dependents, h.dependencies, sig
-            ));
-        }
-        out
-    }
-
-    /// Sidecar fast path: ranked intent search from the warm graph.
-    pub async fn quick_orient(
-        &self,
-        repo_root: &Path,
-        query: &str,
-        limit: usize,
-    ) -> Result<String, String> {
-        let (graph, all_entities) = self.live_graph(repo_root).await;
-        let hits = sem_core::parser::orient::orient(&all_entities, &graph, query, limit);
-        Ok(Self::orient_hits_text(&hits, query))
-    }
-
     /// Sidecar fast path: entity-addressed text search from the warm graph.
     pub async fn quick_text(
         &self,
@@ -1102,11 +1072,17 @@ impl SemServer {
         out
     }
 
-    /// Kick a background graph build for the repo discovered from env/CWD, so
-    /// the first real query hits a warm in-memory graph. Fire-and-forget: any
-    /// failure (not a repo, empty dir) is silently ignored and the first query
-    /// simply builds as before.
+    /// Optionally kick a background graph build so the first whole-graph query
+    /// hits a warm in-memory graph. Opt-in (SEM_PREWARM): proactively holding the
+    /// entire deserialized graph costs GBs on large repos (~5GB on the Linux
+    /// kernel) and is now mostly wasted, since `context` and `impact` answer from
+    /// the indexed cache directly and the CLI's fast paths bypass the resident
+    /// entirely. By default the resident stays light and builds the full graph
+    /// lazily, only when a query that genuinely needs it (graph/diff/text) runs.
     pub fn spawn_prewarm(&self) {
+        if std::env::var_os("SEM_PREWARM").is_none() {
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             let Ok(repo_root) = Self::discover_repo_root(None) else {
@@ -1175,7 +1151,7 @@ impl SemServer {
     // ── Tool 1: Entities ──
 
     #[tool(
-        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `query` to instead search the whole repo by intent and find the most relevant entities when you don't know the name (prefer this over grep for \"where is X\")."
+        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `text` to search entity bodies for an exact substring instead (entity-addressed, grep-style hits ready for sem_context/sem_impact)."
     )]
     async fn sem_entities(
         &self,
@@ -1196,17 +1172,6 @@ impl SemServer {
             let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
             let text = Self::render_text_hits(&all_entities, needle, params.limit());
             return Ok(CallToolResult::success(vec![Content::text(text)]));
-        }
-
-        // Query mode: rank the whole-repo entity graph by relevance to the
-        // query (structural search), instead of listing a path.
-        if let Some(query) = params.query() {
-            let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
-            let hits =
-                sem_core::parser::orient::orient(&all_entities, &graph, query, params.limit());
-            return Ok(CallToolResult::success(vec![Content::text(
-                Self::orient_hits_text(&hits, query),
-            )]));
         }
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);

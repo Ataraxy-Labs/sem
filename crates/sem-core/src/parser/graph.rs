@@ -19,6 +19,62 @@ use regex::Regex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 
+/// A phase boundary during a full graph build, reported to an optional per-thread
+/// hook so a CLI can render a staged progress display (scan → parse → resolve).
+/// Only the CLI installs a hook; for every other caller these calls are no-ops.
+#[derive(Clone, Copy, Debug)]
+pub enum BuildPhase {
+    /// About to parse this many files.
+    Parsing { files: usize },
+    /// Done parsing; about to resolve cross-file references into edges.
+    Resolving,
+}
+
+thread_local! {
+    static BUILD_PHASE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(BuildPhase)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Files parsed so far in the current full build, bumped lock-free from the
+/// (possibly parallel) parse loop. A front-end reads it to render a live
+/// progress bar; nobody else pays a cost beyond one relaxed atomic add per file.
+pub static GRAPH_PARSE_DONE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Files whose references have been resolved so far in the current full build.
+/// Together with [`GRAPH_PARSE_DONE`] this lets a front-end show one bar over
+/// the whole build (parse pass + resolve pass), so 100% means genuinely done.
+pub static GRAPH_RESOLVE_DONE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Files parsed so far in the current full graph build (see [`GRAPH_PARSE_DONE`]).
+pub fn graph_parse_done() -> usize {
+    GRAPH_PARSE_DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Files resolved so far in the current full graph build (see [`GRAPH_RESOLVE_DONE`]).
+pub fn graph_resolve_done() -> usize {
+    GRAPH_RESOLVE_DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Install a per-thread callback invoked at graph-build phase boundaries.
+pub fn set_build_phase_hook(f: Box<dyn Fn(BuildPhase)>) {
+    BUILD_PHASE_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+/// Remove the phase callback installed by [`set_build_phase_hook`].
+pub fn clear_build_phase_hook() {
+    BUILD_PHASE_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+fn report_build_phase(phase: BuildPhase) {
+    BUILD_PHASE_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(phase);
+        }
+    });
+}
+
 /// Helper macro to select parallel or sequential iteration based on feature flag.
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
@@ -783,6 +839,7 @@ fn resolve_references_with_file_indexes<'a>(
 
     maybe_par_iter!(sorted_file_paths)
         .filter_map(|file_path| {
+            GRAPH_RESOLVE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let entities = entities_by_file.get(file_path.as_str())?;
             let needs_index = entities.iter().any(|entity| {
                 !entity_requires_content_span_filter(entity, context.child_ranges_by_parent)
@@ -1141,6 +1198,10 @@ impl EntityGraph {
         file_paths: &[String],
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
+        GRAPH_PARSE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+        report_build_phase(BuildPhase::Parsing {
+            files: file_paths.len(),
+        });
         let retain_parsed_files = file_paths.len() <= PARSED_FILE_REUSE_LIMIT;
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Small and medium repos reuse parse trees in scope resolution; large repos
@@ -1150,6 +1211,7 @@ impl EntityGraph {
             Option<(String, String, tree_sitter::Tree)>,
         )> = maybe_par_iter!(file_paths)
             .filter_map(|file_path| {
+                GRAPH_PARSE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 if retain_parsed_files {
@@ -1340,6 +1402,8 @@ impl EntityGraph {
             go_pkg_index: owned_go_pkg_index,
         };
 
+        GRAPH_RESOLVE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+        report_build_phase(BuildPhase::Resolving);
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
             let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
@@ -4216,9 +4280,20 @@ fn extract_dot_chains_with_positions<'a>(
 
     let mut chains = Vec::new();
     let mut seen: HashSet<(&str, &str, usize, usize)> = HashSet::default();
+    // Track the line number incrementally. `captures_iter` yields matches in
+    // strictly increasing byte order, so instead of re-counting newlines from
+    // the start of the file for every match (O(matches * filelen), quadratic on
+    // large files dense with `a.b` chains), we count only the newlines in the
+    // gap since the previous match. Same one-based line numbers, linear total.
+    let mut line = 1usize;
+    let mut scanned = 0usize;
     for cap in DOT_CHAIN_RE.captures_iter(content) {
         let matched = cap.get(0).unwrap();
-        let line = line_for_byte(content, matched.start());
+        line += content[scanned..matched.start()]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        scanned = matched.start();
         let receiver = cap.get(1).unwrap().as_str();
         let member = cap.get(2).unwrap().as_str();
         if seen.insert((receiver, member, line, matched.start())) {

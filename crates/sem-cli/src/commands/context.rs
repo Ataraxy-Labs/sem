@@ -38,30 +38,60 @@ pub fn context_command(opts: ContextOptions) {
     let source_scope =
         super::graph::cache_source_scope(root, &ext_filter, opts.no_default_excludes);
 
-    let file_paths = super::graph::find_supported_files_with_options(
-        root,
-        &registry,
-        &ext_filter,
-        opts.no_default_excludes,
-    );
-    let prog = crate::progress::Progress::start("Building entity graph");
-    let (graph, all_entities) = super::graph::get_or_build_graph(
-        root,
-        &file_paths,
-        &registry,
-        opts.no_cache,
-        source_scope,
-    );
-    prog.done(&format!(
-        "{} entities, {} files",
-        super::graph::fmt_count(graph.entities.len()),
-        super::graph::fmt_count(file_paths.len())
-    ));
-
     let file_path = opts
         .file_path
         .as_deref()
         .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
+
+    // Fast path: on a git-clean repo the oracle proves the cache fresh, so build
+    // only the k-hop neighbourhood around the target from the indexed store —
+    // skipping both the filesystem walk and full-graph hydration. This is what
+    // makes `sem context` fast on huge repos (millions of entities) instead of
+    // deserializing the entire graph for a point query.
+    let subgraph = if opts.no_cache {
+        None
+    } else {
+        crate::cache::DiskCache::open_existing_readonly(root)
+            .ok()
+            .and_then(|disk| {
+                disk.oracle_context_subgraph(
+                    root,
+                    source_scope,
+                    opts.entity_name.as_deref(),
+                    opts.entity_id.as_deref(),
+                    file_path.as_deref(),
+                    opts.budget,
+                    opts.hops,
+                )
+            })
+    };
+
+    let (graph, all_entities) = match subgraph {
+        Some((graph, all_entities, _target_id)) => (graph, all_entities),
+        None => {
+            let file_paths = super::graph::find_supported_files_with_options(
+                root,
+                &registry,
+                &ext_filter,
+                opts.no_default_excludes,
+            );
+            let prog = crate::progress::Progress::start_staged();
+            let (graph, all_entities) = super::graph::get_or_build_graph(
+                root,
+                &file_paths,
+                &registry,
+                opts.no_cache,
+                source_scope,
+            );
+            prog.done(&format!(
+                "{} entities, {} files",
+                super::graph::fmt_count(graph.entities.len()),
+                super::graph::fmt_count(file_paths.len())
+            ));
+            (graph, all_entities)
+        }
+    };
+
     let entity = find_entity(
         &graph,
         opts.entity_name.as_deref(),

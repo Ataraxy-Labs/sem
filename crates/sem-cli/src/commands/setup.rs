@@ -1,9 +1,45 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
+
+/// The result of one setup step, rendered into the loader's tree.
+enum Outcome {
+    /// The step did something. Rendered as a green ◆.
+    Done(String),
+    /// Nothing to do / not applicable here. Rendered as a dim ·.
+    Skipped(String),
+    /// Left something untouched on purpose. Rendered as a yellow ⚠.
+    Warn(String),
+}
+
+/// A live braille spinner for a setup step, indented into the tree.
+fn step_spinner(label: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("  {spinner:.yellow} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(label.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
+}
+
+/// Resolve a step's spinner into its final aligned tree line.
+fn finish_step(pb: ProgressBar, label: &str, outcome: &Outcome) {
+    pb.finish_and_clear();
+    let (marker, note) = match outcome {
+        Outcome::Done(n) => ("◆".green().bold(), n.as_str().dimmed()),
+        Outcome::Skipped(n) => ("·".dimmed(), n.as_str().dimmed()),
+        Outcome::Warn(n) => ("⚠".yellow().bold(), n.as_str().yellow()),
+    };
+    println!("  {marker} {label:<20} {note}");
+}
 
 #[cfg(unix)]
 fn wrapper_path() -> PathBuf {
@@ -112,25 +148,17 @@ fn git_path(path: &str) -> Option<PathBuf> {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n  {}\n", "⊕ setting up sem".bold());
+
+    // Step 1 — the git diff wrapper + global alias.
+    let pb = step_spinner("git diff → sem diff");
     let path = wrapper_path();
     let dir = path.parent().unwrap();
-
-    // Create wrapper directory if needed
     if !dir.exists() {
         fs::create_dir_all(dir)?;
-        println!("{} Created {}", "✓".green().bold(), dir.display());
     }
-
-    // Write wrapper script
     fs::write(&path, wrapper_script())?;
     set_executable(&path)?;
-    println!(
-        "{} Created wrapper script at {}",
-        "✓".green().bold(),
-        path.display()
-    );
-
-    // Set diff.external globally
     let status = Command::new("git")
         .arg("config")
         .arg("--global")
@@ -138,30 +166,38 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .arg(&path)
         .status()?;
     if !status.success() {
+        pb.finish_and_clear();
         return Err("Failed to set diff.external in git config".into());
     }
+    finish_step(
+        pb,
+        "git diff → sem diff",
+        &Outcome::Done("aliased globally".into()),
+    );
+
+    // Step 2 — the Claude Code session hooks: a warm resident graph and
+    // prompt-time context injection, so structural queries are instant and the
+    // code an agent would forage for arrives at turn zero.
+    let pb = step_spinner("Claude Code hooks");
+    let hooks = install_session_hooks();
+    finish_step(pb, "Claude Code hooks", &hooks);
+
+    // Step 3 — the pre-commit hook (entity-level blast radius of staged changes).
+    let pb = step_spinner("pre-commit hook");
+    let precommit = install_pre_commit_hook();
+    finish_step(pb, "pre-commit hook", &precommit);
+
+    println!();
     println!(
-        "{} Set git config --global diff.external = {}",
+        "  {} sem is wired in — {} to load it",
         "✓".green().bold(),
-        path.display(),
+        "restart your Claude Code session".bold()
     );
-
-    // Install pre-commit hook if we're in a git repo
-    install_pre_commit_hook();
-
-    // Install the session-default hooks for Claude Code: a warm resident graph
-    // and prompt-time context injection, so structural queries are instant and
-    // the code an agent would forage for arrives at turn zero.
-    install_session_hooks();
-
     println!(
-        "\n{} Running `git diff` in any repo will now use sem.",
-        "Done!".green().bold()
+        "     {} warm graph + prompt-time context · entity-level git diff · blast-radius pre-commit",
+        "·".dimmed()
     );
-    println!("  Pre-commit hook shows entity-level blast radius of staged changes.");
-    println!("  Claude Code sessions get a warm graph + prompt-time context (free, local).");
-    println!("  sem-mcp server available for agent integration.");
-    println!("  To revert, run: sem unsetup");
+    println!("     revert anytime:  {}\n", "sem unsetup".cyan());
 
     Ok(())
 }
@@ -272,7 +308,7 @@ fn remove_session_hooks(root: &mut Value) -> bool {
 }
 
 #[cfg(unix)]
-fn install_session_hooks() {
+fn install_session_hooks() -> Outcome {
     let sem = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
@@ -291,27 +327,17 @@ fn install_session_hooks() {
             Ok(s) => match serde_json::from_str(&s) {
                 Ok(v) => v,
                 Err(_) => {
-                    println!(
-                        "{} {} is not valid JSON; leaving it untouched (session hooks skipped)",
-                        "note:".yellow().bold(),
-                        path.display()
-                    );
-                    return;
+                    return Outcome::Warn("settings.json isn't valid JSON — left untouched".into());
                 }
             },
-            Err(_) => return,
+            Err(_) => return Outcome::Warn("couldn't read settings.json — skipped".into()),
         }
     } else {
         json!({})
     };
 
     if !root.is_object() {
-        println!(
-            "{} {} is not a JSON object; leaving it untouched (session hooks skipped)",
-            "note:".yellow().bold(),
-            path.display()
-        );
-        return;
+        return Outcome::Warn("settings.json isn't a JSON object — left untouched".into());
     }
 
     // Back up before the first modification.
@@ -324,11 +350,7 @@ fn install_session_hooks() {
 
     let added = add_session_hooks(&mut root, &resident, &prompt);
     if added == 0 {
-        println!(
-            "{} Claude Code session hooks already installed",
-            "✓".green().bold()
-        );
-        return;
+        return Outcome::Done("already installed".into());
     }
 
     if let Some(dir) = path.parent() {
@@ -336,23 +358,17 @@ fn install_session_hooks() {
             let _ = fs::create_dir_all(dir);
         }
     }
-    if let Ok(s) = serde_json::to_string_pretty(&root) {
-        if fs::write(&path, format!("{s}\n")).is_ok() {
-            println!(
-                "{} Installed Claude Code session hooks (warm graph + prompt-time context) in {}",
-                "✓".green().bold(),
-                path.display()
-            );
+    match serde_json::to_string_pretty(&root) {
+        Ok(s) if fs::write(&path, format!("{s}\n")).is_ok() => {
+            Outcome::Done("resident warm graph + prompt-time prefetch".into())
         }
+        _ => Outcome::Warn("couldn't write settings.json — skipped".into()),
     }
 }
 
 #[cfg(windows)]
-fn install_session_hooks() {
-    println!(
-        "{} Claude Code session hooks (warm graph + prompt-time context) are not installed on Windows yet; git diff integration is active.",
-        "note:".yellow().bold()
-    );
+fn install_session_hooks() -> Outcome {
+    Outcome::Skipped("not on Windows yet (git diff still active)".into())
 }
 
 #[cfg(unix)]
@@ -466,14 +482,14 @@ fn resolve_pre_commit_hook_path() -> Option<PathBuf> {
     git_path("hooks/pre-commit")
 }
 
-fn install_pre_commit_hook() {
+fn install_pre_commit_hook() -> Outcome {
     let hook_path = match resolve_pre_commit_hook_path() {
         Some(p) => p,
-        None => return, // Not in a git repo, skip
+        None => return Outcome::Skipped("not in a git repo — skipped".into()),
     };
     let hooks_dir = match hook_path.parent() {
         Some(d) => d,
-        None => return,
+        None => return Outcome::Skipped("no hooks dir — skipped".into()),
     };
 
     if !hooks_dir.exists() {
@@ -484,41 +500,28 @@ fn install_pre_commit_hook() {
         // Append sem section if not already present
         let existing = fs::read_to_string(&hook_path).unwrap_or_default();
         if existing.contains(SEM_HOOK_START) {
-            println!(
-                "{} Pre-commit hook already has sem section",
-                "✓".green().bold()
-            );
-            return;
+            return Outcome::Done("already installed".into());
         }
-        // Back up the existing hook
+        // Back up the existing hook before touching it.
         let backup = hooks_dir.join("pre-commit.sem-backup");
         if !backup.exists() {
-            if fs::copy(&hook_path, &backup).is_ok() {
-                println!(
-                    "{} Backed up existing hook to {}",
-                    "✓".green().bold(),
-                    backup.display()
-                );
-            }
+            let _ = fs::copy(&hook_path, &backup);
         }
         let updated = format!("{}\n{}", existing.trim_end(), pre_commit_hook_section());
         if fs::write(&hook_path, updated).is_ok() {
             let _ = set_executable(&hook_path);
-            println!(
-                "{} Appended sem section to existing pre-commit hook",
-                "✓".green().bold()
-            );
+            Outcome::Done("appended to your existing hook".into())
+        } else {
+            Outcome::Warn("couldn't write pre-commit hook — skipped".into())
         }
     } else {
         // Create new hook (exit 0 inside markers so unsetup cleans up fully)
         let content = format!("#!/bin/sh\n{}", pre_commit_hook_section());
         if fs::write(&hook_path, content).is_ok() {
             let _ = set_executable(&hook_path);
-            println!(
-                "{} Created pre-commit hook at {}",
-                "✓".green().bold(),
-                hook_path.display()
-            );
+            Outcome::Done("blast radius on staged changes".into())
+        } else {
+            Outcome::Warn("couldn't write pre-commit hook — skipped".into())
         }
     }
 }

@@ -83,7 +83,7 @@ pub fn graph_command(opts: GraphOptions) {
         }
     }
 
-    let prog = crate::progress::Progress::start("Building entity graph");
+    let prog = crate::progress::Progress::start_staged();
     let graph = get_or_build_graph_topology_with_timings(
         root,
         &file_paths,
@@ -444,7 +444,14 @@ fn get_or_build_graph_with_cache_policy(
         match save_policy {
             CacheMissSavePolicy::Full => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save(root, file_paths, &graph, &entities, source_scope);
+                    let _ = disk.save_with_test_dirs(
+                        root,
+                        file_paths,
+                        &graph,
+                        &entities,
+                        &registry.custom_test_dirs,
+                        source_scope,
+                    );
                     timings.mark("cache_full_save");
                 }
             }

@@ -39,7 +39,7 @@ fn build_with_spinner<T>(
     build: impl FnOnce() -> T,
     count: impl FnOnce(&T) -> usize,
 ) -> T {
-    let prog = crate::progress::Progress::start("Building entity graph");
+    let prog = crate::progress::Progress::start_staged();
     let result = build();
     prog.done(&format!(
         "{} entities, {} files",
