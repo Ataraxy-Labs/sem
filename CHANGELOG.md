@@ -4,8 +4,17 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-10
+
+### Added
+
+- **Cloud-enabled `sem diff` now creates an immutable, owner-private hosted review URL.** Snapshot uploads include changed-entity caller/callee relations and truthful Git provenance: branch, scope, base/head refs, and available SHAs. Working-tree reviews explicitly report `HEAD → WORKTREE` rather than implying that uncommitted changes exist on GitHub.
+- **GitHub login can now be exchanged for a revocable CLI session.** Raw GitHub credentials are not persisted as sem credentials, and the CLI session resolves to the same stable principal used by web reviews.
+
 ### Fixed
 
+- **Hosted-review upload failures are visible without breaking the local diff.** `sem diff` still exits successfully with its complete local result, while stderr explains that the private review could not be uploaded.
+- **Transitional cloud repository states refresh immediately.** `sem whoami` no longer leaves a repository stuck at a cached `pending` state after cloud indexing has completed.
 - **`sem diff` now collapses contiguous line chunks on unsupported files into one summary line.** When a file has no grammar, sem falls back to fixed 20-line chunks, so deleting or adding one previously printed a wall of `⊖ chunk lines 1-20 [deleted]` / `21-40` / `41-60` … lines that ate context for no information. Contiguous chunks of the same change type now consolidate to a single line, e.g. `⊖ 13 chunks  lines 1-246  [deleted]`. Verbose mode (`-v`) is unchanged, since it still prints per-chunk content. Thanks @graipher for the report (#466).
 
 ### Performance
