@@ -7,6 +7,12 @@ on:
     paths:
       - "crates/sem-core/Cargo.toml"
   workflow_dispatch:
+    inputs:
+      publish_crates_only:
+        description: "Retry crates.io publishing without rebuilding an existing release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -230,8 +236,8 @@ jobs:
         run: ./mcp-publisher publish || (sleep 60 && ./mcp-publisher publish)
 
   publish-crates:
-    needs: [check-version, create-tag]
-    if: needs.check-version.outputs.should_release == 'true'
+    needs: [check-version]
+    if: needs.check-version.outputs.should_release == 'true' || inputs.publish_crates_only == true
     runs-on: ubuntu-latest
     defaults:
       run:
