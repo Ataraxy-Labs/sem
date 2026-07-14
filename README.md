@@ -508,7 +508,7 @@ Want to add a new language? See [CONTRIBUTING.md](CONTRIBUTING.md) for a step-by
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Ataraxy-Labs/sem&type=Date)](https://star-history.com/#Ataraxy-Labs/sem&Date)
+[![Star History Chart](assets/star-history.png)](https://star-history.com/#Ataraxy-Labs/sem&Date)
 
 ## License
 
