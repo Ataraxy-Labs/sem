@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Building a graph over Svelte components no longer crashes (SIGSEGV) on Linux/glibc.** `sem graph`/`context`/`orient` over `.svelte` files deterministically exited 139 from an invalid free in the `tree-sitter-htmlx-svelte` 0.1.8 grammar's scanner, hit during parallel graph construction (macOS's allocator tolerated the bad free, so it only showed on Linux). Bumped the grammar to 0.1.16, which carries the scanner fixes; the existing version constraint already permitted it, so this is a lock-only dependency update. Added a parallel-Svelte-graph regression test. Thanks @XF-FW for the exhaustive isolation and the verified fix (#471).
+
 ## [0.21.0] - 2026-07-10
 
 ### Added

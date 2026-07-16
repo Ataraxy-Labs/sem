@@ -2262,9 +2262,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-htmlx-svelte"
-version = "0.1.8"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3259693b6c5f6a7044de1a8142507aa1950406a4b124ffaab28c9050e30973dd"
+checksum = "f3278db98d220cb32e1d82510036740786c817afc1224b3360658f499224e63c"
 dependencies = [
  "cc",
  "tree-sitter",

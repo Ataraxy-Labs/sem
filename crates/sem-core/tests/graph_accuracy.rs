@@ -201,3 +201,73 @@ fn graph_accuracy_rust() {
     );
     assert!(tp > 0, "Should find at least some expected edges");
 }
+
+/// Regression for issue #471: building a graph over multiple Svelte components
+/// in parallel triggered a SIGSEGV (invalid free) in the
+/// tree-sitter-htmlx-svelte 0.1.8 grammar's scanner on Linux/glibc. Fixed by
+/// bumping the grammar to 0.1.16. On macOS the bad free was tolerated by the
+/// allocator, so this only fails on Linux/glibc CI; everywhere it at least
+/// exercises the parallel Svelte parse path that used to crash.
+#[test]
+fn graph_svelte_parallel_no_crash_issue_471() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "test@test.com"],
+        vec!["config", "user.name", "Test"],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+
+    // Enough components that the parallel (rayon) graph build parses several
+    // .svelte files concurrently, which is where the grammar crashed.
+    let component = r#"<script lang="ts">
+  let count = 0;
+  function handleLogoClick() {
+    count += 1;
+    console.log("clicked", count);
+  }
+</script>
+
+<button on:click={handleLogoClick}>
+  clicked {count} times
+</button>
+
+<style>
+  button { color: blue; }
+</style>
+"#;
+    let mut files = Vec::new();
+    for i in 0..12 {
+        let name = format!("Component{i}.svelte");
+        std::fs::write(root.join(&name), component).unwrap();
+        files.push(name);
+    }
+
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    let registry = create_default_registry();
+    // Reaching past this call at all means no SIGSEGV during parallel parsing.
+    let (graph, _) = EntityGraph::build(root, &files, &registry);
+
+    // Sanity: the components were actually parsed, not silently skipped.
+    assert!(
+        graph.entities.values().any(|e| e.name == "handleLogoClick"),
+        "expected handleLogoClick entity from parsed .svelte components"
+    );
+}
