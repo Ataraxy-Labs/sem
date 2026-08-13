@@ -44,6 +44,17 @@ impl ParserRegistry {
         self.plugins.push(plugin);
     }
 
+    /// Every file extension currently mapped to a parser plugin, reflecting the
+    /// language grammars compiled into this build (feature-gated) plus any
+    /// custom mappings loaded from `.semrc`/`.gitattributes`. Order is
+    /// unspecified. This is the authoritative, drift-proof set of extensions the
+    /// engine will attempt to parse — downstream code (e.g. `weave setup`'s
+    /// `merge=weave` attribute list) should derive from it rather than hand-
+    /// maintaining a parallel copy that silently rots as grammars are added.
+    pub fn registered_extensions(&self) -> Vec<&str> {
+        self.extension_map.keys().map(String::as_str).collect()
+    }
+
     pub fn get_plugin(&self, file_path: &str) -> Option<&dyn SemanticParserPlugin> {
         for ext in get_extensions(file_path) {
             if let Some(&idx) = self.extension_map.get(&ext) {
