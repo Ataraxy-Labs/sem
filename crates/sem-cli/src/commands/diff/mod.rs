@@ -10,9 +10,7 @@ use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::{
-    collect_binary_file_changes, compute_semantic_diff, BinaryFileChange, DiffResult,
-};
+use sem_core::parser::differ::{collect_binary_file_changes, compute_semantic_diff, DiffResult};
 use sem_core::parser::plugins::code::languages::get_language_config;
 use sem_core::parser::registry::{detect_ext_from_content, ParserRegistry};
 
@@ -20,26 +18,41 @@ use crate::formatters::{
     json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal,
 };
 use crate::stats::SemLifetimeStats;
+use crate::timings::Timings;
 
-pub struct DiffOptions {
-    pub cwd: String,
-    pub format: OutputFormat,
-    pub staged: bool,
-    pub commit: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub stdin: bool,
-    pub patch: bool,
-    pub verbose: bool,
-    pub profile: bool,
-    pub file_exts: Vec<String>,
-    pub no_cosmetics: bool,
-    pub label: Option<String>,
-    pub args: Vec<String>,
+mod cloud_upload;
+// pub(crate), not private: commands/cloud.rs's CloudClient (used broadly,
+// outside diff/) needs FactKey/FactsQueryResponse/PutFactsResponse to type
+// its facts-service methods -- same cross-module reach `super::context::
+// ContextOptions`/`super::impact::ImpactOptions` already have from
+// commands/cloud.rs, just in the other direction.
+pub(crate) mod facts_remote;
+mod relations;
+
+// sem-cli is a `[[bin]]`-only crate (no lib target, and no other workspace
+// member depends on it — `grep -rl sem-cli */Cargo.toml` outside sem-cli/
+// itself is empty), so nothing external can ever reference these items;
+// `pub(crate)` is the real boundary main.rs's cross-module construction
+// needs, not `pub`.
+pub(crate) struct DiffOptions {
+    pub(crate) cwd: String,
+    pub(crate) format: OutputFormat,
+    pub(crate) staged: bool,
+    pub(crate) commit: Option<String>,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) stdin: bool,
+    pub(crate) patch: bool,
+    pub(crate) verbose: bool,
+    pub(crate) profile: bool,
+    pub(crate) file_exts: Vec<String>,
+    pub(crate) no_cosmetics: bool,
+    pub(crate) label: Option<String>,
+    pub(crate) args: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum OutputFormat {
+pub(crate) enum OutputFormat {
     Terminal,
     Plain,
     Json,
@@ -1327,8 +1340,13 @@ fn file_compare_changes(
     )
 }
 
-pub fn diff_command(mut opts: DiffOptions) {
+pub(crate) fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
+    // SEM_TIMINGS-style phase marks (semx-cc3): same convention `sem graph`/
+    // `sem impact`/`sem entities` already use (see `crate::timings`). Additive
+    // to the pre-existing `--profile` flag below, not a replacement for it —
+    // both read from the same Instant checkpoints, neither perturbs the other.
+    let timings = Timings::from_env("diff");
 
     let t0 = Instant::now();
     normalize_trailing_output_format(&mut opts);
@@ -1422,7 +1440,15 @@ pub fn diff_command(mut opts: DiffOptions) {
                 };
                 match git.get_changed_files(&scope, &parsed.pathspecs) {
                     Ok(files) => {
-                        return run_diff_pipeline(files, false, &opts, &parsed, total_start, t0)
+                        return run_diff_pipeline(
+                            files,
+                            false,
+                            &opts,
+                            &parsed,
+                            total_start,
+                            t0,
+                            timings,
+                        )
                     }
                     Err(e) => {
                         eprintln!("\x1b[31mError: {e}\x1b[0m");
@@ -1607,9 +1633,18 @@ pub fn diff_command(mut opts: DiffOptions) {
         (file_changes, false)
     };
 
-    run_diff_pipeline(file_changes, from_stdin, &opts, &parsed, total_start, t0);
+    run_diff_pipeline(
+        file_changes,
+        from_stdin,
+        &opts,
+        &parsed,
+        total_start,
+        t0,
+        timings,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_diff_pipeline(
     file_changes: Vec<FileChange>,
     from_stdin: bool,
@@ -1617,8 +1652,10 @@ fn run_diff_pipeline(
     parsed: &ParsedArgs,
     total_start: Instant,
     t0: Instant,
+    mut timings: Timings,
 ) {
     let git_diff_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    timings.record("staging (git/scope resolve)", git_diff_ms);
 
     // Filter by file extensions if specified
     let file_changes = if opts.file_exts.is_empty() {
@@ -1665,6 +1702,7 @@ fn run_diff_pipeline(
                 println!("\x1b[2mNo semantic changes detected.\x1b[0m");
             }
         }
+        timings.finish();
         return;
     }
 
@@ -1675,11 +1713,31 @@ fn run_diff_pipeline(
     let t2 = Instant::now();
     let registry = super::create_registry(&opts.cwd);
     let registry_ms = t2.elapsed().as_secs_f64() * 1000.0;
+    timings.record("registry init (.semrc/.gitattributes)", registry_ms);
 
     let t3 = Instant::now();
     let binary_changes = collect_binary_file_changes(&file_changes);
     let mut result = compute_semantic_diff(&file_changes, &registry, None, None);
     let parse_diff_ms = t3.elapsed().as_secs_f64() * 1000.0;
+    // compute_semantic_diff fans work out over a rayon par_iter internally,
+    // so there's no single call stack to time per phase — see
+    // sem_core::parser::differ::diff_phase_timings' module doc. The wall
+    // mark below is this whole call (extract + match/rename + orphan,
+    // parallel); the three `record`s under it are CPU-time summed across
+    // every file/thread, so on a multi-core run their sum can legitimately
+    // exceed the wall mark above them — that gap is how much parallelism
+    // absorbed.
+    timings.record("extract+match+orphan (wall)", parse_diff_ms);
+    if timings.is_enabled() {
+        let phases = sem_core::parser::differ::diff_phase_timings();
+        timings.record("  extraction (cpu-sum, both sides)", phases.extraction_ms);
+        timings.record("  matching+move/rename (cpu-sum)", phases.matching_ms);
+        timings.record("  orphan detection (cpu-sum)", phases.orphan_ms);
+    }
+    timings.counter("files_changed", file_changes.len() as u64);
+    timings.counter("entities_before", result.total_entities_before as u64);
+    timings.counter("entities_after", result.total_entities_after as u64);
+    timings.counter("changes", result.changes.len() as u64);
 
     prog.clear();
 
@@ -1701,10 +1759,22 @@ fn run_diff_pipeline(
         OutputFormat::Terminal => format_terminal(&result, &binary_changes, opts.verbose),
     };
     let format_ms = t4.elapsed().as_secs_f64() * 1000.0;
+    timings.record("render", format_ms);
 
     println!("{output}");
 
-    maybe_upload_cloud_diff_snapshot(
+    // Wrapped from the outside (not instrumented inside cloud_upload.rs /
+    // relations.rs) — this whole call is a no-op wall-clock-wise unless
+    // cloud upload is reachable (login + consent + not SEM_LOCAL/stdin; see
+    // `DiffCloudContext::resolve`), in which case it covers both the
+    // upload-first POST and, when the server routes relations back to the
+    // client, the budgeted local relations pass (`relations::
+    // build_changed_entity_relations`, 90s-480s adaptive ceiling). Left as
+    // one combined bucket rather than split into "relations budget" vs
+    // "upload prep": both live inside cloud_upload.rs/relations.rs, which
+    // carry another session's uncommitted WIP this campaign must not touch.
+    let t5 = Instant::now();
+    cloud_upload::maybe_upload_cloud_diff_snapshot(
         opts,
         parsed,
         from_stdin,
@@ -1712,6 +1782,9 @@ fn run_diff_pipeline(
         &result,
         &binary_changes,
     );
+    let cloud_ms = t5.elapsed().as_secs_f64() * 1000.0;
+    timings.record("cloud (relations budget + upload prep)", cloud_ms);
+    timings.finish();
 
     if opts.profile {
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -1748,213 +1821,6 @@ fn run_diff_pipeline(
     if matches!(opts.format, OutputFormat::Terminal) {
         crate::commands::cloud::maybe_suggest_cloud_after_diff(result.changes.len());
     }
-}
-
-fn maybe_upload_cloud_diff_snapshot(
-    opts: &DiffOptions,
-    parsed: &ParsedArgs,
-    from_stdin: bool,
-    file_changes: &[FileChange],
-    result: &DiffResult,
-    binary_changes: &[BinaryFileChange],
-) {
-    if from_stdin || super::cloud::is_local_forced() {
-        return;
-    }
-
-    let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
-        return;
-    };
-    let Some(remote) = git.get_remote_url() else {
-        return;
-    };
-    if !super::consent::cloud_enabled_for(&remote) {
-        return;
-    }
-    let Some(client) = super::cloud::CloudClient::from_credentials() else {
-        return;
-    };
-
-    let head_sha = git.get_head_sha().ok();
-    let git_context = build_git_context(&git, opts, parsed);
-    // Best-effort: enrich the snapshot with caller/callee relations for changed
-    // entities. Only built here, when an upload is actually happening.
-    let relations = build_changed_entity_relations(opts, result);
-    match client.upload_diff_snapshot(
-        &remote,
-        head_sha.as_deref(),
-        opts.label.as_deref(),
-        &git_context,
-        file_changes,
-        result,
-        binary_changes,
-        &relations,
-    ) {
-        Ok(id) => {
-            let url = client.diff_snapshot_url(&id);
-            super::consent::record_outbound(&remote, "diff", &id);
-            eprintln!("sem cloud diff: {url}");
-        }
-        Err(e) => eprintln!(
-            "warning: local diff succeeded, but the private review could not be uploaded: {e}"
-        ),
-    }
-}
-
-/// Capture truthful provenance for the exact comparison that produced a
-/// snapshot. Working-tree reviews deliberately say `HEAD → WORKTREE`: their
-/// uploaded changes do not exist at a GitHub commit yet.
-fn build_git_context(
-    git: &GitBridge,
-    opts: &DiffOptions,
-    parsed: &ParsedArgs,
-) -> serde_json::Value {
-    let branch = git.get_current_branch();
-    let head_commit = git.get_head_sha().ok();
-
-    let (scope, base_ref, head_ref, base_sha, comparison_head_sha) =
-        if let Some(commit) = &opts.commit {
-            (
-                "commit",
-                Some(format!("{commit}^")),
-                Some(commit.clone()),
-                git.resolve_ref_sha(&format!("{commit}^")),
-                git.resolve_ref_sha(commit),
-            )
-        } else if let (Some(from), Some(to)) = (&opts.from, &opts.to) {
-            (
-                "range",
-                Some(from.clone()),
-                Some(to.clone()),
-                git.resolve_ref_sha(from),
-                git.resolve_ref_sha(to),
-            )
-        } else {
-            match parsed.scope.as_ref() {
-                Some(ParsedScope::RefToWorking(base)) => (
-                    if opts.staged { "staged" } else { "working" },
-                    Some(base.clone()),
-                    Some(if opts.staged { "INDEX" } else { "WORKTREE" }.into()),
-                    git.resolve_ref_sha(base),
-                    None,
-                ),
-                Some(ParsedScope::Range(from, to)) => (
-                    "range",
-                    Some(from.clone()),
-                    Some(to.clone()),
-                    git.resolve_ref_sha(from),
-                    git.resolve_ref_sha(to),
-                ),
-                Some(ParsedScope::MergeBaseRange(from, to)) => (
-                    "merge-base",
-                    Some(from.clone()),
-                    Some(to.clone()),
-                    git.resolve_merge_base(from, to).ok(),
-                    git.resolve_ref_sha(to),
-                ),
-                Some(ParsedScope::FileCompare { .. }) => ("files", None, None, None, None),
-                None => (
-                    if opts.staged { "staged" } else { "working" },
-                    Some("HEAD".into()),
-                    Some(if opts.staged { "INDEX" } else { "WORKTREE" }.into()),
-                    head_commit.clone(),
-                    None,
-                ),
-            }
-        };
-
-    serde_json::json!({
-        "branch": branch,
-        "scope": scope,
-        "baseRef": base_ref,
-        "headRef": head_ref,
-        "baseSha": base_sha,
-        "headSha": comparison_head_sha,
-    })
-}
-
-/// Build a `{ "<file>::<name>": { callers, callees } }` map of real graph
-/// relations for each changed entity, for the cloud diff snapshot payload.
-///
-/// Best-effort: reuses the cached `get_or_build_graph` path (never forces a full
-/// rebuild when a cache exists) and swallows every failure — including panics —
-/// so it can neither break nor visibly slow `sem diff`. On any failure it
-/// returns an empty object and relations are simply omitted.
-fn build_changed_entity_relations(opts: &DiffOptions, result: &DiffResult) -> serde_json::Value {
-    let build = || -> Option<serde_json::Value> {
-        let git = GitBridge::open(Path::new(&opts.cwd)).ok()?;
-        let root = git.repo_root().to_path_buf();
-        let root = root.as_path();
-        let registry = super::create_registry(&root.to_string_lossy());
-        let ext_filter = super::graph::normalize_exts(&opts.file_exts);
-        let source_scope = super::graph::cache_source_scope(root, &ext_filter, false);
-        let file_paths =
-            super::graph::find_supported_files_with_options(root, &registry, &ext_filter, false);
-        // no_cache = false: reuse the disk cache; do not force a full rebuild.
-        let (graph, _entities) =
-            super::graph::get_or_build_graph(root, &file_paths, &registry, false, source_scope);
-
-        // Set of (file_path, name) for every changed entity — used to flag
-        // whether a related entity is itself in the diff.
-        let changed: HashSet<(&str, &str)> = result
-            .changes
-            .iter()
-            .map(|c| (c.file_path.as_str(), c.entity_name.as_str()))
-            .collect();
-
-        let related_json = |e: &sem_core::parser::graph::EntityInfo| {
-            serde_json::json!({
-                "name": e.name,
-                "file": e.file_path,
-                "entityType": e.entity_type,
-                "inDiff": changed.contains(&(e.file_path.as_str(), e.name.as_str())),
-            })
-        };
-
-        let mut relations = serde_json::Map::new();
-        for change in &result.changes {
-            // Match graph entities by file_path + name; skip when ambiguous.
-            let mut matches = graph
-                .entities
-                .values()
-                .filter(|e| e.file_path == change.file_path && e.name == change.entity_name);
-            let Some(entity) = matches.next() else {
-                continue;
-            };
-            if matches.next().is_some() {
-                continue; // ambiguous — cannot reliably attribute relations
-            }
-
-            let callers: Vec<serde_json::Value> = graph
-                .get_dependents(&entity.id)
-                .into_iter()
-                .take(6)
-                .map(related_json)
-                .collect();
-            let callees: Vec<serde_json::Value> = graph
-                .get_dependencies(&entity.id)
-                .into_iter()
-                .take(6)
-                .map(related_json)
-                .collect();
-
-            if callers.is_empty() && callees.is_empty() {
-                continue;
-            }
-
-            relations.insert(
-                format!("{}::{}", change.file_path, change.entity_name),
-                serde_json::json!({ "callers": callers, "callees": callees }),
-            );
-        }
-
-        Some(serde_json::Value::Object(relations))
-    };
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
 }
 
 fn retain_non_cosmetic_changes(result: &mut DiffResult) {

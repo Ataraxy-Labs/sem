@@ -608,6 +608,10 @@ impl<'a> SvelteLowerer<'a> {
             parent_id,
             content_hash: content_hash(&content),
             structural_hash,
+            // Svelte's markup-node entities aren't extracted from the
+            // tree-sitter `code` plugin's node-based path -- kappa isn't
+            // computed for this plugin in v1. See KAPPA.md's coverage note.
+            kappa: None,
             content,
             start_line,
             end_line,
@@ -746,6 +750,7 @@ fn extract_svelte_module_entities(
         parent_id: None,
         content_hash: content_hash(content),
         structural_hash: None,
+        kappa: None,
         content: content.to_string(),
         start_line: 1,
         end_line: last_line_number(content),

@@ -15,12 +15,39 @@ use std::cmp::Ordering;
 use std::hash::BuildHasher;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use crate::parser::resolve_profile as prof;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::model::entity::SemanticEntity;
+
+/// `select_member_candidate` wrapped with an opt-in timing + candidate-count
+/// sample for `SEM_PROFILE_RESOLVE=1` (see `resolve_profile`). Behavior is
+/// identical to calling `select_member_candidate` directly; when profiling
+/// is off this expands to exactly that call with no extra work.
+macro_rules! select_member_profiled {
+    ($members:expr, $method:expr, $argument_labels:expr, $swift_call_signatures:expr, $type_hint:expr, $profile:expr) => {{
+        if $profile.is_some() {
+            let __t0 = Instant::now();
+            let __sel = select_member_candidate(
+                $members,
+                $method,
+                $argument_labels,
+                $swift_call_signatures,
+            );
+            if let Some(acc) = $profile.as_deref_mut() {
+                acc.record_method_call($type_hint, $members.len(), __t0.elapsed());
+            }
+            __sel
+        } else {
+            select_member_candidate($members, $method, $argument_labels, $swift_call_signatures)
+        }
+    }};
+}
 
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
@@ -36,17 +63,25 @@ macro_rules! maybe_par_iter {
 }
 use crate::parser::graph::{EntityInfo, RefType};
 use crate::parser::import_resolution::{
-    find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
-    js_ts_named_exports_from_content, sort_import_candidate_files, JS_TS_EXTENSIONS,
+    build_owned_stem_index, find_import_file, find_import_target, import_file_candidates,
+    is_js_ts_file, js_ts_named_exports_from_content, match_bare_import_stem,
+    sort_import_candidate_files, JS_TS_EXTENSIONS,
+};
+use crate::parser::incremental::{
+    key1, key_whole, CachedScopeResult, FingerprintSink, Recorder, Table, TableFingerprints,
+    ValueHasher,
 };
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
     ParamNameField, ScopeResolveConfig,
 };
+use crate::parser::plugins::code::{is_pathological_large_file, parse_tree};
 
 type AttrToParamIndex<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str, &'a str)>>;
 
 /// A scope in the scope tree. Scopes are nested: module -> class -> function -> block.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[derive(Clone, serde::Serialize)]
 pub struct Scope {
     parent: Option<usize>,
     /// Definitions visible in this scope: name -> entity_id
@@ -70,7 +105,55 @@ pub struct Scope {
     kind: &'static str,
 }
 
+/// `Scope::kind` is a `&'static str` compared by value throughout this module,
+/// which `serde`'s derive cannot deserialize without demanding `'de: 'static` of
+/// every container that holds a `Scope`. Deserializing by hand through an owned
+/// shadow struct keeps the hot in-memory representation as-is (no per-scope
+/// `String` allocation on the build path) while letting `PrecomputedFileFacts`
+/// round-trip for the on-disk facts corpus (semx-9en).
+///
+/// The kinds this resolver produces are a closed set, so they map back to the
+/// same statics. Anything else — a kind written by a future version — is leaked
+/// once rather than silently coerced to a wrong kind, because coercing would
+/// change resolution behavior and leaking a handful of short strings will not.
+impl<'de> serde::Deserialize<'de> for Scope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct ScopeShadow {
+            parent: Option<usize>,
+            defs: HashMap<String, String>,
+            bindings: HashSet<String>,
+            binding_rows: HashMap<String, Vec<usize>>,
+            types: HashMap<String, String>,
+            pending_call_types: HashMap<String, String>,
+            pending_field_types: HashMap<String, (String, String)>,
+            owner_id: Option<String>,
+            kind: String,
+        }
+        let s = ScopeShadow::deserialize(deserializer)?;
+        Ok(Scope {
+            parent: s.parent,
+            defs: s.defs,
+            bindings: s.bindings,
+            binding_rows: s.binding_rows,
+            types: s.types,
+            pending_call_types: s.pending_call_types,
+            pending_field_types: s.pending_field_types,
+            owner_id: s.owner_id,
+            kind: match s.kind.as_str() {
+                "module" => "module",
+                "class" => "class",
+                "function" => "function",
+                "block" => "block",
+                _ => Box::leak(s.kind.into_boxed_str()),
+            },
+        })
+    }
+}
+
 /// Reference found in the AST
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AstRef {
     /// Kind of reference
     kind: AstRefKind,
@@ -81,6 +164,8 @@ struct AstRef {
     end_byte: usize,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum AstRefKind {
     /// Bare name call: `foo()`
     Call {
@@ -402,6 +487,199 @@ pub(crate) struct PreBuiltLookups {
     /// Go package index: pkg_name → [(entity_name, entity_id)]
     /// Avoids O(symbol_table) scan per Go import.
     pub(crate) go_pkg_index: HashMap<String, Vec<(String, String)>>,
+    /// Repo-level language overrides (`.semrc`, `.gitattributes`), custom
+    /// extension → canonical extension, exactly as
+    /// [`crate::parser::registry::ParserRegistry::resolve_file_path`] applies
+    /// them. See [`reparse_language_config`].
+    pub(crate) ext_overrides: HashMap<String, String>,
+}
+
+/// The scope resolver's own admission test: `Some` iff this file's language has
+/// a [`ScopeResolveConfig`], which is what every consumer of a re-parsed tree
+/// requires before it looks at one.
+///
+/// Deliberately keyed on the *raw* extension, with no `.semrc`/`.gitattributes`
+/// override applied, because that is what the per-file scope closure and the
+/// return-type/init-attr scan do (see their `get_language_config(ext)` lines).
+/// The re-parse's own grammar choice still honors overrides via
+/// [`reparse_language_config`] — this decides *whether* a file is re-parsed at
+/// all, that decides *with which grammar*, and keeping the first question in one
+/// function is what stops the skip in the re-parse loop from drifting away from
+/// the decline it mirrors. semx-au8.
+fn scope_resolve_config_for_path(
+    file_path: &str,
+) -> Option<&'static crate::parser::plugins::code::languages::ScopeResolveConfig> {
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    get_language_config(ext).and_then(|c| c.scope_resolve)
+}
+
+/// Pick the grammar to re-parse `file_path` with, honoring repo-level language
+/// overrides the way pass 1 did.
+///
+/// Pass 1 (and the non-chunked resolution path, which reuses pass 1's trees)
+/// goes through `ParserRegistry::extract_entities_with_tree`, which resolves
+/// `.gitattributes`/`.semrc` extension mappings before detecting the language.
+/// The chunked path re-reads and re-parses the file itself; keying off the raw
+/// extension there re-parsed e.g. TypeScript's `tests/baselines/reference/*.js`
+/// (`*.js linguist-language=TypeScript` in its `.gitattributes`) with the
+/// JavaScript grammar, while their entities had been extracted from a
+/// TypeScript tree. The resulting error-recovered tree yields fewer scopes and
+/// refs, so references that scope resolution should have resolved fell through
+/// to the bag-of-words resolver instead — the chunked path answering a
+/// different question from the direct path for the same corpus (semx-6rd).
+fn reparse_language_config(
+    file_path: &str,
+    ext_overrides: &HashMap<String, String>,
+) -> Option<&'static crate::parser::plugins::code::languages::LanguageConfig> {
+    let raw_ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    if ext_overrides.is_empty() {
+        return get_language_config(raw_ext);
+    }
+    match ext_overrides.get(&raw_ext.to_ascii_lowercase()) {
+        Some(canonical) => get_language_config(canonical),
+        None => get_language_config(raw_ext),
+    }
+}
+
+/// Corpus-wide entity indexes keyed by file/parent, built once from
+/// `all_entities` (semx-6rd CUT 2). `resolve_with_scopes_full_inner` used to
+/// rebuild these from scratch on every call — a pure function of `all_entities`
+/// alone, so on the chunked path (one call per chunk, same `all_entities` every
+/// time) that was the identical O(corpus) scan repeated once per chunk for no
+/// reason. `resolve_scopes_in_file_chunks` builds this once before its chunk
+/// loop and passes it to every chunk's call instead.
+pub(crate) struct PrebuiltEntityIndex<'a> {
+    entities_by_file: HashMap<&'a str, Vec<&'a SemanticEntity>>,
+    children_by_parent: HashMap<&'a str, Vec<&'a SemanticEntity>>,
+}
+
+impl<'a> PrebuiltEntityIndex<'a> {
+    pub(crate) fn build(all_entities: &'a [SemanticEntity]) -> Self {
+        // `all_entities` is assembled one file at a time, so a file's entities
+        // are contiguous and its bucket's final size is known as soon as the
+        // run ends — building each `Vec` at its exact length avoids the
+        // repeated grow-and-copy the plain `entry().or_default().push()` form
+        // paid ~454k times per build (semx-4an). The grouping itself is
+        // unchanged, and does not *rely* on contiguity: a file whose entities
+        // were split across two runs simply gets two `extend`s.
+        let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> =
+            HashMap::with_capacity_and_hasher(all_entities.len() / 8 + 1, Default::default());
+        let mut run_start = 0usize;
+        while run_start < all_entities.len() {
+            let file_path = all_entities[run_start].file_path.as_str();
+            let mut run_end = run_start + 1;
+            while run_end < all_entities.len()
+                && all_entities[run_end].file_path.as_str() == file_path
+            {
+                run_end += 1;
+            }
+            let run = &all_entities[run_start..run_end];
+            match entities_by_file.get_mut(file_path) {
+                Some(bucket) => bucket.extend(run.iter()),
+                None => {
+                    entities_by_file.insert(file_path, run.iter().collect());
+                }
+            }
+            run_start = run_end;
+        }
+        let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> =
+            HashMap::with_capacity_and_hasher(all_entities.len() / 4 + 1, Default::default());
+        for entity in all_entities {
+            if let Some(ref pid) = entity.parent_id {
+                children_by_parent
+                    .entry(pid.as_str())
+                    .or_default()
+                    .push(entity);
+            }
+        }
+        Self {
+            entities_by_file,
+            children_by_parent,
+        }
+    }
+}
+
+/// MUL Phase 1 (semx-5sw, epic semx-w5k): the CLEAN gate, scoped to only the
+/// files under adjudication instead of the whole corpus.
+///
+/// `graph.rs`'s CLEAN gate only ever asks for the verdict on
+/// `fresh_precomputed`'s keys — pass 1's freshly-precomputed files, typically
+/// a handful (linux: 7 of 2,050 scope-resolvable files) — then throws away
+/// every other file's verdict via `fresh_precomputed.retain(...)`. The
+/// previous implementation (`PrebuiltEntityIndex::build` +
+/// `dirty_precompute_files`, removed by semx-5sw) computed a verdict for
+/// every file in the corpus anyway, by building two corpus-wide indexes
+/// (`entities_by_file`/`children_by_parent`, one `HashMap<&str, Vec<&Entity>>`
+/// bucket per distinct file/parent-id in the *entire* corpus) to answer a
+/// question about a handful of files.
+///
+/// **Soundness (why scoping to the candidate files is exact, not
+/// approximate).** `CLEAN(F)` (MUL-DESIGN.md §1) is: for every entity `e`
+/// declared in `F`, every entity naming `e.id` as `parent_id` also belongs to
+/// `F`. Restated as what this function computes: `F` is dirty iff `∃ e ∈
+/// entities(F). ∃ c ∈ all_entities. c.parent_id == Some(e.id) ∧ c.file_path !=
+/// F`. This depends on exactly two things: (1) `F`'s own entities (to know
+/// which ids are "declared in `F`" at all), and (2) every entity anywhere in
+/// the corpus whose `parent_id` names one of those ids — cross-file parent
+/// edges *into* `F`, which by `build_entity_id`'s construction (MUL-DESIGN.md
+/// §1.1's file-rootedness theorem) can only name `e.id` by having recomputed
+/// the identical id string independently, since extraction is per-file and
+/// never sees another file's bytes; the runtime check exists for the one hole
+/// the theorem admits (id-string collision across files), not because the
+/// scan needs to be corpus-wide in *scope of candidates* — it needs to be
+/// corpus-wide only in *scope of who might point at a candidate*, which is
+/// what pass 2 below still does. Nothing about `CLEAN(F)` for a candidate `F`
+/// depends on any other file's entities, nor on a `children_by_parent` bucket
+/// keyed by an id no candidate file declared — so this function builds
+/// neither a corpus-wide `entities_by_file` nor a corpus-wide
+/// `children_by_parent`.
+///
+/// **What it computes instead.** `candidate_spans` is `(file_path, start,
+/// len)` into `all_entities` for exactly the files that got fresh precomputed
+/// facts this round — indices `graph.rs`'s pass-1 assembly loop already knows
+/// for free (the same `(path, start, len)` bookkeeping `entity_spans` does a
+/// few lines above it), so pass 1 here is a direct slice over each
+/// candidate's *own* entities (`Σ candidates' entity counts`, not the
+/// corpus) building `id_owner : id -> file_path`, with no corpus scan at all.
+/// Pass 2 is the one part that must stay `O(corpus)`: a cross-file child of a
+/// candidate's entity can live in *any* file, precomputed or not, so every
+/// entity's `parent_id` is checked against the small `id_owner` map (I6
+/// fail-safe stays exact — nothing here narrows *who might point at* a
+/// candidate). Neither pass allocates a `Vec` bucket per distinct file or
+/// parent id the way the old `PrebuiltEntityIndex::build` did.
+///
+/// Fail-safe (I6) is unaffected: empty `candidate_spans` (nothing was
+/// precomputed this build) short-circuits to an empty dirty set, exactly as
+/// today's `!fresh_precomputed.is_empty()` guard at the call site already
+/// skips the gate entirely in that case.
+pub(crate) fn clean_gate_dirty_files(
+    all_entities: &[SemanticEntity],
+    candidate_spans: &[(String, usize, usize)],
+) -> HashSet<String> {
+    if candidate_spans.is_empty() {
+        return HashSet::default();
+    }
+    let mut id_owner: HashMap<&str, &str> = HashMap::default();
+    for (file_path, start, len) in candidate_spans {
+        for entity in &all_entities[*start..*start + *len] {
+            id_owner.insert(entity.id.as_str(), file_path.as_str());
+        }
+    }
+    if id_owner.is_empty() {
+        return HashSet::default();
+    }
+    let mut dirty: HashSet<String> = HashSet::default();
+    for entity in all_entities {
+        let Some(pid) = entity.parent_id.as_deref() else {
+            continue;
+        };
+        if let Some(&owner_file) = id_owner.get(pid) {
+            if entity.file_path.as_str() != owner_file && !dirty.contains(owner_file) {
+                dirty.insert(owner_file.to_string());
+            }
+        }
+    }
+    dirty
 }
 
 struct TsDefaultExportTable {
@@ -415,9 +693,17 @@ struct TsDefaultReExport {
     module_path: String,
 }
 
-struct TopLevelEntityIndex {
+pub(crate) struct TopLevelEntityIndex {
     entities_by_file: HashMap<String, Vec<(String, String)>>,
     sorted_files: Vec<String>,
+    /// semx-sbf: `sorted_files`, indexed by file stem, for callers that need
+    /// *every* stem-matching file (bare/package specifier resolution's
+    /// union-of-matches semantics — see [`match_bare_import_stem`]) rather
+    /// than [`find_import_file`]'s single best match. Built alongside
+    /// `sorted_files` unconditionally (cheap relative to `entities_by_file`
+    /// itself); unused by the JS/TS namespace-import path, which still goes
+    /// through `find_import_file`/`sorted_files` exactly as before.
+    stem_index: HashMap<String, Vec<String>>,
 }
 
 struct FileEntityLookup<'a> {
@@ -535,9 +821,16 @@ fn normalized_method_receiver(receiver: &str) -> &str {
     receiver.trim_start_matches('!').trim_start_matches('~')
 }
 
-pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
+/// The single source of truth for "does this entity type own class-shaped
+/// members" — shared by [`class_member_owner_name`] (called on the owned
+/// `EntityInfo` map every whole rebuild) and, since semx-4an,
+/// `graph::maintain_entity_lookups_incremental`'s per-file removal/insertion
+/// (called on a bare `&SemanticEntity` — same fields, different owning type,
+/// same predicate must apply or the two code paths could disagree about
+/// which entities own members).
+pub(crate) fn is_class_member_owner_type(entity_type: &str) -> bool {
     matches!(
-        parent.entity_type.as_str(),
+        entity_type,
         "class"
             | "struct"
             | "interface"
@@ -549,7 +842,10 @@ pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
             | "companion_object"
             | "extension"
     )
-    .then_some(parent.name.as_str())
+}
+
+pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
+    is_class_member_owner_type(&parent.entity_type).then_some(parent.name.as_str())
 }
 
 fn sort_symbol_table_targets_by_source(
@@ -610,6 +906,7 @@ pub fn resolve_with_scopes(
         None,
         None,
         true,
+        None,
     );
     scope_result_from_full(result)
 }
@@ -631,6 +928,7 @@ pub fn resolve_with_scopes_fast(
         None,
         None,
         true,
+        None,
     );
     scope_result_from_full(result)
 }
@@ -652,6 +950,7 @@ pub(crate) fn resolve_with_scopes_full(
     pre_built: Option<&PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
     emit_local_binding_log: bool,
+    incremental: Option<&mut ScopeIncremental<'_, '_>>,
 ) -> ScopeResultFull {
     resolve_with_scopes_full_inner(
         root,
@@ -663,6 +962,8 @@ pub(crate) fn resolve_with_scopes_full(
         pre_built_import_table,
         emit_local_binding_log,
         None,
+        None,
+        incremental,
     )
 }
 
@@ -686,7 +987,577 @@ pub(crate) fn resolve_with_scopes_full_for_entities(
         pre_built_import_table,
         false,
         Some(emit_entity_ids),
+        None,
+        None,
     )
+}
+
+/// One file's contribution to the four corpus-wide maps pass 1's scan builds:
+/// return types by entity id, instance attribute types, `__init__` params, and
+/// the attribute→param mapping.
+type Pass1FileScan = (
+    HashMap<String, String>,
+    HashMap<(String, String), String>,
+    HashMap<String, Vec<String>>,
+    HashMap<(String, String), String>,
+);
+
+/// Whole-corpus state the chunked path builds once and reuses for every chunk.
+///
+/// `facts` are the per-file facts pass 1 already collected (see
+/// [`precompute_js_ts_file_facts`]); files it covers skip the re-parse loop and
+/// its downstream tree walks entirely. `entity_index` is the corpus-wide
+/// file/parent entity index, a pure function of `all_entities` and therefore
+/// identical for every chunk (semx-6rd CUT 2). `corpus_has_swift` is the same
+/// kind of whole-corpus fact, added for semx-nuv: see that field's own doc
+/// comment.
+pub(crate) struct ChunkedResolveInputs<'a> {
+    pub(crate) facts: &'a HashMap<String, PrecomputedFileFacts>,
+    pub(crate) entity_index: &'a PrebuiltEntityIndex<'a>,
+    /// Whether *any* file in the whole corpus is `.swift` — a pure function of
+    /// `all_entities`, computed once before the chunk loop starts (semx-nuv;
+    /// this struct's own doc comment on why: `entity_index` above is the same
+    /// pattern for a different table).
+    ///
+    /// Before this fix, [`resolve_with_scopes_full_inner`]'s gate for building
+    /// `swift_call_signatures` checked *this chunk's own* `parsed_files` for a
+    /// `.swift` extension instead of the corpus as a whole. `build_swift_call_signatures`
+    /// itself was already correct for any Swift entity outside the current
+    /// chunk (its second loop falls back to re-parsing `entity.content`
+    /// standalone via [`extract_swift_signature_from_entity_content`] for any
+    /// entity `parsed_files` didn't cover) — the bug was purely in the guard
+    /// deciding *whether to call it at all*, and that guard read chunk-local
+    /// data to answer a corpus-wide question. Whether a C# file's chunk
+    /// happened to also contain a `.swift` file (a function of
+    /// `SCOPE_RESOLVE_BYTE_BUDGET`/chunk membership, not of that C# file's own
+    /// content) decided whether `resolve_ref`'s Swift-overload-aware branch
+    /// (`has_ambiguous_swift_signature_candidates`,
+    /// `select_swift_overload_candidate`) ever ran for that file's calls —
+    /// producing a chunk-order-dependent tie-break on corpus-wide
+    /// ambiguous-short-name fallback resolution (semx-nuv; see
+    /// RESOLUTION-PROFILE.md's "Resolver tie-break contract" section). Reading
+    /// this precomputed, whole-corpus bool instead makes the gate — and
+    /// therefore `swift_call_signatures`'s contents, and therefore every
+    /// downstream resolution decision that consults it — a pure function of
+    /// repo content, independent of `chunk_files_by_byte_budget`'s output.
+    pub(crate) corpus_has_swift: bool,
+    /// The JS/TS namespace-import index (`register_ts_namespace_import`),
+    /// hoisted across chunks (semx-la2, semx-6rd CUT-2 pattern round 3).
+    /// `build_top_level_entity_index` is a pure function of
+    /// `(symbol_table, entity_map, extensions)`, and on the chunked path all
+    /// three are corpus-invariant across chunks: the same `&PreBuiltLookups`
+    /// and `&entity_map` are passed into every chunk's call, and the
+    /// extensions are compile-time constants (`JS_TS_EXTENSIONS` here,
+    /// `&[".py"]` below). Before this field the lock lived inside
+    /// `resolve_with_scopes_full_inner` — created per call, i.e. per chunk —
+    /// so one bare namespace import per chunk rebuilt a corpus-sized index,
+    /// corpus-proportional × chunk-count (linux: ~31 thread-s across ~16
+    /// chunks; see RESOLUTION-PROFILE.md "hoist the per-chunk import-handler
+    /// indexes"). Still lazy: nothing is built unless some chunk actually
+    /// sees the triggering import form — just at most once per corpus now.
+    pub(crate) top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
+    /// Python's sibling index (`register_namespace_import`, bare
+    /// `import module`), same invariance argument and same hoist as
+    /// `top_level_entities` above. Kept as two separate locks because the two
+    /// handlers build over different extension sets (`&[".py"]` vs
+    /// `JS_TS_EXTENSIONS`), exactly as before the hoist.
+    pub(crate) py_top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
+}
+
+/// Red-green context for one call of [`resolve_with_scopes_full_inner`]
+/// (semx-022). One call == one chunk on the chunked path, one whole corpus
+/// otherwise.
+///
+/// The function fingerprints the chunk-scoped tables it builds (return types,
+/// instance-attribute types) into `inc.cur_fp` *before* deciding which files may
+/// reuse their cached edges, so the decision is taken against a fingerprint map
+/// that already covers every table a file's read set can name.
+pub(crate) struct ScopeIncremental<'a, 'i> {
+    pub(crate) inc: &'a mut crate::parser::incremental::Incremental<'i>,
+    /// Chunk index; mixed into chunk-scoped fingerprint keys so the same name in
+    /// two chunks never compares against the other chunk's answer.
+    pub(crate) scope_tag: u64,
+    /// Files whose resolution this module knows how to attribute completely.
+    /// Currently JS/TS only — see [`crate::parser::incremental::Incremental`].
+    pub(crate) eligible: &'a HashSet<String>,
+}
+
+/// Chunked-path entry point (semx-6rd CUT 1): like [`resolve_with_scopes_full`],
+/// but additionally accepts the [`ChunkedResolveInputs`] the chunk loop built
+/// once. Files covered by `chunked.facts` need no tree; every other file is
+/// handled exactly as before. Only `EntityGraph::build`'s chunked path
+/// (`resolve_scopes_in_file_chunks`) calls this; every other caller keeps using
+/// `resolve_with_scopes_full`, which passes `None` and is behaviorally
+/// unchanged.
+pub(crate) fn resolve_with_scopes_full_chunked(
+    root: &Path,
+    file_paths: &[String],
+    all_entities: &[SemanticEntity],
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_built: Option<&PreBuiltLookups>,
+    pre_built_import_table: Option<&HashMap<(String, String), String>>,
+    chunked: &ChunkedResolveInputs<'_>,
+    incremental: Option<&mut ScopeIncremental<'_, '_>>,
+) -> ScopeResultFull {
+    resolve_with_scopes_full_inner(
+        root,
+        file_paths,
+        all_entities,
+        entity_map,
+        None,
+        pre_built,
+        pre_built_import_table,
+        false,
+        None,
+        Some(chunked),
+        incremental,
+    )
+}
+
+/// Compact, tree-independent per-file facts collected during pass 1 while a
+/// JS/TS file's tree-sitter tree is momentarily in hand (`EntityGraph::build`,
+/// beyond `PARSED_FILE_REUSE_LIMIT`), so the chunked resolution path doesn't
+/// have to re-parse the file to get them (semx-6rd CUT 1).
+///
+/// Scoped to JS/TS files only. Every *other* tree-touching computation the
+/// chunked path performs — `extract_imports_from_ast`'s Python
+/// (`import_from_statement`/self+cls `import_statement`), Rust
+/// (`use_declaration`), and Go (`import_declaration`) branches; ctor-infer's
+/// `scan_constructor_calls` (hardcoded to Python's `call` node kind); and
+/// Swift call-signature building (gated on `.swift` files) — is a *structural*
+/// no-op for a JS/TS AST: those node kinds never occur in the JS/TS grammars,
+/// and `extract_imports_from_ast`'s own JS/TS branches
+/// (`import_statement`/`export_statement`) are already gated off by
+/// `skip_js_ts_imports`, which the chunked path always sets (it always
+/// supplies a pre-built import table). So JS/TS files are the only files that
+/// can safely skip a real tree entirely in the chunked path; every other
+/// language keeps the original re-parse behavior unchanged.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = ""))]
+pub struct PrecomputedFileFacts {
+    /// This file's full source text (`resolve_ref`/entity-span code needs the
+    /// raw bytes regardless of whether the tree stuck around).
+    content: String,
+    scopes: Vec<Scope>,
+    entity_scope_map: HashMap<String, usize>,
+    entity_inner_scope: HashMap<String, usize>,
+    ast_refs: Vec<AstRef>,
+    /// This file's own contribution to the corpus-wide return-type map
+    /// (function/method entity id -> declared/inferred return type name).
+    return_type_map: HashMap<String, String>,
+    instance_attr_types: HashMap<(String, String), String>,
+    init_params: HashMap<String, Vec<String>>,
+    attr_to_param: HashMap<(String, String), String>,
+}
+
+impl PrecomputedFileFacts {
+    /// This file's full source text, already in hand from pass 1. Lets
+    /// downstream per-file work (e.g. bag-of-words index construction, semx-bkz)
+    /// consume the same bytes pass 1 read instead of a second `read_to_string`.
+    pub(crate) fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Approximate heap footprint (semx-4w1 attribution). `content` is exact
+    /// (`.capacity()`); the remaining fields are sized by `Vec`/`HashMap`
+    /// capacity times element size only — nested `String` contents inside
+    /// `Scope`/`AstRef`/the return-type and param maps are *not* individually
+    /// walked. Those fields are typically small relative to `content` for a
+    /// single file (a handful of scope entries, not a second copy of the
+    /// source), so this undercounts by a bounded, minor amount — good enough
+    /// for ranking, not a claim of exactness. See RESOLUTION-PROFILE.md.
+    pub(crate) fn approx_heap_bytes(&self) -> usize {
+        self.content.capacity()
+            + self.scopes.capacity() * std::mem::size_of::<Scope>()
+            + self.entity_scope_map.capacity()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<usize>() + 1)
+            + self.entity_inner_scope.capacity()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<usize>() + 1)
+            + self.ast_refs.capacity() * std::mem::size_of::<AstRef>()
+            + self.return_type_map.capacity() * (std::mem::size_of::<String>() * 2 + 1)
+            + self.instance_attr_types.capacity()
+                * (std::mem::size_of::<(String, String)>() + std::mem::size_of::<String>() + 1)
+            + self.init_params.capacity()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<String>>() + 1)
+            + self.attr_to_param.capacity()
+                * (std::mem::size_of::<(String, String)>() + std::mem::size_of::<String>() + 1)
+    }
+}
+
+/// Build a [`PrecomputedFileFacts`] for one JS/TS file. `entities` must be
+/// exactly this file's own entities (in extraction order) — the same slice
+/// `EntityGraph::build`'s pass 1 just produced for it. Returns `None` if the
+/// file isn't JS/TS or has no scope-resolve config (callers should fall back
+/// to the ordinary re-parse path for it).
+///
+/// Uses file-local substitutes for the `entity_map`/`children_by_parent` that
+/// `build_scopes_from_ast` normally receives as corpus-wide maps: every
+/// lookup it does against them is keyed by an id that belongs to *this* file
+/// (JS/TS declarations never nest across files), so a map built from just
+/// this file's entities produces identical results — verified by the
+/// equivalence hash in the semx-6rd fix-phase notes in RESOLUTION-PROFILE.md.
+pub(crate) fn precompute_js_ts_file_facts(
+    file_path: &str,
+    content: String,
+    tree: &tree_sitter::Tree,
+    entities: &[SemanticEntity],
+) -> Option<PrecomputedFileFacts> {
+    if !is_js_ts_file(file_path) {
+        return None;
+    }
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
+    let source = content.as_bytes();
+
+    let file_entities: Vec<&SemanticEntity> = entities.iter().collect();
+    let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
+    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
+    for entity in &file_entities {
+        entity_map.insert(
+            entity.id.clone(),
+            EntityInfo {
+                id: entity.id.clone(),
+                name: entity.name.clone(),
+                entity_type: entity.entity_type.clone(),
+                file_path: entity.file_path.clone(),
+                parent_id: entity.parent_id.clone(),
+                start_line: entity.start_line,
+                end_line: entity.end_line,
+            },
+        );
+        if let Some(ref pid) = entity.parent_id {
+            children_by_parent
+                .entry(pid.as_str())
+                .or_default()
+                .push(*entity);
+        }
+    }
+
+    let file_lookup = FileEntityLookup::new(&file_entities);
+
+    let mut scopes: Vec<Scope> = vec![Scope {
+        parent: None,
+        defs: HashMap::default(),
+        bindings: HashSet::default(),
+        binding_rows: HashMap::default(),
+        types: HashMap::default(),
+        pending_call_types: HashMap::default(),
+        pending_field_types: HashMap::default(),
+        owner_id: None,
+        kind: "module",
+    }];
+    let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
+    let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+
+    // Same top-level def registration `resolve_with_scopes_full_inner`'s pass
+    // 2 closure does before calling `build_scopes_from_ast` — and, per
+    // MUL-DESIGN.md I2, in the *same order*: `entity_ranges` order
+    // (`(start_line, end_line, id)` ascending), not extraction order. The two
+    // orders agree for all but pathological same-line, same-span, 10+-way
+    // name collisions (see `js_ts_precompute_seed_order_diverges_from_entity_ranges_order_at_ten_plus_siblings`
+    // in this module's tests for the constructed divergence and MUL-DESIGN.md
+    // F1 for the finding), but `defs.insert` is last-write-wins, so seeding
+    // in the wrong order is a silent, real divergence whenever they don't —
+    // this file's own entities are cheap enough to sort per file (typically
+    // tens, not corpus-wide).
+    let mut top_level_by_range: Vec<&SemanticEntity> = file_entities
+        .iter()
+        .filter(|entity| entity.parent_id.is_none())
+        .copied()
+        .collect();
+    top_level_by_range.sort_by(|a, b| {
+        (a.start_line, a.end_line, a.id.as_str()).cmp(&(b.start_line, b.end_line, b.id.as_str()))
+    });
+    for entity in &top_level_by_range {
+        scopes[0]
+            .defs
+            .insert(entity.name.clone(), entity.id.clone());
+        entity_scope_map.insert(entity.id.clone(), 0);
+    }
+
+    build_scopes_from_ast(
+        tree.root_node(),
+        0,
+        &mut scopes,
+        &mut entity_scope_map,
+        &mut entity_inner_scope,
+        &file_lookup,
+        &children_by_parent,
+        &entity_map,
+        file_path,
+        source,
+        config,
+    );
+
+    let mut return_type_map: HashMap<String, String> = HashMap::default();
+    scan_return_types(
+        tree.root_node(),
+        file_path,
+        &file_lookup,
+        source,
+        &mut return_type_map,
+        config,
+    );
+
+    let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
+    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
+    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
+    scan_init_self_attrs(
+        tree.root_node(),
+        file_path,
+        &file_entities,
+        &entity_map,
+        source,
+        &mut instance_attr_types,
+        &mut init_params,
+        &mut attr_to_param,
+        config,
+    );
+
+    let ast_refs = collect_all_file_refs(tree.root_node(), source, config);
+
+    Some(PrecomputedFileFacts {
+        content,
+        scopes,
+        entity_scope_map,
+        entity_inner_scope,
+        ast_refs,
+        return_type_map,
+        instance_attr_types,
+        init_params,
+        attr_to_param,
+    })
+}
+
+/// Whether MUL phase 1's generic precompute
+/// ([`precompute_scope_resolvable_file_facts`]) is admitted for a language id.
+///
+/// This is the **one** place phase 1's rollout is decided, because it has two
+/// consumers that must never disagree: pass 1's admission test
+/// (`EntityGraph::build`'s pass-1 closure, `graph.rs`) and the facts corpus's
+/// per-language salt (`facts_store::effective_language_salt`). A producer
+/// switch the salt does not track is exactly MUL-DESIGN.md's I5/F2 hazard —
+/// corpus dedup is first-writer-wins (semx-fqh), so entries written while the
+/// switch is off (`precomputed: None`) would silently deny the facts a slot
+/// forever after it is turned on.
+///
+/// **C++ (`cpp`): on unconditionally.** semx-mp1 measured llvm-project inside
+/// MUL-A §5.3's stated +15% memory ceiling on both pairs (+5.8%, +6.5%, against
+/// its own +12-13% projection) with reparse −95.3%. That is
+/// RESOLUTION-PROFILE.md's "MUL P1" verdict, verbatim: "C++ (llvm): GO,
+/// unconditionally".
+///
+/// **C# (`csharp`): off by default**, opt-in via `SEM_MUL_CSHARP=1`. The gate's
+/// *correctness* is not in question — I1-I6 all hold, zero CLEAN violations,
+/// entity/edge/edge-hash counts bit-identical. Its *memory* is:
+/// dotnet-runtime measured **+21.2% and +32.9% against the same +15% ceiling,
+/// reproducibly, on both pairs**. RESOLUTION-PROFILE.md's "MUL P1" verdict
+/// ("this is a STOP, not a ship") and its memory-lever follow-up ("**Unchanged
+/// from this section's own predecessor: dotnet stays GATED** … full dotnet
+/// rollout remains gated on a memory fix") are the record, and neither of
+/// MUL-DESIGN.md §5.3's two named levers survived `/usr/bin/time -l`
+/// measurement. Off-by-default is what that verdict means *in code*; the switch
+/// exists so the next bead can re-measure without a rebuild.
+///
+/// Opt-in rather than opt-out for the same reason `fast_extractor`'s switch is:
+/// enabling this is a **memory** decision about a specific corpus, and merely
+/// upgrading `sem-core` must not make it. Phase 2/3 widen this function — not
+/// the `graph.rs` call site, which is now just its consumer.
+pub fn mul_precompute_admits(lang_id: &str) -> bool {
+    match lang_id {
+        "cpp" => true,
+        "csharp" => csharp_precompute_enabled(),
+        _ => false,
+    }
+}
+
+/// Read once per process: pass 1 asks per file, inside a `par_iter`, so an
+/// `env::var` per call would be a lock and an allocation on the hot path.
+fn csharp_precompute_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SEM_MUL_CSHARP").ok().as_deref(),
+            Some("1") | Some("on") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md §4.1 step 1). Build a
+/// [`PrecomputedFileFacts`] for one file of **any** scope-resolvable
+/// language, not just JS/TS — the generic sibling of
+/// [`precompute_js_ts_file_facts`], used for every other language now that
+/// §1's use-site enumeration shows the file-local/corpus-wide substitution
+/// the JS/TS precompute already relies on is not JS/TS-specific (it follows
+/// from `build_entity_id`'s per-file id-rooting, unconditionally — see the
+/// design doc's Theorem in §1.1).
+///
+/// Unlike the JS/TS precompute (which is unconditional because
+/// `skip_js_ts_imports` is always `true` downstream), this function's
+/// semantic license depends on the **structural** predicate `TREELESS(F)`
+/// (§1.2): whether pass 2 would need this file's tree for anything at all.
+/// That is decided *from what the fused walk saw* — `import_starts` empty
+/// and no literal `"call"`-kind node — rather than a per-language table
+/// (I3), so it returns `None` (falling back to the ordinary re-parse path,
+/// I6) whenever the walk saw either. `.swift` is excluded unconditionally:
+/// `build_swift_call_signatures` reads corpus-wide `entity_ranges`/
+/// `entity_map`, so it is not a per-file function in any sense this gate can
+/// license (§4.3).
+///
+/// `entities` must be exactly this file's own entities (in extraction
+/// order), as with `precompute_js_ts_file_facts`. The **semantic** half of
+/// the license (CLEAN) is *not* checked here — it cannot be: it needs the
+/// corpus-wide `children_by_parent`, which does not exist until every
+/// file's entities are assembled. The caller (`EntityGraph::build`'s pass 1
+/// assembly) must run the CLEAN gate afterward
+/// (`PrebuiltEntityIndex::dirty_precompute_files`) and drop this function's
+/// output for any file it marks dirty.
+pub(crate) fn precompute_scope_resolvable_file_facts(
+    file_path: &str,
+    content: String,
+    tree: &tree_sitter::Tree,
+    entities: &[SemanticEntity],
+) -> Option<PrecomputedFileFacts> {
+    // Swift is out of scope in every MUL phase (MUL-DESIGN.md §4.3): its one
+    // tree consumer walks every tree against corpus-wide entity_ranges, not
+    // a per-file function. JS/TS files never reach this function (they take
+    // `precompute_js_ts_file_facts`, gated only on `is_js_ts_file`), but the
+    // exclusion is stated here too so this function's own license doesn't
+    // silently depend on which branch the caller happens to dispatch through.
+    if file_path.ends_with(".swift") {
+        return None;
+    }
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+    let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
+    let source = content.as_bytes();
+
+    let file_entities: Vec<&SemanticEntity> = entities.iter().collect();
+    let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
+    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
+    for entity in &file_entities {
+        entity_map.insert(
+            entity.id.clone(),
+            EntityInfo {
+                id: entity.id.clone(),
+                name: entity.name.clone(),
+                entity_type: entity.entity_type.clone(),
+                file_path: entity.file_path.clone(),
+                parent_id: entity.parent_id.clone(),
+                start_line: entity.start_line,
+                end_line: entity.end_line,
+            },
+        );
+        if let Some(ref pid) = entity.parent_id {
+            children_by_parent
+                .entry(pid.as_str())
+                .or_default()
+                .push(*entity);
+        }
+    }
+
+    let file_lookup = FileEntityLookup::new(&file_entities);
+
+    let mut scopes: Vec<Scope> = vec![Scope {
+        parent: None,
+        defs: HashMap::default(),
+        bindings: HashSet::default(),
+        binding_rows: HashMap::default(),
+        types: HashMap::default(),
+        pending_call_types: HashMap::default(),
+        pending_field_types: HashMap::default(),
+        owner_id: None,
+        kind: "module",
+    }];
+    let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
+    let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+
+    // I2 (seed order): entity_ranges order — `(start_line, end_line, id)`
+    // ascending — matching the AST path
+    // (`resolve_with_scopes_full_inner`'s seed loop) and
+    // `precompute_js_ts_file_facts` post-semx-u16. Not extraction order.
+    let mut top_level_by_range: Vec<&SemanticEntity> = file_entities
+        .iter()
+        .filter(|entity| entity.parent_id.is_none())
+        .copied()
+        .collect();
+    top_level_by_range.sort_by(|a, b| {
+        (a.start_line, a.end_line, a.id.as_str()).cmp(&(b.start_line, b.end_line, b.id.as_str()))
+    });
+    for entity in &top_level_by_range {
+        scopes[0]
+            .defs
+            .insert(entity.name.clone(), entity.id.clone());
+        entity_scope_map.insert(entity.id.clone(), 0);
+    }
+
+    // BS3's fused triple walk (semx-3ao): scopes/entity_scope_map/
+    // entity_inner_scope (mutated in place) and ast_refs are the first four
+    // `PrecomputedFileFacts` fields (the doc's "one program point"); the
+    // returned `import_starts`/`saw_call_node` are exactly what decides
+    // TREELESS below — structurally, from what this walk saw, not from a
+    // language table (I3).
+    let (ast_refs, import_starts, saw_call_node) = fused_scope_refs_import_walk(
+        tree.root_node(),
+        0,
+        &mut scopes,
+        &mut entity_scope_map,
+        &mut entity_inner_scope,
+        &file_lookup,
+        &children_by_parent,
+        &entity_map,
+        source,
+        config,
+    );
+
+    // TREELESS(F) (§1.2): no node kind `classify_import_stmt` handles, and no
+    // literal `"call"` node. Failing either means pass 2 would still need
+    // this file's tree for something (import replay or ctor-infer), so no
+    // facts are emitted — this file falls back to the re-parse path exactly
+    // as it does today (I6). This is what keeps JS/TS's own precompute
+    // (unconditional, relying on `skip_js_ts_imports`) from needing to route
+    // through this function at all: a JS/TS file with real imports would
+    // fail this gate, which is correct for *this* function but would be
+    // wrong for JS/TS's actual license.
+    if !import_starts.is_empty() || saw_call_node {
+        return None;
+    }
+
+    let mut return_type_map: HashMap<String, String> = HashMap::default();
+    scan_return_types(
+        tree.root_node(),
+        file_path,
+        &file_lookup,
+        source,
+        &mut return_type_map,
+        config,
+    );
+
+    let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
+    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
+    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
+    scan_init_self_attrs(
+        tree.root_node(),
+        file_path,
+        &file_entities,
+        &entity_map,
+        source,
+        &mut instance_attr_types,
+        &mut init_params,
+        &mut attr_to_param,
+        config,
+    );
+
+    Some(PrecomputedFileFacts {
+        content,
+        scopes,
+        entity_scope_map,
+        entity_inner_scope,
+        ast_refs,
+        return_type_map,
+        instance_attr_types,
+        init_params,
+        attr_to_param,
+    })
 }
 
 fn resolve_with_scopes_full_inner(
@@ -699,7 +1570,11 @@ fn resolve_with_scopes_full_inner(
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
     emit_local_binding_log: bool,
     emit_entity_ids: Option<&HashSet<&str>>,
+    chunked: Option<&ChunkedResolveInputs<'_>>,
+    mut incremental: Option<&mut ScopeIncremental<'_, '_>>,
 ) -> ScopeResultFull {
+    let precomputed_facts = chunked.map(|c| c.facts);
+    let entity_index = chunked.map(|c| c.entity_index);
     let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
     let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
@@ -769,6 +1644,10 @@ fn resolve_with_scopes_full_inner(
             owner_members,
             entity_ranges,
             go_pkg_index,
+            // No registry reaches this fallback — it exists for callers that
+            // hand us entities without one — so there are no overrides to
+            // honor and `reparse_language_config` keeps the raw extension.
+            ext_overrides: HashMap::default(),
         };
         &owned_lookups
     };
@@ -778,25 +1657,23 @@ fn resolve_with_scopes_full_inner(
     let entity_ranges = &lookups.entity_ranges;
     let go_pkg_index = &lookups.go_pkg_index;
 
-    // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
-    let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
-    for entity in all_entities {
-        entities_by_file
-            .entry(entity.file_path.as_str())
-            .or_default()
-            .push(entity);
-    }
-
-    // Build parent_id indexed entity lookup: parent_id -> Vec<&SemanticEntity>
-    let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
-    for entity in all_entities {
-        if let Some(ref pid) = entity.parent_id {
-            children_by_parent
-                .entry(pid.as_str())
-                .or_default()
-                .push(entity);
-        }
-    }
+    // File-path / parent_id indexed entity lookups. Both are a pure function
+    // of `all_entities` alone (same result no matter which chunk is being
+    // resolved), so when the caller already built one (semx-6rd CUT 2 —
+    // `resolve_scopes_in_file_chunks` builds it once before its chunk loop),
+    // reuse it instead of rescanning the whole corpus again on every chunk.
+    let __chunk_entity_index_t0 = Instant::now();
+    let owned_entity_index;
+    let (entities_by_file, children_by_parent) = if let Some(idx) = entity_index {
+        (&idx.entities_by_file, &idx.children_by_parent)
+    } else {
+        owned_entity_index = PrebuiltEntityIndex::build(all_entities);
+        (
+            &owned_entity_index.entities_by_file,
+            &owned_entity_index.children_by_parent,
+        )
+    };
+    prof::add_chunk_entity_index_ns(__chunk_entity_index_t0.elapsed());
 
     // Return type map: function_entity_id -> class_name (if function returns ClassName())
     let mut return_type_map: HashMap<String, String> = HashMap::default();
@@ -818,32 +1695,139 @@ fn resolve_with_scopes_full_inner(
     } else {
         HashSet::default()
     };
-    // Parse any files not already in the pre-parsed set
-    for file_path in file_paths {
-        if pre_set.contains(file_path) {
-            continue;
-        }
-        let full_path = root.join(file_path);
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-        let config = match get_language_config(ext) {
-            Some(c) => c,
-            None => continue,
-        };
-        let language = match (config.get_language)() {
-            Some(l) => l,
-            None => continue,
-        };
-        let mut parser = tree_sitter::Parser::new();
-        let _ = parser.set_language(&language);
-        if let Some(tree) = parser.parse(content.as_bytes(), None) {
-            owned_parsed_files.push((file_path.clone(), content, tree));
+    // Parse any files not already in the pre-parsed set. This is the exact
+    // same per-file read+parse work pass 1 already does in parallel (see
+    // `EntityGraph::build`'s `maybe_par_iter!(file_paths).filter_map(..)` in
+    // graph.rs) — just re-run here for files pass 1 didn't retain a tree for
+    // (repos over `PARSED_FILE_REUSE_LIMIT`). Same macro, same order-preserving
+    // filter_map+collect pattern, so `owned_parsed_files` ends up in exactly
+    // the order the old serial `for file_path in file_paths` loop produced it
+    // (pre-parsed files first, then re-parsed files in `file_paths` order).
+    let __reparse_t0 = Instant::now();
+    enum ReparseOutcome<'a> {
+        Parsed((String, String, tree_sitter::Tree)),
+        Pathological(&'a str),
+    }
+    let reparse_results: Vec<ReparseOutcome> = maybe_par_iter!(file_paths)
+        .filter_map(|file_path| {
+            if pre_set.contains(file_path) {
+                return None;
+            }
+            // semx-6rd CUT 1: this file's facts were already collected in
+            // pass 1 while its tree was in hand — nothing here needs a fresh
+            // parse. See `PrecomputedFileFacts`.
+            if precomputed_facts.is_some_and(|m| m.contains_key(file_path)) {
+                return None;
+            }
+            // semx-au8 (W2): a file whose language has no `scope_resolve`
+            // config is declined by *every* consumer of this vector — the
+            // per-file scope closure below opens with exactly this predicate
+            // (`get_language_config(ext).and_then(|c| c.scope_resolve)?`), the
+            // return-type/init-attr scan repeats it, `build_ts_default_export_
+            // table` filters to JS/TS and `build_swift_call_signatures` to
+            // `.swift`, all of which have one. So its tree was read, parsed and
+            // dropped. Skipping the read+parse is work elimination, not a
+            // semantics change: chunk membership, chunk order, the visited-chunk
+            // guard and every surviving file's own facts are untouched. Measured
+            // on llvm-project, 34,260 files / 267 MB of `.h`/`.c` re-parsed per
+            // cold build for nothing (linux: 29,158 / 333 MB) — see
+            // RESOLUTION-PROFILE.md's "W2: parse ceiling".
+            //
+            // The one consumer that does *not* repeat the predicate is
+            // `infer_constructor_param_types`' `scan_constructor_calls` sweep,
+            // which walks every tree in this vector. It is a provable no-op
+            // unless `init_params` *and* `attr_to_param` are both non-empty
+            // (its own early return), and both are built exclusively from files
+            // that pass the predicate above; the gate section of W2 records the
+            // bit-identical entity/edge measurement on all five giants that
+            // makes the elimination observationally sound, not just argued.
+            // (`?` on the admission test itself: the grammar this file is
+            // re-parsed *with* still comes from `reparse_language_config`.)
+            scope_resolve_config_for_path(file_path)?;
+            let full_path = root.join(file_path);
+            let content = std::fs::read_to_string(&full_path).ok()?;
+            let config = reparse_language_config(file_path, &lookups.ext_overrides)?;
+            // semx-jo1: shared with pass 1's `CodeParserPlugin::extract_entities_with_tree`
+            // (see `plugins/code/mod.rs`'s `is_pathological_large_file` doc
+            // comment) -- one shared, deterministic, pure-per-file give-up
+            // predicate instead of a wall-clock race, and instead of two
+            // independently-maintained copies of either. This reparse set can
+            // be tens of thousands of files on a >20k-file repo
+            // (dotnet-runtime's was 34,897 in one profiled run); a hybrid
+            // (predicate-then-wall-clock-fallback) was tried and measured to
+            // still reproduce semx-4w1's chunk-boundary edge-count flip
+            // (981,283 at a 5,000-file chunk vs 981,284 at 1,000, stable
+            // across repeats) -- proof some *other* file was still racing
+            // `parse_tree_within_budget`'s clock and flipping outcome with
+            // it. Removing the wall-clock path entirely (this version)
+            // measured bit-identical entities/edges at both chunk sizes --
+            // see `RESOLUTION-PROFILE.md`.
+            let parsed = if is_pathological_large_file(&content) {
+                None
+            } else {
+                parse_tree(config, &content)
+            };
+            match parsed {
+                Some(tree) => Some(ReparseOutcome::Parsed((file_path.clone(), content, tree))),
+                // Pathological content shape (see `is_pathological_large_file`).
+                // Degrade loudly rather than stalling the whole command on one
+                // fixture file.
+                None => Some(ReparseOutcome::Pathological(file_path.as_str())),
+            }
+        })
+        .collect();
+    let mut pathological: Vec<&str> = Vec::new();
+    for outcome in reparse_results {
+        match outcome {
+            ReparseOutcome::Parsed(triple) => owned_parsed_files.push(triple),
+            ReparseOutcome::Pathological(fp) => pathological.push(fp),
         }
     }
+    if !pathological.is_empty() {
+        let shown = pathological
+            .iter()
+            .take(5)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = pathological.len().saturating_sub(5);
+        eprintln!(
+            "warning: skipped cross-file reference resolution for {} file(s) with a pathologically long single line/run (see is_pathological_large_file): {}{}",
+            pathological.len(),
+            shown,
+            if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            }
+        );
+    }
+    prof::add_reparse_ns(__reparse_t0.elapsed());
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
+    // semx-4w1: the chunked (>PARSED_FILE_REUSE_LIMIT) path re-parses and
+    // retains a live `(path, content, Tree)` triple per file for every
+    // non-JS/TS file in this chunk (`chunked` only precomputes JS/TS facts —
+    // see `PrecomputedFileFacts`'s doc comment). `content`'s bytes are
+    // attributed elsewhere; the `tree_sitter::Tree` itself is opaque from
+    // outside the C library (no cheap `.heap_bytes()`), so this samples the
+    // *process's actual RSS* right after the chunk's trees are all live but
+    // before anything in this call has had a chance to drop them — the one
+    // place in the whole build this instrumentation can observe that cost
+    // directly instead of estimating it. See RESOLUTION-PROFILE.md.
+    if crate::parser::mem_profile::enabled() {
+        let content_bytes: usize = parsed_files
+            .iter()
+            .map(|(_, content, _)| content.len())
+            .sum();
+        if let Some(rss) = crate::parser::mem_profile::current_rss_bytes() {
+            eprintln!(
+                "SEM_PROFILE_MEM[chunk-reparse] files={} content_mb={:.1} process_rss_mb={:.1}",
+                parsed_files.len(),
+                content_bytes as f64 / (1024.0 * 1024.0),
+                rss as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
     let content_by_file = OnceLock::new();
     let exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
         Mutex::new(HashMap::default());
@@ -859,12 +1843,29 @@ fn resolve_with_scopes_full_inner(
     } else {
         build_ts_default_export_table(parsed_files, &symbol_table, entity_map)
     };
-    let top_level_entities = OnceLock::new();
+    // semx-la2: on the chunked path, both import-handler indexes are the
+    // caller's — owned by `resolve_scopes_in_file_chunks`, shared across
+    // every chunk — because `build_top_level_entity_index` is a pure
+    // function of corpus-invariant inputs there (see
+    // `ChunkedResolveInputs::top_level_entities`'s doc comment). Every other
+    // caller keeps a per-call lock, exactly the old behavior (one call ==
+    // the whole corpus for them anyway). The py lock is semx-sbf's sibling
+    // of the TS one: same struct, built lazily (only if a `.py` bare
+    // `import module` statement is actually seen) restricted to `.py` files
+    // — see `build_top_level_entity_index` and `register_namespace_import`.
+    let owned_top_level_entities = OnceLock::new();
+    let owned_py_top_level_entities = OnceLock::new();
+    let (top_level_entities, py_top_level_entities) = match chunked {
+        Some(c) => (c.top_level_entities, c.py_top_level_entities),
+        None => (&owned_top_level_entities, &owned_py_top_level_entities),
+    };
 
     // Pass 1: Scan ALL files for return types and instance attr types first
     // This ensures cross-file return type info is available during resolution
     // Parallelized: each file produces local maps, then merged sequentially.
+    let __pass1_t0 = Instant::now();
     let pass1_results: Vec<(
+        &str,
         HashMap<String, String>,
         HashMap<(String, String), String>,
         HashMap<String, Vec<String>>,
@@ -872,8 +1873,9 @@ fn resolve_with_scopes_full_inner(
     )> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
             let source = content.as_bytes();
-            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-            let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
+            // Same admission test the re-parse loop applies before building a
+            // tree at all (semx-au8).
+            let config = scope_resolve_config_for_path(file_path)?;
 
             let file_entities = entities_by_file
                 .get(file_path.as_str())
@@ -908,6 +1910,7 @@ fn resolve_with_scopes_full_inner(
             );
 
             Some((
+                file_path.as_str(),
                 local_return_type_map,
                 local_instance_attr_types,
                 local_init_params,
@@ -916,30 +1919,89 @@ fn resolve_with_scopes_full_inner(
         })
         .collect();
 
-    for (local_rtm, local_iat, local_ip, local_atp) in pass1_results {
-        return_type_map.extend(local_rtm);
-        instance_attr_types.extend(local_iat);
-        init_params.extend(local_ip);
-        attr_to_param.extend(local_atp);
+    // Merge in `file_paths` order (not "all freshly-scanned files, then all
+    // precomputed files" or vice versa) so `instance_attr_types`/`init_params`/
+    // `attr_to_param` — keyed by class *name*, not entity id, so two
+    // same-named classes in different files can collide — see the same
+    // last-write-wins overwrite order the original single `parsed_files`-order
+    // merge produced, regardless of which files took the semx-6rd CUT 1
+    // precomputed-facts path vs. the fresh re-parse+scan path.
+    // (`return_type_map` is keyed by entity id, which is always unique to one
+    // file, so merge order can't affect it either way.)
+    let mut pass1_by_file: HashMap<&str, Pass1FileScan> = pass1_results
+        .into_iter()
+        .map(|(fp, rtm, iat, ip, atp)| (fp, (rtm, iat, ip, atp)))
+        .collect();
+    for file_path in file_paths {
+        if let Some(facts) = precomputed_facts.and_then(|m| m.get(file_path)) {
+            return_type_map.extend(
+                facts
+                    .return_type_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            instance_attr_types.extend(
+                facts
+                    .instance_attr_types
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            init_params.extend(
+                facts
+                    .init_params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            attr_to_param.extend(
+                facts
+                    .attr_to_param
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+        } else if let Some((rtm, iat, ip, atp)) = pass1_by_file.remove(file_path.as_str()) {
+            return_type_map.extend(rtm);
+            instance_attr_types.extend(iat);
+            init_params.extend(ip);
+            attr_to_param.extend(atp);
+        }
     }
+    prof::add_pass1_scan_ns(__pass1_t0.elapsed());
 
     // Pass 1b: Infer constructor parameter types from call sites
     // For `Transaction(get_connection())`, infer conn param has type Connection.
     // Then resolve self.conn = conn -> (Transaction, conn) -> Connection
+    let __ctor_infer_t0 = Instant::now();
     infer_constructor_param_types(
         parsed_files,
         &return_type_map,
         &init_params,
         &attr_to_param,
         &symbol_table,
+        entity_map,
         &mut instance_attr_types,
     );
-    let func_name_return_types = deterministic_return_types_by_name(&return_type_map, symbol_table);
+    prof::add_ctor_infer_ns(__ctor_infer_t0.elapsed());
+    let __return_types_by_name_t0 = Instant::now();
+    let func_name_return_types =
+        deterministic_return_types_by_name(&return_type_map, symbol_table, entity_map);
+    prof::add_return_types_by_name_ns(__return_types_by_name_t0.elapsed());
 
-    let swift_call_signatures = if parsed_files
-        .iter()
-        .any(|(file_path, _, _)| file_path.ends_with(".swift"))
-    {
+    // semx-nuv: on the chunked path, whether to build `swift_call_signatures`
+    // at all must be a corpus-wide question, not "does *this chunk's*
+    // `parsed_files` contain a `.swift` file" — see `ChunkedResolveInputs::
+    // corpus_has_swift`'s doc comment for the full mechanism and why this was
+    // a chunk-order-dependent tie-break. The unchunked path (`chunked` is
+    // `None`, e.g. `resolve_with_scopes_full_for_entities`) already resolves
+    // the whole corpus in one call, so its `parsed_files` already covers every
+    // file and the old per-`parsed_files` check was already corpus-wide there
+    // — unchanged, and cheaper than a redundant `all_entities` scan.
+    let corpus_has_swift_file = match chunked {
+        Some(c) => c.corpus_has_swift,
+        None => parsed_files
+            .iter()
+            .any(|(file_path, _, _)| file_path.ends_with(".swift")),
+    };
+    let swift_call_signatures = if corpus_has_swift_file {
         build_swift_call_signatures(parsed_files, all_entities, &entity_ranges, entity_map)
     } else {
         HashMap::default()
@@ -949,6 +2011,7 @@ fn resolve_with_scopes_full_inner(
     // in Pass 2 would rescan the entire table to find its own entries — O(files ×
     // imports), which is quadratic on a large repo. Grouping makes each file O(its
     // own imports).
+    let __import_group_t0 = Instant::now();
     let import_table_by_file: HashMap<&str, Vec<(&str, &str)>> =
         if let Some(import_table) = pre_built_import_table {
             let mut grouped: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
@@ -962,68 +2025,287 @@ fn resolve_with_scopes_full_inner(
         } else {
             HashMap::default()
         };
+    prof::add_import_group_ns(__import_group_t0.elapsed());
 
-    // Pass 2: Build scopes, imports, and resolve references per file (parallel)
-    let per_file_results: Vec<(
-        Vec<(String, String, RefType)>,
-        Vec<ResolutionEntry>,
-        HashMap<String, HashSet<String>>,
-    )> = maybe_par_iter!(parsed_files)
-        .filter_map(|(file_path, content, tree)| {
-            let source = content.as_bytes();
-            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-            let config = get_language_config(ext).and_then(|c| c.scope_resolve)?;
-
-            let mut scopes: Vec<Scope> = vec![Scope {
-                parent: None,
-                defs: HashMap::default(),
-                bindings: HashSet::default(),
-                binding_rows: HashMap::default(),
-                types: HashMap::default(),
-                pending_call_types: HashMap::default(),
-                pending_field_types: HashMap::default(),
-                owner_id: None,
-                kind: "module",
-            }];
-
-            let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
-            let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
-
-            if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
-                for (_start, _end, eid) in ranges {
-                    if let Some(info) = entity_map.get(eid) {
-                        if info.parent_id.is_none() {
-                            scopes[0].defs.insert(info.name.clone(), eid.clone());
-                            entity_scope_map.insert(eid.clone(), 0);
-                        }
-                    }
+    // semx-022 red-green: fingerprint every chunk-scoped table this function
+    // just built, then decide — per file, against the *complete* fingerprint map
+    // (the caller already added the corpus-wide tables) — which files may reuse
+    // their cached edges. This must happen before the pass-2 closure runs,
+    // because the closure short-circuits on the answer.
+    let green_files: HashSet<&str> = match incremental.as_deref_mut() {
+        None => HashSet::default(),
+        Some(state) => {
+            let scope_tag = state.scope_tag;
+            {
+                let mut sink = FingerprintSink::new(&mut state.inc.cur_fp, scope_tag);
+                for (id, ty) in &return_type_map {
+                    sink.one(Table::ReturnTypeMap, id, hash_of_str(ty));
+                }
+                for ((class_name, attr), ty) in &instance_attr_types {
+                    sink.two(Table::InstanceAttrTypes, class_name, attr, hash_of_str(ty));
+                }
+                for (name, ty) in &func_name_return_types {
+                    sink.one(Table::FuncNameReturnTypes, name, hash_of_str(ty));
+                }
+                // Swift call signatures flip `resolve_ref` onto a different
+                // branch entirely, and that branch's candidate filtering is not
+                // attributed per file — no single file's read set can name this
+                // dependency, so it is fingerprinted whole (`Table`'s own doc:
+                // a whole-table guard's *change* forces every eligible file
+                // RED, exactly like `GuardPyWildcardImport`'s narrower cousin).
+                sink.whole(
+                    Table::GuardSwiftCallSignatures,
+                    hash_swift_signatures(&swift_call_signatures),
+                );
+                // Per-file import slices. Hashed order-independently: the slice
+                // is grouped out of a `HashMap`, so its `Vec` order is not
+                // stable across runs, while its *content* is (keys are unique
+                // per (file, name), so nothing overwrites anything).
+                for (file_path, entries) in &import_table_by_file {
+                    sink.one(
+                        Table::ImportsForFile,
+                        file_path,
+                        hash_import_slice(entries.as_slice()),
+                    );
                 }
             }
+            // A file with no import entries at all still depends on that
+            // absence, and the loop above cannot record it. `unchanged()`
+            // compares `Option`s, so an absent key on both sides is unchanged
+            // and an appearing key is a change — exactly right.
+            //
+            // semx-bvu: whether Swift call-signature ambiguity resolution
+            // forces every eligible file RED must be "did the whole-table
+            // guard's fingerprint *change*", not "is the table non-empty".
+            // The two coincide the first time a corpus ever has a `.swift`
+            // file (nothing to compare against yet — `prev_fp.get` misses,
+            // `cur_fp.get` hits, so `changed` is still `true`, matching the
+            // old behavior exactly on that build). They diverge on every
+            // later no-op rebuild of a corpus that merely *contains* a
+            // `.swift` file without its signatures having changed: a single
+            // incidental fixture (vscode's one-file colorize-test corpus,
+            // measured in semx-bvu at 13,292/13,292 files forced RED on a
+            // zero-change reload) no longer permanently disables reuse for
+            // every other file just because `swift_call_signatures` happens
+            // to be non-empty. This is still the same whole-table-guard
+            // mechanism every other guard in this module uses (`Table`'s own
+            // doc: "fingerprinted whole and any change forces every file
+            // RED") — the fix makes the *change* the trigger, not mere
+            // presence, which is the general rule this one guard had
+            // drifted from. Fails toward RED, never toward a false GREEN:
+            // a missing key on either side (first build, or a `prev_fp` that
+            // never tracked this table) reads as `None != Some(_)` or
+            // `Some(_) != None`, i.e. `changed`, the safe direction.
+            let swift_guard_key = key_whole(Table::GuardSwiftCallSignatures, scope_tag);
+            let swift_signatures_changed =
+                state.inc.prev_fp.get(swift_guard_key) != state.inc.cur_fp.get(swift_guard_key);
+            file_paths
+                .iter()
+                .filter(|file_path| {
+                    if swift_signatures_changed || !state.eligible.contains(file_path.as_str()) {
+                        return false;
+                    }
+                    let Some(cached) = state.inc.cached(file_path.as_str()) else {
+                        return false;
+                    };
+                    state.inc.may_reuse(file_path, &cached.scope.read_set)
+                })
+                .map(String::as_str)
+                .collect()
+        }
+    };
+    let recording = incremental.is_some();
+    let cache = incremental.as_deref().map(|s| &*s.inc);
+    let scope_tag = incremental.as_deref().map(|s| s.scope_tag).unwrap_or(0);
 
+    // Pass 2: Build scopes, imports, and resolve references per file (parallel)
+    let __pass2_t0 = Instant::now();
+    // semx-6rd CUT 1: pass 2 used to always iterate `parsed_files` (which
+    // meant every file needed a live tree, forcing the re-parse above for
+    // anything beyond `PARSED_FILE_REUSE_LIMIT`). It now iterates
+    // `file_paths` and, per file, prefers `precomputed_facts` (no tree
+    // needed) over a freshly (re-)parsed tree from `parsed_files` — indexed
+    // once here for O(1) lookup instead of the O(files) scan a `.find()` per
+    // file would cost.
+    let parsed_by_path: HashMap<&str, &(String, String, tree_sitter::Tree)> = parsed_files
+        .iter()
+        .map(|entry| (entry.0.as_str(), entry))
+        .collect();
+    let per_file_results: Vec<PerFileScopeResult> = maybe_par_iter!(file_paths)
+        .filter_map(|file_path| {
+            // semx-022: a GREEN file's edges and consumed words are reused
+            // verbatim, in the exact position in the merge order a cold build
+            // would have produced them — the whole point of short-circuiting
+            // *inside* this closure rather than splicing edges afterwards.
+            //
+            // semx-4an: the copy made here is the *only* one. It exists because
+            // `all_edges` and the corpus-wide `consumed_words` are build-scoped
+            // and consume what they are given, while the cache entry has to
+            // survive into the next build — and it is made here, in the parallel
+            // closure, rather than in the sequential merge below. The merge no
+            // longer writes anything back for a GREEN file (`keep_scope`): the
+            // entry it would have written is the entry it would have read from.
+            // The read set is not copied at all any more, for the same reason.
+            if green_files.contains(file_path.as_str()) {
+                let cached = cache
+                    .and_then(|inc| inc.cached(file_path.as_str()))
+                    .expect("green implies a cached result exists");
+                return Some(PerFileScopeResult {
+                    file_path: file_path.as_str(),
+                    edges: cached.scope.edges.clone(),
+                    log: Vec::new(),
+                    consumed_words: cached.scope.consumed_words.clone(),
+                    read_set: None,
+                    reused: true,
+                });
+            }
+            let mut rec = if recording {
+                Recorder::on(scope_tag)
+            } else {
+                Recorder::off()
+            };
+            let __prof_on = prof::enabled();
+            // `names_enabled`, not `enabled`: at `SEM_PROFILE_RESOLVE=2` the
+            // phase timers below stay on but this stays `None`, which is what
+            // makes `select_member_profiled!` take its untimed branch and
+            // removes W3's 1.45-1.65x instrument tax from the wall time the
+            // phase timers are attributing.
+            let mut __file_profile: Option<prof::FileAccum> =
+                prof::names_enabled().then(prof::FileAccum::default);
+            let __scope_build_t0 = __prof_on.then(Instant::now);
+            // Same admission test the re-parse loop applies before building a
+            // tree at all (semx-au8).
+            let config = scope_resolve_config_for_path(file_path)?;
+
+            let precomputed = precomputed_facts.and_then(|m| m.get(file_path.as_str()));
+            let reparsed = if precomputed.is_none() {
+                parsed_by_path.get(file_path.as_str()).copied()
+            } else {
+                None
+            };
+            let content: &str = match (precomputed, reparsed) {
+                (Some(facts), _) => facts.content.as_str(),
+                (None, Some((_, content, _))) => content.as_str(),
+                (None, None) => return None,
+            };
+            let source = content.as_bytes();
+
+            // semx-w5k: scope_build's own decomposition. Zero-cost when the
+            // profiler is off (every `then` is a `bool` test), and every
+            // sub-timer measures where its work happens rather than
+            // re-deriving a share afterwards.
+            let mut __sb = prof::ScopeBuildAccum::default();
+            let __t = __prof_on.then(Instant::now);
             let file_entities: Vec<&SemanticEntity> = entities_by_file
                 .get(file_path.as_str())
                 .map(|v| v.as_slice())
                 .unwrap_or(&[])
                 .to_vec();
             let file_lookup = FileEntityLookup::new(&file_entities);
+            if let Some(t) = __t {
+                __sb.entity_lookup_ns = t.elapsed().as_nanos() as u64;
+                __sb.entities_spanned = file_entities.len() as u64;
+            }
+            let __t = __prof_on.then(Instant::now);
             let entity_spans = find_entity_source_spans(&file_entities, content);
+            if let Some(t) = __t {
+                __sb.entity_spans_ns = t.elapsed().as_nanos() as u64;
+            }
 
-            build_scopes_from_ast(
-                tree.root_node(),
-                0,
-                &mut scopes,
-                &mut entity_scope_map,
-                &mut entity_inner_scope,
-                &file_lookup,
-                &children_by_parent,
-                entity_map,
-                file_path,
-                source,
-                config,
-            );
+            // `fused_import_starts` is `Some` exactly when this file took the
+            // fused triple walk (semx-3ao): the recorded import starts the
+            // pruned replay below consumes instead of `extract_imports_from_ast`
+            // re-walking the tree. `None` = the three-walk path or precomputed.
+            let (
+                mut scopes,
+                entity_scope_map,
+                entity_inner_scope,
+                all_file_refs,
+                fused_import_starts,
+            ) = if let Some(facts) = precomputed {
+                __sb.precomputed_path = true;
+                let __t = __prof_on.then(Instant::now);
+                let cloned = (
+                    facts.scopes.clone(),
+                    facts.entity_scope_map.clone(),
+                    facts.entity_inner_scope.clone(),
+                    facts.ast_refs.clone(),
+                    None,
+                );
+                if let Some(t) = __t {
+                    __sb.precomputed_clone_ns = t.elapsed().as_nanos() as u64;
+                }
+                cloned
+            } else {
+                let (_, _, tree) = reparsed.expect("checked above: content came from reparsed");
+                let mut scopes: Vec<Scope> = vec![Scope {
+                    parent: None,
+                    defs: HashMap::default(),
+                    bindings: HashSet::default(),
+                    binding_rows: HashMap::default(),
+                    types: HashMap::default(),
+                    pending_call_types: HashMap::default(),
+                    pending_field_types: HashMap::default(),
+                    owner_id: None,
+                    kind: "module",
+                }];
+                let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
+                let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
 
+                if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
+                    for (_start, _end, eid) in ranges {
+                        if let Some(info) = entity_map.get(eid) {
+                            if info.parent_id.is_none() {
+                                scopes[0].defs.insert(info.name.clone(), eid.clone());
+                                entity_scope_map.insert(eid.clone(), 0);
+                            }
+                        }
+                    }
+                }
+
+                // BS3-F2 (semx-3ao): the fused triple walk is THE AST path —
+                // the prototype's Python gate measured -23.6% of the box on
+                // HA and was deleted. The unfused walks survive as the invariant
+                // test's specification and (build_scopes/collect) as the
+                // JS/TS pass-1 producer's calls.
+                __sb.fused_path = true;
+                let __t = __prof_on.then(Instant::now);
+                let (all_file_refs, import_starts, _saw_call_node) = fused_scope_refs_import_walk(
+                    tree.root_node(),
+                    0,
+                    &mut scopes,
+                    &mut entity_scope_map,
+                    &mut entity_inner_scope,
+                    &file_lookup,
+                    children_by_parent,
+                    entity_map,
+                    source,
+                    config,
+                );
+                if let Some(t) = __t {
+                    __sb.fused_walk_ns = t.elapsed().as_nanos() as u64;
+                }
+                let fused_import_starts = Some(import_starts);
+                (
+                    scopes,
+                    entity_scope_map,
+                    entity_inner_scope,
+                    all_file_refs,
+                    fused_import_starts,
+                )
+            };
+            if __prof_on {
+                __sb.scopes_built = scopes.len() as u64;
+                __sb.refs_collected = all_file_refs.len() as u64;
+            }
+
+            let __t_rekey = __prof_on.then(Instant::now);
             let mut local_import_table: HashMap<(String, String), String> = HashMap::default();
             if pre_built_import_table.is_some() {
+                // One record for the whole slice: every `import_table_by_name`
+                // read inside `resolve_ref` is served from it, and the slice's
+                // *targets* are what tie this file to other files.
+                rec.one(Table::ImportsForFile, file_path.as_str());
                 if let Some(entries) = import_table_by_file.get(file_path.as_str()) {
                     for (local_name, target_id) in entries {
                         local_import_table.insert(
@@ -1036,56 +2318,98 @@ fn resolve_with_scopes_full_inner(
                     }
                 }
             }
-            extract_imports_from_ast(
-                tree.root_node(),
-                file_path,
-                source,
-                &symbol_table,
-                entity_map,
-                &mut local_import_table,
-                &mut scopes,
-                config,
-                &go_pkg_index,
-                &ts_default_exports,
-                &top_level_entities,
-                parsed_files,
-                &content_by_file,
-                &exported_names_by_file,
-                pre_built_import_table.is_some(),
-            );
+            if let Some(t) = __t_rekey {
+                __sb.import_rekey_ns = t.elapsed().as_nanos() as u64;
+            }
+            let __t = __prof_on.then(Instant::now);
+            // The one walk already recorded where every handled import
+            // statement starts; run the handlers in extract's own order,
+            // visiting only subtrees that contain one. Empty (every C# file:
+            // no matching kinds) ⇒ nothing to do at all.
+            if let (Some((_, _, tree)), Some(import_starts)) = (reparsed, &fused_import_starts) {
+                if !import_starts.is_empty() {
+                    replay_import_stmts_pruned(
+                        tree.root_node(),
+                        import_starts,
+                        file_path,
+                        source,
+                        symbol_table,
+                        entity_map,
+                        &mut local_import_table,
+                        &mut scopes,
+                        config,
+                        go_pkg_index,
+                        &ts_default_exports,
+                        top_level_entities,
+                        py_top_level_entities,
+                        parsed_files,
+                        &content_by_file,
+                        &exported_names_by_file,
+                        pre_built_import_table.is_some(),
+                        &mut rec,
+                    );
+                }
+            }
+            // else: `precomputed` (JS/TS, semx-6rd CUT 1) — `extract_imports_from_ast`
+            // is a proven structural no-op for JS/TS here; see `PrecomputedFileFacts`'s
+            // doc comment for why.
+            if let Some(t) = __t {
+                __sb.extract_imports_ns = t.elapsed().as_nanos() as u64;
+            }
 
             // The per-file import table is keyed by (file_path, name) but only ever
             // holds this file's entries, so re-key it by name once. resolve_ref then
             // looks up imports without allocating a key string per reference.
+            let __t = __prof_on.then(Instant::now);
             let local_import_by_name: HashMap<&str, &str> = local_import_table
                 .iter()
                 .map(|((_, name), target_id)| (name.as_str(), target_id.as_str()))
                 .collect();
+            if let Some(t) = __t {
+                __sb.import_rekey_ns += t.elapsed().as_nanos() as u64;
+            }
 
             // Resolve pending call types using the complete return type map.
+            let __t = __prof_on.then(Instant::now);
             inject_return_type_bindings(
                 &mut scopes,
                 &func_name_return_types,
                 &return_type_map,
                 &local_import_by_name,
+                &mut rec,
             );
+            if let Some(t) = __t {
+                __sb.inject_return_types_ns = t.elapsed().as_nanos() as u64;
+            }
             // Resolve `val x = obj.field` accesses against the class field-type map.
-            inject_field_type_bindings(&mut scopes, &instance_attr_types);
+            let __t = __prof_on.then(Instant::now);
+            inject_field_type_bindings(&mut scopes, &instance_attr_types, &mut rec);
+            if let Some(t) = __t {
+                __sb.inject_field_types_ns = t.elapsed().as_nanos() as u64;
+            }
+            let __scope_build_ns = __scope_build_t0.map(|t| t.elapsed().as_nanos() as u64);
+            if __prof_on {
+                prof::merge_scope_build(__sb);
+            }
 
             let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
             let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
-            // Walk the AST once for the entire file, collecting all refs with row positions
-            let all_file_refs = collect_all_file_refs(tree.root_node(), source, config);
+            let __ref_collect_t0 = __prof_on.then(Instant::now);
             let refs_by_row = build_refs_by_row(&all_file_refs);
             let descendant_ranges_by_entity =
                 build_descendant_ranges_by_entity(&file_entities, entity_map);
+            let __ref_collect_ns = __ref_collect_t0.map(|t| t.elapsed().as_nanos() as u64);
             let mut lookup_cache = ScopeLookupCache::default();
             let mut last_resolution: Option<(
                 ResolutionCacheKey<'_>,
                 Option<(String, RefType, &'static str)>,
             )> = None;
+            let __ref_loop_t0 = __prof_on.then(Instant::now);
+            let mut __resolve_ref_ns: u64 = 0;
+            let mut __cache_hit: u64 = 0;
+            let mut __cache_miss: u64 = 0;
 
             for entity in &file_entities {
                 if emit_entity_ids
@@ -1183,8 +2507,15 @@ fn resolve_with_scopes_full_inner(
                                 .as_ref()
                                 .filter(|(last_key, _)| *last_key == cache_key)
                             {
+                                if __prof_on {
+                                    __cache_hit += 1;
+                                }
                                 cached.clone()
                             } else {
+                                if __prof_on {
+                                    __cache_miss += 1;
+                                }
+                                let __resolve_ref_t0 = __prof_on.then(Instant::now);
                                 let resolved = resolve_ref(
                                     ast_ref,
                                     scope_idx,
@@ -1202,12 +2533,21 @@ fn resolve_with_scopes_full_inner(
                                     allow_implicit_instance_member_receiver,
                                     &file_lookup,
                                     &mut lookup_cache,
+                                    __file_profile.as_mut(),
+                                    &mut rec,
                                 );
+                                if let Some(t0) = __resolve_ref_t0 {
+                                    __resolve_ref_ns += t0.elapsed().as_nanos() as u64;
+                                }
                                 last_resolution = Some((cache_key, resolved.clone()));
                                 resolved
                             }
                         } else {
-                            resolve_ref(
+                            if __prof_on {
+                                __cache_miss += 1;
+                            }
+                            let __resolve_ref_t0 = __prof_on.then(Instant::now);
+                            let resolved = resolve_ref(
                                 ast_ref,
                                 scope_idx,
                                 &scopes,
@@ -1224,11 +2564,20 @@ fn resolve_with_scopes_full_inner(
                                 allow_implicit_instance_member_receiver,
                                 &file_lookup,
                                 &mut lookup_cache,
-                            )
+                                __file_profile.as_mut(),
+                                &mut rec,
+                            );
+                            if let Some(t0) = __resolve_ref_t0 {
+                                __resolve_ref_ns += t0.elapsed().as_nanos() as u64;
+                            }
+                            resolved
                         };
 
                         if let Some((target_id, ref_type, method)) = resolution {
                             if target_id != entity.id {
+                                if entity.parent_id.is_some() {
+                                    rec.one(Table::EntityMap, &target_id);
+                                }
                                 let is_parent_child =
                                     entity.parent_id.as_ref().map_or(false, |pid| {
                                         pid == &target_id
@@ -1271,21 +2620,87 @@ fn resolve_with_scopes_full_inner(
                 }
             }
 
-            Some((file_edges, file_log, file_consumed_words))
+            if let Some(t0) = __ref_loop_t0 {
+                // `unwrap_or_default`, not `if let Some`: at
+                // `SEM_PROFILE_RESOLVE=2` the name accumulator is
+                // deliberately absent, but the phase timers this call merges
+                // (`scope_build`, `ref_collect`, `ref_loop`, `resolve_ref`,
+                // `files`) are exactly what `=2` exists to report. Gating the
+                // merge on the accumulator would have `=2` print zeros.
+                {
+                    let accum = __file_profile.unwrap_or_default();
+                    prof::merge_file(
+                        accum,
+                        __scope_build_ns.unwrap_or(0),
+                        __ref_collect_ns.unwrap_or(0),
+                        t0.elapsed().as_nanos() as u64,
+                        __resolve_ref_ns,
+                        __cache_hit,
+                        __cache_miss,
+                    );
+                }
+            }
+
+            Some(PerFileScopeResult {
+                file_path: file_path.as_str(),
+                edges: file_edges,
+                log: file_log,
+                consumed_words: file_consumed_words,
+                read_set: rec.enabled().then(|| rec.into_read_set()),
+                reused: false,
+            })
         })
         .collect();
+    prof::add_pass2_wall_ns(__pass2_t0.elapsed());
 
-    for (file_edges, file_log, file_consumed_words) in per_file_results {
-        all_edges.extend(file_edges);
-        log.extend(file_log);
-        for (entity_id, words) in file_consumed_words {
-            consumed_words.entry(entity_id).or_default().extend(words);
+    let __scope_merge_t0 = Instant::now();
+    for result in per_file_results {
+        if let Some(state) = incremental.as_deref_mut() {
+            if result.reused {
+                // The cache already holds this file's result — the closure above
+                // read its copy out of exactly this entry. Stamping it is the
+                // whole write.
+                state.inc.keep_scope(result.file_path);
+            } else if let Some(read_set) = result.read_set {
+                state.inc.put_scope(
+                    result.file_path,
+                    CachedScopeResult {
+                        edges: result.edges.clone(),
+                        consumed_words: result.consumed_words.clone(),
+                        read_set,
+                    },
+                );
+            }
+        }
+        all_edges.extend(result.edges);
+        log.extend(result.log);
+        // Move each file's word set in whole rather than `or_default().extend()`
+        // (semx-4an). Entity ids are `{file_path}::…` by construction, so two
+        // *files* can never contribute the same key and the vacant case is the
+        // only one that ever runs on real input — but `extend` on a fresh empty
+        // set re-hashes every word, which across a 40k-file corpus was a
+        // whole-corpus rehash on every rebuild. The occupied arm is kept as a
+        // conservative fallback; the merged contents are identical either way
+        // (the only reader collects the set into a `HashSet<&str>` and asks
+        // `contains`, so its iteration order is unobservable).
+        consumed_words.reserve(result.consumed_words.len());
+        for (entity_id, words) in result.consumed_words {
+            match consumed_words.entry(entity_id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(words);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().extend(words);
+                }
+            }
         }
     }
+    prof::add_scope_merge_ns(__scope_merge_t0.elapsed());
 
     // Deduplicate edges keeping the first-inserted (from, to). Index-based:
     // sorting indices by borrowed keys avoids the two String clones per edge
     // the old HashSet key paid — millions of allocations on a monorepo.
+    let __scope_dedup_t0 = Instant::now();
     let all_edges = {
         let mut order: Vec<usize> = (0..all_edges.len()).collect();
         order.sort_by(|&a, &b| {
@@ -1310,12 +2725,244 @@ fn resolve_with_scopes_full_inner(
         }
         result
     };
+    prof::add_scope_dedup_ns(__scope_dedup_t0.elapsed());
 
     ScopeResultFull {
         edges: all_edges,
         resolution_log: log,
         consumed_words,
     }
+}
+
+/// One file's product of the pass-2 closure. Carries the file path so the
+/// red-green cache can attribute the edges (see the edge-ownership invariant in
+/// `incremental`), and the read set that authorizes reusing them next time.
+struct PerFileScopeResult<'a> {
+    file_path: &'a str,
+    edges: Vec<(String, String, RefType)>,
+    log: Vec<ResolutionEntry>,
+    consumed_words: HashMap<String, HashSet<String>>,
+    /// `None` when not recording (the cold, non-session path).
+    read_set: Option<crate::parser::incremental::ReadSet>,
+    /// Whether this result came from the cache rather than from resolution.
+    reused: bool,
+}
+
+fn hash_of_str(v: &str) -> u64 {
+    crate::parser::incremental::hash_str(v)
+}
+
+/// Order-independent hash of one file's import-table slice. The slice is grouped
+/// out of a `HashMap`, so its order is not stable across runs; its content is.
+fn hash_import_slice(entries: &[(&str, &str)]) -> u64 {
+    let mut pairs: Vec<(&str, &str)> = entries.to_vec();
+    pairs.sort_unstable();
+    let mut h = ValueHasher::new();
+    for (name, target) in pairs {
+        h.s(name).s(target);
+    }
+    h.finish()
+}
+
+/// Whole-table hash for the Swift call-signature map (a guard, see [`Table`]).
+fn hash_swift_signatures(sigs: &HashMap<String, SwiftCallSignature>) -> u64 {
+    let mut ids: Vec<&String> = sigs.keys().collect();
+    ids.sort_unstable();
+    let mut h = ValueHasher::new();
+    for id in ids {
+        h.s(id);
+        for label in &sigs[id].argument_labels {
+            h.s(label.as_deref().unwrap_or("\u{0}"));
+        }
+    }
+    h.finish()
+}
+
+/// Fingerprint the corpus-wide lookup tables that `EntityGraph::build` owns and
+/// hands to resolution. Called once per build, before any resolution runs, so a
+/// file's read set is always compared against a map that already covers every
+/// corpus-wide table it can name.
+///
+/// Entity-keyed tables are *not* fingerprinted under a file's own entity ids —
+/// see [`crate::parser::incremental::Incremental`]: for a reuse-eligible (JS/TS)
+/// file, every id derived from its own entities is prefixed with its own path
+/// (`build_entity_id`), so those reads are already covered by the file's own
+/// content hash. Only ids that can cross a file boundary are recorded, and those
+/// all arrive through the tables below.
+///
+/// Returns the `GuardPyWildcardImport` value it folded, so an incremental
+/// rebuild can carry it forward and update it by XOR rather than refolding the
+/// corpus (see [`fingerprint_corpus_tables_incremental`]).
+pub(crate) fn fingerprint_corpus_tables(
+    lookups: &PreBuiltLookups,
+    entity_map: &HashMap<String, EntityInfo>,
+    fp: &mut TableFingerprints,
+) -> u64 {
+    let mut sink = FingerprintSink::new(fp, 0);
+    // `register_namespace_import` (Python's bare `import module` form) scans
+    // every `(name, target file)` pair below looking for ones whose file
+    // matches the imported module — an unbounded read (see `Table::
+    // GuardPyWildcardImport`'s doc). Fold every pair into one order-independent
+    // guard hash (XOR, since the pairs have no stable order) as this same loop
+    // already visits them for the per-key `SymbolTable`/`EntityMap`
+    // fingerprints, so the guard costs one extra `u64` XOR per pair, not a
+    // second corpus scan.
+    let mut wildcard_import_guard: u64 = 0;
+    for (name, ids) in lookups.symbol_table.iter() {
+        let mut h = ValueHasher::new();
+        for id in ids {
+            h.s(id);
+            if let Some(info) = entity_map.get(id) {
+                wildcard_import_guard ^= {
+                    let mut wh = ValueHasher::new();
+                    wh.s(name).s(&info.file_path);
+                    wh.finish()
+                };
+            }
+        }
+        sink.one(Table::SymbolTable, name, h.finish());
+    }
+    for (owner, members) in &lookups.class_members {
+        sink.one(Table::ClassMembers, owner, hash_member_list(members));
+    }
+    for (owner, members) in &lookups.owner_members {
+        sink.one(Table::OwnerMembers, owner, hash_member_list(members));
+    }
+    for (id, info) in entity_map {
+        let mut h = ValueHasher::new();
+        h.s(&info.name)
+            .s(&info.entity_type)
+            .s(&info.file_path)
+            .s(info.parent_id.as_deref().unwrap_or("\u{0}"))
+            .u(info.start_line)
+            .u(info.end_line);
+        sink.one(Table::EntityMap, id, h.finish());
+    }
+    for (pkg, entries) in &lookups.go_pkg_index {
+        sink.one(Table::GoPkgIndex, pkg, hash_member_list(entries));
+    }
+    sink.whole(Table::GuardPyWildcardImport, wildcard_import_guard);
+    wildcard_import_guard
+}
+
+/// The keys `maintain_entity_lookups_incremental` removed from or inserted into
+/// each corpus table this build, plus the XOR delta to the Python
+/// wildcard-import guard those same entities imply.
+///
+/// Everything here is `O(touched files' entities)`, never `O(corpus)`.
+#[derive(Default)]
+pub(crate) struct TouchedCorpusKeys {
+    /// `symbol_table` buckets whose contents may have moved.
+    pub(crate) names: HashSet<String>,
+    /// `class_members` buckets whose contents may have moved.
+    pub(crate) owner_names: HashSet<String>,
+    /// `owner_members` buckets whose contents may have moved.
+    pub(crate) parent_ids: HashSet<String>,
+    /// `entity_map` entries removed or (re)inserted.
+    pub(crate) entity_ids: HashSet<String>,
+    /// XOR of `hash(name, file_path)` over every entity removed *and* every
+    /// entity inserted. See [`fingerprint_corpus_tables_incremental`].
+    pub(crate) wildcard_guard_delta: u64,
+}
+
+/// One entity's contribution to the `GuardPyWildcardImport` XOR fold.
+///
+/// [`fingerprint_corpus_tables`] spells that fold as "for every `(name, id)` in
+/// `symbol_table`, XOR in `hash(name, entity_map[id].file_path)`". That is the
+/// same multiset as "for every entity `e`, XOR in `hash(e.name, e.file_path)`":
+/// `symbol_table[name]` receives one push per entity named `name`, `entity_map`
+/// always holds that id, and an entity id is `{file_path}::…` by construction so
+/// `entity_map[e.id].file_path == e.file_path` — *including* when two entities
+/// collide on one id (TypeScript overloads do), where both formulations XOR the
+/// same value twice and both cancel. Per-entity is what makes the guard
+/// maintainable in `O(touched entities)`: XOR is its own inverse, so removing
+/// and inserting are the same operation.
+pub(crate) fn wildcard_guard_contribution(name: &str, file_path: &str) -> u64 {
+    let mut h = ValueHasher::new();
+    h.s(name).s(file_path);
+    h.finish()
+}
+
+/// Update a carried-forward corpus fingerprint map in place, touching only the
+/// keys [`TouchedCorpusKeys`] names (semx-4an).
+///
+/// Parity with [`fingerprint_corpus_tables`] rests on two facts:
+///
+/// * every value below is a pure function of its own table bucket, and
+///   `maintain_entity_lookups_incremental` guarantees a bucket it did not name
+///   is byte-identical to last build's;
+/// * a key that *vanished* is `remove`d, not left stale — the case that would
+///   otherwise keep a file GREEN whose lookup now misses.
+///
+/// `go_pkg_index` is **not** maintained here; the caller falls back to the whole
+/// fold whenever it is non-empty (i.e. whenever the corpus has `.go` files),
+/// because that index is a re-derivation of the other tables under a different
+/// key shape (file stem / directory name) with no per-file key index of its own.
+pub(crate) fn fingerprint_corpus_tables_incremental(
+    touched: &TouchedCorpusKeys,
+    lookups: &PreBuiltLookups,
+    entity_map: &HashMap<String, EntityInfo>,
+    fp: &mut TableFingerprints,
+    wildcard_import_guard: &mut u64,
+) {
+    for name in &touched.names {
+        match lookups.symbol_table.get(name) {
+            Some(ids) => {
+                let mut h = ValueHasher::new();
+                for id in ids {
+                    h.s(id);
+                }
+                fp.put(key1(Table::SymbolTable, 0, name), h.finish());
+            }
+            None => fp.remove(key1(Table::SymbolTable, 0, name)),
+        }
+    }
+    for owner in &touched.owner_names {
+        match lookups.class_members.get(owner) {
+            Some(members) => fp.put(
+                key1(Table::ClassMembers, 0, owner),
+                hash_member_list(members),
+            ),
+            None => fp.remove(key1(Table::ClassMembers, 0, owner)),
+        }
+    }
+    for parent in &touched.parent_ids {
+        match lookups.owner_members.get(parent) {
+            Some(members) => fp.put(
+                key1(Table::OwnerMembers, 0, parent),
+                hash_member_list(members),
+            ),
+            None => fp.remove(key1(Table::OwnerMembers, 0, parent)),
+        }
+    }
+    for id in &touched.entity_ids {
+        match entity_map.get(id) {
+            Some(info) => {
+                let mut h = ValueHasher::new();
+                h.s(&info.name)
+                    .s(&info.entity_type)
+                    .s(&info.file_path)
+                    .s(info.parent_id.as_deref().unwrap_or("\u{0}"))
+                    .u(info.start_line)
+                    .u(info.end_line);
+                fp.put(key1(Table::EntityMap, 0, id), h.finish());
+            }
+            None => fp.remove(key1(Table::EntityMap, 0, id)),
+        }
+    }
+    *wildcard_import_guard ^= touched.wildcard_guard_delta;
+    fp.put(
+        key_whole(Table::GuardPyWildcardImport, 0),
+        *wildcard_import_guard,
+    );
+}
+
+fn hash_member_list(members: &[(String, String)]) -> u64 {
+    let mut h = ValueHasher::new();
+    for (name, id) in members {
+        h.s(name).s(id);
+    }
+    h.finish()
 }
 
 fn ref_description(ast_ref: &AstRef) -> String {
@@ -1507,6 +3154,16 @@ fn row_in_descendant_ranges(ranges: Option<&Vec<(usize, usize)>>, row: usize) ->
 }
 
 /// Build scope tree by walking the AST.
+// `Node::named_child(i)` is not a random-access lookup: tree-sitter restarts a
+// child iterator at index 0 and walks forward every call, skipping unnamed and
+// extra nodes on the way. Indexing 0..named_child_count() therefore costs
+// O(children^2) per node. Most AST nodes have a handful of children so nobody
+// notices, but real code contains nodes with enormous fan-out — a 3.5 MB
+// single-array fixture like microsoft/TypeScript's
+// `tests/cases/fourslash/reallyLargeFile.ts` is one array literal with ~10^5
+// named children, i.e. ~10^10 iterator steps for one node, which pins a core
+// for many minutes. Walking the children once with a cursor is O(children) and
+// yields exactly the same nodes in the same order.
 /// Creates class scopes and maps methods to them.
 /// Uses an iterative worklist to avoid stack overflow on deeply nested ASTs.
 /// Fixes: https://github.com/Ataraxy-Labs/sem/issues/103
@@ -1514,11 +3171,10 @@ fn push_named_children_rev<'a>(
     worklist: &mut Vec<tree_sitter::Node<'a>>,
     node: tree_sitter::Node<'a>,
 ) {
-    for idx in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(idx as u32) {
-            worklist.push(child);
-        }
-    }
+    let start = worklist.len();
+    let mut cursor = node.walk();
+    worklist.extend(node.named_children(&mut cursor));
+    worklist[start..].reverse();
 }
 
 fn push_scoped_named_children_rev<'a>(
@@ -1526,11 +3182,10 @@ fn push_scoped_named_children_rev<'a>(
     node: tree_sitter::Node<'a>,
     scope: usize,
 ) {
-    for idx in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(idx as u32) {
-            worklist.push((child, scope));
-        }
-    }
+    let start = worklist.len();
+    let mut cursor = node.walk();
+    worklist.extend(node.named_children(&mut cursor).map(|child| (child, scope)));
+    worklist[start..].reverse();
 }
 
 fn build_scopes_from_ast(
@@ -1550,6 +3205,42 @@ fn build_scopes_from_ast(
     let mut worklist: Vec<(tree_sitter::Node, usize)> = vec![(root, root_scope)];
 
     while let Some((node, current_scope)) = worklist.pop() {
+        let child_scope = scope_visit_node(
+            node,
+            current_scope,
+            scopes,
+            entity_scope_map,
+            entity_inner_scope,
+            file_lookup,
+            children_by_parent,
+            entity_map,
+            source,
+            config,
+        );
+        push_scoped_named_children_rev(&mut worklist, node, child_scope);
+    }
+}
+
+/// One node's worth of `build_scopes_from_ast` (semx-3ao): every scope-tree
+/// side effect for `node`, returning the scope its named children inherit.
+/// Factored out verbatim from the walk's loop body so the unfused walk above
+/// and the fused triple walk (`fused_scope_refs_import_walk`) are the same
+/// per-node semantics under different traversal drivers — the fusion may only
+/// change how many times the tree is traversed, never what a visit does.
+#[allow(clippy::too_many_arguments)]
+fn scope_visit_node(
+    node: tree_sitter::Node,
+    current_scope: usize,
+    scopes: &mut Vec<Scope>,
+    entity_scope_map: &mut HashMap<String, usize>,
+    entity_inner_scope: &mut HashMap<String, usize>,
+    file_lookup: &FileEntityLookup<'_>,
+    children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    source: &[u8],
+    config: &ScopeResolveConfig,
+) -> usize {
+    {
         let kind = node.kind();
 
         // Class-like scope: config-driven
@@ -1637,8 +3328,7 @@ fn build_scopes_from_ast(
                     }
                 }
 
-                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
-                continue;
+                return class_scope_idx;
             } else if is_impl {
                 // The impl'd type is usually defined elsewhere (idiomatic Rust:
                 // `struct S;` then `impl S { ... }` on a later line; likewise a
@@ -1672,8 +3362,7 @@ fn build_scopes_from_ast(
                         }
                     }
                 }
-                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
-                continue;
+                return class_scope_idx;
             } else {
                 let class_scope_idx = scopes.len();
                 scopes.push(Scope {
@@ -1687,8 +3376,7 @@ fn build_scopes_from_ast(
                     owner_id: None,
                     kind: "class",
                 });
-                push_scoped_named_children_rev(&mut worklist, node, class_scope_idx);
-                continue;
+                return class_scope_idx;
             }
         }
 
@@ -1735,8 +3423,7 @@ fn build_scopes_from_ast(
                 }
             }
 
-            push_scoped_named_children_rev(&mut worklist, node, mod_scope_idx);
-            continue;
+            return mod_scope_idx;
         }
 
         // Function-like scope: config-driven
@@ -1828,12 +3515,93 @@ fn build_scopes_from_ast(
                 }
             }
 
-            push_scoped_named_children_rev(&mut worklist, node, func_scope_idx);
-            continue;
+            return func_scope_idx;
         }
 
-        push_scoped_named_children_rev(&mut worklist, node, current_scope);
+        current_scope
     }
+}
+
+/// The fused triple walk (semx-3ao, fold-fusion #3 — RESOLUTION-PROFILE.md
+/// §"fuse the three AST walks — the plan"). One document-order pre-order
+/// traversal producing what `build_scopes_from_ast` and
+/// `collect_all_file_refs` produced in two walks — `⟨cata f, cata g⟩ =
+/// cata ⟨f,g⟩` holds with no caveat because the two are order-identical and
+/// state-disjoint — plus the sorted `start_byte`s of every import statement
+/// `extract_imports_from_ast` would handle. The import *handlers* do not run
+/// here: their effective order is not document order (extract's LIFO
+/// forward-push processes sibling subtrees in reverse), so
+/// `replay_import_stmts_pruned` runs them afterwards, at the original program
+/// point (after the pre-built import-table seed), in the original order.
+///
+/// `in_import` suppresses recording inside an already-recorded import node,
+/// mirroring extract's "handled children are not descended" — the recorded
+/// set equals extract's handled set H by the same induction. The root itself
+/// is classified here where extract only ever classified children; no
+/// configured grammar's root kind (`module`, `program`, `source_file`,
+/// `compilation_unit`, …) is an import kind, and the invariant test + bit-identical
+/// gates witness the equivalence rather than leaving it argued.
+#[allow(clippy::too_many_arguments)]
+fn fused_scope_refs_import_walk(
+    root: tree_sitter::Node,
+    root_scope: usize,
+    scopes: &mut Vec<Scope>,
+    entity_scope_map: &mut HashMap<String, usize>,
+    entity_inner_scope: &mut HashMap<String, usize>,
+    file_lookup: &FileEntityLookup<'_>,
+    children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    source: &[u8],
+    config: &ScopeResolveConfig,
+) -> (Vec<AstRef>, Vec<usize>, bool) {
+    let mut refs: Vec<AstRef> = Vec::new();
+    let mut import_starts: Vec<usize> = Vec::new();
+    // MUL Phase 1 (semx-mp1): whether the walk saw a literal `"call"`-kind
+    // node — the one ctor-infer's `scan_constructor_calls` hardcodes to
+    // Python's grammar (MUL-DESIGN.md §1.2's `TREELESS` predicate). One extra
+    // `kind()` comparison on nodes this walk already visits, decided
+    // structurally from what the walk saw rather than a language table (I3).
+    let mut saw_call_node = false;
+    // Each entry: (node, current_scope, inside-a-recorded-import)
+    let mut worklist: Vec<(tree_sitter::Node, usize, bool)> = vec![(root, root_scope, false)];
+
+    while let Some((node, current_scope, in_import)) = worklist.pop() {
+        refs_visit_node(node, source, config, &mut refs);
+
+        if !saw_call_node && node.kind() == "call" {
+            saw_call_node = true;
+        }
+
+        let is_import = !in_import && classify_import_stmt(node.kind(), config).is_some();
+        if is_import {
+            // Pre-order ⇒ pushed in ascending byte order, so the vec is
+            // sorted and `subtree_contains_import_start` may binary-search.
+            import_starts.push(node.start_byte());
+        }
+        let child_in_import = in_import || is_import;
+
+        let child_scope = scope_visit_node(
+            node,
+            current_scope,
+            scopes,
+            entity_scope_map,
+            entity_inner_scope,
+            file_lookup,
+            children_by_parent,
+            entity_map,
+            source,
+            config,
+        );
+
+        let start = worklist.len();
+        let mut cursor = node.walk();
+        worklist.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, child_scope, child_in_import)),
+        );
+        worklist[start..].reverse();
+    }
+    (refs, import_starts, saw_call_node)
 }
 
 /// Scan for variable assignments and record type bindings.
@@ -3895,9 +5663,23 @@ fn infer_constructor_param_types(
     init_params: &HashMap<String, Vec<String>>,
     attr_to_param: &HashMap<(String, String), String>,
     symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    let func_name_returns = deterministic_return_types_by_name(return_type_map, symbol_table);
+    // semx-4an: `scan_constructor_calls` writes to `instance_attr_types` only
+    // from inside `if let Some(param_names) = init_params.get(class_name)`
+    // *and* `if let Some(attrs) = attr_to_param_index.get(..)`. With either
+    // input empty the whole scan is a provable no-op, so returning here cannot
+    // change the result — but it does skip the two whole-corpus folds below
+    // (`deterministic_return_types_by_name` alone is `O(every id in
+    // symbol_table)`, and this runs once per 5,000-file chunk: ~83ms of the
+    // monster's warm rebuild, entirely thrown away on a corpus with no
+    // constructor-parameter facts at all).
+    if init_params.is_empty() || attr_to_param.is_empty() {
+        return;
+    }
+    let func_name_returns =
+        deterministic_return_types_by_name(return_type_map, symbol_table, entity_map);
     let attr_to_param_index = build_attr_to_param_index(attr_to_param);
 
     // Scan all files for constructor call sites: ClassName(arg1, arg2, ...)
@@ -3927,17 +5709,46 @@ fn infer_constructor_param_types(
     }
 }
 
+/// `name -> return type`, where the type is the one carried by the *first* id
+/// in that name's `symbol_table` bucket that has one.
+///
+/// Driven by `return_type_map`'s keys rather than by `symbol_table`'s (semx-4an).
+/// The two enumerate the same result: a name gets an entry iff some id in its
+/// bucket is in `return_type_map`, and every such id's own entity is named that
+/// same name (`symbol_table[name]` is exactly the ids of entities named `name`,
+/// and `entity_map[id].name` is that entity's name), so mapping each
+/// `return_type_map` key through `entity_map` reaches every name that can
+/// possibly get an entry — and nothing else. The value is computed by the
+/// identical `find_map` over the identical bucket, so it is the same map, not
+/// merely a similar one.
+///
+/// The difference is the work: the old form ran `find_map` for *every* name in
+/// the corpus, i.e. one `return_type_map` probe per entity id in the corpus
+/// (~454k on the monster), once per 5,000-file chunk. `return_type_map` is
+/// chunk-scoped and far smaller, and this form touches only the buckets that
+/// can produce a hit.
 fn deterministic_return_types_by_name(
     return_type_map: &HashMap<String, String>,
     symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
 ) -> HashMap<String, String> {
-    let mut by_name = HashMap::with_capacity_and_hasher(return_type_map.len(), Default::default());
-    for (name, target_ids) in symbol_table {
+    let mut by_name: HashMap<String, String> =
+        HashMap::with_capacity_and_hasher(return_type_map.len(), Default::default());
+    for id in return_type_map.keys() {
+        let Some(name) = entity_map.get(id).map(|info| info.name.as_str()) else {
+            continue;
+        };
+        if by_name.contains_key(name) {
+            continue;
+        }
+        let Some(target_ids) = symbol_table.get(name) else {
+            continue;
+        };
         if let Some(return_type) = target_ids
             .iter()
             .find_map(|target_id| return_type_map.get(target_id))
         {
-            by_name.insert(name.clone(), return_type.clone());
+            by_name.insert(name.to_string(), return_type.clone());
         }
     }
     by_name
@@ -4059,23 +5870,31 @@ fn inject_return_type_bindings(
     func_name_return_types: &HashMap<String, String>,
     return_type_map: &HashMap<String, String>,
     import_table_by_name: &HashMap<&str, &str>,
+    rec: &mut Recorder,
 ) {
     // Resolve pending call types in all scopes
-    for scope in scopes.iter_mut() {
-        let resolved: Vec<(String, String)> = scope
-            .pending_call_types
-            .iter()
-            .filter_map(|(var_name, func_name)| {
-                import_table_by_name
-                    .get(func_name.as_str())
-                    .and_then(|target_id| return_type_map.get(*target_id))
-                    .or_else(|| func_name_return_types.get(func_name))
-                    .map(|ret_type| (var_name.clone(), ret_type.clone()))
-            })
-            .collect();
+    for scope_idx in 0..scopes.len() {
+        let mut resolved: Vec<(String, String)> = Vec::new();
+        for (var_name, func_name) in &scopes[scope_idx].pending_call_types {
+            // Both tables are corpus/chunk-wide, so both reads are recorded.
+            // `import_table_by_name` is this file's own slice (recorded once by
+            // the caller as `Table::ImportsForFile`), but the *return type it
+            // leads to* belongs to whichever file defines the import target.
+            let imported = import_table_by_name.get(func_name.as_str()).copied();
+            if let Some(target_id) = imported {
+                rec.one(Table::ReturnTypeMap, target_id);
+            }
+            rec.one(Table::FuncNameReturnTypes, func_name.as_str());
+            if let Some(ret_type) = imported
+                .and_then(|target_id| return_type_map.get(target_id))
+                .or_else(|| func_name_return_types.get(func_name))
+            {
+                resolved.push((var_name.clone(), ret_type.clone()));
+            }
+        }
 
         for (var_name, ret_type) in resolved {
-            scope.types.insert(var_name, ret_type);
+            scopes[scope_idx].types.insert(var_name, ret_type);
         }
     }
 }
@@ -4087,6 +5906,7 @@ fn inject_return_type_bindings(
 fn inject_field_type_bindings(
     scopes: &mut Vec<Scope>,
     instance_attr_types: &HashMap<(String, String), String>,
+    rec: &mut Recorder,
 ) {
     for _ in 0..4 {
         // Collect resolutions under immutable borrows, then apply mutably.
@@ -4094,6 +5914,7 @@ fn inject_field_type_bindings(
         for scope_idx in 0..scopes.len() {
             for (var, (obj, prop)) in &scopes[scope_idx].pending_field_types {
                 if let Some(obj_type) = lookup_type_in_scopes(scope_idx, scopes, obj) {
+                    rec.two(Table::InstanceAttrTypes, &obj_type, prop);
                     if let Some(field_type) = instance_attr_types.get(&(obj_type, prop.clone())) {
                         resolutions.push((scope_idx, var.clone(), field_type.clone()));
                     }
@@ -4230,9 +6051,19 @@ fn resolve_ts_default_re_exports(
     }
 }
 
+/// Build once per build (via a caller-held `OnceLock`), grouping every
+/// top-level (`parent_id.is_none()`) entity whose file matches `extensions`
+/// by file — so a namespace-import specifier resolves via `O(1)`
+/// `entities_by_file`/`stem_index` lookups instead of an `O(symbol_table)`
+/// scan repeated once per import statement. Originally JS/TS-only
+/// (hardcoded `is_js_ts_file`); generalized (semx-sbf) so Python's
+/// `register_namespace_import` — previously the one caller *without* this
+/// index, scanning the whole corpus per bare `import module` statement, see
+/// its doc comment — can share the same structure and the same fix shape.
 fn build_top_level_entity_index(
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
+    extensions: &[&str],
 ) -> TopLevelEntityIndex {
     let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::default();
 
@@ -4241,7 +6072,8 @@ fn build_top_level_entity_index(
             let Some(info) = entity_map.get(target_id) else {
                 continue;
             };
-            if !is_js_ts_file(&info.file_path) || info.parent_id.is_some() {
+            let matches_ext = extensions.iter().any(|ext| info.file_path.ends_with(ext));
+            if !matches_ext || info.parent_id.is_some() {
                 continue;
             }
             entities_by_file
@@ -4252,11 +6084,13 @@ fn build_top_level_entity_index(
     }
 
     let mut sorted_files: Vec<String> = entities_by_file.keys().cloned().collect();
-    sort_import_candidate_files(&mut sorted_files, JS_TS_EXTENSIONS);
+    sort_import_candidate_files(&mut sorted_files, extensions);
+    let stem_index = build_owned_stem_index(&sorted_files);
 
     TopLevelEntityIndex {
         entities_by_file,
         sorted_files,
+        stem_index,
     }
 }
 
@@ -4451,6 +6285,25 @@ fn only_js_ts_statement_trivia(mut text: &str) -> bool {
 }
 
 /// Extract import statements from the AST.
+///
+/// `rec` records every cross-file read the Python/Rust/Go branches below make
+/// against `symbol_table`/`entity_map`/`go_pkg_index` (semx-kzy). The JS/TS
+/// branches do not take a recorder: they run only when `skip_js_ts_imports` is
+/// false, which — inside a [`crate::parser::session::GraphSession`] build —
+/// never happens, because `pre_built_import_table` is always `Some` there and
+/// JS/TS import resolution goes through the already-instrumented semx-h1s
+/// incremental import table (`Table::ImportsForFile`) instead. Outside a
+/// session (the plain `EntityGraph::build` cold path) `rec` is always
+/// `Recorder::off()`, so recording here is a no-op regardless.
+///
+/// BS3-F2 (semx-3ao): no longer called on the build path — the fused triple
+/// walk records the handled set and `replay_import_stmts_pruned` runs the
+/// handlers. Kept alive, deliberately, as the executable specification the
+/// BS3-witness invariant test holds the fused path to (SINGLE-PASS.md §6's
+/// discipline: the unfused side is the spec, so the test cannot degrade into
+/// "the new code agrees with itself").
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn extract_imports_from_ast<'a>(
     root: tree_sitter::Node,
     file_path: &str,
@@ -4463,114 +6316,282 @@ fn extract_imports_from_ast<'a>(
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     parsed_files: &'a [(String, String, tree_sitter::Tree)],
     content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
     exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
     skip_js_ts_imports: bool,
+    rec: &mut Recorder,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            let ck = child.kind();
-            let handled = match ck {
-                "import_from_statement" => {
-                    extract_python_import(
-                        child,
-                        file_path,
-                        source,
-                        symbol_table,
-                        entity_map,
-                        import_table,
-                        scopes,
-                    );
-                    true
-                }
-                "import_statement"
-                    if config.self_keywords.contains(&"self")
-                        && config.self_keywords.contains(&"cls") =>
-                {
-                    // Python: `import mod` or `import mod as m`
-                    extract_python_module_import(
-                        child,
-                        file_path,
-                        source,
-                        symbol_table,
-                        entity_map,
-                        import_table,
-                        scopes,
-                    );
-                    true
-                }
-                "import_statement" if !config.self_keywords.contains(&"cls") => {
-                    if !skip_js_ts_imports {
-                        extract_ts_import(
-                            child,
-                            file_path,
-                            source,
-                            symbol_table,
-                            entity_map,
-                            import_table,
-                            scopes,
-                            ts_default_exports,
-                            top_level_entities,
-                            parsed_files,
-                            content_by_file,
-                            exported_names_by_file,
-                        );
-                    }
-                    true
-                }
-                "export_statement" if !config.self_keywords.contains(&"cls") => {
-                    if !skip_js_ts_imports {
-                        extract_ts_re_export(
-                            child,
-                            file_path,
-                            source,
-                            symbol_table,
-                            entity_map,
-                            import_table,
-                            scopes,
-                            ts_default_exports,
-                        );
-                    }
-                    true
-                }
-                "use_declaration" => {
-                    extract_rust_use(
-                        child,
-                        file_path,
-                        source,
-                        symbol_table,
-                        entity_map,
-                        import_table,
-                        scopes,
-                    );
-                    true
-                }
-                "import_declaration" => {
-                    extract_go_import(
-                        child,
-                        file_path,
-                        source,
-                        symbol_table,
-                        entity_map,
-                        import_table,
-                        scopes,
-                        go_pkg_index,
-                    );
-                    true
-                }
-                _ => false,
-            };
-            if !handled {
-                worklist.push(child);
+            match classify_import_stmt(child.kind(), config) {
+                Some(stmt) => dispatch_import_stmt(
+                    stmt,
+                    child,
+                    file_path,
+                    source,
+                    symbol_table,
+                    entity_map,
+                    import_table,
+                    scopes,
+                    go_pkg_index,
+                    ts_default_exports,
+                    top_level_entities,
+                    py_top_level_entities,
+                    parsed_files,
+                    content_by_file,
+                    exported_names_by_file,
+                    skip_js_ts_imports,
+                    rec,
+                ),
+                None => worklist.push(child),
             }
         }
     }
 }
 
+/// The import-statement node kinds `extract_imports_from_ast` handles (and
+/// therefore never descends into), classified. Pure in `(kind, config)` —
+/// factored out (semx-3ao) so the fused walk's recorder, the pruned replay,
+/// and the unfused walk agree on the handled set H by construction: H =
+/// {named node c : classify(c) is Some ∧ no ancestor of c is in H}.
+///
+/// `import_declaration` is the Go handler's arm but the kind also occurs in
+/// Java/Swift grammars, where the handler runs and resolves nothing —
+/// long-standing behavior, preserved as-is.
+#[derive(Clone, Copy)]
+enum ImportStmtKind {
+    /// Python `from x import y` (`import_from_statement`).
+    PyFromImport,
+    /// Python `import mod [as m]` (`import_statement` when the config knows
+    /// both `self` and `cls`).
+    PyModuleImport,
+    /// JS/TS `import ... from '...'` (`import_statement` when the config does
+    /// not know `cls`).
+    TsImport,
+    /// JS/TS `export ... from '...'` (`export_statement`, same gate).
+    TsReExport,
+    /// Rust `use ...` (`use_declaration`).
+    RustUse,
+    /// Go `import (...)` (`import_declaration`).
+    GoImport,
+}
+
+fn classify_import_stmt(kind: &str, config: &ScopeResolveConfig) -> Option<ImportStmtKind> {
+    match kind {
+        "import_from_statement" => Some(ImportStmtKind::PyFromImport),
+        "import_statement"
+            if config.self_keywords.contains(&"self") && config.self_keywords.contains(&"cls") =>
+        {
+            Some(ImportStmtKind::PyModuleImport)
+        }
+        "import_statement" if !config.self_keywords.contains(&"cls") => {
+            Some(ImportStmtKind::TsImport)
+        }
+        "export_statement" if !config.self_keywords.contains(&"cls") => {
+            Some(ImportStmtKind::TsReExport)
+        }
+        "use_declaration" => Some(ImportStmtKind::RustUse),
+        "import_declaration" => Some(ImportStmtKind::GoImport),
+        _ => None,
+    }
+}
+
+/// Run the one handler `classify_import_stmt` selected for `child`. The
+/// `skip_js_ts_imports` gate lives here (a skipped JS/TS import is still
+/// *handled* — not descended into — exactly as before the factoring).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_import_stmt<'a>(
+    stmt: ImportStmtKind,
+    child: tree_sitter::Node,
+    file_path: &str,
+    source: &[u8],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    ts_default_exports: &TsDefaultExportTable,
+    top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    parsed_files: &'a [(String, String, tree_sitter::Tree)],
+    content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
+    exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
+    skip_js_ts_imports: bool,
+    rec: &mut Recorder,
+) {
+    match stmt {
+        ImportStmtKind::PyFromImport => {
+            extract_python_import(
+                child,
+                file_path,
+                source,
+                symbol_table,
+                entity_map,
+                import_table,
+                scopes,
+                rec,
+            );
+        }
+        ImportStmtKind::PyModuleImport => {
+            // Python: `import mod` or `import mod as m`
+            extract_python_module_import(
+                child,
+                file_path,
+                source,
+                symbol_table,
+                entity_map,
+                import_table,
+                scopes,
+                py_top_level_entities,
+                rec,
+            );
+        }
+        ImportStmtKind::TsImport => {
+            if !skip_js_ts_imports {
+                extract_ts_import(
+                    child,
+                    file_path,
+                    source,
+                    symbol_table,
+                    entity_map,
+                    import_table,
+                    scopes,
+                    ts_default_exports,
+                    top_level_entities,
+                    parsed_files,
+                    content_by_file,
+                    exported_names_by_file,
+                    rec,
+                );
+            }
+        }
+        ImportStmtKind::TsReExport => {
+            if !skip_js_ts_imports {
+                extract_ts_re_export(
+                    child,
+                    file_path,
+                    source,
+                    symbol_table,
+                    entity_map,
+                    import_table,
+                    scopes,
+                    ts_default_exports,
+                    rec,
+                );
+            }
+        }
+        ImportStmtKind::RustUse => {
+            extract_rust_use(
+                child,
+                file_path,
+                source,
+                symbol_table,
+                entity_map,
+                import_table,
+                scopes,
+                rec,
+            );
+        }
+        ImportStmtKind::GoImport => {
+            extract_go_import(
+                child,
+                file_path,
+                source,
+                symbol_table,
+                entity_map,
+                import_table,
+                scopes,
+                go_pkg_index,
+                rec,
+            );
+        }
+    }
+}
+
+/// The pruned replay of `extract_imports_from_ast` for the fused path
+/// (semx-3ao). `import_starts` is the sorted list of `start_byte`s of every
+/// node in H, recorded by `fused_scope_refs_import_walk` during the one
+/// document-order walk. This re-runs extract's own worklist algorithm —
+/// forward child push onto a LIFO worklist, handlers fired at the parent's
+/// visit — but descends only into children whose byte range contains a
+/// recorded start. Pruning removes only pops that emit nothing, and the LIFO
+/// relative order of the kept nodes is determined by their tree positions
+/// alone, so the handler-call sequence (and therefore every last-write-wins
+/// `import_table`/`scopes[0]` outcome) is exactly the unfused walk's. The
+/// caller skips the call entirely when `import_starts` is empty — on a
+/// C# corpus that is every file, which is where `extract_imports_from_ast`'s
+/// pure-traversal cost goes.
+#[allow(clippy::too_many_arguments)]
+fn replay_import_stmts_pruned<'a>(
+    root: tree_sitter::Node,
+    import_starts: &[usize],
+    file_path: &str,
+    source: &[u8],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+    config: &ScopeResolveConfig,
+    go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    ts_default_exports: &TsDefaultExportTable,
+    top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    parsed_files: &'a [(String, String, tree_sitter::Tree)],
+    content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
+    exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
+    skip_js_ts_imports: bool,
+    rec: &mut Recorder,
+) {
+    let mut worklist = vec![root];
+    while let Some(node) = worklist.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match classify_import_stmt(child.kind(), config) {
+                Some(stmt) => dispatch_import_stmt(
+                    stmt,
+                    child,
+                    file_path,
+                    source,
+                    symbol_table,
+                    entity_map,
+                    import_table,
+                    scopes,
+                    go_pkg_index,
+                    ts_default_exports,
+                    top_level_entities,
+                    py_top_level_entities,
+                    parsed_files,
+                    content_by_file,
+                    exported_names_by_file,
+                    skip_js_ts_imports,
+                    rec,
+                ),
+                None => {
+                    if subtree_contains_import_start(child, import_starts) {
+                        worklist.push(child);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Does `node`'s byte range contain any recorded import start? `starts` is
+/// sorted ascending (pre-order recording), so this is a binary search.
+fn subtree_contains_import_start(node: tree_sitter::Node, starts: &[usize]) -> bool {
+    let s = node.start_byte();
+    match starts.binary_search(&s) {
+        Ok(_) => true,
+        Err(i) => i < starts.len() && starts[i] < node.end_byte(),
+    }
+}
+
 /// TS: `import { Foo, Bar } from './module'` or `import Foo from './module'`
+#[allow(clippy::too_many_arguments)]
 fn extract_ts_import<'a>(
     node: tree_sitter::Node,
     file_path: &str,
@@ -4584,6 +6605,7 @@ fn extract_ts_import<'a>(
     parsed_files: &'a [(String, String, tree_sitter::Tree)],
     content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
     exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
+    rec: &mut Recorder,
 ) {
     // Extract the source module from the `from '...'` clause
     let source_path = node
@@ -4627,6 +6649,7 @@ fn extract_ts_import<'a>(
                                     entity_map,
                                     import_table,
                                     scopes,
+                                    rec,
                                 );
                             }
                         }
@@ -4680,6 +6703,7 @@ fn extract_ts_import<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_ts_re_export(
     node: tree_sitter::Node,
     file_path: &str,
@@ -4689,6 +6713,7 @@ fn extract_ts_re_export(
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     ts_default_exports: &TsDefaultExportTable,
+    rec: &mut Recorder,
 ) {
     let source_path = node
         .child_by_field_name("source")
@@ -4740,6 +6765,7 @@ fn extract_ts_re_export(
                             entity_map,
                             import_table,
                             scopes,
+                            rec,
                         );
                     }
                 }
@@ -4754,6 +6780,7 @@ fn extract_ts_re_export(
 
 /// Rust: `use crate::module::Name;` or `use crate::module::{A, B};`
 /// Parse from the text of the use_declaration for reliability.
+#[allow(clippy::too_many_arguments)]
 fn extract_rust_use(
     node: tree_sitter::Node,
     file_path: &str,
@@ -4762,6 +6789,7 @@ fn extract_rust_use(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    rec: &mut Recorder,
 ) {
     let text = node.utf8_text(source).unwrap_or("").trim().to_string();
     // Strip `use ` prefix and trailing `;`
@@ -4805,6 +6833,7 @@ fn extract_rust_use(
                     entity_map,
                     import_table,
                     scopes,
+                    rec,
                 );
             }
         }
@@ -4836,12 +6865,14 @@ fn extract_rust_use(
                 entity_map,
                 import_table,
                 scopes,
+                rec,
             );
         }
     }
 }
 
 /// Go: `import ("module/path")` - maps package names to entities
+#[allow(clippy::too_many_arguments)]
 fn extract_go_import(
     node: tree_sitter::Node,
     file_path: &str,
@@ -4851,6 +6882,7 @@ fn extract_go_import(
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    rec: &mut Recorder,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -4864,6 +6896,7 @@ fn extract_go_import(
                 import_table,
                 scopes,
                 go_pkg_index,
+                rec,
             );
         } else if child.kind() == "interpreted_string_literal"
             || child.kind() == "raw_string_literal"
@@ -4882,11 +6915,13 @@ fn extract_go_import(
                 import_table,
                 scopes,
                 go_pkg_index,
+                rec,
             );
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_go_import_specs(
     root: tree_sitter::Node,
     file_path: &str,
@@ -4896,6 +6931,7 @@ fn extract_go_import_specs(
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    rec: &mut Recorder,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -4920,6 +6956,7 @@ fn extract_go_import_specs(
                         import_table,
                         scopes,
                         go_pkg_index,
+                        rec,
                     );
                 }
             } else {
@@ -4929,6 +6966,7 @@ fn extract_go_import_specs(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_go_package_imports(
     pkg_name: &str,
     file_path: &str,
@@ -4937,8 +6975,13 @@ fn register_go_package_imports(
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     go_pkg_index: &HashMap<String, Vec<(String, String)>>,
+    rec: &mut Recorder,
 ) {
-    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan
+    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan.
+    // Recorded unconditionally (semx-kzy): a miss is a dependency too — a
+    // package that resolves to nothing today may gain entries when a new
+    // file declares that package, which must invalidate this import.
+    rec.one(Table::GoPkgIndex, pkg_name);
     if let Some(entries) = go_pkg_index.get(pkg_name) {
         for (name, target_id) in entries {
             import_table.insert((file_path.to_string(), name.clone()), target_id.clone());
@@ -4949,7 +6992,14 @@ fn register_go_package_imports(
     }
 }
 
-/// Shared helper: resolve an imported name against the symbol table
+/// Shared helper: resolve an imported name against the symbol table.
+///
+/// Every candidate this considers is recorded (semx-kzy): the name lookup
+/// itself (a miss is a dependency — a later-added symbol of this name must
+/// invalidate this file), and every target id `find_import_target` inspects
+/// while picking the best file match (a change to any candidate's file path
+/// could change which one wins, even the ones that lose).
+#[allow(clippy::too_many_arguments)]
 fn resolve_import_name(
     original_name: &str,
     local_name: &str,
@@ -4960,8 +7010,13 @@ fn resolve_import_name(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    rec: &mut Recorder,
 ) {
+    rec.one(Table::SymbolTable, original_name);
     if let Some(target_ids) = symbol_table.get(original_name) {
+        for id in target_ids {
+            rec.one(Table::EntityMap, id);
+        }
         let target = find_import_target(target_ids, source_path, file_path, extensions, entity_map);
 
         if let Some(target_id) = target {
@@ -5024,8 +7079,8 @@ fn register_ts_namespace_import<'a>(
     import_table: &mut HashMap<(String, String), String>,
     _scopes: &mut Vec<Scope>,
 ) {
-    let top_level_entities =
-        top_level_entities.get_or_init(|| build_top_level_entity_index(symbol_table, entity_map));
+    let top_level_entities = top_level_entities
+        .get_or_init(|| build_top_level_entity_index(symbol_table, entity_map, extensions));
     let Some(candidate_file) = find_import_file(
         &top_level_entities.sorted_files,
         source_path,
@@ -5069,34 +7124,79 @@ fn register_ts_namespace_import<'a>(
     }
 }
 
+/// Python's bare `import module` form. The read this needs — "any top-level
+/// entity anywhere in the corpus whose file could match `source_path`" — is
+/// still too diffuse to name with individual `(table, key)` pairs, so the
+/// *incremental-invalidation* guard stays whole (semx-kzy, see
+/// [`Table::GuardPyWildcardImport`]: any future change to any
+/// `(name, target file)` pair in the corpus invalidates this file, which is
+/// conservative but never wrong) — that guard is unchanged by this comment's
+/// history.
+///
+/// semx-sbf: what *did* change is how the match itself is computed. This
+/// used to scan every entry of `symbol_table` — every distinct name across
+/// the whole corpus, and every entity behind each name — checking each
+/// against `source_path`, once per bare `import module` statement in the
+/// build. On home-assistant-core (18k Python files, ~258k entities, bare
+/// module imports like `import logging`/`import os` in nearly every file)
+/// that scan dominated the entire resolve phase: ~1,563s of summed
+/// per-thread CPU time out of a ~91s wall build (attributed via
+/// `SEM_PROFILE_RESOLVE=1`'s `scope_build_ms` bucket — see
+/// `RESOLUTION-PROFILE.md`'s "Python pathology" section). `py_top_level_
+/// entities` is the fix: the exact same `(file -> top-level entities)`
+/// grouping [`build_top_level_entity_index`] already builds for JS/TS
+/// namespace imports, generalized to any extension set and built **once**
+/// (lazily, via `OnceLock`) instead of re-scanned per import statement. The
+/// match below reproduces [`import_source_matches_file`]'s semantics exactly
+/// — every corpus file that could plausibly be the target, not just the one
+/// `find_import_file` would pick — just evaluated against the small
+/// candidate/stem set for *this* specifier instead of every entity in the
+/// corpus.
+#[allow(clippy::too_many_arguments)]
 fn register_namespace_import(
     alias: &str,
     source_path: &str,
     file_path: &str,
     extensions: &[&str],
+    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     _scopes: &mut Vec<Scope>,
+    rec: &mut Recorder,
 ) {
-    // Find all top-level entities whose file matches the imported module.
-    for (name, target_ids) in symbol_table {
-        for target_id in target_ids {
-            if let Some(info) = entity_map.get(target_id) {
-                if import_source_matches_file(file_path, source_path, extensions, &info.file_path)
-                    && info.parent_id.is_none()
-                {
-                    let qualified_name = format!("{alias}.{name}");
-                    import_table.insert(
-                        (file_path.to_string(), qualified_name.clone()),
-                        target_id.clone(),
-                    );
-                }
-            }
+    rec.whole(Table::GuardPyWildcardImport);
+    let index = py_top_level_entities
+        .get_or_init(|| build_top_level_entity_index(symbol_table, entity_map, extensions));
+
+    // Every corpus file that could match this specifier: the bounded
+    // relative/dotted candidate list when there is one, or every file
+    // sharing the bare specifier's stem otherwise — the same two cases
+    // `import_source_matches_file` distinguishes, now evaluated as index
+    // lookups instead of a linear scan.
+    let matched_files: Vec<String> =
+        match import_file_candidates(file_path, source_path, extensions) {
+            Some(candidates) => candidates
+                .into_iter()
+                .filter(|candidate| index.entities_by_file.contains_key(candidate.as_str()))
+                .collect(),
+            None => match_bare_import_stem(&index.stem_index, source_path)
+                .cloned()
+                .unwrap_or_default(),
+        };
+
+    for candidate_file in &matched_files {
+        let Some(entries) = index.entities_by_file.get(candidate_file.as_str()) else {
+            continue;
+        };
+        for (name, target_id) in entries {
+            let qualified_name = format!("{alias}.{name}");
+            import_table.insert((file_path.to_string(), qualified_name), target_id.clone());
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_python_import(
     node: tree_sitter::Node,
     file_path: &str,
@@ -5105,6 +7205,7 @@ fn extract_python_import(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    rec: &mut Recorder,
 ) {
     // import_from_statement has:
     //   module_name (dotted_name or relative_import)
@@ -5147,6 +7248,7 @@ fn extract_python_import(
                 entity_map,
                 import_table,
                 scopes,
+                rec,
             );
         }
     }
@@ -5154,6 +7256,7 @@ fn extract_python_import(
 
 /// Python: `import mod` or `import mod as m` — registers all entities from
 /// the module so that `m.foo()` resolves via the method-call path.
+#[allow(clippy::too_many_arguments)]
 fn extract_python_module_import(
     node: tree_sitter::Node,
     file_path: &str,
@@ -5162,6 +7265,8 @@ fn extract_python_module_import(
     entity_map: &HashMap<String, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
+    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
+    rec: &mut Recorder,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -5194,10 +7299,12 @@ fn extract_python_module_import(
             module_name,
             file_path,
             &[".py"],
+            py_top_level_entities,
             symbol_table,
             entity_map,
             import_table,
             scopes,
+            rec,
         );
     }
 }
@@ -5508,6 +7615,23 @@ fn collect_all_file_refs(
     let mut refs = Vec::new();
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
+        refs_visit_node(node, source, config, &mut refs);
+        push_named_children_rev(&mut worklist, node);
+    }
+    refs
+}
+
+/// One node's worth of `collect_all_file_refs` (semx-3ao): append every
+/// `AstRef` this node contributes. Factored out verbatim from the walk's loop
+/// body — see `scope_visit_node`'s doc comment for why the per-node semantics
+/// live in one place shared by the unfused and fused traversal drivers.
+fn refs_visit_node(
+    node: tree_sitter::Node,
+    source: &[u8],
+    config: &ScopeResolveConfig,
+    refs: &mut Vec<AstRef>,
+) {
+    {
         let node_row = node.start_position().row;
         let kind = node.kind();
 
@@ -5517,9 +7641,7 @@ fn collect_all_file_refs(
                 CallNodeStyle::FunctionField(field) => {
                     if let Some(func) = node.child_by_field_name(field) {
                         // Pass empty entity_name — self-ref filtering is done at resolution time
-                        extract_call_ref(
-                            func, node, "", "", source, &mut refs, config, node_row, None,
-                        );
+                        extract_call_ref(func, node, "", "", source, refs, config, node_row, None);
                     }
                 }
                 CallNodeStyle::FirstChild => {
@@ -5532,7 +7654,7 @@ fn collect_all_file_refs(
                             "",
                             "",
                             source,
-                            &mut refs,
+                            refs,
                             config,
                             node_row,
                             argument_labels,
@@ -5575,8 +7697,7 @@ fn collect_all_file_refs(
                     }
                 }
             }
-            push_named_children_rev(&mut worklist, node);
-            continue;
+            return;
         }
 
         // Macro invocations (Rust: macro_invocation, macro name in "macro" field)
@@ -5595,8 +7716,7 @@ fn collect_all_file_refs(
                     });
                 }
             }
-            push_named_children_rev(&mut worklist, node);
-            continue;
+            return;
         }
 
         // New expression nodes (e.g. "new_expression", "object_creation_expression")
@@ -5616,8 +7736,7 @@ fn collect_all_file_refs(
                     });
                 }
             }
-            push_named_children_rev(&mut worklist, node);
-            continue;
+            return;
         }
 
         // Composite literal nodes (e.g. Go "composite_literal")
@@ -5639,11 +7758,7 @@ fn collect_all_file_refs(
                 }
             }
         }
-
-        // Recurse into children
-        push_named_children_rev(&mut worklist, node);
     }
-    refs
 }
 
 fn build_refs_by_row(refs: &[AstRef]) -> Vec<Vec<usize>> {
@@ -5669,9 +7784,45 @@ fn extract_call_ref(
 ) {
     let func_kind = func.kind();
 
+    // Bash wraps a command's callee one level deeper than every other
+    // language here: `command`'s "name" field is typed `command_name`, whose
+    // own single child is the actual `word` leaf (tree-sitter-bash's
+    // `node-types.json`). Every other `CallNodeStyle` hands `extract_call_ref`
+    // the real leaf directly, so this unwrap is bash-specific -- unwrapping
+    // once and re-dispatching lets the `"word"` arm below (needed for fish,
+    // whose `command` node hands over the `word` leaf without a wrapper)
+    // handle the rest uniformly. Without this, bash calls were never
+    // collected as refs at all: `command_name` matched none of the fast-path
+    // kinds, no member_access pattern, and no scoped_call_node (semx-ocj).
+    if func_kind == "command_name" {
+        if let Some(inner) = func.named_child(0) {
+            extract_call_ref(
+                inner,
+                ref_node,
+                _entity_id,
+                entity_name,
+                source,
+                refs,
+                config,
+                row,
+                argument_labels,
+            );
+        }
+        return;
+    }
+
+    // PHP's plain-identifier node kind is `"name"` (tree-sitter-php's
+    // `function_call_expression.function` field), not `"identifier"` --
+    // discovered the same way as bash/fish (semx-ocj): a language whose call
+    // syntax `extract_call_ref`'s fast path special-cases by exact `.kind()`
+    // string but didn't recognize. `"name"` is otherwise unused by any
+    // other configured language's callee position, so this can only turn a
+    // previously-always-dropped ref into a collected one.
     if func_kind == "identifier"
         || func_kind == "simple_identifier"
         || func_kind == "type_identifier"
+        || func_kind == "word"
+        || func_kind == "name"
     {
         let name = func.utf8_text(source).unwrap_or("");
         if !name.is_empty() && name != entity_name && !is_builtin(name, config) {
@@ -5862,6 +8013,7 @@ fn resolve_qualified_callee_name(
     symbol_table: &HashMap<String, Vec<String>>,
     from_entity_id: &str,
     allow_same_file: bool,
+    rec: &mut Recorder,
 ) -> Option<String> {
     if let Some(target_id) = import_table_by_name.get(name) {
         if *target_id != from_entity_id {
@@ -5875,6 +8027,7 @@ fn resolve_qualified_callee_name(
             }
         }
     }
+    rec.one(Table::SymbolTable, name);
     if let Some(ids) = symbol_table.get(name) {
         if ids.len() == 1 && ids[0] != from_entity_id {
             return Some(ids[0].clone());
@@ -5900,6 +8053,12 @@ fn resolve_ref(
     allow_implicit_instance_member_receiver: bool,
     file_lookup: &FileEntityLookup<'_>,
     lookup_cache: &mut ScopeLookupCache,
+    mut profile: Option<&mut prof::FileAccum>,
+    // semx-022 red-green: every lookup below that can reach another file's data
+    // records its key here, hit or miss. `import_table_by_name` is not recorded
+    // per lookup — it holds only this file's own imports and the caller records
+    // the whole slice once as `Table::ImportsForFile`.
+    rec: &mut Recorder,
 ) -> Option<(String, RefType, &'static str)> {
     match &ast_ref.kind {
         AstRefKind::Call {
@@ -5993,7 +8152,11 @@ fn resolve_ref(
             }
 
             // 3. Global symbol table fallback (constructor calls or cross-file functions)
+            rec.one(Table::SymbolTable, name.as_str());
             if let Some(target_ids) = symbol_table.get(name.as_str()) {
+                if let Some(acc) = profile.as_deref_mut() {
+                    acc.record_call_global(name, target_ids.len());
+                }
                 let is_constructor = name.chars().next().map_or(false, |c| c.is_uppercase());
                 let ref_type = if is_constructor {
                     RefType::TypeRef
@@ -6065,6 +8228,7 @@ fn resolve_ref(
             // not resolve to a local `baz`, even a unique one) — sem does not track
             // full module paths, so guessing there would manufacture false edges.
             let type_hint = path.rsplit("::").next().unwrap_or(path.as_str());
+            rec.one(Table::ClassMembers, type_hint);
             if let Some(members) = class_members.get(type_hint) {
                 if let Some((_, target_id)) = members.iter().find(|(member, _)| member == name) {
                     if target_id != from_entity_id {
@@ -6092,18 +8256,24 @@ fn resolve_ref(
                 let mut idx = scope_idx;
                 loop {
                     if scopes[idx].kind == "class" {
+                        if let Some(owner_id) = scopes[idx].owner_id.as_deref() {
+                            rec.one(Table::EntityMap, owner_id);
+                        }
                         if let Some(class_name) = scopes[idx]
                             .owner_id
                             .as_ref()
                             .and_then(|owner_id| entity_map.get(owner_id))
                             .map(|owner| owner.name.as_str())
                         {
+                            rec.one(Table::ClassMembers, class_name);
                             if let Some(members) = class_members.get(class_name) {
-                                match select_member_candidate(
+                                match select_member_profiled!(
                                     members,
                                     method,
                                     argument_labels.as_deref(),
                                     swift_call_signatures,
+                                    class_name,
+                                    profile
                                 ) {
                                     SwiftOverloadSelection::Matched(eid) => {
                                         return Some((eid, RefType::Calls, "scope_chain"));
@@ -6136,16 +8306,20 @@ fn resolve_ref(
                 let attr_name = &receiver[5..]; // strip "self." or "this."
                                                 // Find the enclosing class name
                 let class_name =
-                    find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache);
+                    find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache, rec);
                 if let Some(cn) = class_name {
                     // Look up instance attribute type
+                    rec.two(Table::InstanceAttrTypes, &cn, attr_name);
                     if let Some(attr_type) = instance_attr_types.get(&(cn, attr_name.to_string())) {
+                        rec.one(Table::ClassMembers, attr_type.as_str());
                         if let Some(members) = class_members.get(attr_type.as_str()) {
-                            match select_member_candidate(
+                            match select_member_profiled!(
                                 members,
                                 method,
                                 argument_labels.as_deref(),
                                 swift_call_signatures,
+                                attr_type.as_str(),
+                                profile
                             ) {
                                 SwiftOverloadSelection::Matched(mid) => {
                                     return Some((mid, RefType::Calls, "type_tracking"));
@@ -6169,15 +8343,19 @@ fn resolve_ref(
                     if let Some(var_type) =
                         lookup_type_in_scopes_cached(scope_idx, scopes, var_part, lookup_cache)
                     {
+                        rec.two(Table::InstanceAttrTypes, &var_type, field_part);
                         if let Some(attr_type) =
                             instance_attr_types.get(&(var_type, field_part.to_string()))
                         {
+                            rec.one(Table::ClassMembers, attr_type.as_str());
                             if let Some(members) = class_members.get(attr_type.as_str()) {
-                                match select_member_candidate(
+                                match select_member_profiled!(
                                     members,
                                     method,
                                     argument_labels.as_deref(),
                                     swift_call_signatures,
+                                    attr_type.as_str(),
+                                    profile
                                 ) {
                                     SwiftOverloadSelection::Matched(mid) => {
                                         return Some((mid, RefType::Calls, "type_tracking"));
@@ -6200,10 +8378,14 @@ fn resolve_ref(
                 && is_simple_identifier_name(receiver)
                 && !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache)
             {
-                match find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache) {
-                    Some(class_name) => instance_attr_types
-                        .get(&(class_name, receiver.to_string()))
-                        .cloned(),
+                match find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache, rec)
+                {
+                    Some(class_name) => {
+                        rec.two(Table::InstanceAttrTypes, &class_name, receiver);
+                        instance_attr_types
+                            .get(&(class_name, receiver.to_string()))
+                            .cloned()
+                    }
                     None => None,
                 }
             } else {
@@ -6211,12 +8393,15 @@ fn resolve_ref(
             };
 
             if let Some(class_name) = receiver_type {
+                rec.one(Table::ClassMembers, class_name.as_str());
                 if let Some(members) = class_members.get(class_name.as_str()) {
-                    match select_member_candidate(
+                    match select_member_profiled!(
                         members,
                         method,
                         argument_labels.as_deref(),
                         swift_call_signatures,
+                        class_name.as_str(),
+                        profile
                     ) {
                         SwiftOverloadSelection::Matched(mid) => {
                             return Some((mid, RefType::Calls, "type_tracking"));
@@ -6234,12 +8419,15 @@ fn resolve_ref(
                 && receiver.chars().next().map_or(false, |c| c.is_uppercase())
                 && !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache)
             {
+                rec.one(Table::ClassMembers, receiver);
                 if let Some(members) = class_members.get(receiver) {
-                    if let SwiftOverloadSelection::Matched(mid) = select_member_candidate(
+                    if let SwiftOverloadSelection::Matched(mid) = select_member_profiled!(
                         members,
                         method,
                         argument_labels.as_deref(),
                         swift_call_signatures,
+                        receiver,
+                        profile
                     ) {
                         return Some((mid, RefType::Calls, "static_call"));
                     }
@@ -6249,6 +8437,7 @@ fn resolve_ref(
                 // Only when `Type` is itself a known repo entity: resolve the method by
                 // a same-file or globally unique definition (the `Type::` qualifier is
                 // the disambiguator), so `Vec::new()` and friends stay unresolved.
+                rec.one(Table::SymbolTable, receiver);
                 if symbol_table.contains_key(receiver) {
                     if let Some(hit) = resolve_qualified_callee_name(
                         method,
@@ -6257,6 +8446,7 @@ fn resolve_ref(
                         symbol_table,
                         from_entity_id,
                         true,
+                        rec,
                     ) {
                         return Some((hit, RefType::Calls, "static_call"));
                     }
@@ -6265,6 +8455,7 @@ fn resolve_ref(
 
             // Inside class methods, unqualified property receivers resolve
             // against the enclosing instance when no local binding shadows them.
+            rec.one(Table::EntityMap, from_entity_id);
             let from_entity_is_container_type =
                 entity_map.get(from_entity_id).map_or(false, |entity| {
                     matches!(
@@ -6284,17 +8475,21 @@ fn resolve_ref(
                 && !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache)
             {
                 if let Some(class_name) =
-                    find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache)
+                    find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache, rec)
                 {
+                    rec.two(Table::InstanceAttrTypes, &class_name, receiver);
                     if let Some(attr_type) =
                         instance_attr_types.get(&(class_name, receiver.to_string()))
                     {
+                        rec.one(Table::ClassMembers, attr_type.as_str());
                         if let Some(members) = class_members.get(attr_type.as_str()) {
-                            match select_member_candidate(
+                            match select_member_profiled!(
                                 members,
                                 method,
                                 argument_labels.as_deref(),
                                 swift_call_signatures,
+                                attr_type.as_str(),
+                                profile
                             ) {
                                 SwiftOverloadSelection::Matched(mid) => {
                                     return Some((mid, RefType::Calls, "type_tracking"));
@@ -6313,10 +8508,12 @@ fn resolve_ref(
                 if let Some(class_id) =
                     lookup_scope_chain_cached(scope_idx, scopes, receiver, lookup_cache)
                 {
+                    rec.one(Table::EntityMap, &class_id);
                     if let Some(info) = entity_map.get(&class_id) {
                         if matches!(info.entity_type.as_str(), "module" | "variable" | "object")
                             && info.name == receiver
                         {
+                            rec.one(Table::OwnerMembers, &class_id);
                             if let Some(mid) =
                                 lookup_entity_member(owner_members, &class_id, method).or_else(
                                     || lookup_owned_scope_member(scopes, &class_id, method),
@@ -6329,12 +8526,15 @@ fn resolve_ref(
                             "class" | "struct" | "interface"
                         ) && info.name == receiver
                         {
+                            rec.one(Table::ClassMembers, &info.name);
                             if let Some(members) = class_members.get(&info.name) {
-                                match select_member_candidate(
+                                match select_member_profiled!(
                                     members,
                                     method,
                                     argument_labels.as_deref(),
                                     swift_call_signatures,
+                                    info.name.as_str(),
+                                    profile
                                 ) {
                                     SwiftOverloadSelection::Matched(mid) => {
                                         return Some((mid, RefType::Calls, "scope_chain"));
@@ -6351,14 +8551,18 @@ fn resolve_ref(
             // Fallback: check import table for the receiver
             if !is_local_binding_in_scopes_cached(scope_idx, scopes, receiver, lookup_cache) {
                 if let Some(target_id) = import_table_by_name.get(receiver) {
+                    rec.one(Table::EntityMap, target_id);
                     if let Some(info) = entity_map.get(*target_id) {
                         if matches!(info.entity_type.as_str(), "class" | "struct") {
+                            rec.one(Table::ClassMembers, &info.name);
                             if let Some(members) = class_members.get(&info.name) {
-                                match select_member_candidate(
+                                match select_member_profiled!(
                                     members,
                                     method,
                                     argument_labels.as_deref(),
                                     swift_call_signatures,
+                                    info.name.as_str(),
+                                    profile
                                 ) {
                                     SwiftOverloadSelection::Matched(mid) => {
                                         return Some((mid, RefType::Calls, "type_tracking"));
@@ -6396,11 +8600,12 @@ fn resolve_ref(
             // unknowable and the missing edge is pure blindness; in static
             // languages an unresolved receiver is deliberate (shadowed
             // import, instance property) and must stay unresolved.
-            let dynamic_receiver_lang =
-                file_path.ends_with(".py") || file_path.ends_with(".rb");
+            let dynamic_receiver_lang = file_path.ends_with(".py") || file_path.ends_with(".rb");
             if allow_cross_file_calls && dynamic_receiver_lang {
+                rec.one(Table::SymbolTable, method.as_str());
                 if let Some(target_ids) = symbol_table.get(method.as_str()) {
                     if let [tid] = target_ids.as_slice() {
+                        rec.one(Table::EntityMap, tid);
                         if tid != from_entity_id
                             && entity_map.get(tid).is_some_and(|e| {
                                 e.parent_id.is_some()
@@ -6545,11 +8750,13 @@ fn find_enclosing_class(
     start_scope: usize,
     scopes: &[Scope],
     entity_map: &HashMap<String, EntityInfo>,
+    rec: &mut Recorder,
 ) -> Option<String> {
     let mut idx = start_scope;
     loop {
         if scopes[idx].kind == "class" {
             if let Some(ref oid) = scopes[idx].owner_id {
+                rec.one(Table::EntityMap, oid);
                 return entity_map.get(oid).map(|e| e.name.clone());
             }
         }
@@ -6560,16 +8767,22 @@ fn find_enclosing_class(
     }
 }
 
+/// Memoized [`find_enclosing_class`].
+///
+/// The cache is per file and per resolution run, so a memoized hit re-uses a
+/// value the *same* run already recorded a read for — the read set stays a
+/// superset either way.
 fn find_enclosing_class_cached(
     start_scope: usize,
     scopes: &[Scope],
     entity_map: &HashMap<String, EntityInfo>,
     cache: &mut ScopeLookupCache,
+    rec: &mut Recorder,
 ) -> Option<String> {
     if let Some(cached) = cache.enclosing_classes.get(&start_scope) {
         return cached.clone();
     }
-    let value = find_enclosing_class(start_scope, scopes, entity_map);
+    let value = find_enclosing_class(start_scope, scopes, entity_map, rec);
     cache.enclosing_classes.insert(start_scope, value.clone());
     value
 }
@@ -6717,6 +8930,452 @@ fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {
 mod tests {
     use super::*;
 
+    /// semx-u16 / MUL-DESIGN.md F1+I2: `precompute_js_ts_file_facts` must seed
+    /// `scopes[0].defs` in **`entity_ranges` order** — `(start_line, end_line,
+    /// id)` ascending, id being the tiebreaker — the same order the AST path
+    /// (`resolve_with_scopes_full_inner`'s `if let Some(ranges) =
+    /// entity_ranges.get(...)` loop) uses. Both loops do
+    /// `defs.insert(name, id)`, last-write-wins, so a seed-order mismatch is a
+    /// silent divergence in which entity wins a same-named collision.
+    ///
+    /// For two same-named top-level entities the two orders always agree
+    /// *unless* the tie reaches the `id` string comparison — which happens
+    /// only when many same-named top-level siblings share both `start_line`
+    /// *and* `end_line` (provably unreachable for 2-9 siblings: a DFS/preorder
+    /// extractor is monotonic in byte position, so an earlier-extracted
+    /// sibling on a shared start_line must end by that same line, forcing its
+    /// `end_line` to be numerically <= a later sibling's — same order both
+    /// ways). At 10+ siblings the id ordinal suffix (`#1`, `#2`, ... `#10`,
+    /// `#11`) breaks that: **string** order is `#1 < #10 < #11 < #2 < ... <
+    /// #9`, not numeric order, so an extraction-order (unsorted) seed and an
+    /// `entity_ranges`-order (sorted) seed pick different last writes.
+    ///
+    /// This fixture — 11 one-line `function f(){}` declarations on a single
+    /// source line, all `start_line == end_line == 1` — is exactly that case:
+    /// before the fix, `precompute_js_ts_file_facts` (extraction order) seeded
+    /// `#11` while `entity_ranges` order (I2, computed here as the same-shape
+    /// oracle `resolve_with_scopes_full_inner` uses) picks `#9`, a real,
+    /// constructed divergence, not merely an argued one. This test pins the
+    /// fix: precompute must now agree with `entity_ranges` order.
+    #[test]
+    fn js_ts_precompute_seed_order_matches_entity_ranges_order_at_ten_plus_siblings() {
+        let registry = crate::parser::plugins::create_default_registry();
+        let source: String = std::iter::repeat_n("function f(){} ", 11).collect();
+        let (entities, tree) = registry
+            .extract_entities_with_tree("over.ts", &source)
+            .expect("extract");
+        let tree = tree.expect("tree");
+
+        let overloads: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|e| e.name == "f" && e.entity_type == "function")
+            .collect();
+        assert_eq!(
+            overloads.len(),
+            11,
+            "expected 11 overloads, got: {entities:?}"
+        );
+        for e in &overloads {
+            assert_eq!(e.start_line, 1);
+            assert_eq!(e.end_line, 1);
+        }
+        // Extraction order is source order: #1..#11, in that order.
+        let extraction_order_ids: Vec<&str> = overloads.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            extraction_order_ids,
+            vec![
+                "over.ts::function::f@L1#1",
+                "over.ts::function::f@L1#2",
+                "over.ts::function::f@L1#3",
+                "over.ts::function::f@L1#4",
+                "over.ts::function::f@L1#5",
+                "over.ts::function::f@L1#6",
+                "over.ts::function::f@L1#7",
+                "over.ts::function::f@L1#8",
+                "over.ts::function::f@L1#9",
+                "over.ts::function::f@L1#10",
+                "over.ts::function::f@L1#11",
+            ]
+        );
+
+        // What `entity_ranges` order (I2 / the AST path) would pick: sort
+        // `(start_line, end_line, id)` ascending and take the last write —
+        // exactly `resolve_with_scopes_full_inner`'s seed loop, replicated
+        // here as a same-shape oracle rather than re-run through the whole
+        // corpus-wide plumbing.
+        let mut ranges_order: Vec<&SemanticEntity> = overloads.clone();
+        ranges_order.sort_by(|a, b| {
+            (a.start_line, a.end_line, a.id.as_str()).cmp(&(
+                b.start_line,
+                b.end_line,
+                b.id.as_str(),
+            ))
+        });
+        let entity_ranges_last_write = ranges_order.last().expect("non-empty").id.clone();
+        assert_eq!(
+            entity_ranges_last_write, "over.ts::function::f@L1#9",
+            "entity_ranges (id-string) order's last write should be the string-max id"
+        );
+
+        // What precompute actually seeds.
+        let facts = precompute_js_ts_file_facts("over.ts", source.clone(), &tree, &entities)
+            .expect("precomputed facts");
+        let precompute_seeded_id = facts.scopes[0]
+            .defs
+            .get("f")
+            .cloned()
+            .expect("f seeded into module scope");
+
+        // I2 (post-fix guarantee): precompute must pick the same last-write
+        // entity as entity_ranges order — the divergence this fixture was
+        // constructed to expose (extraction order's #11 vs. entity_ranges
+        // order's #9) must not reach `scopes[0].defs`.
+        assert_eq!(
+            precompute_seeded_id, entity_ranges_last_write,
+            "F1/I2: precompute must seed scopes[0].defs[\"f\"] in entity_ranges \
+             order, matching the AST path — got {precompute_seeded_id}, expected \
+             {entity_ranges_last_write}"
+        );
+        assert_eq!(precompute_seeded_id, "over.ts::function::f@L1#9");
+    }
+
+    /// semx-mp1 / MUL-DESIGN.md §4.2 I1 + §1: the CLEAN gate must fire on a
+    /// cross-file parent link. MUL-DESIGN.md's own census found **zero** real
+    /// violations across 4.8M entities on seven corpora (§1.1's Theorem
+    /// explains why: `build_entity_id` roots every id at its own file, so
+    /// `children_by_parent[e] ⊆ entities(file(e))` holds unconditionally for
+    /// anything the product's own extractors produce) — so the only way to
+    /// exercise the gate at all is to construct the violation directly,
+    /// bypassing extraction, exactly as this test does. The gate must be
+    /// *seen* to fire, not merely argued sound by the theorem: a file whose
+    /// own theorem-given soundness is bypassed like this is exactly the case
+    /// I6's fail-safe exists for.
+    #[test]
+    fn clean_gate_marks_file_dirty_when_a_child_lives_in_another_file() {
+        // "parent.cs" declares `Outer`, whose *own* extraction would only
+        // ever produce children rooted in "parent.cs" (the theorem). Here a
+        // second, independently-file-rooted entity in "intruder.cs" is
+        // constructed to name `Outer` as its `parent_id` anyway — the one
+        // shape CLEAN(F) forbids: `{ x : x.parent_id == e.id } ⊆
+        // entities(file(e))` violated for `e` = Outer.
+        let outer = mk_entity("parent.cs", "class", "Outer", None, 1, 10);
+        let intruding_child = mk_entity(
+            "intruder.cs",
+            "method",
+            "Sneaky",
+            Some(outer.id.as_str()),
+            1,
+            2,
+        );
+        // A second, genuinely sound file must not be caught by the same
+        // pass — no false positives: `sound.cs`'s own child names its own
+        // file's entity as parent, entirely within `sound.cs`.
+        let sound_parent = mk_entity("sound.cs", "class", "Fine", None, 1, 10);
+        let sound_child = mk_entity(
+            "sound.cs",
+            "method",
+            "Ok",
+            Some(sound_parent.id.as_str()),
+            2,
+            3,
+        );
+        // A third file with no children at all must also not be flagged.
+        let leaf = mk_entity("leaf.cs", "class", "Leaf", None, 1, 1);
+
+        let all_entities = vec![
+            outer.clone(),
+            intruding_child,
+            sound_parent,
+            sound_child,
+            leaf,
+        ];
+
+        // Every file in this fixture is "under adjudication" — the scoped
+        // gate must reproduce the old corpus-wide verdict exactly when every
+        // file is a candidate.
+        let candidate_spans = spans_for(
+            &all_entities,
+            &["parent.cs", "intruder.cs", "sound.cs", "leaf.cs"],
+        );
+        let dirty = clean_gate_dirty_files(&all_entities, &candidate_spans);
+
+        assert!(
+            dirty.contains("parent.cs"),
+            "the file owning the entity whose child crossed a file boundary \
+             must be marked dirty — got {dirty:?}"
+        );
+        assert_eq!(
+            dirty.len(),
+            1,
+            "CLEAN must have no false positives: sound.cs and leaf.cs are \
+             untouched by any cross-file link — got {dirty:?}"
+        );
+        assert!(!dirty.contains("sound.cs"));
+        assert!(!dirty.contains("leaf.cs"));
+        // "intruder.cs" itself is not the dirty party — the theorem's own
+        // entities are still self-consistent (Sneaky's parent chain resolves
+        // fine within intruder.cs's own worldview); it is `Outer`'s file
+        // whose fast-path facts are unsound to serve, because *its*
+        // file-local `children_by_parent[Outer.id]` would have been empty
+        // while the corpus-wide one is not.
+        assert!(!dirty.contains("intruder.cs"));
+    }
+
+    /// semx-5sw: the scoping property itself — `candidate_files` narrower
+    /// than the whole corpus must still reproduce the exact corpus-wide
+    /// verdict for every file it *does* cover, in both directions. This is
+    /// the soundness argument in `clean_gate_dirty_files`'s own doc comment,
+    /// turned into a check: (a) a candidate whose cross-file child lives in a
+    /// file that is *not itself a candidate* (`intruder.cs`, never passed in
+    /// `candidate_files` below) must still be caught — a candidate's dirty
+    /// status depends on who points at it from anywhere in the corpus, not
+    /// on whether the pointer's own file is also under adjudication; (b) a
+    /// candidate with no relationship to the violation elsewhere in the
+    /// corpus must not be flagged, and files outside `candidate_files`
+    /// entirely (`leaf.cs`) must never appear in the result even though they
+    /// exist in `all_entities`.
+    #[test]
+    fn clean_gate_scoping_matches_corpus_wide_verdict_per_candidate() {
+        let outer = mk_entity("parent.cs", "class", "Outer", None, 1, 10);
+        let intruding_child = mk_entity(
+            "intruder.cs",
+            "method",
+            "Sneaky",
+            Some(outer.id.as_str()),
+            1,
+            2,
+        );
+        let sound_parent = mk_entity("sound.cs", "class", "Fine", None, 1, 10);
+        let sound_child = mk_entity(
+            "sound.cs",
+            "method",
+            "Ok",
+            Some(sound_parent.id.as_str()),
+            2,
+            3,
+        );
+        let leaf = mk_entity("leaf.cs", "class", "Leaf", None, 1, 1);
+        let all_entities = vec![outer, intruding_child, sound_parent, sound_child, leaf];
+
+        // Only "parent.cs" and "sound.cs" are under adjudication this build
+        // ("intruder.cs" and "leaf.cs" were not precomputed and so are never
+        // asked about) — the real `fresh_precomputed`-scoped shape.
+        let candidate_spans = spans_for(&all_entities, &["parent.cs", "sound.cs"]);
+        let dirty = clean_gate_dirty_files(&all_entities, &candidate_spans);
+
+        assert_eq!(
+            dirty,
+            ["parent.cs".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "parent.cs must still be caught even though its cross-file child \
+             lives in a file (intruder.cs) that is not itself a candidate, \
+             and sound.cs — a candidate — must not be a false positive — \
+             got {dirty:?}"
+        );
+    }
+
+    /// semx-mp1: end-to-end wiring proof, at the same grain
+    /// `EntityGraph::build`'s pass-1 assembly uses — dropping a dirty file's
+    /// entry from a `fresh_precomputed`-shaped map via `.retain()` (the exact
+    /// operation `graph.rs`'s CLEAN gate performs) must remove only the dirty
+    /// file's facts and leave every other file's facts untouched.
+    #[test]
+    fn clean_gate_drops_only_the_dirty_files_precomputed_facts() {
+        let outer = mk_entity("parent.cs", "class", "Outer", None, 1, 10);
+        let intruding_child = mk_entity(
+            "intruder.cs",
+            "method",
+            "Sneaky",
+            Some(outer.id.as_str()),
+            1,
+            2,
+        );
+        let sound_parent = mk_entity("sound.cs", "class", "Fine", None, 1, 10);
+
+        let all_entities = vec![outer, intruding_child, sound_parent];
+
+        fn dummy_facts() -> PrecomputedFileFacts {
+            PrecomputedFileFacts {
+                content: String::new(),
+                scopes: Vec::new(),
+                entity_scope_map: HashMap::default(),
+                entity_inner_scope: HashMap::default(),
+                ast_refs: Vec::new(),
+                return_type_map: HashMap::default(),
+                instance_attr_types: HashMap::default(),
+                init_params: HashMap::default(),
+                attr_to_param: HashMap::default(),
+            }
+        }
+
+        let mut fresh_precomputed: HashMap<String, PrecomputedFileFacts> = HashMap::default();
+        fresh_precomputed.insert("parent.cs".to_string(), dummy_facts());
+        fresh_precomputed.insert("sound.cs".to_string(), dummy_facts());
+
+        // The exact call `EntityGraph::build_incremental_core` performs
+        // (graph.rs, MUL Phase 1 gate): candidates are `fresh_precomputed`'s
+        // own keys, not the whole corpus ("intruder.cs" was never
+        // precomputed and is not a candidate).
+        let candidate_spans = spans_for(&all_entities, &["parent.cs", "sound.cs"]);
+        let dirty = clean_gate_dirty_files(&all_entities, &candidate_spans);
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty.contains("parent.cs"));
+
+        // The exact operation `EntityGraph::build_incremental_core` performs
+        // (graph.rs, MUL Phase 1 gate) after computing `dirty`.
+        fresh_precomputed.retain(|path, _| !dirty.contains(path.as_str()));
+
+        assert!(
+            !fresh_precomputed.contains_key("parent.cs"),
+            "parent.cs failed CLEAN and must fall back to the re-parse path \
+             — its fast-path facts must not survive"
+        );
+        assert!(
+            fresh_precomputed.contains_key("sound.cs"),
+            "sound.cs is CLEAN and must keep its fast-path facts — I6 must \
+             never punish a sound file for an unrelated one failing the gate"
+        );
+    }
+
+    /// semx-mp1 / MUL-DESIGN.md §1.2: `TREELESS(F)` must be decided from what
+    /// the fused walk actually saw, not a per-language table (I3). A Python
+    /// file containing a real `import` statement must fail the gate (facts
+    /// dropped, `None` returned) even though Python is one of the languages
+    /// this function's caller (`graph.rs`) now attempts for every
+    /// scope-resolvable language.
+    #[test]
+    fn precompute_scope_resolvable_file_facts_none_when_file_has_imports() {
+        let registry = crate::parser::plugins::create_default_registry();
+        let source = "import os\n\nclass Foo:\n    pass\n";
+        let (entities, tree) = registry
+            .extract_entities_with_tree("has_import.py", source)
+            .expect("extract");
+        let tree = tree.expect("tree");
+        let facts = precompute_scope_resolvable_file_facts(
+            "has_import.py",
+            source.to_string(),
+            &tree,
+            &entities,
+        );
+        assert!(
+            facts.is_none(),
+            "a file with a real import statement must fail TREELESS and get \
+             no fast-path facts — pass 2 still needs its tree for import replay"
+        );
+    }
+
+    /// semx-mp1: the positive control — a Python file with **no** import and
+    /// **no** `"call"` node (`TREELESS` per §1.2) does get fast-path facts.
+    #[test]
+    fn precompute_scope_resolvable_file_facts_some_when_treeless() {
+        let registry = crate::parser::plugins::create_default_registry();
+        let source = "class Foo:\n    x = 1\n";
+        let (entities, tree) = registry
+            .extract_entities_with_tree("treeless.py", source)
+            .expect("extract");
+        let tree = tree.expect("tree");
+        let facts = precompute_scope_resolvable_file_facts(
+            "treeless.py",
+            source.to_string(),
+            &tree,
+            &entities,
+        );
+        assert!(
+            facts.is_some(),
+            "an import-less, call-less Python file is TREELESS and must get \
+             fast-path facts, exactly like the census's HA __init__.py stubs"
+        );
+    }
+
+    /// semx-mp1 / MUL-DESIGN.md §4.3: Swift is out of scope in every phase —
+    /// `build_swift_call_signatures` is corpus-wide, not per-file, so no
+    /// Swift file may ever take this fast path regardless of what its own
+    /// tree looks like.
+    #[test]
+    fn precompute_scope_resolvable_file_facts_none_for_swift() {
+        let registry = crate::parser::plugins::create_default_registry();
+        let source = "class Foo {\n    var x: Int = 1\n}\n";
+        let (entities, tree) = registry
+            .extract_entities_with_tree("plain.swift", source)
+            .expect("extract");
+        let tree = tree.expect("tree");
+        let facts = precompute_scope_resolvable_file_facts(
+            "plain.swift",
+            source.to_string(),
+            &tree,
+            &entities,
+        );
+        assert!(
+            facts.is_none(),
+            "Swift must never take the fast path, even for a trivial file \
+             the walk would otherwise call TREELESS"
+        );
+    }
+
+    /// semx-mp1: a representative C# file — the family this bead's per-file
+    /// gate targets — gets fast-path facts. Matches MUL-DESIGN.md §2.3's
+    /// census finding that C# is 100% TREELESS by bytes (no node kind
+    /// `classify_import_stmt` handles fires for `using` directives, and C#'s
+    /// call-expression node kind is `invocation_expression`, never the
+    /// literal `"call"` ctor-infer hardcodes to Python).
+    #[test]
+    fn precompute_scope_resolvable_file_facts_some_for_csharp() {
+        let registry = crate::parser::plugins::create_default_registry();
+        let source = "using System;\n\nnamespace N {\n    public class Foo {\n        public int Bar() { return DoWork(); }\n    }\n}\n";
+        let (entities, tree) = registry
+            .extract_entities_with_tree("Foo.cs", source)
+            .expect("extract");
+        let tree = tree.expect("tree");
+        let facts =
+            precompute_scope_resolvable_file_facts("Foo.cs", source.to_string(), &tree, &entities);
+        assert!(
+            facts.is_some(),
+            "a C# file with a using directive and a method call must still \
+             be TREELESS — neither classify_import_stmt nor the literal \
+             \"call\" kind fire for C#'s grammar"
+        );
+    }
+
+    /// semx-w5k.2: the shipped default must match the shipped verdict.
+    /// RESOLUTION-PROFILE.md's "MUL P1" section and its memory-lever follow-up
+    /// both close on "**dotnet stays GATED**" (+21.2%/+32.9% against a +15%
+    /// ceiling, both pairs) while C++ is "GO, unconditionally" (+5.8%/+6.5%).
+    /// A default that contradicts the measurement is a correctness-of-record
+    /// bug even when every answer it produces is right — which, per that same
+    /// section's bit-identical entity/edge/edge-hash dumps, it is.
+    #[test]
+    fn mul_phase1_default_matches_the_measured_verdict() {
+        assert!(
+            mul_precompute_admits("cpp"),
+            "C++ passed its memory ceiling and is verdicted GO unconditionally"
+        );
+        assert!(
+            !mul_precompute_admits("csharp"),
+            "C# exceeded the +15% memory ceiling on both measured dotnet pairs; \
+             it must be opt-in (SEM_MUL_CSHARP=1) until a memory fix lands"
+        );
+        // Phase 1 is exactly two families. Everything else — including the
+        // NO-GO-as-is four and JS/TS, which has its own unconditional
+        // precompute on a different branch — must not reach this producer.
+        for lang in [
+            "python",
+            "go",
+            "rust",
+            "java",
+            "c",
+            "typescript",
+            "javascript",
+            "swift",
+            "ruby",
+        ] {
+            assert!(
+                !mul_precompute_admits(lang),
+                "{lang} is not in MUL phase 1's GO/NO-GO table"
+            );
+        }
+    }
+
     #[test]
     fn resolution_cache_key_includes_resolution_context() {
         let ast_ref = AstRef {
@@ -6802,7 +9461,30 @@ mod tests {
             ],
         );
 
-        let by_name = deterministic_return_types_by_name(&return_type_map, &symbol_table);
+        // `deterministic_return_types_by_name` reaches a name through
+        // `entity_map`, so both candidates must be present here for the test to
+        // exercise the tie-break it is about (semx-4an).
+        let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
+        for (id, file) in [
+            ("z_backup.py::function::make_conn", "z_backup.py"),
+            ("a_primary.py::function::make_conn", "a_primary.py"),
+        ] {
+            entity_map.insert(
+                id.to_string(),
+                EntityInfo {
+                    id: id.to_string(),
+                    name: "make_conn".to_string(),
+                    entity_type: "function".to_string(),
+                    file_path: file.to_string(),
+                    parent_id: None,
+                    start_line: 1,
+                    end_line: 1,
+                },
+            );
+        }
+
+        let by_name =
+            deterministic_return_types_by_name(&return_type_map, &symbol_table, &entity_map);
 
         assert_eq!(
             by_name.get("make_conn").map(String::as_str),
@@ -6853,6 +9535,795 @@ mod tests {
                 ("alpha".to_string(), second_id),
                 ("zeta".to_string(), first_id),
             ])
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // BS3-witness: the triple-walk fusion invariant (semx-3ao).
+    //
+    //   ∀ file.  fused(tree) ≡ ( build_scopes_from_ast(tree);
+    //                            collect_all_file_refs(tree);
+    //                            seed;
+    //                            extract_imports_from_ast(tree) )
+    //
+    // The unfused side is the three production walks executed in the pass-2
+    // closure's exact phase order — kept alive as the specification, so this
+    // test cannot degrade into "the new code agrees with itself". The per-node
+    // bodies are shared helpers (`scope_visit_node`, `refs_visit_node`,
+    // `dispatch_import_stmt`), so what this invariant actually witnesses is the part
+    // the fusion changes: the traversal drivers — one walk instead of three,
+    // and the recorded-set/pruned-replay reconstruction of extract's
+    // non-document handling order.
+    //
+    // Generation: deterministic xorshift (single_pass_laws.rs discipline; no
+    // proptest dependency), composing programs in five language families that
+    // take the AST path (Python, C#, Rust, Go, TS) from nestable fragments —
+    // imports inside try/except and function bodies, classes with methods,
+    // calls, assignments — with synthetic symbol/entity tables sized so the
+    // import handlers really resolve.
+    //
+    // NON-VACUITY (asserted below): the sampled space produces >1 scope, ≥1
+    // ref and ≥1 resolved import per family battery, and the Python battery
+    // contains the same-alias-two-targets nested-import pair on which handler
+    // order decides the winner.
+    //
+    // POSITIVE CONTROL (asserted below): a deliberately document-order
+    // variant of import processing disagrees with the specification on that
+    // pair — the replay order is load-bearing, not decorative.
+    // ------------------------------------------------------------------
+
+    struct Gen(u64);
+
+    impl Gen {
+        fn new(seed: u64) -> Self {
+            Gen(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                return 0;
+            }
+            (self.next() % n as u64) as usize
+        }
+        fn chance(&mut self, one_in: usize) -> bool {
+            self.below(one_in) == 0
+        }
+    }
+
+    struct WalkFixture {
+        file_path: &'static str,
+        ext: &'static str,
+        source: String,
+        entities: Vec<SemanticEntity>,
+        symbol_table: HashMap<String, Vec<String>>,
+        entity_map: HashMap<String, EntityInfo>,
+    }
+
+    fn mk_entity(
+        file: &str,
+        ty: &str,
+        name: &str,
+        parent: Option<&str>,
+        start: usize,
+        end: usize,
+    ) -> SemanticEntity {
+        let id = match parent {
+            Some(p) => format!("{p}::{name}"),
+            None => format!("{file}::{ty}::{name}"),
+        };
+        SemanticEntity {
+            id,
+            file_path: file.to_string(),
+            entity_type: ty.to_string(),
+            name: name.to_string(),
+            parent_id: parent.map(str::to_string),
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            kappa: None,
+            start_line: start,
+            end_line: end,
+            start_byte: None,
+            end_byte: None,
+            metadata: None,
+        }
+    }
+
+    /// Test-only stand-in for the `(path, start, len)` spans
+    /// `graph.rs`'s pass-1 assembly loop captures for free while building
+    /// `all_entities` — computed here by scanning, since these fixtures are
+    /// hand-built rather than assembled file-by-file, but expressing the same
+    /// "this file's entities are the contiguous run `[start, start+len)`"
+    /// contract `clean_gate_dirty_files` relies on.
+    fn spans_for(all_entities: &[SemanticEntity], files: &[&str]) -> Vec<(String, usize, usize)> {
+        files
+            .iter()
+            .map(|file| {
+                let start = all_entities
+                    .iter()
+                    .position(|e| e.file_path == *file)
+                    .expect("fixture must declare at least one entity for this file");
+                let len = all_entities.iter().filter(|e| e.file_path == *file).count();
+                (file.to_string(), start, len)
+            })
+            .collect()
+    }
+
+    fn register_target(
+        fx_symbols: &mut HashMap<String, Vec<String>>,
+        fx_entity_map: &mut HashMap<String, EntityInfo>,
+        file: &str,
+        name: &str,
+    ) -> String {
+        let id = format!("{file}::function::{name}");
+        fx_symbols
+            .entry(name.to_string())
+            .or_default()
+            .push(id.clone());
+        fx_entity_map.insert(
+            id.clone(),
+            EntityInfo {
+                id: id.clone(),
+                name: name.to_string(),
+                entity_type: "function".to_string(),
+                file_path: file.to_string(),
+                parent_id: None,
+                start_line: 1,
+                end_line: 3,
+            },
+        );
+        id
+    }
+
+    /// Everything the three walks observably produce, captured after the
+    /// phase sequence completes.
+    struct WalkOutcome {
+        scopes: Vec<Scope>,
+        entity_scope_map: HashMap<String, usize>,
+        entity_inner_scope: HashMap<String, usize>,
+        ast_refs: Vec<AstRef>,
+        import_table: HashMap<(String, String), String>,
+    }
+
+    enum ImportMode {
+        SpecSequential,
+        FusedReplay,
+        /// The deliberately wrong variant for the positive control: handlers
+        /// fired in document order instead of extract's LIFO order.
+        BrokenDocOrder,
+    }
+
+    fn run_walks(fx: &WalkFixture, mode: ImportMode) -> WalkOutcome {
+        let config = scope_resolve_config_for_path(fx.file_path)
+            .expect("test family must have a scope-resolve config");
+        let lang = crate::parser::plugins::code::languages::get_language_config(fx.ext)
+            .expect("language config");
+        let tree =
+            crate::parser::plugins::code::parse_tree(lang, &fx.source).expect("fixture parses");
+        let source = fx.source.as_bytes();
+
+        let file_entities: Vec<&SemanticEntity> = fx.entities.iter().collect();
+        let file_lookup = FileEntityLookup::new(&file_entities);
+        let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
+        let mut entity_map = fx.entity_map.clone();
+        for e in &fx.entities {
+            entity_map.insert(
+                e.id.clone(),
+                EntityInfo {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    entity_type: e.entity_type.clone(),
+                    file_path: e.file_path.clone(),
+                    parent_id: e.parent_id.clone(),
+                    start_line: e.start_line,
+                    end_line: e.end_line,
+                },
+            );
+            if let Some(ref pid) = e.parent_id {
+                children_by_parent.entry(pid.as_str()).or_default().push(e);
+            }
+        }
+
+        let mut scopes: Vec<Scope> = vec![Scope {
+            parent: None,
+            defs: HashMap::default(),
+            bindings: HashSet::default(),
+            binding_rows: HashMap::default(),
+            types: HashMap::default(),
+            pending_call_types: HashMap::default(),
+            pending_field_types: HashMap::default(),
+            owner_id: None,
+            kind: "module",
+        }];
+        let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
+        let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+        // The closure's own top-level seed, replicated.
+        for e in &fx.entities {
+            if e.parent_id.is_none() {
+                scopes[0].defs.insert(e.name.clone(), e.id.clone());
+                entity_scope_map.insert(e.id.clone(), 0);
+            }
+        }
+
+        let (ast_refs, fused_starts): (Vec<AstRef>, Option<Vec<usize>>) = match mode {
+            ImportMode::FusedReplay => {
+                let (refs, starts, _saw_call_node) = fused_scope_refs_import_walk(
+                    tree.root_node(),
+                    0,
+                    &mut scopes,
+                    &mut entity_scope_map,
+                    &mut entity_inner_scope,
+                    &file_lookup,
+                    &children_by_parent,
+                    &entity_map,
+                    source,
+                    config,
+                );
+                (refs, Some(starts))
+            }
+            ImportMode::SpecSequential | ImportMode::BrokenDocOrder => {
+                build_scopes_from_ast(
+                    tree.root_node(),
+                    0,
+                    &mut scopes,
+                    &mut entity_scope_map,
+                    &mut entity_inner_scope,
+                    &file_lookup,
+                    &children_by_parent,
+                    &entity_map,
+                    fx.file_path,
+                    source,
+                    config,
+                );
+                let refs = collect_all_file_refs(tree.root_node(), source, config);
+                (refs, None)
+            }
+        };
+
+        // Phase order preserved: the import handlers run after the walk(s),
+        // exactly where the pass-2 closure runs them.
+        let mut import_table: HashMap<(String, String), String> = HashMap::default();
+        let go_pkg_index = build_go_pkg_index(&fx.symbol_table, &entity_map);
+        let ts_default_exports = TsDefaultExportTable {
+            exports_by_file: HashMap::default(),
+            sorted_files: Vec::new(),
+        };
+        let top_level_entities = OnceLock::new();
+        let py_top_level_entities = OnceLock::new();
+        let parsed_files: &[(String, String, tree_sitter::Tree)] = &[];
+        let content_by_file = OnceLock::new();
+        let exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
+            Mutex::new(HashMap::default());
+        let mut rec = Recorder::off();
+
+        match mode {
+            ImportMode::SpecSequential => {
+                extract_imports_from_ast(
+                    tree.root_node(),
+                    fx.file_path,
+                    source,
+                    &fx.symbol_table,
+                    &entity_map,
+                    &mut import_table,
+                    &mut scopes,
+                    config,
+                    &go_pkg_index,
+                    &ts_default_exports,
+                    &top_level_entities,
+                    &py_top_level_entities,
+                    parsed_files,
+                    &content_by_file,
+                    &exported_names_by_file,
+                    false,
+                    &mut rec,
+                );
+            }
+            ImportMode::FusedReplay => {
+                let starts = fused_starts.expect("fused mode records starts");
+                if !starts.is_empty() {
+                    replay_import_stmts_pruned(
+                        tree.root_node(),
+                        &starts,
+                        fx.file_path,
+                        source,
+                        &fx.symbol_table,
+                        &entity_map,
+                        &mut import_table,
+                        &mut scopes,
+                        config,
+                        &go_pkg_index,
+                        &ts_default_exports,
+                        &top_level_entities,
+                        &py_top_level_entities,
+                        parsed_files,
+                        &content_by_file,
+                        &exported_names_by_file,
+                        false,
+                        &mut rec,
+                    );
+                }
+            }
+            ImportMode::BrokenDocOrder => {
+                // Document-order handler firing: collect H in pre-order, then
+                // dispatch forward. Everything else identical.
+                let mut handled: Vec<tree_sitter::Node> = Vec::new();
+                let mut worklist: Vec<(tree_sitter::Node, bool)> = vec![(tree.root_node(), false)];
+                while let Some((node, in_import)) = worklist.pop() {
+                    let is_import =
+                        !in_import && classify_import_stmt(node.kind(), config).is_some();
+                    if is_import {
+                        handled.push(node);
+                    }
+                    let start = worklist.len();
+                    let mut cursor = node.walk();
+                    worklist.extend(
+                        node.named_children(&mut cursor)
+                            .map(|c| (c, in_import || is_import)),
+                    );
+                    worklist[start..].reverse();
+                }
+                for node in handled {
+                    if let Some(stmt) = classify_import_stmt(node.kind(), config) {
+                        dispatch_import_stmt(
+                            stmt,
+                            node,
+                            fx.file_path,
+                            source,
+                            &fx.symbol_table,
+                            &entity_map,
+                            &mut import_table,
+                            &mut scopes,
+                            &go_pkg_index,
+                            &ts_default_exports,
+                            &top_level_entities,
+                            &py_top_level_entities,
+                            parsed_files,
+                            &content_by_file,
+                            &exported_names_by_file,
+                            false,
+                            &mut rec,
+                        );
+                    }
+                }
+            }
+        }
+
+        WalkOutcome {
+            scopes,
+            entity_scope_map,
+            entity_inner_scope,
+            ast_refs,
+            import_table,
+        }
+    }
+
+    fn assert_outcomes_equal(spec: &WalkOutcome, fused: &WalkOutcome, label: &str) {
+        assert_eq!(
+            spec.scopes, fused.scopes,
+            "BS3-witness: scopes diverged on {label}"
+        );
+        assert_eq!(
+            spec.entity_scope_map, fused.entity_scope_map,
+            "BS3-witness: entity_scope_map diverged on {label}"
+        );
+        assert_eq!(
+            spec.entity_inner_scope, fused.entity_inner_scope,
+            "BS3-witness: entity_inner_scope diverged on {label}"
+        );
+        assert_eq!(
+            spec.ast_refs, fused.ast_refs,
+            "BS3-witness: ast_refs (incl. order) diverged on {label}"
+        );
+        assert_eq!(
+            spec.import_table, fused.import_table,
+            "BS3-witness: import_table diverged on {label}"
+        );
+    }
+
+    // ---- fixture generators, one per family --------------------------------
+
+    fn gen_python(g: &mut Gen, with_order_pair: bool) -> WalkFixture {
+        let file = "gen_fixture.py";
+        let mut symbols = HashMap::default();
+        let mut emap = HashMap::default();
+        for m in 0..3 {
+            for n in 0..3 {
+                register_target(
+                    &mut symbols,
+                    &mut emap,
+                    &format!("mod{m}.py"),
+                    &format!("name{m}_{n}"),
+                );
+            }
+        }
+        register_target(&mut symbols, &mut emap, "mod0.py", "shared");
+        register_target(&mut symbols, &mut emap, "mod1.py", "shared");
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut entities: Vec<SemanticEntity> = Vec::new();
+
+        for _ in 0..g.below(3) {
+            let m = g.below(3);
+            let n = g.below(3);
+            if g.chance(2) {
+                lines.push(format!("from mod{m} import name{m}_{n}"));
+            } else {
+                lines.push(format!("from mod{m} import name{m}_{n} as al{m}_{n}"));
+            }
+        }
+        if g.chance(3) {
+            lines.push(format!("import mod{}", g.below(3)));
+        }
+        if with_order_pair || g.chance(2) {
+            // The order-sensitivity witness: same alias, two targets, nested
+            // in sibling containers. Extract handles the except-branch first,
+            // so mod0's binding lands last and wins.
+            lines.push("try:".to_string());
+            lines.push("    from mod0 import shared as S".to_string());
+            lines.push("except ImportError:".to_string());
+            lines.push("    from mod1 import shared as S".to_string());
+        }
+
+        let n_classes = 1 + g.below(2);
+        for c in 0..n_classes {
+            let cname = format!("Klass{c}");
+            let class_start = lines.len() + 1;
+            lines.push(format!("class {cname}:"));
+            let cid = format!("{file}::class::{cname}");
+            let n_methods = 1 + g.below(2);
+            for m in 0..n_methods {
+                let mname = format!("meth{c}_{m}");
+                let meth_start = lines.len() + 1;
+                lines.push(format!("    def {mname}(self, arg: Klass0):"));
+                lines.push(format!("        x = name{}_{}()", g.below(3), g.below(3)));
+                lines.push("        x.helper()".to_string());
+                if g.chance(3) {
+                    lines.push(format!(
+                        "        from mod{} import name{}_0",
+                        g.below(3),
+                        g.below(3)
+                    ));
+                }
+                lines.push(format!("        return meth{c}_0()"));
+                let meth_end = lines.len();
+                entities.push(mk_entity(
+                    file,
+                    "method",
+                    &mname,
+                    Some(&cid),
+                    meth_start,
+                    meth_end,
+                ));
+            }
+            let class_end = lines.len();
+            entities.insert(
+                entities.len() - n_methods,
+                mk_entity(file, "class", &cname, None, class_start, class_end),
+            );
+        }
+        let fn_start = lines.len() + 1;
+        lines.push("def top_fn(a, b):".to_string());
+        lines.push("    v = Klass0()".to_string());
+        lines.push("    v.meth0_0()".to_string());
+        lines.push("    return top_fn(a, b)".to_string());
+        entities.push(mk_entity(
+            file,
+            "function",
+            "top_fn",
+            None,
+            fn_start,
+            lines.len(),
+        ));
+
+        WalkFixture {
+            file_path: file,
+            ext: ".py",
+            source: lines.join("\n") + "\n",
+            entities,
+            symbol_table: symbols,
+            entity_map: emap,
+        }
+    }
+
+    fn gen_csharp(g: &mut Gen) -> WalkFixture {
+        let file = "gen_fixture.cs";
+        let mut lines: Vec<String> = Vec::new();
+        let mut entities: Vec<SemanticEntity> = Vec::new();
+        lines.push("using System;".to_string());
+        lines.push("using System.Collections.Generic;".to_string());
+        lines.push("namespace Gen {".to_string());
+        let n_classes = 1 + g.below(2);
+        for c in 0..n_classes {
+            let cname = format!("Widget{c}");
+            let class_start = lines.len() + 1;
+            lines.push(format!("  public class {cname} {{"));
+            let cid = format!("{file}::class::{cname}");
+            let n_methods = 1 + g.below(3);
+            for m in 0..n_methods {
+                let mname = format!("Run{c}_{m}");
+                let meth_start = lines.len() + 1;
+                lines.push(format!("    public int {mname}(int k) {{"));
+                lines.push(format!("      var w = new Widget{}();", g.below(n_classes)));
+                lines.push(format!("      w.Run{}_0(k);", g.below(n_classes)));
+                lines.push(format!("      return Helper{}(k);", g.below(3)));
+                lines.push("    }".to_string());
+                let meth_end = lines.len();
+                entities.push(mk_entity(
+                    file,
+                    "method",
+                    &mname,
+                    Some(&cid),
+                    meth_start,
+                    meth_end,
+                ));
+            }
+            lines.push("  }".to_string());
+            let class_end = lines.len();
+            entities.insert(
+                entities.len() - n_methods,
+                mk_entity(file, "class", &cname, None, class_start, class_end),
+            );
+        }
+        lines.push("}".to_string());
+
+        WalkFixture {
+            file_path: file,
+            ext: ".cs",
+            source: lines.join("\n") + "\n",
+            entities,
+            symbol_table: HashMap::default(),
+            entity_map: HashMap::default(),
+        }
+    }
+
+    fn gen_rust(g: &mut Gen) -> WalkFixture {
+        let file = "gen_fixture.rs";
+        let mut symbols = HashMap::default();
+        let mut emap = HashMap::default();
+        register_target(&mut symbols, &mut emap, "helpers.rs", "helper_a");
+        register_target(&mut symbols, &mut emap, "helpers.rs", "helper_b");
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut entities: Vec<SemanticEntity> = Vec::new();
+        lines.push("use crate::helpers::helper_a;".to_string());
+        if g.chance(2) {
+            lines.push("mod inner {".to_string());
+            lines.push("    use crate::helpers::helper_b;".to_string());
+            lines.push("    fn nested() { helper_b(); }".to_string());
+            lines.push("}".to_string());
+        }
+        let s_start = lines.len() + 1;
+        lines.push("struct Thing;".to_string());
+        entities.push(mk_entity(file, "struct", "Thing", None, s_start, s_start));
+        let impl_start = lines.len() + 1;
+        lines.push("impl Thing {".to_string());
+        let iid = format!("{file}::impl::Thing");
+        let m_start = lines.len() + 1;
+        lines.push("    fn go(&self) {".to_string());
+        lines.push("        let t = Thing;".to_string());
+        lines.push("        helper_a();".to_string());
+        lines.push("        Thing::go2();".to_string());
+        lines.push("        println!(\"x\");".to_string());
+        lines.push("    }".to_string());
+        let m_end = lines.len();
+        lines.push("}".to_string());
+        let impl_end = lines.len();
+        entities.push(mk_entity(file, "impl", "Thing", None, impl_start, impl_end));
+        entities.push(mk_entity(file, "method", "go", Some(&iid), m_start, m_end));
+        for f in 0..1 + g.below(2) {
+            let f_start = lines.len() + 1;
+            lines.push(format!("fn free{f}() {{"));
+            lines.push(format!("    free{}();", g.below(2)));
+            lines.push("}".to_string());
+            entities.push(mk_entity(
+                file,
+                "function",
+                &format!("free{f}"),
+                None,
+                f_start,
+                lines.len(),
+            ));
+        }
+
+        WalkFixture {
+            file_path: file,
+            ext: ".rs",
+            source: lines.join("\n") + "\n",
+            entities,
+            symbol_table: symbols,
+            entity_map: emap,
+        }
+    }
+
+    fn gen_go(g: &mut Gen) -> WalkFixture {
+        let file = "gen_fixture.go";
+        let mut symbols = HashMap::default();
+        let mut emap = HashMap::default();
+        register_target(&mut symbols, &mut emap, "pkg/util/util.go", "DoWork");
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut entities: Vec<SemanticEntity> = Vec::new();
+        lines.push("package gen".to_string());
+        lines.push("import (".to_string());
+        lines.push("\t\"fmt\"".to_string());
+        lines.push("\tu \"example.com/pkg/util\"".to_string());
+        lines.push(")".to_string());
+        let s_start = lines.len() + 1;
+        lines.push("type Box struct { N int }".to_string());
+        entities.push(mk_entity(file, "struct", "Box", None, s_start, s_start));
+        for m in 0..1 + g.below(2) {
+            let m_start = lines.len() + 1;
+            lines.push(format!("func (b *Box) Fill{m}() {{"));
+            lines.push("\tv := Box{N: 1}".to_string());
+            lines.push("\tfmt.Println(v)".to_string());
+            lines.push("\tu.DoWork()".to_string());
+            lines.push(format!("\tb.Fill{}()", g.below(2)));
+            lines.push("}".to_string());
+            entities.push(mk_entity(
+                file,
+                "method",
+                &format!("Fill{m}"),
+                None,
+                m_start,
+                lines.len(),
+            ));
+        }
+
+        WalkFixture {
+            file_path: file,
+            ext: ".go",
+            source: lines.join("\n") + "\n",
+            entities,
+            symbol_table: symbols,
+            entity_map: emap,
+        }
+    }
+
+    fn gen_typescript(g: &mut Gen) -> WalkFixture {
+        let file = "gen_fixture.ts";
+        let mut lines: Vec<String> = Vec::new();
+        let mut entities: Vec<SemanticEntity> = Vec::new();
+        lines.push("import { helper } from './helpers';".to_string());
+        if g.chance(2) {
+            lines.push("export { relay } from './relay';".to_string());
+        }
+        let c_start = lines.len() + 1;
+        lines.push("class Store {".to_string());
+        let cid = format!("{file}::class::Store");
+        let m_start = lines.len() + 1;
+        lines.push("  load(k: string) {".to_string());
+        lines.push("    const s = new Store();".to_string());
+        lines.push("    s.load(k);".to_string());
+        lines.push("    return helper(k);".to_string());
+        lines.push("  }".to_string());
+        let m_end = lines.len();
+        lines.push("}".to_string());
+        entities.push(mk_entity(
+            file,
+            "class",
+            "Store",
+            None,
+            c_start,
+            lines.len(),
+        ));
+        entities.push(mk_entity(
+            file,
+            "method",
+            "load",
+            Some(&cid),
+            m_start,
+            m_end,
+        ));
+
+        WalkFixture {
+            file_path: file,
+            ext: ".ts",
+            source: lines.join("\n") + "\n",
+            entities,
+            symbol_table: HashMap::default(),
+            entity_map: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn fused_triple_walk_matches_three_sequential_walks() {
+        let mut g = Gen::new(0x5EED_3A03);
+        let mut family_scopes = [0usize; 5];
+        let mut family_refs = [0usize; 5];
+        let mut family_imports = [0usize; 5];
+
+        for round in 0..24 {
+            let fixtures: Vec<(usize, WalkFixture)> = vec![
+                (0, gen_python(&mut g, round == 0)),
+                (1, gen_csharp(&mut g)),
+                (2, gen_rust(&mut g)),
+                (3, gen_go(&mut g)),
+                (4, gen_typescript(&mut g)),
+            ];
+            for (family, fx) in fixtures {
+                let spec = run_walks(&fx, ImportMode::SpecSequential);
+                let fused = run_walks(&fx, ImportMode::FusedReplay);
+                let label = format!("{} (round {round})", fx.file_path);
+                assert_outcomes_equal(&spec, &fused, &label);
+                family_scopes[family] += spec.scopes.len().saturating_sub(1);
+                family_refs[family] += spec.ast_refs.len();
+                family_imports[family] += spec.import_table.len();
+            }
+        }
+
+        // NON-VACUITY: every family battery built real scopes and collected
+        // real refs; the resolvable-import families resolved imports.
+        for (family, name) in ["python", "csharp", "rust", "go", "typescript"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                family_scopes[family] > 0,
+                "non-vacuity: {name} samples built no non-root scopes"
+            );
+            assert!(
+                family_refs[family] > 0,
+                "non-vacuity: {name} samples collected no refs"
+            );
+        }
+        assert!(
+            family_imports[0] > 0,
+            "non-vacuity: python samples resolved no imports"
+        );
+        assert!(
+            family_imports[2] > 0,
+            "non-vacuity: rust samples resolved no imports"
+        );
+        // C# has no import-statement kinds at all — the fused walk must
+        // record nothing, which is exactly where dotnet's extract cost goes.
+        assert_eq!(
+            family_imports[1], 0,
+            "csharp samples must resolve no imports (no matching kinds)"
+        );
+    }
+
+    /// POSITIVE CONTROL for the replay order: on the same-alias-two-targets
+    /// nested pair, extract's LIFO order (except-branch handled before
+    /// try-branch, so the try-branch import wins last-write-wins) differs
+    /// from document order. A fused implementation that fired handlers in
+    /// document order would be caught by the invariant test on exactly this
+    /// fixture; this test proves the fixture really distinguishes the two.
+    #[test]
+    fn import_replay_order_is_load_bearing() {
+        let mut g = Gen::new(0x5EED_3A04);
+        let fx = gen_python(&mut g, true);
+
+        let spec = run_walks(&fx, ImportMode::SpecSequential);
+        let fused = run_walks(&fx, ImportMode::FusedReplay);
+        let broken = run_walks(&fx, ImportMode::BrokenDocOrder);
+
+        let key = (fx.file_path.to_string(), "S".to_string());
+        assert_eq!(
+            spec.import_table.get(&key).map(String::as_str),
+            Some("mod0.py::function::shared"),
+            "spec: extract handles the except-branch first, so the try-branch (mod0) wins"
+        );
+        assert_eq!(
+            spec.import_table.get(&key),
+            fused.import_table.get(&key),
+            "fused replay must reproduce extract's order"
+        );
+        assert_eq!(
+            broken.import_table.get(&key).map(String::as_str),
+            Some("mod1.py::function::shared"),
+            "positive control: document order picks the other target"
+        );
+        assert_ne!(
+            spec.import_table.get(&key),
+            broken.import_table.get(&key),
+            "positive control: the order-witness pair must distinguish the orders"
         );
     }
 }

@@ -17,6 +17,26 @@ pub struct SemanticEntity {
     /// even if formatting/comments differ. Inspired by Unison's content-addressed model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structural_hash: Option<String>,
+    /// Semantic identity hash ("kappa"): a canonical hash over named AST node
+    /// kinds and semantically meaningful leaf tokens (identifiers, literals,
+    /// operators), excluding comments and pure CST punctuation/delimiters
+    /// (braces, parens, semicolons, commas). Computed additively alongside
+    /// `structural_hash` and does not change its meaning or use.
+    ///
+    /// Unlike `structural_hash` (which strips the name so renames don't
+    /// affect it, for `differ.rs` rename detection), kappa includes the name
+    /// and is rename-*sensitive* — it is meant as a parser-independent
+    /// semantic identity, not a rename-detection signal. Formatting-only
+    /// changes (whitespace, comments, trailing commas, brace style) leave it
+    /// unchanged. See `crates/sem-core/KAPPA.md` for the full spec,
+    /// measurements, and collision analysis.
+    ///
+    /// `None` for entities from parsers that don't expose byte spans (most
+    /// non-tree-sitter plugins) and for a couple of tree-sitter-code
+    /// error-recovery fallback paths that don't operate over a single clean
+    /// AST subtree (see KAPPA.md's compat/coverage section).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kappa: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     /// Byte offset of the entity's first byte in the source file (inclusive).

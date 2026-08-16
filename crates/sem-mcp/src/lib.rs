@@ -1,8 +1,9 @@
+pub mod agent_review;
 pub mod cache;
 pub mod cloud;
 pub mod render;
+pub(crate) mod review_protocol;
 pub mod server;
-pub mod sidecar;
 pub mod tools;
 mod transport;
 pub mod watch;
@@ -27,11 +28,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // transport handshakes, so the agent's first structural query answers
         // from memory instead of paying the cold build.
         server.spawn_prewarm();
-        // Socket sidecar: expose the warm graph on a per-repo unix socket so
-        // local short-lived callers (prompt prefetch) answer in milliseconds.
-        if let Ok(repo_root) = server::SemServer::discover_repo_root(None) {
-            sidecar::spawn(server.clone(), repo_root);
-        }
         let transport =
             transport::ResilientStdioTransport::new(tokio::io::stdin(), tokio::io::stdout());
         let service = server.serve(transport).await?;
@@ -40,31 +36,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-/// Resident mode (`sem mcp --resident`, hidden plumbing): serve ONLY the
-/// per-repo unix socket — no stdio MCP transport — so short-lived CLI calls
-/// answer from a warm in-memory graph in milliseconds. The CLI spawns this
-/// detached on a socket miss; it exits immediately if another server already
-/// owns the repo's socket (bind race, or a live `sem mcp` session), and
-/// retires itself after 30 minutes without a request.
-pub fn run_resident() -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let Ok(repo_root) = server::SemServer::discover_repo_root(None) else {
-            return Ok(()); // not a git repo: nothing to serve
-        };
-        if sidecar::socket_is_live(&repo_root).await {
-            return Ok(()); // a live server already owns this repo's socket
-        }
-        let server = server::SemServer::new();
-        server.spawn_prewarm();
-        sidecar::spawn(server.clone(), repo_root);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            // idle_secs is u64::MAX until the socket binds, so a lost bind
-            // race exits at the first tick instead of parking forever.
-            if sidecar::idle_secs() > 30 * 60 {
-                return Ok(());
-            }
-        }
-    })
-}
+// `sem mcp --resident` used to serve only the per-repo sidecar unix socket
+// (QUERY-INDEX.md §7 item 5 / GREP-KILLER S4, semx-woe): 0% availability at
+// production scale (the socket accepted connections and never answered —
+// §1.5), a +300ms tax on every CLI call that tried it, ~2.6GB steady RSS,
+// and ~935 leaked sockets observed in the wild. The index it existed to
+// work around now answers cold in 6-7ms, which deleted the justification
+// (the "fresh process + SQLite hydrate (~800ms)" the sidecar's own docs
+// cited no longer describes any real code path). `run_resident` and the
+// `sidecar` module it drove are gone; `--resident` itself is kept as a
+// backward-compatible no-op flag in `sem-cli` (see main.rs) so an
+// already-installed `sem setup` SessionStart hook that still invokes
+// `sem mcp --resident` exits cleanly instead of erroring, until that hook
+// wiring is updated separately.

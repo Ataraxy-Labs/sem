@@ -226,7 +226,7 @@ fn entities_file_exts_filter_directory_scans() {
 }
 
 #[test]
-fn entities_uses_fresh_topology_cache() {
+fn entities_uses_index_backed_listing_for_a_fresh_index() {
     let repo = TempDir::new().expect("temp repo");
     let cache = TempDir::new().expect("temp cache");
     fs::write(
@@ -252,17 +252,20 @@ fn entities_uses_fresh_topology_cache() {
         .iter()
         .map(|phase| phase["name"].as_str().expect("phase name"))
         .collect::<Vec<_>>();
+    // QUERY-INDEX.md §7 item 1 (semx-woe S4): directory listing now answers
+    // from the mmap query index (`QueryIndex::files_under`) instead of the
+    // deleted SQLite `query_entities_listing`/`write_entities_listing_json`
+    // fast path — no filesystem walk, no SQL. The index path still funnels
+    // through the shared sort/dedup step (unlike the old streaming-JSON
+    // shortcut, which bypassed it entirely), so `sort_dedup` is expected
+    // here now; what must still never happen is a re-parse.
     assert!(
-        phase_names.contains(&"cache_entities_query"),
-        "expected cache hit phase, got {phase_names:?}"
+        phase_names.contains(&"index_entities_dir_query"),
+        "expected index-backed listing phase, got {phase_names:?}"
     );
     assert!(
         !phase_names.contains(&"extract_entities"),
-        "cache hit should not parse files; got {phase_names:?}"
-    );
-    assert!(
-        !phase_names.contains(&"sort_dedup"),
-        "streamed cache hit should not materialize and sort entities; got {phase_names:?}"
+        "index-backed listing should not parse files; got {phase_names:?}"
     );
 
     let counters = timings["counters"]
@@ -276,11 +279,11 @@ fn entities_uses_fresh_topology_cache() {
             )
         })
         .collect::<HashMap<_, _>>();
-    assert_eq!(counters["cached_entities"], entities.len() as u64);
+    assert_eq!(counters["entities"], entities.len() as u64);
 }
 
 #[test]
-fn entities_uses_whole_repo_cache_for_subdirectory_listing() {
+fn entities_index_scopes_a_subdirectory_listing() {
     let repo = TempDir::new().expect("temp repo");
     let cache = TempDir::new().expect("temp cache");
     fs::create_dir_all(repo.path().join("src")).unwrap();
@@ -316,12 +319,12 @@ fn entities_uses_whole_repo_cache_for_subdirectory_listing() {
         .map(|phase| phase["name"].as_str().expect("phase name"))
         .collect::<Vec<_>>();
     assert!(
-        phase_names.contains(&"cache_entities_query"),
-        "expected cache hit phase, got {phase_names:?}"
+        phase_names.contains(&"index_entities_dir_query"),
+        "expected index-backed listing phase, got {phase_names:?}"
     );
     assert!(
         !phase_names.contains(&"extract_entities"),
-        "cache hit should not parse files; got {phase_names:?}"
+        "index-backed listing should not parse files; got {phase_names:?}"
     );
 
     let counters = timings["counters"]
@@ -335,7 +338,7 @@ fn entities_uses_whole_repo_cache_for_subdirectory_listing() {
             )
         })
         .collect::<HashMap<_, _>>();
-    assert_eq!(counters["cached_entities"], entities.len() as u64);
+    assert_eq!(counters["entities"], entities.len() as u64);
     assert_eq!(counters["input_files"], 1);
     assert_eq!(counters["discovered_files"], 1);
 }

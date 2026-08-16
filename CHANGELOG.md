@@ -4,6 +4,27 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-08-16
+
+### Added
+
+- **`sem find` / `sem callers` / `sem refs`**: new query verbs that answer directly from the mmap `index.sem` — entity definitions, direct callers (reverse edges), and direct refs (forward edges) — without touching `cache.db`.
+- **`sem grep <pattern>`**: trigram-accelerated text search over the mmap index. A required-trigram query against the index's `TRIGRAM` section narrows the candidate file set, each candidate is then verified with the real regex matcher against its *current* bytes (never stale stored content), and output is `rg`-compatible `file:line:text`. Beats `rg` 11-26x on giant repos (measured on the TypeScript monster and home-assistant-core corpora: 25-53ms vs. `rg`'s 283-980ms for the same pattern). Falls back to a full scan for patterns no trigram query can be derived from.
+- **`sem review listen <diff-id-or-url> [--dry-run]`**: one-command agent attach to a hosted sem-cloud review. Resolves credentials, validates the diff exists, locates the review-listener plugin, and execs `claude` with the documented flags/env. `--dry-run` prints the assembled command with secrets masked, without launching or requiring `claude` to be installed.
+- **Three new sem-cloud MCP tools** (`join_review`, `wait_for_branch`, `reply_to_branch`) let an agent join a hosted code review as a live listener: long-poll for reviewer questions anchored to lines of a diff, investigate them in the repo, and stream answers back. Ships with a Claude Code plugin (`integrations/claude-review-listener/`) that wires the tools up and adds a read-only Stop-hook backstop for headless sessions.
+- **`sem diff`'s hosted upload no longer blocks on the local caller/callee relations pass.** With cloud consent on, the diff snapshot uploads immediately with empty relations; the server queues enrichment and replies "enrichmentQueued" (or, against an older server, the CLI runs the existing local pass and PUTs the result afterward). `SEM_RELATIONS_LOCAL=1` restores the old blocking single-upload behavior; the local relations pass's own budget is now adaptive to repo size.
+
+### Performance
+
+- **Cold graph builds are 11-30% faster and peak RSS is down 17-40% on giant corpora, versus 0.21.** Measured end-to-end on the shipped release binary: home-assistant-core 5.9s, TypeScript monster 11.2s, dotnet-runtime 46.7s, llvm-project 34.7s, linux 35.2s cold full-CLI (warm rebuilds: 0.2-1.3s). Every corpus improved on both the engine-only and full-CLI metrics; full methodology and per-corpus numbers are in `RESOLUTION-PROFILE.md`'s FINALE section.
+- **C#/C++ builds now skip re-parsing files whose facts are already known**, closing the last gap in precomputed-facts reuse (JS/TS/Python/Go/Java/Rust already had it). A per-file gate proves a corpus-wide invariant — no entity's parent lives in a different file — before trusting precomputed facts wholesale, so this needed no facts-schema change. Measured on dotnet-runtime: reparse time drops from 10.6s to 65ms.
+- **Parsed file facts now persist to disk as a content-addressed corpus**, so a build that has seen a file's exact content before warm-starts it instead of re-parsing from scratch, even in a fresh process. Fixed a regression where checking a shared corpus against a large number of prior contributors got slower as the corpus grew (one repo's known-content rebuild was measured 332% slower against a 7.9GB shared corpus than a 556MB one); it now costs the same regardless of corpus size.
+- **`sem context` regained a fast tier it had lost, by reading each entity's body from its own file at an indexed byte span instead of walking and hydrating the whole corpus.** A prior cascade of cache removals deleted the old fast path along with a correctness bug it had, but left `sem context` always doing a full corpus load — measured on the TypeScript monster 1.11s down to 48ms, on a mid-size repo 0.16-0.28s down to 4.6ms. Verified byte-identical against the always-correct full-load path across both entity- and file-scoped lookups; still declines (never approximates) on a stale cache, an ambiguous name, or any entity missing a span.
+
+### Changed
+
+- **`sem mcp --resident`'s standing sidecar process is gone.** With index-backed queries answering in single-digit milliseconds from a cold process, the resident's whole reason for existing (avoiding a ~800ms SQLite hydrate) no longer applies — it measured 0% availability at scale, a 300ms tax, and 2.6GB of idle RSS. `SEM_NO_SIDECAR` and `SEM_NO_AUTOWARM` are gone with it; the `--resident` flag itself stays as a no-op for compatibility.
+
 ### Fixed
 
 - **`sem --version` now reports the correct version.** The `v0.21.1` tag only bumped `sem-core`, leaving `sem-cli`, `sem-mcp`, `sem-plugin`, and `sem-cloud-client` at `0.21.0`, so the binary still reported `0.21.0`. Bumped those crates (and their internal path dependencies) to `0.21.1` to match the tag. Thanks @chenrui333 (#480).

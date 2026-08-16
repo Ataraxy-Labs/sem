@@ -1,6 +1,6 @@
 [package]
 name = "sem-core"
-version = "0.21.1"
+version = "0.22.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 28 languages via tree-sitter and diffs at the entity level."
@@ -9,12 +9,35 @@ homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["diff", "semantic", "tree-sitter", "ast", "code-analysis"]
 categories = ["development-tools", "parser-implementations"]
 readme = "../../README.md"
+exclude = [
+    "DATA-FLOW-AUDIT.md",
+    "INCREMENTAL-PARSE.md",
+    "KAPPA.md",
+    "MUL-DESIGN.md",
+    "OXC-FASTPATH.md",
+    "QUERY-INDEX.md",
+    "RESOLUTION-PROFILE.md",
+    "SINGLE-PASS.md",
+    "WEAVE-INTEGRATION.md",
+]
 
 [features]
-default = ["git", "parallel", "grammar-all"]
+default = ["git", "parallel", "grammar-all", "mmap"]
 git = ["dep:git2"]
 parallel = ["dep:rayon"]
 wasm = []
+# Memory-mapped reads for the query index (parser-adjacent; see QUERY-INDEX.md).
+# Kept behind a feature, and the reader is defined over `&[u8]` regardless, so
+# `wasm` — where mmap does not exist — builds the same format code with the
+# owned-bytes constructor and no dependency.
+mmap = ["dep:memmap2"]
+
+# Spike: an oxc-based fast path for TS/JS entity extraction. Off by default.
+# See OXC-FASTPATH.md for the measurement and verdict.
+oxc-fastpath = [
+    "dep:oxc_parser", "dep:oxc_ast", "dep:oxc_ast_visit",
+    "dep:oxc_allocator", "dep:oxc_span", "dep:oxc_syntax",
+]
 
 # Grammar groups
 grammar-core = [
@@ -122,6 +145,71 @@ tree-sitter-d = { version = "0.8.2", optional = true }
 tree-sitter-lua = { version = "0.5.0", optional = true }
 tree-sitter-fish = { version = "3.6", optional = true }
 rustc-hash = "2"
+# On-disk persistence for the red-green facts layer (semx-9en, parser::facts_store).
+# Pure Rust, no C dependency (keeps the `wasm` feature viable). CBOR, not
+# bincode: `SemanticEntity` (persisted inside `FileFacts`) uses
+# `#[serde(skip_serializing_if = "Option::is_none")]` on several fields —
+# correct and cheap for the self-describing formats it already round-trips
+# through (`serde_json` elsewhere in this crate), but fatal for a
+# non-self-describing, positional format: skipping a field on write desyncs
+# a decoder that expects one value per declared field in sequence. A RED test
+# in facts_store.rs caught this against bincode directly (see its module doc);
+# CBOR is self-describing (field lookup by key, like JSON) so it round-trips
+# the same structs JSON already does, while still decoding decisively faster
+# than JSON's text parsing for the bulk-load access pattern this store has.
+ciborium = "0.2"
+
+# Zero-copy reads for the query index (`index::reader`). Pure Rust, no C
+# dependency — same constraint the facts layer's CBOR choice above answers to.
+# Optional, and the reader's `from_bytes` constructor works without it, so the
+# `wasm` feature keeps building.
+memmap2 = { version = "0.9", optional = true }
+
+# oxc-fastpath spike (see OXC-FASTPATH.md). Pinned exact versions so the
+# equivalence-pinning tests aren't chasing a moving upstream AST.
+oxc_parser = { version = "=0.143.0", optional = true }
+oxc_ast = { version = "=0.143.0", optional = true }
+oxc_ast_visit = { version = "=0.143.0", optional = true }
+oxc_allocator = { version = "=0.143.0", optional = true }
+oxc_span = { version = "=0.143.0", optional = true }
+oxc_syntax = { version = "=0.143.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3.24.0"
+ignore = "0.4"
+criterion = "0.5"
+# Benches are separate crates, so the profiling benches need their own handles
+# on the parse/hash primitives sem-core uses internally.
+tree-sitter = "0.26"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# semx-4w1: dev-only, used by the `mem_single_probe` example to test the
+# system-allocator-fragmentation hypothesis for the giant-corpus RSS blowout
+# (many small, short-lived tree-sitter/extraction allocations across a highly
+# parallel cold build; macOS's default allocator does not always return freed
+# arena pages to the OS promptly, which shows up as RSS that never comes back
+# down between chunks). Not proposed as sem-core's own allocator — that
+# decision belongs to whichever binary embeds this library.
+mimalloc = "0.1"
+
+[[bench]]
+name = "parse_profile"
+harness = false
+
+[[bench]]
+name = "incremental"
+harness = false
+
+[[bench]]
+name = "interning"
+harness = false
+
+[[bench]]
+name = "oxc_spike"
+harness = false
+required-features = ["oxc-fastpath"]
+
+# Replays real commits through the full `sem diff` pipeline twice (fast path
+# off vs on) and compares. Needs a git repository to read history from.
+[[example]]
+name = "diff_oracle"
+required-features = ["git"]

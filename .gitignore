@@ -5,6 +5,7 @@ target/
 node_modules/
 .npm-cache/
 vendor/
+.quiver/
 
 # Scratch / demo files
 *.cast
@@ -31,3 +32,4 @@ hero.svg
 result/
 dhat-heap.json
 .claude/worktrees/
+ratatui-debug.log

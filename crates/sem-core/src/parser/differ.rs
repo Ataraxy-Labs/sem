@@ -23,6 +23,10 @@ use crate::parser::plugin::SemanticParserPlugin;
 use crate::parser::registry::ParserRegistry;
 use std::collections::{HashMap, HashSet};
 
+mod phase_timing;
+use phase_timing::PHASE_ACC;
+pub use phase_timing::{diff_phase_timings, DiffPhaseTimings};
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffResult {
@@ -81,6 +85,10 @@ pub fn compute_semantic_diff(
     commit_sha: Option<&str>,
     author: Option<&str>,
 ) -> DiffResult {
+    // Fresh accumulation for this call — see phase_timing's module doc for
+    // why a top-level reset is needed before the parallel fan-out below.
+    phase_timing::reset_diff_phase_timings();
+
     // Process files in parallel: each file's entity extraction and matching is independent
     let per_file_changes: Vec<(String, Vec<SemanticChange>, usize, usize)> =
         maybe_par_iter!(file_changes)
@@ -99,23 +107,23 @@ pub fn compute_semantic_diff(
                     let before_path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
                     let before_resolved = registry.resolve_file_path(before_path);
                     let before_detection = before_resolved.as_deref().unwrap_or(before_path);
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        plugin.extract_entities(content, before_detection)
-                    })) {
-                        Ok(entities) => entities,
-                        Err(_) => Vec::new(),
-                    }
+                    phase_timing::timed(&PHASE_ACC.extraction_ns, || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            plugin.extract_entities(content, before_detection)
+                        }))
+                        .unwrap_or_default()
+                    })
                 } else {
                     Vec::new()
                 };
 
                 let after_entities = if let Some(ref content) = file.after_content {
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        plugin.extract_entities(content, detection_path)
-                    })) {
-                        Ok(entities) => entities,
-                        Err(_) => Vec::new(),
-                    }
+                    phase_timing::timed(&PHASE_ACC.extraction_ns, || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            plugin.extract_entities(content, detection_path)
+                        }))
+                        .unwrap_or_default()
+                    })
                 } else {
                     Vec::new()
                 };
@@ -123,29 +131,38 @@ pub fn compute_semantic_diff(
                 let before_count = before_entities.len();
                 let after_count = after_entities.len();
 
-                let mut result = match_entities(
-                    &before_entities,
-                    &after_entities,
-                    &file.file_path,
-                    None,
-                    commit_sha,
-                    author,
-                );
+                let mut result = phase_timing::timed(&PHASE_ACC.matching_ns, || {
+                    let mut result = match_entities(
+                        &before_entities,
+                        &after_entities,
+                        &file.file_path,
+                        None,
+                        commit_sha,
+                        author,
+                    );
 
-                // Suppress parent entities whose modification is already explained
-                // by child entity changes (e.g. impl blocks when methods changed).
-                suppress_redundant_parents(&mut result.changes, &before_entities, &after_entities);
+                    // Suppress parent entities whose modification is already explained
+                    // by child entity changes (e.g. impl blocks when methods changed).
+                    suppress_redundant_parents(
+                        &mut result.changes,
+                        &before_entities,
+                        &after_entities,
+                    );
+                    result
+                });
 
                 // Detect orphan changes (lines that changed outside any entity span).
-                let orphans = detect_orphan_changes(
-                    file,
-                    &before_entities,
-                    &after_entities,
-                    Some(plugin),
-                    detection_path,
-                    commit_sha,
-                    author,
-                );
+                let orphans = phase_timing::timed(&PHASE_ACC.orphan_ns, || {
+                    detect_orphan_changes(
+                        file,
+                        &before_entities,
+                        &after_entities,
+                        Some(plugin),
+                        detection_path,
+                        commit_sha,
+                        author,
+                    )
+                });
                 result.changes.extend(orphans);
 
                 result.changes.sort_by_key(|change| change.entity_line);
@@ -747,6 +764,8 @@ mod tests {
             content: String::new(),
             content_hash: String::new(),
             structural_hash: None,
+
+            kappa: None,
             start_line,
             end_line,
             start_byte: None,

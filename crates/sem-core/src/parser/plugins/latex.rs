@@ -145,6 +145,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                     parent_id: None,
                     content_hash: content_hash(&preamble_content),
                     structural_hash: None,
+
+                    kappa: None,
                     content: preamble_content,
                     start_line: p_start + 1,
                     end_line: p_end,
@@ -199,6 +201,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                                 parent_id: Some(pid.clone()),
                                 content_hash: content_hash(&def_content),
                                 structural_hash: None,
+
+                                kappa: None,
                                 content: def_content,
                                 start_line: p_start + def_start + 1,
                                 end_line: p_start + def_end + 1,
@@ -326,6 +330,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                 parent_id: section.parent_index.map(|pi| section_ids[pi].clone()),
                 content_hash: content_hash(&section_content),
                 structural_hash: None,
+
+                kappa: None,
                 content: section_content,
                 start_line: section.start_line,
                 end_line: section.start_line + section.lines.len() - 1,
@@ -440,6 +446,8 @@ impl SemanticParserPlugin for LatexParserPlugin {
                 parent_id,
                 content_hash: content_hash(&env.content),
                 structural_hash: None,
+
+                kappa: None,
                 content: env.content.clone(),
                 start_line: env.start_line,
                 end_line: env.end_line,

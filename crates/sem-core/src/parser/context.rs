@@ -243,12 +243,12 @@ pub fn build_context_result_bounded(
     for (role, relationships, direct_ids) in [
         (
             "transitive_dependency",
-            &graph.dependencies,
+            graph.dependencies(),
             &direct_dependency_ids,
         ),
         (
             "transitive_dependent",
-            &graph.dependents,
+            graph.dependents(),
             &direct_dependent_ids,
         ),
     ] {
@@ -617,7 +617,7 @@ mod tests {
 
         let graph = graph_from_entities(&entities, edges);
         let result =
-            collect_reachable_related(&graph, "a.py::function::helper_0", &graph.dependencies, 0);
+            collect_reachable_related(&graph, "a.py::function::helper_0", graph.dependencies(), 0);
 
         assert_eq!(result.len(), 10_000);
     }
@@ -642,11 +642,11 @@ mod tests {
         ];
         let graph = graph_from_entities(&entities, edges);
 
-        let hop1 = collect_reachable_related(&graph, ids[0], &graph.dependencies, 1);
+        let hop1 = collect_reachable_related(&graph, ids[0], graph.dependencies(), 1);
         assert_eq!(hop1.len(), 1, "1 hop reaches only b");
-        let hop2 = collect_reachable_related(&graph, ids[0], &graph.dependencies, 2);
+        let hop2 = collect_reachable_related(&graph, ids[0], graph.dependencies(), 2);
         assert_eq!(hop2.len(), 2, "2 hops reach b and c");
-        let unbounded = collect_reachable_related(&graph, ids[0], &graph.dependencies, 0);
+        let unbounded = collect_reachable_related(&graph, ids[0], graph.dependencies(), 0);
         assert_eq!(unbounded.len(), 3, "unbounded reaches b, c, d");
     }
 
@@ -660,6 +660,8 @@ mod tests {
             content: content.to_string(),
             content_hash: String::new(),
             structural_hash: None,
+
+            kappa: None,
             start_line: 1,
             end_line: content.lines().count(),
             start_byte: None,
@@ -716,7 +718,10 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.entries.len(), 1);
         let target = &result.entries[0];
-        assert!(target.content.lines().count() > 5, "more than the bare signature");
+        assert!(
+            target.content.lines().count() > 5,
+            "more than the bare signature"
+        );
         assert!(target.content.contains("… truncated:"), "explicit marker");
         assert!(
             target.estimated_tokens >= 50 && target.estimated_tokens <= 100,
@@ -734,9 +739,21 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let entities = vec![
-            entity("a.py::function::small_target", "small_target", "def small_target():\n    return helper() + giant()"),
-            entity("a.py::function::giant", "giant", &format!("def giant():\n{giant_body}")),
-            entity("a.py::function::helper", "helper", "def helper():\n    return 42"),
+            entity(
+                "a.py::function::small_target",
+                "small_target",
+                "def small_target():\n    return helper() + giant()",
+            ),
+            entity(
+                "a.py::function::giant",
+                "giant",
+                &format!("def giant():\n{giant_body}"),
+            ),
+            entity(
+                "a.py::function::helper",
+                "helper",
+                "def helper():\n    return 42",
+            ),
         ];
         let graph = graph_from_entities(
             &entities,
@@ -746,8 +763,7 @@ mod tests {
             ],
         );
 
-        let result =
-            build_context_result(&graph, "a.py::function::small_target", &entities, 3000);
+        let result = build_context_result(&graph, "a.py::function::small_target", &entities, 3000);
 
         let giant = result
             .entries
@@ -765,6 +781,9 @@ mod tests {
             .iter()
             .find(|e| e.entity_name == "helper")
             .expect("helper included");
-        assert!(helper.content.contains("return 42"), "small neighbor keeps full body");
+        assert!(
+            helper.content.contains("return 42"),
+            "small neighbor keeps full body"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "sem-cli"
-version = "0.21.1"
+version = "0.22.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Semantic version control CLI. Shows what entities changed (functions, classes, methods) instead of lines."
@@ -9,15 +9,16 @@ homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["diff", "semantic", "git", "cli", "code-review"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
+exclude = ["DATA-FLOW.md"]
 
 [[bin]]
 name = "sem"
 path = "src/main.rs"
 
 [dependencies]
-sem-core = { path = "../sem-core", version = "0.21.1" }
-sem-mcp = { path = "../sem-mcp", version = "0.21.1" }
-sem-cloud-client = { path = "../sem-cloud-client", version = "0.21.1" }
+sem-core = { path = "../sem-core", version = "0.22.1" }
+sem-mcp = { path = "../sem-mcp", version = "0.22.1" }
+sem-cloud-client = { path = "../sem-cloud-client", version = "0.22.1" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
@@ -33,6 +34,11 @@ clap_complete_command = "0.6.1"
 mimalloc = "0.1"
 ureq = { version = "2", features = ["json"] }
 indicatif = "0.17"
+# Facts service wire format (commands/diff/facts_remote.rs, semx-9en cloud
+# half): same crate + version sem-core's facts_store.rs uses, so a fact
+# payload's CBOR encoding is byte-compatible with sem-cloud's facts service.
+ciborium = "0.2"
+serde_bytes = "0.11"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/sem-{ target }{ archive-suffix }"
@@ -63,3 +69,5 @@ vendored-openssl = ["openssl-sys/vendored"]
 
 [dev-dependencies]
 tempfile = "3.24.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.8"

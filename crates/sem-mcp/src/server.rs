@@ -22,7 +22,12 @@ use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
 use std::time::Instant;
 use tokio::sync::Mutex;
 
+use crate::agent_review;
 use crate::cache;
+use crate::review_protocol::{
+    BRANCH_FOUND_FOLLOWUP, PARTIAL_REPLY_POSTED, REPLY_POSTED, REVIEW_LISTENER_PROTOCOL,
+    TIMEOUT_INSTRUCTION,
+};
 use crate::tools::*;
 use crate::watch::{watch_enabled, RepoWatcher};
 
@@ -94,6 +99,45 @@ struct CachedTopology {
     graph: Arc<EntityGraph>,
 }
 
+/// Single-flight lock for graph builds, keyed by manifest hash. Without this,
+/// `get_or_build_graph` is check-then-act: the memory-cache check and the
+/// disk-cache check each release their lock before the expensive
+/// `EntityGraph::build(...)` call, so two concurrent tool calls against a
+/// cold cache both miss and both redundantly rebuild the whole graph
+/// (thundering herd). The first caller for a given manifest hash acquires the
+/// per-key lock and does the full check-then-act dance; every other
+/// concurrent caller for that same hash waits on the same lock, then
+/// re-checks the memory cache the winner just populated, instead of
+/// re-triggering the build.
+///
+/// Mirrors sem-cloud's `RefreshLocks` (`sem-cloud/src/tokens.rs`) for GitHub
+/// token refresh: a plain `HashMap<key, Arc<tokio::sync::Mutex<()>>>` behind
+/// a `std::sync::Mutex`, not the atomic-UPDATE-claim idiom a job queue would
+/// use. That idiom fits a queue where losing a race means "someone else got
+/// the job, do nothing"; there's no idle-loser case here either -- every
+/// caller still wants the built graph back, just without paying for a second
+/// full-repo parse. The double-checked memory-cache read after acquiring the
+/// lock is what actually prevents the duplicate build; the mutex only
+/// serializes who does the work.
+#[derive(Default)]
+struct BuildLocks(std::sync::Mutex<HashMap<u64, Arc<Mutex<()>>>>);
+
+impl BuildLocks {
+    async fn acquire(&self, key: u64) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            // A poisoned outer mutex would panic here, same reasoning as
+            // `RefreshLocks::acquire`: this map only ever holds an
+            // `Arc<Mutex<()>>`, whose constructor cannot panic, so poisoning
+            // is not a reachable state in practice.
+            let mut map = self.0.lock().expect("build-lock map mutex poisoned");
+            map.entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+}
+
 /// Live-watch bookkeeping for whole-repo graph queries. Lets `sem_impact` and
 /// `sem_context` serve a hot cached graph without re-walking + re-stat-ing the
 /// tree when nothing has changed since the last build.
@@ -129,6 +173,11 @@ pub struct SemServer {
     entity_cache: Arc<Mutex<EntityCache>>,
     graph_cache: Arc<Mutex<Option<CachedGraph>>>,
     topology_cache: Arc<Mutex<Option<CachedTopology>>>,
+    /// Single-flight guard for `get_or_build_graph`'s build path -- see
+    /// [`BuildLocks`]. `Arc`-shared (not per-clone) so every clone of
+    /// `SemServer` (one per connection) coalesces onto the same in-flight
+    /// build for a given manifest hash.
+    build_locks: Arc<BuildLocks>,
     watch: Arc<Mutex<WatchSlot>>,
     /// Attention ledger: per-session record of context fills already emitted
     /// (key: session\0entity_id). A re-ask whose fingerprint matches collapses
@@ -376,6 +425,71 @@ impl SemServer {
             .map_err(|e| format!("Failed to read {}: {}", display_path, e))
     }
 
+    /// `sem-mcp`'s port of `sem-cli`'s `entities.rs` directory reroute
+    /// (semx-zvq cascade e; §12.1 item 7 named this port as the prerequisite
+    /// for demoting the cloud site below it, and left it undone precisely
+    /// because "gating cloud off there without a fast local replacement would
+    /// trade a working-but-backwards-ordered path for an unconditionally
+    /// slower one").
+    ///
+    /// Answers "every entity under this directory" from the query index: no
+    /// walk, no parse, one `partition_point` over the sorted `FILES` section.
+    /// `None` — never a wrong answer, only "cannot answer fast" — for a
+    /// non-default scope (the image is built at default scope only), a
+    /// missing/salt-mismatched image, or `SEM_NO_INDEX=1`.
+    ///
+    /// Per-file `Verified` freshness (§5.1) with the same self-heal
+    /// `sem-cli`'s version uses: a file whose fingerprint no longer matches
+    /// disk is re-extracted from the current bytes rather than failing the
+    /// whole listing, and a file that vanished since the index listed it is
+    /// dropped (a walk would not have found it either). Same disclosed gap
+    /// too: this is `Verified`, not `Complete` — a file created since the
+    /// last build is invisible until the next one.
+    async fn try_index_entities_for_dir(
+        &self,
+        repo_root: &Path,
+        abs_path: &Path,
+        no_default_excludes: bool,
+    ) -> Option<Vec<SemanticEntity>> {
+        if no_default_excludes || std::env::var_os("SEM_NO_INDEX").is_some() {
+            return None;
+        }
+        let index_path =
+            crate::cache::cache_dir_for_repo(repo_root)?.join(sem_core::index::INDEX_FILE_NAME);
+        let index = sem_core::index::QueryIndex::open(&index_path)?;
+
+        let rel = abs_path.strip_prefix(repo_root).ok()?.to_string_lossy();
+        let prefix = if rel.is_empty() || rel == "." {
+            String::new()
+        } else {
+            format!("{}/", rel.trim_end_matches('/'))
+        };
+
+        let files: Vec<String> = index
+            .files_under(&prefix)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let mut out = Vec::new();
+        for file in &files {
+            if index_file_is_stale(&index, repo_root, file) {
+                let Ok(content) = std::fs::read_to_string(repo_root.join(file)) else {
+                    continue;
+                };
+                out.extend(self.cached_extract_entities(&content, file).await);
+            } else {
+                out.extend(
+                    index
+                        .entities_in_file(file)
+                        .iter()
+                        .map(|e| entity_info_to_entity(e.to_entity_info())),
+                );
+            }
+        }
+        Some(out)
+    }
+
     async fn extract_entities_from_files(
         &self,
         root: &Path,
@@ -544,6 +658,26 @@ impl SemServer {
         let manifest_hash = cache::compute_manifest_hash(repo_root, file_paths).unwrap_or(0);
 
         // Check memory cache
+        {
+            let guard = self.graph_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                if cached.manifest_hash == manifest_hash {
+                    return (cached.graph.clone(), cached.entities.clone());
+                }
+            }
+        }
+
+        // Single-flight: only the first concurrent caller for this manifest
+        // hash proceeds past here to do the (disk-cache -> fresh-build)
+        // dance; every other concurrent caller for the same hash waits on
+        // this lock instead of racing its own redundant build. See
+        // `BuildLocks`.
+        let _build_guard = self.build_locks.acquire(manifest_hash).await;
+
+        // Re-check the memory cache: whoever held the lock before us (or a
+        // prior build entirely) may have already populated it while we were
+        // waiting -- this second read is what actually avoids the duplicate
+        // build; the lock above only serializes who does the work.
         {
             let guard = self.graph_cache.lock().await;
             if let Some(ref cached) = *guard {
@@ -1140,6 +1274,7 @@ impl SemServer {
             ))),
             graph_cache: Arc::new(Mutex::new(None)),
             topology_cache: Arc::new(Mutex::new(None)),
+            build_locks: Arc::new(BuildLocks::default()),
             watch: Arc::new(Mutex::new(WatchSlot::default())),
             fill_ledger: Arc::new(Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(10_000).unwrap(),
@@ -1195,33 +1330,48 @@ impl SemServer {
             }
             (entities, false)
         } else if abs_path.is_dir() {
-            // Cloud-first for whole-repo listings of large registered repos;
-            // single files / subdirs and custom-scope listings stay local.
-            if !params.no_default_excludes() {
-                if let Some(out) = crate::cloud::try_entities(&ctx.git, &ctx.repo_root, &abs_path) {
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        serde_json::to_string_pretty(&out).unwrap_or_default(),
-                    )]));
-                }
-            }
-            let file_paths = match Self::walk_dir_files_with_options(
-                &abs_path,
-                &ctx.repo_root,
-                &self.registry,
-                params.no_default_excludes(),
-            ) {
-                Ok(file_paths) => file_paths,
-                Err(err) => return Ok(tool_error(err)),
-            };
-
-            let all_entities = match self
-                .extract_entities_from_files(&ctx.repo_root, &file_paths)
+            // Local index first (semx-zvq cascade e). This site was the last
+            // ungated, production-active instance of the precedence inversion
+            // §7 item 7 / §12.1 item 7 describe: cloud was tried over the
+            // network *before* any local answer was attempted. It is now
+            // tried only once the local index has declined — matching what
+            // `sem-cli`'s `entities.rs` has done since §12.1, and correct for
+            // the same reason: cloud is a capability (cross-repo xref, repos
+            // with no local index), not a latency tier.
+            if let Some(entities) = self
+                .try_index_entities_for_dir(&ctx.repo_root, &abs_path, params.no_default_excludes())
                 .await
             {
-                Ok(entities) => entities,
-                Err(err) => return Ok(tool_error(err)),
-            };
-            (all_entities, true)
+                (entities, true)
+            } else {
+                if !params.no_default_excludes() {
+                    if let Some(out) =
+                        crate::cloud::try_entities(&ctx.git, &ctx.repo_root, &abs_path)
+                    {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&out).unwrap_or_default(),
+                        )]));
+                    }
+                }
+                let file_paths = match Self::walk_dir_files_with_options(
+                    &abs_path,
+                    &ctx.repo_root,
+                    &self.registry,
+                    params.no_default_excludes(),
+                ) {
+                    Ok(file_paths) => file_paths,
+                    Err(err) => return Ok(tool_error(err)),
+                };
+
+                let all_entities = match self
+                    .extract_entities_from_files(&ctx.repo_root, &file_paths)
+                    .await
+                {
+                    Ok(entities) => entities,
+                    Err(err) => return Ok(tool_error(err)),
+                };
+                (all_entities, true)
+            }
         } else {
             return Ok(tool_error(format!("Path not found: {}", path)));
         };
@@ -1935,6 +2085,195 @@ impl SemServer {
                 "source": "local",
             })),
         )]))
+    }
+
+    // ── Tool 7: Join review (agent listener) ──
+
+    #[tool(
+        description = "Join a sem-cloud code review as a live listener. Fetches the review's manifest summary, announces this session as \"listening\" so the human sees a listener attached, and returns the review context PLUS the full listener protocol you must follow for the rest of this session.\n\n\
+        THIS STARTS A LONG-LIVED LOOP, NOT A ONE-SHOT QUERY. After joining: call wait_for_branch in a loop, for as long as this session runs. Every time it returns a branch (a reviewer's question anchored to a line of the diff), investigate the question IN THIS REPOSITORY — read the referenced file, grep for the entity, run tests if that's what settles it; the attached diff context (patch/callers/callees) is a starting point, not the whole truth. Answer with reply_to_branch: send partial:true chunks as you compose (2-4 sentences each; content is the CUMULATIVE answer so far, never a delta), then one final call with partial:false (or omitted) to commit it. The instant you finish replying, call wait_for_branch again — do not pause, summarize, or wait for further instructions. If wait_for_branch reports status timeout, that's the normal idle state of a listener, not a stopping condition: call it again immediately. Never end the session yourself."
+    )]
+    async fn join_review(
+        &self,
+        Parameters(params): Parameters<JoinReviewParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match resolve_agent_review_client() {
+            Ok(c) => c,
+            Err(result) => return Ok(result),
+        };
+        let diff_id = params.diff_id.clone();
+
+        let manifest_client = client.clone();
+        let manifest_diff_id = diff_id.clone();
+        let manifest = run_blocking("join_review", move || {
+            manifest_client.manifest(&manifest_diff_id)
+        })
+        .await?;
+
+        let presence_client = client.clone();
+        let presence_diff_id = diff_id.clone();
+        let presence_result = run_blocking("join_review", move || {
+            presence_client.presence(&presence_diff_id, "listening", Some("claude-code"))
+        })
+        .await?;
+
+        let mut out = String::new();
+        match manifest {
+            Ok(value) => out.push_str(&agent_review::render_manifest_summary(&diff_id, &value)),
+            Err(err) => out.push_str(&format!(
+                "(could not fetch manifest for diff {diff_id}: {err} — continuing anyway, this is not fatal)\n"
+            )),
+        }
+        match presence_result {
+            Ok(()) => out.push_str("Presence announced: listening (label \"claude-code\").\n"),
+            Err(err) => out.push_str(&format!(
+                "(could not announce presence: {err} — continuing anyway)\n"
+            )),
+        }
+
+        out.push('\n');
+        out.push_str(REVIEW_LISTENER_PROTOCOL);
+
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    // ── Tool 8: Wait for branch ──
+
+    #[tool(
+        description = "Long-poll sem-cloud for the next reviewer question (\"branch\") on this diff. Blocks up to wait_seconds (default 40, max 45) waiting for one to arrive.\n\n\
+        Call this again immediately after every reply_to_branch and after every timeout — a timeout just means no question arrived in this poll window, which is the normal idle state of a listener, never a reason to stop. Keep calling this in a loop for as long as you are listening to this review; going quiet leaves the reviewer waiting on an answer that never comes."
+    )]
+    async fn wait_for_branch(
+        &self,
+        Parameters(params): Parameters<WaitForBranchParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match resolve_agent_review_client() {
+            Ok(c) => c,
+            Err(result) => return Ok(result),
+        };
+        let diff_id = params.diff_id.clone();
+        let wait_ms = params.wait_seconds() * 1000;
+
+        let result = run_blocking("wait_for_branch", move || {
+            client.next_branch(&diff_id, wait_ms)
+        })
+        .await?;
+
+        match result {
+            Ok(agent_review::AgentNext::Branch(branch)) => {
+                let mut out = serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "branch",
+                    "branch": branch,
+                }))
+                .unwrap_or_default();
+                out.push_str(BRANCH_FOUND_FOLLOWUP);
+                Ok(CallToolResult::success(vec![Content::text(out)]))
+            }
+            Ok(agent_review::AgentNext::Timeout) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "timeout",
+                    "instruction": TIMEOUT_INSTRUCTION,
+                })
+                .to_string(),
+            )])),
+            // A 404 here means the DIFF itself is gone (agent_next 404s
+            // before ever looking at individual comments) — deleted or
+            // expired. That's the one legitimate reason for the loop to
+            // stop itself; every other error still says "try again".
+            Err(err) if matches!(&err, agent_review::AgentReviewError::Http { status, .. } if *status == 404) => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    agent_review::review_gone_result().to_string(),
+                )]))
+            }
+            Err(err) => Ok(tool_error(format!(
+                "wait_for_branch: {err} (call wait_for_branch again to keep listening — a transient \
+                 sem-cloud error is not a reason to stop)"
+            ))),
+        }
+    }
+
+    // ── Tool 9: Reply to branch ──
+
+    #[tool(
+        description = "Post an answer to a reviewer's question (a \"branch\") on a sem-cloud diff. Set partial:true while still composing — content must be the FULL cumulative answer each time, not just the newest piece, since each partial call replaces the streamed text. Omit partial (or pass false) on the final call to commit the answer.\n\n\
+        After the final (non-partial) call, immediately call wait_for_branch again to keep listening — answering one question does not end the session."
+    )]
+    async fn reply_to_branch(
+        &self,
+        Parameters(params): Parameters<ReplyToBranchParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match resolve_agent_review_client() {
+            Ok(c) => c,
+            Err(result) => return Ok(result),
+        };
+        let diff_id = params.diff_id.clone();
+        let comment_id = params.comment_id.clone();
+        let content = params.content.clone();
+        let partial = params.partial;
+
+        let result = run_blocking("reply_to_branch", move || {
+            client.reply(&diff_id, &comment_id, &content, partial)
+        })
+        .await?;
+
+        match result {
+            Ok(()) => {
+                let msg = if partial.unwrap_or(false) {
+                    PARTIAL_REPLY_POSTED.to_string()
+                } else {
+                    REPLY_POSTED.to_string()
+                };
+                Ok(CallToolResult::success(vec![Content::text(msg)]))
+            }
+            // Terminal errors (comment deleted / 404, already-answered or
+            // stale-lease conflict / 409) mean THIS reply's target vanished
+            // out from under it — not that the loop should stop or that the
+            // caller did anything wrong. Hand back a typed, successful
+            // "unanswerable" result instead of an error so the loop can
+            // never wedge retrying a reply that will never land; it just
+            // goes back to wait_for_branch. Non-terminal errors (network,
+            // 5xx) still surface as real errors, since those ARE worth
+            // retrying.
+            Err(err) if err.is_terminal() => Ok(CallToolResult::success(vec![Content::text(
+                agent_review::unanswerable_result(&err).to_string(),
+            )])),
+            Err(err) => Ok(tool_error(format!("reply_to_branch failed: {err}"))),
+        }
+    }
+
+    // ── Tool 10: List open branches (read-only backlog) ──
+
+    #[tool(
+        description = "Read-only: list every open or currently-answering root question (\"branch\") on a sem-cloud diff, WITHOUT claiming any of them (this hits a plain GET, never agent/next, so it can never race or steal work from wait_for_branch). Use this to reconcile after confusion — e.g. you're unsure whether a reply actually landed, or you got interrupted and want to see everything still waiting before deciding what to do next. Returns each branch's id, entity, line, a text excerpt, and its state (open or answering)."
+    )]
+    async fn list_open_branches(
+        &self,
+        Parameters(params): Parameters<ListOpenBranchesParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match resolve_agent_review_client() {
+            Ok(c) => c,
+            Err(result) => return Ok(result),
+        };
+        let diff_id = params.diff_id.clone();
+
+        let result = run_blocking("list_open_branches", move || {
+            client.list_open_branches(&diff_id)
+        })
+        .await?;
+
+        match result {
+            Ok(branches) => {
+                let count = branches.len();
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "open_branches": branches,
+                        "count": count,
+                    }))
+                    .unwrap_or_default(),
+                )]))
+            }
+            Err(err) => Ok(tool_error(format!("list_open_branches failed: {err}"))),
+        }
     }
 }
 
@@ -2953,10 +3292,132 @@ mod tests {
         assert_tool_error(result, "Invalid mode 'invalid'");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    // --- semx-bz2: single-flight the entity-graph build ---
+
+    #[tokio::test]
+    async fn build_locks_serialize_same_key_but_not_different_keys() {
+        let locks = BuildLocks::default();
+
+        // Different keys must not block each other.
+        let guard_a = locks.acquire(1).await;
+        let acquired_b =
+            tokio::time::timeout(std::time::Duration::from_millis(200), locks.acquire(2)).await;
+        assert!(acquired_b.is_ok(), "different keys must not share a lock");
+        drop(guard_a);
+        drop(acquired_b);
+
+        // The same key serializes: a second acquire for key 1 must not
+        // succeed until the first guard is dropped.
+        let guard1 = locks.acquire(1).await;
+        let mut second = Box::pin(locks.acquire(1));
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(50), &mut second).await;
+        assert!(
+            raced.is_err(),
+            "second acquire for the same key must block while the first guard is held"
+        );
+        drop(guard1);
+        let acquired = tokio::time::timeout(std::time::Duration::from_millis(200), second).await;
+        assert!(
+            acquired.is_ok(),
+            "second acquire must succeed once the first guard drops"
+        );
+    }
+
+    /// Pins the fix for semx-bz2: `get_or_build_graph` was check-then-act —
+    /// the memory-cache check released its lock before the expensive
+    /// `EntityGraph::build(...)` call, so concurrent callers on a cold cache
+    /// each redundantly rebuilt the whole graph (thundering herd). Fires many
+    /// concurrent callers at a cold cache and asserts they all observe the
+    /// SAME built `Arc<EntityGraph>`/`Arc<Vec<SemanticEntity>>` — the
+    /// property that only holds if exactly one build happened and every
+    /// other caller waited for it instead of racing its own.
+    ///
+    /// Verified RED against the pre-fix check-then-act code (memory-cache
+    /// check with no lock held into the build): with 24 concurrent callers
+    /// against an 80-file cold cache on a multi-thread runtime, this
+    /// assertion reliably failed (multiple distinct `Arc`s observed) before
+    /// `BuildLocks` was introduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_graph_builds_single_flight_to_one_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        // Enough files that a fresh build takes measurable wall time, so
+        // concurrent callers genuinely overlap mid-build rather than
+        // serializing by accident of scheduling.
+        for i in 0..80 {
+            std::fs::write(
+                root.join(format!("mod_{i}.py")),
+                format!(
+                    "def fn_{i}(x):\n    return x + {i}\n\nclass C_{i}:\n    def m(self):\n        return {i}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let server = SemServer::new();
+        let file_paths = SemServer::find_supported_files(&root, &server.registry).unwrap();
+        assert_eq!(file_paths.len(), 80);
+
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let server = server.clone();
+            let root = root.clone();
+            let file_paths = file_paths.clone();
+            tasks.push(tokio::spawn(async move {
+                server
+                    .get_or_build_graph(&root, &file_paths, cache::CacheSourceScope::Default)
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+
+        let (first_graph, first_entities) = &results[0];
+        for (graph, entities) in &results[1..] {
+            assert!(
+                Arc::ptr_eq(first_graph, graph),
+                "every concurrent caller must observe the SAME built graph (single-flight), not its own redundant build"
+            );
+            assert!(
+                Arc::ptr_eq(first_entities, entities),
+                "every concurrent caller must observe the SAME built entities (single-flight)"
+            );
+        }
+    }
 }
 
 fn tool_error(msg: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(msg.into())])
+}
+
+/// Shared client resolution for every review-listener tool (`join_review`,
+/// `wait_for_branch`, `reply_to_branch`, `list_open_branches`): env/credentials
+/// resolution failure is reported as a normal (non-error) tool result
+/// carrying the message — matching what every one of those call sites did
+/// inline before this was factored out.
+fn resolve_agent_review_client() -> Result<agent_review::AgentReviewClient, CallToolResult> {
+    agent_review::AgentReviewClient::from_env_or_credentials()
+        .map_err(|err| tool_error(err.to_string()))
+}
+
+/// Run a blocking `agent_review` client call on `spawn_blocking` and map a
+/// task-join failure the same way every review-listener tool handler did:
+/// an `rmcp` internal error naming which tool failed to rejoin. Factors out
+/// the `spawn_blocking` + `map_err` scaffolding repeated across
+/// `join_review` (twice), `wait_for_branch`, `reply_to_branch`, and
+/// `list_open_branches`.
+async fn run_blocking<T, F>(tool_name: &str, f: F) -> Result<T, rmcp::ErrorData>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        rmcp::ErrorData::internal_error(format!("{tool_name}: task join error: {e}"), None)
+    })
 }
 
 fn format_entity_lookup_candidates(candidates: &[&str]) -> String {
@@ -3349,4 +3810,48 @@ fn chrono_lite_format(unix_seconds: i64) -> String {
         remaining_days -= md;
     }
     format!("{:04}-{:02}-{:02}", y, m + 1, remaining_days + 1)
+}
+
+/// Verified freshness for one file against the index image (§5.1) — `true`
+/// when the stored fingerprint no longer matches disk (content-hash
+/// confirmed, not just mtime) or the image has never seen the file. The
+/// mirror of `sem-cli`'s `commands::query::is_file_stale`; duplicated rather
+/// than shared because the two crates do not depend on each other in that
+/// direction, and the predicate is six lines of comparison.
+fn index_file_is_stale(index: &sem_core::index::QueryIndex, root: &Path, path: &str) -> bool {
+    let Some(fingerprint) = index.file_fingerprint(path) else {
+        return true;
+    };
+    let Some((secs, nanos)) = crate::cache::file_mtime_parts(&root.join(path)) else {
+        return true; // deleted or unreadable
+    };
+    if secs == fingerprint.mtime_secs && nanos as u32 == fingerprint.mtime_nanos {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(root.join(path)) else {
+        return true;
+    };
+    sem_core::parser::incremental::content_hash(&content) != fingerprint.content_hash
+}
+
+/// Materialize an index row as the `SemanticEntity` shape the MCP entity
+/// formatter already speaks. Bodies are not in the image (§3.2), and the
+/// listing does not print them — `entity_line` uses name/type/lines only.
+fn entity_info_to_entity(entity: sem_core::parser::graph::EntityInfo) -> SemanticEntity {
+    SemanticEntity {
+        id: entity.id,
+        file_path: entity.file_path,
+        entity_type: entity.entity_type,
+        name: entity.name,
+        parent_id: entity.parent_id,
+        content: String::new(),
+        content_hash: String::new(),
+        structural_hash: None,
+        kappa: None,
+        start_line: entity.start_line,
+        end_line: entity.end_line,
+        start_byte: None,
+        end_byte: None,
+        metadata: None,
+    }
 }

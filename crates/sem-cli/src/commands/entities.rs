@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{cache::DiskCache, timings::Timings};
+use crate::timings::Timings;
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::graph::EntityInfo;
@@ -65,12 +65,22 @@ pub fn entities_command(opts: EntitiesOptions) {
     timings.mark("path_args");
 
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
+    let root = Path::new(&opts.cwd);
 
-    // The cloud fast-path only helps the whole-repo single listing, and it
-    // can't apply a local kind filter, so skip it when one is active.
+    // Cloud is a capability — cross-repo xref, repos with no local index
+    // (QUERY-INDEX.md §7 item 7) — not a latency tier, so it must not race a
+    // local index read over the network. It only gets a turn for the
+    // whole-repo single listing when there is no local index yet to answer
+    // from (first-ever run, or a scope the index was never built for);
+    // once a local index exists, the directory loop below answers this
+    // exact shape from it directly (§7 item 1) and cloud is never reached.
+    let no_local_index_for_default_scope = ext_filter.is_empty()
+        && !opts.no_default_excludes
+        && super::query::open_index(root).is_none();
     if ext_filter.is_empty()
         && path_args.len() == 1
         && !kind_filter_active
+        && no_local_index_for_default_scope
         && super::cloud::try_cloud_entities(&opts).is_some()
     {
         timings.mark("cloud_entities");
@@ -78,7 +88,6 @@ pub fn entities_command(opts: EntitiesOptions) {
         return;
     }
 
-    let root = Path::new(&opts.cwd);
     let registry = super::create_registry(&opts.cwd);
 
     let mut entities: Vec<SemanticEntity> = Vec::new();
@@ -92,61 +101,60 @@ pub fn entities_command(opts: EntitiesOptions) {
         if full_path.is_file() {
             file_arg_count += 1;
             processed_file_count += 1;
-            let file_entities = extract_file_entities(&full_path, &registry, &path_label)
-                .unwrap_or_else(|e| {
-                    eprintln!(
-                        "{} Cannot read '{}': {}",
-                        "error:".red().bold(),
-                        path_label,
-                        e
-                    );
-                    std::process::exit(1);
-                });
+            let file_entities = match try_index_entities_for_file(&opts.cwd, &full_path) {
+                Some(indexed) => {
+                    timings.mark("index_entities_query");
+                    indexed
+                }
+                None => {
+                    extracted_entities = true;
+                    extract_file_entities(&full_path, &registry, &path_label).unwrap_or_else(|e| {
+                        eprintln!(
+                            "{} Cannot read '{}': {}",
+                            "error:".red().bold(),
+                            path_label,
+                            e
+                        );
+                        std::process::exit(1);
+                    })
+                }
+            };
             entities.extend(file_entities);
-            extracted_entities = true;
         } else if full_path.is_dir() {
             dir_count += 1;
-            let file_paths = super::files::find_supported_files_in_path(
+            // Query-index reroute first (QUERY-INDEX.md §7 item 1 / §12,
+            // unblocked this bead by `QueryIndex::files_under`): skips the
+            // filesystem walk entirely when the index can answer for this
+            // exact scope. `None` — never a wrong answer, only "cannot
+            // answer fast" — falls through to the unchanged walk below.
+            match try_index_entities_for_dir(
+                &opts.cwd,
                 root,
                 &full_path,
                 &registry,
                 &ext_filter,
                 opts.no_default_excludes,
-            );
-            discovered_file_count += file_paths.len();
-            processed_file_count += file_paths.len();
-            timings.mark("file_discovery");
-            if opts.json
-                && path_args.len() == 1
-                && !kind_filter_active
-                && try_write_cached_entities_json(
-                    root,
-                    &file_paths,
-                    &ext_filter,
-                    opts.no_default_excludes,
-                    &mut timings,
-                )
-            {
-                timings.counter("input_files", processed_file_count as u64);
-                timings.counter("input_file_args", file_arg_count as u64);
-                timings.counter("input_dirs", dir_count as u64);
-                timings.counter("processed_files", processed_file_count as u64);
-                timings.counter("discovered_files", discovered_file_count as u64);
-                timings.mark("output_serialization");
-                timings.finish();
-                return;
-            }
-            if let Some(cached_entities) = try_cached_entities(
-                root,
-                &file_paths,
-                &ext_filter,
-                opts.no_default_excludes,
-                &mut timings,
             ) {
-                entities.extend(cached_entities);
-            } else {
-                entities.extend(extract_files_entities(root, &file_paths, &registry));
-                extracted_entities = true;
+                Some((file_count, indexed)) => {
+                    timings.mark("index_entities_dir_query");
+                    discovered_file_count += file_count;
+                    processed_file_count += file_count;
+                    entities.extend(indexed);
+                }
+                None => {
+                    let file_paths = super::files::find_supported_files_in_path(
+                        root,
+                        &full_path,
+                        &registry,
+                        &ext_filter,
+                        opts.no_default_excludes,
+                    );
+                    discovered_file_count += file_paths.len();
+                    processed_file_count += file_paths.len();
+                    timings.mark("file_discovery");
+                    entities.extend(extract_files_entities(root, &file_paths, &registry));
+                    extracted_entities = true;
+                }
             }
         } else {
             eprintln!("{} Path not found '{}'", "error:".red().bold(), path_arg);
@@ -277,84 +285,124 @@ fn extract_files_entities(
     registry.extract_all_entities_brief(root, file_paths)
 }
 
-fn try_cached_entities(
-    root: &Path,
-    file_paths: &[String],
-    ext_filter: &[String],
-    no_default_excludes: bool,
-    timings: &mut Timings,
-) -> Option<Vec<SemanticEntity>> {
-    let source_scope = super::graph::cache_source_scope(root, ext_filter, no_default_excludes);
-    let cache = match DiskCache::open_existing_readonly(root) {
-        Ok(cache) => {
-            timings.mark("cache_open");
-            cache
-        }
-        Err(_) => {
-            timings.mark("cache_open_failed");
-            return None;
-        }
-    };
-
-    match cache.query_entities_listing(root, file_paths, source_scope) {
-        Ok(Some(entities)) => {
-            timings.counter("cached_entities", entities.len() as u64);
-            timings.mark("cache_entities_query");
-            Some(entities.into_iter().map(entity_info_to_entity).collect())
-        }
-        Ok(None) => {
-            timings.mark("cache_entities_miss");
-            None
-        }
-        Err(_) => {
-            timings.mark("cache_entities_query_failed");
-            None
-        }
+/// Reroute of `sem entities <single file>` onto the query index (semx-gis
+/// item 2 / QUERY-INDEX.md §7's "missing path" note: this call used to
+/// consult no cache at all and always re-parse, 229ms on the monster). A
+/// `None` here — index absent, file unknown to it, or Verified freshness
+/// finding it stale — falls through to the unchanged `extract_file_entities`
+/// re-parse below; this function never produces a wrong answer, only
+/// "cannot answer fast."
+fn try_index_entities_for_file(cwd: &str, full_path: &Path) -> Option<Vec<SemanticEntity>> {
+    let repo_root = super::repo_root_or_cwd(cwd);
+    let idx = super::query::open_index(&repo_root)?;
+    let rel = super::normalize_repo_relative_path(
+        Path::new(cwd),
+        &repo_root,
+        &full_path.to_string_lossy(),
+    );
+    if super::query::is_file_stale(&idx, &repo_root, &rel) {
+        return None;
     }
+    // Confirms the index actually knows this file, distinguishing "no
+    // entities in this file" (valid, e.g. an empty file) from "this file is
+    // outside the indexed scope" (must fall through, not report zero rows).
+    idx.file_fingerprint(&rel)?;
+    Some(
+        idx.entities_in_file(&rel)
+            .iter()
+            .map(|e| entity_info_to_entity(e.to_entity_info()))
+            .collect(),
+    )
 }
 
-fn try_write_cached_entities_json(
+/// Reroute of `sem entities <dir>`'s file discovery onto the query index
+/// (QUERY-INDEX.md §7 item 1, unblocked this bead by `QueryIndex::files_under`
+/// — §12's inherited blocker: "the reader *could* answer it... wiring correct
+/// output ordering, exclusion semantics, and per-file Verified freshness...
+/// is real feature work"). Replaces the SQLite listing fast path
+/// (`query_entities_listing`/`write_entities_listing_json`, deleted with this
+/// change — §7 item 4, partial) with a direct index read: no walk, no SQL.
+///
+/// `None` — never a wrong answer, only "cannot answer fast" — whenever:
+/// the request doesn't match the index's own build scope (a custom
+/// `--file-exts`/`--no-default-excludes`/`.semignore` combination, i.e.
+/// anything but `CacheSourceScope::Default`, since the index was built once,
+/// at default scope); or the index is absent/stale-salted. On `Some`, every
+/// listed file that is individually Verified-stale (§5.1) is self-healed by
+/// a per-file re-extract, the same discipline `query.rs`'s def-side repair
+/// uses — a directory reroute never bails an entire large listing over one
+/// stale file the way the entity-scoped verbs bail an entire *related* set.
+///
+/// **Disclosed gap, not a regression**: this is `Verified`, not `Complete`
+/// (§2) — a file created under this directory since the index's last build
+/// is invisible until the next full rebuild repairs the image. `DIRS` (the
+/// section `Complete` needs to prove corpus-wide membership cheaply) is
+/// still reserved (§9), so this capability cannot offer more than S2's
+/// `find`/`callers`/`refs` verbs already ship with for a name that exists
+/// only in a brand-new file. A future `--complete` flag, if the gap proves
+/// to matter in practice, is the natural way to opt back into the walk.
+fn try_index_entities_for_dir(
+    cwd: &str,
     root: &Path,
-    file_paths: &[String],
+    full_dir: &Path,
+    registry: &ParserRegistry,
     ext_filter: &[String],
     no_default_excludes: bool,
-    timings: &mut Timings,
-) -> bool {
-    let source_scope = super::graph::cache_source_scope(root, ext_filter, no_default_excludes);
-    let cache = match DiskCache::open_existing_readonly(root) {
-        Ok(cache) => {
-            timings.mark("cache_open");
-            cache
-        }
-        Err(_) => {
-            timings.mark("cache_open_failed");
-            return false;
-        }
+) -> Option<(usize, Vec<SemanticEntity>)> {
+    if !matches!(
+        super::graph::cache_source_scope(root, ext_filter, no_default_excludes),
+        sem_mcp::cache::CacheSourceScope::Default
+    ) {
+        return None;
+    }
+    let idx = super::query::open_index(root)?;
+    let rel =
+        super::normalize_repo_relative_path(Path::new(cwd), root, &full_dir.to_string_lossy());
+    let prefix = if rel == "." {
+        String::new()
+    } else {
+        format!("{rel}/")
     };
 
-    let stdout = io::stdout();
-    let mut writer = CountingWriter::new(stdout.lock());
-    match cache.write_entities_listing_json(root, file_paths, source_scope, true, &mut writer) {
-        Ok(Some(entity_count)) => {
-            timings.counter("cached_entities", entity_count);
-            timings.counter("entities", entity_count);
-            timings.counter("json_bytes", writer.bytes());
-            timings.mark("cache_entities_query");
-            true
-        }
-        Ok(None) => {
-            timings.mark("cache_entities_miss");
-            false
-        }
-        Err(error) => {
-            eprintln!(
-                "{} Cannot write cached JSON output: {}",
-                "error:".red().bold(),
-                error
+    let files: Vec<String> = idx
+        .files_under(&prefix)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let file_count = files.len();
+
+    let mut out = Vec::with_capacity(files.len());
+    for file in &files {
+        if super::query::is_file_stale(&idx, root, file) {
+            let Ok(content) = std::fs::read_to_string(root.join(file)) else {
+                continue; // deleted since the index listed it — a walk would
+                          // simply not have found it either; drop, don't fail.
+            };
+            out.extend(
+                registry
+                    .extract_entities_brief(file, &content)
+                    .into_iter()
+                    .map(|e| {
+                        entity_info_to_entity(EntityInfo {
+                            id: e.id,
+                            name: e.name,
+                            entity_type: e.entity_type,
+                            file_path: e.file_path,
+                            parent_id: e.parent_id,
+                            start_line: e.start_line,
+                            end_line: e.end_line,
+                        })
+                    }),
             );
-            std::process::exit(1);
+        } else {
+            out.extend(
+                idx.entities_in_file(file)
+                    .iter()
+                    .map(|e| entity_info_to_entity(e.to_entity_info())),
+            );
         }
     }
+    Some((file_count, out))
 }
 
 fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
@@ -367,6 +415,8 @@ fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
         content: String::new(),
         content_hash: String::new(),
         structural_hash: None,
+
+        kappa: None,
         start_line: entity.start_line,
         end_line: entity.end_line,
         start_byte: None,
@@ -381,8 +431,13 @@ fn file_path_for_entity(root: &Path, path: &Path) -> String {
 
 /// Entity-addressed text search: one line per hit (file, innermost entity,
 /// line, matched text) instead of whole bodies — the token-cheap way to
-/// verify a call site or find a string. Sidecar-first (milliseconds from the
-/// warm graph; a miss auto-spawns a resident), local graph fallback.
+/// verify a call site or find a string.
+///
+/// This still runs the full local-graph rebuild path below rather than
+/// `sem grep`'s mmap trigram tier (QUERY-INDEX.md §11) — extending this
+/// entity-addressed shape onto the index is out of GREP-KILLER S4's scope
+/// (semx-woe), not something this deletion could reach; flagged as a
+/// disclosed follow-on rather than silently left implying it's fast.
 const TEXT_SEARCH_LIMIT: usize = 50;
 
 fn text_search(opts: &EntitiesOptions, needle: &str) {
@@ -392,22 +447,6 @@ fn text_search(opts: &EntitiesOptions, needle: &str) {
         Ok(git) => git.repo_root().to_path_buf(),
         Err(_) => Path::new(&opts.cwd).to_path_buf(),
     };
-    let scope_is_default =
-        opts.file_exts.is_empty() && !opts.no_default_excludes && !root.join(".semignore").exists();
-
-    if scope_is_default {
-        let request = serde_json::json!({
-            "op": "text",
-            "needle": needle,
-            "limit": TEXT_SEARCH_LIMIT,
-        });
-        if let Some(response) = super::sidecar::query(&root, &request) {
-            if let Some(text) = response.get("text").and_then(|v| v.as_str()) {
-                print!("{text}");
-                return;
-            }
-        }
-    }
 
     let registry = super::create_registry(&root.to_string_lossy());
     let ext_filter = super::graph::normalize_exts(&opts.file_exts);
@@ -599,6 +638,8 @@ mod tests {
             content: String::new(),
             content_hash: String::new(),
             structural_hash: None,
+
+            kappa: None,
             start_line: 1,
             end_line: 1,
             start_byte: None,

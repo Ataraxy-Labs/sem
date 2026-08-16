@@ -33,12 +33,20 @@ fn git(repo: &Path, args: &[&str]) -> Output {
     )
 }
 
-fn contains_cache_db(path: &Path) -> bool {
+/// Did a build land its per-repo artifacts *here* (and not in the working
+/// tree)? Either on-disk artifact answers that: `index.sem`, which every
+/// build writes, or `cache.db`, which only the content-hydrating verbs write
+/// now that `sem graph`'s cold miss is `CacheMissSavePolicy::IndexOnly`
+/// (semx-4ex, RESOLUTION-PROFILE.md W4.5). These tests are about *where* the
+/// cache directory is, so they must not also pin *which* artifacts a
+/// particular verb chooses to write into it.
+fn contains_cache_artifact(path: &Path) -> bool {
     fs::read_dir(path).unwrap().any(|entry| {
         let entry = entry.unwrap();
         let path = entry.path();
-        path.file_name().is_some_and(|name| name == "cache.db")
-            || (path.is_dir() && contains_cache_db(&path))
+        path.file_name()
+            .is_some_and(|name| name == "cache.db" || name == "index.sem")
+            || (path.is_dir() && contains_cache_artifact(&path))
     })
 }
 
@@ -72,7 +80,7 @@ fn graph_cache_does_not_dirty_the_working_tree() {
     let status = git(repo.path(), &["status", "--porcelain"]);
     assert_eq!(String::from_utf8_lossy(&status.stdout), "");
     assert!(!repo.path().join(".sem").exists());
-    assert!(contains_cache_db(cache.path()));
+    assert!(contains_cache_artifact(cache.path()));
 }
 
 #[test]
@@ -100,7 +108,7 @@ fn graph_ignores_repo_local_cache_override() {
     let status = git(repo.path(), &["status", "--porcelain"]);
     assert_eq!(String::from_utf8_lossy(&status.stdout), "");
     assert!(!repo.path().join(".sem").exists());
-    assert!(contains_cache_db(home.path()));
+    assert!(contains_cache_artifact(home.path()));
 }
 
 #[test]
@@ -128,5 +136,5 @@ fn graph_ignores_repo_local_xdg_cache_home() {
     let status = git(repo.path(), &["status", "--porcelain"]);
     assert_eq!(String::from_utf8_lossy(&status.stdout), "");
     assert!(!repo.path().join(".sem").exists());
-    assert!(contains_cache_db(home.path()));
+    assert!(contains_cache_artifact(home.path()));
 }

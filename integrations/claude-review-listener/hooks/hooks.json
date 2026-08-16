@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/keep-listening.sh",
+            "timeout": 50
+          }
+        ]
+      }
+    ]
+  }
+}

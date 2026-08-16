@@ -5,10 +5,120 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 use super::types::BlameLineInfo;
 use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus};
+
+/// Like `differ.rs`'s `maybe_par_iter!`, mirrored here for `&mut [T]`: falls
+/// back to a plain serial `iter_mut` when the `parallel` feature is off, so
+/// the two build configurations share one call site instead of `#[cfg]`
+/// forking every caller.
+macro_rules! maybe_par_iter_mut {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        {
+            $slice.par_iter_mut()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            $slice.iter_mut()
+        }
+    }};
+}
+
+// semx-cc3 (sem-diff attribution campaign): per-file blob content population
+// for a revision-to-revision diff (`populate_contents`'s `Commit`/`Range`
+// arms) is independent libgit2 object reads (tree path lookup + blob find +
+// possible delta-chain decompress) — same embarrassingly-parallel shape as
+// the entity-extraction fan-out `differ.rs` already parallelizes with rayon.
+// Measured dominant on a monster repo (see RESOLUTION-PROFILE.md's "Diff
+// attribution" section): ~1.2ms/file marginal cost once the one redundant
+// tree re-resolution was deleted (previous commit) — that's genuinely
+// necessary I/O, not duplicate work, so the fix here is concurrency, not
+// removal. `git2::Tree`/`git2::Blob` borrow their `Repository` by lifetime
+// and aren't `Send`, so they can't cross a `par_iter` the way plain `Oid`s
+// can — each rayon worker thread instead opens (once, then reuses across
+// calls on that thread) its own `Repository` handle, keyed by repo root so
+// a `GitBridge` reused across repos in the same process never serves a
+// stale handle.
+thread_local! {
+    static TL_REPO: std::cell::RefCell<Option<(PathBuf, Repository)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `(before_tree_id, after_tree_id)` — `None` on either side means "no tree
+/// there" (a root commit's nonexistent parent). Threaded from
+/// `get_commit_diff_files`/`get_range_diff_files` through `get_changed_files`
+/// into `populate_contents`, replacing a second, redundant ref resolution
+/// that used to happen there (see `get_commit_diff_files`'s doc comment).
+type ResolvedTreeIds = (Option<Oid>, Option<Oid>);
+
+/// Run `f` against a thread-local `Repository` opened at `repo_root`. `None`
+/// only when `Repository::open` itself fails — propagated as a soft miss by
+/// callers, same as every other best-effort git read in this module (a
+/// worker thread that can't open the repo just leaves that file's content
+/// unpopulated, exactly like the pre-parallel code's `.ok()` chains did).
+fn with_thread_local_repo<T>(repo_root: &Path, f: impl FnOnce(&Repository) -> T) -> Option<T> {
+    TL_REPO.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let stale = !matches!(&*slot, Some((path, _)) if path == repo_root);
+        if stale {
+            *slot = Some((repo_root.to_path_buf(), Repository::open(repo_root).ok()?));
+        }
+        slot.as_ref().map(|(_, repo)| f(repo))
+    })
+}
+
+/// Populate `before_content`/`after_content` for every file in `files` from
+/// two tree ids, fanned out across rayon workers when the `parallel` feature
+/// is on (see the module-level doc comment above `TL_REPO`). `None` for
+/// either id means "no tree on that side" — used for a root commit's
+/// nonexistent before-tree; `Range`'s caller always passes `Some` for both.
+fn populate_from_tree_ids(
+    repo_root: &Path,
+    files: &mut [FileChange],
+    before_id: Option<Oid>,
+    after_id: Option<Oid>,
+) {
+    maybe_par_iter_mut!(files).for_each(|file| {
+        with_thread_local_repo(repo_root, |repo| {
+            if file.status != FileStatus::Deleted {
+                file.after_content = after_id.and_then(|id| {
+                    repo.find_tree(id)
+                        .ok()
+                        .and_then(|tree| read_blob_from_tree_in(repo, &tree, &file.file_path))
+                });
+            }
+            if file.status != FileStatus::Added {
+                let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
+                file.before_content = before_id.and_then(|id| {
+                    repo.find_tree(id)
+                        .ok()
+                        .and_then(|tree| read_blob_from_tree_in(repo, &tree, path))
+                });
+            }
+        });
+    });
+}
+
+/// [`GitBridge::read_blob_from_tree`] with the `Repository` passed
+/// explicitly instead of borrowed from `&self` — the form
+/// [`populate_from_tree_ids`]'s parallel workers need, since each reads
+/// through its own thread-local `Repository`, never a `GitBridge`'s.
+fn read_blob_from_tree_in(repo: &Repository, tree: &git2::Tree, file_path: &str) -> Option<String> {
+    let entry = tree.get_path(Path::new(file_path)).ok()?;
+    let blob = repo.find_blob(entry.id()).ok()?;
+    let bytes = blob.content();
+    if blob.is_binary() || GitBridge::bytes_look_binary(bytes, true) {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(|s| GitBridge::normalize_line_endings(s.to_string()))
+}
 
 #[derive(Error, Debug)]
 pub enum GitError {
@@ -139,6 +249,15 @@ impl GitBridge {
         &self.repo_root
     }
 
+    /// Cheap tracked-file-count estimate: reads the git index (equivalent to
+    /// `git ls-files | wc -l`) without walking the working tree or shelling
+    /// out. This is an O(1)-ish read of the already-materialized `.git/index`,
+    /// used only for sizing heuristics (e.g. an adaptive time budget) — never
+    /// for anything that needs an exact or up-to-the-second file list.
+    pub fn tracked_file_count(&self) -> Option<usize> {
+        self.repo.index().ok().map(|index| index.len())
+    }
+
     /// Return the URL of the "origin" remote, if one exists.
     pub fn get_remote_url(&self) -> Option<String> {
         self.repo
@@ -233,7 +352,7 @@ impl GitBridge {
         // Show the full current working state, including staged changes.
         let mut working_files = self.get_working_diff_files(pathspecs)?;
         if !working_files.is_empty() {
-            self.populate_contents(&mut working_files, &DiffScope::Working)?;
+            self.populate_contents(&mut working_files, &DiffScope::Working, None)?;
             return Ok((DiffScope::Working, working_files));
         }
 
@@ -247,11 +366,24 @@ impl GitBridge {
         scope: &DiffScope,
         pathspecs: &[String],
     ) -> Result<Vec<FileChange>, GitError> {
+        // (before, after) tree ids already resolved by the Commit/Range file
+        // listing below, reused by `populate_contents` instead of
+        // re-resolving them from the ref strings a second time — see
+        // `get_commit_diff_files`'s doc comment.
+        let mut resolved_trees: Option<ResolvedTreeIds> = None;
         let mut files = match scope {
             DiffScope::Working => self.get_working_diff_files(pathspecs)?,
             DiffScope::Staged => self.get_staged_diff_files(pathspecs)?,
-            DiffScope::Commit { sha } => self.get_commit_diff_files(sha, pathspecs)?,
-            DiffScope::Range { from, to } => self.get_range_diff_files(from, to, pathspecs)?,
+            DiffScope::Commit { sha } => {
+                let (files, trees) = self.get_commit_diff_files(sha, pathspecs)?;
+                resolved_trees = Some(trees);
+                files
+            }
+            DiffScope::Range { from, to } => {
+                let (files, trees) = self.get_range_diff_files(from, to, pathspecs)?;
+                resolved_trees = Some(trees);
+                files
+            }
             DiffScope::RefToWorking { refspec } => {
                 self.get_ref_to_working_diff_files(refspec, pathspecs)?
             }
@@ -260,7 +392,7 @@ impl GitBridge {
         // Filter .sem/ files
         files.retain(|f| !f.file_path.starts_with(".sem/"));
 
-        self.populate_contents(&mut files, scope)?;
+        self.populate_contents(&mut files, scope, resolved_trees)?;
         Ok(files)
     }
 
@@ -555,11 +687,21 @@ impl GitBridge {
         Ok(obj.peel_to_commit()?.parent_count())
     }
 
+    /// Returns the file list plus the (before, after) tree ids this already
+    /// resolved computing the diff — `after` is always present; `before` is
+    /// `None` only for a root commit. [`populate_contents`](Self::populate_contents)
+    /// reuses these ids (a cheap `find_tree` by id) instead of re-resolving
+    /// `sha`/`sha~1` from scratch (revparse + peel_to_commit + tree()), which
+    /// is what it did before semx-cc3: the exact same two trees, walked from
+    /// the ref string a second time. See RESOLUTION-PROFILE.md's "Diff
+    /// attribution" section — on a large/monster repo that second walk is
+    /// not free, and it produces identical trees to the ones already in
+    /// hand, so re-deriving them was pure waste, not a needed pass.
     fn get_commit_diff_files(
         &self,
         sha: &str,
         pathspecs: &[String],
-    ) -> Result<Vec<FileChange>, GitError> {
+    ) -> Result<(Vec<FileChange>, ResolvedTreeIds), GitError> {
         let obj = self.resolve_object(sha)?;
         let commit = obj.peel_to_commit()?;
         let tree = commit.tree()?;
@@ -576,15 +718,20 @@ impl GitBridge {
                 .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
         Self::detect_renames(&mut diff)?;
 
-        Ok(self.diff_to_file_changes(&diff))
+        let before_id = parent_tree.as_ref().map(|t| t.id());
+        let after_id = Some(tree.id());
+        Ok((self.diff_to_file_changes(&diff), (before_id, after_id)))
     }
 
+    /// See [`get_commit_diff_files`](Self::get_commit_diff_files)'s doc —
+    /// same tree-id reuse, both ids always present for a range (both `from`
+    /// and `to` must resolve to a commit).
     fn get_range_diff_files(
         &self,
         from: &str,
         to: &str,
         pathspecs: &[String],
-    ) -> Result<Vec<FileChange>, GitError> {
+    ) -> Result<(Vec<FileChange>, ResolvedTreeIds), GitError> {
         let from_obj = self.resolve_object(from)?;
         let to_obj = self.resolve_object(to)?;
 
@@ -597,7 +744,9 @@ impl GitBridge {
                 .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
         Self::detect_renames(&mut diff)?;
 
-        Ok(self.diff_to_file_changes(&diff))
+        let before_id = Some(from_tree.id());
+        let after_id = Some(to_tree.id());
+        Ok((self.diff_to_file_changes(&diff), (before_id, after_id)))
     }
 
     fn get_ref_to_working_diff_files(
@@ -700,6 +849,7 @@ impl GitBridge {
         &self,
         files: &mut [FileChange],
         scope: &DiffScope,
+        resolved_trees: Option<ResolvedTreeIds>,
     ) -> Result<(), GitError> {
         match scope {
             DiffScope::Working => {
@@ -733,34 +883,29 @@ impl GitBridge {
                     }
                 }
             }
-            DiffScope::Commit { sha } => {
-                // Resolve both trees once instead of per-file
-                let after_tree = self.resolve_tree(sha)?;
-                let before_tree = self.resolve_tree(&format!("{sha}~1")).ok();
-                for file in files.iter_mut() {
-                    if file.status != FileStatus::Deleted {
-                        file.after_content = self.read_blob_from_tree(&after_tree, &file.file_path);
-                    }
-                    if file.status != FileStatus::Added {
-                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
-                        file.before_content = before_tree
-                            .as_ref()
-                            .and_then(|t| self.read_blob_from_tree(t, path));
-                    }
-                }
+            DiffScope::Commit { sha: _ } => {
+                // Reuse the trees `get_commit_diff_files` already resolved
+                // computing the diff (see its doc comment) instead of
+                // re-resolving `sha`/`sha~1` from scratch a second time.
+                // `get_changed_files` always sets `resolved_trees` before
+                // calling here for a Commit scope; `after` is always
+                // `Some(id)` (a commit always has a tree) and that id was
+                // just successfully resolved moments ago, so a missing
+                // `after_id` would mean an invariant violation, not a normal
+                // error path — same reasoning `get_range_diff_files`'s doc
+                // comment covers for the `Range` arm below.
+                let (before_id, after_id) = resolved_trees
+                    .expect("Commit scope: get_changed_files always resolves trees first");
+                let after_id = after_id.expect("Commit scope: after tree id is always set");
+                populate_from_tree_ids(&self.repo_root, files, before_id, Some(after_id));
             }
-            DiffScope::Range { from, to } => {
-                let after_tree = self.resolve_tree(to)?;
-                let before_tree = self.resolve_tree(from)?;
-                for file in files.iter_mut() {
-                    if file.status != FileStatus::Deleted {
-                        file.after_content = self.read_blob_from_tree(&after_tree, &file.file_path);
-                    }
-                    if file.status != FileStatus::Added {
-                        let path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
-                        file.before_content = self.read_blob_from_tree(&before_tree, path);
-                    }
-                }
+            DiffScope::Range { from: _, to: _ } => {
+                // Same reuse as the Commit arm above, see `get_range_diff_files`
+                // — both ids are always set for a Range (both refs must
+                // resolve to a commit to have produced a diff at all).
+                let (before_id, after_id) = resolved_trees
+                    .expect("Range scope: get_changed_files always resolves trees first");
+                populate_from_tree_ids(&self.repo_root, files, before_id, after_id);
             }
             DiffScope::RefToWorking { refspec } => {
                 let before_tree = self.resolve_tree(refspec)?;

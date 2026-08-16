@@ -126,6 +126,59 @@ pub struct ContextParams {
     pub fresh: Option<bool>,
 }
 
+// ── Review listener tool parameter structs ──
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JoinReviewParams {
+    #[schemars(description = "The sem-cloud diff id to listen on (from the review URL).")]
+    pub diff_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WaitForBranchParams {
+    #[schemars(description = "The diff id to poll (same one passed to join_review).")]
+    pub diff_id: String,
+    #[schemars(
+        description = "How long to long-poll for the next reviewer question, in seconds (default 40, clamped to 45). Keep calling this tool back-to-back — on timeout or right after replying — for as long as you are listening."
+    )]
+    pub wait_seconds: Option<u64>,
+}
+
+impl WaitForBranchParams {
+    /// Clamped, defaulted wait, in whole seconds.
+    pub fn wait_seconds(&self) -> u64 {
+        self.wait_seconds.unwrap_or(40).min(45)
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyToBranchParams {
+    #[schemars(description = "The diff id the comment belongs to.")]
+    pub diff_id: String,
+    #[schemars(
+        description = "The commentId of the branch/question being answered (from the branch payload wait_for_branch returned)."
+    )]
+    pub comment_id: String,
+    #[schemars(
+        description = "The answer text. When partial is true this must be the FULL cumulative answer composed so far, not just the newest chunk — each partial call replaces the streamed text."
+    )]
+    pub content: String,
+    #[schemars(
+        description = "true while still composing (streams `content` so the reviewer watches it build); omit or pass false on the final call, which commits the answer."
+    )]
+    pub partial: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListOpenBranchesParams {
+    #[schemars(description = "The diff id to inspect (same one passed to join_review).")]
+    pub diff_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +239,9 @@ mod tests {
         assert_unknown_fields_return_invalid_params::<ImpactAnalysisParams>();
         assert_unknown_fields_return_invalid_params::<LogParams>();
         assert_unknown_fields_return_invalid_params::<ContextParams>();
+        assert_unknown_fields_return_invalid_params::<JoinReviewParams>();
+        assert_unknown_fields_return_invalid_params::<WaitForBranchParams>();
+        assert_unknown_fields_return_invalid_params::<ReplyToBranchParams>();
+        assert_unknown_fields_return_invalid_params::<ListOpenBranchesParams>();
     }
 }

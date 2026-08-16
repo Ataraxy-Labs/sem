@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 
+use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sem_core::git::bridge::GitBridge;
 use sem_core::git::types::{CommitInfo, DiffScope};
@@ -13,46 +14,56 @@ use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef,
 use sem_core::parser::hotspot::{
     aggregate_history_analytics, CommitEntityChanges, HistoryAnalytics,
 };
-use sem_core::parser::js_ts_import_source_files_from_content;
 use sem_core::parser::registry::ParserRegistry;
+use sem_core::parser::{js_ts_import_source_files_from_set, ImportCandidates};
 use sem_core::utils::hash::content_hash_bytes;
 
-pub const CACHE_SCHEMA_VERSION: i32 = 9;
+/// Bumping this drops and recreates every on-disk cache on next open
+/// (`initialize_schema`'s `user_version` check -> `CACHE_RESET_SQL`) --
+/// the migration story for this cache is "stale schema -> full rebuild",
+/// not in-place `ALTER TABLE`. v10 added the `entities.kappa` column (see
+/// `crates/sem-core/KAPPA.md` v1.1 -- entities round-tripped through this
+/// cache previously always came back with `kappa: None`, silently losing
+/// the field, even though it was computed correctly on first extraction).
+/// v11 (W4, semx-431) removed eight secondary indexes and the `entity_changes`
+/// table, none of which had a production reader left after QUERY-INDEX.md
+/// §12.3 rerouted the SQL query fast paths onto `index.sem` -- the bump is
+/// what makes an existing cache drop its stale ones instead of keeping them.
+pub const CACHE_SCHEMA_VERSION: i32 = 11;
 pub const CACHE_KIND_FULL: &str = "full";
 pub const CACHE_KIND_TOPOLOGY: &str = "topology";
+/// Every index this cache maintains, and the one production statement that
+/// needs each. W4 (semx-431) censused these against every `SELECT`/`DELETE`
+/// in both crates -- the way QUERY-INDEX.md §15.1 censused the module's
+/// symbols -- because each index is a second B-tree written per row on the
+/// save plane, and `insert_entities_with_content` was the single largest
+/// cold-build cost on every giant. Eight of the fourteen had no production
+/// consumer at all: five on `entities` (`name`, `name,file_path`,
+/// `entity_type,name,file_path`, `parent_id`, `parent_id,name` -- nothing
+/// queries `entities` by anything but `id` or a full scan any more, since
+/// §12.3 moved name/type/parent lookups to the index's `NAMES`/`ENTITIES`
+/// sections), two composites on `edges` (`from,to,ref` and `to,from,ref` --
+/// read only by `#[cfg(test)]` helpers, which the surviving single-column
+/// indexes serve anyway), and `idx_file_imports_importing_file`, whose column
+/// is already the leading column of that table's `PRIMARY KEY`.
 pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
+    // `DELETE FROM entities WHERE file_path = ?1` (incremental save).
     ("idx_entities_file_path", "entities", "file_path"),
-    ("idx_entities_name", "entities", "name"),
-    ("idx_entities_name_file_path", "entities", "name, file_path"),
-    (
-        "idx_entities_type_name_file_path",
-        "entities",
-        "entity_type, name, file_path",
-    ),
-    ("idx_entities_parent_id", "entities", "parent_id"),
-    ("idx_entities_parent_id_name", "entities", "parent_id, name"),
+    // `DELETE FROM edges WHERE from_entity = ?1` (incremental save).
     ("idx_edges_from_entity", "edges", "from_entity"),
-    (
-        "idx_edges_from_to_ref",
-        "edges",
-        "from_entity, to_entity, ref_type",
-    ),
+    // `DELETE FROM edges WHERE to_entity = ?1` (incremental save).
     ("idx_edges_to_entity", "edges", "to_entity"),
-    (
-        "idx_edges_to_from_ref",
-        "edges",
-        "to_entity, from_entity, ref_type",
-    ),
+    // `SELECT DISTINCT importing_file FROM file_imports WHERE imported_file = ?1`
+    // (`importing_files_of`). The reverse direction is the table's own PK.
     (
         "idx_file_imports_imported_file",
         "file_imports",
         "imported_file",
     ),
-    (
-        "idx_file_imports_importing_file",
-        "file_imports",
-        "importing_file",
-    ),
+    // `SELECT ... FROM entity_changes WHERE commit_sha = ?1` (`index_commits`'s
+    // history analytics). Kept as found: that table is written only by the
+    // history path, never by the save plane, so its indexes cost a cold build
+    // nothing and this census had no measurement to justify touching them.
     (
         "idx_entity_changes_commit_sha",
         "entity_changes",
@@ -99,6 +110,7 @@ CREATE TABLE IF NOT EXISTS entities (
     content TEXT,
     content_hash TEXT NOT NULL,
     structural_hash TEXT,
+    kappa TEXT,
     parent_id TEXT,
     metadata_json TEXT
 );
@@ -176,6 +188,26 @@ pub fn apply_performance_pragmas(conn: &Connection) -> Result<(), rusqlite::Erro
 /// extraction) keep their content inline — identity by construction, never by
 /// assumption. On a 139K-entity corpus this removes the ~2x source duplication
 /// nested entities cause (#322).
+/// Sub-phase timing for the content store, gated by `SEM_PROFILE_CACHE=1` —
+/// the same `OnceLock<bool>` contract `sem-cli`'s `cache_profile_mark` and
+/// `sem-core`'s `resolve_profile::enabled()` use: zero cost when unset, never
+/// changes a written byte. Added for W4 (semx-431), which found
+/// `insert_entities_with_content` to be the single largest save-plane cost on
+/// every giant (1.9-15.5 s) with no attribution inside it.
+fn store_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env::var("SEM_PROFILE_CACHE").as_deref() == Ok("1"))
+}
+
+fn store_mark(phase: &str, t0: std::time::Instant) {
+    if store_profile_enabled() {
+        eprintln!(
+            "CONTENT_STORE_PHASE phase={phase} ms={:.2}",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 pub fn compress_file_text(text: &str) -> Option<Vec<u8>> {
     zstd::encode_all(text.as_bytes(), 3).ok()
 }
@@ -203,10 +235,30 @@ pub fn insert_entities_with_content_store(
         "INSERT INTO"
     };
     let sql = format!(
-        "{verb} entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+        "{verb} entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, kappa, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
     );
     let mut stmt = tx.prepare(&sql)?;
-    let mut file_texts: HashMap<&str, Option<String>> = HashMap::new();
+
+    // W4 (semx-431): the per-file `read_to_string` used to happen lazily
+    // inside the serial entity loop below — a third full-corpus read (after
+    // pass 1's parse read and the save plane's `CorpusColumns::read`), on one
+    // thread, interleaved with SQLite `execute`s. It is a pure function of
+    // the path, so it hoists out of the loop and parallelizes exactly the way
+    // `CorpusColumns::read` and semx-ccg's fingerprint read already do:
+    // read in parallel, then do the (necessarily serial, `Statement` isn't
+    // `Send`) inserts against the finished map. Same bytes read, same rows
+    // written, same order.
+    let __reads_t0 = std::time::Instant::now();
+    let mut distinct_paths: Vec<&str> = entities.iter().map(|e| e.file_path.as_str()).collect();
+    distinct_paths.sort_unstable();
+    distinct_paths.dedup();
+    let file_texts: HashMap<&str, Option<String>> = distinct_paths
+        .par_iter()
+        .map(|path| (*path, std::fs::read_to_string(root.join(path)).ok()))
+        .collect();
+    store_mark("file_reads_parallel", __reads_t0);
+
+    let __ins_t0 = std::time::Instant::now();
     let mut files_to_store: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for e in entities {
@@ -215,8 +267,8 @@ pub fn insert_entities_with_content_store(
             .as_ref()
             .and_then(|m| serde_json::to_string(m).ok());
         let text = file_texts
-            .entry(e.file_path.as_str())
-            .or_insert_with(|| std::fs::read_to_string(root.join(&e.file_path)).ok());
+            .get(e.file_path.as_str())
+            .expect("every entity's file path was collected above");
         let sliceable = match (text.as_deref(), e.start_byte, e.end_byte) {
             (Some(t), Some(sb), Some(eb)) => t.get(sb..eb) == Some(e.content.as_str()),
             _ => false,
@@ -239,20 +291,40 @@ pub fn insert_entities_with_content_store(
             stored_content,
             e.content_hash,
             e.structural_hash,
+            e.kappa,
             e.parent_id,
             metadata_json,
         ])?;
     }
 
+    store_mark("entity_inserts_serial", __ins_t0);
+
+    // Same hoist for the zstd pass: `compress_file_text` is a pure function of
+    // the text, so every blob is computed in parallel and only the `INSERT`
+    // stays serial. `files_to_store` is a `HashSet`, whose iteration order was
+    // already unspecified, so the write order was never a contract; sorting
+    // makes it one, which is strictly better for the byte-identical gate.
+    let __zstd_t0 = std::time::Instant::now();
+    let mut to_store: Vec<&str> = files_to_store.into_iter().collect();
+    to_store.sort_unstable();
+    let blobs: Vec<(&str, Vec<u8>)> = to_store
+        .par_iter()
+        .filter_map(|path| {
+            let Some(Some(text)) = file_texts.get(*path) else {
+                return None;
+            };
+            compress_file_text(text).map(|blob| (*path, blob))
+        })
+        .collect();
+    store_mark("compress_parallel", __zstd_t0);
+
+    let __fc_t0 = std::time::Instant::now();
     let mut fc =
         tx.prepare("INSERT OR REPLACE INTO file_contents (path, ztext) VALUES (?1, ?2)")?;
-    for path in files_to_store {
-        if let Some(Some(text)) = file_texts.get(path) {
-            if let Some(blob) = compress_file_text(text) {
-                fc.execute(params![path, blob])?;
-            }
-        }
+    for (path, blob) in &blobs {
+        fc.execute(params![path, blob])?;
     }
+    store_mark("file_contents_insert_serial", __fc_t0);
     Ok(())
 }
 
@@ -866,12 +938,91 @@ pub fn refresh_file_import_entries(
     files_to_refresh: &[String],
     all_files: &[String],
 ) -> Result<(), rusqlite::Error> {
-    let candidate_files: Vec<String> = all_files
-        .iter()
-        .filter(|file| !is_manifest_file_name(file))
-        .cloned()
+    // O(1)-membership candidate set, built once per call (not per file) --
+    // `js_ts_import_source_files_from_set` (import_resolution.rs) turns each
+    // relative-import candidate check into a HashSet lookup instead of the
+    // O(candidate_files) linear scan `js_ts_import_source_files_from_content`
+    // did via `find_import_file`'s `candidate_file_paths.iter().find(...)`.
+    // See RESOLUTION-PROFILE.md's "Sub-1s physics budget" §2 item 9.
+    // Prepared once per call, not once per file: O(1) membership for relative
+    // specifiers *and* the stem index bare/package specifiers resolve
+    // through (semx-3tb -- semx-ccg's disclosed residual was that the
+    // bare-import fallback re-sorted this whole list on the first bare
+    // import of every file).
+    let candidate_files = ImportCandidates::new(
+        all_files
+            .iter()
+            .filter(|file| !is_manifest_file_name(file))
+            .map(String::as_str),
+    );
+
+    // Read + resolve every file's imports in parallel first (cache.rs:895 --
+    // `std::fs::read_to_string`, the third of semx-8lf's four full-corpus
+    // byte reads, previously done one file at a time in this same loop that
+    // also drove the DELETE/INSERT statements). The read and
+    // `js_ts_import_source_files_from_set` are pure computation over
+    // `content`/`candidate_files` -- no `Connection`/`Transaction` involved
+    // (both `!Send`) -- so they fan out across rayon workers exactly like
+    // `write_query_index`'s parallel re-read+hash does; only the statements
+    // that own the single `Transaction` stay on the serial loop below.
+    // `None` means "manifest file, untouched" (matches the original's
+    // `continue` before the DELETE); `Some(vec![])` means "touched (DELETE
+    // still runs), nothing to insert" -- covers both an unreadable file and
+    // a readable one with no resolved imports, same as the original falling
+    // through to an empty/no-op insert loop either way.
+    let refreshed: Vec<(&String, Option<Vec<String>>)> = files_to_refresh
+        .par_iter()
+        .map(|file| {
+            if is_manifest_file_name(file) {
+                return (file, None);
+            }
+            let imports = std::fs::read_to_string(root.join(file))
+                .ok()
+                .map(|content| js_ts_import_source_files_from_set(file, &content, &candidate_files))
+                .unwrap_or_default();
+            (file, Some(imports))
+        })
         .collect();
 
+    let mut delete = tx.prepare("DELETE FROM file_imports WHERE importing_file = ?1")?;
+    let mut insert = tx.prepare(
+        "INSERT OR IGNORE INTO file_imports (importing_file, imported_file) VALUES (?1, ?2)",
+    )?;
+
+    for (file, imports) in refreshed {
+        let Some(imports) = imports else {
+            continue;
+        };
+
+        delete.execute(params![file])?;
+        for imported_file in imports {
+            insert.execute(params![file, imported_file])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// [`refresh_file_import_entries`] with the read and the import scan already
+/// done by the caller (semx-3tb, `SINGLE-PASS.md` §2 pass I).
+///
+/// The full-save path (`sem-cli`'s `save_with_test_dirs`/`save_topology`)
+/// reads every file exactly once for the fingerprint/trigram columns anyway,
+/// and `js_ts_import_source_files_from_set` is a pure function of
+/// `(path, content, candidates)` — so it runs inside that same closure and
+/// the bytes are dropped there. This function is the write half that was
+/// always serial (one `Transaction`, `!Send`).
+///
+/// Semantics are identical to the sibling's, deliberately, file for file: a
+/// manifest file is skipped entirely (no `DELETE`), every other file in
+/// `files_to_refresh` gets its `DELETE` whether or not it resolved any
+/// import — an unreadable file (absent from `imports`) lands on the same
+/// `DELETE`-then-insert-nothing path the sibling's `Some(vec![])` produced.
+pub fn refresh_file_import_entries_precomputed(
+    tx: &Transaction<'_>,
+    files_to_refresh: &[String],
+    imports: &std::collections::HashMap<&str, Vec<String>>,
+) -> Result<(), rusqlite::Error> {
     let mut delete = tx.prepare("DELETE FROM file_imports WHERE importing_file = ?1")?;
     let mut insert = tx.prepare(
         "INSERT OR IGNORE INTO file_imports (importing_file, imported_file) VALUES (?1, ?2)",
@@ -881,14 +1032,11 @@ pub fn refresh_file_import_entries(
         if is_manifest_file_name(file) {
             continue;
         }
-
         delete.execute(params![file])?;
-        let Ok(content) = std::fs::read_to_string(root.join(file)) else {
+        let Some(imported_files) = imports.get(file.as_str()) else {
             continue;
         };
-        for imported_file in
-            js_ts_import_source_files_from_content(file, &content, &candidate_files)
-        {
+        for imported_file in imported_files {
             insert.execute(params![file, imported_file])?;
         }
     }
@@ -1176,7 +1324,7 @@ impl DiskCache {
         // Load entities
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte, kappa FROM entities")
             .ok()?;
         let entities: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -1194,6 +1342,8 @@ impl DiskCache {
                     content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
+
+                    kappa: row.get(13)?,
                     parent_id: row.get(9)?,
                     metadata,
                 })
@@ -1517,7 +1667,7 @@ impl DiskCache {
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte, kappa FROM entities")
             .ok()?;
         let all_cached: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -1535,6 +1685,8 @@ impl DiskCache {
                     content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
+
+                    kappa: row.get(13)?,
                     parent_id: row.get(9)?,
                     metadata,
                 })
@@ -1990,6 +2142,8 @@ mod tests {
             content: content.to_string(),
             content_hash: format!("hash:{content}"),
             structural_hash: None,
+
+            kappa: None,
             start_line: 1,
             end_line: 1,
             start_byte: None,
@@ -2835,5 +2989,59 @@ mod tests {
             drop(cache);
             cleanup(root);
         }
+    }
+
+    /// v1.1 (semx-2i2): kappa must round-trip through sem-mcp's own on-disk
+    /// SQLite entity cache too -- a separate `DiskCache`/`save`/`load` from
+    /// sem-cli's, sharing only the schema/insert helpers in this module
+    /// (`initialize_schema`, `insert_entities_with_content_store`), so it
+    /// needs its own proof. Mirrors
+    /// `sem-cli/src/cache.rs::tests::kappa_round_trips_through_disk_cache`.
+    #[test]
+    fn kappa_round_trips_through_disk_cache() {
+        use sem_core::parser::plugin::SemanticParserPlugin;
+        use sem_core::parser::plugins::code::CodeParserPlugin;
+
+        let root = temp_repo_root("kappa-round-trip");
+        let source = "let mutableCounter = 1;\nconst frozenCounter = 2;\n\nfunction add(a: number, b: number): number {\n    return a + b;\n}\n";
+        write_file(&root.join("decls.ts"), source);
+        let files = vec!["decls.ts".to_string()];
+
+        let entities = CodeParserPlugin.extract_entities(source, "decls.ts");
+        assert_eq!(entities.len(), 3, "expected 3 entities: {entities:#?}");
+        let original_kappa: std::collections::HashMap<String, String> = entities
+            .iter()
+            .map(|e| (e.name.clone(), e.kappa.clone().expect("kappa computed")))
+            .collect();
+        assert_ne!(
+            original_kappa["mutableCounter"], original_kappa["frozenCounter"],
+            "sanity: let vs const must differ before the round trip"
+        );
+
+        let graph = graph_with_edges(&entities, vec![]);
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(&root, &files, &graph, &entities, CacheSourceScope::Default)
+            .unwrap();
+        drop(cache);
+
+        let reopened = DiskCache::open(&root).unwrap();
+        let (_graph, loaded_entities) = reopened
+            .load(&root, &files)
+            .expect("cache should be fresh and complete");
+        assert_eq!(loaded_entities.len(), 3);
+
+        for loaded in &loaded_entities {
+            let expected = &original_kappa[&loaded.name];
+            assert_eq!(
+                loaded.kappa.as_deref(),
+                Some(expected.as_str()),
+                "entity `{}` must keep its kappa through save/reopen/load",
+                loaded.name
+            );
+        }
+
+        drop(reopened);
+        cleanup(root);
     }
 }

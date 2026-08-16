@@ -5,7 +5,7 @@ use crate::model::entity::{
     build_entity_id, build_entity_id_disambiguated, build_entity_id_disambiguated_with_ordinal,
     SemanticEntity,
 };
-use crate::utils::hash::{content_hash, structural_hash, structural_hash_excluding_range};
+use crate::utils::hash::{content_hash, structural_and_semantic_hash};
 use std::collections::{HashMap, HashSet};
 
 pub fn extract_entities(
@@ -280,7 +280,7 @@ fn visit_node(
             if let Some((name, entity_type)) = extract_call_entity(node, config, source) {
                 let content_str = node_text(node, source);
                 let content = content_str.to_string();
-                let struct_hash = compute_structural_hash(node, source);
+                let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, entity_type, &name, parent_id),
                     file_path: file_path.to_string(),
@@ -289,6 +289,7 @@ fn visit_node(
                     parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
+                    kappa: Some(kappa_hash),
                     content,
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
@@ -340,7 +341,7 @@ fn visit_node(
                 let content = std::str::from_utf8(&source[key.start_byte()..value.end_byte()])
                     .unwrap_or("")
                     .to_string();
-                let struct_hash = compute_structural_hash(value, source);
+                let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(value, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, "entry", &name, parent_id),
                     file_path: file_path.to_string(),
@@ -349,6 +350,7 @@ fn visit_node(
                     parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
+                    kappa: Some(kappa_hash),
                     content,
                     start_line: key.start_position().row + 1,
                     end_line: value.end_position().row + 1,
@@ -369,7 +371,7 @@ fn visit_node(
             if let Some((name, entity_type)) = extract_list_form_entity(node, config, source) {
                 let content_str = node_text(node, source);
                 let content = content_str.to_string();
-                let struct_hash = compute_structural_hash(node, source);
+                let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, entity_type, &name, parent_id),
                     file_path: file_path.to_string(),
@@ -378,6 +380,7 @@ fn visit_node(
                     parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
+                    kappa: Some(kappa_hash),
                     content,
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
@@ -407,7 +410,8 @@ fn visit_node(
                     let entity_type = map_ocaml_let_binding(binding);
                     let content_str = node_text(binding, source);
                     let content = content_str.to_string();
-                    let struct_hash = compute_structural_hash(binding, source);
+                    let (struct_hash, kappa_hash) =
+                        compute_structural_hash_and_kappa(binding, source);
                     for name in names {
                         let entity = SemanticEntity {
                             id: build_entity_id(file_path, entity_type, &name, parent_id),
@@ -417,6 +421,7 @@ fn visit_node(
                             parent_id: parent_id.map(String::from),
                             content_hash: content_hash(&content),
                             structural_hash: Some(struct_hash.clone()),
+                            kappa: Some(kappa_hash.clone()),
                             content: content.clone(),
                             start_line: binding.start_position().row + 1,
                             end_line: binding.end_position().row + 1,
@@ -497,39 +502,43 @@ fn visit_node(
                 let skip_declaration = should_skip_entity(config, suppression_context, node_type);
                 let mut initializer_children = Vec::new();
                 for declarator in &declarators {
-                    let emitted_entity_id =
-                        if let Some(name_node) = declarator.child_by_field_name("name") {
-                            let entity_type =
-                                map_js_ts_declarator_entity_type(node, *declarator, config);
-                            if !skip_declaration || entity_type == "function" {
-                                let name = node_text(name_node, source).to_string();
-                                let content = node_text(*declarator, source).to_string();
-                                let struct_hash = compute_structural_hash(*declarator, source);
-                                let entity = SemanticEntity {
-                                    id: build_entity_id(file_path, entity_type, &name, parent_id),
-                                    file_path: file_path.to_string(),
-                                    entity_type: entity_type.to_string(),
-                                    name,
-                                    parent_id: parent_id.map(String::from),
-                                    content_hash: content_hash(&content),
-                                    structural_hash: Some(struct_hash),
-                                    content,
-                                    start_line: declarator.start_position().row + 1,
-                                    end_line: declarator.end_position().row + 1,
-                                    start_byte: Some(declarator.start_byte()),
-                                    end_byte: Some(declarator.end_byte()),
-                                    metadata: None,
-                                };
+                    let emitted_entity_id = if let Some(name_node) =
+                        declarator.child_by_field_name("name")
+                    {
+                        let entity_type =
+                            map_js_ts_declarator_entity_type(node, *declarator, config);
+                        if !skip_declaration || entity_type == "function" {
+                            let name = node_text(name_node, source).to_string();
+                            let content = node_text(*declarator, source).to_string();
+                            let (struct_hash, kappa_hash) =
+                                compute_structural_hash_and_kappa(*declarator, source);
+                            let kappa_hash = fold_declaration_keyword_into_kappa(node, kappa_hash);
+                            let entity = SemanticEntity {
+                                id: build_entity_id(file_path, entity_type, &name, parent_id),
+                                file_path: file_path.to_string(),
+                                entity_type: entity_type.to_string(),
+                                name,
+                                parent_id: parent_id.map(String::from),
+                                content_hash: content_hash(&content),
+                                structural_hash: Some(struct_hash),
+                                kappa: Some(kappa_hash),
+                                content,
+                                start_line: declarator.start_position().row + 1,
+                                end_line: declarator.end_position().row + 1,
+                                start_byte: Some(declarator.start_byte()),
+                                end_byte: Some(declarator.end_byte()),
+                                metadata: None,
+                            };
 
-                                let entity_id = entity.id.clone();
-                                entities.push(entity);
-                                Some(entity_id)
-                            } else {
-                                None
-                            }
+                            let entity_id = entity.id.clone();
+                            entities.push(entity);
+                            Some(entity_id)
                         } else {
                             None
-                        };
+                        }
+                    } else {
+                        None
+                    };
 
                     // Suppressed local declarators do not have an entity of
                     // their own, so their initializer is traversed under the
@@ -572,6 +581,11 @@ fn visit_node(
                             parent_id: parent_id.map(String::from),
                             content_hash: content_hash(&binding.content),
                             structural_hash: Some(binding.structural_hash),
+                            // SwiftPropertyBinding is a synthesized text segment
+                            // (multi-declarator `let a, b: Int` split), not a
+                            // single clean AST subtree -- kappa isn't computed
+                            // for this recovery path in v1. See KAPPA.md.
+                            kappa: None,
                             content: binding.content,
                             start_line: binding.start_line,
                             end_line: binding.end_line,
@@ -618,7 +632,8 @@ fn visit_node(
                             let name = node_text(name_node, source).to_string();
                             let entity_type = map_entity_type(node, config);
                             let content = node_text(*spec, source).to_string();
-                            let struct_hash = compute_structural_hash(*spec, source);
+                            let (struct_hash, kappa_hash) =
+                                compute_structural_hash_and_kappa(*spec, source);
                             let entity = SemanticEntity {
                                 id: build_entity_id(file_path, entity_type, &name, parent_id),
                                 file_path: file_path.to_string(),
@@ -627,6 +642,7 @@ fn visit_node(
                                 parent_id: parent_id.map(String::from),
                                 content_hash: content_hash(&content),
                                 structural_hash: Some(struct_hash),
+                                kappa: Some(kappa_hash),
                                 content,
                                 start_line: spec.start_position().row + 1,
                                 end_line: spec.end_position().row + 1,
@@ -651,7 +667,7 @@ fn visit_node(
             {
                 let content_str = node_text(node, source);
                 let content = content_str.to_string();
-                let struct_hash = compute_structural_hash(node, source);
+                let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
                 let entity = SemanticEntity {
                     id: build_entity_id(file_path, test_entity_type, &test_name, parent_id),
                     file_path: file_path.to_string(),
@@ -660,6 +676,7 @@ fn visit_node(
                     parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
+                    kappa: Some(kappa_hash),
                     content,
                     start_line: node.start_position().row + 1,
                     end_line: node.end_position().row + 1,
@@ -700,7 +717,7 @@ fn visit_node(
             extract_js_ts_object_function_pair(node, config, source, suppression_context)
         {
             let content = node_text(node, source).to_string();
-            let struct_hash = compute_structural_hash(node, source);
+            let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
             let entity = SemanticEntity {
                 id: build_entity_id(file_path, "method", &name, parent_id),
                 file_path: file_path.to_string(),
@@ -709,6 +726,7 @@ fn visit_node(
                 parent_id: parent_id.map(String::from),
                 content_hash: content_hash(&content),
                 structural_hash: Some(struct_hash),
+                kappa: Some(kappa_hash),
                 content,
                 start_line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
@@ -763,13 +781,16 @@ fn visit_node(
                     let content = std::str::from_utf8(&source[start_byte..end_byte])
                         .unwrap_or("")
                         .to_string();
-                    let struct_hash = match body {
+                    let (struct_hash, kappa_hash) = match body {
                         Some(b) => {
-                            let sig = compute_structural_hash(node, source);
-                            let bod = structural_hash(b, source);
-                            content_hash(&format!("{}{}", sig, bod))
+                            let (sig, sig_kappa) = compute_structural_hash_and_kappa(node, source);
+                            let (bod, bod_kappa) = structural_and_semantic_hash(b, source, None);
+                            (
+                                content_hash(&format!("{}{}", sig, bod)),
+                                content_hash(&format!("{}{}", sig_kappa, bod_kappa)),
+                            )
                         }
-                        None => compute_structural_hash(node, source),
+                        None => compute_structural_hash_and_kappa(node, source),
                     };
 
                     let entity = SemanticEntity {
@@ -780,6 +801,7 @@ fn visit_node(
                         parent_id: parent_ref.map(String::from),
                         content_hash: content_hash(&content),
                         structural_hash: Some(struct_hash),
+                        kappa: Some(kappa_hash),
                         content,
                         start_line,
                         end_line,
@@ -913,6 +935,8 @@ fn emit_js_ts_re_export_entities(
                 if !original.is_empty() {
                     metadata.insert("export.original".to_string(), original);
                 }
+                let (export_struct_hash, export_kappa_hash) =
+                    compute_structural_hash_and_kappa(child, source);
 
                 entities.push(SemanticEntity {
                     id: build_entity_id(file_path, "export", &local, parent_id),
@@ -921,7 +945,8 @@ fn emit_js_ts_re_export_entities(
                     name: local,
                     parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
-                    structural_hash: Some(compute_structural_hash(child, source)),
+                    structural_hash: Some(export_struct_hash),
+                    kappa: Some(export_kappa_hash),
                     content,
                     start_line: child.start_position().row + 1,
                     end_line: child.end_position().row + 1,
@@ -1052,6 +1077,9 @@ fn recover_swift_conditional_compilation_containers(
             parent_id: None,
             content_hash: content_hash(&content),
             structural_hash: Some(struct_hash),
+            // ERROR-node text recovery, not a clean AST subtree -- see
+            // KAPPA.md's coverage section for why kappa is skipped here.
+            kappa: None,
             content,
             start_line: container.start_line,
             end_line: container.end_line,
@@ -1521,12 +1549,44 @@ fn sibling_function_body(node: Node) -> Option<Node> {
     }
 }
 
-/// Compute the structural hash for an entity, excluding the name token so that
-/// renames of otherwise identical entities produce the same hash.
-fn compute_structural_hash(node: Node, source: &[u8]) -> String {
-    match find_name_byte_range(node, source) {
-        Some((start, end)) => structural_hash_excluding_range(node, source, start, end),
-        None => structural_hash(node, source),
+/// Compute `structural_hash` and kappa (the semantic identity hash; see
+/// `crates/sem-core/KAPPA.md`) for an entity in a single tree walk.
+///
+/// The structural half is exactly what the pre-kappa code computed --
+/// `structural_hash_excluding_range(node, source, name_start, name_end)`
+/// when the entity has a name token, `structural_hash(node, source)`
+/// otherwise -- kept as one function so callers pay for one traversal
+/// instead of two. `kappa_regression_tests` below pins that equivalence
+/// against the plain `structural_hash`/`structural_hash_excluding_range`
+/// functions directly. Kappa deliberately does NOT exclude the name range:
+/// see `structural_and_semantic_hash`'s doc comment.
+fn compute_structural_hash_and_kappa(node: Node, source: &[u8]) -> (String, String) {
+    let exclude_range = find_name_byte_range(node, source);
+    structural_and_semantic_hash(node, source, exclude_range)
+}
+
+/// TS/JS multi-declarator entities (`const a = 1, b = 2` -> one entity per
+/// declarator, #149) compute both hashes over just the `variable_declarator`
+/// subtree (`compute_structural_hash_and_kappa(*declarator, source)` at this
+/// function's call site below) so that `structural_hash` keeps behaving
+/// exactly as it did before kappa existed. That means the enclosing
+/// declaration's leading `let`/`const`/`var` keyword is never visited by
+/// that walk at all -- `is_semantic_leaf`'s v1.1 leading-keyword-
+/// discriminator rule (`hash.rs`) can't catch what it never sees -- so
+/// `let a = 1, b = 2` and `const a = 1, b = 2` would still collide on kappa
+/// without this.
+///
+/// Fold the keyword into kappa explicitly, after the fact, using the same
+/// hash-of-hashes idiom this file already uses to combine a split
+/// signature/body kappa for Dart (`content_hash(&format!("{}{}", sig_kappa,
+/// bod_kappa))`, a few dozen lines above). `structural_hash` is completely
+/// untouched by this -- only the returned kappa string changes.
+fn fold_declaration_keyword_into_kappa(declaration_node: Node, kappa: String) -> String {
+    match declaration_node.child(0) {
+        Some(keyword) if !keyword.is_named() => {
+            content_hash(&format!("{}:{kappa}", keyword.kind()))
+        }
+        _ => kappa,
     }
 }
 
@@ -3345,7 +3405,7 @@ fn extract_ocaml_named_bindings(
         if let Some(name) = name {
             let content_str = node_text(binding, source);
             let content = content_str.to_string();
-            let struct_hash = compute_structural_hash(binding, source);
+            let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(binding, source);
             let entity = SemanticEntity {
                 id: build_entity_id(file_path, entity_type, &name, parent_id),
                 file_path: file_path.to_string(),
@@ -3354,6 +3414,7 @@ fn extract_ocaml_named_bindings(
                 parent_id: parent_id.map(String::from),
                 content_hash: content_hash(&content),
                 structural_hash: Some(struct_hash),
+                kappa: Some(kappa_hash),
                 content,
                 start_line: binding.start_position().row + 1,
                 end_line: binding.end_position().row + 1,
@@ -3504,5 +3565,117 @@ fn find_test_callback(node: Node) -> Option<Node> {
         Some(callback)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod kappa_regression_tests {
+    //! Proves the "structural_hash stays completely untouched" compat story
+    //! from KAPPA.md at the unit level: `compute_structural_hash_and_kappa`'s
+    //! structural half must be byte-identical, on every node in a real tree
+    //! (not just entity nodes), to what the pre-kappa code computed --
+    //! `structural_hash_excluding_range` when a name token is found,
+    //! `structural_hash` otherwise. If the merged single-walk implementation
+    //! in `structural_and_semantic_hash` ever drifted from those, this fails.
+    use super::*;
+    use crate::parser::plugins::code::{languages::get_language_config, parse_tree};
+    use crate::utils::hash::{structural_hash, structural_hash_excluding_range};
+
+    /// The pre-kappa structural-hash computation, reproduced verbatim as an
+    /// oracle (this used to be `compute_structural_hash`, inlined here now
+    /// that its only caller is this test).
+    fn pre_kappa_structural_hash(node: Node, source: &[u8]) -> String {
+        match find_name_byte_range(node, source) {
+            Some((start, end)) => structural_hash_excluding_range(node, source, start, end),
+            None => structural_hash(node, source),
+        }
+    }
+
+    fn assert_structural_half_unchanged(source: &str, ext: &str) {
+        let config = get_language_config(ext).expect("language config for test extension");
+        let tree = parse_tree(config, source).expect("parse");
+        let mut worklist = vec![tree.root_node()];
+        let mut checked = 0usize;
+        while let Some(node) = worklist.pop() {
+            let expected = pre_kappa_structural_hash(node, source.as_bytes());
+            let (actual, _kappa) = compute_structural_hash_and_kappa(node, source.as_bytes());
+            assert_eq!(
+                expected,
+                actual,
+                "structural_hash diverged for node kind `{}` in {ext} fixture",
+                node.kind()
+            );
+            checked += 1;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                worklist.push(child);
+            }
+        }
+        assert!(
+            checked > 10,
+            "sanity: expected to walk more than 10 nodes in the {ext} fixture, walked {checked}"
+        );
+    }
+
+    #[test]
+    fn structural_hash_unchanged_by_kappa_typescript() {
+        assert_structural_half_unchanged(
+            r#"
+export function add(a: number, b: number): number {
+    return a + b;
+}
+
+class Greeter {
+    private name: string;
+    constructor(name: string) {
+        this.name = name;
+    }
+    greet(): string {
+        return `Hello, ${this.name}!`;
+    }
+}
+"#,
+            ".ts",
+        );
+    }
+
+    #[test]
+    fn structural_hash_unchanged_by_kappa_python() {
+        assert_structural_half_unchanged(
+            r#"
+def add(a, b):
+    return a + b
+
+class Greeter:
+    def __init__(self, name):
+        self.name = name
+
+    def greet(self):
+        return f"Hello, {self.name}!"
+"#,
+            ".py",
+        );
+    }
+
+    #[test]
+    fn structural_hash_unchanged_by_kappa_rust() {
+        assert_structural_half_unchanged(
+            r#"
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+struct Greeter {
+    name: String,
+}
+
+impl Greeter {
+    fn greet(&self) -> String {
+        format!("Hello, {}!", self.name)
+    }
+}
+"#,
+            ".rs",
+        );
     }
 }

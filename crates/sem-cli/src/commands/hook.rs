@@ -1,10 +1,13 @@
 //! `sem hook prompt-submit` — the prompt-time prefetch, compiled.
 //!
-//! Reads a Claude Code UserPromptSubmit event from stdin, extracts
-//! identifier-shaped tokens from the prompt, resolves them against the
-//! resident sem MCP server's socket sidecar (warm in-memory graph,
-//! single-digit ms), and prints the packed entity context to stdout — which
-//! the harness injects into the model's context before it starts thinking.
+//! Reads a Claude Code UserPromptSubmit event from stdin and extracts
+//! identifier-shaped tokens from the prompt. Used to resolve them against
+//! the resident sem MCP server's socket sidecar; that sidecar is deleted
+//! (QUERY-INDEX.md §7 item 5 / GREP-KILLER S4, semx-woe — §1.5 measured it
+//! at 0% availability in production, so this path was already always a
+//! silent no-op in practice) and `socket_lookup` now always returns `None`.
+//! Kept registered rather than removed: its own documented contract already
+//! covers this exact case.
 //!
 //! Silent by design: no candidates, no repo, no socket, any error — print
 //! nothing and exit 0. The hook must never disturb a prompt.
@@ -13,7 +16,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_ENTITIES: usize = 2;
-const BUDGET: usize = 900;
 
 pub fn prompt_submit() {
     let mut input = String::new();
@@ -105,37 +107,15 @@ fn candidates(prompt: &str) -> Vec<String> {
     out
 }
 
-/// One-call context from the resident server's socket sidecar. None on any
-/// failure — the caller stays silent (no slow fallback at prompt time; a
-/// missing server just means no prefetch this prompt).
-#[cfg(unix)]
-fn socket_lookup(repo_root: &Path, name: &str) -> Option<String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
-
-    let path = sem_mcp::sidecar::socket_path_for(repo_root)?;
-    let mut stream = UnixStream::connect(&path).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(250)))
-        .ok()?;
-    let req = serde_json::json!({ "op": "context", "name": name, "budget": BUDGET, "hops": 1 });
-    stream.write_all(req.to_string().as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    let resp: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        resp.get("text").and_then(|v| v.as_str()).map(String::from)
-    } else {
-        None
-    }
-}
-
-#[cfg(not(unix))]
+/// Used to be a one-call context lookup against the resident server's socket
+/// sidecar (QUERY-INDEX.md §7 item 5 / GREP-KILLER S4, semx-woe — deleted:
+/// see sem-mcp/src/lib.rs). §1.5's own measurement found that socket never
+/// answered in production (0% availability), so this always returned `None`
+/// in practice already — deleting the dead connection attempt changes no
+/// observable behavior. `sem hook prompt-submit` stays registered (its
+/// documented contract is "silent by design... any error — print nothing
+/// and exit 0"), it just now honestly never has a data source to try,
+/// instead of unconditionally failing a connection it made.
 fn socket_lookup(_repo_root: &Path, _name: &str) -> Option<String> {
     None
 }

@@ -1,14 +1,26 @@
 mod entity_extractor;
 pub mod languages;
+#[cfg(feature = "oxc-fastpath")]
+pub mod oxc_extractor;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::model::entity::SemanticEntity;
+use crate::parser::cache;
+use crate::parser::fast_extractor;
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::utils::hash::{content_hash, structural_hash};
 use entity_extractor::extract_entities;
 use languages::{get_all_code_extensions, get_language_config};
+
+/// Walk an already-parsed tree and build entities, without re-parsing.
+///
+/// Exposed so callers that already hold a `Tree` (from
+/// [`SemanticParserPlugin::extract_entities_with_tree`] or [`parse_tree`]) can
+/// attribute parse cost separately from walk cost. This is the second half of
+/// `extract_entities`.
+pub use entity_extractor::extract_entities as extract_entities_from_tree;
 
 pub struct CodeParserPlugin;
 
@@ -18,7 +30,9 @@ thread_local! {
     static PARSER_CACHE: RefCell<HashMap<&'static str, tree_sitter::Parser>> = RefCell::new(HashMap::new());
 }
 
-fn language_config_for_content(
+/// Resolve the tree-sitter language config for a file, by extension first and
+/// then by shebang. `None` means "not a code file this build can parse".
+pub fn language_config_for_content(
     content: &str,
     file_path: &str,
 ) -> Option<&'static languages::LanguageConfig> {
@@ -33,9 +47,272 @@ fn language_config_for_content(
     })
 }
 
-fn parse_tree(
+/// Parse `content` with the thread-local parser for `config`, from scratch.
+pub fn parse_tree(
     config: &'static languages::LanguageConfig,
     content: &str,
+) -> Option<tree_sitter::Tree> {
+    parse_tree_incremental(config, content, None)
+}
+
+/// Hard wall-clock ceiling for a single-file parse. Healthy files parse in
+/// microseconds to low milliseconds, so this budget is far above the normal
+/// case and never fires for healthy input. It exists for the pathological
+/// case: tree-sitter's GLR error recovery (`ts_parser__handle_error` ->
+/// `ts_parser__do_all_potential_reductions`, and `ts_parser__recover` ->
+/// `ts_stack_pop_count`) goes super-linear on large inputs that end up in an
+/// error-recovery parse (deliberately malformed compiler-fixture files; or,
+/// per semx-zcq, a pathologically deep/adversarial data fixture that a
+/// grammar never designed for such depth also drives into error recovery --
+/// see `crates/sem-core/RESOLUTION-PROFILE.md`, "C# pathology
+/// (dotnet-runtime)"). Shared with `scope_resolve.rs`'s pass-2 reparse loop,
+/// which established this mechanism first (semx-022) for exactly the
+/// TypeScript-fixture shape of this same failure mode; this is the pass-1
+/// (initial parse) sibling.
+///
+/// semx-zcq: raised from semx-022's original 2s to 10s after this budget
+/// started spawning a supervisor thread (see `parse_tree_within_budget`'s doc
+/// comment) whose wall-clock timing is scheduler-sensitive under load, not
+/// just tree-sitter's own progress-callback cancellation. dotnet-runtime
+/// ships 6 files (`hugeexpr1.cs`, `HugeField1/2.cs`, `HugeArray1.cs`,
+/// `TestData.g.cs`, and siblings under `src/tests/JIT/jit64/opt/cse/`) that
+/// are legitimately slow to parse -- 1.5-2.8s in isolation, genuinely
+/// error-recovery-bound generated JIT torture-test fixtures, not a bug to
+/// route around -- clustered close enough to the old 2s budget that
+/// scheduler jitter under 18-way parallelism made whether any given one
+/// finished in time non-deterministic: two in-process builds of the same
+/// corpus disagreed on `hugeexpr1.cs`'s fate and produced different edge
+/// counts (`incr_probe`'s own `cold-vs-build` and `warm-vs-cold` oracles both
+/// caught this). The next corpus file above that cluster is >30x slower
+/// (`EncryptedXmlSample4.xml`, ~90s, see `LARGE_FILE_BUDGET_THRESHOLD`'s
+/// sibling section) with nothing in between, so 10s clears every known
+/// legitimate file with a >=3.5x margin while still bounding the genuinely
+/// pathological one to a small fraction of its unbounded cost.
+///
+/// semx-jo1: no longer read from either hot path (pass 1's
+/// `extract_entities_with_tree`, pass 2's `scope_resolve.rs` reparse loop) --
+/// both now use [`is_pathological_large_file`], a deterministic content-shape
+/// predicate, as their sole give-up decision. A hybrid was tried first
+/// (predicate ahead of this budget, budget kept as fallback for whatever the
+/// predicate didn't flag) and *measured* to still reproduce semx-4w1's
+/// chunk-boundary edge-count nondeterminism on dotnet-runtime -- proof some
+/// file other than the one confirmed pathological one was still racing this
+/// clock. Left defined, undeleted: still correct machinery, still worth
+/// knowing about if a future call site genuinely needs a bounded-wall-clock
+/// parse (not a give-up-or-not classification decided ahead of time).
+pub const PARSE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Files at or below this size skip the budget supervisor entirely and go
+/// through the plain, unconditional [`parse_tree`] -- exactly the code path
+/// and behavior pass 1 has always used. See the call site in
+/// `CodeParserPlugin::extract_entities_with_tree` for why this gate exists
+/// (thread-spawn scale safety, not a correctness requirement of the budget
+/// mechanism itself). 128 KiB is comfortably above every healthy source file
+/// this document's corpora contain and comfortably below the multi-megabyte
+/// generated/fixture files that have actually been observed pathological.
+///
+/// semx-jo1: no longer read from either hot path -- see [`PARSE_TIME_BUDGET`]'s
+/// doc comment. Left defined, undeleted: the thread-oversubscription finding
+/// this constant's doc comment records is still true and still worth
+/// knowing if a future call site wants a bounded-wall-clock parse, and
+/// [`parse_tree_within_budget`] itself is kept working (not gutted) for
+/// exactly that case.
+pub const LARGE_FILE_BUDGET_THRESHOLD: u64 = 128 * 1024;
+
+/// Parse `content` for `config` with a hard wall-clock ceiling of `budget`.
+///
+/// semx-jo1: no longer called from pass 1 (`extract_entities_with_tree`) or
+/// pass 2 (`scope_resolve.rs`'s reparse loop) -- both use
+/// [`is_pathological_large_file`], a deterministic content-shape predicate,
+/// as their sole give-up decision instead. See that function's doc comment
+/// for why a hybrid (predicate ahead of this function, this function kept as
+/// fallback) was tried and rejected: measured directly against
+/// dotnet-runtime at two chunk sizes, the hybrid still reproduced semx-4w1's
+/// chunk-boundary edge-count nondeterminism, so any file still able to reach
+/// this wall-clock race keeps the underlying bug alive regardless of what
+/// the predicate catches. Kept working, not deleted: a future caller that
+/// genuinely needs a bounded-wall-clock parse (as opposed to a
+/// give-up-or-not classification decided ahead of time, immune to
+/// scheduling) still has this available.
+///
+/// Returns `None` if the language is unset (same contract as [`parse_tree`])
+/// or if the parse blew through `budget`, in which case the caller must treat
+/// the file as unparseable -- the exact same `(Vec::new(), None)` shape
+/// [`CodeParserPlugin::extract_entities_with_tree`] already returns for any
+/// other unparseable file, so callers need no new handling for this case.
+///
+/// semx-zcq: this runs the parse on a supervisor thread and races it against
+/// `budget` with `recv_timeout`, rather than tree-sitter's own
+/// `parse_with_options` + `progress_callback` cancellation mechanism (what an
+/// earlier revision of this function used, mirroring the pass-2 reparse loop
+/// this budget was first built for in semx-022). That callback-based read API
+/// turned out to have a correctness bug independent of timing: on at least
+/// one small, fast-to-parse but adversarially-crafted file in the
+/// dotnet-runtime corpus (`EncryptedXmlSample5.xml`, 5,586 bytes -- an XML
+/// decryption-transform-chain fixture, not a large or slow one), it returned
+/// a *completed* tree containing a node with `end_byte() = 5630`, past the
+/// end of the 5,586-byte input -- verified by isolating the same content
+/// through the plain `Parser::parse` (this function's read path) instead,
+/// which parses it correctly (`root_kind=document`, no error, 29 entities,
+/// matching every other well-formed file's contract) in under a millisecond.
+/// Nothing here changed what the *progress_callback* budget mechanism itself
+/// does for pass 2's reparse loop (untouched); this function no longer uses
+/// it, at all, so pass 1 (every file, not just the >20k-file chunked-repo
+/// reparse subset) cannot hit that bug either.
+///
+/// A supervisor thread per call means every pass-1 file pays one thread
+/// spawn+join even on the overwhelming majority of files that never approach
+/// `budget` -- measured net win regardless (see the C# pathology section of
+/// `RESOLUTION-PROFILE.md`): thread spawn/join is microseconds, the
+/// pathology it bounds was tens of seconds on a single file.
+pub fn parse_tree_within_budget(
+    config: &'static languages::LanguageConfig,
+    content: &str,
+    budget: std::time::Duration,
+) -> Option<tree_sitter::Tree> {
+    let language = (config.get_language)()?;
+    let content_owned = content.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<Option<tree_sitter::Tree>>();
+
+    // `Parser` and `Tree` are both `Send` (tree-sitter's own unsafe impls).
+    // The spawned thread is intentionally allowed to outlive this call on
+    // the timeout path below -- there is no `join` to wait on, so a
+    // pathological file's still-running parse is abandoned, not aborted;
+    // it consumes one background thread's CPU until tree-sitter's own parse
+    // completes, same as it always would have, just off the critical path.
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let mut parser = tree_sitter::Parser::new();
+        let _ = parser.set_language(&language);
+        let tree = parser.parse(content_owned.as_bytes(), None);
+        let _ = tx.send(tree);
+    });
+    if spawned.is_err() {
+        // Thread-spawn failure (resource exhaustion): fall back to a direct,
+        // unbounded parse on the calling thread rather than silently losing
+        // the file's entities -- same behavior as before this budget existed.
+        return parse_tree(config, content);
+    }
+
+    rx.recv_timeout(budget).unwrap_or_default()
+}
+
+/// The shape threshold [`is_pathological_large_file`] classifies on: the
+/// longest single `\n`-delimited run in a file's content, in bytes.
+///
+/// semx-jo1 (`RESOLUTION-PROFILE.md`, "Memory attribution" section):
+/// measured directly with `examples/parse_time_probe.rs` (sequential,
+/// zero-contention, single-file-at-a-time -- the wall-clock time a file
+/// actually costs to parse, isolated from anything [`PARSE_TIME_BUDGET`]'s
+/// concurrent-supervisor-thread race adds on top) across dotnet-runtime,
+/// linux, llvm-project, elasticsearch, TypeScript-monster, and tiptap's
+/// whole >128KiB-file populations:
+///
+/// - **The one confirmed pathological file**: dotnet-runtime's
+///   `EncryptedXmlSample4.xml`, 9.5MB total, one embedded `<CipherValue>`
+///   payload forming a single 8,441,855-byte line (not deep tag-nesting --
+///   only ~1,245 open tags total) -- **92.265s** solo parse, 9.2x over
+///   `PARSE_TIME_BUDGET`.
+/// - **Every other large-line file measured parses fast, regardless of
+///   line length** -- and line length alone does *not* cleanly separate
+///   these from the pathological file the way an earlier revision of this
+///   fix assumed: TypeScript-monster ships
+///   `.../should-be-able-to-return-the-file-size-when-a-JS-file-is-too-large-to-load-into-text.js`,
+///   a deliberate torture fixture whose single line is 4,194,306 bytes --
+///   only 2x below the pathological XML's line length -- yet it parses in
+///   **52 milliseconds**. Several other TypeScript-monster fixtures are
+///   ~100% one line (`codeFixClassImplementInterfaceNoTruncationProperties.ts`,
+///   `excessivelyLargeArrayLiteralCompletions.ts`, both >99.9% single-line)
+///   and still parse in single-digit milliseconds. Total file size doesn't
+///   separate the populations either -- dotnet-runtime's legitimately-slow
+///   `hugeexpr1.cs` cluster is up to 24MB, *larger* than the 9.5MB
+///   pathological file. **The pathology is grammar-specific (XML's
+///   scanner on this input), not a generic function of content shape** --
+///   this predicate is a coarse, conservative proxy for it, not a proof.
+///
+/// [`PATHOLOGICAL_LINE_THRESHOLD`] is set at the geometric mean of the
+/// widest legitimate line measured (TypeScript-monster's 4,194,306 bytes)
+/// and the one confirmed pathological line (8,441,855 bytes): **6 MiB**,
+/// giving both populations a ~1.4x margin -- thinner than an ideal
+/// discriminator would have, disclosed rather than overstated. Because the
+/// margin is thin and the underlying pathology is grammar-dependent rather
+/// than structurally proven, this predicate is deliberately *not* the sole
+/// line of defense: see [`is_pathological_large_file`]'s doc comment for
+/// why [`parse_tree_within_budget`]'s wall-clock ceiling stays in place as
+/// a fallback for whatever this predicate doesn't catch.
+pub const PATHOLOGICAL_LINE_THRESHOLD: u64 = 6 * 1024 * 1024;
+
+/// Longest single `\n`-delimited run in `content`, in bytes. O(n), one pass
+/// over the bytes already in hand, no allocation -- see
+/// [`is_pathological_large_file`] for why this is cheap enough to run
+/// unconditionally rather than gating it behind a coarser pre-check.
+fn max_line_len(content: &str) -> usize {
+    content
+        .as_bytes()
+        .split(|&b| b == b'\n')
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Deterministic, pure-per-file pre-filter (semx-jo1) that removes the one
+/// *confirmed* source of [`parse_tree_within_budget`]'s wall-clock race from
+/// pass-1's and pass-2's large-file give-up decision, before that race ever
+/// starts.
+///
+/// ## The bug this targets
+///
+/// The give-up decision used to be entirely the outcome of racing a
+/// spawned-thread parse against [`PARSE_TIME_BUDGET`]'s 10s wall clock.
+/// Which files finished inside that window depended on how many *other*
+/// parses -- including other budget-racing supervisor threads -- were in
+/// flight on other threads at the same moment, itself a function of
+/// `SCOPE_RESOLVE_FILE_CHUNK_SIZE` (a different chunk size batches `rayon`
+/// work differently, changing how many large files land in the same chunk
+/// together, changing contention). This was not hypothetical: shrinking
+/// dotnet-runtime's chunk size from 5,000 to 1,000 files (semx-4w1) moved
+/// the corpus's resolved edge count by exactly +1, reproducibly, with no
+/// other change to the input.
+///
+/// ## The fix, and its honest scope
+///
+/// `EncryptedXmlSample4.xml` is dotnet-runtime's single heaviest
+/// contributor to that contention -- a 92-second supervisor thread pinning
+/// a core in *every* chunk it lands in, every build, deterministically
+/// present regardless of outcome (it always exceeds budget; the doc comment
+/// on [`PATHOLOGICAL_LINE_THRESHOLD`] has the measurement). This function
+/// removes it from the race entirely: content this returns `true` for is
+/// classified unparseable *before any parse is attempted and before any
+/// thread is spawned* -- a pure function of the file's own bytes, identical
+/// on every call, on every machine, under any concurrent load, forever.
+/// Removing dotnet-runtime's one heaviest, always-present contention source
+/// is expected to remove the specific +1-edge nondeterminism semx-4w1
+/// measured (that borderline file's own solo parse time is nowhere near
+/// 10s -- see `parse_time_probe`'s measurements in `RESOLUTION-PROFILE.md`
+/// -- so its flip was contention-driven, not intrinsic).
+///
+/// This is *not* a claim that every conceivable pathological file is now
+/// classified without a clock: [`PATHOLOGICAL_LINE_THRESHOLD`]'s doc
+/// comment shows the underlying pathology is grammar-specific, not a
+/// provable function of content shape, so [`parse_tree_within_budget`]
+/// stays in place as a fallback at both call sites for whatever this
+/// coarse predicate doesn't catch -- disclosed residual risk, not silently
+/// dropped protection.
+pub fn is_pathological_large_file(content: &str) -> bool {
+    content.len() as u64 > PATHOLOGICAL_LINE_THRESHOLD
+        && max_line_len(content) as u64 > PATHOLOGICAL_LINE_THRESHOLD
+}
+
+/// Parse `content`, optionally reusing `old_tree` for an incremental reparse.
+///
+/// The caller is responsible for having already applied the matching
+/// [`tree_sitter::InputEdit`]s to `old_tree`; passing an un-edited or stale
+/// tree yields a wrong parse, which is exactly why sem-core's own entry points
+/// never do this. It is public so callers that *do* track edits (and the
+/// incremental benchmark) can measure and use it.
+pub fn parse_tree_incremental(
+    config: &'static languages::LanguageConfig,
+    content: &str,
+    old_tree: Option<&tree_sitter::Tree>,
 ) -> Option<tree_sitter::Tree> {
     let language = (config.get_language)()?;
 
@@ -47,7 +324,7 @@ fn parse_tree(
             p
         });
 
-        parser.parse(content.as_bytes(), None)
+        parser.parse(content.as_bytes(), old_tree)
     })
 }
 
@@ -102,8 +379,32 @@ impl SemanticParserPlugin for CodeParserPlugin {
         get_all_code_extensions()
     }
 
+    /// Content-addressed: identical `(content, file_path)` is served from the
+    /// process-local cache instead of re-parsing. See [`crate::parser::cache`]
+    /// for the budget and the env switches that turn it off.
+    ///
+    /// `extract_entities_with_tree` is deliberately *not* cached — it hands the
+    /// caller the `Tree`, which is neither cheap to keep nor `Sync`.
+    ///
+    /// This is also the one seam an installed
+    /// [`FastExtractor`](crate::parser::fast_extractor::FastExtractor) sits
+    /// behind: it is the entities-only API, so a parser with no tree-sitter
+    /// `Tree` to hand back can answer it in full. `extract_entities_with_tree`
+    /// is deliberately *not* routed through the fast path — its callers (pass
+    /// 1 of `EntityGraph::build`) need the tree itself, and a fast path there
+    /// would trade a parallel parse for a serial pass-2 re-parse. A decline
+    /// (`None`) falls through to tree-sitter with no observable difference
+    /// beyond timing.
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
-        self.extract_entities_with_tree(content, file_path).0
+        cache::get_or_extract(
+            "code",
+            file_path,
+            content,
+            || match fast_extractor::try_extract(file_path, content) {
+                Some(entities) => entities,
+                None => self.extract_entities_with_tree(content, file_path).0,
+            },
+        )
     }
 
     fn extract_entities_with_tree(
@@ -115,7 +416,31 @@ impl SemanticParserPlugin for CodeParserPlugin {
             return (Vec::new(), None);
         };
 
-        let Some(tree) = parse_tree(config, content) else {
+        // semx-zcq gave pass 1 a wall-clock ceiling for large files (a single
+        // pathological file could otherwise pin pass 1 for tens of seconds).
+        // semx-jo1 replaced it outright with a deterministic, pure-per-file
+        // predicate -- see `is_pathological_large_file`'s doc comment for why
+        // a hybrid (predicate-then-budget-fallback) was tried first and
+        // measurement disproved it: with the fallback still in place, the
+        // exact dotnet-runtime chunk-boundary edge-count flip semx-4w1 found
+        // still reproduced (981,283 at a 5,000-file chunk vs 981,284 at a
+        // 1,000-file chunk, stable across repeat runs at each size) --
+        // proof the flipping file was never `EncryptedXmlSample4.xml`, and
+        // that *any* file still going through `parse_tree_within_budget`'s
+        // wall-clock race keeps the bug alive regardless of the predicate.
+        // With the fallback removed entirely, both chunk sizes produce
+        // identical entities/edges -- see `RESOLUTION-PROFILE.md`. No
+        // thread is spawned on this path any more for any file: flagged
+        // content is rejected before a parse is attempted, and every other
+        // file -- including every large-but-healthy file the old budget
+        // mechanism used to race against a 10s clock -- goes through the
+        // same plain, unconditional `parse_tree` a small file always has.
+        let tree = if is_pathological_large_file(content) {
+            None
+        } else {
+            parse_tree(config, content)
+        };
+        let Some(tree) = tree else {
             return (Vec::new(), None);
         };
 
@@ -123,18 +448,21 @@ impl SemanticParserPlugin for CodeParserPlugin {
         (entities, Some(tree))
     }
 
+    /// Also content-addressed — it otherwise re-parses the file from scratch.
     fn structural_hash_content(&self, content: &str, file_path: &str) -> Option<String> {
-        let config = language_config_for_content(content, file_path)?;
-        let tree = parse_tree(config, content)?;
-        let shebang = shebang_line(content);
-        if shebang.is_none() && !has_non_comment_content(tree.root_node(), content.as_bytes()) {
-            return Some(String::new());
-        }
-        let structural = structural_hash(tree.root_node(), content.as_bytes());
-        match shebang {
-            Some(shebang) => Some(content_hash(&format!("shebang:{shebang}\n{structural}"))),
-            None => Some(structural),
-        }
+        cache::get_or_structural_hash("code", file_path, content, || {
+            let config = language_config_for_content(content, file_path)?;
+            let tree = parse_tree(config, content)?;
+            let shebang = shebang_line(content);
+            if shebang.is_none() && !has_non_comment_content(tree.root_node(), content.as_bytes()) {
+                return Some(String::new());
+            }
+            let structural = structural_hash(tree.root_node(), content.as_bytes());
+            match shebang {
+                Some(shebang) => Some(content_hash(&format!("shebang:{shebang}\n{structural}"))),
+                None => Some(structural),
+            }
+        })
     }
 }
 

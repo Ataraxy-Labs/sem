@@ -232,6 +232,15 @@ impl ParserRegistry {
         }
     }
 
+    /// Repo-level language overrides collected from `.semrc` and
+    /// `.gitattributes`: custom extension → canonical extension (`".mypy"` →
+    /// `".py"`). Exposed so resolution paths that re-parse files from disk
+    /// without a registry in hand can pick the same grammar this registry
+    /// would have — see `scope_resolve::reparse_language_config`.
+    pub fn ext_overrides(&self) -> &HashMap<String, String> {
+        &self.custom_ext_canonical
+    }
+
     /// Resolve custom extension mappings in a file path.
     /// E.g. if `.mypy` is mapped to `python` (canonical `.py`),
     /// `"utils.mypy"` becomes `"utils.py"`.

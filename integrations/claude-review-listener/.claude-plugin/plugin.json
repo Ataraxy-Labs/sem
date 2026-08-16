@@ -1,0 +1,5 @@
+{
+  "name": "sem-review-listener",
+  "description": "Turns this Claude session into a sem review listener",
+  "version": "0.1.0"
+}

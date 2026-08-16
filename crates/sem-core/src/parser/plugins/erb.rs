@@ -45,6 +45,8 @@ impl SemanticParserPlugin for ErbParserPlugin {
             content: content.to_string(),
             content_hash: content_hash(content),
             structural_hash: None,
+
+            kappa: None,
             start_line: 1,
             end_line: lines.len(),
             start_byte: None,
@@ -82,6 +84,8 @@ impl SemanticParserPlugin for ErbParserPlugin {
                             content: block_content.clone(),
                             content_hash: content_hash(&block_content),
                             structural_hash: None,
+
+                            kappa: None,
                             start_line: opener.start_line,
                             end_line: tag.end_line,
                             start_byte: None,
@@ -102,6 +106,8 @@ impl SemanticParserPlugin for ErbParserPlugin {
                         content: expr_content.clone(),
                         content_hash: content_hash(&expr_content),
                         structural_hash: None,
+
+                        kappa: None,
                         start_line: tag.start_line,
                         end_line: tag.end_line,
                         start_byte: None,

@@ -68,6 +68,22 @@ impl Timings {
         self.counters.push(TimingCounter { name, value });
     }
 
+    /// Record a phase duration computed elsewhere (e.g. summed from atomic
+    /// accumulators across a parallel pass), instead of measuring wall-clock
+    /// time since the last [`mark`](Self::mark). Does not touch `self.last`,
+    /// so it never perturbs the wall-clock deltas subsequent `mark` calls
+    /// report — safe to interleave freely with `mark`.
+    pub fn record(&mut self, name: &'static str, duration_ms: f64) {
+        if !self.enabled {
+            return;
+        }
+        self.entries.push(TimingEntry { name, duration_ms });
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn finish(&self) {
         if !self.enabled {
             return;

@@ -6,12 +6,14 @@ pub mod diff;
 pub mod entities;
 pub mod files;
 pub mod graph;
+pub mod grep;
 pub mod hook;
 pub mod impact;
 pub mod log;
+pub mod query;
 pub mod repos;
+pub(crate) mod review;
 pub mod setup;
-pub mod sidecar;
 pub mod stats;
 
 #[cfg(feature = "self-update")]
@@ -154,9 +156,7 @@ pub fn entity_matches_qualified(
     }
     // Accept both `Parent.child` and `Parent::child` — agents reach for
     // whichever qualifier their working language uses.
-    let split = query
-        .rsplit_once("::")
-        .or_else(|| query.rsplit_once('.'));
+    let split = query.rsplit_once("::").or_else(|| query.rsplit_once('.'));
     if let Some((parent_part, child_part)) = split {
         if entity.name == child_part {
             if let Some(pid) = &entity.parent_id {

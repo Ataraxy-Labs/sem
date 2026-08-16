@@ -127,6 +127,8 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
                     .map(|parent_index| section_ids[parent_index].clone()),
                 content_hash: content_hash(&section_content),
                 structural_hash: None,
+
+                kappa: None,
                 content: section_content,
                 start_line: section.start_line,
                 end_line: section.start_line + section.lines.len() - 1,

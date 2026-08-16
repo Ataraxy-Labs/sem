@@ -311,7 +311,7 @@ fn impact_deps_no_cache_uses_direct_dependency_graph() {
 }
 
 #[test]
-fn impact_deps_uses_cached_sql_topology_query_on_second_run() {
+fn impact_deps_answers_from_the_index_on_the_second_run() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -342,19 +342,14 @@ fn impact_deps_uses_cached_sql_topology_query_on_second_run() {
     assert_eq!(json["dependencies"][0]["name"], "source");
 
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
-    assert!(!phases
-        .iter()
-        .any(|phase| phase == "cache_source_files_load"));
+    assert!(phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(!phases.iter().any(|phase| phase == "file_discovery"));
     assert!(!phases.iter().any(|phase| phase == "cache_topology_load"));
     assert!(!phases.iter().any(|phase| phase == "full_graph_build"));
 }
 
 #[test]
-fn impact_deps_uses_cached_sql_when_unrelated_file_changes() {
+fn impact_deps_answers_from_the_index_when_an_unrelated_file_changes() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -390,18 +385,13 @@ fn impact_deps_uses_cached_sql_when_unrelated_file_changes() {
     assert_eq!(json["dependencies"][0]["name"], "source");
 
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
-    assert!(!phases
-        .iter()
-        .any(|phase| phase == "cache_source_files_load"));
+    assert!(phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(!phases.iter().any(|phase| phase == "file_discovery"));
     assert!(!phases.iter().any(|phase| phase == "full_graph_build"));
 }
 
 #[test]
-fn impact_deps_misses_cached_sql_when_imported_file_changes() {
+fn impact_deps_declines_the_index_when_an_imported_file_changes() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -433,16 +423,12 @@ fn impact_deps_misses_cached_sql_when_imported_file_changes() {
     );
 
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_miss"));
-    assert!(!phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+    assert!(phases.iter().any(|phase| phase == "file_discovery"));
+    assert!(!phases.iter().any(|phase| phase == "index_impact_deps"));
 }
 
 #[test]
-fn impact_deps_misses_cached_sql_when_new_import_target_appears() {
+fn impact_deps_index_fast_path_folds_in_a_new_import_target() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_missing_import_target_repo(repo.path());
@@ -474,17 +460,129 @@ fn impact_deps_misses_cached_sql_when_new_import_target_appears() {
         "impact deps after import target appears",
     );
 
+    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
+    // QUERY-INDEX.md §12.3/§13.5). `b.ts`'s ref to `./optional` was
+    // unresolved at the last index build (no entity to point at yet), so
+    // `refs_of` never carried the edge and no *known* file's staleness
+    // check could catch it. The membership sweep now sees `optional.ts` as
+    // a brand-new file and declines the fast path — same "any new file →
+    // decline to cold rebuild" mechanism `find`/`callers`/`refs` already use
+    // (QUERY-INDEX.md §13.2) — so the legacy (always-correct) path runs.
+    //
+    // `import './optional';` is a bare **side-effect** import: it binds no
+    // name, so neither tier records a symbol-level `EntityRef` for it (the
+    // graph model has no representation for "depends on a whole module with
+    // no named symbol" — the same disclosed, out-of-scope gap
+    // `impact_deps_index_fast_path_does_not_notice_a_side_effect_import_change`
+    // pins). The dependency list is therefore `[]` either way; what this
+    // test actually proves is that the fast path stops *asserting* freshness
+    // it cannot prove and instead matches the authoritative answer exactly
+    // (`SEM_NO_INDEX=1` gives the same `[]` — verified below), rather than
+    // silently trusting a CSR that predates `optional.ts`'s existence.
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_miss"));
+    assert!(!phases.iter().any(|phase| phase == "index_impact_deps"));
+    assert!(phases.iter().any(|phase| phase == "file_discovery"));
+
+    let authoritative = assert_success(
+        Command::new(env!("CARGO_BIN_EXE_sem"))
+            .current_dir(repo.path())
+            .env("SEM_CACHE_DIR", cache.path())
+            .env("SEM_NO_INDEX", "1")
+            .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
+            .output()
+            .unwrap(),
+        "authoritative impact deps after import target appears",
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let authoritative_json: serde_json::Value =
+        serde_json::from_slice(&authoritative.stdout).unwrap();
+    assert_eq!(
+        json, authoritative_json,
+        "declined fast path must match the authoritative answer byte-for-byte"
+    );
+    assert_eq!(
+        json["dependencies"].as_array().unwrap().len(),
+        0,
+        "a bare side-effect import binds no name, so both tiers agree on no dependencies"
+    );
+}
+
+/// The bead's exact repro (semx-dev), mirrored to the direction its own
+/// wording names: "new file imports existing entity → dependents answer
+/// includes it". `try_index_impact_dependents` has the same structural gap
+/// `try_index_impact_deps` had — a brand-new file that calls an
+/// already-indexed entity is a new edge `callers_of` cannot carry, and no
+/// *known* file's staleness check can catch a file that didn't exist at the
+/// last build.
+#[test]
+fn impact_dependents_index_fast_path_folds_in_a_new_caller_file() {
+    let repo = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    init_repo(repo.path());
+
+    assert_success(
+        Command::new(env!("CARGO_BIN_EXE_sem"))
+            .current_dir(repo.path())
+            .env("SEM_CACHE_DIR", cache.path())
+            .args([
+                "impact",
+                "source",
+                "--file",
+                "a.ts",
+                "--dependents",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+        "warm impact cache",
+    );
+
+    // A brand-new file that imports and calls the already-indexed `source`.
+    fs::write(
+        repo.path().join("newcaller.ts"),
+        "import { source } from './a';\nexport function useSource() { return source(); }\n",
+    )
+    .unwrap();
+
+    let output = assert_success(
+        Command::new(env!("CARGO_BIN_EXE_sem"))
+            .current_dir(repo.path())
+            .env("SEM_CACHE_DIR", cache.path())
+            .env("SEM_TIMINGS", "json")
+            .args([
+                "impact",
+                "source",
+                "--file",
+                "a.ts",
+                "--dependents",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+        "impact dependents after new caller file appears",
+    );
+
+    let phases = phase_names(&output);
     assert!(!phases
         .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+        .any(|phase| phase == "index_impact_dependents"));
+    assert!(phases.iter().any(|phase| phase == "file_discovery"));
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dependents: Vec<&str> = json["dependents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        dependents.contains(&"useSource"),
+        "the new caller file's entity must appear in source's dependents, got {json}"
+    );
 }
 
 #[test]
-fn impact_deps_misses_cached_sql_when_default_reexport_target_appears() {
+fn impact_deps_index_fast_path_folds_in_a_new_default_reexport_target() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_default_reexport_missing_target_repo(repo.path());
@@ -530,21 +628,31 @@ fn impact_deps_misses_cached_sql_when_default_reexport_target_appears() {
         "impact deps after default re-export target appears",
     );
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["dependencies"][0]["name"], "publicTarget");
-    assert_eq!(json["dependencies"][0]["file"], "target.ts");
-
+    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
+    // QUERY-INDEX.md §12.3/§13.5). Same repair as
+    // `impact_deps_index_fast_path_folds_in_a_new_import_target`: the
+    // membership sweep sees the new target file and declines the fast path,
+    // so the legacy path re-resolves the import fresh.
     let phases = phase_names(&output);
-    assert!(phases
+    assert!(!phases.iter().any(|phase| phase == "index_impact_deps"));
+    assert!(phases.iter().any(|phase| phase == "file_discovery"));
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let deps: Vec<&str> = json["dependencies"]
+        .as_array()
+        .unwrap()
         .iter()
-        .any(|phase| phase == "cache_topology_impact_miss"));
-    assert!(!phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        deps,
+        vec!["publicTarget"],
+        "the new import target must appear in dependencies, got {json}"
+    );
 }
 
 #[test]
-fn impact_deps_misses_cached_sql_when_new_bare_import_target_appears() {
+fn impact_deps_index_fast_path_folds_in_a_new_bare_import_target() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_bare_import_target_repo(repo.path());
@@ -576,18 +684,31 @@ fn impact_deps_misses_cached_sql_when_new_bare_import_target_appears() {
         "impact deps after bare import target appears",
     );
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["dependencies"][0]["name"], "source");
-
+    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
+    // QUERY-INDEX.md §12.3/§13.5). Same repair as
+    // `impact_deps_index_fast_path_folds_in_a_new_import_target`: the
+    // membership sweep sees the new target file and declines the fast path,
+    // so the legacy path re-resolves the import fresh.
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_miss"));
+    assert!(!phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(phases.iter().any(|phase| phase == "file_discovery"));
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let deps: Vec<&str> = json["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        deps,
+        vec!["source"],
+        "the new import target must appear in dependencies, got {json}"
+    );
 }
 
 #[test]
-fn impact_deps_misses_cached_sql_when_new_python_import_target_appears() {
+fn impact_deps_index_fast_path_folds_in_a_new_python_import_target() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_python_missing_import_target_repo(repo.path());
@@ -619,18 +740,31 @@ fn impact_deps_misses_cached_sql_when_new_python_import_target_appears() {
         "impact deps after python import target appears",
     );
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["dependencies"][0]["name"], "source");
-
+    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
+    // QUERY-INDEX.md §12.3/§13.5). Same repair as
+    // `impact_deps_index_fast_path_folds_in_a_new_import_target`: the
+    // membership sweep sees the new target file and declines the fast path,
+    // so the legacy path re-resolves the import fresh.
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_miss"));
+    assert!(!phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(phases.iter().any(|phase| phase == "file_discovery"));
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let deps: Vec<&str> = json["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        deps,
+        vec!["source"],
+        "the new import target must appear in dependencies, got {json}"
+    );
 }
 
 #[test]
-fn impact_deps_does_not_use_cached_sql_outside_file_ext_scope() {
+fn impact_deps_declines_the_index_outside_file_ext_scope() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -667,7 +801,7 @@ fn impact_deps_does_not_use_cached_sql_outside_file_ext_scope() {
 }
 
 #[test]
-fn impact_deps_does_not_use_cached_sql_after_semignore_excludes_target() {
+fn impact_deps_declines_the_index_after_semignore_excludes_target() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -731,7 +865,7 @@ fn impact_deps_does_not_use_cache_first_for_unscoped_name_query() {
 }
 
 #[test]
-fn impact_deps_uses_cached_sql_when_unrelated_source_file_is_deleted() {
+fn impact_deps_answers_from_the_index_when_an_unrelated_source_file_is_deleted() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -760,14 +894,12 @@ fn impact_deps_uses_cached_sql_when_unrelated_source_file_is_deleted() {
     );
 
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+    assert!(phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(!phases.iter().any(|phase| phase == "file_discovery"));
 }
 
 #[test]
-fn impact_deps_uses_cached_sql_when_unrelated_skip_worktree_source_file_is_missing() {
+fn impact_deps_answers_from_the_index_when_an_unrelated_skip_worktree_file_is_missing() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -797,15 +929,13 @@ fn impact_deps_uses_cached_sql_when_unrelated_skip_worktree_source_file_is_missi
     );
 
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+    assert!(phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(!phases.iter().any(|phase| phase == "file_discovery"));
 }
 
 #[cfg(unix)]
 #[test]
-fn impact_deps_uses_cached_sql_when_unrelated_symlink_source_target_is_missing() {
+fn impact_deps_answers_from_the_index_when_an_unrelated_symlink_target_is_missing() {
     let repo = TempDir::new().unwrap();
     let external = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
@@ -836,14 +966,12 @@ fn impact_deps_uses_cached_sql_when_unrelated_symlink_source_target_is_missing()
     );
 
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+    assert!(phases.iter().any(|phase| phase == "index_impact_deps"));
     assert!(!phases.iter().any(|phase| phase == "file_discovery"));
 }
 
 #[test]
-fn impact_deps_misses_topology_cache_when_side_effect_import_changes() {
+fn impact_deps_index_fast_path_does_not_notice_a_side_effect_import_change() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_side_effect_import_repo(repo.path());
@@ -851,6 +979,14 @@ fn impact_deps_misses_topology_cache_when_side_effect_import_changes() {
     assert_success(
         Command::new(env!("CARGO_BIN_EXE_sem"))
             .current_dir(repo.path())
+            // `SEM_BUILD_CACHE=1`: this warm-up exists to give the scaffolding
+            // below a `cache.db` to doctor. `--deps`'s cold miss is
+            // `CacheMissSavePolicy::IndexOnly` since semx-4ex and writes
+            // `index.sem` only, which is the whole point of that change — so
+            // the opt-in is what keeps this test testing what it is about
+            // (the *index* tier's freshness characterization) instead of
+            // silently becoming a test that the mirror still gets written.
+            .env("SEM_BUILD_CACHE", "1")
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -872,17 +1008,24 @@ fn impact_deps_misses_topology_cache_when_side_effect_import_changes() {
         "impact deps after side-effect import edit",
     );
 
+    // CHARACTERIZATION, not an endorsement (semx-zvq, QUERY-INDEX.md §12.3).
+    // Until this bead this test asserted the opposite, because it set
+    // `SEM_NO_INDEX=1` and so exercised the SQLite tier's import-aware
+    // freshness check (`has_fresh_dependency_impact_files`). That tier was
+    // never reached in production: `try_index_impact_deps` has run *ahead* of
+    // it since semx-gis, and it proves freshness only over the entity's own
+    // file and its known dependencies' files — a brand-new import *target*
+    // touches neither, so the index answers, with the pre-change answer.
+    // Deleting the SQLite tier did not cause this; it revealed it, and the
+    // pre-change binary reproduces it identically. Pinned here so a future
+    // repair flips the assertion deliberately rather than silently.
     let phases = phase_names(&output);
-    assert!(phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_miss"));
-    assert!(!phases
-        .iter()
-        .any(|phase| phase == "cache_topology_impact_query"));
+    assert!(phases.iter().any(|phase| phase == "index_impact_deps"));
+    assert!(!phases.iter().any(|phase| phase == "file_discovery"));
 }
 
 #[test]
-fn cached_impact_file_hint_errors_match_graph_path() {
+fn index_impact_file_hint_errors_match_graph_path() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_repo(repo.path());
@@ -920,7 +1063,7 @@ fn cached_impact_file_hint_errors_match_graph_path() {
 }
 
 #[test]
-fn impact_all_and_tests_match_no_cache_from_topology_cache() {
+fn impact_all_and_tests_match_no_cache_from_the_index() {
     let repo = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     init_topology_repo(repo.path());
@@ -971,7 +1114,7 @@ fn impact_all_and_tests_match_no_cache_from_topology_cache() {
         let phases = phase_names(&cached);
         assert!(phases
             .iter()
-            .any(|phase| phase == "cache_topology_impact_query"));
+            .any(|phase| phase == "index_impact_all" || phase == "index_impact_tests"));
         assert!(!phases.iter().any(|phase| phase == "full_graph_build"));
     }
 }

@@ -28,6 +28,8 @@ impl SemanticParserPlugin for VueParserPlugin {
                 parent_id: None,
                 content_hash: content_hash(&block.full_content),
                 structural_hash: None,
+
+                kappa: None,
                 content: block.full_content.clone(),
                 start_line: block.start_line,
                 end_line: block.end_line,

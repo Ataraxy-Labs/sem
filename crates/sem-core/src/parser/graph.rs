@@ -19,6 +19,95 @@ use regex::Regex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 
+/// One file's product from pass 1. `entities: None` means "this file was GREEN
+/// and its entities are moved out of the session's previous build" — see
+/// `BuildCarry::prev_entities`.
+struct Pass1FileProduct<'a> {
+    file_path: &'a str,
+    entities: Option<Vec<SemanticEntity>>,
+    parsed: Option<(String, String, tree_sitter::Tree)>,
+    precomputed: Option<scope_resolve::PrecomputedFileFacts>,
+    content_hash: Option<u64>,
+}
+
+/// Everything a warm rebuild carries into [`EntityGraph::build_incremental_core`]
+/// (semx-022). Absent on a cold build, in which case every stage takes its
+/// original path and the cost is one `Option` check per stage.
+pub(crate) struct BuildCarry<'a, 'i> {
+    /// Red-green state: previous fingerprints and per-file results in, this
+    /// build's fingerprints, results and GREEN sets out.
+    pub(crate) inc: &'a mut Incremental<'i>,
+    /// Files the caller declared changed, plus files new to this build. These
+    /// are re-extracted unconditionally; nothing else is even read from disk.
+    pub(crate) dirty: &'a HashSet<String>,
+    /// Every path in this build, so facts for deleted files are evicted rather
+    /// than lingering and shadowing a later re-add.
+    pub(crate) known: &'a HashSet<String>,
+    /// Files whose resolution this crate can attribute completely, and which may
+    /// therefore go GREEN at all. See [`Incremental`].
+    pub(crate) eligible: &'a HashSet<String>,
+    /// Previous build's entities, grouped by file. GREEN files' entities are
+    /// *moved* out of here into the new `all_entities` — cloning them would cost
+    /// more than the resolution the reuse saves.
+    pub(crate) prev_entities: &'a mut HashMap<String, Vec<SemanticEntity>>,
+    /// Session-owned precomputed facts, updated in place for RED files.
+    pub(crate) precomputed: &'a mut HashMap<String, scope_resolve::PrecomputedFileFacts>,
+    /// Session-owned content hashes, updated in place for re-extracted files.
+    pub(crate) content_hashes: &'a mut HashMap<String, u64>,
+    /// Filled in by the build: `(path, start, len)` spans into `all_entities`.
+    pub(crate) entity_spans: Vec<(String, usize, usize)>,
+    /// Session-owned cache of each JS/TS file's import scan + the read set its
+    /// production consulted (semx-h1s). Updated in place; see
+    /// `build_import_table_incremental`.
+    pub(crate) import_scans: &'a mut HashMap<String, CachedImportScan>,
+    /// The import table itself, maintained in place across rebuilds rather
+    /// than rebuilt whole: GREEN files' entries are left untouched, RED
+    /// files' old entries are removed and their new ones inserted (semx-h1s).
+    pub(crate) import_table: &'a mut HashMap<(String, String), String>,
+    /// Every producing file's current set of `import_table` keys, so a RED
+    /// file's stale entries can be removed in `O(that file's own key count)`
+    /// instead of a full-table scan. Covers every language, not just the
+    /// JS/TS files `import_scans` caches — a Python/Rust/Go/Clojure file is
+    /// always re-scanned, but its old keys still need removing before its new
+    /// ones go in.
+    pub(crate) import_keys: &'a mut HashMap<String, Vec<(String, String)>>,
+    /// Session-owned entity/symbol lookup tables, maintained in place across
+    /// rebuilds on the non-retain path instead of rebuilt whole every time —
+    /// semx-4an, generalizing the `import_table`/`import_keys` pattern above.
+    /// See `maintain_entity_lookups_incremental`'s doc comment.
+    pub(crate) symbol_table: &'a mut HashMap<String, Vec<String>>,
+    pub(crate) entity_map: &'a mut HashMap<String, EntityInfo>,
+    pub(crate) class_members: &'a mut HashMap<String, Vec<(String, String)>>,
+    pub(crate) owner_members: &'a mut HashMap<String, Vec<(String, String)>>,
+    pub(crate) entity_ranges: &'a mut HashMap<String, Vec<(usize, usize, String)>>,
+    /// Bag-of-words' parent → child-position index, session-owned for the same
+    /// reason and maintained by the same function. Rebuilding it whole was the
+    /// single most expensive item in the pre-bead Pass A/B bucket (~335ms of
+    /// ~575ms on the monster, flat across 1/50/500 changed files) because it
+    /// searches each child's source text inside its parent's.
+    pub(crate) child_ranges: &'a mut ChildRangeIndex,
+    /// The five corpus tables' fingerprints, session-owned so a warm rebuild
+    /// can update only the keys it touched and copy the rest forward instead
+    /// of refolding ~1M entries. Kept separate from `Incremental::cur_fp`
+    /// precisely so the tables that *are* refolded whole every build keep
+    /// their "a vanished key reads as absent" property.
+    pub(crate) corpus_fp: &'a mut crate::parser::incremental::TableFingerprints,
+    /// The running `Table::GuardPyWildcardImport` XOR fold that goes with
+    /// `corpus_fp`. XOR is its own inverse, so this is maintainable in
+    /// `O(touched entities)` — see `wildcard_guard_contribution`.
+    pub(crate) wildcard_guard: &'a mut u64,
+    /// Whether the eight fields above currently hold a *complete* reflection
+    /// of the corpus (not just of whichever files an incremental step last
+    /// touched). `false` on a brand-new session and forced back to `false`
+    /// on every `retain_parsed_files` build (which never writes these
+    /// fields at all, so anything they held becomes stale the moment a
+    /// retain-mode build changes the corpus underneath them — see
+    /// `maintain_entity_lookups_incremental`'s doc comment on why priming
+    /// must reset here, not just gate on `!retain_parsed_files` alone).
+    /// Set back to `true` the moment a whole rebuild repopulates them.
+    pub(crate) entity_lookups_primed: &'a mut bool,
+}
+
 /// A phase boundary during a full graph build, reported to an optional per-thread
 /// hook so a CLI can render a staged progress display (scan → parse → resolve).
 /// Only the CLI installs a hook; for every other caller these calls are no-ops.
@@ -67,6 +156,14 @@ pub fn clear_build_phase_hook() {
     BUILD_PHASE_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
+/// Whether `SEM_FP_PARITY=1` asked every session build to verify its
+/// incrementally maintained corpus fingerprints against a fresh whole fold.
+/// Read once per process.
+fn fp_parity_check_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SEM_FP_PARITY").as_deref() == Ok("1"))
+}
+
 fn report_build_phase(phase: BuildPhase) {
     BUILD_PHASE_HOOK.with(|h| {
         if let Some(f) = h.borrow().as_ref() {
@@ -89,43 +186,167 @@ macro_rules! maybe_par_iter {
     }};
 }
 
+/// Same as `maybe_par_iter!`, but consumes an owned `Vec<T>` by value
+/// (`into_par_iter`/`into_iter`) instead of borrowing. For loops that move
+/// fields out of each element rather than just reading them.
+macro_rules! maybe_into_par_iter {
+    ($owned:expr) => {{
+        #[cfg(feature = "parallel")]
+        {
+            $owned.into_par_iter()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            $owned.into_iter()
+        }
+    }};
+}
+
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
 use crate::parser::import_resolution::{
-    find_import_file, find_import_target, import_source_matches_file, is_js_ts_file,
-    js_ts_import_source_files_from_content, js_ts_named_exports_from_content,
-    sort_import_candidate_files, JS_TS_EXTENSIONS,
+    build_stem_index, find_import_file, find_import_target, import_file_candidates,
+    import_source_matches_file, is_js_ts_file, js_ts_import_source_files_from_content,
+    js_ts_named_exports_from_content, resolve_bare_import_stem, sort_import_candidate_files,
+    JS_TS_EXTENSIONS,
 };
+use crate::parser::incremental::{
+    content_hash, key1, CachedBowResult, Incremental, ReadSet, Recorder, Table, TableFingerprints,
+    ValueHasher,
+};
+use crate::parser::mem_profile;
 use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
+use crate::parser::resolve_profile;
 use crate::parser::scope_resolve;
 
 #[cfg(not(test))]
-const PARSED_FILE_REUSE_LIMIT: usize = 20_000;
+pub(crate) const PARSED_FILE_REUSE_LIMIT: usize = 20_000;
 #[cfg(test)]
-const PARSED_FILE_REUSE_LIMIT: usize = 8;
+pub(crate) const PARSED_FILE_REUSE_LIMIT: usize = 8;
+// semx-4w1: was 5_000, then 1_000 (a blunt, file-count-only knob — the
+// tree-cost-per-file multiplier is per-language and isn't modeled by a file
+// count at all, so a chunk that happens to contain the corpus's largest
+// files spikes memory regardless of the constant's value). semx-g6t
+// replaced the file-count knob with `chunk_files_by_byte_budget` below,
+// which bounds chunks by cumulative *source bytes* instead — see that
+// function's doc comment for why bytes are the right unit (Finding 3 in
+// RESOLUTION-PROFILE.md's "Memory attribution" section: a live
+// `tree_sitter::Tree` costs 24.5x-40x its source bytes in RSS,
+// grammar-dependent, so peak per-chunk tree memory is bounded by
+// `budget_bytes * worst-measured-multiplier` regardless of which files land
+// together, for every language, without per-language tuning).
 #[cfg(not(test))]
-const SCOPE_RESOLVE_FILE_CHUNK_SIZE: usize = 5_000;
+const SCOPE_RESOLVE_BYTE_BUDGET: u64 = 20 * 1024 * 1024;
 #[cfg(test)]
-const SCOPE_RESOLVE_FILE_CHUNK_SIZE: usize = 3;
+const SCOPE_RESOLVE_BYTE_BUDGET: u64 = 150;
 
-#[derive(Clone, Copy)]
-struct ChildRange<'a> {
-    file_path: &'a str,
+/// Partition `file_paths` (assumed already in a stable, deterministic order —
+/// every caller sorts its input) into contiguous chunks, each holding no more
+/// than `budget_bytes` of cumulative on-disk source size, except that a
+/// single file larger than `budget_bytes` always gets a singleton chunk of
+/// its own rather than being dropped or merged (see the loop body: a chunk
+/// only closes early once it already holds >=1 file). semx-g6t.
+///
+/// Deterministic and a pure function of `file_paths` and each file's size on
+/// disk (`std::fs::metadata`, not content — cheap, no read/parse; per-file
+/// stat cost is a few microseconds, tens of milliseconds total even on a
+/// 50k-file corpus): same input always produces the same partition. This
+/// matters because `chunk_index` (the position of a chunk in the returned
+/// `Vec`) feeds `ScopeIncremental::scope_tag` at this function's one caller
+/// (`resolve_scopes_in_file_chunks`) — a stable partition keeps a file's
+/// fingerprint tag stable across repeated builds of the same file list.
+///
+/// Returns `(start, end)` byte-offset-free index ranges into `file_paths`,
+/// in the same order `file_paths.chunks()` used to hand back slices —
+/// callers index `&file_paths[range]` instead of receiving slices directly,
+/// since a byte-budget partition can't be expressed as a fixed stride.
+fn chunk_files_by_byte_budget(
+    root: &Path,
+    file_paths: &[String],
+    budget_bytes: u64,
+) -> Vec<std::ops::Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut acc_bytes: u64 = 0;
+    for (i, file_path) in file_paths.iter().enumerate() {
+        let size = std::fs::metadata(root.join(file_path))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if i > start && acc_bytes + size > budget_bytes {
+            chunks.push(start..i);
+            start = i;
+            acc_bytes = 0;
+        }
+        acc_bytes += size;
+    }
+    if start < file_paths.len() {
+        chunks.push(start..file_paths.len());
+    }
+    chunks
+}
+
+/// One child entity's position inside its parent, as bag-of-words' content-span
+/// filter needs it.
+///
+/// `file_path` is an `Arc<str>` rather than a `&'a str` borrowed out of
+/// `all_entities` (semx-4an): the index below is `GraphSession`-owned and
+/// survives across rebuilds, and `all_entities` is rebuilt (GREEN-moved or
+/// RED-fresh) every build, so a borrow could not outlive it. One `Arc` is
+/// allocated per *file*, not per child, and cloning it is a refcount bump —
+/// the struct stays the same 64 bytes it was when it borrowed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChildRange {
+    file_path: Arc<str>,
     start_line: usize,
     end_line: usize,
     start_byte: Option<usize>,
     end_byte: Option<usize>,
 }
 
-fn build_child_ranges_by_parent<'a>(
-    entities: &'a [SemanticEntity],
-) -> HashMap<&'a str, Vec<ChildRange<'a>>> {
+/// parent entity id → that parent's children, ordered by
+/// [`compare_child_ranges`].
+pub(crate) type ChildRangeIndex = HashMap<String, Vec<ChildRange>>;
+
+/// The order every consumer of a [`ChildRangeIndex`] bucket assumes.
+///
+/// Total on the five fields it compares, and those five fields are the *whole*
+/// struct — so two entries that compare `Equal` are indistinguishable to every
+/// reader, which is what lets the incremental maintainer re-sort a touched
+/// bucket with `sort_unstable` and still be content-identical to a whole
+/// rebuild.
+fn compare_child_ranges(left: &ChildRange, right: &ChildRange) -> std::cmp::Ordering {
+    match (left.start_byte, right.start_byte) {
+        (Some(left_start), Some(right_start)) => left_start.cmp(&right_start),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| left.end_byte.cmp(&right.end_byte))
+    .then_with(|| left.file_path.cmp(&right.file_path))
+    .then_with(|| left.start_line.cmp(&right.start_line))
+    .then_with(|| left.end_line.cmp(&right.end_line))
+}
+
+/// One file's contribution to the child-range index: `(parent id, range)` pairs.
+///
+/// Computed from that file's own entities alone. A `parent_id` that names an
+/// entity in a *different* file (only `resolve_go_method_parent_ids` produces
+/// one) is not found in the file-local `entity_by_id` here and yields
+/// `(None, None)` byte offsets — which is exactly what the whole-corpus build
+/// produces for it too, since `child_content_span_in_parent` bails out on a
+/// `file_path` mismatch. That equality is what makes per-file removal and
+/// re-insertion reproduce a whole rebuild's index exactly.
+fn child_ranges_for_file(entities: &[SemanticEntity]) -> Vec<(&str, ChildRange)> {
+    if entities.is_empty() {
+        return Vec::new();
+    }
     let entity_by_id: HashMap<&str, &SemanticEntity> = entities
         .iter()
         .map(|entity| (entity.id.as_str(), entity))
         .collect();
-    let mut line_starts_by_parent: HashMap<&'a str, Vec<usize>> = HashMap::default();
-    let mut child_ranges_by_parent: HashMap<&'a str, Vec<ChildRange<'a>>> = HashMap::default();
+    let mut line_starts_by_parent: HashMap<&str, Vec<usize>> = HashMap::default();
+    let mut file_path_arc: Option<Arc<str>> = None;
+    let mut out = Vec::new();
 
     for child in entities {
         let Some(parent_id) = child.parent_id.as_deref() else {
@@ -141,31 +362,81 @@ fn build_child_ranges_by_parent<'a>(
             })
             .map_or((None, None), |(start, end)| (Some(start), Some(end)));
 
-        child_ranges_by_parent
-            .entry(parent_id)
-            .or_default()
-            .push(ChildRange {
-                file_path: child.file_path.as_str(),
+        // Every entity in one file shares one `file_path`, so one `Arc` per
+        // file is enough; the `is_some_and` guard keeps that true even for the
+        // (never observed, but not structurally forbidden) case of a slice
+        // spanning two paths.
+        let file_path = match &file_path_arc {
+            Some(arc) if &**arc == child.file_path.as_str() => Arc::clone(arc),
+            _ => {
+                let arc: Arc<str> = Arc::from(child.file_path.as_str());
+                file_path_arc = Some(Arc::clone(&arc));
+                arc
+            }
+        };
+        out.push((
+            parent_id,
+            ChildRange {
+                file_path,
                 start_line: child.start_line,
                 end_line: child.end_line,
                 start_byte,
                 end_byte,
-            });
+            },
+        ));
+    }
+    out
+}
+
+fn build_child_ranges_by_parent(entities: &[SemanticEntity]) -> ChildRangeIndex {
+    let entity_by_id: HashMap<&str, &SemanticEntity> = entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect();
+    let mut line_starts_by_parent: HashMap<&str, Vec<usize>> = HashMap::default();
+    let mut file_path_arcs: HashMap<&str, Arc<str>> = HashMap::default();
+    let mut child_ranges_by_parent: ChildRangeIndex = HashMap::default();
+
+    for child in entities {
+        let Some(parent_id) = child.parent_id.as_deref() else {
+            continue;
+        };
+        let (start_byte, end_byte) = entity_by_id
+            .get(parent_id)
+            .and_then(|parent| {
+                let parent_line_starts = line_starts_by_parent
+                    .entry(parent_id)
+                    .or_insert_with(|| line_start_offsets(&parent.content));
+                child_content_span_in_parent(parent, child, parent_line_starts)
+            })
+            .map_or((None, None), |(start, end)| (Some(start), Some(end)));
+
+        let file_path = match file_path_arcs.get(child.file_path.as_str()) {
+            Some(arc) => Arc::clone(arc),
+            None => {
+                let arc: Arc<str> = Arc::from(child.file_path.as_str());
+                file_path_arcs.insert(child.file_path.as_str(), Arc::clone(&arc));
+                arc
+            }
+        };
+        let range = ChildRange {
+            file_path,
+            start_line: child.start_line,
+            end_line: child.end_line,
+            start_byte,
+            end_byte,
+        };
+        // `to_string` only on a genuinely new key, not once per child.
+        match child_ranges_by_parent.get_mut(parent_id) {
+            Some(bucket) => bucket.push(range),
+            None => {
+                child_ranges_by_parent.insert(parent_id.to_string(), vec![range]);
+            }
+        }
     }
 
     for child_ranges in child_ranges_by_parent.values_mut() {
-        child_ranges.sort_unstable_by(|left, right| {
-            match (left.start_byte, right.start_byte) {
-                (Some(left_start), Some(right_start)) => left_start.cmp(&right_start),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-            .then_with(|| left.end_byte.cmp(&right.end_byte))
-            .then_with(|| left.file_path.cmp(right.file_path))
-            .then_with(|| left.start_line.cmp(&right.start_line))
-            .then_with(|| left.end_line.cmp(&right.end_line))
-        });
+        child_ranges.sort_unstable_by(compare_child_ranges);
     }
 
     child_ranges_by_parent
@@ -254,14 +525,14 @@ fn entity_owns_content_span(
     source_line: usize,
     local_start_byte: Option<usize>,
     local_end_byte: Option<usize>,
-    child_ranges_by_parent: &HashMap<&str, Vec<ChildRange<'_>>>,
+    child_ranges_by_parent: &ChildRangeIndex,
 ) -> bool {
     let Some(child_ranges) = child_ranges_by_parent.get(entity_id) else {
         return true;
     };
 
-    let child_has_source_line = |child: &ChildRange<'_>| {
-        child.file_path == file_path
+    let child_has_source_line = |child: &ChildRange| {
+        &*child.file_path == file_path
             && source_line >= child.start_line
             && source_line <= child.end_line
     };
@@ -300,7 +571,7 @@ fn source_line_for_entity_content(entity: &SemanticEntity, local_line: usize) ->
 
 fn entity_requires_content_span_filter(
     entity: &SemanticEntity,
-    child_ranges_by_parent: &HashMap<&str, Vec<ChildRange<'_>>>,
+    child_ranges_by_parent: &ChildRangeIndex,
 ) -> bool {
     entity.start_line == entity.end_line
         || child_ranges_by_parent
@@ -359,10 +630,56 @@ pub struct EntityGraph {
     pub entities: EntityInfoMap,
     /// Edges: from_entity → [(to_entity, ref_type)]
     pub edges: Vec<EntityRef>,
-    /// Reverse index: entity_id → entities that reference it
-    pub dependents: EntityAdjacencyMap,
-    /// Forward index: entity_id → entities it references
-    pub dependencies: EntityAdjacencyMap,
+    /// The two adjacency maps, derived from `edges` **on first demand**
+    /// (semx-ws6, audit D7). Every cold `sem graph` build used to
+    /// materialize them eagerly — four id-String clones per edge — and then
+    /// never read them: the index writer builds REFS directly from `edges`,
+    /// and every warm `impact`/`context` answer comes from `index.sem`'s CSR
+    /// postings. The only real readers (the cold-build fallback of
+    /// `sem impact`/`sem context`/`sem callers`, and the in-place
+    /// incremental-update path) go through [`Self::dependents`] /
+    /// [`Self::dependencies`], which build once, lazily. Laziness, not
+    /// deletion: derived content and bucket order are exactly what the eager
+    /// loop produced, because that loop was itself a mirror of `edges`.
+    adjacency: std::sync::OnceLock<EdgeAdjacency>,
+}
+
+/// The pair [`EntityGraph::adjacency`] materializes: `entity_id -> referencing
+/// ids` (dependents) and `entity_id -> referenced ids` (dependencies), in
+/// `edges` order — the same content and order the pre-D7 eager loop built.
+#[derive(Debug, Default)]
+struct EdgeAdjacency {
+    dependents: EntityAdjacencyMap,
+    dependencies: EntityAdjacencyMap,
+}
+
+impl EdgeAdjacency {
+    fn derive(edges: &[EntityRef]) -> Self {
+        // One key per distinct endpoint; sized to the edge count up front to
+        // avoid incremental rehashing (justified-keep #3, unchanged shape).
+        let mut dependents: EntityAdjacencyMap =
+            EntityAdjacencyMap::with_capacity_and_hasher(edges.len(), Default::default());
+        let mut dependencies: EntityAdjacencyMap =
+            EntityAdjacencyMap::with_capacity_and_hasher(edges.len(), Default::default());
+        for edge in edges {
+            match dependents.get_mut(edge.to_entity.as_str()) {
+                Some(bucket) => bucket.push(edge.from_entity.clone()),
+                None => {
+                    dependents.insert(edge.to_entity.clone(), vec![edge.from_entity.clone()]);
+                }
+            }
+            match dependencies.get_mut(edge.from_entity.as_str()) {
+                Some(bucket) => bucket.push(edge.to_entity.clone()),
+                None => {
+                    dependencies.insert(edge.from_entity.clone(), vec![edge.to_entity.clone()]);
+                }
+            }
+        }
+        EdgeAdjacency {
+            dependents,
+            dependencies,
+        }
+    }
 }
 
 /// Metadata describing repairs made during an incremental graph build.
@@ -399,32 +716,164 @@ fn sort_symbol_table_targets_by_source(
     entity_map: &HashMap<String, EntityInfo>,
 ) {
     for target_ids in symbol_table.values_mut() {
-        if target_ids.len() > 1 {
-            target_ids.sort_unstable_by(|left, right| {
-                match (entity_map.get(left), entity_map.get(right)) {
-                    (Some(left), Some(right)) => (
-                        left.file_path.as_str(),
-                        left.start_line,
-                        left.end_line,
-                        left.id.as_str(),
-                    )
-                        .cmp(&(
-                            right.file_path.as_str(),
-                            right.start_line,
-                            right.end_line,
-                            right.id.as_str(),
-                        )),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => left.cmp(right),
-                }
-            });
-        }
+        sort_one_symbol_table_bucket(target_ids, entity_map);
+    }
+}
+
+/// Same tie-break as [`sort_symbol_table_targets_by_source`], factored out to
+/// a single bucket so semx-4an's incremental maintenance can re-sort just the
+/// name(s) a rebuild actually touched instead of the whole table. A bucket
+/// that was already sorted and only had elements *removed* stays sorted
+/// (removal preserves relative order) — this only needs calling after an
+/// *insertion* touches a bucket.
+/// Compare two bucket entries by their source position, given each one's
+/// already-resolved `EntityInfo` (or `None` when the id is not in
+/// `entity_map`). Split out so the two sorters below can *decorate* each
+/// element with one map lookup instead of paying two per comparison —
+/// `n log n` lookups become `n` (semx-4an; the monster's hottest symbol-table
+/// bucket holds ~10.5k ids, i.e. ~280k lookups collapsing to ~10k), with the
+/// resulting order unchanged because the key each comparison uses is
+/// unchanged.
+fn compare_by_source_position(
+    left: (Option<&EntityInfo>, &str),
+    right: (Option<&EntityInfo>, &str),
+) -> std::cmp::Ordering {
+    match (left.0, right.0) {
+        (Some(l), Some(r)) => (
+            l.file_path.as_str(),
+            l.start_line,
+            l.end_line,
+            l.id.as_str(),
+        )
+            .cmp(&(
+                r.file_path.as_str(),
+                r.start_line,
+                r.end_line,
+                r.id.as_str(),
+            )),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.1.cmp(right.1),
+    }
+}
+
+fn sort_one_symbol_table_bucket(
+    target_ids: &mut Vec<String>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    if target_ids.len() < 2 {
+        return;
+    }
+    let mut decorated: Vec<(Option<&EntityInfo>, String)> = std::mem::take(target_ids)
+        .into_iter()
+        .map(|id| (entity_map.get(&id), id))
+        .collect();
+    decorated.sort_unstable_by(|left, right| {
+        compare_by_source_position((left.0, left.1.as_str()), (right.0, right.1.as_str()))
+    });
+    target_ids.extend(decorated.into_iter().map(|(_, id)| id));
+}
+
+/// Same tie-break key as [`sort_one_symbol_table_bucket`] (`file_path`,
+/// `start_line`, `end_line`, `id`), applied to a `class_members`/
+/// `owner_members` bucket's `(member_name, member_id)` pairs by their id.
+///
+/// `resolve_ref`'s `select_member_candidate` picks the *first* entry in a
+/// `class_members[owner]` bucket matching a method name
+/// (`candidates.first()` over `members.iter().filter_map(...)`) — so bucket
+/// order is not cosmetic, it decides which of several same-named members
+/// wins when a bucket holds more than one candidate (overloads, or two
+/// unrelated types sharing an owner name in different files). A whole
+/// rebuild never sorts these buckets explicitly; their order falls out of
+/// iterating `all_entities` in `file_paths`' given order — which in every
+/// caller in this crate (and every corpus/fixture this bead validated
+/// against) is itself sorted by `file_path`, making this tie-break exactly
+/// reproduce that order. `maintain_entity_lookups_incremental` cannot reuse
+/// "just iterate all_entities" (it only sees the touched files' entities,
+/// not the whole corpus in file order), so it reconstructs the same order
+/// explicitly instead — this function is that reconstruction.
+fn sort_members_bucket_by_source(
+    members: &mut Vec<(String, String)>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    if members.len() < 2 {
+        return;
+    }
+    // Stable, exactly as before: the previous spelling used `sort_by` (stable),
+    // and its `(None, None)` arm compared the whole `(name, id)` pair, which
+    // the decorated form reproduces by carrying the pair itself as the
+    // fallback key.
+    let mut decorated: Vec<(Option<&EntityInfo>, (String, String))> = std::mem::take(members)
+        .into_iter()
+        .map(|pair| (entity_map.get(&pair.1), pair))
+        .collect();
+    decorated.sort_by(|left, right| match (left.0, right.0) {
+        (Some(l), Some(r)) => (
+            l.file_path.as_str(),
+            l.start_line,
+            l.end_line,
+            l.id.as_str(),
+        )
+            .cmp(&(
+                r.file_path.as_str(),
+                r.start_line,
+                r.end_line,
+                r.id.as_str(),
+            )),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.1.cmp(&right.1),
+    });
+    members.extend(decorated.into_iter().map(|(_, pair)| pair));
+}
+
+/// semx-yk5: apply [`sort_members_bucket_by_source`]'s canonical
+/// `(file_path, start_line, end_line, id)` tie-break to every bucket in a
+/// `class_members`/`owner_members`-shaped map, for `PreBuiltLookups`
+/// construction sites that (unlike `maintain_entity_lookups_incremental`'s
+/// phase 3, which already called `sort_members_bucket_by_source` per touched
+/// bucket) previously left these buckets in `all_entities` iteration order —
+/// or, at one site, sorted them with a different key entirely
+/// (lexicographic `(member_name, member_id)`, `Vec<(String, String)>`'s
+/// derived `Ord`). Both were *usually* order-equivalent to this canonical
+/// sort (iteration order coincides with it whenever `file_paths` is itself
+/// file-path-sorted, which every caller in this crate already ensures) but
+/// neither was a *stated*, enforced invariant — see RESOLUTION-PROFILE.md's
+/// "Resolver tie-break contract" section for the measured effect of making
+/// it one.
+fn sort_all_member_buckets_by_source(
+    buckets: &mut HashMap<String, Vec<(String, String)>>,
+    entity_map: &HashMap<String, EntityInfo>,
+) {
+    for members in buckets.values_mut() {
+        sort_members_bucket_by_source(members, entity_map);
+    }
+}
+
+/// semx-yk5: apply the same `(start_line, end_line, id)` source-position
+/// tie-break `maintain_entity_lookups_incremental`'s phase 2
+/// (`ranges.sort_unstable()`, graph.rs) already applies per touched file, to
+/// every bucket in an `entity_ranges`-shaped map. `file_path` is not part of
+/// the tuple because the map is already keyed by file path — every bucket
+/// holds exactly one file's entities, so `(start_line, end_line, id)` alone
+/// is the same key restricted to that file. This is also, precisely, the
+/// order `build_scopes_from_ast`'s top-level-`defs` population iterates
+/// (`resolve_with_scopes_full_inner`'s `entity_ranges.get(file_path)` loop
+/// inserting into `scopes[0].defs` by name) — so making every construction
+/// site sort this table the same way is also what makes "module-scope defs:
+/// same top-level name declared twice in one file" a *stated* rule (last in
+/// this sorted order wins) instead of an unstated by-product of whichever
+/// order entities happened to be discovered in.
+fn sort_all_entity_ranges_by_source(
+    ranges_by_file: &mut HashMap<String, Vec<(usize, usize, String)>>,
+) {
+    for ranges in ranges_by_file.values_mut() {
+        ranges.sort_unstable();
     }
 }
 
 fn dedupe_resolved_edges(
-    combined: Vec<(String, String, RefType)>,
+    mut combined: Vec<(String, String, RefType)>,
 ) -> Vec<(String, String, RefType)> {
     let mut keep = vec![false; combined.len()];
     let mut seen_edges: HashSet<(&str, &str)> =
@@ -436,14 +885,35 @@ fn dedupe_resolved_edges(
     }
     drop(seen_edges);
 
+    // In-place survivor compaction (semx-ws6, audit D8): the `drop` above
+    // already released the `&str` borrows, so `combined` can be mutated —
+    // the old `into_iter().filter_map().collect()` built a whole second
+    // edge vector (both live at the `collect`, a transient ~150-200 MB at
+    // linux scale) to drop a handful of elements. `Vec::retain` preserves
+    // first-occurrence order, so which `RefType` survives is unchanged.
+    let mut index = 0;
+    combined.retain(|_| {
+        let keep_this = keep[index];
+        index += 1;
+        keep_this
+    });
     combined
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, edge)| keep[index].then_some(edge))
-        .collect()
 }
 
 fn sort_resolved_refs(refs: &mut [(String, String, RefType)]) {
+    // `par_sort_by`, not `par_sort_unstable_by`: rayon's stable parallel sort
+    // has the same order semantics as the `sort_by` this replaces, element for
+    // element, so nothing downstream can tell the difference — only the wall
+    // time changes (semx-4an; ~196k edges, whole-graph, redone every build
+    // however few files were RED).
+    #[cfg(feature = "parallel")]
+    refs.par_sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| ref_type_sort_key(&left.2).cmp(&ref_type_sort_key(&right.2)))
+    });
+    #[cfg(not(feature = "parallel"))]
     refs.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -790,12 +1260,68 @@ fn build_imports_by_file<'a>(
     imports_by_file
 }
 
-struct ReferenceResolutionContext<'a> {
+type SymbolTableByFile<'a> = HashMap<&'a str, HashMap<&'a str, Vec<&'a str>>>;
+
+/// Pre-bucket every `symbol_table` candidate list by the file each candidate
+/// id belongs to (semx-h19). Built once per build, over the same
+/// `symbol_table` + `entity_map` data the O(candidates) scan it replaces
+/// already reads — see `resolve_entity_references`'s `context
+/// .symbol_table_by_file.get(ref_name)` call site, the bag-of-words
+/// candidate-scan hot path this eliminates (measured: `ref_match_ns`, the
+/// single largest true "linear scan over a shared candidate list" cost in
+/// the bag-of-words resolver, ~1.48s of aggregate CPU time on the TypeScript
+/// monster corpus — see `RESOLUTION-PROFILE.md`).
+///
+/// **Why this is a pure work-elimination, not a behavior change.** The scan
+/// it replaces was `target_ids.iter().find(|id| *id != &entity.id &&
+/// entity_map[id].file_path == entity.file_path)` — a linear walk over
+/// *every* candidate for a name, corpus-wide, that only ever accepts a
+/// candidate from the resolving entity's own file. Every candidate outside
+/// that file was already structurally ineligible; the scan's only job was to
+/// skip past them to find the first eligible one (or conclude there is
+/// none). Grouping by file does not change *which* candidate wins: within a
+/// file, `symbol_table`'s existing sort discipline
+/// (`sort_symbol_table_targets_by_source`: `(file_path, start_line, end_line,
+/// id)` — semx-6rd) means every file's candidates already form a contiguous,
+/// internally-ordered run in the source `Vec`; splitting that `Vec` into
+/// per-file buckets preserves each bucket's relative order exactly, so
+/// `bucket.iter().find(|id| *id != &entity.id)` returns the identical id the
+/// original whole-list scan would have. The read-set recorded at the call
+/// site (`Table::SymbolTable`, keyed by name only, not by file) is
+/// unchanged, so red-green invalidation is unaffected: this only changes how
+/// the answer is *computed*, not what a later edit invalidates.
+fn build_symbol_table_by_file<'a>(
     symbol_table: &'a HashMap<String, Vec<String>>,
     entity_map: &'a HashMap<String, EntityInfo>,
+) -> SymbolTableByFile<'a> {
+    maybe_par_iter!(symbol_table)
+        .map(|(name, ids)| {
+            let mut by_file: HashMap<&'a str, Vec<&'a str>> = HashMap::default();
+            for id in ids {
+                if let Some(info) = entity_map.get(id) {
+                    by_file
+                        .entry(info.file_path.as_str())
+                        .or_default()
+                        .push(id.as_str());
+                }
+            }
+            (name.as_str(), by_file)
+        })
+        .collect()
+}
+
+struct ReferenceResolutionContext<'a> {
+    // semx-h19: `symbol_table`'s per-name candidate list, pre-bucketed by
+    // file path (see `build_symbol_table_by_file`) so the bag-of-words
+    // global-ref match in `resolve_entity_references` is O(candidates in
+    // the resolving entity's own file) instead of O(all candidates for that
+    // name in the whole corpus) — the only file whose candidates were ever
+    // eligible answers, per the `.find(|id| … file_path == entity.file_path)`
+    // filter the scan already applied.
+    symbol_table_by_file: &'a HashMap<&'a str, HashMap<&'a str, Vec<&'a str>>>,
     imports_by_file: &'a ImportsByFile<'a>,
     scope_consumed_words: &'a HashMap<String, HashSet<String>>,
-    child_ranges_by_parent: &'a HashMap<&'a str, Vec<ChildRange<'a>>>,
+    child_ranges_by_parent: &'a ChildRangeIndex,
     child_line_ranges: &'a HashMap<String, Vec<(usize, usize)>>,
     parent_child_pairs: &'a HashSet<(&'a str, &'a str)>,
     class_child_names: &'a HashSet<(&'a str, &'a str)>,
@@ -804,13 +1330,36 @@ struct ReferenceResolutionContext<'a> {
     class_members: &'a HashMap<&'a str, Vec<(&'a str, &'a str)>>,
 }
 
+/// One file's product of the bag-of-words resolution closure, carrying the file
+/// path so the red-green cache can attribute its edges (see the edge-ownership
+/// invariant in `incremental`).
+struct PerFileBowResult<'a> {
+    file_path: &'a str,
+    edges: Vec<(String, String, RefType)>,
+    read_set: Option<ReadSet>,
+    reused: bool,
+}
+
+// semx-bkz: re-adds `root` (needed again for the disk-read fallback) on top
+// of the pre-existing 7 arguments, matching the same allow already used by
+// `resolve_scopes_in_file_chunks` for the same reason.
+#[allow(clippy::too_many_arguments)]
 fn resolve_references_with_file_indexes<'a>(
     root: &Path,
-    file_paths: &[String],
+    file_paths: &'a [String],
     all_entities: &'a [SemanticEntity],
     needs_resolution: Option<&HashSet<&'a str>>,
     context: &ReferenceResolutionContext<'a>,
+    mut incremental: Option<&mut Incremental<'_>>,
+    // semx-bkz: content pass 1 already read for this file, snapshotted by
+    // `snapshot_bow_content` before `parsed_files` moved into scope
+    // resolution. `build_file_reference_index` still builds each file's
+    // index here, on demand, fused with that file's own resolve step — only
+    // the second disk read is gone, not the fusion. See
+    // `snapshot_bow_content`'s doc comment for why the fusion matters.
+    pre_parsed_content: &HashMap<&str, Cow<'_, str>>,
 ) -> Vec<(String, String, RefType)> {
+    let __bow_wall_t0 = std::time::Instant::now();
     let mut entities_by_file: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::default();
     for entity in all_entities {
         if needs_resolution
@@ -833,50 +1382,204 @@ fn resolve_references_with_file_indexes<'a>(
             .push(entity);
     }
 
-    let mut sorted_file_paths = file_paths.to_vec();
+    let mut sorted_file_paths: Vec<&'a str> = file_paths.iter().map(String::as_str).collect();
     sorted_file_paths.sort_unstable();
     sorted_file_paths.dedup();
 
-    maybe_par_iter!(sorted_file_paths)
+    // semx-022: decided before the closure runs, against a fingerprint map that
+    // already covers every table bag-of-words can read (the caller fingerprints
+    // them right before calling).
+    let green_bow: HashSet<&str> = match incremental.as_deref() {
+        None => HashSet::default(),
+        Some(state) => sorted_file_paths
+            .iter()
+            .copied()
+            // A file qualifies only if it also reused its *scope* result this
+            // build: bag-of-words reads back the words scope resolution consumed
+            // for the same entities, so reusing one without the other would
+            // compare this build's words against last build's edges.
+            .filter(|file_path| {
+                state.scope_reused_this_build(file_path)
+                    && state
+                        .cached(file_path)
+                        .is_some_and(|cached| state.may_reuse(file_path, &cached.bow.read_set))
+            })
+            .collect(),
+    };
+    let recording = incremental.is_some();
+    let cache = incremental.as_deref();
+
+    let per_file: Vec<PerFileBowResult<'a>> = maybe_par_iter!(sorted_file_paths)
         .filter_map(|file_path| {
             GRAPH_RESOLVE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let entities = entities_by_file.get(file_path.as_str())?;
+            // semx-4an: the same single-copy rule as the scope stage — this clone
+            // feeds `result` (build-scoped), the cache entry stays where it is,
+            // and the merge below writes nothing back for a GREEN file.
+            if green_bow.contains(*file_path) {
+                let cached = cache
+                    .and_then(|inc| inc.cached(file_path))
+                    .expect("green implies a cached result exists");
+                return Some(PerFileBowResult {
+                    file_path,
+                    edges: cached.bow.edges.clone(),
+                    read_set: None,
+                    reused: true,
+                });
+            }
+            let entities = entities_by_file.get(*file_path)?;
             let needs_index = entities.iter().any(|entity| {
                 !entity_requires_content_span_filter(entity, context.child_ranges_by_parent)
             });
+            let __idx_t0 = std::time::Instant::now();
             let reference_index = if needs_index {
-                build_file_reference_index(root, file_path)
+                build_file_reference_index(root, file_path, pre_parsed_content)
             } else {
                 None
             };
+            resolve_profile::add_bow_index_build_ns(__idx_t0.elapsed());
 
+            let __resolve_t0 = std::time::Instant::now();
+            let mut rec = if recording {
+                Recorder::on(0)
+            } else {
+                Recorder::off()
+            };
+            // `names_enabled`, not `enabled` — see the twin site in
+            // `scope_resolve.rs`. At `SEM_PROFILE_RESOLVE=2` this is `None`,
+            // so the per-lookup `Instant::now()` and `to_string()` below never
+            // happen and `bow_resolve_ns` measures the real loop.
+            let __bow_prof_on = resolve_profile::names_enabled();
+            let mut __bow_accum: Option<resolve_profile::BowFileAccum> =
+                __bow_prof_on.then(resolve_profile::BowFileAccum::default);
             let mut file_edges = Vec::new();
             for entity in entities {
                 file_edges.extend(resolve_entity_references(
                     entity,
                     reference_index.as_ref(),
                     context,
+                    &mut rec,
+                    __bow_accum.as_mut(),
                 ));
             }
-            Some(file_edges)
+            resolve_profile::add_bow_resolve_ns(__resolve_t0.elapsed());
+            if let Some(accum) = __bow_accum {
+                resolve_profile::merge_bow_file(accum);
+            }
+            Some(PerFileBowResult {
+                file_path,
+                edges: file_edges,
+                read_set: rec.enabled().then(|| rec.into_read_set()),
+                reused: false,
+            })
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
+        .collect();
+
+    let mut result: Vec<(String, String, RefType)> = Vec::new();
+    for entry in per_file {
+        if let Some(state) = incremental.as_deref_mut() {
+            if entry.reused {
+                state.keep_bow(entry.file_path);
+            } else if let Some(read_set) = entry.read_set {
+                state.put_bow(
+                    entry.file_path,
+                    CachedBowResult {
+                        edges: entry.edges.clone(),
+                        read_set,
+                    },
+                );
+            }
+        }
+        result.extend(entry.edges);
+    }
+    resolve_profile::add_bow_wall_ns(__bow_wall_t0.elapsed());
+    result
 }
 
-fn build_file_reference_index(root: &Path, file_path: &str) -> Option<FileReferenceIndex> {
+// semx-bkz: `pre_parsed_content` carries whatever content pass 1 already has
+// in hand for this file — keyed the same way `import_source_content`'s
+// established pattern already does for the import table. A file only falls
+// through to `read_to_string` when pass 1 discarded its content (non-JS/TS
+// files beyond `PARSED_FILE_REUSE_LIMIT`). Still called on-demand, fused with
+// this file's own `resolve_entity_references` loop, exactly like before this
+// bead — see `snapshot_bow_content`'s doc comment for why that fusion matters
+// (a first attempt at this bead split index-build into its own barrier-
+// separated phase and *regressed* wall time; see RESOLUTION-PROFILE.md).
+fn build_file_reference_index(
+    root: &Path,
+    file_path: &str,
+    pre_parsed_content: &HashMap<&str, Cow<'_, str>>,
+) -> Option<FileReferenceIndex> {
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
     let config = crate::parser::plugins::code::languages::get_language_config(ext)?;
-    let content = std::fs::read_to_string(root.join(file_path)).ok()?;
+    let content: Cow<str> = if let Some(content) = pre_parsed_content.get(file_path) {
+        Cow::Borrowed(content.as_ref())
+    } else {
+        let __io_t0 = std::time::Instant::now();
+        let content = std::fs::read_to_string(root.join(file_path)).ok()?;
+        resolve_profile::add_bow_index_io_ns(__io_t0.elapsed());
+        Cow::Owned(content)
+    };
+    let __tok_t0 = std::time::Instant::now();
     let stripped = strip_for_language(config.strip_strategy(), &content);
-    Some(FileReferenceIndex::from_stripped(
-        &stripped,
-        extra_ident_chars_for_file(file_path),
-    ))
+    let index = FileReferenceIndex::from_stripped(&stripped, extra_ident_chars_for_file(file_path));
+    resolve_profile::add_bow_index_tokenize_ns(__tok_t0.elapsed());
+    Some(index)
 }
 
+/// semx-bkz: restores the single-visit invariant for bag-of-words's content, without
+/// re-reading disk. Takes a one-time, cheap (memcpy-bound, no strip/tokenize)
+/// snapshot of every file's content pass 1 already retained — `parsed_files`'s
+/// `(path, content, tree)` triples on the retain path,
+/// `PrecomputedFileFacts::content` on the JS/TS chunked path — into a plain
+/// owned `HashMap<String, String>` with no lifetime tied to `parsed_files`,
+/// called right before `parsed_files` is moved into scope resolution. A file
+/// whose content pass 1 discarded (non-JS/TS beyond `PARSED_FILE_REUSE_LIMIT`)
+/// is simply absent here; `build_file_reference_index` falls back to a disk
+/// read for it, same as before this bead.
+///
+/// **Deliberately just a content copy, not an index build.** A first version
+/// of this bead built every file's whole `FileReferenceIndex` here — the
+/// natural-looking "build bow's index during pass 1" reading of the task —
+/// and *regressed* wall time on vscode (measured: build_total_ms +5% to +8%,
+/// resolve_phase_ms +8% to +17%, reproducible across 3 paired runs; see
+/// RESOLUTION-PROFILE.md for the numbers). Root cause: that design inserted a
+/// hard `.collect()` barrier between "build every file's index" and "resolve
+/// every file's references," so every file's resolve step had to wait for the
+/// *slowest* file's index build, corpus-wide, instead of just its own —
+/// destroying the pipelining the original per-file loop had (index-build
+/// immediately followed by that same file's resolve, so a fast file finished
+/// both steps while a slow file was still on its first). Snapshotting only
+/// the *content* here keeps that fusion intact: `strip_for_language` +
+/// `FileReferenceIndex::from_stripped` still run inside
+/// `resolve_references_with_file_indexes`'s own per-file closure, immediately
+/// followed by that file's resolve — this function only replaces the second
+/// `read_to_string` inside it with a map lookup.
+fn snapshot_bow_content<'a>(
+    file_paths: &'a [String],
+    parsed_files: &[(String, String, tree_sitter::Tree)],
+    precomputed_facts: &'a HashMap<String, scope_resolve::PrecomputedFileFacts>,
+) -> HashMap<&'a str, Cow<'a, str>> {
+    let __wall_t0 = std::time::Instant::now();
+    let file_set: HashSet<&'a str> = file_paths.iter().map(String::as_str).collect();
+    let mut pre_parsed_content: HashMap<&'a str, Cow<'a, str>> =
+        HashMap::with_capacity_and_hasher(file_set.len(), Default::default());
+    for (file_path, content, _tree) in parsed_files {
+        if let Some(key) = file_set.get(file_path.as_str()) {
+            pre_parsed_content.insert(key, Cow::Owned(content.clone()));
+        }
+    }
+    for (file_path, facts) in precomputed_facts {
+        if let Some(key) = file_set.get(file_path.as_str()) {
+            pre_parsed_content
+                .entry(key)
+                .or_insert_with(|| Cow::Borrowed(facts.content()));
+        }
+    }
+    resolve_profile::add_bow_index_precompute_wall_ns(__wall_t0.elapsed());
+    pre_parsed_content
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_scopes_in_file_chunks(
     root: &Path,
     file_paths: &[String],
@@ -884,6 +1587,9 @@ fn resolve_scopes_in_file_chunks(
     entity_map: &HashMap<String, EntityInfo>,
     pre_built: &scope_resolve::PreBuiltLookups,
     import_table: &HashMap<(String, String), String>,
+    precomputed_facts: &HashMap<String, scope_resolve::PrecomputedFileFacts>,
+    mut incremental: Option<&mut Incremental<'_>>,
+    eligible: &HashSet<String>,
 ) -> (
     Vec<(String, String, RefType)>,
     HashMap<String, HashSet<String>>,
@@ -891,7 +1597,41 @@ fn resolve_scopes_in_file_chunks(
     let mut all_edges = Vec::new();
     let mut all_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
-    for chunk in file_paths.chunks(SCOPE_RESOLVE_FILE_CHUNK_SIZE) {
+    // semx-6rd CUT 2: `entities_by_file`/`children_by_parent` are a pure
+    // function of `all_entities`, unchanged across chunks — build them once
+    // here instead of once per chunk inside `resolve_with_scopes_full_inner`.
+    let __entity_index_t0 = std::time::Instant::now();
+    let entity_index = scope_resolve::PrebuiltEntityIndex::build(all_entities);
+    resolve_profile::add_chunk_entity_index_ns(__entity_index_t0.elapsed());
+    // semx-nuv: corpus-wide, computed once (same "once per corpus, not once
+    // per chunk" pattern as `entity_index` above) so every chunk's
+    // `swift_call_signatures` gate answers the same question regardless of
+    // which chunk a `.swift` file happens to land in. See
+    // `ChunkedResolveInputs::corpus_has_swift`'s doc comment.
+    let corpus_has_swift = all_entities
+        .iter()
+        .any(|entity| entity.file_path.ends_with(".swift"));
+    // semx-la2: the two import-handler indexes, hoisted across chunks like
+    // `entity_index` above — pure functions of `(symbol_table, entity_map,
+    // constant extensions)`, all corpus-invariant across chunks (see
+    // `ChunkedResolveInputs::top_level_entities`'s doc comment). Created
+    // empty; each is built lazily by the first chunk whose files actually
+    // contain the triggering import form, then shared by every later chunk
+    // instead of being rebuilt corpus-sized once per chunk.
+    let top_level_entities = OnceLock::new();
+    let py_top_level_entities = OnceLock::new();
+    let chunked = scope_resolve::ChunkedResolveInputs {
+        facts: precomputed_facts,
+        entity_index: &entity_index,
+        corpus_has_swift,
+        top_level_entities: &top_level_entities,
+        py_top_level_entities: &py_top_level_entities,
+    };
+
+    let byte_budget_chunks =
+        chunk_files_by_byte_budget(root, file_paths, SCOPE_RESOLVE_BYTE_BUDGET);
+    for (chunk_index, chunk_range) in byte_budget_chunks.into_iter().enumerate() {
+        let chunk = &file_paths[chunk_range];
         if !chunk.iter().any(|file_path| {
             let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
             crate::parser::plugins::code::languages::get_language_config(ext)
@@ -901,23 +1641,48 @@ fn resolve_scopes_in_file_chunks(
             continue;
         }
 
-        let result = scope_resolve::resolve_with_scopes_full(
+        let __chunk_t0 = std::time::Instant::now();
+        // The chunk index tags this chunk's chunk-scoped fingerprints (return
+        // types, instance-attribute types). Chunk membership is a function of
+        // the file list alone, and the session refuses incremental reuse when
+        // the file list changed, so a file's tag is stable across the rebuilds
+        // that are allowed to reuse anything.
+        let mut scope_inc =
+            incremental
+                .as_deref_mut()
+                .map(|state| scope_resolve::ScopeIncremental {
+                    inc: state,
+                    scope_tag: chunk_index as u64,
+                    eligible,
+                });
+        let result = scope_resolve::resolve_with_scopes_full_chunked(
             root,
             chunk,
             all_entities,
             entity_map,
-            None,
             Some(pre_built),
             Some(import_table),
-            false,
+            &chunked,
+            scope_inc.as_mut(),
         );
+        resolve_profile::note_chunk(__chunk_t0.elapsed());
+        let __merge_t0 = std::time::Instant::now();
         all_edges.extend(result.edges);
+        // Same move-don't-rebuild merge as `resolve_with_scopes_full_inner`'s —
+        // and here the disjointness is even more direct: chunks partition
+        // `file_paths`, and an entity id names exactly one file.
+        all_consumed_words.reserve(result.consumed_words.len());
         for (entity_id, words) in result.consumed_words {
-            all_consumed_words
-                .entry(entity_id)
-                .or_default()
-                .extend(words);
+            match all_consumed_words.entry(entity_id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(words);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().extend(words);
+                }
+            }
         }
+        resolve_profile::add_chunk_words_merge_ns(__merge_t0.elapsed());
     }
 
     (all_edges, all_consumed_words)
@@ -927,6 +1692,17 @@ fn resolve_entity_references(
     entity: &SemanticEntity,
     reference_index: Option<&FileReferenceIndex>,
     context: &ReferenceResolutionContext<'_>,
+    // semx-022 red-green: records every read that can reach another file's data.
+    // Reads keyed by this entity's *own* id are deliberately not recorded — an
+    // id is `{file_path}::…` by construction, so anything keyed by one is a pure
+    // function of this file's own content, which the own-content check already
+    // covers. See `incremental::Incremental`.
+    rec: &mut Recorder,
+    // semx-h19: opt-in sub-phase timing + candidate-scan sampling, gated the
+    // same way `rec` is (a cheap `None` on the cold/non-profiled path — no
+    // extra `Instant::now()` calls happen unless `SEM_PROFILE_RESOLVE=1`).
+    // See `resolve_profile::BowFileAccum`.
+    mut bow_acc: Option<&mut resolve_profile::BowFileAccum>,
 ) -> Vec<(String, String, RefType)> {
     let ext = entity
         .file_path
@@ -958,6 +1734,7 @@ fn resolve_entity_references(
     } else {
         None
     };
+    let __local_binding_t0 = bow_acc.is_some().then(std::time::Instant::now);
     let local_bindings =
         local_binding_names_filtered(&entity.content, ext, |local_line, start, end| {
             entity_owns_content_span(
@@ -969,7 +1746,11 @@ fn resolve_entity_references(
                 context.child_ranges_by_parent,
             )
         });
+    if let (Some(acc), Some(t0)) = (bow_acc.as_deref_mut(), __local_binding_t0) {
+        acc.add_local_binding(t0.elapsed());
+    }
 
+    let __dotchain_extract_t0 = bow_acc.is_some().then(std::time::Instant::now);
     let dot_chains: Vec<(&str, &str, Option<(usize, usize, usize)>)> = match reference_index {
         Some(index) => index
             .dot_chains_in_ranges(&fallback_ranges)
@@ -983,6 +1764,9 @@ fn resolve_entity_references(
             })
             .collect(),
     };
+    if let (Some(acc), Some(t0)) = (bow_acc.as_deref_mut(), __dotchain_extract_t0) {
+        acc.add_dotchain_extract(t0.elapsed());
+    }
     let mut consumed_words: HashSet<&str> = context
         .scope_consumed_words
         .get(&entity.id)
@@ -1008,7 +1792,9 @@ fn resolve_entity_references(
         let edge_count_before = entity_edges.len();
         if *receiver == "self" || *receiver == "this" {
             if let Some(class_name) = context.enclosing_class.get(entity.id.as_str()) {
+                rec.one(Table::BowClassMembers, class_name);
                 if let Some(members) = context.class_members.get(class_name) {
+                    let __t0 = bow_acc.is_some().then(std::time::Instant::now);
                     for (name, target_id) in members {
                         if *name == *member && *target_id != entity.id.as_str() {
                             entity_edges.push((
@@ -1020,13 +1806,24 @@ fn resolve_entity_references(
                             break;
                         }
                     }
+                    if let (Some(acc), Some(t0)) = (bow_acc.as_deref_mut(), __t0) {
+                        acc.record_class_scan(class_name, members.len(), t0.elapsed());
+                    }
                 }
             }
-        } else if context
-            .class_entity_files
-            .contains(&(*receiver, entity.file_path.as_str()))
-        {
+        } else if {
+            rec.two(
+                Table::BowClassEntityFiles,
+                receiver,
+                entity.file_path.as_str(),
+            );
+            context
+                .class_entity_files
+                .contains(&(*receiver, entity.file_path.as_str()))
+        } {
+            rec.one(Table::BowClassMembers, receiver);
             if let Some(members) = context.class_members.get(*receiver) {
+                let __t0 = bow_acc.is_some().then(std::time::Instant::now);
                 for (name, target_id) in members {
                     if *name == *member {
                         entity_edges.push((
@@ -1039,6 +1836,9 @@ fn resolve_entity_references(
                         break;
                     }
                 }
+                if let (Some(acc), Some(t0)) = (bow_acc.as_deref_mut(), __t0) {
+                    acc.record_class_scan(receiver, members.len(), t0.elapsed());
+                }
             }
         }
         if entity_edges.len() == edge_count_before {
@@ -1046,6 +1846,7 @@ fn resolve_entity_references(
         }
     }
 
+    let __ref_extract_t0 = bow_acc.is_some().then(std::time::Instant::now);
     let refs: Vec<(&str, RefType)> = match reference_index {
         Some(index) => index.refs_with_types_in_ranges(&fallback_ranges, &entity.name),
         None => {
@@ -1071,7 +1872,11 @@ fn resolve_entity_references(
             .collect()
         }
     };
+    if let (Some(acc), Some(t0)) = (bow_acc.as_deref_mut(), __ref_extract_t0) {
+        acc.add_ref_extract(t0.elapsed());
+    }
     let entity_id = entity.id.as_str();
+    rec.one(Table::ImportsForFile, entity.file_path.as_str());
     let imports_for_file = context.imports_by_file.get(entity.file_path.as_str());
 
     for (ref_name, ref_type) in refs {
@@ -1092,6 +1897,8 @@ fn resolve_entity_references(
         if let Some(import_target_id) =
             imports_for_file.and_then(|imports| imports.get(ref_name).copied())
         {
+            rec.two(Table::BowParentChildPairs, entity_id, import_target_id);
+            rec.two(Table::BowParentChildPairs, import_target_id, entity_id);
             if import_target_id != entity_id
                 && !context
                     .parent_child_pairs
@@ -1105,26 +1912,36 @@ fn resolve_entity_references(
             continue;
         }
 
-        if let Some(target_ids) = context.symbol_table.get(ref_name) {
-            let target = target_ids.iter().find(|id| {
-                *id != &entity.id
-                    && context
-                        .entity_map
-                        .get(*id)
-                        .map_or(false, |e| e.file_path == entity.file_path)
-            });
+        rec.one(Table::SymbolTable, ref_name);
+        // semx-h19: `symbol_table_by_file` pre-groups every name's candidates
+        // by file, so this only scans the candidates that were ever eligible
+        // (this entity's own file) instead of every candidate for `ref_name`
+        // in the whole corpus. See `build_symbol_table_by_file`'s doc comment
+        // for why this is a pure work-elimination, not a selection change.
+        if let Some(by_file) = context.symbol_table_by_file.get(ref_name) {
+            let file_candidates = by_file.get(entity.file_path.as_str());
+            let __t0 = bow_acc.is_some().then(std::time::Instant::now);
+            let target = file_candidates
+                .and_then(|ids| ids.iter().find(|id| **id != entity.id.as_str()))
+                .copied();
+            if let (Some(acc), Some(t0)) = (bow_acc.as_deref_mut(), __t0) {
+                let candidates = file_candidates.map_or(0, |ids| ids.len());
+                acc.record_symbol_scan(ref_name, candidates, t0.elapsed());
+            }
 
             if let Some(target_id) = target {
+                rec.two(Table::BowParentChildPairs, entity_id, target_id);
+                rec.two(Table::BowParentChildPairs, target_id, entity_id);
                 if context
                     .parent_child_pairs
-                    .contains(&(entity.id.as_str(), target_id.as_str()))
+                    .contains(&(entity.id.as_str(), target_id))
                     || context
                         .parent_child_pairs
-                        .contains(&(target_id.as_str(), entity.id.as_str()))
+                        .contains(&(target_id, entity.id.as_str()))
                 {
                     continue;
                 }
-                entity_edges.push((entity.id.clone(), target_id.clone(), ref_type));
+                entity_edges.push((entity.id.clone(), target_id.to_string(), ref_type));
             }
         }
     }
@@ -1143,6 +1960,8 @@ fn resolve_entity_references(
             if let Some(import_target_id) =
                 imports_for_file.and_then(|imports| imports.get(qualified).copied())
             {
+                rec.two(Table::BowParentChildPairs, entity_id, import_target_id);
+                rec.two(Table::BowParentChildPairs, import_target_id, entity_id);
                 if import_target_id != entity_id
                     && !context
                         .parent_child_pairs
@@ -1165,27 +1984,39 @@ fn resolve_entity_references(
 }
 
 impl EntityGraph {
-    /// Reconstruct an EntityGraph from pre-loaded parts (e.g. from a cache).
-    pub fn from_parts(entities: EntityInfoMap, mut edges: Vec<EntityRef>) -> Self {
-        sort_entity_refs(&mut edges);
-        let mut dependents: EntityAdjacencyMap = EntityAdjacencyMap::default();
-        let mut dependencies: EntityAdjacencyMap = EntityAdjacencyMap::default();
-        for edge in &edges {
-            dependents
-                .entry(edge.to_entity.clone())
-                .or_default()
-                .push(edge.from_entity.clone());
-            dependencies
-                .entry(edge.from_entity.clone())
-                .or_default()
-                .push(edge.to_entity.clone());
-        }
+    /// Assemble a graph from its two owned parts; the adjacency maps are
+    /// derived from `edges` lazily, on first [`Self::dependents`] /
+    /// [`Self::dependencies`] demand (semx-ws6, audit D7).
+    fn assemble(entities: EntityInfoMap, edges: Vec<EntityRef>) -> Self {
         EntityGraph {
             entities,
             edges,
-            dependents,
-            dependencies,
+            adjacency: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Reconstruct an EntityGraph from pre-loaded parts (e.g. from a cache).
+    pub fn from_parts(entities: EntityInfoMap, mut edges: Vec<EntityRef>) -> Self {
+        sort_entity_refs(&mut edges);
+        Self::assemble(entities, edges)
+    }
+
+    /// Reverse index: entity_id → entities that reference it. Derived from
+    /// [`Self::edges`] on first call (audit D7) — identical content and
+    /// bucket order to the eagerly-built map it replaces.
+    pub fn dependents(&self) -> &EntityAdjacencyMap {
+        &self.adjacency().dependents
+    }
+
+    /// Forward index: entity_id → entities it references. Derived from
+    /// [`Self::edges`] on first call (audit D7).
+    pub fn dependencies(&self) -> &EntityAdjacencyMap {
+        &self.adjacency().dependencies
+    }
+
+    fn adjacency(&self) -> &EdgeAdjacency {
+        self.adjacency
+            .get_or_init(|| EdgeAdjacency::derive(&self.edges))
     }
 
     /// Build an entity graph from a set of files.
@@ -1198,6 +2029,27 @@ impl EntityGraph {
         file_paths: &[String],
         registry: &ParserRegistry,
     ) -> (Self, Vec<SemanticEntity>) {
+        Self::build_incremental_core(root, file_paths, registry, None)
+    }
+
+    /// The one implementation behind both a cold [`EntityGraph::build`] and a
+    /// warm [`crate::parser::session::GraphSession::rebuild`] (semx-022).
+    ///
+    /// There is deliberately no second code path: a warm rebuild runs exactly
+    /// these stages in exactly this order, and differs only in that (a) pass 1
+    /// serves GREEN files from `carry.facts` instead of re-reading and
+    /// re-extracting them, and (b) the two per-file resolution closures return a
+    /// GREEN file's cached edges instead of recomputing them. Everything that
+    /// merges, dedupes, sorts or indexes edges sees the identical input it would
+    /// have seen cold — which is what makes bit-identical output a structural
+    /// property rather than something the oracle test merely happens to observe.
+    pub(crate) fn build_incremental_core(
+        root: &Path,
+        file_paths: &[String],
+        registry: &ParserRegistry,
+        mut carry: Option<&mut BuildCarry<'_, '_>>,
+    ) -> (Self, Vec<SemanticEntity>) {
+        resolve_profile::reset();
         GRAPH_PARSE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
         report_build_phase(BuildPhase::Parsing {
             files: file_paths.len(),
@@ -1206,111 +2058,654 @@ impl EntityGraph {
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Small and medium repos reuse parse trees in scope resolution; large repos
         // keep peak memory bounded by reparsing scope chunks.
-        let per_file: Vec<(
-            Vec<SemanticEntity>,
-            Option<(String, String, tree_sitter::Tree)>,
-        )> = maybe_par_iter!(file_paths)
+        //
+        // semx-6rd CUT 1: for JS/TS files beyond `PARSED_FILE_REUSE_LIMIT`, the
+        // tree is still parsed here (same underlying tree-sitter call
+        // `extract_entities` makes internally, just not discarded) and, while
+        // it's in hand, `scope_resolve::precompute_js_ts_file_facts` collects
+        // everything the chunked resolution path's pass 2 needs from it
+        // (scopes, imports, return types, refs — see that function's doc
+        // comment for exactly which tree-touching computations this covers
+        // and why it's safe to skip for every other language). This is what
+        // lets `resolve_scopes_in_file_chunks` skip re-parsing those files
+        // entirely instead of just parallelizing the re-parse (semx-022).
+        // semx-022: a warm rebuild re-extracts only files it already knows are
+        // dirty. Everything else is served from the facts layer — no disk read,
+        // no tree-sitter parse, no extraction — and the extraction cache makes
+        // even a dirty file whose bytes did not actually change nearly free.
+        let recording = carry.is_some();
+        let dirty: Option<&HashSet<String>> = carry.as_deref().map(|c| &*c.dirty);
+        let cached_precomputed: Option<&HashMap<String, scope_resolve::PrecomputedFileFacts>> =
+            carry.as_deref().map(|c| &*c.precomputed);
+        let reusable_entities: Option<&HashMap<String, Vec<SemanticEntity>>> =
+            carry.as_deref().map(|c| &*c.prev_entities);
+
+        let __pass1_wall_t0 = std::time::Instant::now();
+        let per_file: Vec<Pass1FileProduct> = maybe_par_iter!(file_paths)
             .filter_map(|file_path| {
                 GRAPH_PARSE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Reuse this file's facts when the session already holds them
+                // and the caller did not flag the file as changed. The reuse is
+                // exact, not approximate: the cached entities and precomputed
+                // facts are byte-for-byte what a fresh extraction of the same
+                // content produces — `precompute_js_ts_file_facts` reads nothing
+                // but this file's own tree and its own entities.
+                //
+                // Only the chunked path can skip the parse outright: the retain
+                // path needs a live tree per file for the resolution closure, so
+                // those files fall through and re-parse (their entities still
+                // come back free from the content-addressed extraction cache).
+                //
+                // semx-4an: the *entity* half of this reuse is not JS/TS-specific.
+                // `registry.extract_entities` is a pure function of (path,
+                // content, registry config), so an unchanged non-JS/TS file's
+                // entities are byte-identical to a re-extraction — and on the
+                // chunked path nothing downstream needs its tree either
+                // (`resolve_scopes_in_file_chunks` re-reads and re-parses every
+                // file that has no `PrecomputedFileFacts` entry anyway, and
+                // bag-of-words re-reads its content). Before this bead these
+                // files were re-read from disk and re-extracted on *every*
+                // rebuild — 1,577 of the monster's 40,872 files, ~220ms of pass 1
+                // — and, worse, that left them in `prev_entities`, forcing
+                // `maintain_entity_lookups_incremental` to remove-and-reinsert
+                // their table entries every build too. A JS/TS file still needs
+                // its `PrecomputedFileFacts` entry to skip, because pass 2 reads
+                // those facts instead of a tree.
+                //
+                // `.go` is excluded, and the exclusion is load-bearing:
+                // `resolve_go_method_parent_ids` rewrites a Go method's
+                // `parent_id` *and its id* against types declared in **other**
+                // files of the same package, and it is a no-op when the receiver
+                // type is not found. Serving a Go file's entities from the
+                // previous build would therefore preserve a parent id that a
+                // sibling file's edit had just invalidated, with nothing to
+                // re-derive it — the one cross-file entity rewrite this crate
+                // has, and the one case where "unchanged content ⇒ unchanged
+                // entities" is false. Gated on the same literal `.go` suffix
+                // that function itself tests, so the two cannot drift apart.
+                let entity_reuse_ok = dirty.is_some_and(|d| !d.contains(file_path.as_str()))
+                    && !retain_parsed_files
+                    && reusable_entities.is_some_and(|e| e.contains_key(file_path.as_str()))
+                    && !file_path.ends_with(".go")
+                    && (cached_precomputed.is_some_and(|p| p.contains_key(file_path.as_str()))
+                        || !crate::parser::import_resolution::is_js_ts_file(
+                            registry
+                                .resolve_file_path(file_path)
+                                .as_deref()
+                                .unwrap_or(file_path),
+                        ));
+                if entity_reuse_ok {
+                    return Some(Pass1FileProduct {
+                        file_path: file_path.as_str(),
+                        entities: None,
+                        parsed: None,
+                        precomputed: None,
+                        content_hash: None,
+                    });
+                }
                 let full_path = root.join(file_path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 if retain_parsed_files {
                     let (entities, tree) =
                         registry.extract_entities_with_tree(file_path, &content)?;
+                    let hash = recording.then(|| content_hash(&content));
                     let parsed = tree.map(|tree| (file_path.clone(), content, tree));
-                    Some((entities, parsed))
+                    Some(Pass1FileProduct {
+                        file_path: file_path.as_str(),
+                        entities: Some(entities),
+                        parsed,
+                        precomputed: None,
+                        content_hash: hash,
+                    })
+                } else if crate::parser::import_resolution::is_js_ts_file(
+                    registry
+                        .resolve_file_path(file_path)
+                        .as_deref()
+                        .unwrap_or(file_path),
+                ) {
+                    // Precompute only applies when the *detected* language is
+                    // JS/TS (honoring any custom-extension-mapping override),
+                    // not just when the raw extension looks like one.
+                    let (entities, tree) =
+                        registry.extract_entities_with_tree(file_path, &content)?;
+                    let hash = recording.then(|| content_hash(&content));
+                    let facts = match &tree {
+                        Some(t) => scope_resolve::precompute_js_ts_file_facts(
+                            file_path, content, t, &entities,
+                        ),
+                        None => None,
+                    };
+                    Some(Pass1FileProduct {
+                        file_path: file_path.as_str(),
+                        entities: Some(entities),
+                        parsed: None,
+                        precomputed: facts,
+                        content_hash: hash,
+                    })
+                } else if {
+                    // MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md
+                    // §6.2 Phase 1, §6.1's GO/NO-GO table): C++ and C# are
+                    // the only families phase 1 is verdicted on — the only
+                    // two whose `LANGUAGE_SALTS` entries that bead bumps
+                    // (I5/F2). `precompute_scope_resolvable_file_facts` is
+                    // written generically (any scope-resolvable, non-Swift
+                    // language — matching I3's structural, not per-language,
+                    // TREELESS decision), so phases 2/3 widen the *admission
+                    // predicate* alone; narrowing it outside the function is
+                    // what keeps the blast radius to exactly the families
+                    // that were measured and salted. Python/Go/Java/Rust's
+                    // producer output is therefore byte-identical to before
+                    // that bead — still always `precomputed: None` from this
+                    // closure — so their `LANGUAGE_SALTS` entries are
+                    // correctly left untouched.
+                    //
+                    // The predicate itself lives in `scope_resolve` (semx-w5k.2)
+                    // because the facts corpus's salt has to agree with it
+                    // file-for-file; see `scope_resolve::mul_precompute_admits`
+                    // for why C++ is unconditional and C# is not.
+                    let lang_id = crate::parser::plugins::code::languages::get_language_config(
+                        file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or(""),
+                    )
+                    .map(|c| c.id);
+                    lang_id.is_some_and(scope_resolve::mul_precompute_admits)
+                } {
+                    let (entities, tree) =
+                        registry.extract_entities_with_tree(file_path, &content)?;
+                    let hash = recording.then(|| content_hash(&content));
+                    let facts = match &tree {
+                        Some(t) => scope_resolve::precompute_scope_resolvable_file_facts(
+                            file_path, content, t, &entities,
+                        ),
+                        None => None,
+                    };
+                    Some(Pass1FileProduct {
+                        file_path: file_path.as_str(),
+                        entities: Some(entities),
+                        parsed: None,
+                        precomputed: facts,
+                        content_hash: hash,
+                    })
                 } else {
                     let entities = registry.extract_entities(file_path, &content);
-                    Some((entities, None))
+                    let hash = recording.then(|| content_hash(&content));
+                    Some(Pass1FileProduct {
+                        file_path: file_path.as_str(),
+                        entities: Some(entities),
+                        parsed: None,
+                        precomputed: None,
+                        content_hash: hash,
+                    })
                 }
             })
             .collect();
+        resolve_profile::add_pass1_wall_ns(__pass1_wall_t0.elapsed());
 
+        let __assemble_t0 = std::time::Instant::now();
         let mut all_entities: Vec<SemanticEntity> = Vec::new();
         let mut parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
-        for (entities, parsed) in per_file {
-            all_entities.extend(entities);
-            if let Some(p) = parsed {
+        let mut fresh_precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
+            HashMap::default();
+        // (path, start, len) in `all_entities`, so the next rebuild can hand a
+        // GREEN file's entities back by *moving* them rather than cloning half a
+        // million entity bodies on every rebuild.
+        let mut entity_spans: Vec<(String, usize, usize)> = Vec::new();
+        // semx-5sw: same (path, start, len) shape as `entity_spans` above, but
+        // captured unconditionally (not gated on `carry`) and only for files
+        // that got fresh precomputed facts this round — the CLEAN gate's own
+        // candidate set. Free to record here (pure bookkeeping against
+        // indices this loop already computes); lets the gate below look up
+        // exactly those files' entities by slicing `all_entities` instead of
+        // re-scanning the whole corpus to find them.
+        let mut clean_gate_candidate_spans: Vec<(String, usize, usize)> = Vec::new();
+        for product in per_file {
+            let start = all_entities.len();
+            match product.entities {
+                Some(entities) => all_entities.extend(entities),
+                None => {
+                    let reused = carry
+                        .as_deref_mut()
+                        .and_then(|c| c.prev_entities.remove(product.file_path))
+                        .expect("reuse decision implies the previous entities are held");
+                    all_entities.extend(reused);
+                }
+            }
+            if let Some(c) = carry.as_deref_mut() {
+                entity_spans.push((
+                    product.file_path.to_string(),
+                    start,
+                    all_entities.len() - start,
+                ));
+                if let Some(hash) = product.content_hash {
+                    c.content_hashes.insert(product.file_path.to_string(), hash);
+                }
+                let _ = c;
+            }
+            if let Some(p) = product.parsed {
                 parsed_files.push(p);
             }
+            if let Some(f) = product.precomputed {
+                clean_gate_candidate_spans.push((
+                    product.file_path.to_string(),
+                    start,
+                    all_entities.len() - start,
+                ));
+                fresh_precomputed.insert(product.file_path.to_string(), f);
+            }
         }
+        // MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md §4.1 step 2,
+        // I1/I6): the CLEAN gate. Pass 1's precompute (both
+        // `precompute_js_ts_file_facts` and, as of this bead,
+        // `precompute_scope_resolvable_file_facts`) can only ever see this
+        // file's own entities — the corpus-wide `children_by_parent` doesn't
+        // exist until every file's entities are assembled, which is exactly
+        // now. Checked at run time, not argued: any file with an entity whose
+        // child lives in a *different* file fails CLEAN and has its fresh
+        // facts dropped here, falling back to today's re-parse path in pass 2
+        // exactly as if pass 1 had never precomputed anything for it — an
+        // ungated file is never wrong, only slower. Skipped entirely when
+        // this build precomputed nothing (every corpus with no JS/TS/C#/C++/
+        // other-scope-resolvable files, and every warm rebuild where nothing
+        // fresh was precomputed this round).
+        //
+        // semx-5sw: scoped to `fresh_precomputed`'s own keys — the only files
+        // this gate's verdict is ever read for (the `retain` below discards
+        // every other file's answer anyway) — instead of building a
+        // full-corpus `PrebuiltEntityIndex` to answer a question about a
+        // handful of files. See `scope_resolve::clean_gate_dirty_files`'s doc
+        // comment for the soundness argument and RESOLUTION-PROFILE.md's
+        // semx-5sw section for the measurements.
+        if !fresh_precomputed.is_empty() {
+            let __clean_gate_t0 = std::time::Instant::now();
+            let dirty_files =
+                scope_resolve::clean_gate_dirty_files(&all_entities, &clean_gate_candidate_spans);
+            if !dirty_files.is_empty() {
+                let before = fresh_precomputed.len();
+                fresh_precomputed.retain(|path, _| !dirty_files.contains(path.as_str()));
+                resolve_profile::add_clean_gate_files_dropped(
+                    (before - fresh_precomputed.len()) as u64,
+                );
+            }
+            resolve_profile::add_clean_gate_ns(__clean_gate_t0.elapsed());
+        }
+        // Fold this build's fresh precomputed facts into the session's store and
+        // let the store be what resolution sees. Keeping the store authoritative
+        // is what lets a GREEN file's facts survive arbitrarily many rebuilds.
+        if let Some(c) = carry.as_deref_mut() {
+            for (path, f) in fresh_precomputed.drain() {
+                c.precomputed.insert(path, f);
+            }
+            c.precomputed.retain(|path, _| c.known.contains(path));
+            c.content_hashes.retain(|path, _| c.known.contains(path));
+            // Cloned, not moved: semx-4an's `maintain_entity_lookups_incremental`
+            // needs its own read of these spans later in this function, after
+            // `carry.entity_spans` has already been handed to the caller here.
+            // Cheap — one small tuple per *file*, not per entity.
+            c.entity_spans = entity_spans.clone();
+        }
+        resolve_profile::add_assemble_ns(__assemble_t0.elapsed());
+        // semx-022: split the carry once, here, into the three pieces the rest
+        // of the build needs. Doing it in one place keeps the incremental state
+        // borrowed mutably while the precomputed facts stay borrowed immutably,
+        // which the borrow checker will not allow if the split is done twice.
+        let empty_paths: HashSet<String> = HashSet::default();
+        let mut empty_import_scans: HashMap<String, CachedImportScan> = HashMap::default();
+        let mut empty_import_table: HashMap<(String, String), String> = HashMap::default();
+        let mut empty_import_keys: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut empty_prev_entities: HashMap<String, Vec<SemanticEntity>> = HashMap::default();
+        let mut empty_symbol_table: HashMap<String, Vec<String>> = HashMap::default();
+        let mut empty_entity_lookup_map: HashMap<String, EntityInfo> = HashMap::default();
+        let mut empty_class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut empty_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
+        let mut empty_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
+            HashMap::default();
+        let mut empty_child_ranges: ChildRangeIndex = HashMap::default();
+        let mut empty_corpus_fp = crate::parser::incremental::TableFingerprints::default();
+        let mut empty_wildcard_guard = 0u64;
+        let mut empty_entity_lookups_primed = false;
+        #[allow(clippy::type_complexity)]
+        let (
+            mut inc,
+            eligible,
+            carry_dirty,
+            precomputed_facts,
+            import_scans,
+            import_table_carry,
+            import_keys,
+            carry_prev_entities,
+            carry_symbol_table,
+            carry_entity_map,
+            carry_class_members,
+            carry_owner_members,
+            carry_entity_ranges,
+            carry_child_ranges,
+            carry_corpus_fp,
+            carry_wildcard_guard,
+            carry_entity_lookups_primed,
+        ): (
+            Option<&mut Incremental<'_>>,
+            &HashSet<String>,
+            &HashSet<String>,
+            &HashMap<String, scope_resolve::PrecomputedFileFacts>,
+            &mut HashMap<String, CachedImportScan>,
+            &mut HashMap<(String, String), String>,
+            &mut HashMap<String, Vec<(String, String)>>,
+            &mut HashMap<String, Vec<SemanticEntity>>,
+            &mut HashMap<String, Vec<String>>,
+            &mut HashMap<String, EntityInfo>,
+            &mut HashMap<String, Vec<(String, String)>>,
+            &mut HashMap<String, Vec<(String, String)>>,
+            &mut HashMap<String, Vec<(usize, usize, String)>>,
+            &mut ChildRangeIndex,
+            &mut crate::parser::incremental::TableFingerprints,
+            &mut u64,
+            &mut bool,
+        ) = match carry {
+            Some(c) => (
+                Some(c.inc),
+                c.eligible,
+                c.dirty,
+                c.precomputed,
+                c.import_scans,
+                c.import_table,
+                c.import_keys,
+                c.prev_entities,
+                c.symbol_table,
+                c.entity_map,
+                c.class_members,
+                c.owner_members,
+                c.entity_ranges,
+                c.child_ranges,
+                c.corpus_fp,
+                c.wildcard_guard,
+                c.entity_lookups_primed,
+            ),
+            None => (
+                None,
+                &empty_paths,
+                &empty_paths,
+                &fresh_precomputed,
+                &mut empty_import_scans,
+                &mut empty_import_table,
+                &mut empty_import_keys,
+                &mut empty_prev_entities,
+                &mut empty_symbol_table,
+                &mut empty_entity_lookup_map,
+                &mut empty_class_members,
+                &mut empty_owner_members,
+                &mut empty_entity_ranges,
+                &mut empty_child_ranges,
+                &mut empty_corpus_fp,
+                &mut empty_wildcard_guard,
+                &mut empty_entity_lookups_primed,
+            ),
+        };
         resolve_go_method_parent_ids(&mut all_entities);
 
-        // Pass A: Build all lookup structures in a single pass over all_entities.
-        // This merges what was previously 6 separate O(E) iterations.
-        let mut symbol_table: HashMap<String, Vec<String>> =
-            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
-        let mut entity_map: HashMap<String, EntityInfo> =
-            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
-        let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::default();
-        let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
-        let mut class_child_names: HashSet<(&str, &str)> = HashSet::default();
-        let child_ranges_by_parent = build_child_ranges_by_parent(&all_entities);
-        let mut class_entity_names: HashSet<&str> = HashSet::default();
-        let mut class_entity_files: HashSet<(&str, &str)> = HashSet::default();
-        let mut id_to_name: HashMap<&str, &str> =
-            HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
-        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
-            HashMap::default();
-
-        for entity in &all_entities {
-            symbol_table
-                .entry(entity.name.clone())
-                .or_default()
-                .push(entity.id.clone());
-
-            entity_map.insert(
-                entity.id.clone(),
-                EntityInfo {
-                    id: entity.id.clone(),
-                    name: entity.name.clone(),
-                    entity_type: entity.entity_type.clone(),
-                    file_path: entity.file_path.clone(),
-                    parent_id: entity.parent_id.clone(),
-                    start_line: entity.start_line,
-                    end_line: entity.end_line,
-                },
-            );
-
-            if let Some(ref pid) = entity.parent_id {
-                parent_child_pairs.insert((pid.as_str(), entity.id.as_str()));
-                child_line_ranges
-                    .entry(pid.clone())
-                    .or_default()
-                    .push((entity.start_line, entity.end_line));
-                class_child_names.insert((pid.as_str(), entity.name.as_str()));
-            }
-
-            if is_nominal_member_container(entity.entity_type.as_str()) {
-                class_entity_names.insert(entity.name.as_str());
-                class_entity_files.insert((entity.name.as_str(), entity.file_path.as_str()));
-            }
-
-            id_to_name.insert(entity.id.as_str(), entity.name.as_str());
-
-            scope_entity_ranges
-                .entry(entity.file_path.clone())
-                .or_default()
-                .push((entity.start_line, entity.end_line, entity.id.clone()));
+        // semx-4an: measure Pass A + Pass B (below) as one bucket — see
+        // `ENTITY_LOOKUP_BUILD_NS`'s doc comment. Stopped right before
+        // `PreBuiltLookups` is constructed, so it covers exactly the same span
+        // the inventory in RESOLUTION-PROFILE.md's "Delta-proportional warm"
+        // section measured.
+        let __entity_lookup_build_t0 = std::time::Instant::now();
+        // A retain-mode build never writes `carry_symbol_table`/etc (see
+        // `maintain_entity_lookups_incremental`'s doc comment — that regime
+        // gets zero benefit from this and stays on the plain whole-rebuild
+        // path), so anything those fields held is stale the instant a
+        // retain-mode build runs and changes the corpus underneath them.
+        // Un-priming here, unconditionally, is what makes the *next*
+        // non-retain build re-derive from a known-good whole rebuild instead
+        // of trusting carry state that predates however many retain-mode
+        // builds happened in between.
+        if retain_parsed_files {
+            *carry_entity_lookups_primed = false;
         }
-        for ranges in child_line_ranges.values_mut() {
-            ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
-        }
+        // Active only on the non-retain (chunked) path of a session build,
+        // and only once the carry fields hold a complete reflection of the
+        // corpus — see `maintain_entity_lookups_incremental`'s doc comment.
+        let use_incremental_lookups =
+            inc.is_some() && !retain_parsed_files && *carry_entity_lookups_primed;
 
-        // Pass B: Build enclosing_class, class_members, and scope_class_members
-        // (depends on id_to_name, class_entity_names, and entity_map from Pass A)
+        // Pass A (borrowed half): lookups that borrow `&str` out of
+        // `all_entities` and so must be rebuilt every build regardless of
+        // incrementality — `all_entities` itself is only ever reconstructed
+        // whole (GREEN-moved or RED-fresh) per build, never carried forward
+        // as a persistent structure the way the owned, `String`-keyed maps
+        // below are. Not part of this bead's scope; see RESOLUTION-
+        // PROFILE.md's "Delta-proportional warm" section.
+        let __lookup_pass_a_t0 = std::time::Instant::now();
+        // No `id_to_name` here (semx-4an): Pass B below needs `id -> name`
+        // only for parent ids, and `entity_map` — built just after this loop
+        // and, on a warm rebuild, not rebuilt at all — already *is* that map
+        // (`EntityInfo::name`), over exactly the same key set (both are
+        // populated once per entity in `all_entities`). Keeping a second
+        // 454k-entry copy cost an `O(corpus)` insert loop on every build for
+        // information the build already had.
+        //
+        // The three groups below were one loop; they share no state and every
+        // structure they build is order-insensitive (two `HashSet`s, and a
+        // `HashMap` whose buckets are explicitly sorted afterwards), so running
+        // them concurrently produces the identical result and turns a sum of
+        // three `O(corpus)` passes into their max. `pairs_and_names` keeps
+        // `parent_child_pairs` and `class_child_names` together because both
+        // are driven by the same `parent_id` test.
+        let pairs_and_names = || {
+            let mut parent_child_pairs: HashSet<(&str, &str)> = HashSet::default();
+            let mut class_child_names: HashSet<(&str, &str)> = HashSet::default();
+            for entity in &all_entities {
+                if let Some(ref pid) = entity.parent_id {
+                    parent_child_pairs.insert((pid.as_str(), entity.id.as_str()));
+                    class_child_names.insert((pid.as_str(), entity.name.as_str()));
+                }
+            }
+            (parent_child_pairs, class_child_names)
+        };
+        let lines = || {
+            let mut child_line_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
+            for entity in &all_entities {
+                if let Some(ref pid) = entity.parent_id {
+                    match child_line_ranges.get_mut(pid.as_str()) {
+                        Some(bucket) => bucket.push((entity.start_line, entity.end_line)),
+                        None => {
+                            child_line_ranges
+                                .insert(pid.clone(), vec![(entity.start_line, entity.end_line)]);
+                        }
+                    }
+                }
+            }
+            for ranges in child_line_ranges.values_mut() {
+                ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+            }
+            child_line_ranges
+        };
+        let classes = || {
+            let mut class_entity_names: HashSet<&str> = HashSet::default();
+            let mut class_entity_files: HashSet<(&str, &str)> = HashSet::default();
+            for entity in &all_entities {
+                if is_nominal_member_container(entity.entity_type.as_str()) {
+                    class_entity_names.insert(entity.name.as_str());
+                    class_entity_files.insert((entity.name.as_str(), entity.file_path.as_str()));
+                }
+            }
+            (class_entity_names, class_entity_files)
+        };
+        #[cfg(feature = "parallel")]
+        let (
+            (parent_child_pairs, class_child_names),
+            (child_line_ranges, (class_entity_names, class_entity_files)),
+        ) = rayon::join(pairs_and_names, || rayon::join(lines, classes));
+        #[cfg(not(feature = "parallel"))]
+        let (
+            (parent_child_pairs, class_child_names),
+            (child_line_ranges, (class_entity_names, class_entity_files)),
+        ) = (pairs_and_names(), (lines(), classes()));
+        resolve_profile::add_lookup_pass_a_ns(__lookup_pass_a_t0.elapsed());
+
+        // Owned, `String`-keyed lookups: session-maintained incrementally on
+        // the non-retain path (semx-4an), rebuilt whole otherwise — see
+        // `maintain_entity_lookups_incremental`'s doc comment for why only
+        // these five (not the borrowed maps above) are candidates for that.
+        let symbol_table_plain: HashMap<String, Vec<String>>;
+        let mut entity_map: HashMap<String, EntityInfo>;
+        let mut scope_class_members: HashMap<String, Vec<(String, String)>>;
+        let mut scope_owner_members: HashMap<String, Vec<(String, String)>>;
+        let mut scope_entity_ranges: HashMap<String, Vec<(usize, usize, String)>>;
+        let mut child_ranges_by_parent: ChildRangeIndex;
+        // `Some` exactly when this build maintained the tables incrementally,
+        // which is also exactly when the corpus fingerprints may be updated
+        // key-by-key instead of refolded whole.
+        let touched_corpus_keys: Option<scope_resolve::TouchedCorpusKeys>;
+
+        let __lookup_owned_t0 = std::time::Instant::now();
+        if use_incremental_lookups {
+            let mut symbol_table_owned = std::mem::take(carry_symbol_table);
+            entity_map = std::mem::take(carry_entity_map);
+            scope_class_members = std::mem::take(carry_class_members);
+            scope_owner_members = std::mem::take(carry_owner_members);
+            scope_entity_ranges = std::mem::take(carry_entity_ranges);
+            child_ranges_by_parent = std::mem::take(carry_child_ranges);
+            touched_corpus_keys = Some(maintain_entity_lookups_incremental(
+                carry_dirty,
+                carry_prev_entities,
+                &all_entities,
+                &entity_spans,
+                &mut symbol_table_owned,
+                &mut entity_map,
+                &mut scope_class_members,
+                &mut scope_owner_members,
+                &mut scope_entity_ranges,
+                &mut child_ranges_by_parent,
+            ));
+            symbol_table_plain = symbol_table_owned;
+        } else {
+            // Unchanged from before semx-4an: whole rebuild, single pass over
+            // all_entities for symbol_table/entity_map/entity_ranges, a
+            // second pass (needs entity_map complete) for class/owner
+            // members.
+            let mut symbol_table_owned: HashMap<String, Vec<String>> =
+                HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+            let mut owned_entity_map: HashMap<String, EntityInfo> =
+                HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+            let mut owned_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
+                HashMap::default();
+            for entity in &all_entities {
+                // No eager `entry(key.clone())` (semx-ws6, audit D4): `entry`
+                // demands an owned key up front, so the old spelling allocated
+                // `name`/`file_path` Strings that were immediately dropped on
+                // every hit — `file_path` once per entity in the file. Same
+                // get_mut/insert idiom `child_line_ranges` above already uses.
+                match symbol_table_owned.get_mut(entity.name.as_str()) {
+                    Some(bucket) => bucket.push(entity.id.clone()),
+                    None => {
+                        symbol_table_owned.insert(entity.name.clone(), vec![entity.id.clone()]);
+                    }
+                }
+                owned_entity_map.insert(
+                    entity.id.clone(),
+                    EntityInfo {
+                        id: entity.id.clone(),
+                        name: entity.name.clone(),
+                        entity_type: entity.entity_type.clone(),
+                        file_path: entity.file_path.clone(),
+                        parent_id: entity.parent_id.clone(),
+                        start_line: entity.start_line,
+                        end_line: entity.end_line,
+                    },
+                );
+                match owned_entity_ranges.get_mut(entity.file_path.as_str()) {
+                    Some(bucket) => {
+                        bucket.push((entity.start_line, entity.end_line, entity.id.clone()))
+                    }
+                    None => {
+                        owned_entity_ranges.insert(
+                            entity.file_path.clone(),
+                            vec![(entity.start_line, entity.end_line, entity.id.clone())],
+                        );
+                    }
+                }
+            }
+            let mut owned_class_members: HashMap<String, Vec<(String, String)>> =
+                HashMap::default();
+            let mut owned_owner_members: HashMap<String, Vec<(String, String)>> =
+                HashMap::default();
+            for entity in &all_entities {
+                if let Some(ref pid) = entity.parent_id {
+                    owned_owner_members
+                        .entry(pid.clone())
+                        .or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                    if let Some(parent) = owned_entity_map.get(pid.as_str()) {
+                        if let Some(owner_name) = scope_resolve::class_member_owner_name(parent) {
+                            owned_class_members
+                                .entry(owner_name.to_string())
+                                .or_default()
+                                .push((entity.name.clone(), entity.id.clone()));
+                        }
+                    }
+                }
+                if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                    if let Some(struct_name) =
+                        scope_resolve::extract_go_receiver_type(&entity.content)
+                    {
+                        owned_class_members
+                            .entry(struct_name)
+                            .or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+            sort_symbol_table_targets_by_source(&mut symbol_table_owned, &owned_entity_map);
+            // semx-yk5: same canonical (file_path, start_line, end_line, id)
+            // tie-break as `symbol_table`, made explicit here instead of
+            // relying on `all_entities` already being in file-path order
+            // (true today, but unstated/unenforced at this site) — see
+            // `sort_all_member_buckets_by_source`'s doc comment. Sorting
+            // before the carry-priming clone below means a later incremental
+            // build's `maintain_entity_lookups_incremental` (which re-sorts
+            // only the buckets it touches) starts from an already-canonical
+            // baseline.
+            sort_all_member_buckets_by_source(&mut owned_class_members, &owned_entity_map);
+            sort_all_member_buckets_by_source(&mut owned_owner_members, &owned_entity_map);
+            sort_all_entity_ranges_by_source(&mut owned_entity_ranges);
+            // Prime the carry for a future non-retain build to maintain
+            // incrementally, if this build is itself a non-retain session
+            // build that took the whole-rebuild path (unprimed carry, first
+            // non-retain build, or a coarse guard). One `O(corpus)` clone —
+            // the same order of cost this whole rebuild already paid — not
+            // paid again until the next un-priming event (see above).
+            let __lookup_child_ranges_t0 = std::time::Instant::now();
+            let owned_child_ranges = build_child_ranges_by_parent(&all_entities);
+            resolve_profile::add_lookup_child_ranges_ns(__lookup_child_ranges_t0.elapsed());
+            if inc.is_some() && !retain_parsed_files {
+                *carry_symbol_table = symbol_table_owned.clone();
+                *carry_entity_map = owned_entity_map.clone();
+                *carry_class_members = owned_class_members.clone();
+                *carry_owner_members = owned_owner_members.clone();
+                *carry_entity_ranges = owned_entity_ranges.clone();
+                *carry_child_ranges = owned_child_ranges.clone();
+                *carry_entity_lookups_primed = true;
+            }
+            symbol_table_plain = symbol_table_owned;
+            entity_map = owned_entity_map;
+            scope_class_members = owned_class_members;
+            scope_owner_members = owned_owner_members;
+            scope_entity_ranges = owned_entity_ranges;
+            child_ranges_by_parent = owned_child_ranges;
+            touched_corpus_keys = None;
+        }
+        resolve_profile::add_lookup_owned_ns(__lookup_owned_t0.elapsed());
+
+        // Pass B (borrowed half): `enclosing_class`/`class_members` need
+        // `class_entity_names` from the borrowed pass above and `entity_map`
+        // from the owned pass, both complete before this runs (a parent can
+        // appear later in `all_entities` than its child) — same reason the
+        // original single-combined-Pass-B code ran as its own loop after
+        // Pass A.
+        let __lookup_pass_b_t0 = std::time::Instant::now();
         let mut enclosing_class: HashMap<&str, &str> = HashMap::default();
         let mut class_members: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
-        let mut scope_class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
-        let mut scope_owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
-
         for entity in &all_entities {
             if let Some(ref pid) = entity.parent_id {
-                scope_owner_members
-                    .entry(pid.clone())
-                    .or_default()
-                    .push((entity.name.clone(), entity.id.clone()));
-                if let Some(&parent_name) = id_to_name.get(pid.as_str()) {
+                if let Some(parent_name) = entity_map.get(pid.as_str()).map(|p| p.name.as_str()) {
                     if class_entity_names.contains(parent_name) {
                         enclosing_class.insert(entity.id.as_str(), parent_name);
                         class_members
@@ -1319,40 +2714,14 @@ impl EntityGraph {
                             .push((entity.name.as_str(), entity.id.as_str()));
                     }
                 }
-                // scope_class_members for scope resolver (checks entity_type of parent)
-                if let Some(parent) = entity_map.get(pid.as_str()) {
-                    if let Some(owner_name) = scope_resolve::class_member_owner_name(parent) {
-                        scope_class_members
-                            .entry(owner_name.to_string())
-                            .or_default()
-                            .push((entity.name.clone(), entity.id.clone()));
-                    }
-                }
-            }
-            // Go receiver-based methods
-            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
-                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content)
-                {
-                    scope_class_members
-                        .entry(struct_name)
-                        .or_default()
-                        .push((entity.name.clone(), entity.id.clone()));
-                }
             }
         }
-        sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
-        let symbol_table = Arc::new(symbol_table);
+        resolve_profile::add_lookup_pass_b_ns(__lookup_pass_b_t0.elapsed());
 
-        // Build import table: (file_path, imported_name) → target entity ID
-        // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
-        let import_table = build_import_table(
-            root,
-            file_paths,
-            &symbol_table,
-            &entity_map,
-            retain_parsed_files.then_some(parsed_files.as_slice()),
-        );
+        let symbol_table = Arc::new(symbol_table_plain);
+
         // Build owned Go package index for scope resolver
+        let __lookup_go_pkg_t0 = std::time::Instant::now();
         let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
             if file_paths.iter().any(|f| f.ends_with(".go")) {
                 let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::default();
@@ -1393,6 +2762,52 @@ impl EntityGraph {
             } else {
                 HashMap::default()
             };
+        resolve_profile::add_lookup_go_pkg_ns(__lookup_go_pkg_t0.elapsed());
+        resolve_profile::add_entity_lookup_build_ns(__entity_lookup_build_t0.elapsed());
+
+        // semx-4w1 checkpoint 1: "post-pass-1" — all_entities plus every
+        // corpus-wide lookup table pass 1's output feeds (entity_map,
+        // symbol_table, class/owner_members, entity_ranges, child_ranges),
+        // before scope resolution (pass 2) or import-table build add
+        // anything. `parsed_files`/`precomputed_facts` are whatever pass 1
+        // already retained (empty on the chunked >PARSED_FILE_REUSE_LIMIT
+        // path for non-JS/TS files — see their own doc comments).
+        if mem_profile::enabled() {
+            let (entities_content, entities_meta) =
+                mem_profile::semantic_entities_bytes(&all_entities);
+            mem_profile::checkpoint(
+                "post-pass-1",
+                &[
+                    mem_profile::entry("all_entities.content", entities_content),
+                    mem_profile::entry("all_entities.metadata", entities_meta),
+                    mem_profile::entry("entity_map", mem_profile::entity_map_bytes(&entity_map)),
+                    mem_profile::entry(
+                        "symbol_table",
+                        mem_profile::string_to_string_vec_map_bytes(symbol_table.as_ref()),
+                    ),
+                    mem_profile::entry(
+                        "class_members",
+                        mem_profile::string_to_pair_vec_map_bytes(&scope_class_members),
+                    ),
+                    mem_profile::entry(
+                        "owner_members",
+                        mem_profile::string_to_pair_vec_map_bytes(&scope_owner_members),
+                    ),
+                    mem_profile::entry(
+                        "entity_ranges",
+                        mem_profile::entity_ranges_bytes(&scope_entity_ranges),
+                    ),
+                    mem_profile::entry(
+                        "parsed_files(path+content)",
+                        mem_profile::parsed_files_content_bytes(&parsed_files),
+                    ),
+                    mem_profile::entry(
+                        "precomputed_facts",
+                        mem_profile::precomputed_facts_bytes(precomputed_facts),
+                    ),
+                ],
+            );
+        }
 
         let pre_built = scope_resolve::PreBuiltLookups {
             symbol_table: Arc::clone(&symbol_table),
@@ -1400,10 +2815,174 @@ impl EntityGraph {
             owner_members: scope_owner_members,
             entity_ranges: scope_entity_ranges,
             go_pkg_index: owned_go_pkg_index,
+            ext_overrides: registry
+                .ext_overrides()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
 
         GRAPH_RESOLVE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
         report_build_phase(BuildPhase::Resolving);
+
+        // Fingerprint every corpus-wide table before a single file's read set is
+        // evaluated. A read set names keys, not tables, so the comparison is only
+        // meaningful once the map it compares against is complete for the tables
+        // that stage can reach. `SymbolTable`/`EntityMap` are fingerprinted here,
+        // *before* the import table is built (semx-h1s moved this up from after),
+        // because `build_import_table_incremental`'s own GREEN test needs them
+        // already populated in `cur_fp`.
+        if let Some(state) = inc.as_deref_mut() {
+            let __fingerprint_corpus_tables_t0 = std::time::Instant::now();
+            // semx-4an: the five corpus tables' fingerprints live in their own
+            // session-owned map (`carry_corpus_fp`), maintained key-by-key
+            // alongside the tables themselves and then *copied* into this
+            // build's `cur_fp`, which the rest of the build adds the
+            // per-chunk/import/bag-of-words tables to. They cannot simply share
+            // one map across builds: `cur_fp` also holds tables that are
+            // refolded whole every build, and seeding those from the previous
+            // build would leave a vanished key reading back as its stale value
+            // — the one failure mode that turns a should-be-RED file GREEN.
+            //
+            // Falls back to the whole fold whenever the tables themselves were
+            // rebuilt whole, or whenever `go_pkg_index` is non-empty (a `.go`
+            // corpus): that index has no per-file key index, so its keys'
+            // disappearance cannot be detected key-by-key.
+            match touched_corpus_keys
+                .as_ref()
+                .filter(|_| pre_built.go_pkg_index.is_empty() && !carry_corpus_fp.is_empty())
+            {
+                Some(touched) => scope_resolve::fingerprint_corpus_tables_incremental(
+                    touched,
+                    &pre_built,
+                    &entity_map,
+                    carry_corpus_fp,
+                    carry_wildcard_guard,
+                ),
+                None => {
+                    let mut fresh = crate::parser::incremental::TableFingerprints::default();
+                    *carry_wildcard_guard = scope_resolve::fingerprint_corpus_tables(
+                        &pre_built,
+                        &entity_map,
+                        &mut fresh,
+                    );
+                    *carry_corpus_fp = fresh;
+                }
+            }
+            // Parity gate (semx-4an). Off by default and costed at exactly one
+            // env lookup; with `SEM_FP_PARITY=1` every build additionally does
+            // the whole fold it just avoided and panics unless the two maps and
+            // the guard agree entry-for-entry. This is what the "parity vs
+            // whole-fold across all mutation scenarios" gate is discharged
+            // with, on the real monster corpus, not on a fixture.
+            if fp_parity_check_enabled() {
+                let mut expected = crate::parser::incremental::TableFingerprints::default();
+                let expected_guard = scope_resolve::fingerprint_corpus_tables(
+                    &pre_built,
+                    &entity_map,
+                    &mut expected,
+                );
+                assert_eq!(
+                    expected_guard, *carry_wildcard_guard,
+                    "SEM_FP_PARITY: incremental wildcard-import guard diverged from the whole fold"
+                );
+                assert!(
+                    expected == *carry_corpus_fp,
+                    "SEM_FP_PARITY: incremental corpus fingerprints diverged from the whole fold \
+                     (incremental has {} keys, whole fold has {})",
+                    carry_corpus_fp.len(),
+                    expected.len()
+                );
+            }
+            state.cur_fp = carry_corpus_fp.clone();
+            resolve_profile::add_fingerprint_corpus_tables_ns(
+                __fingerprint_corpus_tables_t0.elapsed(),
+            );
+        }
+
+        // Build import table: (file_path, imported_name) → target entity ID
+        // e.g. ("io_handler.py", "validate") → "core.py::function::validate"
+        //
+        // A session build (`inc.is_some()`) maintains `import_table_carry`
+        // in place across rebuilds instead of rebuilding it whole — see
+        // `build_import_table_incremental`'s doc comment (semx-h1s). Every
+        // other caller (`inc.is_none()`) is untouched: the original pure
+        // function, byte-for-byte.
+        let import_table_owned;
+        let import_table: &HashMap<(String, String), String> = if inc.is_some() {
+            build_import_table_incremental(
+                root,
+                file_paths,
+                &symbol_table,
+                &entity_map,
+                retain_parsed_files.then_some(parsed_files.as_slice()),
+                eligible,
+                inc.as_deref_mut(),
+                import_scans,
+                import_table_carry,
+                import_keys,
+            );
+            &*import_table_carry
+        } else {
+            import_table_owned = build_import_table(
+                root,
+                file_paths,
+                &symbol_table,
+                &entity_map,
+                retain_parsed_files.then_some(parsed_files.as_slice()),
+            );
+            &import_table_owned
+        };
+
+        if let Some(state) = inc.as_deref_mut() {
+            fingerprint_import_table(import_table, &mut state.cur_fp);
+        }
+
+        // semx-bkz: snapshot every file's content now, while pass 1's
+        // (`parsed_files`/`precomputed_facts`) is still in hand and before
+        // `parsed_files` is moved into scope resolution just below. See
+        // `snapshot_bow_content`'s doc comment.
+        let pre_parsed_content = snapshot_bow_content(file_paths, &parsed_files, precomputed_facts);
+
+        // semx-4w1 checkpoint 2: "peak-resolve" — right before scope
+        // resolution (pass 2) starts. Everything checkpoint 1 held is still
+        // live, plus `import_table` (just built) and `pre_parsed_content`
+        // (bag-of-words's content snapshot, just taken). This is the
+        // structural peak: pass 2 itself only adds edges/consumed-words,
+        // which are far smaller than the corpus-wide tables already built.
+        if mem_profile::enabled() {
+            let (entities_content, entities_meta) =
+                mem_profile::semantic_entities_bytes(&all_entities);
+            mem_profile::checkpoint(
+                "peak-resolve",
+                &[
+                    mem_profile::entry("all_entities.content", entities_content),
+                    mem_profile::entry("all_entities.metadata", entities_meta),
+                    mem_profile::entry("entity_map", mem_profile::entity_map_bytes(&entity_map)),
+                    mem_profile::entry(
+                        "symbol_table",
+                        mem_profile::string_to_string_vec_map_bytes(symbol_table.as_ref()),
+                    ),
+                    mem_profile::entry(
+                        "parsed_files(path+content)",
+                        mem_profile::parsed_files_content_bytes(&parsed_files),
+                    ),
+                    mem_profile::entry(
+                        "precomputed_facts",
+                        mem_profile::precomputed_facts_bytes(precomputed_facts),
+                    ),
+                    mem_profile::entry(
+                        "pre_parsed_content(bow)",
+                        mem_profile::cow_content_map_bytes(&pre_parsed_content),
+                    ),
+                    mem_profile::entry(
+                        "import_table",
+                        mem_profile::pair_key_string_map_bytes(import_table),
+                    ),
+                ],
+            );
+        }
+
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
             let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
@@ -1411,7 +2990,15 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
+        let __scope_wall_t0 = std::time::Instant::now();
         let (scope_edges, scope_consumed_words) = if has_scope_lang && retain_parsed_files {
+            let mut scope_inc = inc
+                .as_deref_mut()
+                .map(|state| scope_resolve::ScopeIncremental {
+                    inc: state,
+                    scope_tag: 0,
+                    eligible,
+                });
             let result = scope_resolve::resolve_with_scopes_full(
                 root,
                 file_paths,
@@ -1419,8 +3006,9 @@ impl EntityGraph {
                 &entity_map,
                 Some(parsed_files),
                 Some(&pre_built),
-                Some(&import_table),
+                Some(import_table),
                 false,
+                scope_inc.as_mut(),
             );
             (result.edges, result.consumed_words)
         } else if has_scope_lang {
@@ -1430,16 +3018,73 @@ impl EntityGraph {
                 &all_entities,
                 &entity_map,
                 &pre_built,
-                &import_table,
+                import_table,
+                precomputed_facts,
+                inc.as_deref_mut(),
+                eligible,
             )
         } else {
             (vec![], HashMap::default())
         };
+        resolve_profile::add_scope_wall_ns(__scope_wall_t0.elapsed());
 
-        let imports_by_file = build_imports_by_file(&import_table);
+        // semx-4w1 checkpoint 2.5: "post-scope-resolve" — right after pass 2's
+        // scope-resolution stage returns. Everything checkpoint 2 held is
+        // gone or shrinking (per-chunk trees/content freed chunk by chunk),
+        // but `scope_edges` and, especially, `scope_consumed_words`
+        // (entity_id -> {consumed word, ...}, one `HashSet<String>` per
+        // resolved entity, accumulated across every chunk) are now fully
+        // populated and live through `resolve_references_with_file_indexes`
+        // below — a structure the first two checkpoints never sized at all.
+        if mem_profile::enabled() {
+            mem_profile::checkpoint(
+                "post-scope-resolve",
+                &[
+                    mem_profile::entry(
+                        "scope_edges",
+                        scope_edges.len() * std::mem::size_of::<(String, String, RefType)>()
+                            + scope_edges
+                                .iter()
+                                .map(|(a, b, _)| a.capacity() + b.capacity())
+                                .sum::<usize>(),
+                    ),
+                    mem_profile::entry(
+                        "scope_consumed_words",
+                        mem_profile::string_to_string_set_map_bytes(&scope_consumed_words),
+                    ),
+                ],
+            );
+        }
+
+        let __post_resolve_t0 = std::time::Instant::now();
+        // `pre_built` was used for the last time above (`resolve_with_scopes_
+        // full`/`resolve_scopes_in_file_chunks`, both by shared reference) —
+        // reclaim its owned `class_members`/`owner_members`/`entity_ranges`
+        // fields back into the session so the *next* build's incremental
+        // maintenance has them, instead of letting them drop with the
+        // struct. Only meaningful when this build itself used the
+        // incremental path — the whole-rebuild branch already wrote a copy
+        // into carry directly, before `pre_built` ever took ownership.
+        if use_incremental_lookups {
+            let scope_resolve::PreBuiltLookups {
+                class_members: reclaimed_class_members,
+                owner_members: reclaimed_owner_members,
+                entity_ranges: reclaimed_entity_ranges,
+                ..
+            } = pre_built;
+            *carry_class_members = reclaimed_class_members;
+            *carry_owner_members = reclaimed_owner_members;
+            *carry_entity_ranges = reclaimed_entity_ranges;
+        }
+
+        let __imports_by_file_t0 = std::time::Instant::now();
+        let imports_by_file = build_imports_by_file(import_table);
+        resolve_profile::add_imports_by_file_ns(__imports_by_file_t0.elapsed());
+        let __symbol_table_by_file_t0 = std::time::Instant::now();
+        let symbol_table_by_file = build_symbol_table_by_file(symbol_table.as_ref(), &entity_map);
+        resolve_profile::add_symbol_table_by_file_ns(__symbol_table_by_file_t0.elapsed());
         let reference_context = ReferenceResolutionContext {
-            symbol_table: symbol_table.as_ref(),
-            entity_map: &entity_map,
+            symbol_table_by_file: &symbol_table_by_file,
             imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
             child_ranges_by_parent: &child_ranges_by_parent,
@@ -1450,51 +3095,129 @@ impl EntityGraph {
             enclosing_class: &enclosing_class,
             class_members: &class_members,
         };
+        // Bag-of-words reads three tables scope resolution does not, so they are
+        // fingerprinted here, immediately before its read sets are evaluated.
+        if let Some(state) = inc.as_deref_mut() {
+            let __fingerprint_bow_t0 = std::time::Instant::now();
+            fingerprint_bow_tables(
+                &class_members,
+                &class_entity_files,
+                &parent_child_pairs,
+                &mut state.cur_fp,
+            );
+            resolve_profile::add_fingerprint_bow_tables_ns(__fingerprint_bow_t0.elapsed());
+        }
         let resolved_refs = resolve_references_with_file_indexes(
             root,
             file_paths,
             &all_entities,
             None,
             &reference_context,
+            inc.as_deref_mut(),
+            &pre_parsed_content,
         );
+        // `symbol_table` (the `Arc`) was last borrowed via `reference_context`
+        // (through `symbol_table_by_file`, itself a borrowed view into it) in
+        // the call just above — NLL ends that borrow there, no explicit drop
+        // needed. Reclaim it back into the session, mirroring the
+        // `class_members`/`owner_members`/`entity_ranges` reclaim above —
+        // `pre_built`'s own `Arc::clone` has already been discarded by then
+        // (see the destructure above), so this should be the sole remaining
+        // handle and `try_unwrap` should always succeed; the fallback clone
+        // is a conservative safety net only, so a bug that adds another
+        // clone somewhere between here and the top of this function
+        // degrades to "as slow as before" rather than a panic.
+        if use_incremental_lookups {
+            *carry_symbol_table = match Arc::try_unwrap(symbol_table) {
+                Ok(map) => map,
+                Err(arc) => (*arc).clone(),
+            };
+            // Same reclaim, for the child-range index: `reference_context`'s
+            // borrow of it also ends at the call above.
+            *carry_child_ranges = std::mem::take(&mut child_ranges_by_parent);
+        } else {
+            drop(symbol_table);
+        }
 
-        let export_edges = build_export_alias_edges(&all_entities, &import_table);
+        let __export_edges_t0 = std::time::Instant::now();
+        let export_edges = build_export_alias_edges(&all_entities, import_table);
+        resolve_profile::add_export_edges_ns(__export_edges_t0.elapsed());
 
         // Merge scope edges with bag-of-words edges, deduplicating
         let mut combined: Vec<(String, String, RefType)> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
+        let __dedupe_t0 = std::time::Instant::now();
         let mut all_resolved = dedupe_resolved_edges(combined);
+        resolve_profile::add_dedupe_ns(__dedupe_t0.elapsed());
+        let __sort_t0 = std::time::Instant::now();
         sort_resolved_refs(&mut all_resolved);
+        resolve_profile::add_sort_ns(__sort_t0.elapsed());
 
-        // Build edge indexes from resolved references
-        let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
-        let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::default();
-
-        for (from_entity, to_entity, ref_type) in all_resolved {
-            dependents
-                .entry(to_entity.clone())
-                .or_default()
-                .push(from_entity.clone());
-            dependencies
-                .entry(from_entity.clone())
-                .or_default()
-                .push(to_entity.clone());
-            edges.push(EntityRef {
+        // Wrap resolved references as edges. The two adjacency maps that
+        // used to be built alongside — four id-String clones per edge, ~160
+        // ms and ~450 MB on the giants — were written on every cold build
+        // and never read by it (the index writer builds REFS from `edges`;
+        // warm impact/context answers come from `index.sem`). They are now
+        // derived lazily from `edges` on first demand (semx-ws6, audit D7;
+        // see `EntityGraph::adjacency`).
+        let __edge_index_t0 = std::time::Instant::now();
+        let edges: Vec<EntityRef> = all_resolved
+            .into_iter()
+            .map(|(from_entity, to_entity, ref_type)| EntityRef {
                 from_entity,
                 to_entity,
                 ref_type,
-            });
+            })
+            .collect();
+        resolve_profile::add_edge_index_ns(__edge_index_t0.elapsed());
+        resolve_profile::add_post_resolve_ns(__post_resolve_t0.elapsed());
+
+        // Moved, not re-collected (semx-4an): `EntityInfoMap` is the exact
+        // type of `entity_map`, so no hash table is rebuilt here.
+        let graph = EntityGraph::assemble(entity_map, edges);
+
+        // semx-4w1 checkpoint 3: "post-build" — everything transient to
+        // resolution (precomputed_facts, pre_parsed_content, import_table,
+        // parsed_files, the pre-move class/owner_members/entity_ranges) has
+        // already been dropped or reclaimed into the session carry by this
+        // point. What remains is the actual return value plus the corpus
+        // tables an in-process caller keeps using afterward — this is the
+        // build's genuine floor, not a transient peak.
+        if mem_profile::enabled() {
+            let (entities_content, entities_meta) =
+                mem_profile::semantic_entities_bytes(&all_entities);
+            mem_profile::checkpoint(
+                "post-build",
+                &[
+                    mem_profile::entry("all_entities.content", entities_content),
+                    mem_profile::entry("all_entities.metadata", entities_meta),
+                    mem_profile::entry(
+                        "graph.entities(EntityInfo)",
+                        mem_profile::entity_map_bytes(&graph.entities),
+                    ),
+                    mem_profile::entry("graph.edges", mem_profile::entity_refs_bytes(&graph.edges)),
+                    // Honest zeros post-D7: the adjacency maps are no longer
+                    // materialized by the build; they cost nothing until a
+                    // consumer demands them (and this checkpoint reports the
+                    // graph as built, not as a hypothetical consumer sees it).
+                    mem_profile::entry(
+                        "graph.dependents",
+                        graph.adjacency.get().map_or(0, |a| {
+                            mem_profile::string_to_string_vec_map_bytes(&a.dependents)
+                        }),
+                    ),
+                    mem_profile::entry(
+                        "graph.dependencies",
+                        graph.adjacency.get().map_or(0, |a| {
+                            mem_profile::string_to_string_vec_map_bytes(&a.dependencies)
+                        }),
+                    ),
+                ],
+            );
         }
 
-        let graph = EntityGraph {
-            entities: entity_map.into_iter().collect(),
-            edges,
-            dependents: dependents.into_iter().collect(),
-            dependencies: dependencies.into_iter().collect(),
-        };
-
+        resolve_profile::maybe_print_report();
         (graph, all_entities)
     }
 
@@ -1640,6 +3363,13 @@ impl EntityGraph {
         }
         sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
         let symbol_table = Arc::new(symbol_table);
+        // semx-yk5: same canonical tie-break as `symbol_table` above, made
+        // explicit for `scope_class_members`/`scope_owner_members`/
+        // `scope_entity_ranges` too — see `sort_all_member_buckets_by_source`'s
+        // doc comment.
+        sort_all_member_buckets_by_source(&mut scope_class_members, &entity_map);
+        sort_all_member_buckets_by_source(&mut scope_owner_members, &entity_map);
+        sort_all_entity_ranges_by_source(&mut scope_entity_ranges);
 
         let mut needs_resolution: HashSet<String> = HashSet::default();
         let mut resolve_file_paths: Vec<String> = Vec::new();
@@ -1661,19 +3391,22 @@ impl EntityGraph {
 
         if needs_resolution.is_empty() {
             return (
-                EntityGraph {
-                    entities: entity_map.into_iter().collect(),
-                    edges: Vec::new(),
-                    dependents: EntityAdjacencyMap::default(),
-                    dependencies: EntityAdjacencyMap::default(),
-                },
+                EntityGraph::assemble(entity_map.into_iter().collect(), Vec::new()),
                 all_entities,
             );
         }
 
         let scope_file_paths = if file_paths.len() > PARSED_FILE_REUSE_LIMIT {
             let mut scoped = Vec::new();
-            for chunk in file_paths.chunks(SCOPE_RESOLVE_FILE_CHUNK_SIZE) {
+            // semx-g6t: same byte-budget partition as `resolve_scopes_in_file_chunks`
+            // (no `scope_tag`/incremental state threaded through this path, so
+            // there is no cross-call consistency requirement here — this is
+            // purely a re-parse batching/locality heuristic, same RSS-bounding
+            // motivation as the chunked path).
+            for chunk_range in
+                chunk_files_by_byte_budget(root, file_paths, SCOPE_RESOLVE_BYTE_BUDGET)
+            {
+                let chunk = &file_paths[chunk_range];
                 if chunk.iter().any(|file| resolve_file_set.contains(file)) {
                     scoped.extend(chunk.iter().cloned());
                 }
@@ -1725,7 +3458,25 @@ impl EntityGraph {
             owner_members: scope_owner_members,
             entity_ranges: scope_entity_ranges,
             go_pkg_index: owned_go_pkg_index,
+            ext_overrides: registry
+                .ext_overrides()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
+
+        // semx-bkz: same as `build_incremental_core` — snapshot content from
+        // `parsed_files` before it's moved into scope resolution just below.
+        // No `PrecomputedFileFacts` mechanism exists on this API, so files
+        // outside `parsed_files` fall back to a disk read, unchanged from
+        // before this bead.
+        // Bound the empty facts map to a local so the borrowed content map
+        // (semx-3tb) can outlive the call — this API has no precomputed
+        // facts, so every entry here is `Cow::Owned` exactly as before.
+        let no_precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
+            HashMap::default();
+        let pre_parsed_content =
+            snapshot_bow_content(&resolve_file_paths, &parsed_files, &no_precomputed);
 
         let needs_resolution_refs: HashSet<&str> =
             needs_resolution.iter().map(String::as_str).collect();
@@ -1746,9 +3497,9 @@ impl EntityGraph {
         };
 
         let imports_by_file = build_imports_by_file(&import_table);
+        let symbol_table_by_file = build_symbol_table_by_file(symbol_table.as_ref(), &entity_map);
         let reference_context = ReferenceResolutionContext {
-            symbol_table: symbol_table.as_ref(),
-            entity_map: &entity_map,
+            symbol_table_by_file: &symbol_table_by_file,
             imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
             child_ranges_by_parent: &child_ranges_by_parent,
@@ -1765,6 +3516,8 @@ impl EntityGraph {
             &all_entities,
             Some(&needs_resolution_refs),
             &reference_context,
+            None,
+            &pre_parsed_content,
         );
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table)
@@ -1781,33 +3534,19 @@ impl EntityGraph {
         let mut all_resolved = dedupe_resolved_edges(combined);
         sort_resolved_refs(&mut all_resolved);
 
-        let mut edges: Vec<EntityRef> = Vec::with_capacity(all_resolved.len());
-        let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::default();
-
-        for (from_entity, to_entity, ref_type) in all_resolved {
-            dependents
-                .entry(to_entity.clone())
-                .or_default()
-                .push(from_entity.clone());
-            dependencies
-                .entry(from_entity.clone())
-                .or_default()
-                .push(to_entity.clone());
-            edges.push(EntityRef {
+        // Adjacency derived lazily from `edges` on demand (audit D7), same
+        // as the whole-corpus build path.
+        let edges: Vec<EntityRef> = all_resolved
+            .into_iter()
+            .map(|(from_entity, to_entity, ref_type)| EntityRef {
                 from_entity,
                 to_entity,
                 ref_type,
-            });
-        }
+            })
+            .collect();
 
         (
-            EntityGraph {
-                entities: entity_map.into_iter().collect(),
-                edges,
-                dependents: dependents.into_iter().collect(),
-                dependencies: dependencies.into_iter().collect(),
-            },
+            EntityGraph::assemble(entity_map.into_iter().collect(), edges),
             all_entities,
         )
     }
@@ -2437,15 +4176,13 @@ impl EntityGraph {
                 }
             }
         }
-        for members in scope_class_members.values_mut() {
-            members.sort_unstable();
-        }
-        for members in scope_owner_members.values_mut() {
-            members.sort_unstable();
-        }
-        for ranges in scope_entity_ranges.values_mut() {
-            ranges.sort_unstable();
-        }
+        // semx-yk5: canonical (file_path, start_line, end_line, id)
+        // source-position tie-break, not the previous plain lexicographic
+        // `(member_name, member_id)` sort — see `sort_all_member_buckets_by_source`'s
+        // doc comment.
+        sort_all_member_buckets_by_source(&mut scope_class_members, &entity_map);
+        sort_all_member_buckets_by_source(&mut scope_owner_members, &entity_map);
+        sort_all_entity_ranges_by_source(&mut scope_entity_ranges);
 
         // Run scope-aware resolver only on files that need resolution
         let resolve_file_paths: Vec<String> = all_file_paths
@@ -2462,6 +4199,18 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
+        // semx-bkz: snapshot content from `parsed_files` (the stale files this
+        // call reparsed) before it's consumed by `.into_iter()` just below.
+        // Clean files' content isn't retained on this legacy incremental API,
+        // so they fall back to a disk read here, unchanged from before this
+        // bead.
+        // Bound the empty facts map to a local so the borrowed content map
+        // (semx-3tb) can outlive the call — this API has no precomputed
+        // facts, so every entry here is `Cow::Owned` exactly as before.
+        let no_precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
+            HashMap::default();
+        let pre_parsed_content =
+            snapshot_bow_content(&resolve_file_paths, &parsed_files, &no_precomputed);
         let (scope_edges, scope_consumed_words) = if has_scope_lang {
             // Pass pre-parsed stale-file trees; scope_resolve reads affected clean files from disk
             let resolve_set: HashSet<&str> =
@@ -2487,6 +4236,11 @@ impl EntityGraph {
                 owner_members: scope_owner_members,
                 entity_ranges: scope_entity_ranges,
                 go_pkg_index: owned_go_pkg_index,
+                ext_overrides: registry
+                    .ext_overrides()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             };
             let result = scope_resolve::resolve_with_scopes_full(
                 root,
@@ -2497,6 +4251,7 @@ impl EntityGraph {
                 Some(&pre_built),
                 Some(&import_table),
                 false,
+                None,
             );
             (result.edges, result.consumed_words)
         } else {
@@ -2504,9 +4259,9 @@ impl EntityGraph {
         };
 
         let imports_by_file = build_imports_by_file(&import_table);
+        let symbol_table_by_file = build_symbol_table_by_file(symbol_table.as_ref(), &entity_map);
         let reference_context = ReferenceResolutionContext {
-            symbol_table: symbol_table.as_ref(),
-            entity_map: &entity_map,
+            symbol_table_by_file: &symbol_table_by_file,
             imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
             child_ranges_by_parent: &child_ranges_by_parent,
@@ -2523,6 +4278,8 @@ impl EntityGraph {
             &all_entities,
             Some(&needs_resolution),
             &reference_context,
+            None,
+            &pre_parsed_content,
         );
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table);
@@ -2591,7 +4348,7 @@ impl EntityGraph {
 
     /// Get entities that depend on the given entity (reverse deps).
     pub fn get_dependents(&self, entity_id: &str) -> Vec<&EntityInfo> {
-        self.dependents
+        self.dependents()
             .get(entity_id)
             .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
             .unwrap_or_default()
@@ -2599,7 +4356,7 @@ impl EntityGraph {
 
     /// Get entities that the given entity depends on (forward deps).
     pub fn get_dependencies(&self, entity_id: &str) -> Vec<&EntityInfo> {
-        self.dependencies
+        self.dependencies()
             .get(entity_id)
             .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
             .unwrap_or_default()
@@ -2632,7 +4389,7 @@ impl EntityGraph {
         visited.insert(start_key);
 
         while let Some((current, depth)) = queue.pop_front() {
-            if let Some(deps) = self.dependents.get(current) {
+            if let Some(deps) = self.dependents().get(current) {
                 let next_depth = depth + 1;
                 if max_depth > 0 && next_depth > max_depth {
                     continue;
@@ -2670,7 +4427,7 @@ impl EntityGraph {
             if result.len() >= max_visited {
                 break;
             }
-            if let Some(deps) = self.dependents.get(current) {
+            if let Some(deps) = self.dependents().get(current) {
                 for dep in deps {
                     if visited.insert(dep.as_str()) {
                         if let Some(info) = self.entities.get(dep.as_str()) {
@@ -2708,7 +4465,7 @@ impl EntityGraph {
             if count >= max_count {
                 break;
             }
-            if let Some(deps) = self.dependents.get(current) {
+            if let Some(deps) = self.dependents().get(current) {
                 for dep in deps {
                     if visited.insert(dep.as_str()) {
                         count += 1;
@@ -2726,24 +4483,30 @@ impl EntityGraph {
 
     /// Filter entities to those that look like tests.
     /// Uses name heuristics, file path patterns, and content patterns.
-    pub fn filter_test_entities(
+    ///
+    /// Borrows the ids out of `entities` (semx-ws6, audit D5): every consumer
+    /// — the index writer's per-entity flag lookup, the SQL `entity_flags`
+    /// insert, `test_impact`'s membership check — only ever *reads* the set
+    /// while `entities` is still alive, so an owned `String` per test entity
+    /// was a pure allocation tax at corpus scale.
+    pub fn filter_test_entities<'a>(
         &self,
-        entities: &[crate::model::entity::SemanticEntity],
-    ) -> StdHashSet<String> {
+        entities: &'a [crate::model::entity::SemanticEntity],
+    ) -> StdHashSet<&'a str> {
         self.filter_test_entities_with_custom_dirs(entities, &[])
     }
 
     /// Like [`filter_test_entities`], but also considers user-configured
     /// test directories from `.semrc`.
-    pub fn filter_test_entities_with_custom_dirs(
+    pub fn filter_test_entities_with_custom_dirs<'a>(
         &self,
-        entities: &[crate::model::entity::SemanticEntity],
+        entities: &'a [crate::model::entity::SemanticEntity],
         custom_test_dirs: &[String],
-    ) -> StdHashSet<String> {
+    ) -> StdHashSet<&'a str> {
         let mut test_ids = StdHashSet::new();
         for entity in entities {
             if is_test_entity(entity, custom_test_dirs) {
-                test_ids.insert(entity.id.clone());
+                test_ids.insert(entity.id.as_str());
             }
         }
         test_ids
@@ -2771,7 +4534,7 @@ impl EntityGraph {
         let impact = self.impact_analysis(entity_id);
         impact
             .into_iter()
-            .filter(|info| test_ids.contains(&info.id))
+            .filter(|info| test_ids.contains(info.id.as_str()))
             .collect()
     }
 
@@ -2871,7 +4634,7 @@ impl EntityGraph {
             .values()
             .filter(|e| !affected_files.contains(&e.file_path))
             .filter(|e| {
-                self.dependencies.get(&e.id).map_or(false, |deps| {
+                self.dependencies().get(&e.id).map_or(false, |deps| {
                     deps.iter().any(|dep_id| {
                         self.entities
                             .get(dep_id)
@@ -2930,23 +4693,28 @@ impl EntityGraph {
             !id_set.contains(e.from_entity.as_str()) && !id_set.contains(e.to_entity.as_str())
         });
 
-        // Clean up dependency/dependent indexes
-        for id in &ids_to_remove {
-            // Remove forward deps
-            if let Some(deps) = self.dependencies.remove(id) {
-                // Also remove from reverse index
-                for dep in &deps {
-                    if let Some(dependents) = self.dependents.get_mut(dep) {
-                        dependents.retain(|d| d != id);
+        // Clean up dependency/dependent indexes — only if they were ever
+        // materialized (audit D7). An unbuilt adjacency needs no maintenance:
+        // whenever it is later demanded, it derives from the already-pruned
+        // `edges`, which is exactly the state this loop maintains toward.
+        if let Some(adj) = self.adjacency.get_mut() {
+            for id in &ids_to_remove {
+                // Remove forward deps
+                if let Some(deps) = adj.dependencies.remove(id) {
+                    // Also remove from reverse index
+                    for dep in &deps {
+                        if let Some(dependents) = adj.dependents.get_mut(dep) {
+                            dependents.retain(|d| d != id);
+                        }
                     }
                 }
-            }
-            // Remove reverse deps
-            if let Some(deps) = self.dependents.remove(id) {
-                // Also remove from forward index
-                for dep in &deps {
-                    if let Some(dependencies) = self.dependencies.get_mut(dep) {
-                        dependencies.retain(|d| d != id);
+                // Remove reverse deps
+                if let Some(deps) = adj.dependents.remove(id) {
+                    // Also remove from forward index
+                    for dep in &deps {
+                        if let Some(dependencies) = adj.dependencies.get_mut(dep) {
+                            dependencies.retain(|d| d != id);
+                        }
                     }
                 }
             }
@@ -2978,7 +4746,7 @@ impl EntityGraph {
         &mut self,
         entity: &SemanticEntity,
         symbol_table: &HashMap<String, Vec<String>>,
-        child_ranges_by_parent: &HashMap<&str, Vec<ChildRange<'_>>>,
+        child_ranges_by_parent: &ChildRangeIndex,
     ) {
         let stripped = strip_comments_and_strings(&entity.content);
         let refs = extract_references_with_stripped_filtered(
@@ -3018,14 +4786,19 @@ impl EntityGraph {
                         to_entity: target_id.clone(),
                         ref_type,
                     });
-                    self.dependents
-                        .entry(target_id.clone())
-                        .or_default()
-                        .push(entity.id.clone());
-                    self.dependencies
-                        .entry(entity.id.clone())
-                        .or_default()
-                        .push(target_id.clone());
+                    // Mirror into the adjacency maps only if they were ever
+                    // materialized (audit D7) — an unbuilt adjacency derives
+                    // this exact edge from `edges` on later demand.
+                    if let Some(adj) = self.adjacency.get_mut() {
+                        adj.dependents
+                            .entry(target_id.clone())
+                            .or_default()
+                            .push(entity.id.clone());
+                        adj.dependencies
+                            .entry(entity.id.clone())
+                            .or_default()
+                            .push(target_id.clone());
+                    }
                 }
             }
         }
@@ -3093,6 +4866,64 @@ pub fn is_test_entity(
     in_test_file && has_test_marker
 }
 
+/// Fingerprint the corpus-wide import table, one entry per importing file.
+///
+/// Hashed order-independently: the table is a `HashMap`, and its keys are unique
+/// per `(file, name)`, so the *content* of a file's slice is stable even though
+/// iteration order is not.
+fn fingerprint_import_table(
+    import_table: &HashMap<(String, String), String>,
+    fp: &mut TableFingerprints,
+) {
+    let mut by_file: HashMap<&str, Vec<(&str, &str)>> = HashMap::default();
+    for ((file_path, name), target_id) in import_table {
+        by_file
+            .entry(file_path.as_str())
+            .or_default()
+            .push((name.as_str(), target_id.as_str()));
+    }
+    let mut sink = crate::parser::incremental::FingerprintSink::new(fp, 0);
+    for (file_path, mut entries) in by_file {
+        entries.sort_unstable();
+        let mut h = ValueHasher::new();
+        for (name, target) in entries {
+            h.s(name).s(target);
+        }
+        sink.one(Table::ImportsForFile, file_path, h.finish());
+    }
+}
+
+/// Fingerprint the three bag-of-words structures whose keys can name another
+/// file's data. The rest of `ReferenceResolutionContext` is keyed by the
+/// resolving entity's own id or own file path, which the file's own content hash
+/// already covers (entity ids are `{file_path}::…` by construction).
+fn fingerprint_bow_tables(
+    class_members: &HashMap<&str, Vec<(&str, &str)>>,
+    class_entity_files: &HashSet<(&str, &str)>,
+    parent_child_pairs: &HashSet<(&str, &str)>,
+    fp: &mut TableFingerprints,
+) {
+    let mut sink = crate::parser::incremental::FingerprintSink::new(fp, 0);
+    for (owner, members) in class_members {
+        let mut sorted: Vec<(&str, &str)> = members.clone();
+        sorted.sort_unstable();
+        let mut h = ValueHasher::new();
+        for (name, id) in sorted {
+            h.s(name).s(id);
+        }
+        sink.one(Table::BowClassMembers, owner, h.finish());
+    }
+    // Membership sets: presence is the value, so a present key fingerprints to a
+    // constant and an absent key simply has no entry. `ReadSet::unchanged`
+    // compares `Option`s, so appearing and disappearing are both changes.
+    for (name, file_path) in class_entity_files {
+        sink.two(Table::BowClassEntityFiles, name, file_path, 1);
+    }
+    for (parent, child) in parent_child_pairs {
+        sink.two(Table::BowParentChildPairs, parent, child, 1);
+    }
+}
+
 fn build_export_alias_edges(
     all_entities: &[SemanticEntity],
     import_table: &HashMap<(String, String), String>,
@@ -3121,24 +4952,46 @@ struct TsTopLevelEntityTable {
     sorted_files: Vec<String>,
 }
 
+#[derive(Clone)]
 struct TsDefaultReExport {
     file_path: String,
     original_name: String,
     module_path: String,
 }
 
+#[derive(Clone)]
 struct PendingDefaultImport {
     file_path: String,
     local_name: String,
     module_path: String,
 }
 
+#[derive(Clone)]
 struct PendingNamespaceImport {
     file_path: String,
     alias: String,
     module_path: String,
 }
 
+/// A named import or named re-export before it is resolved against
+/// `symbol_table`: everything `resolve_named_import_tracked` (semx-h1s) needs
+/// to redo that resolution later without re-reading or re-scanning the file's
+/// content, so a file whose only invalidating change is "a name it imports
+/// moved elsewhere" can be re-resolved from its cached scan instead of
+/// falling all the way back to a fresh regex pass.
+#[derive(Clone)]
+struct PendingNamedImport {
+    file_path: String,
+    /// The name as declared at the source (pre-alias) — the key looked up in
+    /// `symbol_table`.
+    original_name: String,
+    /// The local binding name (post-alias) — the second half of the
+    /// `import_table` key this resolves into.
+    local_name: String,
+    module_path: String,
+}
+
+#[derive(Clone)]
 struct ImportFileScan {
     default_export: Option<(String, String)>,
     default_re_exports: Vec<TsDefaultReExport>,
@@ -3147,6 +5000,14 @@ struct ImportFileScan {
     default_imports: Vec<PendingDefaultImport>,
     namespace_imports: Vec<PendingNamespaceImport>,
     re_export_imports: Vec<((String, String), String)>,
+    /// JS/TS named imports (`import { a } from './x'`), pre-resolution — see
+    /// [`PendingNamedImport`]. Populated alongside `local_imports` for JS/TS
+    /// files only; every other caller of `scan_import_file` ignores it.
+    pending_named_local: Vec<PendingNamedImport>,
+    /// JS/TS named re-exports (`export { a } from './x'`, non-`default`
+    /// specifiers only — the `default` ones are `default_imports`),
+    /// pre-resolution. Populated alongside `re_export_imports`.
+    pending_named_re_export: Vec<PendingNamedImport>,
 }
 
 fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec<String> {
@@ -3402,6 +5263,8 @@ fn scan_import_file(
         default_imports: Vec::new(),
         namespace_imports: Vec::new(),
         re_export_imports: Vec::new(),
+        pending_named_local: Vec::new(),
+        pending_named_re_export: Vec::new(),
     };
 
     let is_js_ts = is_js_ts_file(file_path);
@@ -3561,6 +5424,12 @@ fn scan_import_file(
                         ));
                     }
                 }
+                scan.pending_named_local.push(PendingNamedImport {
+                    file_path: file_path.to_string(),
+                    original_name: original_name.to_string(),
+                    local_name: local_name.to_string(),
+                    module_path: module_path.to_string(),
+                });
             }
         }
 
@@ -3596,20 +5465,28 @@ fn scan_import_file(
                         local_name: local_name.to_string(),
                         module_path: module_path.to_string(),
                     });
-                } else if let Some(target_id) =
-                    symbol_table.get(original_name).and_then(|target_ids| {
-                        find_import_target(
-                            target_ids,
-                            module_path,
-                            file_path,
-                            JS_TS_EXTENSIONS,
-                            entity_map,
-                        )
-                        .cloned()
-                    })
-                {
-                    scan.re_export_imports
-                        .push(((file_path.to_string(), local_name.to_string()), target_id));
+                } else {
+                    if let Some(target_id) =
+                        symbol_table.get(original_name).and_then(|target_ids| {
+                            find_import_target(
+                                target_ids,
+                                module_path,
+                                file_path,
+                                JS_TS_EXTENSIONS,
+                                entity_map,
+                            )
+                            .cloned()
+                        })
+                    {
+                        scan.re_export_imports
+                            .push(((file_path.to_string(), local_name.to_string()), target_id));
+                    }
+                    scan.pending_named_re_export.push(PendingNamedImport {
+                        file_path: file_path.to_string(),
+                        original_name: original_name.to_string(),
+                        local_name: local_name.to_string(),
+                        module_path: module_path.to_string(),
+                    });
                 }
             }
         }
@@ -3760,6 +5637,7 @@ fn build_import_table_with_default_export_paths(
     entity_map: &HashMap<String, EntityInfo>,
     pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
 ) -> HashMap<(String, String), String> {
+    let __import_table_wall_t0 = std::time::Instant::now();
     let mut pre_parsed_content_map: HashMap<&str, &str> = HashMap::default();
     if let Some(files) = pre_parsed_content {
         pre_parsed_content_map.extend(
@@ -3820,15 +5698,20 @@ fn build_import_table_with_default_export_paths(
                     return None;
                 }
 
+                let __io_t0 = std::time::Instant::now();
                 let content = import_source_content(root, &pre_parsed_content_map, file_path)?;
-                Some(scan_import_file(
+                resolve_profile::add_import_table_io_ns(__io_t0.elapsed());
+                let __scan_t0 = std::time::Instant::now();
+                let scan = scan_import_file(
                     file_path,
                     content.as_ref(),
                     import_source_set.contains(file_path.as_str()),
                     symbol_table,
                     entity_map,
                     &clojure_ns_index,
-                ))
+                );
+                resolve_profile::add_import_table_scan_ns(__scan_t0.elapsed());
+                Some(scan)
             })
             .collect()
     } else {
@@ -3858,6 +5741,8 @@ fn build_import_table_with_default_export_paths(
         scans
     };
 
+    let __merge_t0 = std::time::Instant::now();
+    let __export_build_t0 = std::time::Instant::now();
     let mut default_exports = HashMap::default();
     let mut re_exports = Vec::new();
     let mut named_exports_by_file: HashMap<String, HashSet<String>> = HashMap::default();
@@ -3876,57 +5761,1051 @@ fn build_import_table_with_default_export_paths(
         exports_by_file: default_exports,
     };
     let ts_top_level_entities = OnceLock::new();
+    resolve_profile::add_import_table_export_build_ns(__export_build_t0.elapsed());
+
+    let __insert_t0 = std::time::Instant::now();
+    // Build each scan's import-table entries in parallel, then insert them
+    // into `import_table` sequentially. Safe because every entry's key is
+    // `(scan.file_path, name)` and `scan_import_file` runs exactly once per
+    // unique file_path (see `content_file_paths`, deduped just above) — so no
+    // two *different* scans can ever produce the same key. Only the relative
+    // order *within* one scan matters for correctness (a later push
+    // overwriting an earlier one for the same key), and that sub-order
+    // (local -> default -> namespace -> re-export) is unchanged: each scan
+    // still builds its own `Vec` in exactly that sequence before any entries
+    // reach `import_table`. Cross-scan ordering — the only thing parallelism
+    // changes — is provably irrelevant since cross-scan keys are disjoint.
+    let scan_entries: Vec<Vec<((String, String), String)>> = maybe_into_par_iter!(scans)
+        .map(|scan| {
+            let mut entries: Vec<((String, String), String)> = Vec::new();
+            for (key, val) in scan.local_imports {
+                entries.push((key, val));
+            }
+            for pending in scan.default_imports {
+                if let Some(target_id) = resolve_default_export_target(
+                    &ts_default_exports,
+                    &pending.module_path,
+                    &pending.file_path,
+                ) {
+                    entries.push(((pending.file_path, pending.local_name), target_id));
+                }
+            }
+            for pending in scan.namespace_imports {
+                let ts_top_level_entities = ts_top_level_entities
+                    .get_or_init(|| build_ts_top_level_entity_table(entity_map));
+                let Some(target_file) = find_import_file(
+                    &ts_top_level_entities.sorted_files,
+                    &pending.module_path,
+                    &pending.file_path,
+                    JS_TS_EXTENSIONS,
+                ) else {
+                    continue;
+                };
+                let Some(target_entries) = ts_top_level_entities.entities_by_file.get(target_file)
+                else {
+                    continue;
+                };
+                let Some(exported_names) = named_exports_by_file.get(target_file) else {
+                    continue;
+                };
+                for (name, target_id) in target_entries {
+                    if !exported_names.contains(name) {
+                        continue;
+                    }
+                    entries.push((
+                        (
+                            pending.file_path.clone(),
+                            format!("{}.{}", pending.alias, name),
+                        ),
+                        target_id.clone(),
+                    ));
+                }
+            }
+            for (key, val) in scan.re_export_imports {
+                entries.push((key, val));
+            }
+            entries
+        })
+        .collect();
 
     let mut import_table: HashMap<(String, String), String> = HashMap::default();
-    for scan in scans {
-        for (key, val) in scan.local_imports {
-            import_table.insert(key, val);
-        }
-        for pending in scan.default_imports {
-            if let Some(target_id) = resolve_default_export_target(
-                &ts_default_exports,
-                &pending.module_path,
-                &pending.file_path,
-            ) {
-                import_table.insert((pending.file_path, pending.local_name), target_id);
-            }
-        }
-        for pending in scan.namespace_imports {
-            let ts_top_level_entities =
-                ts_top_level_entities.get_or_init(|| build_ts_top_level_entity_table(entity_map));
-            let Some(target_file) = find_import_file(
-                &ts_top_level_entities.sorted_files,
-                &pending.module_path,
-                &pending.file_path,
-                JS_TS_EXTENSIONS,
-            ) else {
-                continue;
-            };
-            let Some(entries) = ts_top_level_entities.entities_by_file.get(target_file) else {
-                continue;
-            };
-            let Some(exported_names) = named_exports_by_file.get(target_file) else {
-                continue;
-            };
-            for (name, target_id) in entries {
-                if !exported_names.contains(name) {
-                    continue;
-                }
-                import_table.insert(
-                    (
-                        pending.file_path.clone(),
-                        format!("{}.{}", pending.alias, name),
-                    ),
-                    target_id.clone(),
-                );
-            }
-        }
-        for (key, val) in scan.re_export_imports {
+    for entries in scan_entries {
+        for (key, val) in entries {
             import_table.insert(key, val);
         }
     }
+    resolve_profile::add_import_table_insert_ns(__insert_t0.elapsed());
+    resolve_profile::add_import_table_merge_ns(__merge_t0.elapsed());
 
+    resolve_profile::add_import_table_wall_ns(__import_table_wall_t0.elapsed());
     import_table
+}
+
+// ---------------------------------------------------------------------------
+// Incremental import-table maintenance (semx-h1s)
+// ---------------------------------------------------------------------------
+
+/// One JS/TS file's cached import-table contribution: its scan (including the
+/// pre-resolution `pending_named_local`/`pending_named_re_export` lists
+/// [`build_import_table_incremental`] re-resolves from) plus the read set that
+/// resolution consulted.
+///
+/// Reusable verbatim while the file is GREEN for import-table purposes — a
+/// narrower, per-key test than scope/bow's own GREEN; see
+/// `build_import_table_incremental`'s doc comment.
+pub(crate) struct CachedImportScan {
+    scan: ImportFileScan,
+    /// `Table::SymbolTable` keys (names) this file's named imports/re-exports
+    /// consulted, and `Table::TsExportSurface` keys (candidate file paths)
+    /// its default/namespace imports consulted — hit or miss, both matter.
+    read_set: ReadSet,
+    /// Whether any pending default/namespace import in this scan is a bare
+    /// specifier (`import x from 'lodash'`, no relative path) — an unbounded
+    /// candidate set this module does not track key-by-key. A file with one
+    /// is always re-resolved, never reused; see the "what is conservative"
+    /// note on `build_import_table_incremental`.
+    has_bare_dependency: bool,
+}
+
+/// Resolve one already-captured named import/re-export against the current
+/// `symbol_table`, recording the name it consults into `read_set` (hit or
+/// miss — a later edit that adds the name is as much a dependency as one
+/// that removes it).
+///
+/// Mirrors the `JS_NAMED_RE`/`JS_REEXPORT_RE` loops in `scan_import_file`
+/// exactly (same `find_import_target` call, same arguments), so calling this
+/// against a cached `PendingNamedImport` reproduces what a fresh scan would
+/// have computed for that one import.
+fn resolve_named_import_tracked(
+    pending: &PendingNamedImport,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    read_set: &mut ReadSet,
+) -> Option<((String, String), String)> {
+    read_set.record(key1(Table::SymbolTable, 0, &pending.original_name));
+    let target_ids = symbol_table.get(pending.original_name.as_str())?;
+    let target_id = find_import_target(
+        target_ids,
+        &pending.module_path,
+        &pending.file_path,
+        JS_TS_EXTENSIONS,
+        entity_map,
+    )?;
+    Some((
+        (pending.file_path.clone(), pending.local_name.clone()),
+        target_id.clone(),
+    ))
+}
+
+/// Record this pending TS default/namespace import's dependency on every
+/// repo-relative candidate path its module specifier could resolve to (hit or
+/// miss — see [`Table::TsExportSurface`]'s doc comment), and report whether it
+/// is a bare/package specifier instead (an unbounded candidate set this
+/// module does not track key-by-key — see the "what is conservative" note on
+/// `build_import_table_incremental`).
+fn record_ts_export_candidates(file_path: &str, module_path: &str, read_set: &mut ReadSet) -> bool {
+    match import_file_candidates(file_path, module_path, JS_TS_EXTENSIONS) {
+        Some(candidates) => {
+            for candidate in &candidates {
+                read_set.record(key1(Table::TsExportSurface, 0, candidate));
+            }
+            false
+        }
+        None => true,
+    }
+}
+
+/// Hash file `T`'s export surface: `(default export target id, sorted named
+/// exports, sorted top-level entities)` — everything a default/namespace
+/// import that resolves to `T` could read about it. `top_level` is `None`
+/// when nothing scanned this build has a namespace import at all (namespace
+/// resolution is the only reader of top-level entities, so skipping that
+/// component then avoids an `O(corpus)` `entity_map` scan on repos that never
+/// use `import * as X`).
+fn ts_export_surface_value(
+    file_path: &str,
+    default_exports: &HashMap<String, String>,
+    named_exports_by_file: &HashMap<String, HashSet<String>>,
+    top_level: Option<&TsTopLevelEntityTable>,
+) -> u64 {
+    let mut h = ValueHasher::new();
+    h.s(default_exports
+        .get(file_path)
+        .map(String::as_str)
+        .unwrap_or("\u{0}"));
+    if let Some(names) = named_exports_by_file.get(file_path) {
+        let mut sorted: Vec<&String> = names.iter().collect();
+        sorted.sort();
+        for n in sorted {
+            h.s(n);
+        }
+    }
+    if let Some(table) = top_level {
+        if let Some(entries) = table.entities_by_file.get(file_path) {
+            for (name, id) in entries {
+                h.s(name).s(id);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// Incrementally maintain `symbol_table`, `entity_map`, `class_members`
+/// (`scope_class_members`), `owner_members` (`scope_owner_members`),
+/// `entity_ranges` (`scope_entity_ranges`) and `child_ranges` across a
+/// `GraphSession` rebuild, instead of rebuilding all six from a whole-corpus
+/// scan of `all_entities` every time (semx-4an, generalizing semx-h1s's
+/// import-table pattern).
+///
+/// Also returns the [`scope_resolve::TouchedCorpusKeys`] the caller needs to
+/// update the corpus fingerprints key-by-key instead of refolding them.
+///
+/// # Why this exists
+///
+/// RESOLUTION-PROFILE.md's "Delta-proportional warm" section measured the
+/// combined Pass A/B loop this replaces (`entity_lookup_build_ms`) at
+/// ~700ms, *flat* whether 1, 50, or 500 files changed — a pure `O(corpus)`
+/// floor, and after semx-h1s/semx-h19 collapsed the import table and
+/// bag-of-words, the single largest attributable bucket left in a warm
+/// rebuild on the TypeScript monster corpus.
+///
+/// # Why per-file removal is exact here (no separate key index needed)
+///
+/// Every one of these five tables' entries is a pure function of *one
+/// file's own entities* — a name, an id, an owner name, a parent id, a
+/// range — never of another file's content. Concretely:
+/// * `entity_map`: keyed by entity id; an id is globally unique and always
+///   produced by exactly the file that declares it.
+/// * `symbol_table`: keyed by entity *name*, but every id it stores under
+///   that name was pushed by exactly the entity that owns it — the file
+///   that owns the id is unambiguous from the id alone.
+/// * `class_members`/`owner_members`: keyed by owner name / parent id, but
+///   this crate's entity model never links a `parent_id` across a file
+///   boundary (AST containment is inherently file-local for every
+///   supported language, Go's receiver-based "members" included — see the
+///   Go branch below, which derives its owner from the member's own
+///   `content`, not a cross-file lookup). So a member's *old* owner name is
+///   recoverable from that same file's *old* entity list alone.
+/// * `entity_ranges`: keyed directly by file path — trivially per-file.
+/// * `child_ranges`: keyed by parent id, and the *only* one of the six where
+///   a bucket can legitimately hold two different files' contributions —
+///   `resolve_go_method_parent_ids` can point methods in several `.go` files
+///   at one struct's id. So this one is removed *by value*, one occurrence per
+///   old child, rather than by dropping the bucket; see the removal loop.
+///   Recomputing an old child's range from `prev_entities` reproduces exactly
+///   what the last build inserted, because `child_ranges_for_file` is a pure
+///   function of one file's own (unchanged) entities.
+///
+/// This means `prev_entities` (already threaded through `BuildCarry` for
+/// GREEN-entity reuse) is already the exact per-file key index *removal*
+/// needs — nothing new has to be built for `O(touched files)` removal,
+/// unlike `import_table`'s dedicated `import_keys` side table (import-table
+/// keys are `(file, name)` pairs with no equivalent existing index). A
+/// file's entry survives in `prev_entities` past the GREEN-reuse step in
+/// `build_incremental_core`'s pass-1 loop exactly when phase 1 below needs
+/// to touch it: GREEN files are removed from it (nothing to remove), so what
+/// remains after that loop is precisely {this build's RED files} ∪ {files
+/// deleted since the last build}. **Insertion is driven separately, by the
+/// caller's `dirty` set** — `prev_entities`'s remaining keys are empty on a
+/// cold build (there is nothing to remove yet), so using it to also gate
+/// insertion would silently build empty tables on every session's first
+/// build; `dirty` names every file needing fresh entries whether or not it
+/// had a previous one.
+///
+/// # Fingerprinting
+///
+/// The five fingerprinted tables' entries are now updated key-by-key too
+/// (`scope_resolve::fingerprint_corpus_tables_incremental`, driven by the
+/// [`scope_resolve::TouchedCorpusKeys`] this function returns), against a
+/// session-owned fingerprint map. The whole fold remains the fallback — and
+/// the parity oracle: `SEM_FP_PARITY=1` makes every build recompute it and
+/// assert the two agree. Because `fingerprint_corpus_tables` is a pure
+/// function of whatever map it is handed, a correctly maintained table
+/// produces
+/// byte-identical fingerprints to a fresh whole rebuild — every read-set/
+/// GREEN-decision test already in this crate's suite (`assert_warm_matches_
+/// cold`, `assert_import_churn_matches_cold`'s explicit fingerprint-parity
+/// assertion, `every_file_whose_edges_change_is_red`, the per-language
+/// oracle fixtures) exercises this function on every mutation shape it
+/// covers, since every one of them calls `GraphSession::rebuild`.
+///
+/// # Where this is NOT used
+///
+/// Only called when `!retain_parsed_files` (i.e. only on corpora over
+/// `PARSED_FILE_REUSE_LIMIT`, which resolve in chunks — the TypeScript
+/// monster's regime). Under `retain_parsed_files`, pass 1 re-extracts every
+/// file's entities on every rebuild regardless of dirty status (see that
+/// function's own doc comment for why — it needs live trees for the
+/// resolution closure), so `prev_entities` never sheds a genuinely
+/// unchanged file's entry there and this function would do full
+/// removal-then-reinsertion work for the *entire* corpus, every rebuild —
+/// strictly worse than the plain whole-rebuild it would replace, for
+/// exactly the corpus sizes (small enough to retain parse trees) where the
+/// ~700ms floor was never the bottleneck anyway (tiptap's own warm rebuilds
+/// sit at ~190ms total). Callers gate on `!retain_parsed_files` before
+/// calling this; every retain-mode build keeps the original whole-rebuild
+/// Pass A/B code, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn maintain_entity_lookups_incremental(
+    // The caller's own dirty set (changed + newly added files this build).
+    // Phase 2 below inserts for `dirty ∪ touched_paths` (`touched_paths` is
+    // computed from `prev_entities` at the top of this function) — neither
+    // set alone is correct on its own: `dirty` alone misses every file pass 1
+    // re-extracted for a reason other than dirtiness (`.go` files always, and
+    // any JS/TS file whose `PrecomputedFileFacts` entry is missing — see pass
+    // 1's `entity_reuse_ok`), and `prev_entities`/`touched_paths` alone is
+    // empty on a cold build (nothing to remove yet), which would silently
+    // insert nothing at all.
+    dirty: &HashSet<String>,
+    prev_entities: &HashMap<String, Vec<SemanticEntity>>,
+    all_entities: &[SemanticEntity],
+    entity_spans: &[(String, usize, usize)],
+    symbol_table: &mut HashMap<String, Vec<String>>,
+    entity_map: &mut HashMap<String, EntityInfo>,
+    class_members: &mut HashMap<String, Vec<(String, String)>>,
+    owner_members: &mut HashMap<String, Vec<(String, String)>>,
+    entity_ranges: &mut HashMap<String, Vec<(usize, usize, String)>>,
+    child_ranges: &mut ChildRangeIndex,
+) -> scope_resolve::TouchedCorpusKeys {
+    let mut child_ranges_ns = std::time::Duration::ZERO;
+    let mut touched_entity_ids: HashSet<String> = HashSet::default();
+    let mut wildcard_guard_delta: u64 = 0;
+    // Phase 1: remove every touched file's old contributions. `prev_entities`
+    // holds exactly {every file pass 1 did NOT serve as a GREEN entity
+    // reuse} ∩ {previously known} at this point — which is a superset of
+    // `dirty`: pass 1 re-extracts every `.go` file unconditionally (see
+    // `entity_reuse_ok`'s comment on `resolve_go_method_parent_ids`), and any
+    // JS/TS file with no `PrecomputedFileFacts` entry, so those are left in
+    // `prev_entities` here whether or not the caller called them dirty.
+    // Phase 2 below must insert for this same set, not just `dirty`, or such
+    // a file's entries would be removed here and never come back.
+    let touched_paths: HashSet<String> = prev_entities.keys().cloned().collect();
+    let mut touched_names: HashSet<String> = HashSet::default();
+    let mut touched_owner_names: HashSet<String> = HashSet::default();
+    let mut touched_parent_ids: HashSet<String> = HashSet::default();
+
+    for path in &touched_paths {
+        let Some(old) = prev_entities.get(path.as_str()) else {
+            continue;
+        };
+        // Same-file basis for each old member's owner name — see doc
+        // comment: parent-child containment never crosses a file here.
+        let old_by_id: HashMap<&str, &SemanticEntity> =
+            old.iter().map(|e| (e.id.as_str(), e)).collect();
+
+        // Child ranges: remove *one occurrence per old child*, matched by
+        // value, rather than dropping the whole bucket. Value matching is
+        // exact because `child_ranges_for_file` is a pure function of this
+        // file's own (unchanged, previous-build) entities, so it reproduces
+        // byte-for-byte what the last build inserted; and it is the only
+        // correct choice for Go, where `resolve_go_method_parent_ids` can
+        // point two *different* files' methods at one struct's id, so a
+        // bucket is not owned by a single file. Entries that compare equal
+        // are field-identical (see `compare_child_ranges`), so "remove some
+        // matching occurrence" and "remove the one this file put there" are
+        // the same operation.
+        let __cr_t0 = std::time::Instant::now();
+        for (pid, range) in child_ranges_for_file(old) {
+            let Some(bucket) = child_ranges.get_mut(pid) else {
+                continue;
+            };
+            if let Some(idx) = bucket.iter().position(|existing| existing == &range) {
+                bucket.remove(idx);
+            }
+            if bucket.is_empty() {
+                child_ranges.remove(pid);
+            }
+        }
+        child_ranges_ns += __cr_t0.elapsed();
+
+        for entity in old {
+            touched_entity_ids.insert(entity.id.clone());
+            wildcard_guard_delta ^=
+                scope_resolve::wildcard_guard_contribution(&entity.name, &entity.file_path);
+            entity_map.remove(&entity.id);
+            if let Some(bucket) = symbol_table.get_mut(&entity.name) {
+                bucket.retain(|id| id != &entity.id);
+                if bucket.is_empty() {
+                    symbol_table.remove(&entity.name);
+                }
+            }
+            touched_names.insert(entity.name.clone());
+
+            if let Some(pid) = entity.parent_id.as_deref() {
+                touched_parent_ids.insert(pid.to_string());
+                if let Some(bucket) = owner_members.get_mut(pid) {
+                    bucket.retain(|(_, id)| id != &entity.id);
+                    if bucket.is_empty() {
+                        owner_members.remove(pid);
+                    }
+                }
+                if let Some(parent) = old_by_id.get(pid) {
+                    if scope_resolve::is_class_member_owner_type(&parent.entity_type) {
+                        touched_owner_names.insert(parent.name.clone());
+                        if let Some(bucket) = class_members.get_mut(&parent.name) {
+                            bucket.retain(|(_, id)| id != &entity.id);
+                            if bucket.is_empty() {
+                                class_members.remove(&parent.name);
+                            }
+                        }
+                    }
+                }
+            }
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content)
+                {
+                    touched_owner_names.insert(struct_name.clone());
+                    if let Some(bucket) = class_members.get_mut(&struct_name) {
+                        bucket.retain(|(_, id)| id != &entity.id);
+                        if bucket.is_empty() {
+                            class_members.remove(&struct_name);
+                        }
+                    }
+                }
+            }
+        }
+        entity_ranges.remove(path);
+    }
+
+    // Phase 2: insert every touched-or-dirty file's *current* contributions,
+    // from this build's fresh `all_entities`/`entity_spans`. The union of
+    // `touched_paths` (phase 1's set — every previously-known file pass 1
+    // did NOT GREEN-reuse, see above) and `dirty` (covers brand-new files,
+    // which have no `prev_entities` entry to have appeared in `touched_paths`
+    // at all): neither alone is correct — `dirty` alone silently drops
+    // non-JS/TS files' entries forever (they are never in `dirty` on a
+    // pure no-op rebuild, yet phase 1 always removes them), and
+    // `touched_paths` alone silently produces empty tables on a cold build
+    // (nothing to remove yet, so nothing would ever get inserted either). A
+    // deleted file is in neither set with a live span, so it naturally
+    // contributes nothing here, matching phase 1's pure removal for it.
+    for (path, start, len) in entity_spans {
+        if !touched_paths.contains(path.as_str()) && !dirty.contains(path.as_str()) {
+            continue; // GREEN file: its old entries are still correct.
+        }
+        let new = &all_entities[*start..*start + *len];
+        let mut ranges: Vec<(usize, usize, String)> = Vec::with_capacity(new.len());
+
+        for entity in new {
+            touched_entity_ids.insert(entity.id.clone());
+            wildcard_guard_delta ^=
+                scope_resolve::wildcard_guard_contribution(&entity.name, &entity.file_path);
+            symbol_table
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+            touched_names.insert(entity.name.clone());
+
+            entity_map.insert(
+                entity.id.clone(),
+                EntityInfo {
+                    id: entity.id.clone(),
+                    name: entity.name.clone(),
+                    entity_type: entity.entity_type.clone(),
+                    file_path: entity.file_path.clone(),
+                    parent_id: entity.parent_id.clone(),
+                    start_line: entity.start_line,
+                    end_line: entity.end_line,
+                },
+            );
+
+            ranges.push((entity.start_line, entity.end_line, entity.id.clone()));
+        }
+        // Second pass, same file: owner/class-member insertion needs this
+        // file's own entities already in `entity_map` (a member's parent is
+        // always in the same file — see doc comment), so it runs after the
+        // loop above has inserted every one of this file's entities, not
+        // interleaved with it.
+        for entity in new {
+            if let Some(pid) = entity.parent_id.as_deref() {
+                touched_parent_ids.insert(pid.to_string());
+                owner_members
+                    .entry(pid.to_string())
+                    .or_default()
+                    .push((entity.name.clone(), entity.id.clone()));
+                if let Some(parent) = entity_map.get(pid) {
+                    if let Some(owner_name) = scope_resolve::class_member_owner_name(parent) {
+                        touched_owner_names.insert(owner_name.to_string());
+                        class_members
+                            .entry(owner_name.to_string())
+                            .or_default()
+                            .push((entity.name.clone(), entity.id.clone()));
+                    }
+                }
+            }
+            if entity.entity_type == "method" && entity.file_path.ends_with(".go") {
+                if let Some(struct_name) = scope_resolve::extract_go_receiver_type(&entity.content)
+                {
+                    touched_owner_names.insert(struct_name.clone());
+                    class_members
+                        .entry(struct_name)
+                        .or_default()
+                        .push((entity.name.clone(), entity.id.clone()));
+                }
+            }
+        }
+
+        let __cr_t0 = std::time::Instant::now();
+        for (pid, range) in child_ranges_for_file(new) {
+            match child_ranges.get_mut(pid) {
+                Some(bucket) => bucket.push(range),
+                None => {
+                    child_ranges.insert(pid.to_string(), vec![range]);
+                }
+            }
+        }
+        child_ranges_ns += __cr_t0.elapsed();
+
+        ranges.sort_unstable();
+        if ranges.is_empty() {
+            entity_ranges.remove(path);
+        } else {
+            entity_ranges.insert(path.clone(), ranges);
+        }
+    }
+
+    // Phase 3: re-sort exactly the buckets phase 1/2 touched — `O(touched
+    // keys)`, not `O(every owner/parent in the corpus)` — matching a whole
+    // rebuild's ordering discipline. `symbol_table` uses `sort_symbol_table_
+    // targets_by_source`'s explicit (file/line/id) tie-break; `class_members`/
+    // `owner_members` use the same tie-break via `sort_members_bucket_by_
+    // source` — see that function's doc comment for why (a whole rebuild
+    // never sorts these explicitly, but its *implicit* order — iterating
+    // `all_entities` in `file_paths`' given order — coincides with this
+    // tie-break whenever `file_paths` is itself file-path-sorted, which
+    // every caller in this crate already ensures, and matters here because
+    // `select_member_candidate` picks the *first* matching entry in a bucket,
+    // not just any). Removal alone never needs a re-sort (it preserves
+    // relative order); only a bucket an insertion touched does — re-sorting
+    // every touched bucket regardless is simpler and still `O(touched keys)`
+    // overall, so this does not special-case insert-vs-remove-only.
+    for name in &touched_names {
+        if let Some(bucket) = symbol_table.get_mut(name) {
+            sort_one_symbol_table_bucket(bucket, entity_map);
+        }
+    }
+    for owner in &touched_owner_names {
+        if let Some(bucket) = class_members.get_mut(owner) {
+            sort_members_bucket_by_source(bucket, entity_map);
+        }
+    }
+    let __cr_t0 = std::time::Instant::now();
+    for pid in &touched_parent_ids {
+        if let Some(bucket) = owner_members.get_mut(pid) {
+            sort_members_bucket_by_source(bucket, entity_map);
+        }
+        // `touched_parent_ids` is collected from exactly the entities whose
+        // child ranges phases 1/2 removed or inserted, so it is precisely the
+        // set of child-range buckets that can have moved.
+        if let Some(bucket) = child_ranges.get_mut(pid) {
+            bucket.sort_unstable_by(compare_child_ranges);
+        }
+    }
+    resolve_profile::add_lookup_child_ranges_ns(child_ranges_ns + __cr_t0.elapsed());
+
+    scope_resolve::TouchedCorpusKeys {
+        names: touched_names,
+        owner_names: touched_owner_names,
+        parent_ids: touched_parent_ids,
+        entity_ids: touched_entity_ids,
+        wildcard_guard_delta,
+    }
+}
+
+/// Incrementally maintain the import table across a `GraphSession` rebuild
+/// instead of rebuilding it whole (semx-h1s).
+///
+/// # Why this exists
+///
+/// `build_import_table_with_default_export_paths` (used by every other
+/// caller, unchanged by this function's existence) is a pure function: scan
+/// every file, merge, done. On a warm rebuild that is wasteful —
+/// RESOLUTION-PROFILE.md's red-green section measured it as the single
+/// largest bucket left after scope resolution and bag-of-words collapsed
+/// 33x/4x: 1,471ms of a 3,438ms warm rebuild on the TypeScript monster
+/// corpus, rebuilding the same ~230k entries for ~39,000 files whose imports
+/// did not change, every time.
+///
+/// # Design
+///
+/// `import_table` is treated as persistent state, not a fresh `HashMap` per
+/// build. Every entry's key is `(producing file's own path, name)` — proven
+/// in `build_import_table_with_default_export_paths`'s own comment on its
+/// parallel merge (e996964): `scan_import_file` runs exactly once per unique
+/// `file_path`, and every entry it can produce is stamped with that same
+/// `file_path`, so no two different files' entries can ever collide on a
+/// key. That is what makes per-file removal and insertion structurally safe.
+///
+/// A file is either:
+///
+/// * **GREEN for import-table purposes** — its own content is unchanged, it
+///   is JS/TS (the only language this function attributes precisely; see
+///   below), it was scanned before, it has no bare-specifier default/
+///   namespace import, and every key its last production consulted still
+///   holds the value it held last build. Its entries are left untouched in
+///   `import_table`.
+/// * **RED** — everything else: every non-JS/TS file, every file the caller
+///   named as changed, every file new to this build, and every file whose
+///   read set caught a real dependency change. Its previous entries (tracked
+///   in `import_keys`, so removal is `O(that file's own key count)`, not a
+///   full-table scan) are removed and its freshly resolved entries are
+///   inserted.
+///
+/// # Why GREEN is a per-key test, not just "content unchanged"
+///
+/// Unlike scope resolution and bag-of-words (whose GREEN test is entirely
+/// about *this file's own* references), an import-table entry's *value* can
+/// depend on a file the importer never touches syntactically: `import Foo
+/// from './bar'` resolves against whatever `bar.ts` currently exports as its
+/// default, and `bar.ts` changing that must invalidate the *importer's*
+/// entry even though the importer's own content did not change. Two read
+/// sets cover this:
+///
+/// * **`Table::SymbolTable`** (already fingerprinted by
+///   `scope_resolve::fingerprint_corpus_tables`, moved to run *before* this
+///   function in `build_incremental_core` for exactly this reason) covers
+///   named imports and named re-exports: `resolve_named_import_tracked`
+///   records every name a file's `pending_named_local`/
+///   `pending_named_re_export` list looks up, hit or miss, so "some other
+///   file started declaring the name I import" is caught the same way
+///   `resolve_ref`'s own `Table::SymbolTable` reads are.
+/// * **`Table::TsExportSurface`** (new; see its doc comment) covers default
+///   and namespace imports, which resolve against corpus-wide tables
+///   (`default_exports`, `named_exports_by_file`, top-level entities) built
+///   fresh every build from every file's own scan — cheap
+///   (`import_table_export_build_ns` measured single-digit ms even at
+///   monster scale, so no incrementality is needed *there*; what changes is
+///   that a file importing from `T` records a read of `T`'s combined
+///   export-surface hash for every path its module specifier could resolve
+///   to, so `T` gaining, losing, or changing an export invalidates exactly
+///   its importers, not the whole corpus.
+///
+/// `default_export` itself needs no read-set entry: `scan_import_file`
+/// resolves it by filtering `symbol_table.get(name)` down to entities in the
+/// *same file*, so its value is a pure function of the file's own content —
+/// the same self-invariant RESOLUTION-PROFILE.md's red-green section already
+/// relies on for a file's own `entity_map`/`entity_ranges` reads.
+///
+/// # What is conservative
+///
+/// * **Only JS/TS files are ever cached or reuse-eligible for import-table
+///   purposes**, matching every other red-green boundary in this crate.
+///   Python/Rust/Go/Clojure imports are re-scanned and their entries
+///   re-inserted on every build, exactly as before this bead — slower, never
+///   wrong.
+/// * **A bare/package specifier default or namespace import
+///   (`import x from 'lodash'`) forces its whole owning file's contribution
+///   to be recomputed every build.** `find_import_file`'s fallback for a bare
+///   specifier is a whole-corpus stem scan, not a bounded candidate list —
+///   precisely tracking "would a new local file start matching this stem" is
+///   possible but out of this bead's budget; over-invalidating a file with
+///   one is safe, just not free. Named imports/re-exports and relative
+///   default/namespace imports (the common case for a repo's own cross-file
+///   dependencies) are unaffected.
+/// * **A RED, previously-cached file's named imports/re-exports are always
+///   re-derived from `pending_named_local`/`pending_named_re_export`, never
+///   from the stale cached `local_imports`/`re_export_imports` fields.** This
+///   is exact for every import `scan_import_file`'s JS-specific regex loops
+///   produce. The one theoretical gap: `scan_import_file` also runs a
+///   generic Python-style `from X import Y` line scan unconditionally
+///   (unrelated to `is_js_ts`), and a JS/TS file whose raw content happens to
+///   contain a line matching that pattern (inside a string or comment, since
+///   it cannot be valid JS/TS syntax) would have contributed an entry via
+///   that path that is not captured in `pending_named_local`. A freshly
+///   *re-scanned* file is unaffected (it uses `scan.local_imports`/
+///   `re_export_imports` directly, exactly as the non-incremental function
+///   does); only a file whose own content is unchanged but whose read set
+///   was invalidated purely by another file's edit would miss such an entry.
+///   Judged not worth the added complexity given how contrived the trigger
+///   is; documented rather than silently accepted.
+/// * **An add or a delete on a chunked (>20k-file) corpus still disables
+///   reuse for the whole build**, per `GraphSession::rebuild`'s existing
+///   rule — this function's per-file removal/insertion is correct for adds
+///   and deletes on their own (exercised by the oracle's synthetic fixture,
+///   which chunks at 8 files), but there is no reuse to protect on a chunked
+///   add/delete regardless, since the scope-resolution side disables it
+///   first.
+#[allow(clippy::too_many_arguments)]
+fn build_import_table_incremental(
+    root: &Path,
+    file_paths: &[String],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    pre_parsed_content: Option<&[(String, String, tree_sitter::Tree)]>,
+    eligible: &HashSet<String>,
+    inc: Option<&mut Incremental<'_>>,
+    import_scans: &mut HashMap<String, CachedImportScan>,
+    import_table: &mut HashMap<(String, String), String>,
+    import_keys: &mut HashMap<String, Vec<(String, String)>>,
+) {
+    let __import_table_wall_t0 = std::time::Instant::now();
+
+    let mut pre_parsed_content_map: HashMap<&str, &str> = HashMap::default();
+    if let Some(files) = pre_parsed_content {
+        pre_parsed_content_map.extend(
+            files
+                .iter()
+                .map(|(fp, content, _)| (fp.as_str(), content.as_str())),
+        );
+    }
+    let import_source_set: HashSet<&str> = file_paths.iter().map(String::as_str).collect();
+    let clojure_ns_index = build_clojure_ns_index(entity_map);
+
+    let mut content_file_paths: Vec<String> = file_paths.to_vec();
+    content_file_paths.sort_unstable();
+    let content_set: HashSet<&str> = content_file_paths.iter().map(String::as_str).collect();
+
+    // Deletions: evict every producing file this build no longer has, and
+    // remove what it last contributed. `O(deleted files' own key counts)`,
+    // not a full-table scan.
+    let deleted: Vec<String> = import_keys
+        .keys()
+        .filter(|f| !content_set.contains(f.as_str()))
+        .cloned()
+        .collect();
+    for f in deleted {
+        if let Some(keys) = import_keys.remove(&f) {
+            for k in keys {
+                import_table.remove(&k);
+            }
+        }
+        import_scans.remove(&f);
+    }
+
+    let (forced_red, prev_fp, cur_fp): (
+        Option<&HashSet<String>>,
+        Option<&TableFingerprints>,
+        Option<&mut TableFingerprints>,
+    ) = match inc {
+        Some(state) => (
+            Some(state.forced_red),
+            Some(state.prev_fp),
+            Some(&mut state.cur_fp),
+        ),
+        None => (None, None, None),
+    };
+    let mut cur_fp = cur_fp;
+    let recording = cur_fp.is_some();
+    let reuse_enabled = recording && prev_fp.is_some_and(|fp| !fp.is_empty());
+
+    // Step 1: every file's scan — reused from cache when eligible and its own
+    // content is unchanged, freshly computed otherwise. Needed for *every*
+    // file regardless of eventual GREEN/RED status: a file's export-side
+    // fields feed the corpus-wide aggregation below no matter who ends up
+    // reusing entries.
+    struct FileScanResult {
+        file_path: String,
+        scan: ImportFileScan,
+        from_cache: bool,
+        eligible: bool,
+    }
+    let scan_results: Vec<FileScanResult> = maybe_par_iter!(content_file_paths)
+        .filter_map(|file_path| {
+            let is_eligible = eligible.contains(file_path.as_str());
+            let own_content_unchanged = forced_red.is_none_or(|d| !d.contains(file_path.as_str()));
+            if is_eligible && own_content_unchanged {
+                if let Some(cached) = import_scans.get(file_path.as_str()) {
+                    return Some(FileScanResult {
+                        file_path: file_path.clone(),
+                        scan: cached.scan.clone(),
+                        from_cache: true,
+                        eligible: true,
+                    });
+                }
+            }
+            if file_path.ends_with(".go") {
+                return None;
+            }
+            let __io_t0 = std::time::Instant::now();
+            let content = import_source_content(root, &pre_parsed_content_map, file_path)?;
+            resolve_profile::add_import_table_io_ns(__io_t0.elapsed());
+            let __scan_t0 = std::time::Instant::now();
+            let scan = scan_import_file(
+                file_path,
+                content.as_ref(),
+                import_source_set.contains(file_path.as_str()),
+                symbol_table,
+                entity_map,
+                &clojure_ns_index,
+            );
+            resolve_profile::add_import_table_scan_ns(__scan_t0.elapsed());
+            Some(FileScanResult {
+                file_path: file_path.clone(),
+                scan,
+                from_cache: false,
+                eligible: is_eligible,
+            })
+        })
+        .collect();
+
+    // Step 2: aggregate export-side data from *every* scan (green or red —
+    // any file could be another file's default/namespace import target).
+    // Cheap: `scan_import_file` already resolved each file's own
+    // `default_export` against its own content only (see the self-invariant
+    // note above), so this is a plain fold, not a fresh scan.
+    let __merge_t0 = std::time::Instant::now();
+    let __export_build_t0 = std::time::Instant::now();
+    let mut default_exports: HashMap<String, String> = HashMap::default();
+    let mut re_exports_pending: Vec<TsDefaultReExport> = Vec::new();
+    let mut named_exports_by_file: HashMap<String, HashSet<String>> = HashMap::default();
+    let mut any_namespace_imports = false;
+    for result in &scan_results {
+        if let Some((file_path, target_id)) = result.scan.default_export.clone() {
+            default_exports.insert(file_path, target_id);
+        }
+        re_exports_pending.extend(result.scan.default_re_exports.iter().cloned());
+        if let Some((file_path, named_exports)) = result.scan.named_exports.clone() {
+            named_exports_by_file.insert(file_path, named_exports);
+        }
+        any_namespace_imports |= !result.scan.namespace_imports.is_empty();
+    }
+    resolve_ts_default_re_exports(
+        &mut default_exports,
+        re_exports_pending,
+        symbol_table,
+        entity_map,
+    );
+    let ts_default_exports = TsDefaultExportTable {
+        sorted_files: sorted_default_export_files(&default_exports),
+        exports_by_file: default_exports,
+    };
+    let ts_top_level_entities: Option<TsTopLevelEntityTable> =
+        any_namespace_imports.then(|| build_ts_top_level_entity_table(entity_map));
+    // Bare/package specifiers (`import x from 'lodash'`) resolve through
+    // `find_import_file`'s O(candidates) whole-corpus fallback scan — cheap
+    // once per build, not when re-run per RED file's pending import on every
+    // warm rebuild. Building each index once here and looking up through
+    // `resolve_bare_import_stem` below is what keeps that cost from
+    // dominating the warm rebuild at monster scale (measured).
+    let default_export_stem_index = build_stem_index(&ts_default_exports.sorted_files);
+    let namespace_stem_index = ts_top_level_entities
+        .as_ref()
+        .map(|table| build_stem_index(&table.sorted_files));
+    resolve_profile::add_import_table_export_build_ns(__export_build_t0.elapsed());
+
+    // Step 3: fingerprint every file that contributes to the export surface,
+    // so this build's GREEN decisions (below) and next build's have
+    // something to compare against.
+    if let Some(fp) = cur_fp.as_deref_mut() {
+        let mut surface_files: HashSet<&str> = HashSet::default();
+        surface_files.extend(
+            ts_default_exports
+                .exports_by_file
+                .keys()
+                .map(String::as_str),
+        );
+        surface_files.extend(named_exports_by_file.keys().map(String::as_str));
+        if let Some(table) = ts_top_level_entities.as_ref() {
+            surface_files.extend(table.entities_by_file.keys().map(String::as_str));
+        }
+        let mut sink = crate::parser::incremental::FingerprintSink::new(fp, 0);
+        for file_path in surface_files {
+            let value = ts_export_surface_value(
+                file_path,
+                &ts_default_exports.exports_by_file,
+                &named_exports_by_file,
+                ts_top_level_entities.as_ref(),
+            );
+            sink.one(Table::TsExportSurface, file_path, value);
+        }
+    }
+
+    // Step 4: decide GREEN/RED per file, using the cache's *previous* read
+    // set against (prev_fp, cur_fp) — cheap key lookups, no re-scanning.
+    let cur_fp_ref = cur_fp.as_deref();
+    let is_green = |result: &FileScanResult| -> bool {
+        if !reuse_enabled || !result.from_cache || !result.eligible {
+            return false;
+        }
+        let (Some(prev), Some(cur)) = (prev_fp, cur_fp_ref) else {
+            return false;
+        };
+        match import_scans.get(result.file_path.as_str()) {
+            Some(cached) => !cached.has_bare_dependency && cached.read_set.unchanged(prev, cur),
+            None => false,
+        }
+    };
+
+    // Step 5: build entries for every RED file. GREEN files are untouched —
+    // their entries already sit in `import_table` from a previous build.
+    struct RedFileEntries {
+        file_path: String,
+        scan: ImportFileScan,
+        entries: Vec<((String, String), String)>,
+        read_set: ReadSet,
+        has_bare: bool,
+        eligible: bool,
+    }
+    let __insert_t0 = std::time::Instant::now();
+    let red_results: Vec<RedFileEntries> = maybe_into_par_iter!(scan_results)
+        .filter_map(|result| {
+            if is_green(&result) {
+                return None;
+            }
+            let mut entries: Vec<((String, String), String)> = Vec::new();
+            let mut read_set = ReadSet::default();
+            let mut has_bare = false;
+
+            if result.eligible && result.from_cache {
+                // Own content unchanged, but its read set (from a previous
+                // build) was invalidated. Re-resolve from the raw pending
+                // lists — no need to re-read or re-scan the file's content.
+                for pending in &result.scan.pending_named_local {
+                    if let Some(entry) = resolve_named_import_tracked(
+                        pending,
+                        symbol_table,
+                        entity_map,
+                        &mut read_set,
+                    ) {
+                        entries.push(entry);
+                    }
+                }
+                for pending in &result.scan.pending_named_re_export {
+                    if let Some(entry) = resolve_named_import_tracked(
+                        pending,
+                        symbol_table,
+                        entity_map,
+                        &mut read_set,
+                    ) {
+                        entries.push(entry);
+                    }
+                }
+            } else {
+                // Freshly scanned this build (or not eligible for the pending
+                // path at all): the scan's own resolution is trustworthy.
+                for (key, val) in &result.scan.local_imports {
+                    entries.push((key.clone(), val.clone()));
+                }
+                for (key, val) in &result.scan.re_export_imports {
+                    entries.push((key.clone(), val.clone()));
+                }
+                if result.eligible {
+                    for pending in &result.scan.pending_named_local {
+                        read_set.record(key1(Table::SymbolTable, 0, &pending.original_name));
+                    }
+                    for pending in &result.scan.pending_named_re_export {
+                        read_set.record(key1(Table::SymbolTable, 0, &pending.original_name));
+                    }
+                }
+            }
+
+            for pending in &result.scan.default_imports {
+                let is_bare = record_ts_export_candidates(
+                    &pending.file_path,
+                    &pending.module_path,
+                    &mut read_set,
+                );
+                has_bare |= is_bare;
+                let target_id = if is_bare {
+                    resolve_bare_import_stem(
+                        &default_export_stem_index,
+                        &pending.module_path,
+                        JS_TS_EXTENSIONS,
+                    )
+                    .and_then(|f| ts_default_exports.exports_by_file.get(f))
+                    .cloned()
+                } else {
+                    resolve_default_export_target(
+                        &ts_default_exports,
+                        &pending.module_path,
+                        &pending.file_path,
+                    )
+                };
+                if let Some(target_id) = target_id {
+                    entries.push((
+                        (pending.file_path.clone(), pending.local_name.clone()),
+                        target_id,
+                    ));
+                }
+            }
+
+            for pending in &result.scan.namespace_imports {
+                let is_bare = record_ts_export_candidates(
+                    &pending.file_path,
+                    &pending.module_path,
+                    &mut read_set,
+                );
+                has_bare |= is_bare;
+                let Some(table) = ts_top_level_entities.as_ref() else {
+                    continue;
+                };
+                let target_file = if is_bare {
+                    namespace_stem_index.as_ref().and_then(|idx| {
+                        resolve_bare_import_stem(idx, &pending.module_path, JS_TS_EXTENSIONS)
+                    })
+                } else {
+                    find_import_file(
+                        &table.sorted_files,
+                        &pending.module_path,
+                        &pending.file_path,
+                        JS_TS_EXTENSIONS,
+                    )
+                };
+                let Some(target_file) = target_file else {
+                    continue;
+                };
+                let Some(target_entries) = table.entities_by_file.get(target_file) else {
+                    continue;
+                };
+                let Some(exported_names) = named_exports_by_file.get(target_file) else {
+                    continue;
+                };
+                for (name, target_id) in target_entries {
+                    if !exported_names.contains(name) {
+                        continue;
+                    }
+                    entries.push((
+                        (
+                            pending.file_path.clone(),
+                            format!("{}.{}", pending.alias, name),
+                        ),
+                        target_id.clone(),
+                    ));
+                }
+            }
+
+            Some(RedFileEntries {
+                file_path: result.file_path,
+                scan: result.scan,
+                entries,
+                read_set,
+                has_bare,
+                eligible: result.eligible,
+            })
+        })
+        .collect();
+
+    // Step 6: apply. Sequential — `HashMap::insert`/`remove` on the one
+    // shared table — but now `O(RED files' own entries)`, not `O(corpus)`.
+    for red in red_results {
+        if let Some(old_keys) = import_keys.remove(&red.file_path) {
+            for k in old_keys {
+                import_table.remove(&k);
+            }
+        }
+        let new_keys: Vec<(String, String)> = red.entries.iter().map(|(k, _)| k.clone()).collect();
+        for (key, val) in red.entries {
+            import_table.insert(key, val);
+        }
+        if !new_keys.is_empty() {
+            import_keys.insert(red.file_path.clone(), new_keys);
+        }
+        if red.eligible {
+            import_scans.insert(
+                red.file_path,
+                CachedImportScan {
+                    scan: red.scan,
+                    read_set: red.read_set,
+                    has_bare_dependency: red.has_bare,
+                },
+            );
+        } else {
+            import_scans.remove(&red.file_path);
+        }
+    }
+    resolve_profile::add_import_table_insert_ns(__insert_t0.elapsed());
+    resolve_profile::add_import_table_merge_ns(__merge_t0.elapsed());
+    resolve_profile::add_import_table_wall_ns(__import_table_wall_t0.elapsed());
 }
 
 /// Resolve a Rust import: find the target entity in the symbol table
@@ -5295,6 +8174,8 @@ export { default as PublicDefault, X as PublicX } from './stale';
             content: String::new(),
             content_hash: String::new(),
             structural_hash: None,
+
+            kappa: None,
             start_line: 1,
             end_line: 7,
             start_byte: None,
@@ -5372,6 +8253,112 @@ function outer() {
             deps.iter().any(|dep| dep.name == "target"),
             "caller should resolve imported target across scope chunks. Deps: {:?}",
             deps.iter().map(|dep| &dep.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// semx-nuv determinism invariant: whether an ambiguous bare-name call
+    /// resolves must be a pure function of the whole corpus's content, never
+    /// of which chunk happens to hold which file. Before the fix, whether
+    /// `resolve_ref`'s Swift-overload-aware branch ran at all for a given
+    /// call depended on whether *that call's own chunk* happened to contain
+    /// a `.swift` file (`swift_call_signatures` was built from chunk-local
+    /// `parsed_files`, not the corpus) — so a genuinely ambiguous cross-file
+    /// name collision could silently resolve to whichever candidate's file
+    /// happened to co-chunk with the caller, and correctly refuse (no edge)
+    /// otherwise, for the exact same repo content. This test constructs a
+    /// corpus that reproduces that shape at the `#[cfg(test)]` byte budget
+    /// (150 bytes): two `.swift` files each defining an ambiguous `combine`
+    /// with no argument labels, and a Python caller with no local or
+    /// same-file candidate, positioned so its own chunk contains *neither*
+    /// `.swift` file (asserted directly below, so this test fails loudly if
+    /// `chunk_files_by_byte_budget`'s behavior ever changes instead of
+    /// silently stopping to cover the scenario). The correct, chunk-
+    /// independent answer is "no edge" — one candidate's file happening to
+    /// share a chunk with the caller must not manufacture a false one.
+    #[test]
+    fn test_ambiguous_cross_chunk_swift_name_resolution_is_chunk_independent() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        // Sized (via the "p"-padding comment) so that, at the test-cfg 150
+        // byte budget: chunk 0 = {swift_a} alone (its own size is under 150,
+        // but 150 - size(swift_a) < size(caller), so appending caller would
+        // overflow and closes the chunk first); chunk 1 = {caller} alone (by
+        // the same logic against swift_b); chunk 2 = {swift_b} alone. Exact
+        // sizes are computed below and re-verified against the real
+        // partitioner rather than hand-counted, so a future change to the
+        // fixture text can't silently drift this precondition out from
+        // under the test.
+        let swift_a = format!("// {}\nfunc combine(_ x: Int) {{}}\n", "p".repeat(120));
+        let swift_b = format!("// {}\nfunc combine(_ y: Int) {{}}\n", "p".repeat(120));
+        let caller = "def user():\n    return combine(1)\n".to_string();
+
+        write_file(root, "a_ambiguous.swift", &swift_a);
+        write_file(root, "m_caller.py", &caller);
+        write_file(root, "z_ambiguous.swift", &swift_b);
+        // Padding so the corpus exceeds the test-cfg `PARSED_FILE_REUSE_LIMIT`
+        // (8) and actually takes the chunked path at all — placed *after*
+        // the three files above so it cannot perturb their chunk boundaries.
+        let mut file_paths = vec![
+            "a_ambiguous.swift".to_string(),
+            "m_caller.py".to_string(),
+            "z_ambiguous.swift".to_string(),
+        ];
+        for i in 0..6 {
+            let name = format!("filler_{i}.py");
+            write_file(root, &name, "pass\n");
+            file_paths.push(name);
+        }
+        assert!(
+            file_paths.len() > PARSED_FILE_REUSE_LIMIT,
+            "fixture must exceed PARSED_FILE_REUSE_LIMIT to take the chunked path"
+        );
+
+        let chunks = chunk_files_by_byte_budget(root, &file_paths, SCOPE_RESOLVE_BYTE_BUDGET);
+        assert_eq!(
+            &chunks[0],
+            &(0..1),
+            "chunk 0 should be {{a_ambiguous.swift}} alone; got {:?} (adjust padding sizes)",
+            chunks
+        );
+        assert_eq!(
+            &chunks[1], &(1..2),
+            "chunk 1 should be {{m_caller.py}} alone, containing NO .swift file; got {:?} (adjust padding sizes)",
+            chunks
+        );
+        assert_eq!(
+            &chunks[2],
+            &(2..3),
+            "chunk 2 should be {{z_ambiguous.swift}} alone; got {:?} (adjust padding sizes)",
+            chunks
+        );
+
+        let (graph, _) = EntityGraph::build(root, &file_paths, &registry);
+
+        let caller_id = graph
+            .entities
+            .iter()
+            .find(|(_, entity)| entity.name == "user")
+            .map(|(id, _)| id.clone())
+            .expect("caller `user` entity should exist");
+
+        let resolves_to_either_combine = graph.edges.iter().any(|edge| {
+            edge.from_entity == caller_id
+                && edge.ref_type == RefType::Calls
+                && (edge.to_entity.contains("a_ambiguous.swift")
+                    || edge.to_entity.contains("z_ambiguous.swift"))
+        });
+        assert!(
+            !resolves_to_either_combine,
+            "a genuinely ambiguous cross-file `combine` (two same-named Swift \
+             candidates, no argument labels, caller in neither candidate's \
+             chunk) must resolve to no edge regardless of chunk membership; \
+             got edges: {:?}",
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.from_entity == caller_id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -8942,6 +11929,8 @@ export function caller() {
             content: content.to_string(),
             content_hash: String::new(),
             structural_hash: None,
+
+            kappa: None,
             parent_id: None,
             metadata: None,
         }
@@ -9056,5 +12045,108 @@ export function caller() {
         assert!(with_custom.contains("src/lib.rs::function::test_a"));
         assert!(with_custom.contains("qa/smoke.rs::function::run"));
         assert!(!with_custom.contains("src/main.rs::function::main"));
+    }
+}
+
+#[cfg(test)]
+mod single_pass_laws {
+    use super::*;
+    use crate::parser::plugins::create_default_registry;
+
+    /// **L-BOW-SHARE** (`SINGLE-PASS.md` §2, pass D; the deforestation
+    /// witness for bag-of-words's content column)
+    ///
+    /// ```text
+    /// ∀ corpus.  content(snapshot(corpus))  =  content(copy(corpus))
+    ///          ∧ facts-sourced entries are BORROWED, not copied
+    /// ```
+    ///
+    /// The first conjunct is representation-invariance: what bag-of-words
+    /// reads is unchanged. The second is the whole point — before semx-3tb
+    /// `snapshot_bow_content` did `facts.content().to_string()` for every
+    /// file on the chunked path, a full second copy of the corpus's JS/TS
+    /// content (136 MB on the TypeScript monster) held live from here through
+    /// the whole of scope resolution, when `precomputed_facts` — the owner of
+    /// those very bytes — outlives the snapshot on that path. Asserting
+    /// *only* the first conjunct would leave a copy-restoring regression
+    /// invisible, which is why the second is an invariant and not a comment.
+    ///
+    /// NON-VACUITY: the fixture asserts at least one entry actually comes
+    /// from the facts side (a JS/TS file with real precomputed facts, built
+    /// through the production `precompute_js_ts_file_facts`, not a stub) and
+    /// at least one from the parsed-files side, so neither branch is vacuous.
+    /// POSITIVE CONTROL: the parsed-files entry must still be `Owned` —
+    /// `parsed_files` is moved into scope resolution immediately after, so a
+    /// borrow there would not compile, and the test pins the distinction
+    /// rather than letting a future "optimization" silently borrow a dangling
+    /// source.
+    #[test]
+    fn bow_content_is_shared_not_copied() {
+        let registry = create_default_registry();
+        let ts_source = "export const a = 1;\nexport function f() { return a; }\n";
+        let (entities, tree) = registry
+            .extract_entities_with_tree("borrowed.ts", ts_source)
+            .expect("extract");
+        let tree = tree.expect("tree");
+        let facts = scope_resolve::precompute_js_ts_file_facts(
+            "borrowed.ts",
+            ts_source.to_string(),
+            &tree,
+            &entities,
+        )
+        .expect("precomputed facts");
+        let mut precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
+            HashMap::default();
+        precomputed.insert("borrowed.ts".to_string(), facts);
+
+        let owned_source = "export const b = 2;\n";
+        let (_, owned_tree) = registry
+            .extract_entities_with_tree("owned.ts", owned_source)
+            .expect("extract");
+        let parsed_files = vec![(
+            "owned.ts".to_string(),
+            owned_source.to_string(),
+            owned_tree.expect("tree"),
+        )];
+
+        let file_paths = vec!["borrowed.ts".to_string(), "owned.ts".to_string()];
+        let snapshot = snapshot_bow_content(&file_paths, &parsed_files, &precomputed);
+
+        // Conjunct 1: representation-invariance — the bytes bag-of-words
+        // reads are exactly the file's own content, whichever arm produced
+        // them.
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot.get("borrowed.ts").map(|c| c.as_ref()),
+            Some(ts_source)
+        );
+        assert_eq!(
+            snapshot.get("owned.ts").map(|c| c.as_ref()),
+            Some(owned_source)
+        );
+
+        // Conjunct 2: the facts-sourced entry is a borrow of the facts' own
+        // bytes — same address, not a copy.
+        let borrowed = snapshot.get("borrowed.ts").expect("entry");
+        assert!(
+            matches!(borrowed, Cow::Borrowed(_)),
+            "L-BOW-SHARE: the facts-sourced entry must borrow, not copy"
+        );
+        assert_eq!(
+            borrowed.as_ptr(),
+            precomputed
+                .get("borrowed.ts")
+                .expect("facts")
+                .content()
+                .as_ptr(),
+            "L-BOW-SHARE: the borrow must alias the facts' own bytes"
+        );
+
+        // Positive control: the parsed-files entry is still owned.
+        assert!(
+            matches!(snapshot.get("owned.ts").expect("entry"), Cow::Owned(_)),
+            "the parsed-files arm must stay owned — its source is moved into \
+             scope resolution immediately after"
+        );
     }
 }

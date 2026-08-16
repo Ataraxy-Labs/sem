@@ -8,7 +8,8 @@
 //!   decision for impact/context queries.
 //! - **Local**: every on-disk entity cache under the sem cache root, with
 //!   sizes, entity counts, and the repo each cache was built from (caches
-//!   written before the `repo_root` stamp show as unlabeled).
+//!   written before the `repo_root` stamp, and index-only caches that have
+//!   no `cache.db` to carry it, show as unlabeled).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -160,14 +161,24 @@ fn collect_local_caches() -> LocalSection {
         for entry in entries.flatten() {
             let dir = entry.path();
             let db = dir.join("cache.db");
-            if !db.exists() {
+            // `index.sem` is now the artifact every build writes and
+            // `cache.db` the one only the content-hydrating verbs write
+            // (semx-4ex, RESOLUTION-PROFILE.md W4.5), so keying this listing
+            // on `cache.db` would hide an indexed repo entirely and
+            // under-report the disk of every repo that has both.
+            if !db.exists() && !dir.join("index.sem").exists() {
                 continue;
             }
-            let size_bytes = ["cache.db", "cache.db-wal", "cache.db-shm"]
-                .iter()
-                .filter_map(|f| fs::metadata(dir.join(f)).ok())
-                .map(|m| m.len())
-                .sum();
+            let size_bytes = [
+                "cache.db",
+                "cache.db-wal",
+                "cache.db-shm",
+                "index.sem",
+                "facts",
+            ]
+            .iter()
+            .filter_map(|f| dir_size(&dir.join(f)))
+            .sum();
             let (repo_root, kind, entities) = read_cache_summary(&db);
             caches.push(LocalCache {
                 dir,
@@ -185,8 +196,25 @@ fn collect_local_caches() -> LocalSection {
     }
 }
 
-/// Read-only peek into one cache.db; every field is best-effort so a locked
-/// or half-written cache never breaks the listing.
+/// Bytes at `path`, following one level of directory (the `facts/` shard
+/// dir), or `None` if it does not exist.
+fn dir_size(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return Some(meta.len());
+    }
+    Some(
+        fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .filter_map(|e| dir_size(&e.path()))
+            .sum(),
+    )
+}
+
+/// Read-only peek into one cache.db; every field is best-effort so a locked,
+/// half-written, or entirely absent cache never breaks the listing — an
+/// index-only repo simply reports `—` for all three.
 fn read_cache_summary(db: &Path) -> (Option<String>, Option<String>, Option<u64>) {
     let Ok(conn) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return (None, None, None);
@@ -226,8 +254,17 @@ fn print_local(local: &LocalSection) {
     for c in &local.caches {
         let label = match &c.repo_root {
             Some(root) => root.clone(),
+            // The `repo_root` stamp lives in `cache.db`'s `cache_metadata`,
+            // so an index-only cache (semx-4ex) has no label to read — say
+            // that, rather than blaming the pre-stamp caches this message was
+            // written for.
             None => format!(
-                "(unlabeled — built before repo stamping; dir {})",
+                "({}; dir {})",
+                if c.entities.is_none() {
+                    "unlabeled — index-only cache, no cache.db to stamp"
+                } else {
+                    "unlabeled — built before repo stamping"
+                },
                 c.dir.file_name().and_then(|n| n.to_str()).unwrap_or("?")
             ),
         };

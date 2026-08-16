@@ -1,4 +1,5 @@
-mod cache;
+mod build_cache;
+mod corpus_columns;
 mod commands;
 mod formatters;
 mod hyperlinks;
@@ -39,6 +40,24 @@ enum ColorMode {
 #[derive(Subcommand)]
 enum Commands {
     /// Show semantic diff of changes (supports git diff syntax). Untracked files are excluded, matching git behavior.
+    #[command(long_about = "Show semantic diff of changes (supports git diff syntax). Untracked files are excluded, matching git behavior.\n\n\
+        Cloud upload (when this repo has cloud consent — `sem cloud enable`/`share`, or SEM_CLOUD=1):\n\
+        the local diff above is always computed and printed first, unaffected by anything below. If \
+        consent is on, the diff is then uploaded to sem cloud immediately, WITHOUT first computing \
+        caller/callee relations locally — relations are the slow part on cold/large repos, and the \
+        upload should never wait on them. What happens next depends on the server's response:\n\
+        \x20 - it queued its own relations enrichment: sem prints a one-line note and exits, no local \
+        graph work at all;\n\
+        \x20 - it can't compute them for this repo (private/unregistered — the consent boundary), or \
+        it's an older server that doesn't know about this flow yet: sem runs the same budgeted local \
+        relations pass as before and attaches the result afterward, printing what happened either way.\n\
+        \x20 The budget is adaptive to repo size by default: 90s up to ~10k tracked files, ramping \
+        linearly to an 8min cap at ~100k+ tracked files (tracked-file count read from the git index, \
+        no repo walk). Set SEM_RELATIONS_BUDGET_MS to override with an exact value in milliseconds — \
+        it always wins over the adaptive curve.\n\
+        Set SEM_RELATIONS_LOCAL=1 to always compute relations locally before uploading (the old, \
+        single-upload behavior), instead of the above. With cloud consent off, none of this runs: no \
+        network, no relations upload, identical to running with no cloud account at all.")]
     Diff {
         /// Display path label for direct file comparison
         #[arg(long, hide = true)]
@@ -161,6 +180,69 @@ enum Commands {
         /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
+    },
+    /// Find entity definitions by name — answers from the mmap query index
+    /// when one exists (cold-process, <10ms on a large repo); falls back to
+    /// a fresh build otherwise, which then leaves an index for next time.
+    Find {
+        /// Entity name, optionally as "type name" (e.g. "function createProgram")
+        query: String,
+
+        /// Restrict to entities defined in this file
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show direct callers of an entity (who calls/references it) — the
+    /// index's reverse postings, same freshness/fallback discipline as `find`.
+    Callers {
+        /// Entity name or id
+        query: String,
+
+        /// Disambiguate by defining file
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show direct refs of an entity (what it calls/references) — the
+    /// index's forward postings, same freshness/fallback discipline as `find`.
+    Refs {
+        /// Entity name or id
+        query: String,
+
+        /// Disambiguate by defining file
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search file text — rg-compatible `file:line:text` output, served from
+    /// the mmap query index's trigram postings when one exists (cold
+    /// process, target <50ms on a large repo); falls back to a plain scan
+    /// otherwise. Pattern is always a regex (same default as rg without
+    /// `-F`); patterns with no usable trigram (e.g. `-i`, short literals,
+    /// unconstrained alternation) degrade to an honest full scan rather than
+    /// a wrong answer. See QUERY-INDEX.md's trigram section.
+    Grep {
+        /// Regex or literal pattern
+        pattern: String,
+
+        /// Case-insensitive match (disables the trigram prefilter — see
+        /// QUERY-INDEX.md's out-of-scope list)
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+
+        /// Output as JSON (one object: hits, candidate_files, total_files, origin)
+        #[arg(long)]
+        json: bool,
     },
     /// Show the full entity dependency graph
     Graph {
@@ -319,10 +401,12 @@ enum Commands {
     Stats,
     /// Start the MCP server (stdin/stdout transport)
     Mcp {
-        /// Hidden plumbing: serve only the per-repo socket (no stdio MCP),
-        /// spawned detached by the CLI so repeat queries answer in
-        /// milliseconds. Exits when idle or when another server owns the
-        /// repo's socket.
+        /// Removed (QUERY-INDEX.md §7 item 5 / semx-woe): used to spawn the
+        /// per-repo sidecar socket. The mmap query index answers cold in
+        /// 6-7ms, deleting the sidecar's reason to exist. Kept as a
+        /// backward-compatible no-op (exits immediately, does nothing) so an
+        /// existing `sem setup` SessionStart hook that still invokes
+        /// `sem mcp --resident` doesn't error.
         #[arg(long, hide = true)]
         resident: bool,
     },
@@ -347,6 +431,11 @@ enum Commands {
     Cloud {
         #[command(subcommand)]
         action: CloudAction,
+    },
+    /// Attach an agent to a sem-cloud code review
+    Review {
+        #[command(subcommand)]
+        action: ReviewAction,
     },
     /// Control anonymous usage telemetry (local by default — nothing uploaded)
     Telemetry {
@@ -402,6 +491,30 @@ enum CloudAction {
 }
 
 #[derive(Subcommand)]
+enum ReviewAction {
+    /// Join a sem-cloud code review as a live listener (the one-command agent attach)
+    #[command(long_about = "Join a sem-cloud code review as a live listener: resolves credentials, \
+        validates the diff exists, and execs `claude` pre-configured with the sem-review-listener \
+        plugin so the session joins the review and answers reviewer questions in a loop for as long \
+        as it runs.\n\n\
+        Accepts either a bare diff id or a hosted review URL (…/diffs/{id}, optionally with a \
+        trailing /canvas and a query string or fragment).\n\n\
+        Environment:\n  \
+        SEM_CLOUD_URL, SEM_API_KEY   Override ~/.sem/credentials.json (same precedence as every \
+                                     other cloud command).\n  \
+        SEM_LISTENER_MODEL          Model for the listener session (default: claude-opus-5).\n  \
+        SEM_LISTENER_PLUGIN_DIR     Override the claude-review-listener plugin directory \
+                                     (auto-detected relative to the sem binary otherwise).")]
+    Listen {
+        /// Diff id, or a hosted review URL (…/diffs/{id}, optionally /canvas)
+        diff_id_or_url: String,
+        /// Print the assembled command and environment (secrets masked) instead of launching
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TelemetryAction {
     /// Record usage locally and upload it to help improve sem
     On,
@@ -424,6 +537,10 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Hook { .. }) => "hook",
         Some(Commands::Log { .. }) => "log",
         Some(Commands::Entities { .. }) => "entities",
+        Some(Commands::Find { .. }) => "find",
+        Some(Commands::Callers { .. }) => "callers",
+        Some(Commands::Refs { .. }) => "refs",
+        Some(Commands::Grep { .. }) => "grep",
         Some(Commands::Context { .. }) => "context",
         Some(Commands::Stats) => "stats",
         Some(Commands::Mcp { .. }) => "mcp",
@@ -433,6 +550,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Logout) => "logout",
         Some(Commands::Whoami) => "whoami",
         Some(Commands::Cloud { .. }) => "cloud",
+        Some(Commands::Review { .. }) => "review",
         Some(Commands::Telemetry { .. }) => "telemetry",
         Some(Commands::Xref { .. }) => "xref",
         Some(Commands::Repos { .. }) => "repos",
@@ -601,6 +719,54 @@ fn main() {
                 no_default_excludes,
             });
         }
+        Some(Commands::Find { query, file, json }) => {
+            commands::query::find_command(commands::query::QueryOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                query,
+                file,
+                json,
+            });
+        }
+        Some(Commands::Callers { query, file, json }) => {
+            commands::query::callers_command(commands::query::QueryOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                query,
+                file,
+                json,
+            });
+        }
+        Some(Commands::Refs { query, file, json }) => {
+            commands::query::refs_command(commands::query::QueryOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                query,
+                file,
+                json,
+            });
+        }
+        Some(Commands::Grep {
+            pattern,
+            ignore_case,
+            json,
+        }) => {
+            commands::grep::grep_command(commands::grep::GrepOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                pattern,
+                case_insensitive: ignore_case,
+                json,
+            });
+        }
         Some(Commands::Hook { kind }) => {
             if kind == "prompt-submit" {
                 commands::hook::prompt_submit();
@@ -692,12 +858,11 @@ fn main() {
             commands::stats::run();
         }
         Some(Commands::Mcp { resident }) => {
-            let result = if resident {
-                sem_mcp::run_resident()
-            } else {
-                sem_mcp::run()
-            };
-            if let Err(e) = result {
+            if resident {
+                // No-op: see the `resident` field's doc comment above.
+                return;
+            }
+            if let Err(e) = sem_mcp::run() {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);
             }
@@ -749,6 +914,14 @@ fn main() {
                 CloudAction::Forget => commands::consent::forget(&cwd),
             }
         }
+        Some(Commands::Review { action }) => match action {
+            ReviewAction::Listen { diff_id_or_url, dry_run } => {
+                if let Err(e) = commands::review::listen(&diff_id_or_url, dry_run) {
+                    eprintln!("{} {}", "error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Some(Commands::Telemetry { action }) => match action {
             TelemetryAction::On => telemetry::set_mode("on"),
             TelemetryAction::Local => telemetry::set_mode("local"),

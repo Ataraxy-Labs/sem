@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sem-review": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/../../crates/target/debug/sem",
+      "args": ["mcp"],
+      "env": {
+        "SEM_CLOUD_URL": "${SEM_CLOUD_URL:-}",
+        "SEM_API_KEY": "${SEM_API_KEY:-}"
+      }
+    }
+  }
+}

@@ -152,6 +152,8 @@ fn extract_entries(
                 parent_id: frame.parent_entity_id.clone(),
                 content_hash: content_hash_value,
                 structural_hash: structural_hash_value,
+
+                kappa: None,
                 content: stored_content,
                 start_line: abs_start,
                 end_line: abs_end,
@@ -201,6 +203,8 @@ fn document_chunk_entity(
         parent_id: None,
         content_hash: content_hash_value,
         structural_hash: None,
+
+        kappa: None,
         content: stored_content,
         start_line: 1,
         end_line: line_count,

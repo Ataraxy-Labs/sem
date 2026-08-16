@@ -578,6 +578,18 @@ pub struct CloudHistoryResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CloudDiffSnapshotResponse {
     pub id: String,
+    /// How the server will handle caller/callee relations for this snapshot:
+    /// `"included"` (relations were already computed from the payload),
+    /// `"enrichmentQueued"` (the server will compute them itself; no local
+    /// work needed), or `"unavailable"` (the server won't compute them for
+    /// this repo — the consent boundary — so the client should). `None` means
+    /// an older server that predates this field entirely; treated the same
+    /// as `"unavailable"` for version tolerance.
+    // No external consumer (sem-cli has no lib target / dependents) — only
+    // cloud_upload.rs (same crate) reads this; pub(crate) is enough. The
+    // sibling `id` field is pre-existing/already ledger-covered, untouched.
+    #[serde(default)]
+    pub(crate) relations_status: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1034,6 +1046,11 @@ impl CloudClient {
         Ok(resp)
     }
 
+    /// Upload a diff snapshot. `relations` is sent as-is — callers on the fast
+    /// path pass an empty object so the upload never blocks on the local graph
+    /// pass; callers using the `SEM_RELATIONS_LOCAL=1` escape hatch pass the
+    /// already-computed relations, matching the pre-instant-upload behavior.
+    /// Returns the full response so the caller can branch on `relationsStatus`.
     #[allow(clippy::too_many_arguments)]
     pub fn upload_diff_snapshot(
         &self,
@@ -1045,7 +1062,7 @@ impl CloudClient {
         diff_result: &DiffResult,
         binary_changes: &[BinaryFileChange],
         relations: &serde_json::Value,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<CloudDiffSnapshotResponse, Box<dyn std::error::Error>> {
         let resp: CloudDiffSnapshotResponse = self
             .agent
             .post(&self.api_url("/v1/diffs"))
@@ -1061,7 +1078,25 @@ impl CloudClient {
                 "relations": relations,
             }))?
             .into_json()?;
-        Ok(resp.id)
+        Ok(resp)
+    }
+
+    /// Attach caller/callee relations to a diff snapshot after the fact — the
+    /// counterpart to uploading with empty relations. Used when the server
+    /// reported `relationsStatus: "unavailable"` (or omitted the field
+    /// entirely, an older server) and the client computed them locally.
+    // No external consumer — only cloud_upload.rs (same crate) calls this;
+    // pub(crate) is enough (sem-cli has no lib target / dependents).
+    pub(crate) fn put_diff_relations(
+        &self,
+        diff_id: &str,
+        relations: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.agent
+            .put(&self.api_url(&format!("/v1/diffs/{diff_id}/relations")))
+            .set("Authorization", &self.auth_header())
+            .send_json(relations.clone())?;
+        Ok(())
     }
 
     pub fn diff_snapshot_url(&self, id: &str) -> String {
@@ -1088,6 +1123,61 @@ impl CloudClient {
             .get(&self.api_url("/v1/cross-deps"))
             .set("Authorization", &self.auth_header())
             .call()?
+            .into_json()?;
+        Ok(resp)
+    }
+
+    // ── Facts service (semx-9en cloud half; see commands/diff/facts_remote.rs
+    //    for the only caller and docs/architecture/FACTS-SERVICE.md in
+    //    sem-cloud for the wire contract) ──
+    //
+    // No external consumer besides facts_remote.rs (same crate) — pub(crate)
+    // is enough, same reasoning as `put_diff_relations` above.
+
+    /// `POST /v1/facts/query`: index-aligned known/unknown split for `keys`.
+    pub(crate) fn query_facts(
+        &self,
+        keys: &[super::diff::facts_remote::FactKey],
+    ) -> Result<super::diff::facts_remote::FactsQueryResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .agent
+            .post(&self.api_url("/v1/facts/query"))
+            .set("Authorization", &self.auth_header())
+            .send_json(serde_json::json!({ "keys": keys }))?
+            .into_json()?;
+        Ok(resp)
+    }
+
+    /// `POST /v1/facts/download`: raw CBOR response body — the caller
+    /// (`facts_remote::download_known`) decodes it, since this client stays
+    /// agnostic to the fact payload's own shape.
+    pub(crate) fn download_facts(
+        &self,
+        keys: &[super::diff::facts_remote::FactKey],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let resp = self
+            .agent
+            .post(&self.api_url("/v1/facts/download"))
+            .set("Authorization", &self.auth_header())
+            .send_json(serde_json::json!({ "keys": keys }))?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)?;
+        Ok(buf)
+    }
+
+    /// `POST /v1/facts/put`: write-once, consent-gated upload. `body` is
+    /// already-encoded CBOR (`facts_remote::encode_put_body`) — this client
+    /// only knows how to transport it, not how to build it.
+    pub(crate) fn put_facts(
+        &self,
+        body: &[u8],
+    ) -> Result<super::diff::facts_remote::PutFactsResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .agent
+            .post(&self.api_url("/v1/facts/put"))
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/cbor")
+            .send_bytes(body)?
             .into_json()?;
         Ok(resp)
     }

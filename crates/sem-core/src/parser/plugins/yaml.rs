@@ -32,6 +32,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                     parent_id: None,
                     content_hash: content_hash(content),
                     structural_hash: None,
+
+                    kappa: None,
                     content: content.to_string(),
                     start_line: 1,
                     end_line: lines.len(),
@@ -71,6 +73,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                         parent_id: None,
                         content_hash: content_hash(&preamble_content),
                         structural_hash: None,
+
+                        kappa: None,
                         content: preamble_content,
                         start_line: 1,
                         end_line: preamble_end,
@@ -103,6 +107,8 @@ impl SemanticParserPlugin for YamlParserPlugin {
                 parent_id: None,
                 content_hash: content_hash(&entity_content),
                 structural_hash: None,
+
+                kappa: None,
                 content: entity_content,
                 start_line: tk.line,
                 end_line,

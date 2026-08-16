@@ -91,6 +91,8 @@ impl SemanticParserPlugin for TomlParserPlugin {
                 parent_id: None,
                 content_hash: content_hash(&value_str),
                 structural_hash: None,
+
+                kappa: None,
                 content: entity_content,
                 start_line: section.line,
                 end_line,
