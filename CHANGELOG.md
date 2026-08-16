@@ -6,6 +6,7 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- **`sem --version` now reports the correct version.** The `v0.21.1` tag only bumped `sem-core`, leaving `sem-cli`, `sem-mcp`, `sem-plugin`, and `sem-cloud-client` at `0.21.0`, so the binary still reported `0.21.0`. Bumped those crates (and their internal path dependencies) to `0.21.1` to match the tag. Thanks @chenrui333 (#480).
 - **Building a graph over Svelte components no longer crashes (SIGSEGV) on Linux/glibc.** `sem graph`/`context`/`orient` over `.svelte` files deterministically exited 139 from an invalid free in the `tree-sitter-htmlx-svelte` 0.1.8 grammar's scanner, hit during parallel graph construction (macOS's allocator tolerated the bad free, so it only showed on Linux). Bumped the grammar to 0.1.16, which carries the scanner fixes; the existing version constraint already permitted it, so this is a lock-only dependency update. Added a parallel-Svelte-graph regression test. Thanks @XF-FW for the exhaustive isolation and the verified fix (#471).
 
 ## [0.21.0] - 2026-07-10
