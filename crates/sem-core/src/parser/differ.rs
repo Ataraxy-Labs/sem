@@ -321,9 +321,9 @@ fn suppress_redundant_parents(
             continue;
         }
 
-        // Added/Deleted: suppress unconditionally; the children carry the detail.
-        // Modified: only suppress if the container's own declaration is unchanged
-        // and the value type didn't transition.
+        // Modified containers are redundant when only their children changed.
+        // Added/Deleted containers carry structural information of their own,
+        // so retain them alongside their changed children.
         let should_suppress = if change.change_type == ChangeType::Modified {
             match (before_by_id.get(eid), after_by_id.get(eid)) {
                 (Some(bp), Some(ap)) if bp.entity_type == ap.entity_type => {
@@ -334,7 +334,7 @@ fn suppress_redundant_parents(
                 _ => false,
             }
         } else {
-            true
+            false
         };
 
         if should_suppress {
@@ -342,13 +342,17 @@ fn suppress_redundant_parents(
         }
     }
 
-    // Suppress an old parent that a Moved child left behind when the old
-    // parent itself appears as a change — handles the parent-rename case
-    // where the parent itself failed to match.
+    // A moved child already explains a Modified old parent. An Added or
+    // Deleted parent represents a structural replacement and must remain.
+    let modified_ids: HashSet<&str> = changes
+        .iter()
+        .filter(|change| change.change_type == ChangeType::Modified)
+        .map(|change| change.entity_id.as_str())
+        .collect();
     for change in changes.iter() {
         if change.change_type == ChangeType::Moved {
             if let Some(ref old_pid) = change.old_parent_id {
-                if changed_ids.contains(old_pid.as_str()) {
+                if modified_ids.contains(old_pid.as_str()) {
                     suppress.insert(old_pid.clone());
                 }
             }
