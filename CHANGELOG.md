@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Semantic diffs now retain added and deleted containers alongside their changed children.** Adding or removing a whole JSON section surfaces the structural parent instead of only its leaves; unchanged parent declarations modified solely through child edits remain suppressed to avoid redundant output.
+
 ## [0.22.1] - 2026-08-16
 
 ### Added
