@@ -96,12 +96,30 @@ pub fn entities_command(opts: EntitiesOptions) {
     let mut processed_file_count = 0usize;
     let mut discovered_file_count = 0usize;
     let mut extracted_entities = false;
+    // The index-root lookup is one repo-scoped fact, not a per-file one —
+    // computed at most once, lazily, on the first file-shaped `path_arg`
+    // (never for a directory-only invocation, which doesn't need it: see
+    // `try_index_entities_for_dir`, which reads through the raw `root`
+    // instead). `SEM_NO_INDEX` is checked here, before any discovery work
+    // runs, not downstream inside `open_index` — the outer `None` means
+    // "index reroute disabled," the inner `None` means "not inside a repo."
+    let mut index_repo_root: Option<Option<PathBuf>> = None;
     for path_arg in &path_args {
         let (path_label, full_path) = resolve_path(root, path_arg);
         if full_path.is_file() {
             file_arg_count += 1;
             processed_file_count += 1;
-            let file_entities = match try_index_entities_for_file(&opts.cwd, &full_path) {
+            let repo_root = index_repo_root.get_or_insert_with(|| {
+                if std::env::var_os("SEM_NO_INDEX").is_some() {
+                    None
+                } else {
+                    Some(super::repo_root_or_cwd(&opts.cwd))
+                }
+            });
+            let file_entities = match repo_root
+                .as_deref()
+                .and_then(|repo_root| try_index_entities_for_file(&opts.cwd, repo_root, &full_path))
+            {
                 Some(indexed) => {
                     timings.mark("index_entities_query");
                     indexed
@@ -292,15 +310,18 @@ fn extract_files_entities(
 /// finding it stale — falls through to the unchanged `extract_file_entities`
 /// re-parse below; this function never produces a wrong answer, only
 /// "cannot answer fast."
-fn try_index_entities_for_file(cwd: &str, full_path: &Path) -> Option<Vec<SemanticEntity>> {
-    let repo_root = super::repo_root_or_cwd(cwd);
-    let idx = super::query::open_index(&repo_root)?;
+fn try_index_entities_for_file(
+    cwd: &str,
+    repo_root: &Path,
+    full_path: &Path,
+) -> Option<Vec<SemanticEntity>> {
+    let idx = super::query::open_index(repo_root)?;
     let rel = super::normalize_repo_relative_path(
         Path::new(cwd),
-        &repo_root,
+        repo_root,
         &full_path.to_string_lossy(),
     );
-    if super::query::is_file_stale(&idx, &repo_root, &rel) {
+    if super::query::is_file_stale(&idx, repo_root, &rel) {
         return None;
     }
     // Confirms the index actually knows this file, distinguishing "no
@@ -711,5 +732,39 @@ mod tests {
 
         assert_eq!(entity_depth(&entities[0], &entities_by_id), 1);
         assert_eq!(entity_depth(&entities[1], &entities_by_id), 1);
+    }
+
+    #[test]
+    fn entities_command_computes_repo_root_once_for_multiple_file_args() {
+        // SEM_NO_INDEX unset is this test's precondition: it's proving the
+        // index-root lookup is hoisted out of the per-file loop, which only
+        // matters on the path where that lookup runs at all. Guard against
+        // ambient state leaking in from elsewhere in the process.
+        std::env::remove_var("SEM_NO_INDEX");
+
+        let temp = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(temp.path()).unwrap();
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(temp.path().join(name), "export const x = 1;\n").unwrap();
+        }
+
+        super::super::reset_repo_root_lookup_count_for_test();
+
+        entities_command(EntitiesOptions {
+            cwd: temp.path().to_string_lossy().to_string(),
+            paths: vec!["a.ts".into(), "b.ts".into(), "c.ts".into()],
+            json: true,
+            no_default_excludes: false,
+            file_exts: vec![],
+            only_kinds: vec![],
+            except_kinds: vec![],
+            text: None,
+        });
+
+        assert_eq!(
+            super::super::repo_root_lookup_count_for_test(),
+            1,
+            "3 file arguments against the same cwd must share one repo-root lookup, not one per file"
+        );
     }
 }

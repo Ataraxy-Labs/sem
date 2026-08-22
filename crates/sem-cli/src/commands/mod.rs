@@ -39,8 +39,6 @@ use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
 use std::path::{Component, Path, PathBuf};
 
-use sem_core::git::bridge::GitBridge;
-
 /// Create a parser registry with extension mappings loaded from `cwd`.
 /// Loads `.semrc` first (takes priority), then `.gitattributes` as fallback.
 pub fn create_registry(cwd: &str) -> ParserRegistry {
@@ -51,10 +49,41 @@ pub fn create_registry(cwd: &str) -> ParserRegistry {
     registry
 }
 
+// Test-only call counter: proves callers (e.g. `entities_command`) hoist
+// this lookup out of a per-file-argument loop instead of recomputing it
+// once per file. `thread_local` rather than a shared atomic because
+// `cargo test`'s default harness runs each test function on its own
+// thread, so this needs no cross-test locking to stay accurate.
+#[cfg(test)]
+thread_local! {
+    static REPO_ROOT_LOOKUP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn reset_repo_root_lookup_count_for_test() {
+    REPO_ROOT_LOOKUP_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub fn repo_root_lookup_count_for_test() -> usize {
+    REPO_ROOT_LOOKUP_COUNT.with(|count| count.get())
+}
+
+/// Resolve `cwd`'s enclosing git repo root, or `cwd` itself when it isn't
+/// inside one. Cheap: a filesystem walk for a `.git` entry
+/// ([`sem_core::git::bridge::discover_repo_root`]), never a full
+/// `GitBridge::open` (no libgit2 ODB/index/config work) — callers that only
+/// need the root path, not a repo handle for reads, should call this rather
+/// than opening a `GitBridge` themselves. Callers that call this once per
+/// logical request (not once per file) get the benefit for free; a caller
+/// iterating multiple files for the same `cwd` should hoist one call
+/// outside its loop rather than relying on this being free to repeat.
 pub fn repo_root_or_cwd(cwd: &str) -> PathBuf {
-    GitBridge::open(Path::new(cwd))
-        .map(|git| git.repo_root().to_path_buf())
-        .unwrap_or_else(|_| Path::new(cwd).to_path_buf())
+    #[cfg(test)]
+    REPO_ROOT_LOOKUP_COUNT.with(|count| count.set(count.get() + 1));
+
+    sem_core::git::bridge::discover_repo_root(Path::new(cwd))
+        .unwrap_or_else(|| Path::new(cwd).to_path_buf())
 }
 
 pub fn normalize_repo_relative_path(cwd: &Path, repo_root: &Path, path: &str) -> String {

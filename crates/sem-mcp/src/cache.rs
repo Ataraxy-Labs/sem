@@ -56,7 +56,9 @@ use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef, RefType};
 #[cfg(test)]
 #[allow(unused_imports)]
-use sem_core::parser::hotspot::{aggregate_history_analytics, CommitEntityChanges, HistoryAnalytics};
+use sem_core::parser::hotspot::{
+    aggregate_history_analytics, CommitEntityChanges, HistoryAnalytics,
+};
 #[cfg(test)]
 #[allow(unused_imports)]
 use sem_core::parser::registry::ParserRegistry;
@@ -613,7 +615,10 @@ mod tests {
 
     fn assert_table_empty(cache: &DiskCache, table: &str) {
         let sql = format!("SELECT COUNT(*) FROM {table}");
-        let count: i64 = cache.connection().query_row(&sql, [], |row| row.get(0)).unwrap();
+        let count: i64 = cache
+            .connection()
+            .query_row(&sql, [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0, "{table} should be empty after schema rebuild");
     }
 

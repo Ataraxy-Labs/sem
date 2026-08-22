@@ -669,7 +669,7 @@ mod tests {
             (
                 "a.ts",
                 good_hash,
-                "ts-0.23-u16",
+                "ts-0.23-u16-exportspan",
                 FACTS_SCHEMA_VERSION,
                 &good_payload,
             ),
@@ -678,7 +678,7 @@ mod tests {
             (
                 "b.ts",
                 good_hash,
-                "ts-0.23-u16",
+                "ts-0.23-u16-exportspan",
                 FACTS_SCHEMA_VERSION,
                 &bad_payload,
             ),

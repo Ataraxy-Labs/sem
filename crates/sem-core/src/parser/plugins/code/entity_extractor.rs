@@ -1,10 +1,7 @@
 use tree_sitter::{Node, Tree};
 
 use super::languages::LanguageConfig;
-use crate::model::entity::{
-    build_entity_id, build_entity_id_disambiguated, build_entity_id_disambiguated_with_ordinal,
-    SemanticEntity,
-};
+use crate::model::entity::{build_entity_id, disambiguate_colliding_entity_ids, SemanticEntity};
 use crate::utils::hash::{content_hash, structural_and_semantic_hash};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -40,179 +37,6 @@ pub fn extract_entities(
     disambiguate_colliding_entity_ids(&mut entities);
 
     entities
-}
-
-type IdRewrites = HashMap<String, Vec<(usize, String)>>;
-
-fn disambiguate_colliding_entity_ids(entities: &mut [SemanticEntity]) {
-    if !has_duplicate_entity_ids(entities) {
-        return;
-    }
-
-    // Each pass can expose child ID collisions at the next descendant level.
-    // The entity count bounds the maximum number of parent-child propagation steps.
-    for _ in 0..=entities.len() {
-        let rewrites = disambiguate_current_entity_ids(entities);
-        if rewrites.is_empty() {
-            assert_unique_entity_ids(entities);
-            return;
-        }
-
-        propagate_parent_id_rewrites(entities, rewrites);
-    }
-
-    assert_unique_entity_ids(entities);
-}
-
-fn has_duplicate_entity_ids(entities: &[SemanticEntity]) -> bool {
-    let mut seen = HashSet::with_capacity(entities.len());
-    for entity in entities {
-        if !seen.insert(entity.id.as_str()) {
-            return true;
-        }
-    }
-    false
-}
-
-fn disambiguate_current_entity_ids(entities: &mut [SemanticEntity]) -> IdRewrites {
-    let mut id_indices: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, entity) in entities.iter().enumerate() {
-        id_indices.entry(entity.id.clone()).or_default().push(i);
-    }
-
-    let mut rewrites: IdRewrites = HashMap::new();
-    for (_id, indices) in &id_indices {
-        if indices.len() > 1 {
-            let mut indices = indices.clone();
-            indices.sort_unstable();
-
-            let mut line_counts: HashMap<usize, usize> = HashMap::new();
-            for &idx in &indices {
-                *line_counts.entry(entities[idx].start_line).or_default() += 1;
-            }
-
-            let mut line_ordinals: HashMap<usize, usize> = HashMap::new();
-            for &idx in &indices {
-                let e = &entities[idx];
-                let new_id = if line_counts[&e.start_line] > 1 {
-                    let ordinal = line_ordinals.entry(e.start_line).or_default();
-                    *ordinal += 1;
-                    build_entity_id_disambiguated_with_ordinal(
-                        &e.file_path,
-                        &e.entity_type,
-                        &e.name,
-                        e.parent_id.as_deref(),
-                        e.start_line,
-                        *ordinal,
-                    )
-                } else {
-                    build_entity_id_disambiguated(
-                        &e.file_path,
-                        &e.entity_type,
-                        &e.name,
-                        e.parent_id.as_deref(),
-                        e.start_line,
-                    )
-                };
-                let old_id = std::mem::replace(&mut entities[idx].id, new_id.clone());
-                if old_id != new_id {
-                    rewrites.entry(old_id).or_default().push((idx, new_id));
-                }
-            }
-        }
-    }
-
-    rewrites
-}
-
-fn propagate_parent_id_rewrites(entities: &mut [SemanticEntity], mut rewrites: IdRewrites) {
-    while !rewrites.is_empty() {
-        let mut child_rewrites: IdRewrites = HashMap::new();
-
-        for child_idx in 0..entities.len() {
-            let Some(parent_id) = entities[child_idx].parent_id.clone() else {
-                continue;
-            };
-            let Some(candidates) = rewrites.get(&parent_id) else {
-                continue;
-            };
-            let Some(new_parent_id) = select_rewritten_parent_id(entities, child_idx, candidates)
-            else {
-                continue;
-            };
-
-            entities[child_idx].parent_id = Some(new_parent_id.clone());
-            let new_child_id = build_entity_id(
-                &entities[child_idx].file_path,
-                &entities[child_idx].entity_type,
-                &entities[child_idx].name,
-                Some(&new_parent_id),
-            );
-            let old_child_id = std::mem::replace(&mut entities[child_idx].id, new_child_id.clone());
-            if old_child_id != new_child_id {
-                child_rewrites
-                    .entry(old_child_id)
-                    .or_default()
-                    .push((child_idx, new_child_id));
-            }
-        }
-
-        rewrites = child_rewrites;
-    }
-}
-
-fn select_rewritten_parent_id(
-    entities: &[SemanticEntity],
-    child_idx: usize,
-    candidates: &[(usize, String)],
-) -> Option<String> {
-    let child = &entities[child_idx];
-    let mut best: Option<((u8, u8, u8, usize, usize), String)> = None;
-
-    for (parent_idx, parent_id) in candidates {
-        if *parent_idx == child_idx {
-            continue;
-        }
-        let parent = &entities[*parent_idx];
-        let same_file_rank = if parent.file_path == child.file_path {
-            0
-        } else {
-            1
-        };
-        let before_rank = if *parent_idx < child_idx { 0 } else { 1 };
-        let line_span_contains_child =
-            parent.start_line <= child.start_line && child.end_line <= parent.end_line;
-        let line_span_differs =
-            (parent.start_line, parent.end_line) != (child.start_line, child.end_line);
-        let contains_rank = if line_span_contains_child && line_span_differs {
-            0
-        } else {
-            1
-        };
-        let distance = parent_idx.abs_diff(child_idx);
-        let span = parent.end_line.saturating_sub(parent.start_line);
-        let key = (same_file_rank, contains_rank, before_rank, distance, span);
-
-        if match best.as_ref() {
-            Some((best_key, _)) => key < *best_key,
-            None => true,
-        } {
-            best = Some((key, parent_id.clone()));
-        }
-    }
-
-    best.map(|(_, parent_id)| parent_id)
-}
-
-fn assert_unique_entity_ids(entities: &[SemanticEntity]) {
-    let mut seen = HashSet::with_capacity(entities.len());
-    for entity in entities {
-        assert!(
-            seen.insert(entity.id.as_str()),
-            "duplicate semantic entity id generated: {}",
-            entity.id
-        );
-    }
 }
 
 fn attach_go_package_metadata(root: Node, source: &[u8], entities: &mut [SemanticEntity]) {
@@ -1511,10 +1335,17 @@ fn recovered_swift_structural_hash(
 /// For languages with outer attributes/annotations that are sibling nodes
 /// (e.g. Rust `#[derive(...)]`, `#[cfg(...)]`), walk backward to find the
 /// earliest preceding attribute so the entity span includes them.
-/// Returns (start_byte, start_row) of the first attribute if any found.
+/// For TS/JS exported declarations the parsed node is the *inner* declaration
+/// (function_declaration / class_declaration / lexical_declaration); its
+/// `export_statement` parent additionally spans the `export`/`default`
+/// keywords, so that parent's start is used instead.
+/// Returns (start_byte, start_row) of the first such token if any found.
 fn preceding_attributes_start(node: Node, config: &LanguageConfig) -> Option<(usize, usize)> {
     let attr_kind = match config.id {
         "rust" => "attribute_item",
+        // TS/JS have no outer-attribute siblings; only an export wrapper
+        // (see `export_statement_start`) can extend their span backward.
+        "typescript" | "tsx" | "javascript" => return export_statement_start(node, config),
         _ => return None,
     };
 
@@ -1535,6 +1366,23 @@ fn preceding_attributes_start(node: Node, config: &LanguageConfig) -> Option<(us
     }
 
     found.then_some((earliest_start_byte, earliest_start_row))
+}
+
+/// For TS/JS exported declarations (`export function foo() {}`,
+/// `export default class Foo {}`, `export const x = 1;`), tree-sitter hands
+/// us the inner declaration whose parent is an `export_statement` node that
+/// also covers the `export` (and, for default exports, the `default`)
+/// keywords. Return that parent's start so the entity span includes them.
+/// `export`/`default` are anonymous tokens, so they have no preceding named
+/// sibling to walk to -- only node.parent() can find them.
+fn export_statement_start(node: Node, config: &LanguageConfig) -> Option<(usize, usize)> {
+    match config.id {
+        "typescript" | "tsx" | "javascript" => {}
+        _ => return None,
+    }
+    let parent = node.parent()?;
+    (parent.kind() == "export_statement")
+        .then(|| (parent.start_byte(), parent.start_position().row))
 }
 
 /// For Dart top-level function/getter/setter signatures, return the sibling
@@ -3676,6 +3524,198 @@ impl Greeter {
 }
 "#,
             ".rs",
+        );
+    }
+}
+
+#[cfg(test)]
+mod modifier_span_tests {
+    //! An entity's byte span must agree with its line span about
+    //! where the declaration starts. Before this fix, `export function foo`
+    //! (and friends) produced start_byte pointing at `function` while
+    //! start_line pointed at the `export` line -- a byte-precise read
+    //! (`content[start_byte..end_byte]`) and a line-based read of the same
+    //! entity disagreed about the leading modifier.
+    //!
+    //! Rule applied: an entity's span must include leading visibility /
+    //! export modifiers that are its own declaration's immediate syntactic
+    //! wrapper (TS/JS `export` / `export default`). Rust visibility (`pub`,
+    //! `pub(crate)`) is already a *child* of the item node in the grammar,
+    //! not a wrapper, so it was never excluded -- asserted here as a
+    //! regression guard. Python decorators and Go (no wrapper) are
+    //! unaffected by this bug; Python decorators are already handled by a
+    //! separate, pre-existing mechanism (`preceding_attributes_start`) and
+    //! are asserted here too so this change doesn't regress them.
+    use super::*;
+    use crate::parser::plugins::code::{languages::get_language_config, parse_tree};
+
+    fn entities_for(source: &str, ext: &str) -> Vec<SemanticEntity> {
+        let config = get_language_config(ext).expect("language config for test extension");
+        let tree = parse_tree(config, source).expect("parse");
+        extract_entities(&tree, "test_file", config, source)
+    }
+
+    fn find<'a>(entities: &'a [SemanticEntity], name: &str) -> &'a SemanticEntity {
+        entities
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entity `{name}` not found among {entities:#?}"))
+    }
+
+    /// Prints the byte slice and line slice so a human (or the next test
+    /// run) can see the exact disagreement instead of just a pass/fail.
+    fn assert_span_includes_modifier(source: &str, entity: &SemanticEntity, modifier: &str) {
+        let start_byte = entity
+            .start_byte
+            .unwrap_or_else(|| panic!("entity `{}` has no start_byte", entity.name));
+        let end_byte = entity
+            .end_byte
+            .unwrap_or_else(|| panic!("entity `{}` has no end_byte", entity.name));
+        let byte_slice = &source[start_byte..end_byte];
+
+        let line_slice = source
+            .lines()
+            .nth(entity.start_line - 1)
+            .unwrap_or_else(|| panic!("start_line {} out of range", entity.start_line));
+
+        println!(
+            "entity `{}`: byte_slice starts with {:?}, line_slice = {:?}",
+            entity.name,
+            &byte_slice[..byte_slice.len().min(40)],
+            line_slice
+        );
+
+        assert!(
+            byte_slice.trim_start().starts_with(modifier),
+            "entity `{}`: byte-precise slice does not start with `{modifier}` -- \
+             got {:?} (start_byte={start_byte}); line-based slice is {:?} (start_line={}). \
+             byte span and line span disagree about the leading modifier.",
+            entity.name,
+            &byte_slice[..byte_slice.len().min(60)],
+            line_slice,
+            entity.start_line
+        );
+        assert!(
+            line_slice.trim_start().starts_with(modifier),
+            "entity `{}`: line-based slice does not start with `{modifier}`: {:?}",
+            entity.name,
+            line_slice
+        );
+    }
+
+    #[test]
+    fn ts_export_function_span_includes_export_keyword() {
+        let source = "export function foo(a: number): number {\n    return a;\n}\n";
+        let entities = entities_for(source, ".ts");
+        let foo = find(&entities, "foo");
+        assert_span_includes_modifier(source, foo, "export");
+    }
+
+    #[test]
+    fn ts_export_default_function_span_includes_export_default() {
+        let source = "export default function foo(a: number): number {\n    return a;\n}\n";
+        let entities = entities_for(source, ".ts");
+        let foo = find(&entities, "foo");
+        assert_span_includes_modifier(source, foo, "export default");
+    }
+
+    #[test]
+    fn ts_export_default_class_span_includes_export_default() {
+        let source = "export default class Foo {\n    bar() {\n        return 1;\n    }\n}\n";
+        let entities = entities_for(source, ".ts");
+        let foo = find(&entities, "Foo");
+        assert_span_includes_modifier(source, foo, "export default");
+    }
+
+    #[test]
+    fn ts_export_class_span_includes_export_keyword() {
+        let source = "export class Foo {\n    bar() {\n        return 1;\n    }\n}\n";
+        let entities = entities_for(source, ".ts");
+        let foo = find(&entities, "Foo");
+        assert_span_includes_modifier(source, foo, "export");
+    }
+
+    #[test]
+    fn ts_export_const_span_includes_export_keyword() {
+        let source = "export const x = 1;\n";
+        let entities = entities_for(source, ".ts");
+        let x = find(&entities, "x");
+        assert_span_includes_modifier(source, x, "export");
+    }
+
+    #[test]
+    fn js_export_function_span_includes_export_keyword() {
+        let source = "export function foo(a) {\n    return a;\n}\n";
+        let entities = entities_for(source, ".js");
+        let foo = find(&entities, "foo");
+        assert_span_includes_modifier(source, foo, "export");
+    }
+
+    #[test]
+    fn ts_non_exported_function_span_unchanged() {
+        // Regression guard: a plain (non-exported) declaration's span must
+        // NOT gain a leading modifier it doesn't have, and must not grow.
+        let source = "function foo(a: number): number {\n    return a;\n}\n";
+        let entities = entities_for(source, ".ts");
+        let foo = find(&entities, "foo");
+        let start_byte = foo.start_byte.expect("start_byte");
+        let end_byte = foo.end_byte.expect("end_byte");
+        assert_eq!(start_byte, 0, "plain declaration should start at byte 0");
+        assert_eq!(&source[start_byte..end_byte], source.trim_end());
+        assert_eq!(foo.start_line, 1);
+    }
+
+    #[test]
+    fn rust_pub_fn_span_includes_pub_keyword() {
+        // Regression guard: Rust `pub` is a child of the item node in the
+        // grammar (not a wrapper), so this was never broken -- but assert
+        // it explicitly so the JS/TS fix can't regress it.
+        let source = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let entities = entities_for(source, ".rs");
+        let add = find(&entities, "add");
+        assert_span_includes_modifier(source, add, "pub");
+    }
+
+    #[test]
+    fn rust_pub_crate_struct_span_includes_pub_crate_keyword() {
+        let source = "pub(crate) struct Greeter {\n    name: String,\n}\n";
+        let entities = entities_for(source, ".rs");
+        let greeter = find(&entities, "Greeter");
+        assert_span_includes_modifier(source, greeter, "pub(crate)");
+    }
+
+    #[test]
+    fn python_decorated_function_span_includes_decorator() {
+        // Regression guard for the pre-existing `preceding_attributes_start`
+        // mechanism, which already includes decorators -- must keep working.
+        let source = "@staticmethod\ndef foo(a):\n    return a\n";
+        let entities = entities_for(source, ".py");
+        let foo = find(&entities, "foo");
+        assert_span_includes_modifier(source, foo, "@staticmethod");
+    }
+
+    #[test]
+    fn end_byte_unchanged_by_export_wrapper_fix() {
+        // The fix must only move start_byte/start_line backward; end_byte
+        // must still point exactly at the end of the declaration, matching
+        // what a non-exported version of the same declaration would give.
+        let exported = "export function foo(a: number): number {\n    return a;\n}\n";
+        let plain = "function foo(a: number): number {\n    return a;\n}\n";
+
+        let exported_entities = entities_for(exported, ".ts");
+        let plain_entities = entities_for(plain, ".ts");
+
+        let exported_foo = find(&exported_entities, "foo");
+        let plain_foo = find(&plain_entities, "foo");
+
+        // Both bodies are byte-identical (only the "export " prefix differs),
+        // so end-relative-to-start-of-body must line up: the exported
+        // entity's end_byte is exactly len("export ") further along.
+        let prefix_len = "export ".len();
+        assert_eq!(
+            exported_foo.end_byte.unwrap(),
+            plain_foo.end_byte.unwrap() + prefix_len,
+            "end_byte should shift by exactly the export-prefix length, not over-extend"
         );
     }
 }

@@ -21,6 +21,8 @@ pub struct EntitiesParams {
         description = "Exact substring to search for inside entity bodies across the whole repo (use instead of grep for strings, error messages, config keys). Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text."
     )]
     pub text: Option<String>,
+    #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
+    pub format: Option<String>,
 }
 
 impl EntitiesParams {
@@ -48,6 +50,10 @@ impl EntitiesParams {
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
+    }
+
+    pub fn format(&self) -> &str {
+        self.format.as_deref().unwrap_or("text")
     }
 }
 
@@ -124,6 +130,62 @@ pub struct ContextParams {
         description = "Force a full re-send even if this session already received an identical fill for the entity (use when your context was compacted and the earlier body is gone)."
     )]
     pub fresh: Option<bool>,
+    #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
+    pub format: Option<String>,
+}
+
+impl ContextParams {
+    pub fn format(&self) -> &str {
+        self.format.as_deref().unwrap_or("text")
+    }
+}
+
+// ── Find / Grep tool parameter structs ──
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FindParams {
+    #[schemars(
+        description = "Entity name to look up, optionally as \"type name\" (e.g. \"function createProgram\") to disambiguate by kind."
+    )]
+    pub query: String,
+    #[schemars(description = "Restrict to entities defined in this file.")]
+    pub file: Option<String>,
+    #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
+    pub format: Option<String>,
+}
+
+impl FindParams {
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_deref().filter(|f| !f.is_empty())
+    }
+
+    pub fn format(&self) -> &str {
+        self.format.as_deref().unwrap_or("text")
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrepParams {
+    #[schemars(
+        description = "Regex or literal pattern to search file contents for (rg-compatible)."
+    )]
+    pub pattern: String,
+    #[schemars(description = "Case-insensitive match.")]
+    pub case_insensitive: Option<bool>,
+    #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
+    pub format: Option<String>,
+}
+
+impl GrepParams {
+    pub fn case_insensitive(&self) -> bool {
+        self.case_insensitive.unwrap_or(false)
+    }
+
+    pub fn format(&self) -> &str {
+        self.format.as_deref().unwrap_or("text")
+    }
 }
 
 // ── Review listener tool parameter structs ──
@@ -239,6 +301,8 @@ mod tests {
         assert_unknown_fields_return_invalid_params::<ImpactAnalysisParams>();
         assert_unknown_fields_return_invalid_params::<LogParams>();
         assert_unknown_fields_return_invalid_params::<ContextParams>();
+        assert_unknown_fields_return_invalid_params::<FindParams>();
+        assert_unknown_fields_return_invalid_params::<GrepParams>();
         assert_unknown_fields_return_invalid_params::<JoinReviewParams>();
         assert_unknown_fields_return_invalid_params::<WaitForBranchParams>();
         assert_unknown_fields_return_invalid_params::<ReplyToBranchParams>();

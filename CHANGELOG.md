@@ -4,6 +4,22 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-08-22
+
+### Fixed
+
+- **CSV, JSON, and Vue entities no longer collide on generated ids with entities from other files.** Their id-generation scheme is now disambiguated per plugin, closing a gap where two entities could silently collapse onto the same id and one would drop out of the graph.
+- **Entities from non-code files (Markdown, TOML, YAML, JSON, CSV, Vue/Svelte) now carry accurate byte ranges**, so tools that rely on byte offsets (extraction, editing, highlighting) work correctly for these file types instead of getting an inaccurate span.
+- **Markdown headings that appear inside a fenced code block are no longer parsed as real document headings.**
+- **TypeScript/JavaScript entity byte spans now include a leading `export` keyword when present**, so extracting an exported declaration's exact source text no longer drops the `export ` prefix. Facts schema v4 — existing caches rebuild automatically on first use.
+- **`sem entities` no longer opens the git repository through libgit2 on every call.** That was a fixed per-call cost regardless of file size, disproportionately noticeable on small-file lookups; it's now only paid when actually needed.
+- **sem-mcp's `query` and `limit` parameters on the `entities` and `context` tools now work correctly** (previously ignored).
+
+### Added
+
+- **sem-mcp: new `find` and `grep` tools**, giving MCP clients the same fast entity-lookup and trigram-accelerated search already available from the CLI (`sem find`, `sem grep`).
+- **sem-mcp: `entities` and `context` tools accept `format=json`**, returning structured JSON instead of human-readable text for callers that want to parse results programmatically.
+
 ## [0.23.0] - 2026-08-22
 
 ### Changed

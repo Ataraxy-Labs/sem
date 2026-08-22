@@ -1,4 +1,4 @@
-use crate::model::entity::{build_entity_id, SemanticEntity};
+use crate::model::entity::{build_entity_id, disambiguate_colliding_entity_ids, SemanticEntity};
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::utils::hash::content_hash;
 
@@ -14,11 +14,17 @@ impl SemanticParserPlugin for JsonParserPlugin {
     }
 
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
-        self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Full)
+        let mut entities =
+            self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Full);
+        disambiguate_colliding_entity_ids(&mut entities);
+        entities
     }
 
     fn extract_entities_brief(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
-        self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Brief)
+        let mut entities =
+            self.extract_entities_with_payload(content, file_path, EntityPayloadMode::Brief);
+        disambiguate_colliding_entity_ids(&mut entities);
+        entities
     }
 }
 
@@ -1476,6 +1482,37 @@ mod tests {
             !changes.iter().any(|c| c.change_type == ChangeType::Renamed),
             "rename should not be detectable; got: {:?}",
             names(&changes)
+        );
+    }
+
+    /// RED: `json.rs`'s hand-written scanner walks the raw text
+    /// and does not reject (or dedupe) a repeated top-level key — two
+    /// entries named `"dup"` at the same nesting produce the same
+    /// `{file_path}::/dup` id with no disambiguation post-pass. Both
+    /// entries must survive extraction as distinct entities with distinct
+    /// ids, the way the code plugin's tree-sitter extractor already
+    /// disambiguates colliding ids within one file.
+    #[test]
+    fn duplicate_top_level_keys_get_unique_entity_ids() {
+        let content = "{\n  \"dup\": 1,\n  \"other\": 2,\n  \"dup\": 3\n}\n";
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(content, "config.json");
+
+        let dup_entities: Vec<_> = entities.iter().filter(|e| e.name == "dup").collect();
+        assert_eq!(
+            dup_entities.len(),
+            2,
+            "expected both same-named top-level keys to survive extraction; got: {:?}",
+            entities.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        let ids: std::collections::HashSet<&str> =
+            dup_entities.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            dup_entities.len(),
+            "duplicate entity ids for same-named top-level keys: {:?}",
+            dup_entities.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
     }
 }

@@ -181,7 +181,31 @@ macro_rules! maybe_par_iter {
 /// `PersistedFacts`; every producer but Python's still writes an empty
 /// `Vec`), so it gets the identical clean-miss treatment rather than relying
 /// on CBOR's forward-compatible decode.
-pub const FACTS_SCHEMA_VERSION: u32 = 3;
+///
+/// 3 -> 4 (non-code plugin byte ranges + markdown fenced-code-block fix): not a shape
+/// change — `SemanticEntity::start_byte`/`end_byte` stay `Option<usize>` —
+/// but a *meaning* change this doc's own rule still catches: every
+/// non-tree-sitter plugin (markdown, toml, yaml, json, csv, latex, vue,
+/// svelte, erb, fallback) used to leave both fields `None` unconditionally;
+/// the registry's extractor boundary now fills them from the entity's own
+/// line range for any plugin other than the tree-sitter code plugin. A
+/// pre-fix store's `None` for one of these entities no longer means "not
+/// computed" (a correct default) — it means "computed by buggy code," which
+/// `#[serde(default)]` cannot tell apart from the real default. The
+/// markdown plugin's fenced-code-block heading fix changes which heading
+/// entities exist at all for an affected file, same reasoning. `file`
+/// content_hash gates re-extraction only when the file's own bytes change,
+/// not when the extractor's output for unchanged bytes changes, so a plain
+/// content-hash hit would keep serving the stale (pre-fix) entities across a
+/// binary upgrade that shares `sem_core_salt` with the pre-fix release (a
+/// dev build between release-prep commits, in particular) — the same
+/// producer-identity problem `language_salt`/`producer_language_salt` exists
+/// to solve for tree-sitter grammars, just not something a non-code plugin
+/// has ever needed a salt for before. Bumping the shared schema version is
+/// the coarse-but-correct fix: it clean-misses the whole corpus (code-plugin
+/// entries included, even though their producer didn't change) rather than
+/// inventing a new per-non-code-plugin salt table for a one-time fix.
+pub const FACTS_SCHEMA_VERSION: u32 = 4;
 
 const MAGIC: &[u8; 8] = b"SEMFACT1";
 
@@ -800,9 +824,20 @@ const SHARD_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// this table, so drift between the two is a build failure, not a silent
 /// divergence.
 pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
-    ("typescript", "ts-0.23-u16"),
-    ("tsx", "ts-0.23-u16"),
-    ("javascript", "ts-0.23-u16"),
+    // Entity byte spans for exported TS/JS declarations (export function,
+    // export default class, export const, ...) used to start_byte right
+    // after the `export`/`export default` keywords while start_line already
+    // pointed at that same line -- a byte-precise read of an entity and a
+    // line-based read of the same entity disagreed about where it began.
+    // Fixed by extending the span backward to the wrapping
+    // `export_statement` node's own start. This changes the
+    // `start_byte`/`start_line` fields `FileFacts.entities` carries into the
+    // corpus for every exported declaration in these three languages, so a
+    // pre-fix corpus entry would silently keep serving the wrong span
+    // forever (dedup is first-writer-wins) without this bump.
+    ("typescript", "ts-0.23-u16-exportspan"),
+    ("tsx", "ts-0.23-u16-exportspan"),
+    ("javascript", "ts-0.23-u16-exportspan"),
     // MUL: python's producer now emits populated
     // import_stmts (Field 10) *and* ctor_call_sites (Field 11) — bumped from
     // "ts-0.23" following rust's/go's/java's salt-bump precedent. Shipped
@@ -966,12 +1001,33 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("svelte", "ts-0.1.7"),
     ("erb", "ts-0.25"),
     ("toml", "handrolled-1"),
-    ("csv", "handrolled-1"),
-    ("json", "handrolled-1"),
+    // csv/json/vue were bumped `handrolled-1` -> `handrolled-2`,
+    // the same salt-bump species as yaml's bump below: only the code plugin's
+    // tree-sitter extractor disambiguated colliding entity ids within one
+    // file (an `@L{line}` suffix); every other hand-rolled plugin called
+    // `build_entity_id` with no post-pass, so two CSV rows sharing a
+    // first-cell value, two JSON object entries sharing a top-level key, or
+    // two `<style>` blocks in one Vue SFC (a common real pattern —
+    // `<style scoped>` next to a plain `<style>`) produced the same id and
+    // silently collided in `EntityGraph::build`'s `entity_map`. The fix
+    // (`model/entity.rs`'s `disambiguate_colliding_entity_ids`, the same
+    // function the code plugin already used, now also run at every
+    // extractor boundary — `registry.rs`, `differ.rs`, `diff_oracle.rs` —
+    // plus directly inside `csv_plugin.rs`/`json.rs`) changes the `id` field
+    // only for files that actually collide; a well-formed file with no
+    // colliding names keeps the same id (verified: bit-identical entity ids
+    // before/after on a real corpus with no colliding CSV/JSON/Vue content).
+    // `toml`/`fallback`/`erb` are not bumped: TOML's own parser already
+    // rejects duplicate keys before an id is ever built, fallback's chunk
+    // names are monotonic line ranges that cannot repeat, and erb already
+    // disambiguates block/expression names itself (`unique_name`) — none of
+    // the three can produce a colliding id, pre- or post-fix.
+    ("csv", "handrolled-2"),
+    ("json", "handrolled-2"),
     ("yaml", "handrolled-2"),
     ("markdown", "handrolled-1"),
     ("latex", "handrolled-1"),
-    ("vue", "handrolled-1"),
+    ("vue", "handrolled-2"),
     ("fallback", "handrolled-1"),
 ];
 
@@ -2574,11 +2630,11 @@ mod corpus_tests {
 
         let hash = content_hash(source);
         assert!(
-            corpus.get("a.ts", hash, "ts-0.23-u16").is_some(),
+            corpus.get("a.ts", hash, "ts-0.23-u16-exportspan").is_some(),
             "the path that was actually populated must hit"
         );
         assert!(
-            corpus.get("b.ts", hash, "ts-0.23-u16").is_none(),
+            corpus.get("b.ts", hash, "ts-0.23-u16-exportspan").is_none(),
             "identical content at a different path must miss — path is part of the key, \
              not just a locality hint"
         );
@@ -3024,7 +3080,11 @@ mod corpus_tests {
             "a v1 shard must not decode under v2"
         );
         assert!(corpus
-            .get("a.ts", content_hash("export const a = 1;\n"), "ts-0.23-u16")
+            .get(
+                "a.ts",
+                content_hash("export const a = 1;\n"),
+                "ts-0.23-u16-exportspan"
+            )
             .is_none());
 
         // ...and writing past it leaves a readable v2 shard: the old corpus
@@ -3329,7 +3389,7 @@ mod corpus_tests {
             let source = format!("export const v = '{p}';\n");
             let hash = content_hash(&source);
             assert!(
-                corpus.get(p, hash, "ts-0.23-u16").is_some(),
+                corpus.get(p, hash, "ts-0.23-u16-exportspan").is_some(),
                 "entry for {p} lost under concurrent writers"
             );
         }
@@ -3363,7 +3423,10 @@ mod corpus_tests {
         let source = "export function shared() { return 1; }";
 
         let outcome = corpus
-            .ingest_remote(&reg, vec![remote_fact("a.ts", source, "ts-0.23-u16")])
+            .ingest_remote(
+                &reg,
+                vec![remote_fact("a.ts", source, "ts-0.23-u16-exportspan")],
+            )
             .expect("ingest");
         assert_eq!(outcome.accepted.files_written, 1);
         assert!(outcome.rejected.is_empty());
@@ -3372,7 +3435,7 @@ mod corpus_tests {
         // hits it, and `merge_with_local` returns it as an ordinary corpus
         // hit — the same path a downstream `warm_start` consults.
         let hash = content_hash(source);
-        assert!(corpus.get("a.ts", hash, "ts-0.23-u16").is_some());
+        assert!(corpus.get("a.ts", hash, "ts-0.23-u16-exportspan").is_some());
 
         let repo = tempfile::tempdir().expect("repo");
         std::fs::write(repo.path().join("a.ts"), source).unwrap();
@@ -3393,7 +3456,7 @@ mod corpus_tests {
         let reg = registry();
         let source = "export const a = 1;\n";
 
-        let mut fact = remote_fact("a.ts", source, "ts-0.23-u16");
+        let mut fact = remote_fact("a.ts", source, "ts-0.23-u16-exportspan");
         fact.claimed_relative_path = "b.ts".to_string(); // tamper: wrong key
         let outcome = corpus.ingest_remote(&reg, vec![fact]).expect("ingest");
 
@@ -3404,10 +3467,10 @@ mod corpus_tests {
             IngestError::PathMismatch { .. }
         ));
         assert!(corpus
-            .get("a.ts", content_hash(source), "ts-0.23-u16")
+            .get("a.ts", content_hash(source), "ts-0.23-u16-exportspan")
             .is_none());
         assert!(corpus
-            .get("b.ts", content_hash(source), "ts-0.23-u16")
+            .get("b.ts", content_hash(source), "ts-0.23-u16-exportspan")
             .is_none());
     }
 
@@ -3422,7 +3485,7 @@ mod corpus_tests {
         let reg = registry();
         let source = "export const a = 1;\n";
 
-        let mut fact = remote_fact("a.ts", source, "ts-0.23-u16");
+        let mut fact = remote_fact("a.ts", source, "ts-0.23-u16-exportspan");
         fact.claimed_content_hash = content_hash("totally different bytes");
         let outcome = corpus.ingest_remote(&reg, vec![fact]).expect("ingest");
 
@@ -3433,7 +3496,7 @@ mod corpus_tests {
             IngestError::ContentHashMismatch { .. }
         ));
         assert!(corpus
-            .get("a.ts", content_hash(source), "ts-0.23-u16")
+            .get("a.ts", content_hash(source), "ts-0.23-u16-exportspan")
             .is_none());
     }
 
@@ -3445,7 +3508,7 @@ mod corpus_tests {
         let reg = registry();
         let source = "export const a = 1;\n";
 
-        // "ts-0.23-u16" is the real salt for .ts; claim a stale/wrong one.
+        // "ts-0.23-u16-exportspan" is the real salt for .ts; claim a stale/wrong one.
         let fact = remote_fact("a.ts", source, "ts-0.24-stale");
         let outcome = corpus.ingest_remote(&reg, vec![fact]).expect("ingest");
 
@@ -3465,7 +3528,7 @@ mod corpus_tests {
         let reg = registry();
         let source = "export const a = 1;\n";
 
-        let mut fact = remote_fact("a.ts", source, "ts-0.23-u16");
+        let mut fact = remote_fact("a.ts", source, "ts-0.23-u16-exportspan");
         fact.claimed_schema_version = FACTS_SCHEMA_VERSION + 1;
         let outcome = corpus.ingest_remote(&reg, vec![fact]).expect("ingest");
 
@@ -3488,8 +3551,8 @@ mod corpus_tests {
         let good_source = "export const a = 1;\n";
         let bad_source = "export const b = 2;\n";
 
-        let good = remote_fact("a.ts", good_source, "ts-0.23-u16");
-        let mut bad = remote_fact("b.ts", bad_source, "ts-0.23-u16");
+        let good = remote_fact("a.ts", good_source, "ts-0.23-u16-exportspan");
+        let mut bad = remote_fact("b.ts", bad_source, "ts-0.23-u16-exportspan");
         bad.claimed_content_hash = content_hash("tampered");
 
         let outcome = corpus.ingest_remote(&reg, vec![good, bad]).expect("ingest");
@@ -3497,10 +3560,10 @@ mod corpus_tests {
         assert_eq!(outcome.rejected.len(), 1);
         assert_eq!(outcome.rejected[0].0, "b.ts");
         assert!(corpus
-            .get("a.ts", content_hash(good_source), "ts-0.23-u16")
+            .get("a.ts", content_hash(good_source), "ts-0.23-u16-exportspan")
             .is_some());
         assert!(corpus
-            .get("b.ts", content_hash(bad_source), "ts-0.23-u16")
+            .get("b.ts", content_hash(bad_source), "ts-0.23-u16-exportspan")
             .is_none());
     }
 }

@@ -24,7 +24,8 @@ use crate::agent_review::AgentReviewError;
 
 /// Protocol text handed back verbatim by `join_review` — the loop discipline
 /// that keeps a headless listener session alive.
-pub const REVIEW_LISTENER_PROTOCOL: &str = "You are now a review listener. Loop: call wait_for_branch. \
+pub const REVIEW_LISTENER_PROTOCOL: &str =
+    "You are now a review listener. Loop: call wait_for_branch. \
     When it returns a branch, investigate the question IN THIS REPOSITORY (read code, grep, run \
     tests if needed — the diff context attached is a starting point, not the whole truth), then \
     reply_to_branch with partial:true chunks as you compose (2-4 sentences each, content is \
@@ -45,7 +46,8 @@ pub const TIMEOUT_INSTRUCTION: &str = "Call wait_for_branch again now. You are s
 
 /// Follow-up text appended after `wait_for_branch` returns a branch,
 /// telling the agent what to do with the question it just received.
-pub const BRANCH_FOUND_FOLLOWUP: &str = "\n\nA reviewer asked a question. Investigate it in this repository, then answer \
+pub const BRANCH_FOUND_FOLLOWUP: &str =
+    "\n\nA reviewer asked a question. Investigate it in this repository, then answer \
      with reply_to_branch (partial:true chunks while composing, a final partial:false \
      call to commit). As soon as you've replied, call wait_for_branch again immediately.";
 
@@ -90,7 +92,10 @@ mod tests {
         };
         let result = unanswerable_result(&err);
         assert_eq!(result["status"], Value::String("unanswerable".to_string()));
-        assert_eq!(result["instruction"], Value::String("Call wait_for_branch again now.".to_string()));
+        assert_eq!(
+            result["instruction"],
+            Value::String("Call wait_for_branch again now.".to_string())
+        );
         assert!(result["reason"].as_str().unwrap().contains("404"));
     }
 

@@ -8249,6 +8249,42 @@ function outer() {
         assert_eq!(entities.len(), depth + 1);
     }
 
+    /// RED: the CSV plugin ids rows by their first cell (`row[<value>]`)
+    /// with no per-file disambiguation post-pass (the code plugin's
+    /// `entity_extractor` has one; non-code plugins do not). Two rows sharing a
+    /// first-cell value collide on the same id, and `EntityGraph::build`'s
+    /// `entity_map: HashMap<String, EntityInfo>` insert silently drops one of
+    /// them — pass-1 extraction sees 3 rows, but the built graph ends up with
+    /// only 2 entities for the file.
+    #[test]
+    fn test_csv_duplicate_first_cell_rows_do_not_collapse_in_graph() {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(root, "people.csv", "name,age\nalice,30\nalice,41\nbob,22\n");
+
+        let (graph, entities) = EntityGraph::build(root, &["people.csv".into()], &registry);
+
+        assert_eq!(
+            entities.len(),
+            3,
+            "pass-1 extraction should see one entity per data row; got: {:?}",
+            entities.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        let csv_entities_in_graph = graph
+            .entities
+            .keys()
+            .filter(|id| id.starts_with("people.csv::"))
+            .count();
+        assert_eq!(
+            csv_entities_in_graph,
+            3,
+            "built graph must not silently collapse rows with colliding ids; entity_map keys: {:?}",
+            graph.entities.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_chunked_scope_resolution_keeps_cross_chunk_import_edges() {
         let (dir, registry) = create_test_repo();

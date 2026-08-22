@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::model::entity::{build_entity_id, SemanticEntity};
+use crate::model::entity::{build_entity_id, disambiguate_colliding_entity_ids, SemanticEntity};
 
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
@@ -274,6 +274,10 @@ impl ParserRegistry {
         };
 
         let mut entities = plugin.extract_entities(content, detection_path);
+        if plugin.id() != "code" {
+            fill_missing_byte_ranges(&mut entities, content);
+        }
+        disambiguate_colliding_entity_ids(&mut entities);
         if let Some(ref rp) = resolved {
             fix_entity_paths(&mut entities, file_path, rp);
         }
@@ -291,6 +295,10 @@ impl ParserRegistry {
         };
 
         let mut entities = plugin.extract_entities_brief(content, detection_path);
+        if plugin.id() != "code" {
+            fill_missing_byte_ranges(&mut entities, content);
+        }
+        disambiguate_colliding_entity_ids(&mut entities);
         if let Some(ref rp) = resolved {
             fix_entity_paths(&mut entities, file_path, rp);
         }
@@ -308,6 +316,10 @@ impl ParserRegistry {
 
         let plugin = self.get_plugin_with_content(detection_path, content)?;
         let (mut entities, tree) = plugin.extract_entities_with_tree(content, detection_path);
+        if plugin.id() != "code" {
+            fill_missing_byte_ranges(&mut entities, content);
+        }
+        disambiguate_colliding_entity_ids(&mut entities);
         if let Some(ref rp) = resolved {
             fix_entity_paths(&mut entities, file_path, rp);
         }
@@ -585,6 +597,47 @@ fn fix_entity_paths(entities: &mut [SemanticEntity], original: &str, resolved: &
         if let Some(ref mut pid) = entity.parent_id {
             *pid = pid.replace(resolved, original);
         }
+    }
+}
+
+/// Compute a byte span for entities whose plugin didn't set one correctly,
+/// from the entity's own start_line/end_line. Mirrors the tree-sitter code
+/// plugin's convention: start_byte is the offset of the first byte of
+/// start_line; end_byte is the offset one past the last byte of end_line,
+/// EXCLUDING that line's own trailing newline (and trailing \r, for CRLF
+/// files). Entities whose existing range already matches are untouched;
+/// entities carrying a *different* range (e.g. vue/svelte children whose
+/// bytes were computed relative to an extracted `<script>` slice rather than
+/// the whole file) are rewritten to the line-derived span. Callers gate this
+/// on `plugin.id() != "code"` so the tree-sitter code plugin's authoritative
+/// node offsets are never second-guessed.
+fn fill_missing_byte_ranges(entities: &mut [SemanticEntity], content: &str) {
+    let mut line_starts = vec![0usize];
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        pos += line.len();
+        line_starts.push(pos);
+    }
+    for entity in entities.iter_mut() {
+        if entity.start_line == 0 || entity.start_line > entity.end_line {
+            continue;
+        }
+        let start_idx = entity.start_line - 1;
+        let end_idx = entity.end_line;
+        if start_idx >= line_starts.len() || end_idx >= line_starts.len() {
+            continue;
+        }
+        let start_byte = line_starts[start_idx];
+        let raw_end = line_starts[end_idx];
+        let end_byte = content[..raw_end].trim_end_matches(['\n', '\r']).len();
+        if end_byte <= start_byte {
+            continue;
+        }
+        if entity.start_byte == Some(start_byte) && entity.end_byte == Some(end_byte) {
+            continue;
+        }
+        entity.start_byte = Some(start_byte);
+        entity.end_byte = Some(end_byte);
     }
 }
 

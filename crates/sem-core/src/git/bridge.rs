@@ -1513,6 +1513,38 @@ fn command_line_safe_directories() -> Vec<String> {
         .collect()
 }
 
+/// Cheap repo-root discovery for callers that only need the root PATH, not
+/// a [`GitBridge`] handle for reads — e.g. `sem-cli`'s `repo_root_or_cwd`,
+/// used to locate a repo-scoped on-disk index before deciding whether to
+/// open it. Walks up from `path` looking for a `.git` entry (directory OR
+/// file — a linked worktree's `.git` is a file containing `gitdir: ...`,
+/// and the worktree's own directory is the correct root here, same as
+/// `GitBridge::open(path).repo_root()` returns for a worktree), without
+/// opening the repository through libgit2 at all: no ODB, no index, no
+/// config parse, no ref resolution.
+///
+/// Deliberately narrower than [`GitBridge::open`], by design, for every
+/// piece of `open`'s work that doesn't matter to a path-only caller:
+/// - **No `GIT_DIR`/`GIT_WORK_TREE` env handling.** `GitBridge::open` never
+///   honored these either — it calls `Repository::discover`, which does a
+///   pure upward directory walk and does not consult them (that's
+///   `Repository::open_from_env`, a different libgit2 entry point this
+///   module never calls) — so there is nothing to preserve.
+/// - **No bare-repo resolution.** `GitBridge::open` already treats a bare
+///   repo as `GitError::NotARepo` (`repo.workdir()` is `None` for one), and
+///   a plain `.git`-entry walk naturally agrees: a bare repo has no `.git`
+///   entry *inside itself* to find, so this returns `None` for one too —
+///   same outcome, no special-casing needed.
+/// - **No `extensions.refstorage`/reftable detection, no owner-validation
+///   retry.** Both exist in `GitBridge::open` to let ref *resolution* and
+///   libgit2's `Repository::discover` succeed under edge-case git configs
+///   (reftable refs, `safe.directory`); a plain filesystem walk never
+///   touches refs or libgit2's owner checks, so neither applies.
+pub fn discover_repo_root(path: &Path) -> Option<PathBuf> {
+    let start = normalize_open_path(path).ok()?;
+    nearest_git_root(&start)
+}
+
 fn nearest_git_root(path: &Path) -> Option<PathBuf> {
     let mut current = if path.is_file() { path.parent()? } else { path };
 
@@ -2555,6 +2587,130 @@ export function bar(y: number) {
         assert!(
             !before.contains('\r'),
             "before_content read from CRLF blob should be normalized to LF"
+        );
+    }
+
+    // -- discover_repo_root: parity with GitBridge::open(path).repo_root() --
+    //
+    // `discover_repo_root` is a cheap path-only alternative to
+    // `GitBridge::open` for callers (`sem-cli`'s `repo_root_or_cwd`) that
+    // never read through the repo, only need to know its root. These tests
+    // pin the exact cases its doc comment claims parity — or a deliberate,
+    // documented divergence — for.
+
+    #[test]
+    fn discover_repo_root_matches_gitbridge_root_from_nested_dir() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        commit_file(&repo, "a.rs", "fn a() {}\n", "init");
+
+        let nested = temp.path().join("src").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+
+        let expected = GitBridge::open(&nested).unwrap().repo_root().to_path_buf();
+        let actual = discover_repo_root(&nested).unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "discovery from a nested directory must agree with GitBridge::open's root"
+        );
+    }
+
+    #[test]
+    fn discover_repo_root_matches_gitbridge_root_for_linked_worktree() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        commit_file(&repo, "a.rs", "fn a() {}\n", "init");
+
+        // A linked worktree's `.git` is a FILE ("gitdir: ...."), not a
+        // directory — the case the doc comment calls out explicitly. The
+        // worktree's own directory is the correct root, same as
+        // `GitBridge::open` resolves it to (each worktree has its own
+        // `workdir()`, distinct from the main checkout's).
+        let worktree_dir = temp.path().parent().unwrap().join("linked-worktree");
+        repo.worktree("feature", &worktree_dir, None)
+            .expect("git2 should be able to add a linked worktree");
+        assert!(
+            worktree_dir.join(".git").is_file(),
+            "sanity: a linked worktree's .git must be a file, not a directory"
+        );
+
+        let expected = GitBridge::open(&worktree_dir)
+            .unwrap()
+            .repo_root()
+            .to_path_buf();
+        let actual = discover_repo_root(&worktree_dir).unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "discovery inside a linked worktree must resolve to the worktree's own directory, \
+             matching GitBridge::open"
+        );
+        assert_eq!(
+            actual,
+            fs::canonicalize(&worktree_dir).unwrap(),
+            "the worktree's own directory is the expected root, not the main checkout's"
+        );
+
+        fs::remove_dir_all(&worktree_dir).ok();
+    }
+
+    #[test]
+    fn discover_repo_root_returns_none_outside_any_repo() {
+        let temp = TempDir::new().unwrap();
+        // No `Repository::init` — a plain, non-repo directory.
+        let plain_dir = temp.path().join("not-a-repo");
+        fs::create_dir_all(&plain_dir).unwrap();
+
+        assert!(
+            GitBridge::open(&plain_dir).is_err(),
+            "sanity: GitBridge::open must fail outside any repo"
+        );
+        assert_eq!(
+            discover_repo_root(&plain_dir),
+            None,
+            "discovery must return None outside any repo, matching GitBridge::open's failure"
+        );
+    }
+
+    // Changing the process's current directory is process-global state; no
+    // other test in this module touches it, but guard with a lock (same
+    // discipline as `owner_validation_lock`/`OwnerValidationDisabled` above)
+    // and a Drop-based restore so a panicking assertion can't leak a changed
+    // cwd into whichever test happens to run next.
+    static CWD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreCwd(PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn discover_repo_root_matches_gitbridge_root_for_relative_path() {
+        let _guard = CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original_cwd = env::current_dir().unwrap();
+        let _restore = RestoreCwd(original_cwd);
+
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        commit_file(&repo, "a.rs", "fn a() {}\n", "init");
+
+        let nested = temp.path().join("src");
+        fs::create_dir_all(&nested).unwrap();
+        env::set_current_dir(&nested).unwrap();
+
+        // "." is relative — the exact case `normalize_open_path`'s
+        // does-not-exist-yet fallback vs. its canonicalize-succeeds path
+        // both need to agree on, since here canonicalize succeeds.
+        let relative = Path::new(".");
+        let expected = GitBridge::open(relative).unwrap().repo_root().to_path_buf();
+        let actual = discover_repo_root(relative).unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "a relative start path must resolve to the same root as GitBridge::open"
         );
     }
 }

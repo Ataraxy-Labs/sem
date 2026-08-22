@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::model::entity::{build_entity_id, SemanticEntity};
+use crate::model::entity::{build_entity_id, disambiguate_colliding_entity_ids, SemanticEntity};
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::utils::hash::content_hash;
 
@@ -60,6 +60,8 @@ impl SemanticParserPlugin for CsvParserPlugin {
             });
         }
 
+        disambiguate_colliding_entity_ids(&mut entities);
+
         entities
     }
 }
@@ -94,4 +96,38 @@ fn parse_csv_line(line: &str, separator: char) -> Vec<String> {
     }
     cells.push(current.trim().to_string());
     cells
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// RED: two data rows that share the same first-cell value
+    /// collide on `row[<value>]` because `csv_plugin` calls the plain
+    /// `build_entity_id` with no disambiguation post-pass (unlike the code
+    /// plugin's `entity_extractor`, which disambiguates colliding ids with
+    /// an `@L{line}` suffix before returning). Both rows must survive
+    /// extraction as distinct entities with distinct ids.
+    #[test]
+    fn duplicate_first_cell_rows_get_unique_entity_ids() {
+        let content = "name,age\nalice,30\nalice,41\nbob,22\n";
+        let plugin = CsvParserPlugin;
+        let entities = plugin.extract_entities(content, "people.csv");
+
+        assert_eq!(
+            entities.len(),
+            3,
+            "expected one entity per data row; got: {:?}",
+            entities.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        let ids: HashSet<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            entities.len(),
+            "duplicate entity ids for rows sharing a first-cell value: {:?}",
+            entities.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
 }

@@ -17,7 +17,7 @@ macro_rules! maybe_par_iter {
     }};
 }
 use crate::model::change::{ChangeType, SemanticChange};
-use crate::model::entity::SemanticEntity;
+use crate::model::entity::{disambiguate_colliding_entity_ids, SemanticEntity};
 use crate::model::identity::match_entities;
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::parser::registry::ParserRegistry;
@@ -109,7 +109,9 @@ pub fn compute_semantic_diff(
                     let before_detection = before_resolved.as_deref().unwrap_or(before_path);
                     phase_timing::timed(&PHASE_ACC.extraction_ns, || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            plugin.extract_entities(content, before_detection)
+                            let mut entities = plugin.extract_entities(content, before_detection);
+                            disambiguate_colliding_entity_ids(&mut entities);
+                            entities
                         }))
                         .unwrap_or_default()
                     })
@@ -120,7 +122,9 @@ pub fn compute_semantic_diff(
                 let after_entities = if let Some(ref content) = file.after_content {
                     phase_timing::timed(&PHASE_ACC.extraction_ns, || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            plugin.extract_entities(content, detection_path)
+                            let mut entities = plugin.extract_entities(content, detection_path);
+                            disambiguate_colliding_entity_ids(&mut entities);
+                            entities
                         }))
                         .unwrap_or_default()
                     })

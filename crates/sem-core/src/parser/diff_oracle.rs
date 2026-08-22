@@ -55,7 +55,7 @@ use serde::Serialize;
 
 use crate::format::json::format_diff_json_with_binary_changes;
 use crate::git::types::FileChange;
-use crate::model::entity::SemanticEntity;
+use crate::model::entity::{disambiguate_colliding_entity_ids, SemanticEntity};
 use crate::parser::differ::{collect_binary_file_changes, compute_semantic_diff, DiffResult};
 use crate::parser::fast_extractor::{self, FastExtractor, FastExtractorSet};
 use crate::parser::registry::ParserRegistry;
@@ -302,7 +302,8 @@ fn snapshot(file_changes: &[FileChange], registry: &ParserRegistry) -> Snapshot 
             let before_path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
             let before_resolved = registry.resolve_file_path(before_path);
             let before_detection = before_resolved.as_deref().unwrap_or(before_path);
-            let extracted = plugin.extract_entities(content, before_detection);
+            let mut extracted = plugin.extract_entities(content, before_detection);
+            disambiguate_colliding_entity_ids(&mut extracted);
             sides.push(SideEntities {
                 file_path: before_detection.to_string(),
                 side: "before",
@@ -311,7 +312,8 @@ fn snapshot(file_changes: &[FileChange], registry: &ParserRegistry) -> Snapshot 
             });
         }
         if let Some(content) = file.after_content.as_deref() {
-            let extracted = plugin.extract_entities(content, detection_path);
+            let mut extracted = plugin.extract_entities(content, detection_path);
+            disambiguate_colliding_entity_ids(&mut extracted);
             sides.push(SideEntities {
                 file_path: detection_path.to_string(),
                 side: "after",

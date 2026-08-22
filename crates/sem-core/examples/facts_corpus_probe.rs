@@ -321,9 +321,9 @@ fn cmd_consume(root: &Path, corpus_dir: &Path, label: &str) {
 /// asserts byte-equality against the real table on every test run, turning
 /// "can silently drift" into "fails a build the moment it drifts."
 const LANGUAGE_SALTS: &[(&str, &str)] = &[
-    ("typescript", "ts-0.23-u16"),
-    ("tsx", "ts-0.23-u16"),
-    ("javascript", "ts-0.23-u16"),
+    ("typescript", "ts-0.23-u16-exportspan"),
+    ("tsx", "ts-0.23-u16-exportspan"),
+    ("javascript", "ts-0.23-u16-exportspan"),
     ("python", "ts-0.23-mp4"),
     ("go", "ts-0.23-mp5-dm5t-bpn2"),
     ("rust", "ts-0.23-mp2"),
@@ -358,12 +358,14 @@ const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("svelte", "ts-0.1.7"),
     ("erb", "ts-0.25"),
     ("toml", "handrolled-1"),
-    ("csv", "handrolled-1"),
-    ("json", "handrolled-1"),
+    // csv/json/vue bumped handrolled-1 -> handrolled-2 — see the
+    // matching entries' doc comment in sem-core's real LANGUAGE_SALTS.
+    ("csv", "handrolled-2"),
+    ("json", "handrolled-2"),
     ("yaml", "handrolled-2"),
     ("markdown", "handrolled-1"),
     ("latex", "handrolled-1"),
-    ("vue", "handrolled-1"),
+    ("vue", "handrolled-2"),
     ("fallback", "handrolled-1"),
 ];
 const DEFAULT_LANGUAGE_SALT: &str = "unmapped-1";
