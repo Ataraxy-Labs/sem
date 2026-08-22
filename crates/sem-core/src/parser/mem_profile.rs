@@ -1,5 +1,5 @@
 //! Opt-in, behavior-neutral memory attribution for `EntityGraph::build`,
-//! gated by the `SEM_PROFILE_MEM=1` environment variable (semx-4w1).
+//! gated by the `SEM_PROFILE_MEM=1` environment variable.
 //!
 //! Mirrors `resolve_profile.rs`'s discipline: every public function here is a
 //! cheap no-op (a single cached env-var read) unless the variable is set, and
@@ -14,8 +14,8 @@
 //! accounting (which would need `MallocStackLogging`/heaptrack). They are
 //! good enough to rank structures by order of magnitude and to attribute a
 //! blowout to a specific field (e.g. `SemanticEntity::content`) — that is
-//! this instrumentation's whole job. See RESOLUTION-PROFILE.md, "Memory
-//! attribution (semx-4w1)" for the numbers this produced.
+//! this instrumentation's whole job. "Memory
+//! attribution " for the numbers this produced.
 
 use std::collections::HashMap as StdHashMap;
 use std::hash::BuildHasher;
@@ -43,7 +43,7 @@ pub(crate) fn entry(name: &'static str, bytes: usize) -> Entry {
 ///
 /// `pub` rather than `pub(crate)` because the facts plane's own phase
 /// boundaries are orchestrated in `sem-cli` (`build_graph_with_facts_store`),
-/// not here: W5 (semx-gbb) found the plane costing +9.23 GB of peak RSS on
+/// not here: found the plane costing +9.23 GB of peak RSS on
 /// dotnet with no timer and no counter covering it, precisely because the
 /// boundaries either side of it are outside this crate. Sampling is still
 /// opt-in and still shells out at most a handful of times per build.
@@ -118,7 +118,7 @@ fn mb(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-// ---- structure-specific sizers (semx-4w1) ----
+// ---- structure-specific sizers ----
 //
 // Bespoke rather than blanket-trait for the two entity-shaped structs:
 // `SemanticEntity`/`EntityInfo` both live in other modules and the point of
@@ -126,7 +126,7 @@ fn mb(bytes: usize) -> f64 {
 // `approx_heap_bytes() -> usize` can't report on its own.
 
 /// `(content_bytes, metadata_bytes)` — deliberately split because the
-/// attribution question this bead asks is "how much of `all_entities` is
+/// attribution question this change asks is "how much of `all_entities` is
 /// `content` versus everything else." `content_bytes` is exact
 /// (`.capacity()` summed); `metadata_bytes` covers every other `String`/
 /// `Option<String>`/`metadata` field, also by `.capacity()`.
@@ -183,7 +183,7 @@ pub(crate) fn entity_map_bytes<S: BuildHasher>(
 /// bucket per word, not just a pointer/len/cap triple. Alive from the end of
 /// scope resolution (`resolve_scopes_in_file_chunks`/`resolve_with_scopes_
 /// full`) through `resolve_references_with_file_indexes`, which is most of
-/// pass 2 — and, before this bead, never sized by this instrumentation.
+/// pass 2 — and, before this change, never sized by this instrumentation.
 pub(crate) fn string_to_string_set_map_bytes<S: BuildHasher, S2: BuildHasher>(
     map: &StdHashMap<String, std::collections::HashSet<String, S2>, S>,
 ) -> usize {
@@ -255,7 +255,7 @@ pub(crate) fn entity_ranges_bytes<S: BuildHasher>(
     table_overhead + entries
 }
 
-/// bag-of-words's content map (semx-3tb): `&path -> Cow<content>`. A
+/// bag-of-words's content map: `&path -> Cow<content>`. A
 /// `Cow::Borrowed` entry costs the map slot only — the bytes belong to
 /// `precomputed_facts`, already accounted separately — which is exactly the
 /// copy `snapshot_bow_content` no longer makes on the chunked path.
@@ -301,7 +301,7 @@ pub(crate) fn precomputed_facts_bytes<S: BuildHasher>(
     table_overhead + entries
 }
 
-/// Field-by-field breakdown of `precomputed_facts` (semx-bpn2 Stage 1): which
+/// Field-by-field breakdown of `precomputed_facts` (Stage 1): which
 /// field actually dominates a MUL-admitted language's fast-path facts, rather
 /// than only the aggregate `precomputed_facts` entry `checkpoint` already
 /// prints. Deliberately its own diagnostic block, not fed through
@@ -348,7 +348,7 @@ pub(crate) fn precomputed_facts_field_breakdown<S: BuildHasher>(
     }
 }
 
-/// Stage-0 instrument (interning-for-memory wave, semx-taq6): decomposes
+/// Stage-0 instrument (interning-for-memory wave): decomposes
 /// each candidate field's total duplicate string bytes into within-file
 /// repeats (what a per-file string table, design (a), would reclaim) versus
 /// cross-file repeats (the *additional* bytes a corpus-wide interner,

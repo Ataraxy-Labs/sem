@@ -178,7 +178,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2 — the Claude Code session hook: registers `sem hook prompt-submit`
     // as a UserPromptSubmit hook. (This used to also install a SessionStart
     // hook that forked `sem mcp --resident` detached on every session; that
-    // resident server was deleted (QUERY-INDEX.md §7 item 5), so the hook was
+    // resident server was deleted, so the hook was
     // forking a no-op process per session for no benefit. Removed here.)
     let pb = step_spinner("Claude Code hooks");
     let hooks = install_session_hooks();
@@ -245,7 +245,7 @@ fn entry_is_sem_hook(entry: &Value) -> bool {
 /// Installs only the `UserPromptSubmit` hook (`sem hook prompt-submit`). It
 /// deliberately does not install a `SessionStart` hook: that used to run
 /// `mcp --resident` detached, but the resident server it started is gone
-/// (QUERY-INDEX.md §7 item 5) — the flag is kept only as a no-op for
+/// — the flag is kept only as a no-op for
 /// backward compatibility, so installing a hook that runs it would fork a
 /// process that does nothing, once per session, for every user who runs
 /// `sem setup` from here on.

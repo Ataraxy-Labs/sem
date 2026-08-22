@@ -29,12 +29,12 @@ macro_rules! maybe_par_iter_mut {
     }};
 }
 
-// semx-cc3 (sem-diff attribution campaign): per-file blob content population
+// (sem-diff attribution campaign): per-file blob content population
 // for a revision-to-revision diff (`populate_contents`'s `Commit`/`Range`
 // arms) is independent libgit2 object reads (tree path lookup + blob find +
 // possible delta-chain decompress) — same embarrassingly-parallel shape as
 // the entity-extraction fan-out `differ.rs` already parallelizes with rayon.
-// Measured dominant on a monster repo (see RESOLUTION-PROFILE.md's "Diff
+// Measured dominant on a monster repo (see "Diff
 // attribution" section): ~1.2ms/file marginal cost once the one redundant
 // tree re-resolution was deleted (previous commit) — that's genuinely
 // necessary I/O, not duplicate work, so the fix here is concurrency, not
@@ -692,8 +692,8 @@ impl GitBridge {
     /// `None` only for a root commit. [`populate_contents`](Self::populate_contents)
     /// reuses these ids (a cheap `find_tree` by id) instead of re-resolving
     /// `sha`/`sha~1` from scratch (revparse + peel_to_commit + tree()), which
-    /// is what it did before semx-cc3: the exact same two trees, walked from
-    /// the ref string a second time. See RESOLUTION-PROFILE.md's "Diff
+    /// is what it did before: the exact same two trees, walked from
+    /// the ref string a second time. See "Diff
     /// attribution" section — on a large/monster repo that second walk is
     /// not free, and it produces identical trees to the ones already in
     /// hand, so re-deriving them was pure waste, not a needed pass.

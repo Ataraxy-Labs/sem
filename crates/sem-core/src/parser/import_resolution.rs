@@ -16,7 +16,7 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 }
 
 /// Extensions whose cross-file reads `scope_resolve.rs` now attributes through
-/// the read-set recorder (semx-kzy), beyond the original JS/TS set:
+/// the read-set recorder, beyond the original JS/TS set:
 /// * `.py` — `extract_python_import`/`extract_python_module_import`, via
 ///   `resolve_import_name` (`Table::SymbolTable`/`Table::EntityMap`, bounded
 ///   per import) and `register_namespace_import` (whole-table guard,
@@ -43,13 +43,13 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   list as the genuinely newly-instrumented languages for GREEN
 ///   eligibility purposes.
 ///
-///   (bash was evaluated first and rejected by the semx-kzy bead: `BASH_
+/// (bash was evaluated first and rejected by the change: `BASH_
 ///   SCOPE_CONFIG`'s `call_style: FunctionField("name")` hands `extract_
 ///   call_ref` a `command_name` node, whose `.kind()` is `"command_name"` —
 ///   not `"identifier"`/`"simple_identifier"`/`"type_identifier"`, the only
 ///   kinds `extract_call_ref`'s fast path recognized at the time — so bash
 ///   calls were never collected as `AstRefKind::Call` at all, cold or warm.
-///   semx-ocj fixed this: `extract_call_ref` now unwraps `command_name` to
+/// fixed this: `extract_call_ref` now unwraps `command_name` to
 ///   its `word` child and recognizes bare `"word"` nodes directly (fish's
 ///   `command` node hands over `word` with no wrapper, so the same one-line
 ///   fix covers both). See `bash_calls_across_files_become_reference_edges`
@@ -61,7 +61,7 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   filter out what would otherwise look like a call to the sourced file).
 ///   Cross-file calls resolve entirely through the generic `Table::
 ///   SymbolTable` fallback, confirmed by the oracle fixtures in `session.rs`
-///   (`write_bash_fixture`/`write_fish_fixture`) now that semx-ocj lets a
+/// (`write_bash_fixture`/`write_fish_fixture`) now that lets a
 ///   bash/fish call become a ref to resolve in the first place.
 /// * `.java` — whitelisted, not attributed, with a caveat worth recording:
 ///   tree-sitter-java's import statement node kind is *also* named
@@ -119,14 +119,14 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   branch, only expression-bodied arrow functions (`() => helper()`) are.
 ///   The oracle fixture below (ordinary block-bodied functions, the normal
 ///   Dart style) confirms this empirically: zero `Calls` edges appear
-///   between its hub and its callers even after semx-ocj, so there is
+/// between its hub and its callers even after, so there is
 ///   nothing here for GREEN eligibility to be unsound *about* — but nothing
 ///   to gain either. This is a real, narrower entity/ref-extraction gap in
-///   Dart (not scope-resolution eligibility), out of this bead's scope to
+/// Dart (not scope-resolution eligibility), out of this change's scope to
 ///   fix, surfaced here rather than silently routed around by writing
 ///   arrow-bodied Dart just to make eligibility look proven.
 ///
-/// See RESOLUTION-PROFILE.md's "Universal GREEN eligibility" section for the
+/// for the
 /// full per-language verdict table and why every other language stays
 /// perma-RED for now (either genuinely unattributed, or attributable but not
 /// yet exercised by a dedicated oracle fixture in this pass).
@@ -137,7 +137,7 @@ const NEWLY_ATTRIBUTED_EXTENSIONS: &[&str] = &[
 ];
 
 /// Whether `file_path`'s detected language may reuse cached resolution
-/// results on a warm rebuild (semx-022 + semx-kzy). See
+/// results on a warm rebuild (+). See
 /// [`NEWLY_ATTRIBUTED_EXTENSIONS`] for what changed and why; everything not
 /// named here is held perma-RED — slower, never wrong.
 pub(crate) fn is_reuse_eligible_file(file_path: &str) -> bool {
@@ -170,13 +170,13 @@ pub fn js_ts_import_source_files_from_content<P: AsRef<str>>(
     imported_files
 }
 
-/// The corpus's import-candidate set, **prepared once per build** (semx-3tb,
-/// `SINGLE-PASS.md` §2 pass I): O(1) membership for relative specifiers, plus
+/// The corpus's import-candidate set, **prepared once per build** (
+/// pass I): O(1) membership for relative specifiers, plus
 /// the stem index [`build_stem_index`] already provided for bare/package
 /// specifiers.
 ///
 /// Both halves are properties of the candidate *corpus*, not of the importing
-/// file, so building them per file was pure repetition — semx-ccg measured
+/// file, so building them per file was pure repetition — measured
 /// the second half of that repetition as the monster's residual after the
 /// O(1)-membership fix: `sorted_candidates` re-sorted the whole ~40k-entry
 /// candidate list on the first bare import *of every file*.
@@ -494,7 +494,7 @@ pub(crate) fn find_import_file<'a, P: AsRef<str>>(
 /// fallback as expensive when run "once per import statement" against a
 /// whole-repo candidate list. That comment was written for a caller that
 /// visits each import once per build; `graph.rs`'s incremental import-table
-/// maintenance (semx-h1s) re-resolves every RED file's pending imports on
+/// maintenance re-resolves every RED file's pending imports on
 /// *every* warm rebuild, so the same O(candidates) fallback, run repeatedly
 /// against a stable candidate list, dominated a warm rebuild's wall time at
 /// monster scale (measured: cut one warm-rebuild phase from over 700ms to
@@ -583,7 +583,7 @@ pub(crate) fn import_source_matches_file(
 /// stem scan; see [`find_import_file`]'s fallback branch).
 ///
 /// `pub(crate)` so `graph.rs`'s incremental import-table maintenance
-/// (semx-h1s) can enumerate the same candidates `find_import_file` would, to
+/// can enumerate the same candidates `find_import_file` would, to
 /// record a read-set dependency on each one without duplicating the
 /// extension/index-variant logic.
 pub(crate) fn import_file_candidates(
@@ -907,7 +907,7 @@ mod single_pass_invariants {
     }
 
     /// The **specification**: the bare/package fallback exactly as it was
-    /// written before semx-3tb — sort the whole candidate list by
+    /// written before — sort the whole candidate list by
     /// `(extension_priority, path)` and take the first entry whose stem
     /// matches. Expressed with the production comparator and the production
     /// stem functions, so this is the old algorithm, not a paraphrase of the
@@ -921,7 +921,7 @@ mod single_pass_invariants {
             .find(|path| file_stem(path) == source_module)
     }
 
-    /// **L-STEM-INDEX** (`SINGLE-PASS.md` §6, W1-F4)
+    /// **L-STEM-INDEX**
     ///
     /// ```text
     /// ∀ candidates, s.  resolve_bare_import_stem(build_stem_index(candidates), s)

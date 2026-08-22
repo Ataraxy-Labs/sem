@@ -1,5 +1,5 @@
 //! Cross-repo proof + timing probe for the machine-global facts corpus
-//! (semx-2o8, Phase B's local tier). Companion to `facts_probe.rs` (the
+//! (Phase B's local tier). Companion to `facts_probe.rs` (the
 //! per-repo tier's own cross-process oracle) — this probe proves the *new*
 //! claim: identical file content at the same relative path, in two
 //! *different* repo roots on this machine, shares extracted facts, without
@@ -27,7 +27,7 @@
 //!   2. Separately cold-builds the same tree with `EntityGraph::build` (no
 //!      corpus involved at all) and fingerprints it.
 //!   3. Asserts (a) the corpus-assisted build's fingerprint equals the cold
-//!      build's — proof (a) from the bead: bit-identical graph vs a
+//! build's — proof (a) from the change: bit-identical graph vs a
 //!      no-corpus cold build.
 //!   4. Reports `files probed`/`files hit` from the merge stats — proof (b):
 //!      cross-repo reuse actually happened (`hits > 0` whenever the two
@@ -41,11 +41,11 @@
 //!      new path misses the corpus — same content, different path, must not
 //!      share.
 //!
-//! # `remote-populate` / `remote-consume` (semx-bhc): the cloud-ingestion path
+//! # `remote-populate` / `remote-consume`: the cloud-ingestion path
 //!
 //! `populate`/`consume` above prove the *local* corpus tier (`populate_delta`,
 //! a process deriving facts from its own read+hash pass). They do not exercise
-//! `FactsCorpus::ingest_remote` at all — the API this bead adds for facts that
+//! `FactsCorpus::ingest_remote` at all — the API this change adds for facts that
 //! arrived over a network, from a process that never touched `repo_b_root`'s
 //! files itself. `remote-populate`/`remote-consume` extend this probe's
 //! existing two-machine shape (two independent roots + a shared corpus dir
@@ -71,7 +71,7 @@
 //!      `facts_remote.rs::decode_download_response` does, optionally
 //!      tampering one record first (`--tamper`: mutates the claimed
 //!      `contentHash` so it disagrees with the payload's own embedded hash —
-//!      the mismatched-key-vs-content shape this bead's tamper proof targets).
+//! the mismatched-key-vs-content shape this change's tamper proof targets).
 //!   2. Calls `FactsCorpus::ingest_remote` and reports accepted/rejected
 //!      counts and reasons — proof (c) starts here: a tampered fact must be
 //!      rejected with a typed `IngestError`, never silently written.
@@ -303,11 +303,11 @@ fn cmd_consume(root: &Path, corpus_dir: &Path, label: &str) {
 }
 
 // =============================================================================
-// remote-populate / remote-consume (semx-bhc): the ingest_remote path
+// remote-populate / remote-consume: the ingest_remote path
 // =============================================================================
 
 /// Mirrors `sem-core/src/parser/facts_store.rs::LANGUAGE_SALTS` verbatim —
-/// deliberately, unlike `sem-cli`'s `facts_remote.rs` (semx-0lj retired that
+/// deliberately, unlike `sem-cli`'s `facts_remote.rs` (retired that
 /// mirror: it is the same crate graph, version-locked to this `sem-core` via
 /// a path dependency, so it now imports the real
 /// `facts_store::effective_language_salt` instead of hand-copying the
@@ -372,12 +372,12 @@ fn language_salt(lang_id: &str) -> &'static str {
     // Mirrors `facts_store::producer_language_salt` / `resolve_gated_salt`:
     // any language registered in `MUL_RUNTIME_GATES` (MUL phase 1's C#/C++
     // precomputes, MUL phase 2's Go/Java/Rust/Python precomputes — C++ and
-    // Python joined the table at M1, 2026-08-22, demoted from their prior
-    // unconditional admissions once I6's ceiling was redefined against peak
+    // Python joined the table on 2026-08-22, demoted from their prior
+    // unconditional admissions once the ceiling was redefined against peak
     // memory footprint) has a run-time producer switch, so the salt this
     // probe predicts has to follow it, or the oracle reports a miss against
     // a corpus entry that is in fact correct. Consulting the real table
-    // (semx-ys0) replaces what used to be this file's own independent
+    // replaces what used to be this file's own independent
     // `if lang_id == "csharp"` copy — a second hand-written branch that
     // would have needed updating in lockstep with `facts_store.rs`'s, and
     // wouldn't have been, for any future gated language neither file's
@@ -514,7 +514,7 @@ fn cmd_remote_consume(root: &Path, corpus_dir: &Path, wire_file: &Path, label: &
         tampered_path = Some(rec.relative_path.clone());
         // Mismatched key vs content: claim a content_hash that disagrees
         // with the payload's own embedded FileFacts::content_hash —
-        // exactly the tamper shape this bead's E2E proof targets.
+        // exactly the tamper shape this change's E2E proof targets.
         let bumped: u64 = rec.content_hash.parse::<u64>().unwrap_or(0).wrapping_add(1);
         rec.content_hash = bumped.to_string();
     }
@@ -691,7 +691,7 @@ fn main() {
 mod tests {
     use super::LANGUAGE_SALTS;
 
-    /// semx-0lj: this probe's `LANGUAGE_SALTS` is a deliberate, independent
+    /// this probe's `LANGUAGE_SALTS` is a deliberate, independent
     /// copy (see the doc comment on the const above for why it must stay a
     /// real second computation rather than calling
     /// `facts_store::effective_language_salt` directly). "Deliberate" must

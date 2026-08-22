@@ -40,13 +40,12 @@ pub fn context_command(opts: ContextOptions) {
         .as_deref()
         .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
 
-    // The git-oracle subgraph fast path that used to sit here (deleted
-    // semx-zvq, QUERY-INDEX.md §12.3) answered *differently* from the tier
+    // The git-oracle subgraph fast path that used to sit here (deleted) answered *differently* from the tier
     // it fronted — a bug, not a latency tier, so its removal left `sem
     // context` with no index tier at all rather than a repaired one. The
     // missing datum was precise: `EntityRec` carried `start_line`/`end_line`,
     // not the byte span `SemanticEntity.content` is sliced from, so the
-    // image could not reconstruct an entity's body. semx-a3w adds that span
+    // image could not reconstruct an entity's body. adds that span
     // (`FORMAT_VERSION` 3) and reroutes here — `try_index_context` below —
     // onto index lookup + file-read-at-span, gated on the same whole-corpus
     // `corpus_is_fresh` proof the other transitive-closure reroutes
@@ -62,7 +61,7 @@ pub fn context_command(opts: ContextOptions) {
     }
 
     // Cloud is a capability — cross-repo xref, repos with no local index/cache
-    // (QUERY-INDEX.md §7 item 7) — not a latency tier, so it must not race a
+    // — not a latency tier, so it must not race a
     // local answer over the network; it only gets a turn once the index
     // reroute above has already declined.
     if super::cloud::try_cloud_context(&opts).is_some() {
@@ -117,7 +116,7 @@ pub fn context_command(opts: ContextOptions) {
 }
 
 /// The output half of `context_command`, shared verbatim by the index
-/// reroute (`try_index_context`, semx-a3w) and this always-correct walk —
+/// reroute (`try_index_context`) and this always-correct walk —
 /// one render function is what makes the two byte-identical by
 /// construction rather than by two hand-kept-in-sync copies.
 fn render_context(
@@ -238,8 +237,8 @@ fn render_context(
 /// packer needs, which is what byte-identical output requires.
 const MAX_VISITED: usize = 10_000;
 
-/// Index-backed fast path for `sem context` (semx-a3w, QUERY-INDEX.md's
-/// missing-datum bead following semx-zvq §12.3). Never approximates: every
+/// Index-backed fast path for `sem context` (
+/// missing-datum change following). Never approximates: every
 /// branch that cannot *prove* its answer matches the authoritative
 /// `build_context_result_bounded` walk returns `false` and the caller falls
 /// straight into that walk, unchanged.
@@ -251,7 +250,7 @@ const MAX_VISITED: usize = 10_000;
 /// directions from the target up to [`MAX_VISITED`] to assemble a subgraph
 /// that is provably a superset of whatever the packer could ever touch for
 /// this target, read each of those entities' content by slicing its own file
-/// at its indexed byte span (semx-a3w's new datum), and then hand that
+/// at its indexed byte span (new datum), and then hand that
 /// subgraph plus real bodies to the **exact same**
 /// `build_context_result_bounded`/`render_context` the authoritative path
 /// calls — so the only way this reroute's output could differ from the
@@ -439,7 +438,7 @@ fn collect_subgraph(idx: &QueryIndex, at: usize) -> Option<(Vec<usize>, Vec<Enti
     Some((all, edges))
 }
 
-/// File-read-at-span (semx-a3w's new datum), grouped by file so a file with
+/// File-read-at-span (new datum), grouped by file so a file with
 /// several collected entities is read once. `None` on any I/O or UTF-8
 /// failure — the caller declines the whole reroute rather than serve a
 /// partial/incorrect body, the same all-or-nothing discipline

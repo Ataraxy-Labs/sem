@@ -1,21 +1,21 @@
 //! `cache.db`: the on-disk SQLite cache of a resolved `EntityGraph` plus
 //! entity bodies, and the single `DiskCache` constructor family over it.
 //!
-//! # Provenance (semx-r94)
+//! # Provenance
 //!
 //! Until this module existed, `sem-cli` (`build_cache.rs`) and `sem-mcp`
 //! (`cache.rs`) each defined their own `struct DiskCache` over the same
 //! `cache.db` schema — "a second, independently-written constructor family
-//! for the identical semantic object" (QUERY-INDEX.md §15.3's disclosed
+//! for the identical semantic object" (disclosed
 //! finding). Perf fixes landed on whichever copy its author was looking at:
 //! `sem-mcp`'s own `refresh_file_import_entries` picked up the O(1)-candidate-
-//! set fix (semx-ccg) and the single-corpus-read fusion's *shared* half
-//! (`insert_entities_with_content_store`'s parallel read, W4-F1) because
+//! set fix and the single-corpus-read fusion's *shared* half
+//! (`insert_entities_with_content_store`'s parallel read) because
 //! those functions already lived in `sem-mcp/src/cache.rs` — the "shared
 //! substrate" both crates compiled against — but each crate's *own*
 //! `DiskCache::save`/`save_with_test_dirs` reimplemented the SQL orchestration
 //! around that substrate separately, and the fusion `sem-cli` applied to its
-//! copy (semx-3tb, "one corpus read for the whole save path") never reached
+//! copy ("one corpus read for the whole save path") never reached
 //! `sem-mcp`'s copy, which still paid 2-3 separate reads per save. Worse:
 //! `sem-mcp`'s own `save` never called the test-classification write at all
 //! (`entity_flags` stayed empty on every MCP-originated cache), so a
@@ -29,7 +29,7 @@
 //! `sem-mcp`'s `cache.rs` are now thin consumers: each re-exports this
 //! module's public surface and keeps only what is genuinely its own —
 //! `sem-cli` keeps `write_query_index`/`index.sem` orchestration (`sem-mcp`
-//! writes no index at all, per QUERY-INDEX.md §15.3's superseding note), and
+//! writes no index at all, per the superseding note), and
 //! neither crate keeps a second copy of the SQL.
 //!
 //! ## Why `sem-core`, not `sem-mcp` (where the substrate happened to live)
@@ -55,7 +55,7 @@
 //!
 //! `sem-cli`'s old `save_with_test_dirs`/`save_topology` did their SQL work
 //! *and* wrote `index.sem` in the same method, sharing one corpus read
-//! between both (semx-3tb). `index.sem` is `sem-cli`-only — `sem-mcp` never
+//! between both. `index.sem` is `sem-cli`-only — `sem-mcp` never
 //! writes one — so a verbatim move would have forced this module to carry
 //! `sem-cli`'s index-writing side effect into a struct `sem-mcp` also
 //! constructs: `Needs(DiskCache) ⊋ declared(DiskCache)`. The fix:
@@ -72,7 +72,7 @@
 //! `save`/`save_topology` convenience wrappers every existing test still
 //! calls) gets a single internal fused read via [`read_file_cache_columns`]
 //! — strictly better than the 2-3 reads `sem-mcp`'s old `save` used to pay,
-//! and the fix for the "perf landed on one side" problem this bead was
+//! and the fix for the "perf landed on one side" problem this change was
 //! opened to close.
 
 use std::collections::{HashMap, HashSet};
@@ -98,12 +98,12 @@ use crate::utils::hash::content_hash_bytes;
 /// (`initialize_schema`'s `user_version` check -> `CACHE_RESET_SQL`) --
 /// the migration story for this cache is "stale schema -> full rebuild",
 /// not in-place `ALTER TABLE`. v10 added the `entities.kappa` column (see
-/// `crates/sem-core/KAPPA.md` v1.1 -- entities round-tripped through this
+/// `crates/sem-core/ v1.1 -- entities round-tripped through this
 /// cache previously always came back with `kappa: None`, silently losing
 /// the field, even though it was computed correctly on first extraction).
-/// v11 (W4, semx-431) reset eight secondary indexes and the `entity_changes`
+/// v11 reset eight secondary indexes and the `entity_changes`
 /// table's shape, none of the removed indexes having had a production reader
-/// left after QUERY-INDEX.md §12.3 rerouted the SQL query fast paths onto
+/// left after rerouted the SQL query fast paths onto
 /// `index.sem` -- the bump is what makes an existing cache drop its stale
 /// indexes instead of keeping them. `entity_changes` the *table* survives
 /// (the semantic commit index below still owns it); only its two indexes
@@ -112,15 +112,15 @@ pub const CACHE_SCHEMA_VERSION: i32 = 11;
 pub const CACHE_KIND_FULL: &str = "full";
 pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 /// Every index this cache maintains, and the one production statement that
-/// needs each. W4 (semx-431) censused these against every `SELECT`/`DELETE`
-/// in both crates -- the way QUERY-INDEX.md §15.1 censused the module's
+/// needs each. censused these against every `SELECT`/`DELETE`
+/// in both crates -- the way censused the module's
 /// symbols -- because each index is a second B-tree written per row on the
 /// save plane, and `insert_entities_with_content` was the single largest
 /// cold-build cost on every giant. Eight of the fourteen had no production
 /// consumer at all: five on `entities` (`name`, `name,file_path`,
 /// `entity_type,name,file_path`, `parent_id`, `parent_id,name` -- nothing
 /// queries `entities` by anything but `id` or a full scan any more, since
-/// §12.3 moved name/type/parent lookups to the index's `NAMES`/`ENTITIES`
+/// moved name/type/parent lookups to the index's `NAMES`/`ENTITIES`
 /// sections), two composites on `edges` (`from,to,ref` and `to,from,ref` --
 /// read only by `#[cfg(test)]` helpers, which the surviving single-column
 /// indexes serve anyway), and `idx_file_imports_importing_file`, whose column
@@ -275,7 +275,7 @@ pub fn apply_performance_pragmas(conn: &Connection) -> Result<(), rusqlite::Erro
 /// Sub-phase timing for the content store, gated by `SEM_PROFILE_CACHE=1` —
 /// the same `OnceLock<bool>` contract `sem-cli`'s `cache_profile_mark` and
 /// `sem-core`'s `resolve_profile::enabled()` use: zero cost when unset, never
-/// changes a written byte. Added for W4 (semx-431), which found
+/// changes a written byte. Added because profiling found
 /// `insert_entities_with_content` to be the single largest save-plane cost on
 /// every giant (1.9-15.5 s) with no attribution inside it.
 fn store_profile_enabled() -> bool {
@@ -323,12 +323,12 @@ pub fn insert_entities_with_content_store(
     );
     let mut stmt = tx.prepare(&sql)?;
 
-    // W4 (semx-431): the per-file `read_to_string` used to happen lazily
+    // the per-file `read_to_string` used to happen lazily
     // inside the serial entity loop below — a third full-corpus read (after
     // pass 1's parse read and the save plane's `CorpusColumns::read`), on one
     // thread, interleaved with SQLite `execute`s. It is a pure function of
     // the path, so it hoists out of the loop and parallelizes exactly the way
-    // `CorpusColumns::read` and semx-ccg's fingerprint read already do:
+    // `CorpusColumns::read` and fingerprint read already do:
     // read in parallel, then do the (necessarily serial, `Statement` isn't
     // `Send`) inserts against the finished map. Same bytes read, same rows
     // written, same order.
@@ -1019,7 +1019,7 @@ pub fn refresh_file_import_entries(
     // relative-import candidate check into a HashSet lookup instead of the
     // O(candidate_files) linear scan `js_ts_import_source_files_from_content`
     // did via `find_import_file`'s `candidate_file_paths.iter().find(...)`.
-    // See RESOLUTION-PROFILE.md's "Sub-1s physics budget" §2 item 9.
+    // item 9.
     let candidate_files = ImportCandidates::new(
         all_files
             .iter()
@@ -1061,7 +1061,7 @@ pub fn refresh_file_import_entries(
 }
 
 /// [`refresh_file_import_entries`] with the read and the import scan already
-/// done by the caller (semx-3tb, `SINGLE-PASS.md` §2 pass I).
+/// done by the caller (pass I).
 ///
 /// Semantics are identical to the sibling's, deliberately, file for file: a
 /// manifest file is skipped entirely (no `DELETE`), every other file in
@@ -1138,7 +1138,7 @@ pub fn cached_importing_files_for_stale_files(
 /// [`DiskCache::save_with_test_dirs_precomputed`]/
 /// [`DiskCache::save_topology_precomputed`] via `precomputed`, so the fused
 /// read below isn't a second pass over files that read already covered
-/// (semx-r94's fix for the read-amplification half of the duplicate-`DiskCache`
+/// (fix for the read-amplification half of the duplicate-`DiskCache`
 /// finding).
 pub struct FileCacheColumns {
     pub path: String,
@@ -1253,7 +1253,7 @@ impl DiskCache {
     /// exists so tooling (`sem repos`) and each consumer crate's own cache
     /// tests, which verify low-level schema/row invariants directly, can
     /// reach the connection now that `DiskCache` lives across a crate
-    /// boundary from them (semx-r94) rather than in the same module its
+    /// boundary from them rather than in the same module its
     /// private `conn` field used to be directly reachable from.
     pub fn connection(&self) -> &Connection {
         &self.conn
@@ -1272,7 +1272,7 @@ impl DiskCache {
     }
 
     /// [`Self::open`] for the *read* side: declines instead of creating an
-    /// empty `cache.db` (semx-4ex).
+    /// empty `cache.db`.
     ///
     /// `Connection::open` creates the file, so every cache-tier probe used to
     /// leave a schema-only SQLite database behind even on a path that never
@@ -1424,7 +1424,7 @@ impl DiskCache {
     }
 
     /// [`Self::save_with_test_dirs`] with the corpus read optionally supplied
-    /// by the caller (semx-r94). `precomputed: None` performs the same fused
+    /// by the caller. `precomputed: None` performs the same fused
     /// read [`read_file_cache_columns`] does internally; `Some(columns)` skips
     /// it and uses the given columns directly — for a caller (`sem-cli`) that
     /// already read the corpus once for `index.sem`'s trigrams and would
@@ -2080,7 +2080,7 @@ impl DiskCache {
 
     /// Incrementally update the cache with graph-repair metadata. Pure SQL —
     /// unlike the full/topology saves this never fused with an `index.sem`
-    /// write even before semx-r94 (the old `sem-cli` copy re-read the corpus
+    /// write even before (the old `sem-cli` copy re-read the corpus
     /// for `index.sem` separately here regardless), so there is nothing for a
     /// caller to precompute and hand down.
     #[allow(clippy::too_many_arguments)]
@@ -2290,7 +2290,7 @@ impl DiskCache {
 
 #[cfg(test)]
 mod tests {
-    //! Focused tests for the divergences semx-r94 reconciled between the two
+    //! Focused tests for the divergences reconciled between the two
     //! pre-unification `DiskCache` copies. Each consumer crate's own,
     //! larger cache test suite (sem-cli's `build_cache.rs`, sem-mcp's
     //! `cache.rs`) still runs unchanged against this module's re-exported
@@ -2339,7 +2339,7 @@ mod tests {
         }
     }
 
-    /// The gap this bead closed: MCP's old bare `save()` never called
+    /// The gap this change closed: MCP's old bare `save` never called
     /// `write_test_flags`, so `entity_flags` stayed empty forever on any
     /// cache MCP originated — a correctness gap at the exact file both
     /// consumers share. The unified `save()` now routes through
@@ -2366,7 +2366,7 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .is_ok();
-        assert!(computed, "save() must mark test flags computed (semx-r94)");
+        assert!(computed, "save() must mark test flags computed");
         cleanup(root);
     }
 

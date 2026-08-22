@@ -363,7 +363,7 @@ impl ParserRegistry {
     }
 }
 
-/// MUL Phase 2 (semx-mul): structural proof that [`resolve_go_method_parent_ids`]
+/// MUL Phase 2 (MUL): structural proof that [`resolve_go_method_parent_ids`]
 /// has run against the current build's `all_entities` — the one cross-file
 /// entity rewrite this crate performs (a Go method's `parent_id`/`id`,
 /// rewritten against a receiver type declared in a *different* file of the
@@ -374,8 +374,8 @@ impl ParserRegistry {
 /// see the complete cross-file parent-edge set" a compile-time fact instead
 /// of a call-site convention. Before this token existed, that ordering lived
 /// only in a comment at `graph.rs`'s gate call site — exactly the shape a
-/// future refactor silently breaks (see MUL-DESIGN.md's Go-admission
-/// hazard note and RESOLUTION-PROFILE.md's semx-mul phase-2 W0 addendum).
+/// future refactor silently breaks (see the Go-admission hazard note in
+/// `graph.rs`).
 ///
 /// Does not prove the *specific* entity slice passed to
 /// `clean_gate_dirty_files` was the one rewritten, only that
@@ -384,11 +384,11 @@ impl ParserRegistry {
 /// for that call site the two coincide; that is the only call site the gate
 /// is ever wired into.
 ///
-/// semx-dm5t: no longer zero-sized. Carries the id-staleness repair kit — the
+/// no longer zero-sized. Carries the id-staleness repair kit — the
 /// old id -> new id map for every entity this rewrite actually mutated, plus
 /// the set of files any of those entities live in — so a caller can re-key
 /// `PrecomputedFileFacts`' id-keyed fields (`entity_scope_map`,
-/// `entity_inner_scope`, `return_type_map`, and — since semx-bpn2 closed the
+/// `entity_inner_scope`, `return_type_map`, and — since closed the
 /// gap those three alone left open — every `Scope`'s `defs` values and
 /// `owner_id`; see `PrecomputedFileFacts::rekey_entity_ids`) for exactly the
 /// files this rewrite touched, immediately after calling it and before
@@ -474,7 +474,7 @@ pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) -> GoParent
         }
     }
 
-    // semx-dm5t follow-up: `build_entity_id` (model/entity.rs) makes a
+    // follow-up: `build_entity_id` (model/entity.rs) makes a
     // child's own id a literal prefix extension of its parent's —
     // `format!("{parent_id}::{name}")` — so rewriting a method's id above
     // does not just orphan that one entity, it invalidates the id of every
@@ -544,7 +544,7 @@ fn go_package_name(entity: &SemanticEntity) -> Option<&str> {
 
 /// A Go package's declaring directory — the unambiguous identity a package
 /// actually has (every file in one directory shares one package; Go has no
-/// sub-directory packages). `pub(crate)` (semx-u3rk) so `scope_resolve.rs`'s
+/// sub-directory packages). `pub(crate)` so `scope_resolve.rs`'s
 /// `build_go_pkg_index` keys on the same notion of "this package" that
 /// `resolve_go_method_parent_ids` above already trusts for same-package
 /// cross-file method/type pairing, instead of a second, independent

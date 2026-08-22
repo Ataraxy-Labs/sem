@@ -1342,7 +1342,7 @@ fn file_compare_changes(
 
 pub(crate) fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
-    // SEM_TIMINGS-style phase marks (semx-cc3): same convention `sem graph`/
+    // SEM_TIMINGS-style phase marks: same convention `sem graph`/
     // `sem impact`/`sem entities` already use (see `crate::timings`). Additive
     // to the pre-existing `--profile` flag below, not a replacement for it —
     // both read from the same Instant checkpoints, neither perturbs the other.

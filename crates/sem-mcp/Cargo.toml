@@ -37,7 +37,7 @@ ureq = { version = "2", features = ["json"] }
 tempfile = "3.24.0"
 axum = "0.8"
 # The cache test module (src/cache.rs) asserts against raw `rusqlite` types
-# directly (schema/row-level checks predating semx-r94's DiskCache move to
+# directly (schema/row-level checks predating DiskCache move to
 # sem-core); production code no longer touches `rusqlite` itself, so this is
 # dev-only now.
 rusqlite = { version = "0.32", features = ["bundled"] }

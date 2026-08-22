@@ -63,7 +63,7 @@ impl SemanticParserPlugin for YamlParserPlugin {
         // Base id per top-level key, computed before any disambiguation, so
         // colliding ids can be detected first — the overwhelmingly common
         // single-document (and non-colliding multi-document) case keeps the
-        // plain id unchanged (semx-vlg/semx-kkk: a multi-document file's
+        // plain id unchanged (: a multi-document file's
         // same-named keys in different documents otherwise share one id,
         // making which entity's data — e.g. is_test — survives a
         // corpus-wide id collision depend on processing order).
@@ -180,7 +180,7 @@ struct TopLevelKey {
     /// to. Always 0 for a single-document file. See
     /// `build_entity_id_disambiguated_by_document`'s doc comment for why
     /// this exists — it lets colliding same-named keys in different
-    /// documents get distinct, stable entity ids (semx-vlg/semx-kkk).
+    /// documents get distinct, stable entity ids.
     doc_index: usize,
 }
 
@@ -310,12 +310,12 @@ mod tests {
         assert_ne!(entities_a[0].content_hash, entities_b[0].content_hash);
     }
 
-    // ── semx-vlg / semx-kkk: multi-document id collisions ──────────────────
+    // ──: multi-document id collisions ──────────────────
 
     #[test]
     fn test_yaml_multidoc_same_named_keys_get_distinct_ids() {
         // Two documents, each with a top-level "Args" section and a "name"
-        // property — the pattern behind semx-kkk's llvm oracle failure (11
+        // property — the pattern behind llvm oracle failure (11
         // "Args" entities across documents in one fixture sharing one id).
         let content = "---\nname: foo\nArgs:\n  x: 1\n---\nname: bar\nArgs:\n  y: 2\n";
         let plugin = YamlParserPlugin;
@@ -326,7 +326,7 @@ mod tests {
         assert_ne!(
             args[0].id, args[1].id,
             "Args entities from different YAML documents must not collide on id \
-             (semx-vlg/semx-kkk) — got the same id {:?} for both, so which \
+             — got the same id {:?} for both, so which \
              document's data (e.g. is_test) survives a corpus-wide id \
              collision would depend on processing order",
             args[0].id

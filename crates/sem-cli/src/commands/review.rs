@@ -28,7 +28,7 @@ const DEFAULT_MODEL: &str = "claude-opus-5";
 /// three (now four) MCP review tools, namespaced per Claude Code's
 /// plugin-bundled-MCP convention (`mcp__plugin_<plugin>_<server>__<tool>`,
 /// with plugin "sem-review-listener" and server "sem-review" — see the
-/// plugin's own README "Contract doubts" §1), plus the read tools the
+/// plugin's own README "Contract doubts"), plus the read tools the
 /// listener protocol requires for investigating each question in-repo.
 const ALLOWED_TOOLS: [&str; 4] = [
     "mcp__plugin_sem-review-listener_sem-review__*",

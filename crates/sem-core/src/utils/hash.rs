@@ -194,7 +194,7 @@ fn is_comment_node(kind: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// kappa: a second, semantic identity hash (spike; see crates/sem-core/KAPPA.md)
+// kappa: a second, semantic identity hash (spike; see crates/sem-core)
 // ---------------------------------------------------------------------------
 
 /// Compute `structural_hash` and kappa (the semantic hash) together in one
@@ -211,7 +211,7 @@ fn is_comment_node(kind: &str) -> bool {
 /// Kappa never excludes the name range: a rename is a semantic change and
 /// kappa is deliberately rename-*sensitive* (unlike `structural_hash`,
 /// which is rename-invariant by design so `differ.rs` can detect renames).
-/// See `KAPPA.md` for the full inclusion/exclusion spec.
+/// The full inclusion/exclusion spec.
 pub fn structural_and_semantic_hash(
     node: Node,
     source: &[u8],
@@ -219,7 +219,7 @@ pub fn structural_and_semantic_hash(
 ) -> (String, String) {
     let mut struct_hasher = Xxh3::new();
     let mut kappa_hasher = Xxh3::new();
-    // semx-zcq: worklist entries carry the node's parent (`None` only for
+    // worklist entries carry the node's parent (`None` only for
     // `node` itself) instead of leaving `is_semantic_leaf` to call
     // `Node::parent()` on demand. `Node::parent()` is NOT O(1): tree-sitter's
     // `ts_node_parent` (src/node.c) starts at `ts_tree_root_node` and walks
@@ -240,7 +240,7 @@ pub fn structural_and_semantic_hash(
     // (13ms at N=50, 2.09s at N=300, 9.5s at N=500), matching this
     // mechanism's predicted O(depth^3) exactly, and per-phase timing showed
     // 9.48s of that 9.5s inside this function specifically. See
-    // `crates/sem-core/RESOLUTION-PROFILE.md`'s "C# pathology" section.
+    // `crates/sem-core/"C# pathology" section.
     let mut worklist: Vec<(Node, Option<Node>)> = vec![(node, None)];
     let mut cursor = node.walk();
     while let Some((n, known_parent)) = worklist.pop() {
@@ -316,8 +316,8 @@ const KAPPA_PUNCTUATION: &[&[u8]] = &[b"{", b"}", b"(", b")", b"[", b"]", b";", 
 /// slot that inclusion could spuriously latch onto.
 ///
 /// Found by sweeping every "sibling" language for the same failure shape as
-/// `let`/`const` (KAPPA.md v1.1 §1), then a second pass triggered by real
-/// collisions `kappa_stats` (KAPPA.md's collision analysis) surfaced on the
+/// `let`/`const` (v1.1), then a second pass triggered by real
+/// collisions `kappa_stats` (collision analysis) surfaced on the
 /// TypeScript-monster corpus:
 ///
 /// - `lexical_declaration` (TS/JS): `choice('let', 'const')` followed by
@@ -331,7 +331,7 @@ const KAPPA_PUNCTUATION: &[&[u8]] = &[b"{", b"}", b"(", b")", b"[", b"]", b";", 
 ///   method (`async foo()`) are all `method_definition` nodes whose
 ///   `get`/`set`/`static`/`async` keywords are anonymous non-sole children
 ///   — found via `kappa_stats` on the TypeScript-monster corpus merging
-///   `foo() {}` and `get foo() {}` under one kappa (KAPPA.md v1.1's
+/// `foo {}` and `get foo {}` under one kappa (v1.1's
 ///   collision analysis).
 /// - `public_field_definition` (TS): `readonly x = 1`/`abstract x: T`/
 ///   `x = 1` are all `public_field_definition` nodes — same shape as the
@@ -371,7 +371,7 @@ const KAPPA_PUNCTUATION: &[&[u8]] = &[b"{", b"}", b"(", b")", b"[", b"]", b";", 
 ///   `def __call__(self, **kwargs): ...` and `async def __call__(self,
 ///   **kwargs): ...` (two behaviorally different methods) sharing one
 ///   kappa in `tests/signals/tests.py`. The original per-language sweep
-///   (KAPPA.md v1.1 §2) checked Python's `global`/`nonlocal` and missed
+/// (v1.1) checked Python's `global`/`nonlocal` and missed
 ///   `async def` entirely; running the corpus analysis against a Python
 ///   repo, not just TypeScript ones, is what caught it.
 ///
@@ -381,14 +381,14 @@ const KAPPA_PUNCTUATION: &[&[u8]] = &[b"{", b"}", b"(", b")", b"[", b"]", b";", 
 /// languages until the sample stopped turning up new node kinds — not from
 /// a first-principles enumeration of any one grammar. `export { Foo }`
 /// (`export_clause`), `import ... from '...'` (imports aren't a
-/// kappa-bearing entity kind in this codebase's extractor — see KAPPA.md),
+/// kappa-bearing entity kind in this codebase's extractor —),
 /// and `abstract class C {}` (its own node kind, `abstract_class_
 /// declaration`, distinct from `class_declaration`) were checked and don't
 /// need this treatment.
 ///
 /// Everything else swept turned out NOT to need this table, because the
-/// grammar already resolves the ambiguity another way — see KAPPA.md v1.1
-/// §2 ("Sibling-gap sweep") for the full per-candidate verdict table:
+/// grammar already resolves the ambiguity another way — see v1.1
+/// ("Sibling-gap sweep") for the full per-candidate verdict table:
 /// JS/TS `var` gets its own node kind (`variable_declaration`, distinct
 /// from `lexical_declaration`); a generator's `*` is a symbolic (non-
 /// keyword-shaped) anonymous leaf so rule 4 already includes it regardless
@@ -449,7 +449,7 @@ fn is_leading_keyword_discriminator(known_parent: Option<Node>) -> bool {
 /// wrapper, so they never needed this generalization — only the "sole
 /// child" case, i.e. n=1, which this rule still covers.)
 ///
-/// Known residual gap (documented, not fixed, in KAPPA.md v1.1 §2): if a
+/// Known residual gap (documented, not fixed, v1.1): if a
 /// grammar mixes a non-keyword sibling into the same wrapper (e.g. Java
 /// `modifiers` holding an `@Override` annotation alongside `public`), this
 /// predicate returns `false` for the whole node and none of its keywords
@@ -482,7 +482,7 @@ fn is_keyword_shaped_leaf_text(leaf: Node, source: &[u8]) -> bool {
 }
 
 /// Decide whether a leaf token is semantically meaningful enough for kappa.
-/// Precise spec (also documented in `KAPPA.md`, which a reimplementation
+/// Precise spec (also documented, which a reimplementation
 /// against a different parser should follow instead of this tree-sitter-
 /// specific code):
 ///
@@ -491,12 +491,12 @@ fn is_keyword_shaped_leaf_text(leaf: Node, source: &[u8]) -> bool {
 ///    tokens a typed AST exposes as node fields (`Identifier.name`,
 ///    `Literal.value`, ...).
 /// 2. Anonymous leaves that are pure punctuation/delimiters
-///    (`KAPPA_PUNCTUATION`) are always excluded.
+/// (`KAPPA_PUNCTUATION`) are always excluded.
 /// 3. Anonymous leaves whose text is entirely ASCII alphanumeric/underscore
 ///    look like keywords (`function`, `class`, `return`, `if`, ...) and are
 ///    excluded, UNLESS either:
 ///    (3a) the leaf is the *leading discriminator* of a
-///    `KAPPA_LEADING_KEYWORD_DISCRIMINATOR_PARENTS` parent (v1.1) — e.g.
+/// `KAPPA_LEADING_KEYWORD_DISCRIMINATOR_PARENTS` parent (v1.1) — e.g.
 ///    TS/JS `let`/`const` in a `lexical_declaration`; or
 ///    (3b) the leaf's parent is a "pure keyword bag" (v1.1, generalizing
 ///    v1's "sole child of a named parent" rule) — every child of the

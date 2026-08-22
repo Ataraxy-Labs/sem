@@ -1,4 +1,4 @@
-//! F2 (semx overnight loop, feynman/f2-f3): independent ground-truth fixtures
+//! Independent ground-truth fixtures
 //! for the stem/bare-name matching family (`match_bare_import_stem`,
 //! `import_file_candidates`, `find_import_file`'s bare fallback, and their
 //! callers `register_namespace_import` / `register_rust_module_import` /
@@ -9,7 +9,7 @@
 //! collided into one bucket and `register_go_package_imports` inserted the
 //! *whole* polluted bucket into an importing file's `import_table`,
 //! last-write-wins — invisible to every ON/OFF comparison because both sides
-//! shared the bug ("identical wrongness", semx-u3rk, commit 18f03ff). These
+//! shared the bug ("identical wrongness", commit 18f03ff). These
 //! tests build same-named-file fixtures for Python/TS/Rust where the correct
 //! edge target is known by construction (two files share a name, different
 //! bodies, so a wrong resolution produces a *provably* wrong edge — not just
@@ -73,12 +73,12 @@ fn edge_target<'a>(graph: &'a EntityGraph, from_pat: &str, to_file_pat: &str) ->
 }
 
 // ---------------------------------------------------------------------------
-// Control fixtures: the two shapes F2 was asked to check first. Both resolve
+// Control fixtures: the two shapes this file was asked to check first. Both resolve
 // through `import_file_candidates`'s *bounded* path branch (dotted-absolute
 // for Python, base-dir-join for TS relative imports) rather than the bare-
 // stem fallback -- so by construction (see import_resolution.rs's own doc
 // comments on `import_file_candidates`) these should already be immune. Kept
-// as permanent regression guards either way, per F2's instructions: a GREEN
+// as permanent regression guards either way, by design: a GREEN
 // result here is a genuine clearance worth locking in, not just a check to
 // throw away.
 // ---------------------------------------------------------------------------
@@ -262,12 +262,12 @@ fn rust_use_module_alias_keeps_its_own_qualifying_path_not_a_same_named_collisio
 }
 
 // ---------------------------------------------------------------------------
-// F2b (semx-gla, v-f2 verification round): F2's own fix landed the wrong
-// granularity -- `select_rust_module_candidates` narrowed a bare-stem bucket
+// An earlier fix landed the wrong granularity --
+// `select_rust_module_candidates` narrowed a bare-stem bucket
 // down to one *file* before ever asking which file defines the item actually
 // being looked up, silently dropping every item the winner didn't happen to
 // define even when a losing candidate did (verified concretely on
-// rust-lang/rust: `std::cmp::max` resolved to nothing under F2's fix because
+// rust-lang/rust: `std::cmp::max` resolved to nothing under that fix because
 // the directory tie-break's winner among 7 same-stem `cmp.rs` files wasn't
 // `library/core/src/cmp.rs`, the one that defines `max`). These three
 // fixtures pin the redo's two-part design: (i) an external `std`/`core`/
@@ -318,7 +318,7 @@ fn rust_std_prefixed_use_never_resolves_to_a_same_named_local_file() {
 /// net.rs` share a bare stem; only `b/net.rs` defines `only_b` (each file's
 /// function is uniquely its own, no name overlap). The importer's
 /// qualifying segment (`"x"`, from `use crate::x::net;`) matches *neither*
-/// candidate's real directory, so F2's fix (per-bucket trailing-overlap,
+/// candidate's real directory, so the earlier fix (per-bucket trailing-overlap,
 /// else lexicographically-smallest) ties at zero and falls to
 /// `a/net.rs` -- the *wrong* file for this lookup, having already thrown
 /// away `b/net.rs`'s entries before ever checking which file defines

@@ -1,13 +1,13 @@
-//! `Complete` freshness (semx-ykf): the whole-corpus membership proof §2
-//! names and §10.2/§10.6 left unimplemented — "a name that exists on disk
+//! `Complete` freshness: the whole-corpus membership proof, and one gap
+//! left unimplemented — "a name that exists on disk
 //! but was never indexed will not appear via [`find`/`callers`/`refs`] until
 //! the next full build."
 //!
-//! The primitive is exactly what §1.6 measured: a parallel `stat` over the
+//! The primitive is exactly what measured: a parallel `stat` over the
 //! index's own `FILES` and `DIRS` sections. Nothing here walks the corpus —
-//! that would reintroduce the −301 ms cost §7 spent removing. `FILES` gives
+//! that would reintroduce the −301 ms cost spent removing. `FILES` gives
 //! deletions directly (a path the index knows about that no longer stats).
-//! `DIRS` gives *additions* indirectly, through the POSIX guarantee §2 leans
+//! `DIRS` gives *additions* indirectly, through the POSIX guarantee leans
 //! on: creating, deleting, or renaming a directory entry bumps that
 //! directory's own mtime, and nothing else's. Because `DIRS` holds every
 //! ancestor directory of every indexed file (not just direct parents,
@@ -59,9 +59,8 @@ pub struct CompleteReport {
     /// treat an inconclusive report as "membership freshness not proven",
     /// never as "no changes found" — the honest response to uncertainty is
     /// to do more work (fall back to a full rebuild), not to serve a
-    /// possibly-wrong fast answer. See `QUERY-INDEX.md`'s membership-gap
-    /// section for why a false "complete" is the one unacceptable outcome
-    /// here and a missed one is merely slower.
+    /// possibly-wrong fast answer: a false "complete" is the one
+    /// unacceptable outcome here, and a missed one is merely slower.
     pub inconclusive: bool,
     /// Directories the sweep flagged as drifted, purely for
     /// instrumentation/tests — not a promise callers act on directly.
@@ -88,7 +87,7 @@ pub fn complete_check(
 ) -> CompleteReport {
     let mut inconclusive = false;
 
-    // FILES-existence and DIRS-mtime are two disjoint stat sets (§1.6: ~12ms
+    // FILES-existence and DIRS-mtime are two disjoint stat sets (~12ms
     // was for FILES alone; DIRS is a much smaller addition) — running them as
     // sibling `rayon` tasks rather than back-to-back sequential passes lets
     // the scheduler interleave both across every worker thread instead of
@@ -390,7 +389,7 @@ mod tests {
         assert_eq!(report.new_files, vec!["new.txt".to_string()]);
     }
 
-    /// Mutation test (the bead's item 3): hide a file from the sweep by
+    /// Mutation test (the change's item 3): hide a file from the sweep by
     /// constructing a `walk_subtree` that omits it, and assert the omission
     /// is what a caller would see — proving the harness is capable of
     /// catching a ghost (a real bug that silently drops a new file) rather

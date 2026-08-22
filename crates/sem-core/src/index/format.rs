@@ -1,4 +1,4 @@
-//! The on-disk byte layout. See `QUERY-INDEX.md` §3.
+//! The on-disk byte layout.
 //!
 //! Everything here is little-endian, fixed-width, and read through accessors
 //! that take a `&[u8]` — no `repr` tricks, no alignment requirement on the
@@ -10,29 +10,29 @@
 /// *layout* axis only; extractor semantics ride
 /// `facts_store::corpus_identity_salt()` in [`Header::build_salt`].
 ///
-/// `2` (semx-zvq): `REFS` targets are no longer bare entity indices — the
+/// `2`: `REFS` targets are no longer bare entity indices — the
 /// high `refs::KIND_BITS` bits now carry the edge's `ref_type` (`refs`
 /// module below). The record *width* didn't change (still one `u32` per
 /// posting), but the *meaning* of those bits did, which is exactly the class
-/// of change `format_version` exists to guard (§3.5): a `1`-tagged image
+/// of change `format_version` exists to guard: a `1`-tagged image
 /// read under this code would have every target's top nibble misread as part
 /// of the entity index, corrupting every `refs_of`/`callers_of` answer
 /// silently. Bumping the version makes that a clean miss instead (`Header::
 /// read` rejects any non-matching version outright, unconditionally, so no
 /// migration path is needed — the next build just writes a `2`-tagged image).
 ///
-/// `3` (semx-a3w): `EntityRec` grows from 32 to 40 bytes — `start_byte`/
+/// `3`: `EntityRec` grows from 32 to 40 bytes — `start_byte`/
 /// `end_byte` appended at offsets 32/36. Unlike `FLAG_ENTITY_TESTS`
-/// (semx-zvq, §3's `is_test` precedent), there was no reserved padding left
+/// (`is_test` precedent), there was no reserved padding left
 /// to reuse: `EntityRec`'s 32 bytes were exactly full (the `_pad` `u16` that
 /// precedent repurposed is `flags` now). A record whose *width* changes is
 /// exactly `format_version`'s axis, not a flag's — every offset past
 /// `ENTITIES`'s start shifts, so a `2`-tagged image read under `ENTITY_REC_
 /// LEN = 40` would misalign every record after the first. Bumping makes that
-/// a clean miss (magic/version/salt mismatch ⇒ "index does not exist", §3.5)
+/// a clean miss (magic/version/salt mismatch ⇒ "index does not exist")
 /// instead of silent corruption. Cost, measured on the monster's 454,528-row
 /// `ENTITIES` section: 32B → 40B is +8B/entity, +3.64 MB (14.5 MB → 18.2 MB),
-/// +11.7% of the ≈31.2 MB base image (QUERY-INDEX.md §3.3's table).
+/// +11.7% of the ≈31.2 MB base image (table).
 pub const FORMAT_VERSION: u32 = 3;
 
 pub const MAGIC: &[u8; 8] = b"SEMIDX01";
@@ -47,7 +47,7 @@ pub const FLAG_IDS_ELIDED: u32 = 1 << 0;
 /// the fail-safe fallback `refs::MAX_ENTITIES` overflow case (see the `refs`
 /// module doc) — a corpus with more entities than the 28-bit target field can
 /// address. No corpus measured against this design (largest: the monster's
-/// 714,819 entities, §3.3) is within three orders of magnitude of that cap,
+/// 714,819 entities) is within three orders of magnitude of that cap,
 /// so this flag reads `1` on every image built today; it exists so a future
 /// reader can tell the degraded case apart from a real "every edge is a
 /// `Calls`" corpus rather than silently trusting zeroed kind bits.
@@ -55,7 +55,7 @@ pub const FLAG_REFS_TYPED: u32 = 1 << 1;
 
 /// Set when every `EntityRec.flags` word carries a computed
 /// [`entity::FLAG_IS_TEST`] bit rather than the zero the field held while it
-/// was reserved padding (semx-zvq). This is the index's analogue of the
+/// was reserved padding. This is the index's analogue of the
 /// SQLite cache's `test_flags_computed` metadata key: the bit's *absence* on
 /// an entity is only meaningful if the writer actually classified every
 /// entity, and the two build entry points that have the classification on
@@ -71,7 +71,7 @@ pub const FLAG_REFS_TYPED: u32 = 1 << 1;
 /// bits live in the `_pad` `u16` the writer has always written as zero), so
 /// a `2`-tagged image built before this flag existed reads correctly under
 /// this code — its zeroed field is simply never consulted, because the flag
-/// that authorizes consulting it is clear. §3.5's rule is about *misreads*,
+/// that authorizes consulting it is clear. rule is about *misreads*,
 /// and there is none to guard against here.
 pub const FLAG_ENTITY_TESTS: u32 = 1 << 2;
 
@@ -224,11 +224,11 @@ pub fn i64_at(bytes: &[u8], at: usize) -> Option<i64> {
 /// 16  file        u32
 /// ```
 ///
-/// `flags` was `_pad` until semx-zvq and is still written as zero by every
+/// `flags` was `_pad` until and is still written as zero by every
 /// build that cannot classify test entities; bit 0 ([`entity::FLAG_IS_TEST`])
 /// is trustworthy only when the header carries [`FLAG_ENTITY_TESTS`].
 ///
-/// `start_byte`/`end_byte` (semx-a3w, `FORMAT_VERSION` 3) are `NONE_U32` when
+/// `start_byte`/`end_byte` (`FORMAT_VERSION` 3) are `NONE_U32` when
 /// the writer had no byte span to record — `SemanticEntity.start_byte`/
 /// `end_byte` are `Option<usize>` and several extractors (`fallback.rs`,
 /// `json.rs`'s entity path, cache rehydration) never set them. Unlike
@@ -326,7 +326,7 @@ pub mod entity {
 ///
 /// `entity_lo..entity_hi` is the half-open `ENTITIES` range belonging to this
 /// file, which is what makes "entities of this file" a slice rather than a
-/// search and what makes the §4.2 patch protocol a range replacement.
+/// search and what makes the patch protocol a range replacement.
 pub mod file {
     use super::*;
 
@@ -370,7 +370,7 @@ pub mod file {
     }
 }
 
-/// `DirRec`, 24 bytes (§2/§3.2, wired by semx-ykf — the `Complete` freshness
+/// `DirRec`, 24 bytes (wired into the `Complete` freshness
 /// tier): every distinct ancestor directory of every indexed file, all
 /// levels (not just direct parents) plus the repo root (`path` = `""`). The
 /// ancestor-chain requirement is what makes directory-mtime drift a sound
@@ -406,8 +406,8 @@ pub mod dir {
     }
 }
 
-/// `TRIGRAM` section (S3, semx-az9): postings over **file** indices, not
-/// entity indices — QUERY-INDEX.md §9's "the text tier can answer without the
+/// `TRIGRAM` section (S3): postings over **file** indices, not
+/// entity indices — "the text tier can answer without the
 /// entity tier being loaded" contract.
 ///
 /// ```text
@@ -422,11 +422,11 @@ pub mod dir {
 /// A trigram absent from `KEYS` occurs in **zero** files — a strong, correct
 /// "no candidates" signal. A trigram present but flagged `STOP` occurs in so
 /// many files that storing its full posting list would blow the section's
-/// budget (§3.3); its row is empty and the reader must treat it as "no
+/// budget; its row is empty and the reader must treat it as "no
 /// filtering information", never as "zero files" — the two are not the same
 /// claim and conflating them would turn a budget decision into a correctness
 /// bug. See `writer::build_trigram_section` for how the flag gets set and
-/// `QUERY-INDEX.md`'s trigram section for the measured stop-list.
+/// trigram section for the measured stop-list.
 pub mod trigram {
     use super::*;
 
@@ -498,13 +498,13 @@ pub mod trigram {
 }
 
 /// `REFS` postings pack each edge's `ref_type` into the same `u32` that
-/// already carried the bare target entity index (semx-zvq, `QUERY-INDEX.md`
-/// §3.8 extension), rather than adding a parallel `u8` array.
+/// already carried the bare target entity index (a packed-field
+/// extension), rather than adding a parallel `u8` array.
 ///
-/// Measured trade, on the two encodings the bead was asked to weigh:
+/// Measured trade, on the two encodings the change was asked to weigh:
 ///
 /// - **parallel `u8` array** (one extra byte per posting, both directions):
-///   on the monster (§3.3's 454,528-entity image, ~196k edges per §S2's own
+///   on the monster (454,528-entity image, ~196k edges per §S2's own
 ///   comment in `graph.rs`) that is ≈ +400 KB across fwd+rev, plus a second
 ///   cache line touched per edge at read time (`targets[i]` and `kinds[i]`
 ///   live in different arrays) — real, but not the deciding factor.
@@ -518,7 +518,7 @@ pub mod trigram {
 /// variants today and this field reserves 4 bits (16 values), 5x headroom for
 /// future kinds with no format change. Meanwhile the entity-count cap this
 /// costs is 375x the largest corpus this design has ever measured (the
-/// monster's 714,819 entities, §3.3's "confirmed by the skeleton" scope) —
+/// monster's 714,819 entities, "confirmed by the skeleton" scope) —
 /// nowhere near a real constraint. Zero-copy, zero-extra-bytes, and a cap
 /// four orders of magnitude above any measured corpus dominates a strictly
 /// larger, strictly slower alternative that buys nothing back for it: this is
@@ -538,7 +538,7 @@ pub mod refs {
     /// this, the writer falls back: clear [`super::FLAG_REFS_TYPED`] for the
     /// whole image and pack every target with kind `0`, the same fail-safe
     /// (never a corrupted index, only a less-precise one) `id_tail_of`'s
-    /// prefix-rule fallback already establishes for §3.4.
+    /// prefix-rule fallback already establishes.
     pub const MAX_ENTITIES: usize = 1 << TARGET_BITS;
     pub const MAX_KIND: u8 = (1 << KIND_BITS) - 1;
 
@@ -556,7 +556,7 @@ pub mod refs {
         (target & TARGET_MASK) | ((kind as u32) << TARGET_BITS)
     }
 
-    /// The entity index half of a packed posting — what every pre-semx-zvq
+    /// The entity index half of a packed posting — what every prior
     /// reader needs, and still all `refs_of`/`callers_of` (the untyped
     /// accessors) return.
     pub fn target_of(packed: u32) -> u32 {
@@ -565,7 +565,7 @@ pub mod refs {
 
     /// The `ref_type` half, as its raw 4-bit encoding (0/1/2 today). Callers
     /// map this back to `parser::graph::RefType` — kept out of this module so
-    /// `format.rs` stays dependency-free (§3.7): this file only knows about
+    /// `format.rs` stays dependency-free: this file only knows about
     /// bytes and bits, never about `parser::graph`.
     pub fn kind_of(packed: u32) -> u8 {
         (packed >> TARGET_BITS) as u8

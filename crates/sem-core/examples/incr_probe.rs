@@ -1,4 +1,4 @@
-//! Oracle + timing probe for red-green incremental resolution (semx-022).
+//! Oracle + timing probe for red-green incremental resolution.
 //!
 //! Not part of the public API and not wired into any product code path.
 //!
@@ -33,7 +33,7 @@ use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
 /// mutation adds an *edge* and not merely an entity — an append that only grows
 /// the entity set would leave the edge set untouched and make the oracle a much
 /// weaker check than it looks.
-const PROBE_SUFFIX: &str = "\n// semx-022 probe\nfunction __semx022Helper() { return 1; }\nexport function __semx022Probe() { return __semx022Helper(); }\n";
+const PROBE_SUFFIX: &str = "\n// incr probe\nfunction __incrHelper() { return 1; }\nexport function __incrProbe() { return __incrHelper(); }\n";
 
 fn make_registry(root: &Path) -> ParserRegistry {
     let mut registry = create_default_registry();
@@ -100,7 +100,7 @@ impl Restore {
         }
         let mut mutated = String::with_capacity(original.len() + 16);
         mutated.push_str(&original[..name_end]);
-        mutated.push_str("__semx022Renamed");
+        mutated.push_str("__incrRenamed");
         mutated.push_str(&original[name_end..]);
         if std::fs::write(&full, mutated).is_err() {
             return false;
@@ -122,7 +122,7 @@ impl Restore {
         true
     }
 
-    /// semx-h1s: give `rel` a brand-new named export. Paired with
+    /// give `rel` a brand-new named export. Paired with
     /// `add_import_and_use` to build the "importchurn" scenario — unlike
     /// every other mutation here, this one actually touches the import
     /// table (the others only add entities/edges within a single file).
@@ -132,7 +132,7 @@ impl Restore {
             return false;
         };
         let mutated = format!(
-            "{original}\n// semx-h1s import-churn probe\nexport function {export_name}() {{ return 7; }}\n"
+            "{original}\n// import-churn probe\nexport function {export_name}() {{ return 7; }}\n"
         );
         if std::fs::write(&full, mutated).is_err() {
             return false;
@@ -141,7 +141,7 @@ impl Restore {
         true
     }
 
-    /// semx-h1s: give `rel` a brand-new import of `export_name` from
+    /// give `rel` a brand-new import of `export_name` from
     /// `import_path`, plus a function that calls it — a new
     /// `(rel, export_name) -> target` entry the import table did not have
     /// before this mutation.
@@ -157,7 +157,7 @@ impl Restore {
             return false;
         };
         let mutated = format!(
-            "{original}\n// semx-h1s import-churn probe\nimport {{ {export_name} }} from '{import_path}';\nexport function {local_fn_name}() {{ return {export_name}(); }}\n"
+            "{original}\n// import-churn probe\nimport {{ {export_name} }} from '{import_path}';\nexport function {local_fn_name}() {{ return {export_name}(); }}\n"
         );
         if std::fs::write(&full, mutated).is_err() {
             return false;
@@ -269,7 +269,7 @@ fn is_js_ts(path: &str) -> bool {
         .any(|ext| path.ends_with(ext))
 }
 
-/// semx-h1s: two distinct JS/TS files for the "importchurn" scenario — a
+/// two distinct JS/TS files for the "importchurn" scenario — a
 /// "provider" that will gain a new export, and a "consumer" that will start
 /// importing it. Picked generically (first two JS/TS files) so this works on
 /// any real corpus, not just the synthetic fixture in `session.rs`'s tests.
@@ -319,9 +319,9 @@ fn pick(scenario: &str, graph: &EntityGraph, files: &[String]) -> Vec<String> {
             .take(50)
             .cloned()
             .collect(),
-        // `mixedN` (semx-4an): N files spread evenly across the corpus. Any
+        // `mixedN`: N files spread evenly across the corpus. Any
         // other unrecognized scenario name (including the original
-        // `mixed50`) falls back to N=50, unchanged from before this bead.
+        // `mixed50`) falls back to N=50, unchanged from before this change.
         _ => {
             let n: usize = scenario
                 .strip_prefix("mixed")
@@ -343,7 +343,7 @@ fn pick(scenario: &str, graph: &EntityGraph, files: &[String]) -> Vec<String> {
 }
 
 /// Apply one scenario's mutation(s) via `restore`, returning the paths that
-/// actually changed. `importchurn` (semx-h1s) is handled separately from
+/// actually changed. `importchurn` is handled separately from
 /// every other scenario: it needs a *pair* of files (a provider that gains
 /// an export, a consumer that starts importing it), not one mutation applied
 /// uniformly to a picked target list.
@@ -357,14 +357,14 @@ fn apply_scenario(
         let mut changed = Vec::new();
         if let Some((provider, consumer)) = import_churn_pair(files) {
             let rel_path = repo_relative_import(&consumer, &provider);
-            if restore.add_export(&provider, "__semxH1sProvided022") {
+            if restore.add_export(&provider, "__importChurnProvided") {
                 changed.push(provider.clone());
             }
             if restore.add_import_and_use(
                 &consumer,
                 &rel_path,
-                "__semxH1sProvided022",
-                "__semxH1sConsumed022",
+                "__importChurnProvided",
+                "__importChurnConsumed",
             ) {
                 changed.push(consumer.clone());
             }

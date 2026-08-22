@@ -1,5 +1,5 @@
-//! `sem context`'s index-backed fast path (semx-a3w, QUERY-INDEX.md's byte-span
-//! bead following semx-zvq §12.3). The old git-oracle subgraph fast path
+//! `sem context`'s index-backed fast path (byte-span
+//! change following). The old git-oracle subgraph fast path
 //! answered *differently* from the authoritative walk and was deleted rather
 //! than repaired, leaving `context` with no index tier at all; this reroute
 //! adds one back, gated so hard that a divergence should be structurally

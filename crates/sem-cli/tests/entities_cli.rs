@@ -252,7 +252,7 @@ fn entities_uses_index_backed_listing_for_a_fresh_index() {
         .iter()
         .map(|phase| phase["name"].as_str().expect("phase name"))
         .collect::<Vec<_>>();
-    // QUERY-INDEX.md §7 item 1 (semx-woe S4): directory listing now answers
+    // (S4): directory listing now answers
     // from the mmap query index (`QueryIndex::files_under`) instead of the
     // deleted SQLite `query_entities_listing`/`write_entities_listing_json`
     // fast path — no filesystem walk, no SQL. The index path still funnels

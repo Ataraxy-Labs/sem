@@ -1,10 +1,10 @@
-//! Throwaway probe (interning-for-memory wave, semx-taq6): does `Arc<str>`
+//! Throwaway probe (interning-for-memory wave): does `Arc<str>`
 //! serialize to byte-identical CBOR as `String`, and does an old
 //! `String`-shaped payload decode cleanly into an `Arc<str>`-shaped struct?
 //! If both hold, per-file `Arc<str>` interning of `AstRefKind`'s identifier
 //! fields needs no `FACTS_SCHEMA_VERSION` bump — the wire format is
 //! unchanged, only the in-memory representation is. Not wired into any
-//! build; delete once its answer is recorded in RESOLUTION-PROFILE.md.
+//! build; delete once its answer is recorded.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

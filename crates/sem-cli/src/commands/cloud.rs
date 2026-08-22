@@ -1127,7 +1127,7 @@ impl CloudClient {
         Ok(resp)
     }
 
-    // ── Facts service (semx-9en cloud half; see commands/diff/facts_remote.rs
+    // ── Facts service (cloud half; see commands/diff/facts_remote.rs
     //    for the only caller and docs/architecture/FACTS-SERVICE.md in
     //    sem-cloud for the wire contract) ──
     //

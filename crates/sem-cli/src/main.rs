@@ -230,13 +230,12 @@ enum Commands {
     /// otherwise. Pattern is always a regex (same default as rg without
     /// `-F`); patterns with no usable trigram (e.g. `-i`, short literals,
     /// unconstrained alternation) degrade to an honest full scan rather than
-    /// a wrong answer. See QUERY-INDEX.md's trigram section.
+    /// a wrong answer.
     Grep {
         /// Regex or literal pattern
         pattern: String,
 
-        /// Case-insensitive match (disables the trigram prefilter — see
-        /// QUERY-INDEX.md's out-of-scope list)
+        /// Case-insensitive match (disables the trigram prefilter)
         #[arg(long, short = 'i')]
         ignore_case: bool,
 
@@ -401,7 +400,7 @@ enum Commands {
     Stats,
     /// Start the MCP server (stdin/stdout transport)
     Mcp {
-        /// Removed (QUERY-INDEX.md §7 item 5 / semx-woe): used to spawn the
+        /// Removed: used to spawn the
         /// per-repo sidecar socket. The mmap query index answers cold in
         /// 6-7ms, deleting the sidecar's reason to exist. Kept as a
         /// backward-compatible no-op (exits immediately, does nothing) so an

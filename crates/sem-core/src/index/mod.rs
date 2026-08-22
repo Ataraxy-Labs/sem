@@ -2,15 +2,15 @@
 //! structural questions from a cold process without a daemon, a filesystem
 //! walk, or a corpus-wide freshness proof.
 //!
-//! `QUERY-INDEX.md` is the contract — the measured attribution that justifies
-//! this design (§1), the invariants it satisfies (§2), the byte layout (§3), and
-//! the list of layers it obsoletes (§7). Read that before changing anything
+//! is the contract — the measured attribution that justifies
+//! this design, the invariants it satisfies, the byte layout, and
+//! the list of layers it obsoletes. Read that before changing anything
 //! here; several of the choices below look arbitrary and are not.
 //!
 //! Scope today: the entity tier (entity-by-name, entities-by-file), `REFS`
-//! (callers/refs postings, semx-gis), `TRIGRAM` (the text tier, `sem grep`,
-//! semx-az9 — see `grep`), and `DIRS`/`Complete` freshness (the membership
-//! sweep, semx-ykf — see `complete`). An image built via the dirs-less
+//! (callers/refs postings), `TRIGRAM` (the text tier, `sem grep`,
+//! — see `grep`), and `DIRS`/`Complete` freshness (the membership
+//! sweep, — see `complete`). An image built via the dirs-less
 //! writer entry points still writes `DIRS` zero-length, which reads as "tier
 //! absent" exactly like an unbuilt `REFS`/`TRIGRAM`, so old images and old
 //! callers keep working without a format version bump.
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn lookup_agrees_with_the_graph_for_every_name() {
-        // Property 1 of the consistency oracle (QUERY-INDEX.md §6), in
+        // Property 1 of the consistency oracle, in
         // miniature: the index's answer for every name in the graph is the
         // graph's own answer.
         let graph = sample();
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn files_under_matches_a_directory_prefix_not_a_string_prefix() {
-        // `QUERY-INDEX.md` §7 item 1's oracle: index-backed listing must
+        // oracle: index-backed listing must
         // agree with a directory walk on a fresh index, and must not
         // false-positive on a sibling whose name merely starts with the
         // same characters (`src` vs `src2`).
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn files_under_reflects_only_what_the_index_built_from() {
-        // Stale-membership behavior (§2's Verified/Complete split): a file
+        // Stale-membership behavior (Verified/Complete split): a file
         // that appears on disk after the index was built is invisible to
         // `files_under` — Verified proves membership w.r.t. the index's own
         // `FILES` table, not the corpus's current file set. This is the
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(index.files_under("src/"), vec!["src/a.ts"]);
     }
 
-    // semx-q344: `FILES` always stores repo-relative paths with forward
+    // `FILES` always stores repo-relative paths with forward
     // slashes (every writer call site normalizes before it ever reaches this
     // image — `sem-cli`'s `file_path_for_entity`, `sem-mcp`'s `path_to_slash`).
     // But the reader methods that key off a caller-supplied path string
@@ -576,7 +576,7 @@ mod tests {
         assert!(round_trip(&graph_with_edges()).has_refs());
     }
 
-    /// Property 1's refs analogue, in miniature (`QUERY-INDEX.md` §6, S2's
+    /// Property 1's refs analogue, in miniature (S2's
     /// obligation): for every entity in the graph, the index's callers/refs
     /// answer equals the graph's own `dependents`/`dependencies` maps.
     #[test]
@@ -617,7 +617,7 @@ mod tests {
         }
     }
 
-    /// semx-zvq: a graph whose edges span all three `RefType` variants
+    /// a graph whose edges span all three `RefType` variants
     /// between the same small set of entities, so packing/unpacking is
     /// exercised on every kind, not just the `Calls`-only fixture above.
     fn graph_with_typed_edges() -> EntityGraph {
@@ -653,7 +653,7 @@ mod tests {
         assert!(round_trip(&graph_with_typed_edges()).refs_are_typed());
     }
 
-    /// semx-zvq: `refs_of_typed`/`callers_of_typed` recover each edge's
+    /// `refs_of_typed`/`callers_of_typed` recover each edge's
     /// `ref_type` after the pack/unpack round trip through the image.
     #[test]
     fn refs_of_typed_recovers_each_edges_kind() {
@@ -677,7 +677,7 @@ mod tests {
         );
     }
 
-    /// semx-zvq: the reverse (`callers_of_typed`) direction, and a target
+    /// the reverse (`callers_of_typed`) direction, and a target
     /// with callers of two different kinds (`TypeRef` from `alpha`,
     /// `Imports` from `gamma`) — proves the kind travels with the *edge*,
     /// not with the target entity.
@@ -703,7 +703,7 @@ mod tests {
         );
     }
 
-    /// semx-zvq: the untyped accessors must still decode the correct target
+    /// the untyped accessors must still decode the correct target
     /// entity id once the high nibble carries a non-zero kind — this is the
     /// regression `csr_row`'s `target_of` mask exists to prevent (an
     /// unmasked read would corrupt the entity index for any `TypeRef`/
@@ -753,7 +753,7 @@ mod tests {
         // Same discipline as `a_torn_refs_section_is_a_clean_miss`: a
         // TRIGRAM section whose declared `posting_total` doesn't account for
         // the section's actual length must fail to open, not panic the
-        // first time `grep` reaches for a posting. This is also the bead's
+        // first time `grep` reaches for a posting. This is also the change's
         // mutation test: corrupt a posting, the oracle (here, `open`) must
         // catch it.
         let mut contents = std::collections::HashMap::new();

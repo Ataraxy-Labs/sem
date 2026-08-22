@@ -6,7 +6,7 @@
 //! itself a cached env-var read) unless the variable is set, and nothing in
 //! this module changes resolution output — it only observes timings and
 //! candidate-list sizes at points the resolver already visits. Built to
-//! settle semx-022 step 1: see `crates/sem-core/RESOLUTION-PROFILE.md`.
+//! settle step 1: see `crates/sem-core/.
 //!
 //! Design notes:
 //! - Phase-level timers (reparse, pass-1 scan, scope build, ref collection,
@@ -46,13 +46,13 @@ pub fn enabled() -> bool {
 /// Per-name candidate sampling ([`FileAccum`]/[`BowFileAccum`]): on **only**
 /// at `SEM_PROFILE_RESOLVE=1`.
 ///
-/// W3 (`RESOLUTION-PROFILE.md` §W3) measured what this costs and disclosed it
+/// Profiling measured what this costs and disclosed it
 /// rather than absorbing it: profiled `full_graph_build` ran 1.45-1.65x the
 /// clean wall time on dotnet/llvm/linux, all of it the per-lookup
 /// `name.to_string()` and per-file map merge these accumulators do, and all
 /// of it landing *inside* resolve — which is exactly the phase the phase
-/// timers are trying to attribute. W3's conclusion, that its sub-phase
-/// numbers were "attribution, not wall time", is the direct consequence.
+/// timers are trying to attribute. The conclusion — that its sub-phase
+/// numbers were "attribution, not wall time" — is the direct consequence.
 ///
 /// `=2` is that conclusion turned into a mode: phase timers on, name sampling
 /// off, so shares can be read off a run whose wall time is the real one. The
@@ -92,7 +92,7 @@ static IMPORT_GROUP_NS: AtomicU64 = AtomicU64::new(0);
 static PASS2_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static SCOPE_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 
-// ---- scope_build decomposition (semx-w5k) ----
+// ---- scope_build decomposition ----
 //
 // `scope_build_ns` was the last unmeasured box inside resolve: 6.6 s on
 // dotnet, and on home-assistant — the one giant whose *parse* fits the 1 s
@@ -115,7 +115,7 @@ static SB_ENTITY_SPANS_NS: AtomicU64 = AtomicU64::new(0);
 static SB_PRECOMPUTED_CLONE_NS: AtomicU64 = AtomicU64::new(0);
 /// The non-precomputed path: `build_scopes_from_ast`, the actual scope tree.
 static SB_BUILD_SCOPES_AST_NS: AtomicU64 = AtomicU64::new(0);
-/// The fused triple walk (`fused_scope_refs_import_walk`, semx-3ao): scopes +
+/// The fused triple walk (`fused_scope_refs_import_walk`): scopes +
 /// refs + recorded import starts in one traversal. Populated instead of
 /// `build_scopes_ast`/`collect_refs` for files on the fused path; the pruned
 /// replay of the import handlers still lands in `extract_imports`.
@@ -134,7 +134,7 @@ static SB_INJECT_FIELD_TYPES_NS: AtomicU64 = AtomicU64::new(0);
 static SB_FILES_PRECOMPUTED: AtomicU64 = AtomicU64::new(0);
 /// Files that took the AST path (everything else).
 static SB_FILES_AST: AtomicU64 = AtomicU64::new(0);
-/// Of the AST-path files, those that took the fused triple walk (semx-3ao).
+/// Of the AST-path files, those that took the fused triple walk.
 static SB_FILES_FUSED: AtomicU64 = AtomicU64::new(0);
 /// Entities `find_entity_source_spans` was asked to place, summed — the
 /// demand term the span cost should be proportional to.
@@ -143,24 +143,24 @@ static SB_ENTITIES_SPANNED: AtomicU64 = AtomicU64::new(0);
 static SB_SCOPES_BUILT: AtomicU64 = AtomicU64::new(0);
 /// AST refs collected/cloned, summed.
 static SB_REFS_COLLECTED: AtomicU64 = AtomicU64::new(0);
-/// MUL Phase 2 (semx-mul, W2): files whose precomputed facts carried
+/// MUL: files whose precomputed facts carried
 /// nonempty `import_stmts`, dispatched without a tree.
 static SB_PRECOMPUTED_IMPORT_FILES: AtomicU64 = AtomicU64::new(0);
-/// MUL Phase 2 (semx-mul, W2): total `import_stmts` descriptors dispatched
+/// MUL: total `import_stmts` descriptors dispatched
 /// from precomputed facts, summed across those files.
 static SB_PRECOMPUTED_IMPORT_DESCRIPTORS: AtomicU64 = AtomicU64::new(0);
-/// MUL Phase 2 (semx-mul, W5; MUL-DESIGN.md §4.3 Field 11): files whose
+/// MUL Phase 2 (MUL;): files whose
 /// precomputed facts carried nonempty `ctor_call_sites`, applied without a
 /// tree (`infer_constructor_param_types`, not `ScopeBuildAccum` — this scan
 /// runs once per build in its own pass-1b step, not per file inside pass 2's
 /// closure, so it is bumped directly rather than through
 /// [`merge_scope_build`]).
 static SB_PRECOMPUTED_CTOR_CALL_FILES: AtomicU64 = AtomicU64::new(0);
-/// MUL Phase 2 (semx-mul, W5): total `ctor_call_sites` descriptors applied
+/// MUL: total `ctor_call_sites` descriptors applied
 /// from precomputed facts, summed across those files.
 static SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS: AtomicU64 = AtomicU64::new(0);
 
-/// MUL Phase 2 (semx-mul, W5; MUL-DESIGN.md §4.3 Field 11): record that one
+/// MUL Phase 2 (MUL;): record that one
 /// file's precomputed `ctor_call_sites` were applied without a tree.
 /// Engagement proof, not inference — called only when
 /// `infer_constructor_param_types` actually sourced a file's descriptors
@@ -266,7 +266,7 @@ pub struct ScopeBuildAccum {
     pub entities_spanned: u64,
     pub scopes_built: u64,
     pub refs_collected: u64,
-    /// MUL Phase 2 (semx-mul, W2): number of `PrecomputedFileFacts::import_stmts`
+    /// MUL: number of `PrecomputedFileFacts::import_stmts`
     /// descriptors dispatched for this file without a tree — nonzero only
     /// when `precomputed` is `Some` *and* those descriptors were nonempty,
     /// i.e. proof (not assumption) that a phase-2-admitted language's
@@ -333,7 +333,7 @@ static CACHE_HIT: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISS: AtomicU64 = AtomicU64::new(0);
 static FILES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 
-// ---- residual sub-phase accumulators (semx-9h3): everything in `EntityGraph::build`
+// ---- residual sub-phase accumulators: everything in `EntityGraph::build`
 // that runs inside `resolve_phase_ms` (post `BuildPhase::Resolving`) or inside
 // `import_table_derived_ms` (pre-hook) but outside scope_resolve.rs's own buckets
 // above. Same zero-cost-when-off contract as everything else in this module.
@@ -362,29 +362,29 @@ static IMPORT_TABLE_INSERT_NS: AtomicU64 = AtomicU64::new(0);
 /// `build_imports_by_file`: grouping the finished import table by file for
 /// bag-of-words lookup (sequential, part of `resolve_phase_ms`).
 static IMPORTS_BY_FILE_NS: AtomicU64 = AtomicU64::new(0);
-/// `build_symbol_table_by_file` (semx-h19): pre-bucketing `symbol_table`'s
+/// `build_symbol_table_by_file`: pre-bucketing `symbol_table`'s
 /// per-name candidate lists by file, once per build, so bag-of-words'
 /// global-ref match becomes O(candidates in this file) instead of
 /// O(candidates in the whole corpus). Parallel across names.
 static SYMBOL_TABLE_BY_FILE_NS: AtomicU64 = AtomicU64::new(0);
 
-/// semx-4an: `build_incremental_core`'s "Pass A + Pass B" — the single O(all
+/// `build_incremental_core`'s "Pass A + Pass B" — the single O(all
 /// entities) loop building `symbol_table`, `entity_map`, `scope_class_members`,
 /// `scope_owner_members`, `scope_entity_ranges`, plus the local `&str`-borrowed
 /// maps (`class_members`, `enclosing_class`, `class_child_names`, …) and
 /// `go_pkg_index` — every one of them rebuilt whole on *every* warm rebuild
-/// before this bead, never previously instrumented as its own bucket (it sat
+/// before this change, never previously instrumented as its own bucket (it sat
 /// inside the unattributed gap between `pass1_scan_ms` and `resolve_phase_ms`
 /// in every prior section of this document).
 static ENTITY_LOOKUP_BUILD_NS: AtomicU64 = AtomicU64::new(0);
-/// semx-4an: `fingerprint_corpus_tables` — the whole-table hash pass over
+/// `fingerprint_corpus_tables` — the whole-table hash pass over
 /// `symbol_table`/`class_members`/`owner_members`/`entity_map`/`go_pkg_index`
 /// that runs once per build, before any read set is evaluated, regardless of
 /// how many files are RED. Never previously instrumented as its own bucket.
 static FINGERPRINT_CORPUS_TABLES_NS: AtomicU64 = AtomicU64::new(0);
 
-// semx-4an (continuation): sub-buckets of `ENTITY_LOOKUP_BUILD_NS`, added so
-// the "borrowed Pass A/B maps" residual the first half of this bead named
+// (continuation): sub-buckets of `ENTITY_LOOKUP_BUILD_NS`, added so
+// the "borrowed Pass A/B maps" residual the first half of this change named
 // (~600ms, flat across 1/50/500 changed files) could be attributed to a
 // specific structure instead of a whole phase. They sum to
 // `ENTITY_LOOKUP_BUILD_NS` up to the handful of statements between them.
@@ -416,19 +416,18 @@ static PASS1_WALL_NS: AtomicU64 = AtomicU64::new(0);
 /// bookkeeping (`precomputed`/`content_hashes` retain, `entity_spans` clone)
 /// that follows it.
 static ASSEMBLE_NS: AtomicU64 = AtomicU64::new(0);
-/// MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md §4.1 step 2; scoped to
-/// the adjudicated files by semx-5sw). The CLEAN gate:
+/// MUL Phase 1. The CLEAN gate:
 /// `scope_resolve::clean_gate_dirty_files`'s two passes (a free slice over
 /// just the candidate files' own entities, then one O(corpus) scan for
 /// cross-file parent edges into them — see that function's doc comment for
 /// why the second pass must stay corpus-wide), run once per build right
 /// after `all_entities` is assembled (a sub-span of `ASSEMBLE_NS`, broken out
-/// here because its cost is a first-class question — "how much does checking
-/// I1 cost" — not just a component of a pre-existing bucket).
+/// here because its cost is a first-class question — "how much does the
+/// CLEAN-gate check cost" — not just a component of a pre-existing bucket).
 static CLEAN_GATE_NS: AtomicU64 = AtomicU64::new(0);
 /// Sibling counter to `CLEAN_GATE_NS`: how many files' fresh precomputed
-/// facts the CLEAN gate dropped this build (I1 firing). Zero on every real
-/// corpus MUL-DESIGN.md's census checked — nonzero only means the gate
+/// facts the CLEAN gate dropped this build (the gate firing). Zero on every real
+/// corpus census checked — nonzero only means the gate
 /// caught a cross-file parent link (or a fixture built to have one).
 static CLEAN_GATE_FILES_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// `GraphSession::run`'s pre-build state hand-off: `known`/`eligible` sets and
@@ -465,7 +464,7 @@ static BOW_WALL_NS: AtomicU64 = AtomicU64::new(0);
 /// Sum across files (parallel) of `build_file_reference_index`:
 /// `strip_for_language` + `FileReferenceIndex` construction, still fused with
 /// this file's own resolve step inside `resolve_references_with_file_indexes`'s
-/// per-file closure (semx-bkz: `BOW_INDEX_IO_NS` below is the sub-bucket that
+/// per-file closure (: `BOW_INDEX_IO_NS` below is the sub-bucket that
 /// used to dominate this — a genuine second file read, past pass 1 and pass
 /// 2's reparse — now near-zero for files `snapshot_bow_content` covered;
 /// see that function's doc comment for why the fusion itself is unchanged).
@@ -473,19 +472,19 @@ static BOW_INDEX_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 /// Sum across files (parallel) of the per-entity `resolve_entity_references`
 /// loop (dot-chain extraction + local-binding scan + candidate matching).
 static BOW_RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
-/// semx-bkz: wall time of `snapshot_bow_content` — the small pre-step, run
+/// wall time of `snapshot_bow_content` — the small pre-step, run
 /// right after pass 1 and before scope resolution moves `parsed_files` away,
 /// that copies every file's content pass 1 already read into a map
 /// `build_file_reference_index` can look up instead of re-reading. Cheap and
 /// memcpy-bound (no strip/tokenize work here — that stays fused with the
 /// resolve loop, see `BOW_INDEX_BUILD_NS`'s doc comment for why a first
-/// version of this bead that *did* move tokenize into this phase regressed
+/// version of this change that *did* move tokenize into this phase regressed
 /// wall time). Kept as its own bucket to make that "this phase is cheap"
 /// claim checkable rather than asserted.
 static BOW_INDEX_PRECOMPUTE_WALL_NS: AtomicU64 = AtomicU64::new(0);
 
-// ---- bag-of-words sub-phase accumulators (semx-h19): drilling below the
-// index-build vs resolve-loop split semx-9h3 left as a proposal. Same
+// ---- bag-of-words sub-phase accumulators: drilling below the
+// index-build vs resolve-loop split left as a proposal. Same
 // zero-cost-when-off contract; see `BowFileAccum` below for the per-file,
 // zero-locking accumulation discipline (identical shape to `FileAccum`).
 
@@ -623,7 +622,7 @@ impl FileAccum {
 }
 
 /// Per-file accumulator for bag-of-words sub-phase timing + candidate-scan
-/// samples (semx-h19), built and mutated locally inside one rayon closure
+/// samples, built and mutated locally inside one rayon closure
 /// (one file, across every entity in it) with no locking, then handed to
 /// [`merge_bow_file`] once at the end of the closure — same discipline as
 /// [`FileAccum`], and separate from it because bag-of-words and the scope
@@ -768,8 +767,8 @@ add_ns_fn!(add_pass1_wall_ns, PASS1_WALL_NS);
 add_ns_fn!(add_assemble_ns, ASSEMBLE_NS);
 add_ns_fn!(add_clean_gate_ns, CLEAN_GATE_NS);
 
-/// MUL Phase 1 (semx-mp1): record how many files the CLEAN gate dropped this
-/// build (I1 firing — see `CLEAN_GATE_FILES_DROPPED`'s doc comment).
+/// MUL Phase 1: record how many files the CLEAN gate dropped this
+/// build (see `CLEAN_GATE_FILES_DROPPED`'s doc comment).
 pub(crate) fn add_clean_gate_files_dropped(n: u64) {
     if enabled() && n > 0 {
         CLEAN_GATE_FILES_DROPPED.fetch_add(n, Ordering::Relaxed);
@@ -1038,7 +1037,7 @@ pub fn maybe_print_report() {
         ms(RESOLVE_REF_NS.load(Ordering::Relaxed)),
     );
 
-    // semx-w5k: scope_build's constituents. `residual_ms` is
+    // scope_build's constituents. `residual_ms` is
     // `scope_build_ms` minus the sum below — the part of the region no
     // sub-timer covers (config lookup, content selection, the timers
     // themselves). Reported rather than silently folded into a neighbour.

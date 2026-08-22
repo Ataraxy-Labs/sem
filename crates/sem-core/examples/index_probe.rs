@@ -4,7 +4,7 @@
 //!
 //! Not part of the public API and not wired into any product code path — the
 //! sibling of `perf_probe` (build plane) and `incr_probe` (red-green), for the
-//! query plane. See `QUERY-INDEX.md` §1 and §6.
+//! query plane.
 //!
 //! Usage:
 //!   cargo run --release --example index_probe -- write  <repo_root> <index_path>
@@ -21,16 +21,16 @@
 //!   SECTION    — per-section bytes, and each as a share of the image
 //!   ORACLE     — Property 1: index.lookup(name) ≡ graph's answer, ∀ name
 //!   REFS_ORACLE — S2's Property 1 analogue: callers/refs ≡ graph's
-//!                 dependents/dependencies, ∀ entity (QUERY-INDEX.md §6),
-//!                 extended semx-zvq to also check every edge's `ref_type`:
+//! dependents/dependencies, ∀ entity,
+//! extended to also check every edge's `ref_type`:
 //!                 refs_of_typed/callers_of_typed ≡ graph.edges' kinds, ∀
 //!                 entity, ∀ edge
-//!   FILES_ORACLE — §7 item 1's Property 1 analogue: `files_under(prefix)` ≡
+//! FILES_ORACLE — item 1's Property 1 analogue: `files_under(prefix)` ≡
 //!                 a plain walk restricted to `prefix`, on a fresh index, for
 //!                 the whole repo and every top-level directory
 //!   TRIGRAM_ORACLE — S3's Property 1 analogue: for a pattern battery,
 //!                 `grep::search` (postings-narrowed) ≡ `grep::full_scan`
-//!                 (ground truth), same file:line set (QUERY-INDEX.md §9)
+//! (ground truth), same file:line set
 //!   MUTATION   — corrupt one real posting, confirm TRIGRAM_ORACLE catches it
 //!   OPEN       — mmap + header validation wall time (cold process)
 //!   LOOKUP     — per-name lookup wall time and hit count (cold process)
@@ -51,7 +51,7 @@ use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
 use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
 
-/// `grep::search`'s `Complete`-sweep walker (semx-ykf): every index this
+/// `grep::search`'s `Complete`-sweep walker: every index this
 /// probe builds goes through `index::build_with_content_and_dirs_and_tests`
 /// (no `DirFingerprint`s — `DIRS` is absent), so `complete_check` never
 /// observes a drifted directory here and this closure is never actually
@@ -101,7 +101,7 @@ fn write_mode(root: &Path, index_path: &Path) {
 
     // One parallel read per file feeds both the fingerprint's mtime (used
     // here; content_hash stays 0 — the probe doesn't re-hash the corpus, see
-    // §8's honesty note) and TRIGRAM's byte content (S3, semx-az9) — same
+    // honesty note) and TRIGRAM's byte content (S3) — same
     // read `sem-cli`'s `write_query_index` does in production, so this
     // number is the real added cost, not a probe-only shortcut.
     let started = Instant::now();
@@ -138,7 +138,7 @@ fn write_mode(root: &Path, index_path: &Path) {
     let contents: HashMap<String, Vec<u8>> = rows.into_iter().collect();
 
     // The test classification the writer packs into `EntityRec.flags`
-    // (semx-zvq) — the same call `sem-cli`'s `save_topology`/
+    // — the same call `sem-cli`'s `save_topology`/
     // `save_with_test_dirs` make before handing the set to
     // `write_query_index`, so the probe exercises the production shape rather
     // than a probe-only `None`.
@@ -219,7 +219,7 @@ fn report_sections(bytes: &[u8]) {
     }
 }
 
-/// Property 1 of the consistency oracle (`QUERY-INDEX.md` §6): for every
+/// Property 1 of the consistency oracle: for every
 /// distinct name in the graph, the index's answer equals the graph's answer,
 /// as a set of ids and field-by-field on each row.
 fn oracle(graph: &EntityGraph, bytes: Vec<u8>) -> QueryIndex {
@@ -328,15 +328,15 @@ struct RefsCheckStats {
     refs_typed: bool,
 }
 
-/// S2's Property 1 analogue (`QUERY-INDEX.md` §6, extended for semx-gis, and
-/// again for semx-zvq's typed `REFS`): for every entity in the graph,
+/// S2's Property 1 analogue (extended for, and
+/// again for typed `REFS`): for every entity in the graph,
 /// `index.refs_of`/`callers_of` equals the graph's own
 /// `dependencies`/`dependents` maps, as a sorted id multiset — **and**
 /// `index.refs_of_typed`/`callers_of_typed` equals `graph.edges`' own
 /// `ref_type` for every one of those edges, as a sorted `(id, kind)`
 /// multiset.
 ///
-/// semx-o0x: entity→index-slot resolution used to go through
+/// entity→index-slot resolution used to go through
 /// `index.lookup(&entity.name)` (a NAMES binary search) followed by a linear
 /// `.find()` over that name's whole bucket, once per graph entity. That
 /// reads as O(n) at a glance, but the real cost is `Σ over names x of
@@ -348,7 +348,7 @@ struct RefsCheckStats {
 /// would produce. On the TypeScript monster (714,819 entities) the ratio
 /// climbed to 2806x, tracking wall time (24.5s → 100.5s, a 4.1x jump for
 /// only 2.24x more entities) far more tightly than entity count does. This
-/// is the documented llvm pathology (semx-o0x): ref-dense, hub-heavy
+/// is the documented llvm pathology: ref-dense, hub-heavy
 /// corpora pay quadratic-shaped cost for a lookup path a *different*,
 /// already-exhaustive check (`oracle()` above, over every *distinct* name)
 /// had already fully proven correct — this function's own name-bucket walk
@@ -432,7 +432,7 @@ fn refs_check(graph: &EntityGraph, index: &QueryIndex) -> RefsCheckStats {
             }
         }
 
-        // semx-zvq: kind check, only meaningful when the image is typed
+        // kind check, only meaningful when the image is typed
         // (`FLAG_REFS_TYPED`) — an untyped fallback image (never produced by
         // any corpus measured against this design, §format::refs::
         // MAX_ENTITIES) is a documented degraded mode, not a mismatch.
@@ -512,14 +512,14 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) -> bool {
     ok
 }
 
-/// `QUERY-INDEX.md` §7 item 1's Property 1 analogue: `QueryIndex::files_under`
+/// Property 1 analogue: `QueryIndex::files_under`
 /// must equal a plain walk restricted to the same prefix, on a just-built
 /// (fresh) index — the exact guarantee `entities.rs`'s directory-listing
 /// reroute leans on. Checks the whole repo (`prefix=""`) and every top-level
 /// directory found by the same walk `write_mode` fed into the graph build, so
 /// this is self-consistent with `ORACLE`/`REFS_ORACLE` above rather than a
 /// second, independently-scoped walk.
-/// `TESTS_ORACLE` (semx-zvq): every entity's packed `FLAG_IS_TEST` bit must
+/// `TESTS_ORACLE`: every entity's packed `FLAG_IS_TEST` bit must
 /// agree with `parser::graph::is_test_entity` evaluated independently against
 /// the `SemanticEntity` (body included) the build produced — the same
 /// predicate the SQLite cache's `entity_flags.is_test` column stores, which
@@ -636,7 +636,7 @@ fn files_oracle(files: &[String], index: &QueryIndex) {
     }
 }
 
-/// The battery `QUERY-INDEX.md`'s trigram section asks for: common
+/// The battery trigram section asks for: common
 /// identifier, rare identifier, two-word phrase, regex with a literal core,
 /// and a pattern with no usable trigrams (forces the full-scan fallback).
 /// Generic across languages deliberately — this runs on both the monster
@@ -646,7 +646,7 @@ fn files_oracle(files: &[String], index: &QueryIndex) {
 /// The last entry (`createProgram`) is TypeScript-specific, added
 /// deliberately so at least one battery pattern is guaranteed to land
 /// `Trigram`-origin *with real hits* on the monster: `return` and
-/// `[A-Za-z]+Error` are both stop-listed there (§11.2 of QUERY-INDEX.md) and
+/// `[A-Za-z]+Error` are both stop-listed there (of) and
 /// `candidate files` has zero real occurrences in TypeScript's own source,
 /// which — as `mutation_test` discovered empirically — makes a posting
 /// corruption unobservable (a candidate set change with no true positives to
@@ -662,7 +662,7 @@ const PATTERN_BATTERY: &[(&str, &str)] = &[
     ("common_identifier_ts", "createProgram"),
 ];
 
-/// S3's Property 1 analogue (`QUERY-INDEX.md` §6/§9, semx-az9's obligation):
+/// S3's Property 1 analogue (obligation):
 /// for every pattern in `PATTERN_BATTERY`, `grep::search` (postings-narrowed,
 /// candidate-verified) must equal `grep::full_scan` (ground truth — never
 /// touches TRIGRAM) as the same `(file, line)` set. `search` is also
@@ -670,7 +670,7 @@ const PATTERN_BATTERY: &[(&str, &str)] = &[
 /// `full_scan`'s own disk re-read) so a bug shared between `search`'s and
 /// `full_scan`'s common `verify_file` helper cannot hide a real divergence —
 /// though the primary claim under test is candidate-set correctness, not
-/// `verify_file` itself (QUERY-INDEX.md's trigram section documents this
+/// `verify_file` itself (trigram section documents this
 /// distinction).
 fn trigram_oracle(index: &QueryIndex, root: &Path, contents: &HashMap<String, Vec<u8>>) {
     let started = Instant::now();
@@ -732,7 +732,7 @@ fn trigram_oracle(index: &QueryIndex, root: &Path, contents: &HashMap<String, Ve
     }
 }
 
-/// Mutation test (bead item 3): corrupt one real posting — flip a single
+/// Mutation test (change item 3): corrupt one real posting — flip a single
 /// `TARGETS` entry for a trigram one of `PATTERN_BATTERY`'s patterns
 /// *actually consults* to point at the wrong file — and confirm
 /// `TRIGRAM_ORACLE`'s comparison (`search` vs `full_scan`) actually
@@ -902,7 +902,7 @@ fn corrupt_posting_for_file(bytes: &[u8], trigram: [u8; 3], target_file: u32) ->
 const REFS_SUB_HEADER_LEN: usize = 8;
 
 /// Flips one forward-CSR posting's target entity, keeping its packed
-/// `ref_type` bits intact (`format::refs::pack`) — semx-o0x's negative for
+/// `ref_type` bits intact (`format::refs::pack`) — negative for
 /// `REFS_ORACLE`: proof the now-O(n) [`refs_check`] still catches a
 /// corrupted posting exhaustively, the same "wrong answer, not a wrong byte
 /// nobody would notice" shape `corrupt_posting_for_file` proves for
@@ -944,7 +944,7 @@ fn corrupt_refs_posting(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(mutated)
 }
 
-/// semx-o0x negative: corrupt one `REFS` posting and confirm the (now O(n))
+/// negative: corrupt one `REFS` posting and confirm the (now O(n))
 /// `refs_check` still screams — proof the complexity fix didn't trade away
 /// exhaustiveness. Mirrors `mutation_test`'s TRIGRAM proof shape: mutate,
 /// rebuild a `QueryIndex` over the corrupted bytes, run the exact check the

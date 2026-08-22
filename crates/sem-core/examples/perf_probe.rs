@@ -1,4 +1,4 @@
-//! Ad hoc performance probe for cold full-repo graph builds (semx-cnq).
+//! Ad hoc performance probe for cold full-repo graph builds.
 //!
 //! Not part of the public API and not wired into any product code path.
 //! Answers: on a cold `EntityGraph::build`, where does wall time go —

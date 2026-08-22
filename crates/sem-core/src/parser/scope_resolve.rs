@@ -110,7 +110,7 @@ pub struct Scope {
 /// every container that holds a `Scope`. Deserializing by hand through an owned
 /// shadow struct keeps the hot in-memory representation as-is (no per-scope
 /// `String` allocation on the build path) while letting `PrecomputedFileFacts`
-/// round-trip for the on-disk facts corpus (semx-9en).
+/// round-trip for the on-disk facts corpus.
 ///
 /// The kinds this resolver produces are a closed set, so they map back to the
 /// same statics. Anything else — a kind written by a future version — is leaked
@@ -164,7 +164,7 @@ struct AstRef {
     end_byte: usize,
 }
 
-/// Interning-for-memory wave (semx-taq6, Stage 1): `name`/`path`/`receiver`/
+/// Interning-for-memory wave (Stage 1): `name`/`path`/`receiver`/
 /// `method` are `Arc<str>`, not `String` — per-file-interned via
 /// [`AstRefCollector`] at construction time (Stage 0 measured 72-79% of
 /// `ast_refs`' duplicate string bytes as *within-file* repeats, dwarfing
@@ -176,7 +176,7 @@ struct AstRef {
 /// sites). Proven wire-compatible with the pre-change `String`-typed shape
 /// (`examples/arc_str_wire_probe.rs`: byte-identical CBOR under `ciborium`
 /// with `serde`'s `rc` feature, cross-decodes cleanly in both directions)
-/// — see RESOLUTION-PROFILE.md for the empirical proof and the real-corpus
+/// — the empirical proof and the real-corpus
 /// cross-binary check this claim rests on. No `FACTS_SCHEMA_VERSION` bump.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -196,7 +196,7 @@ enum AstRefKind {
     },
 }
 
-/// Per-file interning accumulator for [`AstRef`] construction (semx-taq6,
+/// Per-file interning accumulator for [`AstRef`] construction (
 /// Stage 1). Wraps the `Vec<AstRef>` every ref-emitting function already
 /// threads through, adding a transient, file-scoped `&str -> Arc<str>`
 /// table so repeated identifiers within one file share a single heap
@@ -617,7 +617,7 @@ pub(crate) struct PreBuiltLookups {
 /// [`reparse_language_config`] — this decides *whether* a file is re-parsed at
 /// all, that decides *with which grammar*, and keeping the first question in one
 /// function is what stops the skip in the re-parse loop from drifting away from
-/// the decline it mirrors. semx-au8.
+/// the decline it mirrors.
 fn scope_resolve_config_for_path(
     file_path: &str,
 ) -> Option<&'static crate::parser::plugins::code::languages::ScopeResolveConfig> {
@@ -638,7 +638,7 @@ fn scope_resolve_config_for_path(
 /// TypeScript tree. The resulting error-recovered tree yields fewer scopes and
 /// refs, so references that scope resolution should have resolved fell through
 /// to the bag-of-words resolver instead — the chunked path answering a
-/// different question from the direct path for the same corpus (semx-6rd).
+/// different question from the direct path for the same corpus.
 fn reparse_language_config(
     file_path: &str,
     ext_overrides: &HashMap<String, String>,
@@ -654,7 +654,7 @@ fn reparse_language_config(
 }
 
 /// Corpus-wide entity indexes keyed by file/parent, built once from
-/// `all_entities` (semx-6rd CUT 2). `resolve_with_scopes_full_inner` used to
+/// `all_entities` (CUT 2). `resolve_with_scopes_full_inner` used to
 /// rebuild these from scratch on every call — a pure function of `all_entities`
 /// alone, so on the chunked path (one call per chunk, same `all_entities` every
 /// time) that was the identical O(corpus) scan repeated once per chunk for no
@@ -671,7 +671,7 @@ impl<'a> PrebuiltEntityIndex<'a> {
         // are contiguous and its bucket's final size is known as soon as the
         // run ends — building each `Vec` at its exact length avoids the
         // repeated grow-and-copy the plain `entry().or_default().push()` form
-        // paid ~454k times per build (semx-4an). The grouping itself is
+        // paid ~454k times per build. The grouping itself is
         // unchanged, and does not *rely* on contiguity: a file whose entities
         // were split across two runs simply gets two `extend`s.
         let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> =
@@ -711,7 +711,7 @@ impl<'a> PrebuiltEntityIndex<'a> {
     }
 }
 
-/// MUL Phase 1 (semx-5sw, epic semx-w5k): the CLEAN gate, scoped to only the
+/// MUL Phase 1 (epic): the CLEAN gate, scoped to only the
 /// files under adjudication instead of the whole corpus.
 ///
 /// `graph.rs`'s CLEAN gate only ever asks for the verdict on
@@ -719,22 +719,22 @@ impl<'a> PrebuiltEntityIndex<'a> {
 /// a handful (linux: 7 of 2,050 scope-resolvable files) — then throws away
 /// every other file's verdict via `fresh_precomputed.retain(...)`. The
 /// previous implementation (`PrebuiltEntityIndex::build` +
-/// `dirty_precompute_files`, removed by semx-5sw) computed a verdict for
+/// `dirty_precompute_files`, removed by) computed a verdict for
 /// every file in the corpus anyway, by building two corpus-wide indexes
 /// (`entities_by_file`/`children_by_parent`, one `HashMap<&str, Vec<&Entity>>`
 /// bucket per distinct file/parent-id in the *entire* corpus) to answer a
 /// question about a handful of files.
 ///
 /// **Soundness (why scoping to the candidate files is exact, not
-/// approximate).** `CLEAN(F)` (MUL-DESIGN.md §1) is: for every entity `e`
+/// approximate).** `CLEAN(F)` is: for every entity `e`
 /// declared in `F`, every entity naming `e.id` as `parent_id` also belongs to
 /// `F`. Restated as what this function computes: `F` is dirty iff `∃ e ∈
 /// entities(F). ∃ c ∈ all_entities. c.parent_id == Some(e.id) ∧ c.file_path !=
 /// F`. This depends on exactly two things: (1) `F`'s own entities (to know
 /// which ids are "declared in `F`" at all), and (2) every entity anywhere in
 /// the corpus whose `parent_id` names one of those ids — cross-file parent
-/// edges *into* `F`, which by `build_entity_id`'s construction (MUL-DESIGN.md
-/// §1.1's file-rootedness theorem) can only name `e.id` by having recomputed
+/// edges *into* `F`, which by `build_entity_id`'s construction (
+/// file-rootedness theorem) can only name `e.id` by having recomputed
 /// the identical id string independently, since extraction is per-file and
 /// never sees another file's bytes; the runtime check exists for the one hole
 /// the theorem admits (id-string collision across files), not because the
@@ -755,23 +755,23 @@ impl<'a> PrebuiltEntityIndex<'a> {
 /// corpus) building `id_owner : id -> file_path`, with no corpus scan at all.
 /// Pass 2 is the one part that must stay `O(corpus)`: a cross-file child of a
 /// candidate's entity can live in *any* file, precomputed or not, so every
-/// entity's `parent_id` is checked against the small `id_owner` map (I6
+/// entity's `parent_id` is checked against the small `id_owner` map (the
 /// fail-safe stays exact — nothing here narrows *who might point at* a
 /// candidate). Neither pass allocates a `Vec` bucket per distinct file or
 /// parent id the way the old `PrebuiltEntityIndex::build` did.
 ///
-/// Fail-safe (I6) is unaffected: empty `candidate_spans` (nothing was
+/// This fail-safe is unaffected: empty `candidate_spans` (nothing was
 /// precomputed this build) short-circuits to an empty dirty set, exactly as
 /// today's `!fresh_precomputed.is_empty()` guard at the call site already
 /// skips the gate entirely in that case.
 ///
-/// **semx-mul phase-2 W0.** `CLEAN(F)`'s soundness argument above depends on
+/// **MUL phase 2.** `CLEAN(F)`'s soundness argument above depends on
 /// scanning *every* cross-file parent edge into a candidate — and this crate
 /// has exactly one producer of a cross-file parent edge,
 /// [`crate::parser::registry::resolve_go_method_parent_ids`]. Before this
-/// bead, nothing enforced that it had run before this function was called;
+/// change, nothing enforced that it had run before this function was called;
 /// `graph.rs`'s gate call site happened to run first, which was silently
-/// unsound the moment a `.go` file became a candidate (MUL-DESIGN.md's
+/// unsound the moment a `.go` file became a candidate (
 /// Go-admission hazard note). The `GoParentsResolved` parameter makes that
 /// ordering a compile-time fact instead of a call-site convention: the only
 /// way to obtain one is to call `resolve_go_method_parent_ids` first, so a
@@ -823,7 +823,7 @@ struct TsDefaultReExport {
 pub(crate) struct TopLevelEntityIndex {
     entities_by_file: HashMap<String, Vec<(String, String)>>,
     sorted_files: Vec<String>,
-    /// semx-sbf: `sorted_files`, indexed by file stem, for callers that need
+    /// `sorted_files`, indexed by file stem, for callers that need
     /// *every* stem-matching file (bare/package specifier resolution's
     /// union-of-matches semantics — see [`match_bare_import_stem`]) rather
     /// than [`find_import_file`]'s single best match. Built alongside
@@ -950,7 +950,7 @@ fn normalized_method_receiver(receiver: &str) -> &str {
 
 /// The single source of truth for "does this entity type own class-shaped
 /// members" — shared by [`class_member_owner_name`] (called on the owned
-/// `EntityInfo` map every whole rebuild) and, since semx-4an,
+/// `EntityInfo` map every whole rebuild) and, since,
 /// `graph::maintain_entity_lookups_incremental`'s per-file removal/insertion
 /// (called on a bare `&SemanticEntity` — same fields, different owning type,
 /// same predicate must apply or the two code paths could disagree about
@@ -1135,14 +1135,14 @@ type Pass1FileScan = (
 /// [`precompute_js_ts_file_facts`]); files it covers skip the re-parse loop and
 /// its downstream tree walks entirely. `entity_index` is the corpus-wide
 /// file/parent entity index, a pure function of `all_entities` and therefore
-/// identical for every chunk (semx-6rd CUT 2). `corpus_has_swift` is the same
-/// kind of whole-corpus fact, added for semx-nuv: see that field's own doc
+/// identical for every chunk (CUT 2). `corpus_has_swift` is the same
+/// kind of whole-corpus fact, added for: see that field's own doc
 /// comment.
 pub(crate) struct ChunkedResolveInputs<'a> {
     pub(crate) facts: &'a HashMap<String, PrecomputedFileFacts>,
     pub(crate) entity_index: &'a PrebuiltEntityIndex<'a>,
     /// Whether *any* file in the whole corpus is `.swift` — a pure function of
-    /// `all_entities`, computed once before the chunk loop starts (semx-nuv;
+    /// `all_entities`, computed once before the chunk loop starts (;
     /// this struct's own doc comment on why: `entity_index` above is the same
     /// pattern for a different table).
     ///
@@ -1161,15 +1161,15 @@ pub(crate) struct ChunkedResolveInputs<'a> {
     /// (`has_ambiguous_swift_signature_candidates`,
     /// `select_swift_overload_candidate`) ever ran for that file's calls —
     /// producing a chunk-order-dependent tie-break on corpus-wide
-    /// ambiguous-short-name fallback resolution (semx-nuv; see
-    /// RESOLUTION-PROFILE.md's "Resolver tie-break contract" section). Reading
+    /// ambiguous-short-name fallback resolution (; see
+    /// "Resolver tie-break contract" section). Reading
     /// this precomputed, whole-corpus bool instead makes the gate — and
     /// therefore `swift_call_signatures`'s contents, and therefore every
     /// downstream resolution decision that consults it — a pure function of
     /// repo content, independent of `chunk_files_by_byte_budget`'s output.
     pub(crate) corpus_has_swift: bool,
     /// The JS/TS namespace-import index (`register_ts_namespace_import`),
-    /// hoisted across chunks (semx-la2, semx-6rd CUT-2 pattern round 3).
+    /// hoisted across chunks (CUT-2 pattern round 3).
     /// `build_top_level_entity_index` is a pure function of
     /// `(symbol_table, entity_map, extensions)`, and on the chunked path all
     /// three are corpus-invariant across chunks: the same `&PreBuiltLookups`
@@ -1179,7 +1179,7 @@ pub(crate) struct ChunkedResolveInputs<'a> {
     /// `resolve_with_scopes_full_inner` — created per call, i.e. per chunk —
     /// so one bare namespace import per chunk rebuilt a corpus-sized index,
     /// corpus-proportional × chunk-count (linux: ~31 thread-s across ~16
-    /// chunks; see RESOLUTION-PROFILE.md "hoist the per-chunk import-handler
+    /// chunks; see "hoist the per-chunk import-handler
     /// indexes"). Still lazy: nothing is built unless some chunk actually
     /// sees the triggering import form — just at most once per corpus now.
     pub(crate) top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
@@ -1189,7 +1189,7 @@ pub(crate) struct ChunkedResolveInputs<'a> {
     /// handlers build over different extension sets (`&[".py"]` vs
     /// `JS_TS_EXTENSIONS`), exactly as before the hoist.
     pub(crate) py_top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
-    /// Rust's sibling index (`register_rust_module_import`, semx-gla, relative
+    /// Rust's sibling index (`register_rust_module_import`, relative
     /// module-alias `use` form), same invariance argument and same hoist as
     /// `top_level_entities` above. Its own lock because it is built over its
     /// own extension set (`&[".rs"]`), exactly like the Python/TS split.
@@ -1197,7 +1197,7 @@ pub(crate) struct ChunkedResolveInputs<'a> {
 }
 
 /// Red-green context for one call of [`resolve_with_scopes_full_inner`]
-/// (semx-022). One call == one chunk on the chunked path, one whole corpus
+///. One call == one chunk on the chunked path, one whole corpus
 /// otherwise.
 ///
 /// The function fingerprints the chunk-scoped tables it builds (return types,
@@ -1214,7 +1214,7 @@ pub(crate) struct ScopeIncremental<'a, 'i> {
     pub(crate) eligible: &'a HashSet<String>,
 }
 
-/// Chunked-path entry point (semx-6rd CUT 1): like [`resolve_with_scopes_full`],
+/// Chunked-path entry point (CUT 1): like [`resolve_with_scopes_full`],
 /// but additionally accepts the [`ChunkedResolveInputs`] the chunk loop built
 /// once. Files covered by `chunked.facts` need no tree; every other file is
 /// handled exactly as before. Only `EntityGraph::build`'s chunked path
@@ -1249,7 +1249,7 @@ pub(crate) fn resolve_with_scopes_full_chunked(
 /// Compact, tree-independent per-file facts collected during pass 1 while a
 /// JS/TS file's tree-sitter tree is momentarily in hand (`EntityGraph::build`,
 /// beyond `PARSED_FILE_REUSE_LIMIT`), so the chunked resolution path doesn't
-/// have to re-parse the file to get them (semx-6rd CUT 1).
+/// have to re-parse the file to get them (CUT 1).
 ///
 /// Scoped to JS/TS files only. Every *other* tree-touching computation the
 /// chunked path performs — `extract_imports_from_ast`'s Python
@@ -1280,11 +1280,11 @@ pub struct PrecomputedFileFacts {
     instance_attr_types: HashMap<(String, String), String>,
     init_params: HashMap<String, Vec<String>>,
     attr_to_param: HashMap<(String, String), String>,
-    /// Field 10 (MUL-DESIGN.md §4.3, semx-mul phase 2): one descriptor per
+    /// Field 10 (MUL phase 2): one descriptor per
     /// import-statement node the pruned replay would have dispatched, in
     /// that same order. Populated by [`precompute_scope_resolvable_file_facts`]
     /// via [`record_import_stmts_pruned`] — no longer always empty as of
-    /// phase 2 W5: **Python is admitted unconditionally**
+    /// phase 2: **Python is admitted unconditionally**
     /// ([`mul_precompute_admits`]) and has real imports, so this field is
     /// populated on every active Python file. **C++ stays empty**: also
     /// admitted unconditionally, but import-free by construction of the
@@ -1294,8 +1294,8 @@ pub struct PrecomputedFileFacts {
     /// `SEM_MUL_RUST`/`SEM_MUL_JAVA`; see [`mul_precompute_admits`]'s doc
     /// comment for why each stays gated — memory) — off by default, so
     /// empty in the common case but not provably so. **Go is admitted
-    /// unconditionally** (semx-bpn2: correctness chain closed, memory
-    /// fence cleared), so this field is populated on every active Go file,
+    /// unconditionally** (correctness chain closed, memory
+    /// check cleared), so this field is populated on every active Go file,
     /// the same shape as Python's. Always
     /// empty from [`precompute_js_ts_file_facts`] too: JS/TS imports are
     /// never replayed from a tree in a [`crate::parser::session::GraphSession`]
@@ -1308,7 +1308,7 @@ pub struct PrecomputedFileFacts {
     /// `ImportStmtFacts` type `record_import_stmts_pruned` builds on the
     /// tree-driven path, dispatched by the same function either way.
     import_stmts: Vec<ImportStmtFacts>,
-    /// Field 11 (MUL-DESIGN.md §4.3, semx-mul phase 2/3): one descriptor per
+    /// Field 11 (MUL phase 2/3): one descriptor per
     /// constructor-call-shaped `"call"` node — `scan_constructor_calls`'
     /// former per-node inputs — recorded by [`record_ctor_call_sites`] in
     /// that same worklist order. Populated only when the fused walk saw a
@@ -1328,13 +1328,13 @@ pub struct PrecomputedFileFacts {
 
 impl PrecomputedFileFacts {
     /// This file's full source text, already in hand from pass 1. Lets
-    /// downstream per-file work (e.g. bag-of-words index construction, semx-bkz)
+    /// downstream per-file work (e.g. bag-of-words index construction)
     /// consume the same bytes pass 1 read instead of a second `read_to_string`.
     pub(crate) fn content(&self) -> &str {
         &self.content
     }
 
-    /// semx-dm5t: repair the id-staleness species — pass 1's per-file
+    /// repair the id-staleness species — pass 1's per-file
     /// precompute (`precompute_scope_resolvable_file_facts`) builds this
     /// file's `entity_scope_map`/`entity_inner_scope`/`return_type_map`
     /// against the entity ids `all_entities` held for this file *at that
@@ -1350,14 +1350,14 @@ impl PrecomputedFileFacts {
     /// is touched) — the common case, since it is non-empty only for a
     /// build that actually contains a Go method whose receiver type lives
     /// in a different file of the same package (most corpora have none;
-    /// Go's precompute path itself runs unconditionally, semx-bpn2).
+    /// Go's precompute path itself runs unconditionally.
     /// `registry.rs::GoParentsResolved` hands out a `std::collections::HashMap`
     /// (it has no `rustc_hash` dependency of its own), not this module's
     /// `FxHashMap` alias — spelled out fully qualified here rather than
     /// widening `registry.rs`'s public surface with a dependency it
     /// otherwise doesn't need.
     ///
-    /// semx-bpn2 (go-fence follow-up): the original repair above missed
+    /// (a follow-up to the Go memory-check work): the original repair above missed
     /// [`Scope::defs`] and [`Scope::owner_id`] — the two other places this
     /// struct stores an *entity id* rather than a plain name string, by
     /// [`Scope`]'s own field doc comments (`defs`: "name -> entity_id",
@@ -1423,7 +1423,7 @@ impl PrecomputedFileFacts {
         }
     }
 
-    /// Approximate heap footprint (semx-4w1 attribution), summed across every
+    /// Approximate heap footprint (attribution), summed across every
     /// field. Thin wrapper over [`Self::field_heap_bytes`] — see that
     /// method's doc comment for what's walked and the approximation's
     /// limits.
@@ -1432,7 +1432,7 @@ impl PrecomputedFileFacts {
     }
 
     /// Shrink every heap-owning collection to its exact `len()`, in place
-    /// (semx-bpn2 Stage 2 trim). Every collection here is built by repeated
+    /// (Stage 2 trim). Every collection here is built by repeated
     /// `push`/`insert` over the course of one file's tree walk
     /// (`fused_scope_refs_import_walk`/`record_import_stmts_pruned`/
     /// `record_ctor_call_sites`/`scan_*`), with no `with_capacity` sizing
@@ -1507,7 +1507,7 @@ impl PrecomputedFileFacts {
     }
 
     /// Same walk as [`Self::approx_heap_bytes`], split by field instead of
-    /// summed (semx-bpn2 Stage 1: attribute which field actually dominates a
+    /// summed (Stage 1: attribute which field actually dominates a
     /// MUL-admitted language's fast-path facts, rather than only the
     /// aggregate). `content` is exact (`.capacity()`); the container fields
     /// are sized by `Vec`/`HashMap` capacity times element size plus a
@@ -1516,7 +1516,7 @@ impl PrecomputedFileFacts {
     /// collections' keys/values by `.capacity()`, every [`AstRefKind`]
     /// variant's `String` payloads (`argument_labels` included), the actual
     /// key+value string bytes of the return-type/instance-attr/init-param
-    /// maps, and — new as of this bead, closing a gap the four maps above
+    /// maps, and — new as of this change, closing a gap the four maps above
     /// already had fixed — every [`ImportStmtFacts`]/[`CtorCallFacts`]
     /// variant's own nested `String`/`Vec` payloads (`import_stmts`/
     /// `ctor_call_sites` previously counted only `size_of::<T>() *
@@ -1526,7 +1526,7 @@ impl PrecomputedFileFacts {
     /// four maps, just never extended to Fields 10/11 because nothing had
     /// measured them in isolation before). Still an approximation by
     /// `.capacity()`, not allocator-level accounting. See
-    /// RESOLUTION-PROFILE.md.
+    ///.
     pub(crate) fn field_heap_bytes(&self) -> PrecomputedFieldBytes {
         fn argument_labels_bytes(labels: &Option<Vec<Option<String>>>) -> usize {
             labels.as_ref().map_or(0, |labels| {
@@ -1580,7 +1580,7 @@ impl PrecomputedFileFacts {
             + self.entity_inner_scope.capacity()
                 * (std::mem::size_of::<String>() + std::mem::size_of::<usize>() + 1);
 
-        // `Arc<str>` allocations may be shared (per-file interning, semx-taq6
+        // `Arc<str>` allocations may be shared (per-file interning,
         // Stage 1) — a pointer already seen in this file's `ast_refs` costs
         // nothing more, matching what the allocator actually holds live.
         // `ARC_STR_HEADER_BYTES` is the strong+weak refcount header every
@@ -1725,12 +1725,12 @@ impl PrecomputedFileFacts {
         }
     }
 
-    /// Stage-0 instrument (interning-for-memory wave, semx-taq6): every
+    /// Stage-0 instrument (interning-for-memory wave): every
     /// identifier-shaped string `ast_refs` owns that a per-node interner
     /// would replace with a token — `Call`'s `name`, `ScopedCall`'s `path`/
     /// `name`, `MethodCall`'s `receiver`/`method`. `argument_labels`
     /// deliberately excluded: those are call-site keyword-argument names,
-    /// not the identifier text the duplicate-rate finding (semx-bpn2,
+    /// not the identifier text the duplicate-rate finding (
     /// Stage 4) named as the lever. Diagnostic only — never called outside
     /// `mem_profile`'s `SEM_PROFILE_MEM=1` gate.
     pub(crate) fn ast_ref_intern_candidates(&self) -> Vec<&str> {
@@ -1753,9 +1753,9 @@ impl PrecomputedFileFacts {
         out
     }
 
-    /// Stage-0 instrument (interning-for-memory wave, semx-taq6): every
+    /// Stage-0 instrument (interning-for-memory wave): every
     /// module/specifier/path string `import_stmts` owns — the Field 10
-    /// lever the python-fence wave named but did not attempt. Diagnostic
+    /// lever the Python memory-check work named but did not attempt. Diagnostic
     /// only — never called outside `mem_profile`'s `SEM_PROFILE_MEM=1` gate.
     pub(crate) fn import_stmt_intern_candidates(&self) -> Vec<&str> {
         let mut out = Vec::with_capacity(self.import_stmts.len() * 2);
@@ -1806,7 +1806,7 @@ impl PrecomputedFileFacts {
     }
 }
 
-/// Per-field split of [`PrecomputedFileFacts::field_heap_bytes`] (semx-bpn2
+/// Per-field split of [`PrecomputedFileFacts::field_heap_bytes`] (
 /// Stage 1 attribution instrument). One field per [`PrecomputedFileFacts`]
 /// field group; `total()` reproduces exactly what
 /// [`PrecomputedFileFacts::approx_heap_bytes`] used to compute inline.
@@ -1885,7 +1885,7 @@ pub(crate) fn dummy_precomputed_facts_for_test(content: &str) -> PrecomputedFile
 /// lookup it does against them is keyed by an id that belongs to *this* file
 /// (JS/TS declarations never nest across files), so a map built from just
 /// this file's entities produces identical results — verified by the
-/// equivalence hash in the semx-6rd fix-phase notes in RESOLUTION-PROFILE.md.
+/// equivalence hash in the fix-phase notes.
 pub(crate) fn precompute_js_ts_file_facts(
     file_path: &str,
     content: String,
@@ -1940,13 +1940,13 @@ pub(crate) fn precompute_js_ts_file_facts(
     let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
 
     // Same top-level def registration `resolve_with_scopes_full_inner`'s pass
-    // 2 closure does before calling `build_scopes_from_ast` — and, per
-    // MUL-DESIGN.md I2, in the *same order*: `entity_ranges` order
+    // 2 closure does before calling `build_scopes_from_ast` — and in
+    // the *same order*: `entity_ranges` order
     // (`(start_line, end_line, id)` ascending), not extraction order. The two
     // orders agree for all but pathological same-line, same-span, 10+-way
     // name collisions (see `js_ts_precompute_seed_order_diverges_from_entity_ranges_order_at_ten_plus_siblings`
-    // in this module's tests for the constructed divergence and MUL-DESIGN.md
-    // F1 for the finding), but `defs.insert` is last-write-wins, so seeding
+    // in this module's tests for the constructed divergence), but
+    // `defs.insert` is last-write-wins, so seeding
     // in the wrong order is a silent, real divergence whenever they don't —
     // this file's own entities are cheap enough to sort per file (typically
     // tens, not corpus-wide).
@@ -2020,7 +2020,7 @@ pub(crate) fn precompute_js_ts_file_facts(
         // Field 11 (Python-only) scans for — see this field's doc comment.
         ctor_call_sites: Vec::new(),
     };
-    // semx-bpn2 Stage 2: same slack-reclaim as the scope-resolvable
+    // Stage 2: same slack-reclaim as the scope-resolvable
     // producer's own construction site — see `shrink_to_fit`'s doc comment.
     facts.shrink_to_fit();
     Some(facts)
@@ -2033,24 +2033,25 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// consumers that must never disagree: pass 1's admission test
 /// (`EntityGraph::build`'s pass-1 closure, `graph.rs`) and the facts corpus's
 /// per-language salt (`facts_store::effective_language_salt`). A producer
-/// switch the salt does not track is exactly MUL-DESIGN.md's I5/F2 hazard —
-/// corpus dedup is first-writer-wins (semx-fqh), so entries written while the
+/// switch the salt does not track is exactly the hazard the salt-bump
+/// discipline exists to prevent — corpus dedup is first-writer-wins, so entries written while the
 /// switch is off (`precomputed: None`) would silently deny the facts a slot
 /// forever after it is turned on.
 ///
-/// **The +15% ceiling's metric (I6), corrected 2026-08-22 (M1):** every gate
+/// **The +15% ceiling's metric, corrected 2026-08-22:** every gate
 /// below through Rust's demotion was read off `/usr/bin/time -l`'s `maximum
 /// resident set size` (`getrusage` `ru_maxrss` — resident pages; pages the
 /// macOS VM compressor has swapped into the compressor **vanish** from this
 /// number, since they are no longer resident). The same tool also emits
 /// `peak memory footprint` (`task_info` `phys_footprint` — Apple's own
 /// memory-pressure accounting, which **counts** compressed pages, matching
-/// what actually drives jetsam/swap/user-felt pressure). M1's re-read found
+/// what actually drives jetsam/swap/user-felt pressure). The 2026-08-22
+/// re-read found
 /// the two fields disagree in *sign*, not just magnitude, on the two
 /// languages that had shipped unconditionally: Python's admission populates
 /// exactly the compressible content (short, repetitive identifier strings)
 /// the compressor eats, so maxRSS reads a small *decrease* while footprint
-/// reads a large *increase*. A standalone allocator probe (M1) confirmed the
+/// reads a large *increase*. A standalone allocator probe confirmed the
 /// mechanism directly: `ps -o rss=` and maxRSS agree bit-for-bit; a process
 /// holding actively-touched compressible content shows **no** divergence
 /// from an equal amount of random content until the OS has actual reason to
@@ -2062,47 +2063,46 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// regime. The ceiling is henceforth defined against **peak memory
 /// footprint**, with maxRSS reported alongside for continuity; every
 /// admission decided under the old metric was re-read, and verdicts flip
-/// mechanically per I6 — see C++'s and Python's entries below, both demoted
-/// this bead. This is a Darwin-specific accounting distinction
+/// mechanically under the corrected metric — see C++'s and Python's entries
+/// below, both demoted
+/// by this change. This is a Darwin-specific accounting distinction
 /// (`task_info`/VM-compressor semantics); Linux carries no equivalent
 /// compressor by default, so Linux re-validation under this same two-field
-/// discipline is a separate, still-open task — see RESOLUTION-PROFILE.md's
-/// M1 addendum.
+/// discipline is a separate, still-open task.
 ///
-/// **C++ (`cpp`): off by default, gated on `SEM_MUL_CPP`** — demoted (M1,
-/// 2026-08-22) from semx-mp1's original unconditional "GO" verdict.
-/// Correctness is not in question — nothing about M1's re-measurement
+/// **C++ (`cpp`): off by default, gated on `SEM_MUL_CPP`** — demoted
+/// (2026-08-22) from the original unconditional "GO" verdict.
+/// Correctness is not in question — nothing about the re-measurement
 /// touched TREELESS/CLEAN or *what* the fast path produces, only whether its
-/// memory cost clears the ceiling. Two things moved together: semx-mp1's
+/// memory cost clears the ceiling. Two things moved together: the
 /// original same-binary reading (+5.8%/+6.5% peak-RSS against the +15%
 /// ceiling, without `--no-cache` or a fresh `SEM_CACHE_DIR` per run — the
-/// exact protocol gap semx-j1fw later named for Rust's own outlier +11%
-/// reading) turned out to be an artifact of that gap, not the ceiling. M1's
-/// throwaway-worktree re-verification (one predicate flipped, `--no-cache`,
+/// exact protocol gap identified from Rust's own outlier +11%
+/// reading) turned out to be an artifact of that gap, not the ceiling. The
+/// 2026-08-22 throwaway-worktree re-verification (one predicate flipped, `--no-cache`,
 /// fresh `SEM_CACHE_DIR` per run, three order-swapped pairs on
 /// llvm/llvm-project's full checkout) found peak-RSS (`maximum resident set
 /// size`) itself busts the ceiling — **+19.98%/+20.50%/+21.02%** — before
-/// even applying I6's corrected metric. Peak memory footprint (`phys_
-/// footprint`, the metric I6 now defines the ceiling against — see this
+/// even applying the corrected metric. Peak memory footprint (`phys_
+/// footprint`, the metric that now defines the ceiling — see this
 /// function's doc note above `MUL_RUNTIME_GATES`) reads even higher:
 /// **+26.33%/+27.65%/+28.11%**. Both readings are unanimous in direction and
 /// tight (≤1.8 points of spread across pairs), so this is not measurement
-/// noise. Per I6, C++ now stays gated (`SEM_MUL_CPP`, off by default,
+/// noise. Under the corrected metric, C++ now stays gated (`SEM_MUL_CPP`, off by default,
 /// [`MUL_RUNTIME_GATES`] row with `pre_switch_salt = "ts-0.23"`) — C#'s/
-/// Java's/Rust's shape, not its own original one. See
-/// RESOLUTION-PROFILE.md's dated M1 addendum for the full battery.
+/// Java's/Rust's shape, not its own original one.
 ///
 /// **C# (`csharp`): off by default**, opt-in via `SEM_MUL_CSHARP=1`. The gate's
-/// *correctness* is not in question — I1-I6 all hold, zero CLEAN violations,
+/// *correctness* is not in question — every correctness invariant holds, zero CLEAN violations,
 /// entity/edge/edge-hash counts bit-identical. Its *memory* is:
 /// dotnet-runtime measured **+21.2% and +32.9% against the same +15% ceiling,
-/// reproducibly, on both pairs**. RESOLUTION-PROFILE.md's "MUL P1" verdict
+/// reproducibly, on both pairs**. The "MUL P1" verdict
 /// ("this is a STOP, not a ship") and its memory-lever follow-up ("**Unchanged
-/// from this section's own predecessor: dotnet stays GATED** … full dotnet
+/// from the prior verdict: dotnet stays GATED** … full dotnet
 /// rollout remains gated on a memory fix") are the record, and neither of
-/// MUL-DESIGN.md §5.3's two named levers survived `/usr/bin/time -l`
+/// the two named levers survived `/usr/bin/time -l`
 /// measurement. Off-by-default is what that verdict means *in code*; the switch
-/// exists so the next bead can re-measure without a rebuild.
+/// exists so the next change can re-measure without a rebuild.
 ///
 /// Opt-in rather than opt-out for the same reason `fast_extractor`'s switch is:
 /// enabling this is a **memory** decision about a specific corpus, and merely
@@ -2110,57 +2110,55 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// the `graph.rs` call site, which is now just its consumer.
 ///
 /// **Rust (`rust`): off by default, gated on `SEM_MUL_RUST`** — demoted
-/// (semx-j1fw, 2026-08-22) from MUL phase 2 W2's original unconditional
-/// verdict. Correctness (I1-I6) is not in question — CLEAN is 100% on every
-/// census corpus regardless of language (MUL-A §2.1), and TREELESS accepts
+/// (2026-08-22) from MUL phase 2's original unconditional
+/// verdict. Correctness is not in question — CLEAN is 100% on every
+/// census corpus regardless of language (MUL-A), and TREELESS accepts
 /// Rust's import-bearing files because [`mul_precompute_consumes_imports`]
 /// routes them through Field 10's descriptor path (`import_stmts`) instead
 /// of requiring the tree — verified bit-identical (`edge_dump_probe`
 /// sha256) on rust-lang/rust and on this crate's own tree, both before and
-/// after this demotion. It is **memory** that moved: W2 shipped
+/// after this demotion. It is **memory** that moved: shipped
 /// unconditionally on a same-binary reading of **+11.16%/+11.28%** against
-/// the +15% peak-RSS ceiling (MUL-DESIGN.md §4.2 I6 / §5.3). The W6 finale's
+/// the +15% peak-RSS ceiling. A follow-up
 /// pinned-baseline-vs-HEAD comparison, eight commits later, re-measured
 /// **+18.2%/+21.2%** — above the ceiling — which by itself could have been a
-/// binaries-eight-commits-apart artifact. semx-j1fw isolated the admission
-/// variable exactly (same binary at campaign HEAD, one predicate flipped,
+/// binaries-eight-commits-apart artifact. A further re-verification isolated the admission
+/// variable exactly (same binary at the same commit, one predicate flipped,
 /// shared source tree otherwise) and got **+17.72%/+19.64%/+19.35%** across
 /// three order-swapped pairs on rust-lang/rust — unanimous direction, all
-/// above +15%, confirming the finale's reading was not the artifact; W2's
-/// own +11% reading was the outlier, most plausibly because W2's original
+/// above +15%, confirming the earlier reading was not the artifact; the
+/// original +11% reading was the outlier, most plausibly because the original
 /// protocol (`sem find <nonexistent>`, bare "fresh `SEM_CACHE_DIR`") did not
-/// isolate `SEM_FACTS_CORPUS_DIR` the way RESOLUTION-PROFILE.md's own later
+/// isolate `SEM_FACTS_CORPUS_DIR` the way a later
 /// finding says it needed to, so the ON side plausibly benefited from
-/// partial corpus warmth that suppressed its measured peak RSS. Per I6,
+/// partial corpus warmth that suppressed its measured peak RSS. Under the corrected metric,
 /// Rust now stays gated (`SEM_MUL_RUST`, off by default,
 /// [`MUL_RUNTIME_GATES`] row with `pre_switch_salt = "ts-0.23"`) — C#'s/
-/// Java's shape, not its own original one. See RESOLUTION-PROFILE.md's
-/// phase-2 W2 section for the original measurement and semx-j1fw's bead
-/// comments for the re-verification.
+/// Java's shape, not its own original one.
 ///
-/// **Java (`java`): off by default, gated on `SEM_MUL_JAVA`** — MUL phase 2
-/// (semx-mul, W3+W4). Correctness is clean: `edge_dump_probe` sha256
+/// **Java (`java`): off by default, gated on `SEM_MUL_JAVA`** — MUL phase 2.
+/// Correctness is clean: `edge_dump_probe` sha256
 /// bit-identical ON vs OFF on elasticsearch (1,257,229 edges both sides),
 /// `incr_probe` 8/8 `ORACLE ok`, `facts_probe` 4/4 `ORACLE ok`,
 /// `facts_corpus_probe` cross-repo 861/861 hits + adversarial salt-clean-miss
 /// proof. Java's `import_declaration` nodes were already descriptor-dispatched
-/// before this bead — they classify as `GoImport` (`classify_import_stmt`'s
+/// before this change — they classify as `GoImport` (`classify_import_stmt`'s
 /// doc comment: the kind is shared with Go/Swift's grammars) and resolve
 /// through `register_go_package_imports`, which only ever matches
 /// `.go`-suffixed entities (`build_go_pkg_index`) — a documented, pre-existing
-/// no-op for Java (finding F4, MUL-DESIGN.md §7), preserved verbatim by this
-/// admission. It is the **memory** fence that fails: `/usr/bin/time -l` on
+/// no-op for Java, preserved verbatim by this
+/// admission. It is **memory** that fails: `/usr/bin/time -l` on
 /// elasticsearch measured **+20.97% and +21.01% against the +15% ceiling,
 /// reproducibly, on both order-swapped pairs** — C#'s shape, not Rust's/C++'s.
 /// Consistent with dotnet's own overshoot: Java's pre-Field-10 FASTPATH byte
-/// share was the smallest of any admitted language (0.98%, MUL-A §2.3), so
+/// share was the smallest of any admitted language (0.98%, MUL-A), so
 /// admission moves nearly all of its bytes onto the fast path at once.
 ///
-/// **Go (`go`): admitted unconditionally (semx-bpn2, go-fence wave,
-/// 2026-08-22)** — the correctness blocker chain and the memory fence both
-/// closed this wave; W2's precedent applies (`"go" => true`, no
+/// **Go (`go`): admitted unconditionally (the Go memory-check work,
+/// 2026-08-22)** — the correctness blocker chain and the memory check both
+/// closed cleanly, so the same no-switch precedent applies (`"go" => true`, no
 /// `SEM_MUL_GO` switch, no [`MUL_RUNTIME_GATES`] row).
-/// W3+W4 found two compounding issues behind kubernetes's non-bit-identical
+/// Root-cause analysis found two compounding issues behind kubernetes's non-bit-identical
 /// `edge_dump_probe`: (1) `build_go_pkg_index`/`register_go_package_imports`
 /// keyed packages by their bare last-path-segment string ("v1", "util", ...)
 /// with no disambiguation by full import path, so common short package names
@@ -2172,7 +2170,7 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// increases how often that type-directed resolution fails for Go
 /// specifically, pushing more calls into the (formerly polluted) fallback.
 ///
-/// semx-u3rk fixed (1): `GoImport::packages` now carries each import spec's
+/// The fix for (1): `GoImport::packages` now carries each import spec's
 /// *full* path (not reduced to a bare segment), and
 /// `register_go_package_imports` disambiguates a same-named bucket by
 /// matching the import path's trailing segments against each candidate's
@@ -2191,8 +2189,8 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// symbols) into every importing file's `import_table`; the fix inserts one
 /// package's worth.
 ///
-/// (2)'s mechanism was semx-u3rk's own honest residual — "root cause not
-/// isolated this bead." semx-dm5t (2026-08-22) found and fixed it:
+/// (2)'s mechanism was left as an honest residual — "root cause not
+/// isolated in this change." A follow-up investigation (2026-08-22) found and fixed it:
 /// `registry::resolve_go_method_parent_ids` — the one cross-file entity
 /// rewrite this crate performs, run once `all_entities` is fully assembled
 /// — rewrites a Go method's `id`/`parent_id` when its receiver type lives in
@@ -2202,14 +2200,14 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// `return_type_map` by the pre-rewrite id. Pass 2 looks entities up by the
 /// post-rewrite id — a clean miss, silently defaulting `scope_idx` to 0
 /// (module scope) via `.unwrap_or(0)`, which is exactly the scope-blind
-/// state the W0 honest-miss backstop above (`scope_lookup_missed`) was
+/// state the honest-miss backstop above (`scope_lookup_missed`) was
 /// built to make safe rather than wrong-but-plausible: from scope 0,
 /// `resolve_ref`'s type-directed branch (the one `in.DeepCopyInto(out)`
 /// case above needs) fails to find the real local binding and the call
 /// falls through to the package-qualified fallback instead — precisely the
-/// `ClusterConfiguration::DeepCopy`-shaped divergence W3+W4/semx-u3rk
+/// `ClusterConfiguration::DeepCopy`-shaped divergence already
 /// documented, just a different mechanism than the bare-segment collision
-/// they'd already fixed.
+/// already fixed.
 ///
 /// The fix has two parts, both scoped to `.go` files by construction
 /// (`is_go_file` guards every mutation either makes): (a)
@@ -2226,18 +2224,18 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// contract — a child's id is `format!("{parent_id}::{name}")`), since a
 /// rewritten method's *own* local variables/constants/nested types were
 /// left with a dangling `parent_id` otherwise (only the method's own
-/// id/parent_id were being rewritten before this bead).
+/// id/parent_id were being rewritten before this change).
 ///
-/// `edge_dump_probe` ON vs OFF on kubernetes, at semx-dm5t's own HEAD:
+/// `edge_dump_probe` ON vs OFF on kubernetes, at the current HEAD:
 /// **bit-identical, 0-line diff** (was 334,664 vs 331,190, ~30,795 lines) —
 /// `sha256` matches, both sides 330,558 edges, for the id-staleness
-/// signature that bead targeted. semx-dm5t's own honest residual: a
+/// signature the fix targeted. Another honest residual remained: a
 /// *separate* fallback residual (14.01%, `ENTITY_SCOPE_LOOKUP`'s
-/// `fallback_pct`) remained — the same species semx-9g8q was independently
-/// chasing for TS/JS (nested entities inside a plain function never
+/// `fallback_pct`) — the same species was independently
+/// being chased for TS/JS (nested entities inside a plain function never
 /// entering any scope's `.defs`, via `scope_visit_node`'s function-like
 /// branch never running the class-like/`mod_item` branches' registration
-/// loop). semx-9g8q (2026-08-22) closed it for both languages at once —
+/// loop). A follow-up fix (2026-08-22) closed it for both languages at once —
 /// the earlier attempt's regression was a pre-existing precedence bug in
 /// `resolve_ref` (the `.bindings` shadow gate short-circuited before
 /// `.defs` ever ran), not the registration loop itself; fixing the
@@ -2245,15 +2243,15 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// `fallback_pct` to 0.00% with a four-corpus convergent correctness
 /// signature (Go, TS/JS, Python, Rust) and no lost correct edge anywhere.
 ///
-/// **The go-fence wave (semx-bpn2) found a third species — this one
+/// **The Go memory-check work found a third species — this one
 /// inverted.** The correctness-chain-closed claim above was cross-checked
-/// against `edge_dump_probe` ON vs OFF at semx-9g8q's own HEAD before
+/// against `edge_dump_probe` ON vs OFF at the current HEAD before
 /// trusting it for admission, and it failed: 331,120 (ON) vs 331,117 (OFF),
 /// 3 edges present only under `SEM_MUL_GO=1`. Root cause, confirmed with a
 /// throwaway entity-id dump (not shipped) and a scoped, reverted debug
 /// print: all 3 targets are **dangling** — ids no entity in the graph
 /// holds — not edges OFF was missing. `PrecomputedFileFacts::rekey_entity_
-/// ids` (semx-dm5t) rekeys `entity_scope_map`/`entity_inner_scope`/
+/// ids` rekeys `entity_scope_map`/`entity_inner_scope`/
 /// `return_type_map`'s keys, but never revisited [`Scope::defs`]' *values*
 /// or [`Scope::owner_id`] — the two other places a `Scope` caches an entity
 /// id, both populated by `scope_visit_node`'s registration loops during
@@ -2281,13 +2279,13 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// three non-Go corpora (`rekey_entity_ids` is a guaranteed no-op whenever
 /// `rekey` is empty, which it always is absent a Go cross-file rewrite).
 ///
-/// **The memory fence.** Go's correctness blocker chain is now fully
+/// **The memory check.** Go's correctness blocker chain is now fully
 /// closed — `SEM_MUL_GO=1` vs unset produce byte-identical graphs on every
-/// corpus this campaign has touched — so the remaining question was purely
-/// I6's ceiling. `/usr/bin/time -l sem graph --no-cache --json`, same
+/// corpus this project has touched — so the remaining question was purely
+/// the ceiling. `/usr/bin/time -l sem graph --no-cache --json`, same
 /// binary, fresh `SEM_CACHE_DIR` + isolated `SEM_FACTS_CORPUS_DIR` per run,
 /// 3 order-swapped pairs on kubernetes, both `/usr/bin/time -l` fields
-/// captured per M1's protocol:
+/// captured using the same two-field protocol used above:
 ///
 /// | pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
 /// |---|---|---:|---:|---:|---:|---:|---:|
@@ -2299,46 +2297,45 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// **+6.78% to +8.46%**, tight (<1.7 points of spread), comfortably under
 /// the +15% ceiling on every pair — Go clears both fields, unlike C++/
 /// Python/Rust/Java, all of which busted the ceiling on at least one field.
-/// Per I6, Go is **admitted unconditionally**: `mul_precompute_admits`
+/// Under the corrected metric, Go is **admitted unconditionally**: `mul_precompute_admits`
 /// gained a plain `"go" => true` arm, `go_precompute_enabled`/`SEM_MUL_GO`
-/// removed (no switched-off state left to preserve — W2's own close-out
-/// precedent, not left as unused scaffolding), [`MUL_RUNTIME_GATES`]'s
+/// removed (no switched-off state left to preserve — the same close-out
+/// precedent as above, not left as unused scaffolding), [`MUL_RUNTIME_GATES`]'s
 /// "go" row deleted. `LANGUAGE_SALTS`'s go entry bumped again
 /// (`rekey_entity_ids`'s new `.defs`/`owner_id` rewriting is a
-/// content-only producer change, I5/F2's bump discipline) so a stale
+/// content-only producer change, the usual salt-bump discipline) so a stale
 /// pre-fix corpus entry from an earlier local `SEM_MUL_GO=1` session can
 /// never silently answer a post-fix lookup now that the path is always on.
 ///
 /// **Python (`python`): off by default, gated on `SEM_MUL_PYTHON`** —
-/// demoted (M1, 2026-08-22) from MUL phase 2 W5's original unconditional
+/// demoted (2026-08-22) from MUL phase 2's original unconditional
 /// verdict. Correctness is untouched by this demotion — `edge_dump_probe`
 /// sha256 bit-identical ON vs OFF on home-assistant/core (310,398 edges both
 /// sides), `incr_probe` 8/8 `ORACLE ok`, `facts_probe` 4/4 `ORACLE ok`,
-/// `facts_corpus_probe` 109/109 hits on a real two-copy corpus, all as W5
-/// and F1 already established; none of that changes here. It is **memory**,
-/// again, and specifically the metric: W5 measured **-7.95%/-7.80%** peak
-/// maxRSS on home-assistant/core, a reading F1 re-derived with a corrected
-/// (`--no-cache`, fresh-`SEM_CACHE_DIR`) protocol and got a weaker but still
+/// `facts_corpus_probe` 109/109 hits on a real two-copy corpus, all as
+/// the earlier Python measurement round already established; none of that changes here. It is **memory**,
+/// again, and specifically the metric: measured **-7.95%/-7.80%** peak
+/// maxRSS on home-assistant/core; a follow-up re-derivation using a corrected
+/// (`--no-cache`, fresh-`SEM_CACHE_DIR`) protocol got a weaker but still
 /// negative **-1.63% median** (four of five pairs negative) — both readings
-/// comfortably under the old +15% maxRSS ceiling, the basis for W5's and
-/// F1's unconditional verdicts. M1 re-ran F1's exact protocol capturing
-/// *both* `/usr/bin/time -l` fields: maxRSS reproduced F1's finding almost
+/// comfortably under the old +15% maxRSS ceiling, the basis for the
+/// original unconditional verdict. The 2026-08-22 re-verification re-ran that exact protocol capturing
+/// *both* `/usr/bin/time -l` fields: maxRSS reproduced the earlier finding almost
 /// exactly (**-1.04%/-3.99%/-1.71%**, three order-swapped pairs, still
 /// negative), but peak memory footprint reads **+26.02%/+25.29%/+27.44%** —
 /// unanimous, tight (≤2.2 points of spread), and well above the ceiling
-/// under I6's corrected metric. The mechanism is exactly what this
+/// under the corrected metric. The mechanism is exactly what this
 /// function's doc note above names: Python's admission populates many
 /// short, repetitive identifier strings (the fast path's `import_stmts`/
 /// `ctor_call_sites` records) that the VM compressor eats once they go idle
 /// mid-build, so they drop out of maxRSS's resident-page count while still
 /// counting against footprint's task-level commitment — the same reason
-/// admission looks like a maxRSS *win* while being a footprint *loss*. Per
-/// I6, Python now stays gated (`SEM_MUL_PYTHON`, off by default,
+/// admission looks like a maxRSS *win* while being a footprint *loss*. Under
+/// the corrected metric, Python now stays gated (`SEM_MUL_PYTHON`, off by default,
 /// [`MUL_RUNTIME_GATES`] row with `pre_switch_salt = "ts-0.23"`) — C#'s/
-/// Java's/Rust's/C++'s shape, not its own original one. See
-/// RESOLUTION-PROFILE.md's dated M1 addendum for the full battery.
+/// Java's/Rust's/C++'s shape, not its own original one.
 ///
-/// The switches that remain ([`MUL_RUNTIME_GATES`]) exist so a future bead
+/// The switches that remain ([`MUL_RUNTIME_GATES`]) exist so a future change
 /// can re-measure/re-diagnose without a rebuild — every gated language's
 /// only blocker is memory under the corrected (footprint) metric (a future
 /// memory lever could promote any of them). Go's chain (correctness, then
@@ -2348,12 +2345,12 @@ pub fn mul_precompute_admits(lang_id: &str) -> bool {
         "cpp" => cpp_precompute_enabled(),
         "csharp" => csharp_precompute_enabled(),
         "rust" => rust_precompute_enabled(),
-        // Admitted unconditionally (semx-bpn2, go-fence wave): correctness
-        // blocker chain closed (semx-u3rk/semx-dm5t/semx-9g8q/semx-bpn2, see
-        // this function's own doc comment), memory fence cleared (+6.78% to
+        // Admitted unconditionally (the Go memory-check work): correctness
+        // blocker chain closed (see
+        // this function's own doc comment), memory check cleared (+6.78% to
         // +8.46% peak footprint, three order-swapped pairs on kubernetes,
         // comfortably under the +15% ceiling). No `SEM_MUL_GO` switch, no
-        // `MUL_RUNTIME_GATES` row — W2's own close-out precedent.
+        // `MUL_RUNTIME_GATES` row — the same close-out precedent as above.
         "go" => true,
         "java" => java_precompute_enabled(),
         "python" => python_precompute_enabled(),
@@ -2373,8 +2370,8 @@ fn csharp_precompute_enabled() -> bool {
     })
 }
 
-/// MUL phase 2 follow-up (semx-j1fw): switch for Rust, same shape as
-/// [`csharp_precompute_enabled`] — W2 (`adde06a`) shipped Rust unconditionally
+/// MUL phase 2 follow-up: switch for Rust, same shape as
+/// [`csharp_precompute_enabled`] — (`adde06a`) shipped Rust unconditionally
 /// on a same-binary reading of +11.16%/+11.28% against the +15% peak-RSS
 /// ceiling; a same-binary re-verification at campaign HEAD (`602dc6e`, three
 /// order-swapped pairs) found +17.72%/+19.64%/+19.35% instead — consistently
@@ -2390,7 +2387,7 @@ fn rust_precompute_enabled() -> bool {
     })
 }
 
-/// MUL phase 2 (semx-mul, W3+W4): switch for Java, same shape as
+/// MUL: switch for Java, same shape as
 /// [`csharp_precompute_enabled`] — measured and left OFF: it busted its own
 /// +15% peak-RSS ceiling on elasticsearch. See [`mul_precompute_admits`]'s
 /// doc comment.
@@ -2404,12 +2401,12 @@ fn java_precompute_enabled() -> bool {
     })
 }
 
-/// M1 follow-up (2026-08-22): switch for C++, same shape as
-/// [`csharp_precompute_enabled`] — semx-mp1 shipped C++ unconditionally on a
+/// 2026-08-22 follow-up: switch for C++, same shape as
+/// [`csharp_precompute_enabled`] — shipped C++ unconditionally on a
 /// same-binary reading of +5.8%/+6.5% peak-RSS against the +15% ceiling,
-/// measured without `--no-cache`/a fresh `SEM_CACHE_DIR` per run; M1's
+/// measured without `--no-cache`/a fresh `SEM_CACHE_DIR` per run; the
 /// corrected-protocol re-verification found peak-RSS itself re-measures at
-/// +19.98%/+20.50%/+21.02%, and peak memory footprint (I6's now-corrected
+/// +19.98%/+20.50%/+21.02%, and peak memory footprint (the now-corrected
 /// metric) at +26.33%/+27.65%/+28.11% — both above the ceiling, three
 /// order-swapped pairs, unanimous direction. Demoted to gated. See
 /// [`mul_precompute_admits`]'s doc comment.
@@ -2423,13 +2420,13 @@ fn cpp_precompute_enabled() -> bool {
     })
 }
 
-/// M1 follow-up (2026-08-22): switch for Python, same shape as
-/// [`csharp_precompute_enabled`] — W5/F1 shipped/reconfirmed Python
+/// 2026-08-22 follow-up: switch for Python, same shape as
+/// [`csharp_precompute_enabled`] — shipped/reconfirmed Python
 /// unconditionally on maxRSS readings of -7.95%/-7.80% then -1.63% median,
-/// both comfortably under the +15% ceiling. M1's same protocol, capturing
+/// both comfortably under the +15% ceiling. The same protocol, capturing
 /// peak memory footprint alongside maxRSS, found maxRSS still negative
 /// (-1.04%/-3.99%/-1.71%) but footprint reads +26.02%/+25.29%/+27.44% —
-/// above the ceiling under I6's corrected metric, three order-swapped
+/// above the ceiling under the corrected metric, three order-swapped
 /// pairs, unanimous direction. Demoted to gated. See
 /// [`mul_precompute_admits`]'s doc comment.
 fn python_precompute_enabled() -> bool {
@@ -2442,7 +2439,7 @@ fn python_precompute_enabled() -> bool {
     })
 }
 
-/// MUL Phase 2 (semx-mul, W2; MUL-DESIGN.md §4.3 Field 10): whether pass 2
+/// MUL Phase 2 (MUL;): whether pass 2
 /// has a real consumer for [`PrecomputedFileFacts::import_stmts`] for
 /// `lang_id` — i.e. whether [`precompute_scope_resolvable_file_facts`]'s
 /// TREELESS gate may accept a file whose fused walk saw import statements,
@@ -2452,13 +2449,13 @@ fn python_precompute_enabled() -> bool {
 /// whether this producer runs for `lang_id` **at all**: a language can be
 /// admitted to the producer while still failing TREELESS on imports, if its
 /// import handlers hadn't been ported to the descriptor path yet (true of
-/// every language before W1 landed Field 10). `cpp`/`csharp` are import-free
-/// by construction (§2.3's census), so this predicate is never exercised for
+/// every language before landed Field 10). `cpp`/`csharp` are import-free
+/// by construction (census), so this predicate is never exercised for
 /// them; `rust`, `go`, `java`, `python` are the four languages where it
 /// actually widens TREELESS — all four ride the same six descriptor-ized
-/// handlers W1 built (`ImportStmtFacts`'s variants), so admitting a new one
+/// handlers built (`ImportStmtFacts`'s variants), so admitting a new one
 /// here is a table row, not a new mechanism. Python needs both this *and*
-/// [`mul_precompute_consumes_calls`] — MUL-A §2.3's census found imports the
+/// [`mul_precompute_consumes_calls`] — MUL-A census found imports the
 /// *larger* half of Python's tree-need on HA (16,559 of ~16,600
 /// tree-needing files), `"call"` nodes the rest — before either widened
 /// TREELESS, admitting Python here alone would still fail almost every real
@@ -2467,7 +2464,7 @@ fn mul_precompute_consumes_imports(lang_id: &str) -> bool {
     matches!(lang_id, "rust" | "go" | "java" | "python")
 }
 
-/// MUL Phase 2 (semx-mul, W5; MUL-DESIGN.md §4.3 Field 11): the call-node
+/// MUL Phase 2 (MUL;): the call-node
 /// sibling of [`mul_precompute_consumes_imports`] — whether pass 2 has a
 /// real consumer for [`PrecomputedFileFacts::ctor_call_sites`] for `lang_id`,
 /// i.e. whether the TREELESS gate may accept a file whose fused walk saw a
@@ -2502,7 +2499,7 @@ fn mul_precompute_consumes_calls(lang_id: &str) -> bool {
 /// salt an *off* build wrote under — so a warm corpus entry from before the
 /// switch existed (or from a switched-off build, `precomputed: None`) can
 /// never permanently deny the switched-on producer's richer facts a slot
-/// (first-writer-wins corpus dedup, MUL-DESIGN.md I5/F2, semx-ys0).
+/// (first-writer-wins corpus dedup).
 ///
 /// [`MUL_RUNTIME_GATES`] is the single place that pairing is recorded now.
 /// Before it existed, `facts_store::producer_language_salt` hardcoded one
@@ -2510,8 +2507,8 @@ fn mul_precompute_consumes_calls(lang_id: &str) -> bool {
 /// (an independent client simulation) hardcoded a *second*, unconnected copy
 /// of the same branch and the same `"ts-0.23"` literal — two places a future
 /// switch could be added to [`mul_precompute_admits`] without being added
-/// to, silently reproducing I5/F2 for whichever language got missed. MUL
-/// phase 2/3 (MUL-DESIGN.md §6.2) name Rust/Go/Java/Python as the next
+/// to, silently reproducing the same hazard for whichever language got missed. MUL
+/// phase 2/3 name Rust/Go/Java/Python as the next
 /// languages `mul_precompute_admits` is expected to grow gates for, which is
 /// exactly the scenario this table exists to make structural: wiring a new
 /// runtime-gated language means adding one match arm to
@@ -2535,37 +2532,37 @@ pub const MUL_RUNTIME_GATES: &[MulRuntimeGate] = &[
         lang_id: "csharp",
         pre_switch_salt: "ts-0.23",
     },
-    // MUL phase 2 (semx-mul, W3+W4): measured and stays gated — memory
+    // MUL: measured and stays gated — memory
     // (+20.97%/+21.01% vs +15%). See `mul_precompute_admits`'s doc comment.
     // A language promoted to unconditional has this row deleted, not left
-    // stale (W2's own close-out precedent, applied to Go by semx-bpn2
-    // below) — and the reverse holds too: a language demoted back to gated
-    // (rust, below) gets a row added back, per semx-j1fw.
+    // stale (the same close-out precedent applied to Go below) — and the
+    // reverse holds too: a language demoted back to gated
+    // (rust, below) gets a row added back too.
     MulRuntimeGate {
         lang_id: "java",
         pre_switch_salt: "ts-0.23",
     },
-    // MUL phase 2 follow-up (semx-j1fw): rust was unconditional at W2
+    // MUL phase 2 follow-up: rust was unconditional at
     // (`adde06a`) but a same-binary re-verification at campaign HEAD found
     // its peak-RSS delta re-measures at +17.7-19.6%, above the +15% ceiling
-    // W2's own +11% reading had passed. `pre_switch_salt` is `"ts-0.23"` —
-    // the pre-W2 salt, i.e. what a build from before Rust's admission ever
+    // own +11% reading had passed. `pre_switch_salt` is `"ts-0.23"` —
+    // the prior salt, i.e. what a build from before Rust's admission ever
     // existed wrote under — so a switched-off build today shares corpus
-    // entries with that pre-W2 world (a true revert), and the table's
-    // current `"ts-0.23-mp2"` (unchanged from W2) becomes the switched-*on*
+    // entries with that prior world (a true revert), and the table's
+    // current `"ts-0.23-mp2"` (unchanged from) becomes the switched-*on*
     // salt, isolating richer entries the same way `resolve_gated_salt`
     // already handles for java.
     MulRuntimeGate {
         lang_id: "rust",
         pre_switch_salt: "ts-0.23",
     },
-    // M1 (2026-08-22): I6's ceiling was redefined against peak memory
+    // 2026-08-22: the ceiling was redefined against peak memory
     // footprint (see `mul_precompute_admits`'s doc note above its C++
     // entry) — cpp and python were the two remaining unconditional
     // admissions, and both re-measure over the new ceiling on the
     // corrected metric even though their maxRSS readings (the metric their
     // original verdicts used) still look fine or favorable. `pre_switch_
-    // salt` is `"ts-0.23"` for both — the pre-MP1/pre-W5 salt, i.e. what a
+    // salt` is `"ts-0.23"` for both — the original, prior salt, i.e. what a
     // build from before either admission ever existed wrote under — so a
     // switched-off build today shares corpus entries with that pre-
     // admission world (a true revert), and each table's current salt
@@ -2583,26 +2580,26 @@ pub const MUL_RUNTIME_GATES: &[MulRuntimeGate] = &[
     },
 ];
 
-/// MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md §4.1 step 1). Build a
+/// MUL Phase 1 (epic;). Build a
 /// [`PrecomputedFileFacts`] for one file of **any** scope-resolvable
 /// language, not just JS/TS — the generic sibling of
 /// [`precompute_js_ts_file_facts`], used for every other language now that
-/// §1's use-site enumeration shows the file-local/corpus-wide substitution
+/// use-site enumeration shows the file-local/corpus-wide substitution
 /// the JS/TS precompute already relies on is not JS/TS-specific (it follows
 /// from `build_entity_id`'s per-file id-rooting, unconditionally — see the
-/// design doc's Theorem in §1.1).
+/// design doc's Theorem).
 ///
 /// Unlike the JS/TS precompute (which is unconditional because
 /// `skip_js_ts_imports` is always `true` downstream), this function's
-/// semantic license depends on the **structural** predicate `TREELESS(F)`
-/// (§1.2): whether pass 2 would need this file's tree for anything at all.
+/// semantic license depends on the **structural** predicate `TREELESS(F)`:
+/// whether pass 2 would need this file's tree for anything at all.
 /// That is decided *from what the fused walk saw* — `import_starts` empty
-/// and no literal `"call"`-kind node — rather than a per-language table
-/// (I3), so it returns `None` (falling back to the ordinary re-parse path,
-/// I6) whenever the walk saw either. `.swift` is excluded unconditionally:
+/// and no literal `"call"`-kind node — rather than a per-language table,
+/// so it returns `None` (falling back to the ordinary re-parse path)
+/// whenever the walk saw either. `.swift` is excluded unconditionally:
 /// `build_swift_call_signatures` reads corpus-wide `entity_ranges`/
 /// `entity_map`, so it is not a per-file function in any sense this gate can
-/// license (§4.3).
+/// license.
 ///
 /// `entities` must be exactly this file's own entities (in extraction
 /// order), as with `precompute_js_ts_file_facts`. The **semantic** half of
@@ -2618,7 +2615,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     tree: &tree_sitter::Tree,
     entities: &[SemanticEntity],
 ) -> Option<PrecomputedFileFacts> {
-    // Swift is out of scope in every MUL phase (MUL-DESIGN.md §4.3): its one
+    // Swift is out of scope in every MUL phase: its one
     // tree consumer walks every tree against corpus-wide entity_ranges, not
     // a per-file function. JS/TS files never reach this function (they take
     // `precompute_js_ts_file_facts`, gated only on `is_js_ts_file`), but the
@@ -2672,10 +2669,10 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
     let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
 
-    // I2 (seed order): entity_ranges order — `(start_line, end_line, id)`
+    // The seed order: entity_ranges order — `(start_line, end_line, id)`
     // ascending — matching the AST path
     // (`resolve_with_scopes_full_inner`'s seed loop) and
-    // `precompute_js_ts_file_facts` post-semx-u16. Not extraction order.
+    // `precompute_js_ts_file_facts` afterward. Not extraction order.
     let mut top_level_by_range: Vec<&SemanticEntity> = file_entities
         .iter()
         .filter(|entity| entity.parent_id.is_none())
@@ -2691,12 +2688,12 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         entity_scope_map.insert(entity.id.clone(), 0);
     }
 
-    // BS3's fused triple walk (semx-3ao): scopes/entity_scope_map/
+    // The fused triple walk: scopes/entity_scope_map/
     // entity_inner_scope (mutated in place) and ast_refs are the first four
     // `PrecomputedFileFacts` fields (the doc's "one program point"); the
     // returned `import_starts`/`saw_call_node` are exactly what decides
     // TREELESS below — structurally, from what this walk saw, not from a
-    // language table (I3).
+    // language table.
     let (ast_refs, import_starts, saw_call_node) = fused_scope_refs_import_walk(
         tree.root_node(),
         0,
@@ -2710,15 +2707,15 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         config,
     );
 
-    // TREELESS(F) (§1.2): no node kind `classify_import_stmt` handles (unless
+    // TREELESS(F): no node kind `classify_import_stmt` handles (unless
     // `lang_id` has a pass-2 consumer for the recorded descriptors — Field
     // 10, MUL phase 2, `mul_precompute_consumes_imports` below), and no
     // literal `"call"` node (unless `lang_id` has a pass-2 consumer for
-    // *those* descriptors too — Field 11, MUL phase 2 W5,
+    // *those* descriptors too — Field 11, MUL phase 2,
     // `mul_precompute_consumes_calls` below). Failing either means pass 2
     // would still need this file's tree for something pass 1 cannot yet
     // hand it a descriptor for, so no facts are emitted — this file falls
-    // back to the re-parse path exactly as it does today (I6). This is what
+    // back to the re-parse path exactly as it does today. This is what
     // keeps JS/TS's own precompute (unconditional, relying on
     // `skip_js_ts_imports`) from needing to route through this function at
     // all: a JS/TS file with real imports would fail this gate, which is
@@ -2730,7 +2727,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         return None;
     }
 
-    // Field 10 (MUL-DESIGN.md §4.3, semx-mul phase 2): record via the real
+    // Field 10 (MUL phase 2): record via the real
     // producer, not a hardcoded empty literal, so this line needs no change
     // when a future phase widens the TREELESS gate above to admit files
     // with real imports. `import_starts` is provably empty on every path
@@ -2745,7 +2742,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     let import_stmts =
         record_import_stmts_pruned(tree.root_node(), &import_starts, source, config, false);
 
-    // Field 11 (MUL-DESIGN.md §4.3, semx-mul phase 2 W5): same discipline —
+    // Field 11 (MUL phase 2): same discipline —
     // `saw_call_node` is provably `false` here unless `mul_precompute_
     // consumes_calls` just admitted it (the gate above), so this is either a
     // one-node no-op (nothing to record) or the real Python scan.
@@ -2789,7 +2786,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         import_stmts,
         ctor_call_sites,
     };
-    // semx-bpn2 Stage 2: reclaim this file's push/insert-loop Vec/HashMap
+    // Stage 2: reclaim this file's push/insert-loop Vec/HashMap
     // slack before it joins the corpus-wide map it lives in for the rest of
     // the build. See `shrink_to_fit`'s own doc comment.
     facts.shrink_to_fit();
@@ -2895,7 +2892,7 @@ fn resolve_with_scopes_full_inner(
 
     // File-path / parent_id indexed entity lookups. Both are a pure function
     // of `all_entities` alone (same result no matter which chunk is being
-    // resolved), so when the caller already built one (semx-6rd CUT 2 —
+    // resolved), so when the caller already built one (CUT 2 —
     // `resolve_scopes_in_file_chunks` builds it once before its chunk loop),
     // reuse it instead of rescanning the whole corpus again on every chunk.
     let __chunk_entity_index_t0 = Instant::now();
@@ -2949,13 +2946,13 @@ fn resolve_with_scopes_full_inner(
             if pre_set.contains(file_path) {
                 return None;
             }
-            // semx-6rd CUT 1: this file's facts were already collected in
+            // CUT 1: this file's facts were already collected in
             // pass 1 while its tree was in hand — nothing here needs a fresh
             // parse. See `PrecomputedFileFacts`.
             if precomputed_facts.is_some_and(|m| m.contains_key(file_path)) {
                 return None;
             }
-            // semx-au8 (W2): a file whose language has no `scope_resolve`
+            //: a file whose language has no `scope_resolve`
             // config is declined by *every* consumer of this vector — the
             // per-file scope closure below opens with exactly this predicate
             // (`get_language_config(ext).and_then(|c| c.scope_resolve)?`), the
@@ -2967,14 +2964,14 @@ fn resolve_with_scopes_full_inner(
             // guard and every surviving file's own facts are untouched. Measured
             // on llvm-project, 34,260 files / 267 MB of `.h`/`.c` re-parsed per
             // cold build for nothing (linux: 29,158 / 333 MB) — see
-            // RESOLUTION-PROFILE.md's "W2: parse ceiling".
+            // ": parse ceiling".
             //
             // The one consumer that does *not* repeat the predicate is
             // `infer_constructor_param_types`' `scan_constructor_calls` sweep,
             // which walks every tree in this vector. It is a provable no-op
             // unless `init_params` *and* `attr_to_param` are both non-empty
             // (its own early return), and both are built exclusively from files
-            // that pass the predicate above; the gate section of W2 records the
+            // that pass the predicate above; the gate section of records the
             // bit-identical entity/edge measurement on all five giants that
             // makes the elimination observationally sound, not just argued.
             // (`?` on the admission test itself: the grammar this file is
@@ -2983,7 +2980,7 @@ fn resolve_with_scopes_full_inner(
             let full_path = root.join(file_path);
             let content = std::fs::read_to_string(&full_path).ok()?;
             let config = reparse_language_config(file_path, &lookups.ext_overrides)?;
-            // semx-jo1: shared with pass 1's `CodeParserPlugin::extract_entities_with_tree`
+            // shared with pass 1's `CodeParserPlugin::extract_entities_with_tree`
             // (see `plugins/code/mod.rs`'s `is_pathological_large_file` doc
             // comment) -- one shared, deterministic, pure-per-file give-up
             // predicate instead of a wall-clock race, and instead of two
@@ -2991,13 +2988,12 @@ fn resolve_with_scopes_full_inner(
             // be tens of thousands of files on a >20k-file repo
             // (dotnet-runtime's was 34,897 in one profiled run); a hybrid
             // (predicate-then-wall-clock-fallback) was tried and measured to
-            // still reproduce semx-4w1's chunk-boundary edge-count flip
+            // still reproduce chunk-boundary edge-count flip
             // (981,283 at a 5,000-file chunk vs 981,284 at 1,000, stable
             // across repeats) -- proof some *other* file was still racing
             // `parse_tree_within_budget`'s clock and flipping outcome with
             // it. Removing the wall-clock path entirely (this version)
-            // measured bit-identical entities/edges at both chunk sizes --
-            // see `RESOLUTION-PROFILE.md`.
+            // measured bit-identical entities/edges at both chunk sizes.
             let parsed = if is_pathological_large_file(&content) {
                 None
             } else {
@@ -3040,7 +3036,7 @@ fn resolve_with_scopes_full_inner(
     }
     prof::add_reparse_ns(__reparse_t0.elapsed());
     let parsed_files: &[(String, String, tree_sitter::Tree)] = &owned_parsed_files;
-    // semx-4w1: the chunked (>PARSED_FILE_REUSE_LIMIT) path re-parses and
+    // the chunked (>PARSED_FILE_REUSE_LIMIT) path re-parses and
     // retains a live `(path, content, Tree)` triple per file for every
     // non-JS/TS file in this chunk (`chunked` only precomputes JS/TS facts —
     // see `PrecomputedFileFacts`'s doc comment). `content`'s bytes are
@@ -3049,7 +3045,7 @@ fn resolve_with_scopes_full_inner(
     // *process's actual RSS* right after the chunk's trees are all live but
     // before anything in this call has had a chance to drop them — the one
     // place in the whole build this instrumentation can observe that cost
-    // directly instead of estimating it. See RESOLUTION-PROFILE.md.
+    // directly instead of estimating it.
     if crate::parser::mem_profile::enabled() {
         let content_bytes: usize = parsed_files
             .iter()
@@ -3080,13 +3076,13 @@ fn resolve_with_scopes_full_inner(
     } else {
         build_ts_default_export_table(parsed_files, &symbol_table, entity_map)
     };
-    // semx-la2: on the chunked path, both import-handler indexes are the
+    // on the chunked path, both import-handler indexes are the
     // caller's — owned by `resolve_scopes_in_file_chunks`, shared across
     // every chunk — because `build_top_level_entity_index` is a pure
     // function of corpus-invariant inputs there (see
     // `ChunkedResolveInputs::top_level_entities`'s doc comment). Every other
     // caller keeps a per-call lock, exactly the old behavior (one call ==
-    // the whole corpus for them anyway). The py lock is semx-sbf's sibling
+    // the whole corpus for them anyway). The py lock is sibling
     // of the TS one: same struct, built lazily (only if a `.py` bare
     // `import module` statement is actually seen) restricted to `.py` files
     // — see `build_top_level_entity_index` and `register_namespace_import`.
@@ -3120,7 +3116,7 @@ fn resolve_with_scopes_full_inner(
         .filter_map(|(file_path, content, tree)| {
             let source = content.as_bytes();
             // Same admission test the re-parse loop applies before building a
-            // tree at all (semx-au8).
+            // tree at all.
             let config = scope_resolve_config_for_path(file_path)?;
 
             let file_entities = entities_by_file
@@ -3166,7 +3162,7 @@ fn resolve_with_scopes_full_inner(
     // `attr_to_param` — keyed by class *name*, not entity id, so two
     // same-named classes in different files can collide — see the same
     // last-write-wins overwrite order the original single `parsed_files`-order
-    // merge produced, regardless of which files took the semx-6rd CUT 1
+    // merge produced, regardless of which files took the CUT 1
     // precomputed-facts path vs. the fresh re-parse+scan path.
     // (`return_type_map` is keyed by entity id, which is always unique to one
     // file, so merge order can't affect it either way.)
@@ -3230,7 +3226,7 @@ fn resolve_with_scopes_full_inner(
         deterministic_return_types_by_name(&return_type_map, symbol_table, entity_map);
     prof::add_return_types_by_name_ns(__return_types_by_name_t0.elapsed());
 
-    // semx-nuv: on the chunked path, whether to build `swift_call_signatures`
+    // on the chunked path, whether to build `swift_call_signatures`
     // at all must be a corpus-wide question, not "does *this chunk's*
     // `parsed_files` contain a `.swift` file" — see `ChunkedResolveInputs::
     // corpus_has_swift`'s doc comment for the full mechanism and why this was
@@ -3271,7 +3267,7 @@ fn resolve_with_scopes_full_inner(
         };
     prof::add_import_group_ns(__import_group_t0.elapsed());
 
-    // semx-022 red-green: fingerprint every chunk-scoped table this function
+    // red-green: fingerprint every chunk-scoped table this function
     // just built, then decide — per file, against the *complete* fingerprint map
     // (the caller already added the corpus-wide tables) — which files may reuse
     // their cached edges. This must happen before the pass-2 closure runs,
@@ -3318,7 +3314,7 @@ fn resolve_with_scopes_full_inner(
             // compares `Option`s, so an absent key on both sides is unchanged
             // and an appearing key is a change — exactly right.
             //
-            // semx-bvu: whether Swift call-signature ambiguity resolution
+            // whether Swift call-signature ambiguity resolution
             // forces every eligible file RED must be "did the whole-table
             // guard's fingerprint *change*", not "is the table non-empty".
             // The two coincide the first time a corpus ever has a `.swift`
@@ -3328,7 +3324,7 @@ fn resolve_with_scopes_full_inner(
             // later no-op rebuild of a corpus that merely *contains* a
             // `.swift` file without its signatures having changed: a single
             // incidental fixture (vscode's one-file colorize-test corpus,
-            // measured in semx-bvu at 13,292/13,292 files forced RED on a
+            // measured in at 13,292/13,292 files forced RED on a
             // zero-change reload) no longer permanently disables reuse for
             // every other file just because `swift_call_signatures` happens
             // to be non-empty. This is still the same whole-table-guard
@@ -3364,7 +3360,7 @@ fn resolve_with_scopes_full_inner(
 
     // Pass 2: Build scopes, imports, and resolve references per file (parallel)
     let __pass2_t0 = Instant::now();
-    // semx-6rd CUT 1: pass 2 used to always iterate `parsed_files` (which
+    // CUT 1: pass 2 used to always iterate `parsed_files` (which
     // meant every file needed a live tree, forcing the re-parse above for
     // anything beyond `PARSED_FILE_REUSE_LIMIT`). It now iterates
     // `file_paths` and, per file, prefers `precomputed_facts` (no tree
@@ -3377,12 +3373,12 @@ fn resolve_with_scopes_full_inner(
         .collect();
     let per_file_results: Vec<PerFileScopeResult> = maybe_par_iter!(file_paths)
         .filter_map(|file_path| {
-            // semx-022: a GREEN file's edges and consumed words are reused
+            // a GREEN file's edges and consumed words are reused
             // verbatim, in the exact position in the merge order a cold build
             // would have produced them — the whole point of short-circuiting
             // *inside* this closure rather than splicing edges afterwards.
             //
-            // semx-4an: the copy made here is the *only* one. It exists because
+            // the copy made here is the *only* one. It exists because
             // `all_edges` and the corpus-wide `consumed_words` are build-scoped
             // and consume what they are given, while the cache entry has to
             // survive into the next build — and it is made here, in the parallel
@@ -3412,13 +3408,13 @@ fn resolve_with_scopes_full_inner(
             // `names_enabled`, not `enabled`: at `SEM_PROFILE_RESOLVE=2` the
             // phase timers below stay on but this stays `None`, which is what
             // makes `select_member_profiled!` take its untimed branch and
-            // removes W3's 1.45-1.65x instrument tax from the wall time the
+            // removes 1.45-1.65x instrument tax from the wall time the
             // phase timers are attributing.
             let mut __file_profile: Option<prof::FileAccum> =
                 prof::names_enabled().then(prof::FileAccum::default);
             let __scope_build_t0 = __prof_on.then(Instant::now);
             // Same admission test the re-parse loop applies before building a
-            // tree at all (semx-au8).
+            // tree at all.
             let config = scope_resolve_config_for_path(file_path)?;
 
             let precomputed = precomputed_facts.and_then(|m| m.get(file_path.as_str()));
@@ -3434,7 +3430,7 @@ fn resolve_with_scopes_full_inner(
             };
             let source = content.as_bytes();
 
-            // semx-w5k: scope_build's own decomposition. Zero-cost when the
+            // scope_build's own decomposition. Zero-cost when the
             // profiler is off (every `then` is a `bool` test), and every
             // sub-timer measures where its work happens rather than
             // re-deriving a share afterwards.
@@ -3457,7 +3453,7 @@ fn resolve_with_scopes_full_inner(
             }
 
             // `fused_import_starts` is `Some` exactly when this file took the
-            // fused triple walk (semx-3ao): the recorded import starts the
+            // fused triple walk: the recorded import starts the
             // pruned replay below consumes instead of `extract_imports_from_ast`
             // re-walking the tree. `None` = the three-walk path or precomputed.
             let (
@@ -3507,7 +3503,7 @@ fn resolve_with_scopes_full_inner(
                     }
                 }
 
-                // BS3-F2 (semx-3ao): the fused triple walk is THE AST path —
+                // The fused triple walk is THE AST path —
                 // the prototype's Python gate measured -23.6% of the box on
                 // HA and was deleted. The unfused walks survive as the invariant
                 // test's specification and (build_scopes/collect) as the
@@ -3566,17 +3562,17 @@ fn resolve_with_scopes_full_inner(
                 __sb.import_rekey_ns = t.elapsed().as_nanos() as u64;
             }
             let __t = __prof_on.then(Instant::now);
-            // MUL Phase 2 (semx-mul, W2; MUL-DESIGN.md §4.3 Field 10): a
+            // MUL Phase 2 (MUL;): a
             // precomputed file's import descriptors, if any, were already
             // recorded in pass 1 (`record_import_stmts_pruned` inside
             // `precompute_scope_resolvable_file_facts`) against the live
             // tree there — dispatch them directly here, no tree, no second
             // traversal. Always empty for C++ (import-free by TREELESS's
-            // construction, MUL-A §2.3) and for JS/TS
+            // construction, MUL-A) and for JS/TS
             // (`precompute_js_ts_file_facts` never records any — see
             // `PrecomputedFileFacts::import_stmts`'s doc comment); nonzero
-            // unconditionally for Python (admitted since W5) and Go
-            // (admitted since semx-bpn2), and nonzero for C#/Rust/Java only
+            // unconditionally for Python (admitted since) and Go
+            // (admitted since), and nonzero for C#/Rust/Java only
             // when each's own gate (`SEM_MUL_CSHARP`/`SEM_MUL_RUST`/
             // `SEM_MUL_JAVA`) is flipped on — see
             // [`mul_precompute_admits`]'s doc comment for why each of those
@@ -3612,7 +3608,7 @@ fn resolve_with_scopes_full_inner(
                 // The one walk already recorded where every handled import
                 // statement starts; record a descriptor per handled node in
                 // extract's own order, visiting only subtrees that contain one,
-                // then dispatch every descriptor (MUL-DESIGN.md §4.3 Field 10 —
+                // then dispatch every descriptor (—
                 // one path, record-then-dispatch, no dispatch-direct variant
                 // kept alongside it). Empty (every C# file: no matching kinds)
                 // ⇒ nothing to do at all.
@@ -3980,7 +3976,7 @@ fn resolve_with_scopes_full_inner(
         all_edges.extend(result.edges);
         log.extend(result.log);
         // Move each file's word set in whole rather than `or_default().extend()`
-        // (semx-4an). Entity ids are `{file_path}::…` by construction, so two
+        //. Entity ids are `{file_path}::…` by construction, so two
         // *files* can never contribute the same key and the vacant case is the
         // only one that ever runs on real input — but `extend` on a fresh empty
         // set re-hashes every word, which across a 40k-file corpus was a
@@ -4148,7 +4144,7 @@ pub(crate) fn fingerprint_corpus_tables(
     }
     sink.whole(Table::GuardPyWildcardImport, wildcard_import_guard);
     // Same fold, second tag: `register_rust_module_import` (Rust's relative
-    // module-alias `use` form, semx-gla) has the identical unbounded-read
+    // module-alias `use` form) has the identical unbounded-read
     // shape over the identical `(name, file_path)` data — see
     // `Table::GuardRustModuleAlias`'s doc for why it still gets its own tag
     // rather than reusing the Python one above.
@@ -4195,7 +4191,7 @@ pub(crate) fn wildcard_guard_contribution(name: &str, file_path: &str) -> u64 {
 }
 
 /// Update a carried-forward corpus fingerprint map in place, touching only the
-/// keys [`TouchedCorpusKeys`] names (semx-4an).
+/// keys [`TouchedCorpusKeys`] names.
 ///
 /// Parity with [`fingerprint_corpus_tables`] rests on two facts:
 ///
@@ -4282,7 +4278,7 @@ fn hash_member_list(members: &[(String, String)]) -> u64 {
     h.finish()
 }
 
-/// [`hash_member_list`]'s sibling for [`GoPkgIndex`] buckets (semx-u3rk): the
+/// [`hash_member_list`]'s sibling for [`GoPkgIndex`] buckets: the
 /// declaring-directory field is new information a bucket carries that
 /// `hash_member_list`'s two-tuple shape cannot fold in, so a dedicated
 /// fingerprint keeps `Table::GoPkgIndex`'s invalidation correct rather than
@@ -4551,7 +4547,7 @@ fn build_scopes_from_ast(
     }
 }
 
-/// One node's worth of `build_scopes_from_ast` (semx-3ao): every scope-tree
+/// One node's worth of `build_scopes_from_ast`: every scope-tree
 /// side effect for `node`, returning the scope its named children inherit.
 /// Factored out verbatim from the walk's loop body so the unfused walk above
 /// and the fused triple walk (`fused_scope_refs_import_walk`) are the same
@@ -4809,7 +4805,7 @@ fn scope_visit_node(
                     .entry(fe.id.clone())
                     .or_insert(parent_scope);
                 entity_inner_scope.insert(fe.id.clone(), func_scope_idx);
-                // Register this function's nested child entities (semx-9g8q):
+                // Register this function's nested child entities:
                 // same shape as the class-like branch above. Without it,
                 // entities nested inside a plain function never enter any
                 // scope's `.defs`/`entity_scope_map` and every lookup of them
@@ -4865,7 +4861,7 @@ fn scope_visit_node(
     }
 }
 
-/// The fused triple walk (semx-3ao, fold-fusion #3 — RESOLUTION-PROFILE.md
+/// The fused triple walk (fold-fusion #3 —
 /// §"fuse the three AST walks — the plan"). One document-order pre-order
 /// traversal producing what `build_scopes_from_ast` and
 /// `collect_all_file_refs` produced in two walks — `⟨cata f, cata g⟩ =
@@ -4900,11 +4896,11 @@ fn fused_scope_refs_import_walk(
 ) -> (Vec<AstRef>, Vec<usize>, bool) {
     let mut refs = AstRefCollector::new();
     let mut import_starts: Vec<usize> = Vec::new();
-    // MUL Phase 1 (semx-mp1): whether the walk saw a literal `"call"`-kind
+    // MUL Phase 1: whether the walk saw a literal `"call"`-kind
     // node — the one ctor-infer's `scan_constructor_calls` hardcodes to
-    // Python's grammar (MUL-DESIGN.md §1.2's `TREELESS` predicate). One extra
+    // Python's grammar (`TREELESS` predicate). One extra
     // `kind()` comparison on nodes this walk already visits, decided
-    // structurally from what the walk saw rather than a language table (I3).
+    // structurally from what the walk saw rather than a language table.
     let mut saw_call_node = false;
     // Each entry: (node, current_scope, inside-a-recorded-import)
     let mut worklist: Vec<(tree_sitter::Node, usize, bool)> = vec![(root, root_scope, false)];
@@ -5847,7 +5843,7 @@ pub fn extract_go_receiver_type(content: &str) -> Option<String> {
 /// pkg identifier (bare last-path-segment string — the local name a Go call
 /// site actually spells, e.g. `v1` in `v1.Pod{}`) → every entity any
 /// same-named package exports, each carrying its own declaring directory
-/// (semx-u3rk, MUL-DESIGN.md's Go-admission finding): kubernetes has dozens
+/// (Go-admission finding): kubernetes has dozens
 /// of packages literally named `v1`, one per API group, so a bucket keyed
 /// only on this bare string is not a single package's symbol table — it is
 /// the union of every package that happens to share the name. The
@@ -5863,7 +5859,7 @@ pub(crate) type GoPkgIndex = HashMap<String, Vec<(String, String, String)>>;
 /// a legitimate resolution key. An earlier revision of this function also
 /// keyed on the file's own stripped-of-`.go` stem, matching the bare last
 /// segment of a Go import path against a corpus file's *filename* rather
-/// than its *directory*. That route was deleted (post-semx-k07t
+/// than its *directory*. That route was deleted (afterward
 /// verification): kubernetes has real source files literally named after Go
 /// standard-library packages (`os.go`, `time.go`, `errors.go`, ...), and
 /// with no signal to tell "this bucket entry is the stdlib package" from
@@ -7013,8 +7009,7 @@ fn scan_init_body(
 /// so Transaction.__init__'s conn param has type Connection,
 /// and self.conn in Transaction has type Connection.
 /// `parsed_files`' AST-path files are supplemented with `precomputed_facts`'
-/// [`PrecomputedFileFacts::ctor_call_sites`] (Field 11, MUL-DESIGN.md §4.3,
-/// semx-mul W5) for any file whose language [`mul_precompute_consumes_calls`]
+/// [`PrecomputedFileFacts::ctor_call_sites`] (Field 11, MUL) for any file whose language [`mul_precompute_consumes_calls`]
 /// admits — a fast-path file was never in `parsed_files` to begin with (its
 /// tree died at the end of pass 1), so without this it would silently
 /// contribute nothing to `instance_attr_types` the moment TREELESS starts
@@ -7039,7 +7034,7 @@ fn infer_constructor_param_types(
     entity_map: &HashMap<String, EntityInfo>,
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
-    // semx-4an: the scan writes to `instance_attr_types` only from inside
+    // the scan writes to `instance_attr_types` only from inside
     // `if let Some(param_names) = init_params.get(callee)` *and* `if let
     // Some(attrs) = attr_to_param_index.get(..)` (see `apply_ctor_call_facts`).
     // With either input empty the whole scan is a provable no-op, so
@@ -7112,7 +7107,7 @@ fn infer_constructor_param_types(
 /// `name -> return type`, where the type is the one carried by the *first* id
 /// in that name's `symbol_table` bucket that has one.
 ///
-/// Driven by `return_type_map`'s keys rather than by `symbol_table`'s (semx-4an).
+/// Driven by `return_type_map`'s keys rather than by `symbol_table`'s.
 /// The two enumerate the same result: a name gets an entry iff some id in its
 /// bucket is in `return_type_map`, and every such id's own entity is named that
 /// same name (`symbol_table[name]` is exactly the ids of entities named `name`,
@@ -7171,7 +7166,7 @@ fn build_attr_to_param_index(
     index
 }
 
-/// Field 11 (MUL-DESIGN.md §4.3, semx-mul phase 2/3): one descriptor per
+/// Field 11 (MUL phase 2/3): one descriptor per
 /// constructor-call-shaped `"call"` node — the syntactic half of the former
 /// `scan_constructor_calls`, minus the corpus-dependent lookups it used to
 /// make inline (`init_params`/`attr_to_param_index`/`func_name_returns`, all
@@ -7252,7 +7247,7 @@ fn record_arg_call_shape(node: tree_sitter::Node, source: &[u8]) -> Option<Strin
 /// Replays [`record_ctor_call_sites`]' descriptors against the corpus-wide
 /// maps `scan_constructor_calls` used to consult inline — the only
 /// corpus-dependent step, run after every file's own scan has been merged
-/// (Field 11, MUL-DESIGN.md §4.3). One-to-one with the old function's body:
+/// (Field 11). One-to-one with the old function's body:
 /// `arg_shapes[i]` stands in for `infer_expr_type(arg, source,
 /// func_name_returns)`, resolved by [`infer_arg_type_from_shape`].
 fn apply_ctor_call_facts(
@@ -7499,7 +7494,7 @@ fn resolve_ts_default_re_exports(
 /// by file — so a namespace-import specifier resolves via `O(1)`
 /// `entities_by_file`/`stem_index` lookups instead of an `O(symbol_table)`
 /// scan repeated once per import statement. Originally JS/TS-only
-/// (hardcoded `is_js_ts_file`); generalized (semx-sbf) so Python's
+/// (hardcoded `is_js_ts_file`); generalized so Python's
 /// `register_namespace_import` — previously the one caller *without* this
 /// index, scanning the whole corpus per bare `import module` statement, see
 /// its doc comment — can share the same structure and the same fix shape.
@@ -7730,20 +7725,20 @@ fn only_js_ts_statement_trivia(mut text: &str) -> bool {
 /// Extract import statements from the AST.
 ///
 /// `rec` records every cross-file read the Python/Rust/Go branches below make
-/// against `symbol_table`/`entity_map`/`go_pkg_index` (semx-kzy). The JS/TS
+/// against `symbol_table`/`entity_map`/`go_pkg_index`. The JS/TS
 /// branches do not take a recorder: they run only when `skip_js_ts_imports` is
 /// false, which — inside a [`crate::parser::session::GraphSession`] build —
 /// never happens, because `pre_built_import_table` is always `Some` there and
-/// JS/TS import resolution goes through the already-instrumented semx-h1s
+/// JS/TS import resolution goes through the already-instrumented
 /// incremental import table (`Table::ImportsForFile`) instead. Outside a
 /// session (the plain `EntityGraph::build` cold path) `rec` is always
 /// `Recorder::off()`, so recording here is a no-op regardless.
 ///
-/// BS3-F2 (semx-3ao): no longer called on the build path — the fused triple
+/// No longer called on the build path — the fused triple
 /// walk records the handled set and `record_import_stmts_pruned` +
 /// `dispatch_import_stmts_from_facts` run the handlers. Kept alive,
 /// deliberately, as the executable specification the
-/// BS3-witness invariant test holds the fused path to (SINGLE-PASS.md §6's
+/// fusion-witness invariant test holds the fused path to (an independent-oracle
 /// discipline: the unfused side is the spec, so the test cannot degrade into
 /// "the new code agrees with itself").
 #[cfg_attr(not(test), allow(dead_code))]
@@ -7768,7 +7763,7 @@ fn extract_imports_from_ast<'a>(
     skip_js_ts_imports: bool,
     rec: &mut Recorder,
 ) {
-    // MUL phase 2 (semx-mul, MUL-DESIGN.md §4.3 Field 10): dispatch-direct —
+    // MUL phase 2 (MUL): dispatch-direct —
     // build one `ImportStmtFacts` descriptor per handled node and resolve it
     // immediately, on this traversal's own stack frame, no batching. This is
     // the "dispatch-direct" side the record-then-dispatch composition
@@ -7776,7 +7771,7 @@ fn extract_imports_from_ast<'a>(
     // pass 2's one production caller) is checked against (see
     // `record_then_dispatch_matches_dispatch_direct` below): both now share
     // the same descriptor type and the same `dispatch_import_stmt`, so what
-    // the BS3-witness invariant test still isolates is the traversal driver
+    // the fusion-witness invariant test still isolates is the traversal driver
     // (full recursive-via-worklist here vs pruned-subtree-only there),
     // exactly as before this refactor — the per-node body was already shared.
     let mut worklist = vec![root];
@@ -7814,7 +7809,7 @@ fn extract_imports_from_ast<'a>(
 
 /// The import-statement node kinds `extract_imports_from_ast` handles (and
 /// therefore never descends into), classified. Pure in `(kind, config)` —
-/// factored out (semx-3ao) so the fused walk's recorder, the pruned replay,
+/// factored out so the fused walk's recorder, the pruned replay,
 /// and the unfused walk agree on the handled set H by construction: H =
 /// {named node c : classify(c) is Some ∧ no ancestor of c is in H}.
 ///
@@ -7859,7 +7854,7 @@ fn classify_import_stmt(kind: &str, config: &ScopeResolveConfig) -> Option<Impor
     }
 }
 
-/// MUL-DESIGN.md §4.3 Field 10 (semx-mul phase 2): one serializable
+/// (MUL phase 2): one serializable
 /// descriptor per import-statement node in `H` (the set `classify_import_stmt`
 /// selects) — every value the six handlers below used to read directly off
 /// the `tree_sitter::Node`, and nothing else. No corpus-wide table
@@ -7912,7 +7907,7 @@ pub(crate) enum ImportStmtFacts {
     /// corpus reads, so it stays in the dispatcher, operating on this field.
     RustUse { text: String },
     /// Go `import (...)` — one *full* package import path per spec
-    /// (stripped of quotes; semx-u3rk, MUL-DESIGN.md's Go-admission
+    /// (stripped of quotes; Go-admission
     /// finding), in the same order the original handler discovered and
     /// registered them. Used to be reduced to the bare last `/` segment
     /// here — the same string `register_go_package_imports` still uses as
@@ -8187,7 +8182,7 @@ fn build_import_stmt_facts(
 
 /// Tree-only half of the old `extract_go_import_specs`: collects package
 /// import paths (stripped of quotes; the *full* path, not reduced to a
-/// bare last `/` segment — semx-u3rk needs the whole string to disambiguate
+/// bare last `/` segment — needs the whole string to disambiguate
 /// same-named packages, see [`register_go_package_imports`]) from a Go
 /// `import_spec`/`import_spec_list` subtree, appending them to `out` in the
 /// same LIFO worklist order the original handler dispatched them in.
@@ -8354,7 +8349,7 @@ fn dispatch_import_stmt<'a>(
         }
         // Rust: `use crate::module::Name;` or `use crate::module::{A, B};`.
         //
-        // semx-gla: every segment this parses is tried two ways, not one —
+        // every segment this parses is tried two ways, not one —
         // as an imported *item* (`resolve_import_name`: `Name` is a
         // function/struct/etc. defined in `module`) and, unless it is
         // obviously a type, also as an imported *module alias*
@@ -8371,7 +8366,7 @@ fn dispatch_import_stmt<'a>(
         // `receiver_is_type` in `extract_call_ref` already relies on for
         // this exact type/module distinction) avoids the wasted
         // module-alias lookup on the common case, `use path::SomeType;`.
-        // semx-gla F2b: a third skip, `rust_use_path_is_external_std`,
+        // A third skip, `rust_use_path_is_external_std`,
         // additionally rules out the module-alias attempt whenever the
         // `use` path is rooted at `std`/`core`/`alloc` — those can never
         // legitimately name a corpus file, so even trying invites a same-stem
@@ -8384,7 +8379,7 @@ fn dispatch_import_stmt<'a>(
                 let module_path = &text[..brace_pos];
                 let source_module = module_path.rsplit("::").next().unwrap_or(module_path);
                 let qualifying_path = rust_qualifying_path(module_path);
-                // semx-gla F2b: `std`/`core`/`alloc` name no corpus file
+                // `std`/`core`/`alloc` name no corpus file
                 // outside the rust-lang/rust tree itself -- see
                 // `rust_use_path_is_external_std`'s doc.
                 let is_external_std_prefix = rust_use_path_is_external_std(module_path);
@@ -8446,7 +8441,7 @@ fn dispatch_import_stmt<'a>(
                 };
                 let qualifying_path =
                     rust_qualifying_path(&parts[..parts.len().saturating_sub(1)].join("::"));
-                // semx-gla F2b: judged off the *whole* `use` path's own root
+                // Judged off the *whole* `use` path's own root
                 // segment (`text`, not the already-crate/self/super-stripped
                 // `qualifying_path`) so a bare `use std;` (no `::` at all,
                 // `qualifying_path == ""`) is still caught.
@@ -8495,7 +8490,7 @@ fn dispatch_import_stmt<'a>(
     }
 }
 
-/// Field 10's *recording* half (MUL-DESIGN.md §4.3): same traversal, same
+/// Field 10's *recording* half: same traversal, same
 /// pruning, same order as the dispatch-direct pruned replay this used to be
 /// — but instead of resolving each import statement against corpus-wide
 /// tables, it reads the node into an [`ImportStmtFacts`] descriptor and
@@ -8522,7 +8517,7 @@ fn dispatch_import_stmt<'a>(
 /// is every file, which is where `extract_imports_from_ast`'s
 /// pure-traversal cost goes. One path: this records descriptors,
 /// [`dispatch_import_stmts_from_facts`] consumes them — no dispatch-direct
-/// pruned-replay variant kept alongside it (MUL-DESIGN.md §4.3 Field 10).
+/// pruned-replay variant kept alongside it.
 fn record_import_stmts_pruned(
     root: tree_sitter::Node,
     import_starts: &[usize],
@@ -8633,10 +8628,10 @@ fn register_go_package_imports(
 ) {
     // The bare identifier a call site actually spells (`v1` in `v1.Pod{}`)
     // is still the O(1) bucket key — only the disambiguation inside the
-    // bucket is new (semx-u3rk).
+    // bucket is new.
     let pkg_name = import_path.rsplit('/').next().unwrap_or(import_path);
     // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan.
-    // Recorded unconditionally (semx-kzy): a miss is a dependency too — a
+    // Recorded unconditionally: a miss is a dependency too — a
     // package that resolves to nothing today may gain entries when a new
     // file declares that package, which must invalidate this import. Keyed
     // on the bucket (`pkg_name`), not the winning candidate: any change to
@@ -8646,7 +8641,7 @@ fn register_go_package_imports(
     let Some(entries) = go_pkg_index.get(pkg_name) else {
         return;
     };
-    // semx-u3rk: a bucket keyed by bare last segment can hold entries from
+    // a bucket keyed by bare last segment can hold entries from
     // more than one declaring package (kubernetes has dozens of directories
     // literally named `v1`, one per API group) — inserting the whole bucket
     // used to merge every one of their exported names into this file's
@@ -8669,7 +8664,7 @@ fn register_go_package_imports(
 }
 
 /// Which declaring directory (of possibly several sharing `entries`' bare
-/// bucket key) `import_path` actually means — the fix for semx-u3rk's
+/// bucket key) `import_path` actually means — the fix for 's
 /// kubernetes collision. Picks the directory whose own trailing path
 /// segments overlap `import_path`'s trailing segments the longest: a Go
 /// import path always ends with its package's declaring directory's own
@@ -8714,7 +8709,7 @@ fn trailing_path_overlap(a: &str, b: &str) -> usize {
 
 /// Shared helper: resolve an imported name against the symbol table.
 ///
-/// Every candidate this considers is recorded (semx-kzy): the name lookup
+/// Every candidate this considers is recorded: the name lookup
 /// itself (a miss is a dependency — a later-added symbol of this name must
 /// invalidate this file), and every target id `find_import_target` inspects
 /// while picking the best file match (a change to any candidate's file path
@@ -8846,13 +8841,13 @@ fn register_ts_namespace_import<'a>(
 /// Python's bare `import module` form. The read this needs — "any top-level
 /// entity anywhere in the corpus whose file could match `source_path`" — is
 /// still too diffuse to name with individual `(table, key)` pairs, so the
-/// *incremental-invalidation* guard stays whole (semx-kzy, see
+/// *incremental-invalidation* guard stays whole (see
 /// [`Table::GuardPyWildcardImport`]: any future change to any
 /// `(name, target file)` pair in the corpus invalidates this file, which is
 /// conservative but never wrong) — that guard is unchanged by this comment's
 /// history.
 ///
-/// semx-sbf: what *did* change is how the match itself is computed. This
+/// what *did* change is how the match itself is computed. This
 /// used to scan every entry of `symbol_table` — every distinct name across
 /// the whole corpus, and every entity behind each name — checking each
 /// against `source_path`, once per bare `import module` statement in the
@@ -8861,7 +8856,7 @@ fn register_ts_namespace_import<'a>(
 /// that scan dominated the entire resolve phase: ~1,563s of summed
 /// per-thread CPU time out of a ~91s wall build (attributed via
 /// `SEM_PROFILE_RESOLVE=1`'s `scope_build_ms` bucket — see
-/// `RESOLUTION-PROFILE.md`'s "Python pathology" section). `py_top_level_
+/// "Python pathology" section). `py_top_level_
 /// entities` is the fix: the exact same `(file -> top-level entities)`
 /// grouping [`build_top_level_entity_index`] already builds for JS/TS
 /// namespace imports, generalized to any extension set and built **once**
@@ -8918,7 +8913,7 @@ fn register_namespace_import(
 /// `use self::module_name;` where `module_name` is itself a module (not an
 /// item) — registers every top-level item of the aliased module, keyed
 /// `alias::item`, so a later `module_name::some_fn()` call resolves through
-/// `resolve_ref`'s `ScopedCall` arm (semx-gla).
+/// `resolve_ref`'s `ScopedCall` arm.
 ///
 /// A structural copy of [`register_namespace_import`] immediately above
 /// (same unbounded-read shape, same stem-match resolution, `::` in the
@@ -8943,13 +8938,13 @@ fn register_namespace_import(
 /// is_external_std` — since an external stdlib import can never legitimately
 /// name a corpus file outside the rust-lang/rust tree itself.
 ///
-/// semx-f2/semx-gla-F2b: `source_path` is only ever the bare last
+/// `source_path` is only ever the bare last
 /// `::`-segment of the `use` path (`extract_rust_use`'s two call sites both
 /// reduce to it before calling this — see `dispatch_import_stmt`'s `RustUse`
 /// arm). When that bare segment collides — two-plus files share a stem, e.g.
 /// `a/util.rs` and `b/util.rs` — the bucket is a REAL collision only for the
 /// specific item names two-plus of its files actually define; most item
-/// names in a same-stem bucket are defined by exactly one file. F2's first
+/// names in a same-stem bucket are defined by exactly one file. An earlier
 /// attempt at this fix pre-filtered the whole bucket down to one file
 /// *before* looking at item names at all (by directory/`qualifying_path`
 /// trailing-overlap, else lexicographically-smallest) — the wrong
@@ -9070,7 +9065,7 @@ fn select_rust_module_item_winner<'a>(
 }
 
 /// Whether a Rust `use` path's own root segment names the standard library
-/// (`std`), `core`, or `alloc` — semx-gla F2b: an import rooted at one of
+/// (`std`), `core`, or `alloc` — an import rooted at one of
 /// these three can never legitimately resolve to a corpus file outside the
 /// rust-lang/rust source tree itself (its symbols live in a prebuilt
 /// sysroot, never in workspace source under analysis), so treating a
@@ -9450,7 +9445,7 @@ fn collect_all_file_refs(
     refs.into_refs()
 }
 
-/// One node's worth of `collect_all_file_refs` (semx-3ao): append every
+/// One node's worth of `collect_all_file_refs`: append every
 /// `AstRef` this node contributes. Factored out verbatim from the walk's loop
 /// body — see `scope_visit_node`'s doc comment for why the per-node semantics
 /// live in one place shared by the unfused and fused traversal drivers.
@@ -9612,7 +9607,7 @@ fn extract_call_ref(
     // whose `command` node hands over the `word` leaf without a wrapper)
     // handle the rest uniformly. Without this, bash calls were never
     // collected as refs at all: `command_name` matched none of the fast-path
-    // kinds, no member_access pattern, and no scoped_call_node (semx-ocj).
+    // kinds, no member_access pattern, and no scoped_call_node.
     if func_kind == "command_name" {
         if let Some(inner) = func.named_child(0) {
             extract_call_ref(
@@ -9632,7 +9627,7 @@ fn extract_call_ref(
 
     // PHP's plain-identifier node kind is `"name"` (tree-sitter-php's
     // `function_call_expression.function` field), not `"identifier"` --
-    // discovered the same way as bash/fish (semx-ocj): a language whose call
+    // discovered the same way as bash/fish: a language whose call
     // syntax `extract_call_ref`'s fast path special-cases by exact `.kind()`
     // string but didn't recognize. `"name"` is otherwise unused by any
     // other configured language's callee position, so this can only turn a
@@ -9873,7 +9868,7 @@ fn resolve_ref(
     file_lookup: &FileEntityLookup<'_>,
     lookup_cache: &mut ScopeLookupCache,
     mut profile: Option<&mut prof::FileAccum>,
-    // semx-022 red-green: every lookup below that can reach another file's data
+    // red-green: every lookup below that can reach another file's data
     // records its key here, hit or miss. `import_table_by_name` is not recorded
     // per lookup — it holds only this file's own imports and the caller records
     // the whole slice once as `Table::ImportsForFile`.
@@ -9884,7 +9879,7 @@ fn resolve_ref(
             name,
             argument_labels,
         } => {
-            // semx-9g8q: one combined per-scope-level walk replaces the old
+            // one combined per-scope-level walk replaces the old
             // bindings-only shadow gate + separate defs lookup. `.defs` is
             // checked before `.bindings` at each level, so same-scope
             // co-populated def+binding resolves as the definition it is,
@@ -10077,7 +10072,7 @@ fn resolve_ref(
                 }
             }
             // Rust module-alias qualified call: `alias::item()` where `alias`
-            // was brought in by `use path::alias;` (semx-gla). `register_rust_
+            // was brought in by `use path::alias;`. `register_rust_
             // module_import` writes exactly this `"{alias}::{item}"` key, so a
             // hit here requires an actual recorded `use` of a real module —
             // never a name-only guess (see that function's doc).
@@ -10360,7 +10355,7 @@ fn resolve_ref(
             }
 
             // ClassName.method() static call, only when ClassName is visible and
-            // not shadowed by a local binding. semx-9g8q: the shadow gate and
+            // not shadowed by a local binding.: the shadow gate and
             // the defs walk are one combined per-level lookup — a same-scope
             // co-populated def+binding still resolves as the definition.
             if let ScopeChainLookup::Defined(class_id) =
@@ -10664,7 +10659,7 @@ fn find_enclosing_class_cached(
 /// while `scan_assignments` also records the same declarator as a
 /// `.binding`) — the grammar admits no redeclaration, so co-population at
 /// the *same* scope index can only be the same declaration, and the def
-/// must win instead of being read as a shadow (semx-9g8q). A binding in a
+/// must win instead of being read as a shadow. A binding in a
 /// strictly nearer (inner) scope with no def of its own still shadows
 /// everything above it, preserving the guarantee the old
 /// `is_local_binding_in_scopes_cached` gate protected.
@@ -10829,7 +10824,7 @@ fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {
 mod tests {
     use super::*;
 
-    /// semx-4w1 follow-up: `approx_heap_bytes` must walk the nested heap
+    /// follow-up: `approx_heap_bytes` must walk the nested heap
     /// content the container-capacity terms skip — each [`Scope`]'s six
     /// internal collections' String contents, every [`AstRefKind`] variant's
     /// String payloads (`argument_labels` included), and the actual
@@ -10947,7 +10942,7 @@ mod tests {
         );
     }
 
-    /// semx-bpn2 Stage 2: `shrink_to_fit` must reclaim genuine over-capacity
+    /// Stage 2: `shrink_to_fit` must reclaim genuine over-capacity
     /// slack (the shape every real push/insert-loop precompute path leaves
     /// behind — see the method's own doc comment) without changing any
     /// value, key, or length it touches. Deliberately builds each exercised
@@ -11206,7 +11201,7 @@ mod tests {
         assert_eq!(resolved_missed, None);
     }
 
-    /// semx-u16 / MUL-DESIGN.md F1+I2: `precompute_js_ts_file_facts` must seed
+    /// `precompute_js_ts_file_facts` must seed
     /// `scopes[0].defs` in **`entity_ranges` order** — `(start_line, end_line,
     /// id)` ascending, id being the tiebreaker — the same order the AST path
     /// (`resolve_with_scopes_full_inner`'s `if let Some(ranges) =
@@ -11229,7 +11224,7 @@ mod tests {
     /// This fixture — 11 one-line `function f(){}` declarations on a single
     /// source line, all `start_line == end_line == 1` — is exactly that case:
     /// before the fix, `precompute_js_ts_file_facts` (extraction order) seeded
-    /// `#11` while `entity_ranges` order (I2, computed here as the same-shape
+    /// `#11` while `entity_ranges` order (computed here as the same-shape
     /// oracle `resolve_with_scopes_full_inner` uses) picks `#9`, a real,
     /// constructed divergence, not merely an argued one. This test pins the
     /// fix: precompute must now agree with `entity_ranges` order.
@@ -11274,7 +11269,7 @@ mod tests {
             ]
         );
 
-        // What `entity_ranges` order (I2 / the AST path) would pick: sort
+        // What `entity_ranges` order (the AST path) would pick: sort
         // `(start_line, end_line, id)` ascending and take the last write —
         // exactly `resolve_with_scopes_full_inner`'s seed loop, replicated
         // here as a same-shape oracle rather than re-run through the whole
@@ -11302,22 +11297,22 @@ mod tests {
             .cloned()
             .expect("f seeded into module scope");
 
-        // I2 (post-fix guarantee): precompute must pick the same last-write
+        // Post-fix guarantee: precompute must pick the same last-write
         // entity as entity_ranges order — the divergence this fixture was
         // constructed to expose (extraction order's #11 vs. entity_ranges
         // order's #9) must not reach `scopes[0].defs`.
         assert_eq!(
             precompute_seeded_id, entity_ranges_last_write,
-            "F1/I2: precompute must seed scopes[0].defs[\"f\"] in entity_ranges \
+            "precompute must seed scopes[0].defs[\"f\"] in entity_ranges \
              order, matching the AST path — got {precompute_seeded_id}, expected \
              {entity_ranges_last_write}"
         );
         assert_eq!(precompute_seeded_id, "over.ts::function::f@L1#9");
     }
 
-    /// semx-mp1 / MUL-DESIGN.md §4.2 I1 + §1: the CLEAN gate must fire on a
-    /// cross-file parent link. MUL-DESIGN.md's own census found **zero** real
-    /// violations across 4.8M entities on seven corpora (§1.1's Theorem
+    /// The CLEAN gate must fire on a
+    /// cross-file parent link. A census found **zero** real
+    /// violations across 4.8M entities on seven corpora (the theorem
     /// explains why: `build_entity_id` roots every id at its own file, so
     /// `children_by_parent[e] ⊆ entities(file(e))` holds unconditionally for
     /// anything the product's own extractors produce) — so the only way to
@@ -11325,7 +11320,7 @@ mod tests {
     /// bypassing extraction, exactly as this test does. The gate must be
     /// *seen* to fire, not merely argued sound by the theorem: a file whose
     /// own theorem-given soundness is bypassed like this is exactly the case
-    /// I6's fail-safe exists for.
+    /// this fail-safe exists for.
     #[test]
     fn clean_gate_marks_file_dirty_when_a_child_lives_in_another_file() {
         // "parent.cs" declares `Outer`, whose *own* extraction would only
@@ -11365,7 +11360,7 @@ mod tests {
             sound_child,
             leaf,
         ];
-        // semx-mul phase-2 W0: the real call site runs this before the gate
+        // MUL phase 2: the real call site runs this before the gate
         // — a no-op here (no `.go` entities), matching production order.
         let go_parents_resolved =
             crate::parser::registry::resolve_go_method_parent_ids(&mut all_entities);
@@ -11401,7 +11396,7 @@ mod tests {
         assert!(!dirty.contains("intruder.cs"));
     }
 
-    /// semx-5sw: the scoping property itself — `candidate_files` narrower
+    /// the scoping property itself — `candidate_files` narrower
     /// than the whole corpus must still reproduce the exact corpus-wide
     /// verdict for every file it *does* cover, in both directions. This is
     /// the soundness argument in `clean_gate_dirty_files`'s own doc comment,
@@ -11457,7 +11452,7 @@ mod tests {
         );
     }
 
-    /// semx-mp1: end-to-end wiring proof, at the same grain
+    /// end-to-end wiring proof, at the same grain
     /// `EntityGraph::build`'s pass-1 assembly uses — dropping a dirty file's
     /// entry from a `fresh_precomputed`-shaped map via `.retain()` (the exact
     /// operation `graph.rs`'s CLEAN gate performs) must remove only the dirty
@@ -11507,14 +11502,14 @@ mod tests {
         );
         assert!(
             fresh_precomputed.contains_key("sound.cs"),
-            "sound.cs is CLEAN and must keep its fast-path facts — I6 must \
+            "sound.cs is CLEAN and must keep its fast-path facts — the gate must \
              never punish a sound file for an unrelated one failing the gate"
         );
     }
 
-    /// semx-mul phase-2 W0: pins the CLEAN gate's ordering dependency on
+    /// MUL phase 2: pins the CLEAN gate's ordering dependency on
     /// `resolve_go_method_parent_ids` — the exact hazard recorded on the
-    /// semx-mul bead (`mul_precompute_admits` currently hardcodes `_ =>
+    /// MUL change (`mul_precompute_admits` currently hardcodes `_ =>
     /// false` for every language but C++/C#, so `.go` never reaches
     /// `clean_gate_candidate_spans` today; this becomes live the moment
     /// phase 2 admits Go). There is no injectable seam that flips that
@@ -11590,13 +11585,13 @@ mod tests {
         );
     }
 
-    /// semx-dm5t: the id-staleness species itself, at the exact grain it
+    /// the id-staleness species itself, at the exact grain it
     /// bites — a Go method's `PrecomputedFileFacts` entry, built by pass 1
     /// against the pre-rewrite id, must still be reachable by the
     /// post-rewrite id pass 2 actually looks up. Same `Hub`/`Ping`
     /// cross-file receiver shape as
     /// `go_parent_repair_must_run_before_clean_gate_adjudication` above (the
-    /// W0 witness fixture this one is deliberately modeled on), but probing
+    /// witness fixture this one is deliberately modeled on), but probing
     /// `entity_scope_map`/`entity_inner_scope`/`return_type_map` — the three
     /// id-keyed fields `resolve_ref`'s pass-2 lookup (`scope_resolve.rs`,
     /// `entity_inner_scope.get(&entity.id).or_else(|| entity_scope_map.get(&entity.id))`)
@@ -11681,11 +11676,11 @@ mod tests {
         assert!(facts.return_type_map.get(&pre_rewrite_id).is_none());
     }
 
-    /// semx-mp1 / MUL-DESIGN.md §1.2: `TREELESS(F)` is decided from what the
-    /// fused walk actually saw, not a per-language table (I3). Originally
-    /// (semx-mp1, before Field 10/11 existed) a Python file with a real
+    /// `TREELESS(F)` is decided from what the
+    /// fused walk actually saw, not a per-language table. Originally
+    /// (before Field 10/11 existed) a Python file with a real
     /// `import` statement failed the gate outright — Python had no pass-2
-    /// consumer for either descriptor kind yet. MUL phase 2 W5
+    /// consumer for either descriptor kind yet. MUL phase 2
     /// (`mul_precompute_consumes_imports`/`mul_precompute_consumes_calls`)
     /// gave it both, so this now pins the *current* verdict: an import-only
     /// Python file (no `"call"` node) gets fast-path facts, with
@@ -11717,8 +11712,8 @@ mod tests {
         );
     }
 
-    /// semx-mp1: the positive control — a Python file with **no** import and
-    /// **no** `"call"` node (`TREELESS` per §1.2) does get fast-path facts.
+    /// the positive control — a Python file with **no** import and
+    /// **no** `"call"` node (`TREELESS` per) does get fast-path facts.
     #[test]
     fn precompute_scope_resolvable_file_facts_some_when_treeless() {
         let registry = crate::parser::plugins::create_default_registry();
@@ -11740,7 +11735,7 @@ mod tests {
         );
     }
 
-    /// semx-mp1 / MUL-DESIGN.md §4.3: Swift is out of scope in every phase —
+    /// /: Swift is out of scope in every phase —
     /// `build_swift_call_signatures` is corpus-wide, not per-file, so no
     /// Swift file may ever take this fast path regardless of what its own
     /// tree looks like.
@@ -11765,8 +11760,8 @@ mod tests {
         );
     }
 
-    /// semx-mp1: a representative C# file — the family this bead's per-file
-    /// gate targets — gets fast-path facts. Matches MUL-DESIGN.md §2.3's
+    /// a representative C# file — the family this change's per-file
+    /// gate targets — gets fast-path facts. Matches.3's
     /// census finding that C# is 100% TREELESS by bytes (no node kind
     /// `classify_import_stmt` handles fires for `using` directives, and C#'s
     /// call-expression node kind is `invocation_expression`, never the
@@ -11789,11 +11784,11 @@ mod tests {
         );
     }
 
-    /// semx-w5k.2: the shipped default must match the shipped verdict.
-    /// RESOLUTION-PROFILE.md's "MUL P1" section and its memory-lever
+    /// the shipped default must match the shipped verdict.
+    /// The "MUL P1" section and its memory-lever
     /// follow-up both close on "**dotnet stays GATED**" (+21.2%/+32.9%
     /// against a +15% ceiling, both pairs) for C#. C++ was originally "GO,
-    /// unconditionally" (+5.8%/+6.5%) but M1's corrected-protocol,
+    /// unconditionally" (+5.8%/+6.5%) but the corrected-protocol,
     /// corrected-metric re-verification (2026-08-22) found both fields bust
     /// the ceiling on llvm-project (maxRSS +19.98-21.02%, footprint
     /// +26.33-28.11%) — see `mul_precompute_admits`'s doc comment — so C++
@@ -11804,10 +11799,10 @@ mod tests {
     fn mul_phase1_default_matches_the_measured_verdict() {
         assert!(
             !mul_precompute_admits("cpp"),
-            "C++'s M1 re-verification (corrected protocol + corrected \
+            "C++'s 2026-08-22 re-verification (corrected protocol + corrected \
              footprint metric) measured +19.98-21.02% maxRSS / \
              +26.33-28.11% footprint against the +15% ceiling on \
-             llvm-project — above it on both fields, unlike semx-mp1's \
+             llvm-project — above it on both fields, unlike the \
              original +5.8%/+6.5% reading — so it must be opt-in \
              (SEM_MUL_CPP=1) until a memory fix lands"
         );
@@ -11819,7 +11814,7 @@ mod tests {
         // Phase 1 was originally exactly two families (C#, C++); both are
         // now gated. Everything else — java/rust/python are all gated
         // off-by-default via SEM_MUL_JAVA/SEM_MUL_RUST/SEM_MUL_PYTHON,
-        // tested below; go is unconditional (semx-bpn2), tested below too —
+        // tested below; go is unconditional, tested below too —
         // and JS/TS, which has its own unconditional precompute on a
         // different branch — must not reach this producer with the env
         // switches unset.
@@ -11831,8 +11826,8 @@ mod tests {
         }
     }
 
-    /// MUL Phase 2 follow-up (semx-j1fw): rust was admitted unconditionally
-    /// at W2 (RESOLUTION-PROFILE.md's phase-2 W2 section, +11.16%/+11.28%
+    /// MUL Phase 2 follow-up: rust was admitted unconditionally
+    /// at (phase-2 section, +11.16%/+11.28%
     /// against the +15% ceiling), but a same-binary re-verification at
     /// campaign HEAD found the delta re-measures at +17.72%/+19.64%/
     /// +19.35% — above the ceiling, three order-swapped pairs, unanimous
@@ -11842,17 +11837,17 @@ mod tests {
     fn mul_phase2_rust_default_matches_the_measured_verdict() {
         assert!(
             !mul_precompute_admits("rust"),
-            "rust's same-binary peak-RSS re-verification (semx-j1fw) measured \
+            "rust's same-binary peak-RSS re-verification measured \
              +17.72%/+19.64%/+19.35% against the +15% ceiling — above it, \
-             unlike W2's original +11.16%/+11.28% reading — so it must be \
+             unlike the original +11.16%/+11.28% reading — so it must be \
              opt-in (SEM_MUL_RUST=1) until a memory fix lands"
         );
     }
 
-    /// go-fence wave (semx-bpn2): Go's correctness blocker chain closed
-    /// (semx-u3rk/semx-dm5t/semx-9g8q/this bead's own `rekey_entity_ids`
+    /// the Go memory-check work: Go's correctness blocker chain closed
+    /// (/this change's own `rekey_entity_ids`
     /// fix — `edge_dump_probe` ON vs OFF bit-identical on kubernetes,
-    /// 331,117 edges both sides) and its memory fence cleared (+6.78% to
+    /// 331,117 edges both sides) and its memory check cleared (+6.78% to
     /// +8.46% peak footprint, three order-swapped pairs on kubernetes,
     /// under the +15% ceiling; maxRSS flat). Admitted unconditionally —
     /// same shape as phase 1's C++/phase 2's Python at their own admission
@@ -11863,14 +11858,14 @@ mod tests {
     fn mul_phase2_go_default_matches_the_measured_verdict() {
         assert!(
             mul_precompute_admits("go"),
-            "go's correctness blocker chain is closed and its memory fence \
+            "go's correctness blocker chain is closed and its memory check \
              (+6.78% to +8.46% peak footprint, three order-swapped pairs on \
              kubernetes) clears the +15% ceiling on both fields — it must be \
              unconditional, not gated"
         );
     }
 
-    /// MUL Phase 2 (semx-mul, W2 / MUL-DESIGN.md §4.3 Field 10): a Rust file
+    /// MUL: a Rust file
     /// with a real `use` import must now get fast-path facts. This producer
     /// does not itself consult `mul_precompute_admits`/`SEM_MUL_RUST` (that
     /// gate is `graph.rs`'s call-site job) — it only decides TREELESS, and
@@ -11900,14 +11895,14 @@ mod tests {
         );
     }
 
-    /// MUL Phase 2 (semx-mul, W3+W4): the shipped default must match the
+    /// MUL: the shipped default must match the
     /// shipped verdict, same discipline as `mul_phase1_default_matches_the_
     /// measured_verdict`. Java: correctness is clean (bit-identical
     /// edge_dump_probe, full oracle battery) but it busted its own +15%
     /// peak-RSS ceiling on elasticsearch (+20.97%/+21.01%, both pairs) — off
     /// by default, C#'s shape. Go's own default is covered separately by
-    /// `mul_phase2_go_default_matches_the_measured_verdict` (semx-bpn2: now
-    /// unconditional, correctness chain closed, memory fence cleared) — this
+    /// `mul_phase2_go_default_matches_the_measured_verdict` (: now
+    /// unconditional, correctness chain closed, memory check cleared) — this
     /// test used to assert Go's gated state too, back when `edge_dump_probe`
     /// was not yet bit-identical ON vs OFF on kubernetes.
     #[test]
@@ -11920,7 +11915,7 @@ mod tests {
         );
     }
 
-    /// MUL Phase 2 (semx-mul, W3+W4 / MUL-DESIGN.md §4.3 Field 10): a Go file
+    /// MUL: a Go file
     /// with a real multi-spec `import (...)` block must now get fast-path
     /// facts — mirrors `precompute_scope_resolvable_file_facts_some_for_rust_with_imports`.
     /// This producer does not itself consult `mul_precompute_admits`
@@ -11983,8 +11978,7 @@ mod tests {
         );
     }
 
-    /// MUL Phase 2 (semx-mul, W3+W4 / MUL-DESIGN.md §4.3 Field 10, finding
-    /// F4): a Java file with a real `import` statement must now get
+    /// MUL Phase 2: a Java file with a real `import` statement must now get
     /// fast-path facts too. Java's `import_declaration` nodes classify as
     /// `ImportStmtKind::GoImport` (shared grammar kind, `classify_import_stmt`'s
     /// doc comment) and dispatch through `register_go_package_imports`,
@@ -12075,22 +12069,22 @@ mod tests {
         );
     }
 
-    /// M1 follow-up (2026-08-22): python was admitted unconditionally at W5
-    /// (maxRSS -7.95%/-7.80%) and reconfirmed by F1 (maxRSS -1.63% median,
+    /// 2026-08-22 follow-up: python was admitted unconditionally
+    /// (maxRSS -7.95%/-7.80%) and reconfirmed by an earlier re-check (maxRSS -1.63% median,
     /// weaker but still negative) — both readings comfortably under the old
-    /// +15% maxRSS ceiling. M1 re-ran F1's exact protocol capturing *both*
+    /// +15% maxRSS ceiling. The 2026-08-22 re-verification re-ran that exact protocol capturing *both*
     /// `/usr/bin/time -l` fields: maxRSS again reads negative
-    /// (-1.04%/-3.99%/-1.71%), but peak memory footprint — the metric I6 now
-    /// defines the ceiling against — reads +26.02%/+25.29%/+27.44%, above
+    /// (-1.04%/-3.99%/-1.71%), but peak memory footprint — the metric the
+    /// ceiling is now measured against — reads +26.02%/+25.29%/+27.44%, above
     /// the ceiling, three order-swapped pairs, unanimous direction. Demoted
     /// to opt-in (`SEM_MUL_PYTHON=1`), gated like C#/Java/Rust/C++, not
-    /// unconditional like its own original W5/F1 verdict.
+    /// unconditional like its own original verdict.
     #[test]
     fn mul_phase2_python_default_matches_the_measured_verdict() {
         assert!(
             !mul_precompute_admits("python"),
-            "python's maxRSS reading stayed negative under M1's re-verification \
-             (-1.04%/-3.99%/-1.71%), but peak memory footprint — I6's corrected \
+            "python's maxRSS reading stayed negative under the 2026-08-22 re-verification \
+             (-1.04%/-3.99%/-1.71%), but peak memory footprint — the corrected \
              metric — measured +26.02%/+25.29%/+27.44% against the +15% \
              ceiling on home-assistant/core, above it on all three \
              order-swapped pairs, so it must be opt-in (SEM_MUL_PYTHON=1) \
@@ -12098,7 +12092,7 @@ mod tests {
         );
     }
 
-    /// MUL Phase 2 (semx-mul, W5 / MUL-DESIGN.md §4.3 Field 10+11): a Python
+    /// MUL: a Python
     /// file with both a real import statement *and* a real `"call"` node
     /// must now get fast-path facts — mirrors the Rust/Go/Java "some_for_..."
     /// tests, but Python needs both `mul_precompute_consumes_imports` *and*
@@ -12165,11 +12159,11 @@ mod tests {
         );
     }
 
-    /// MUL-DESIGN.md §4.3 Field 11 (semx-mul phase 2 W5): record-vs-direct
+    /// (MUL phase 2): record-vs-direct
     /// equivalence witness for the ctor-call scan, mirroring
     /// `record_then_dispatch_matches_dispatch_direct`'s proof for Field 10.
     ///
-    /// semx-f3: this used to compare against a *fresh test-local
+    /// this used to compare against a *fresh test-local
     /// transcription* of `scan_constructor_calls`/`infer_expr_type`, written
     /// once by the same author who wrote the refactor it was meant to check
     /// — a self-agreement risk (a transcription error shared between spec
@@ -12177,7 +12171,7 @@ mod tests {
     /// below (`frozen_pre_w5_scan_constructor_calls`/
     /// `frozen_pre_w5_infer_expr_type`) are instead extracted verbatim from
     /// git history — `git show 9c80258^:crates/sem-core/src/parser/
-    /// scope_resolve.rs`, the commit immediately before W5 deleted the
+    /// scope_resolve.rs`, the commit immediately before deleted the
     /// original direct-dispatch scan — with only mechanical renames to avoid
     /// colliding with `record_ctor_call_sites`/`apply_ctor_call_facts`'s own
     /// names. This makes the "direct" side genuinely independent evidence: a
@@ -12185,8 +12179,8 @@ mod tests {
     /// test, not a paraphrase written to match it.
     #[test]
     fn record_then_apply_matches_direct_scan_for_ctor_calls() {
-        // --- frozen pre-W5 originals from commit 9c80258^ (parent of "semx-mul
-        // phase-2 W5: build Field 11 (ctor_call_sites)"), verbatim except for
+        // --- frozen prior originals from commit 9c80258^ (parent of "MUL
+        // phase-2: build Field 11 (ctor_call_sites)"), verbatim except for
         // the `frozen_pre_w5_` name prefix. Do not edit to "improve" or
         // "modernize" — any behavioral drift here defeats the point of this
         // test. If real behavior needs to change, change the production
@@ -12294,7 +12288,7 @@ mod tests {
                 _ => None,
             }
         }
-        // --- end frozen pre-W5 originals ---
+        // --- end frozen prior originals ---
 
         let registry = crate::parser::plugins::create_default_registry();
         let source = "class Connection:\n    def __init__(self):\n        pass\n\n\nclass Transaction:\n    def __init__(self, conn):\n        self.conn = conn\n\n\ndef get_connection():\n    return Connection()\n\n\nt = Transaction(get_connection())\n";
@@ -12343,7 +12337,7 @@ mod tests {
         assert_eq!(
             record_apply_result, direct_result,
             "record_ctor_call_sites + apply_ctor_call_facts must land on the \
-             same instance_attr_types as the frozen pre-W5 direct tree walk \
+             same instance_attr_types as the frozen prior direct tree walk \
              (commit 9c80258^) -- genuinely independent evidence, not a \
              self-transcribed spec"
         );
@@ -12436,7 +12430,7 @@ mod tests {
 
         // `deterministic_return_types_by_name` reaches a name through
         // `entity_map`, so both candidates must be present here for the test to
-        // exercise the tie-break it is about (semx-4an).
+        // exercise the tie-break it is about.
         let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
         for (id, file) in [
             ("z_backup.py::function::make_conn", "z_backup.py"),
@@ -12512,7 +12506,7 @@ mod tests {
     }
 
     /// Filter semantics of the shared `build_go_pkg_index`, which graph.rs's
-    /// cold build path delegates to (semx-k07t unification + the deferred
+    /// cold build path delegates to (unification + the deferred
     /// route deletion): a Go file contributes to the index via its
     /// DIRECTORY name only — Go import paths name packages, which are
     /// directories, never files, so a bucket keyed on a file's own
@@ -12632,7 +12626,7 @@ mod tests {
         }
     }
 
-    /// semx-u3rk: the collision at the root of kubernetes's 30,801-line
+    /// the collision at the root of kubernetes's 30,801-line
     /// `edge_dump_probe` divergence, reproduced as a minimal fixture. Two
     /// distinct Go packages, both declared in a directory literally named
     /// `v1` (kubernetes has dozens — one per API group), each with its own
@@ -12709,14 +12703,14 @@ mod tests {
         );
     }
 
-    /// semx-u3rk: `register_go_package_imports` must resolve a
+    /// `register_go_package_imports` must resolve a
     /// package-qualified call to the *importing file's own* package, never
     /// a same-named package elsewhere in the repo — the fix for the
     /// collision the test above proves exists in the raw index. A file that
     /// imports kubeadm's `v1` (full import path, not just "v1") must get
     /// kubeadm's `DeepCopyInto` in its `import_table`, never
     /// pod-security-admission's — the exact substitution kubernetes's
-    /// `edge_dump_probe` diff caught (30,801 lines, MUL-DESIGN.md's
+    /// `edge_dump_probe` diff caught (30,801 lines,
     /// Go-admission finding).
     #[test]
     fn register_go_package_imports_resolves_the_file_own_import_not_a_same_named_collision() {
@@ -12811,7 +12805,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // BS3-witness: the triple-walk fusion invariant (semx-3ao).
+    // The fusion-witness: the triple-walk fusion invariant.
     //
     //   ∀ file.  fused(tree) ≡ ( build_scopes_from_ast(tree);
     //                            collect_all_file_refs(tree);
@@ -12969,7 +12963,7 @@ mod tests {
         /// worklist traversal, building one `ImportStmtFacts` descriptor per
         /// handled node and resolving it immediately (no batching).
         SpecSequential,
-        /// Record-then-dispatch (MUL-DESIGN.md §4.3 Field 10, semx-mul
+        /// Record-then-dispatch (MUL
         /// phase 2): the pruned-subtree traversal's own composition,
         /// `record_import_stmts_pruned` (collect every descriptor into a
         /// `Vec`, in traversal order) then `dispatch_import_stmts_from_facts`
@@ -13198,23 +13192,23 @@ mod tests {
     fn assert_outcomes_equal(spec: &WalkOutcome, fused: &WalkOutcome, label: &str) {
         assert_eq!(
             spec.scopes, fused.scopes,
-            "BS3-witness: scopes diverged on {label}"
+            "fusion-witness: scopes diverged on {label}"
         );
         assert_eq!(
             spec.entity_scope_map, fused.entity_scope_map,
-            "BS3-witness: entity_scope_map diverged on {label}"
+            "fusion-witness: entity_scope_map diverged on {label}"
         );
         assert_eq!(
             spec.entity_inner_scope, fused.entity_inner_scope,
-            "BS3-witness: entity_inner_scope diverged on {label}"
+            "fusion-witness: entity_inner_scope diverged on {label}"
         );
         assert_eq!(
             spec.ast_refs, fused.ast_refs,
-            "BS3-witness: ast_refs (incl. order) diverged on {label}"
+            "fusion-witness: ast_refs (incl. order) diverged on {label}"
         );
         assert_eq!(
             spec.import_table, fused.import_table,
-            "BS3-witness: import_table diverged on {label}"
+            "fusion-witness: import_table diverged on {label}"
         );
     }
 
@@ -13477,8 +13471,8 @@ mod tests {
         }
     }
 
-    /// MUL Phase 2 (semx-mul, W3+W4): Java's import statements are the
-    /// documented no-op (finding F4 — `import_declaration` classifies as
+    /// MUL: Java's import statements are the
+    /// documented no-op (`import_declaration` classifies as
     /// `GoImport`, which only ever resolves against `.go`-suffixed
     /// entities). This fixture still carries two real imports so the walk
     /// records descriptors for them (Field 10 must fire even though
@@ -13627,12 +13621,12 @@ mod tests {
             family_imports[2] > 0,
             "non-vacuity: rust samples resolved no imports"
         );
-        // MUL Phase 2 (semx-mul, W3+W4): go's aliased multi-spec import
+        // MUL: go's aliased multi-spec import
         // block (`gen_go`'s "example.com/pkg/util" registered against
         // `pkg/util/util.go::DoWork`) must actually resolve through
         // `go_pkg_index` — this was an unasserted gap (every other
         // resolvable-import family had this check, go did not) closed by
-        // this bead since it is now touching this exact test.
+        // this change since it is now touching this exact test.
         assert!(
             family_imports[3] > 0,
             "non-vacuity: go samples resolved no imports"
@@ -13643,7 +13637,7 @@ mod tests {
             family_imports[1], 0,
             "csharp samples must resolve no imports (no matching kinds)"
         );
-        // MUL Phase 2 (semx-mul, W3+W4 / finding F4): Java's imports
+        // MUL Phase 2: Java's imports
         // classify as GoImport (shared grammar kind) but `go_pkg_index`
         // only ever matches `.go`-suffixed entities, so dispatch is a
         // documented no-op — the fused walk still records descriptors
@@ -13694,7 +13688,7 @@ mod tests {
         );
     }
 
-    /// MUL-DESIGN.md §4.3 Field 10 (semx-mul phase 2): explicit
+    /// (MUL phase 2): explicit
     /// record-then-dispatch vs dispatch-direct equivalence witness, on top
     /// of `fused_triple_walk_matches_three_sequential_walks`'s
     /// `SpecSequential`-vs-`FusedReplay` comparison (which this refactor
@@ -13985,7 +13979,7 @@ mod tests {
         }
     }
 
-    /// semx-9g8q test (a): when one scope's `.defs` and `.bindings`
+    /// test (a): when one scope's `.defs` and `.bindings`
     /// co-populate the same name — exactly what happens once the
     /// function-like branch's registration loop inserts a nested entity into
     /// `.defs` while `scan_assignments` records the same declarator as a
@@ -14064,7 +14058,7 @@ mod tests {
         assert_eq!(second, direct);
     }
 
-    /// semx-9g8q test (b): the shadow-safety property the old
+    /// test (b): the shadow-safety property the old
     /// `is_local_binding_in_scopes_cached` gate protected must survive. A
     /// `.bindings`-only hit in a *nearer* scope stops the walk even when an
     /// ancestor scope has a `.defs` entry for the same name — the resolver

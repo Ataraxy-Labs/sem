@@ -37,9 +37,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // `sem mcp --resident` used to serve only the per-repo sidecar unix socket
-// (QUERY-INDEX.md §7 item 5 / GREP-KILLER S4, semx-woe): 0% availability at
-// production scale (the socket accepted connections and never answered —
-// §1.5), a +300ms tax on every CLI call that tried it, ~2.6GB steady RSS,
+// (GREP-KILLER S4): 0% availability at
+// production scale (the socket accepted connections and never answered),
+// a +300ms tax on every CLI call that tried it, ~2.6GB steady RSS,
 // and ~935 leaked sockets observed in the wild. The index it existed to
 // work around now answers cold in 6-7ms, which deleted the justification
 // (the "fresh process + SQLite hydrate (~800ms)" the sidecar's own docs

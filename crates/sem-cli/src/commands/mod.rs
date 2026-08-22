@@ -69,7 +69,7 @@ pub fn normalize_repo_relative_path(cwd: &Path, repo_root: &Path, path: &str) ->
     let cwd_base = normalize_existing_prefix(cwd).unwrap_or_else(|| normalize_lexical(cwd));
     let repo_root_base =
         normalize_existing_prefix(repo_root).unwrap_or_else(|| normalize_lexical(repo_root));
-    // semx-q344: an already-absolute `path` must be canonicalized the same
+    // an already-absolute `path` must be canonicalized the same
     // way `cwd`/`repo_root` are above, or `strip_prefix` below compares two
     // representations of the same directory that were resolved through
     // different rules and can permanently disagree. On Windows this is not
@@ -450,7 +450,7 @@ mod tests {
         fs::remove_dir_all(temp).expect("remove temp dir");
     }
 
-    // semx-q344: `path` arrives already-absolute at this call site whenever the
+    // `path` arrives already-absolute at this call site whenever the
     // caller pre-joins it (e.g. `entities.rs`'s directory reroute does
     // `root.join(path_arg)` before calling here). The absolute branch used to
     // skip `normalize_existing_prefix` — i.e. it never canonicalized `path`
@@ -500,7 +500,7 @@ mod tests {
             normalized, "sub",
             "expected the symlink-traversed absolute path to resolve to a \
              repo-relative path, got {normalized:?} (a non-relative fallback \
-             here is exactly the semx-q344 empty-listing shape: the caller's \
+             here is exactly the empty-listing shape: the caller's \
              `files_under` prefix then matches nothing)"
         );
         fs::remove_dir_all(temp).expect("remove temp dir");

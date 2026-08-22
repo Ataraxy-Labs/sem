@@ -1,4 +1,4 @@
-//! Cross-process oracle + timing probe for the on-disk facts store (semx-9en).
+//! Cross-process oracle + timing probe for the on-disk facts store.
 //!
 //! Not part of the public API and not wired into any product code path.
 //!
@@ -32,16 +32,16 @@ use sem_core::parser::registry::ParserRegistry;
 use sem_core::parser::session::GraphSession;
 use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
 
-const PROBE_SUFFIX_JS_TS: &str = "\n// semx-9en probe\nfunction __semx9enHelper() { return 1; }\nexport function __semx9enProbe() { return __semx9enHelper(); }\n";
+const PROBE_SUFFIX_JS_TS: &str = "\n// facts probe\nfunction __factsHelper() { return 1; }\nexport function __factsProbe() { return __factsHelper(); }\n";
 const PROBE_SUFFIX_PY: &str =
-    "\n\ndef __semx9en_helper():\n    return 1\n\n\ndef __semx9en_probe():\n    return __semx9en_helper()\n";
+    "\n\ndef __facts_helper():\n    return 1\n\n\ndef __facts_probe():\n    return __facts_helper()\n";
 const PROBE_SUFFIX_GO: &str =
-    "\n\nfunc semx9enHelper() int { return 1 }\n\nfunc semx9enProbe() int { return semx9enHelper() }\n";
+    "\n\nfunc factsHelper() int { return 1 }\n\nfunc factsProbe() int { return factsHelper() }\n";
 const PROBE_SUFFIX_RUST: &str =
-    "\n\nfn semx9en_helper() -> i32 { 1 }\n\npub fn semx9en_probe() -> i32 { semx9en_helper() }\n";
+    "\n\nfn facts_helper() -> i32 { 1 }\n\npub fn facts_probe() -> i32 { facts_helper() }\n";
 
 /// A same-file, syntactically-valid append for whichever language `path`
-/// detects as (semx-kzy: generalized past the JS/TS-only original so this
+/// detects as (: generalized past the JS/TS-only original so this
 /// probe can exercise the newly-attributed languages too). Falls back to the
 /// JS/TS snippet for anything else — callers only ever invoke this on a path
 /// [`is_reuse_eligible`] already accepted, so the fallback is unreachable in
@@ -101,7 +101,7 @@ fn is_js_ts(path: &str) -> bool {
 }
 
 /// Mirrors `sem_core::parser::import_resolution::is_reuse_eligible_file`
-/// (semx-kzy), duplicated here because that function is `pub(crate)` and this
+/// Duplicated here because that function is `pub(crate)` and this
 /// probe links against the crate as an ordinary dependent, not from inside
 /// it. Extensions must be kept in sync by hand; both lists are small and
 /// change rarely.

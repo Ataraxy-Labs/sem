@@ -1,11 +1,11 @@
-//! One-off diagnostic (semx-jo1 follow-up): dump every resolved edge,
+//! One-off diagnostic (follow-up): dump every resolved edge,
 //! sorted, so two runs (e.g. at different `SCOPE_RESOLVE_FILE_CHUNK_SIZE`
 //! values) can be diffed to find exactly which edge(s) differ. Not part of
-//! the public example surface this bead ships.
+//! the public example surface this change ships.
 //!
 //! Usage: cargo run --release --example edge_dump_probe -- <repo_root> <out_file>
 //!
-//! DANGLING_EDGE_ORACLE (semx-bpn2, go-fence follow-up): every edge's
+//! DANGLING_EDGE_ORACLE (a follow-up to the Go memory-check work): every edge's
 //! `to_entity`/`from_entity` must name a real id in this same build's
 //! entity set — the invariant `PrecomputedFileFacts::rekey_entity_ids`'
 //! `Scope::defs`/`Scope::owner_id` gap violated (a stale pre-Go-rewrite id

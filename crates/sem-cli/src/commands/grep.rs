@@ -1,9 +1,8 @@
-//! `sem grep <pattern>` — the text tier (`sem_core::index::grep`, semx-az9).
+//! `sem grep <pattern>` — the text tier (`sem_core::index::grep`).
 //! Same shape as `commands::query`'s verbs: answer from the mmap index when
 //! one exists and has a trigram tier, fall back to a fresh walk + full scan
 //! otherwise (which then leaves an index for next time). rg-compatible
-//! `file:line:text` output. See `QUERY-INDEX.md`'s trigram section for the
-//! design, the budget outcome, and the measured `sem`-vs-`rg` table.
+//! `file:line:text` output.
 
 use colored::Colorize;
 use sem_core::index::grep::{self, CandidateOrigin, GrepHit};

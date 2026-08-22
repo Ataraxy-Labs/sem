@@ -1,9 +1,9 @@
-//! MUL-A (semx-mul phase A) violation census: measure, per language family and
+//! MUL-A (MUL phase A) violation census: measure, per language family and
 //! per file, whether the property that licenses `PrecomputedFileFacts` actually
 //! holds on real corpora.
 //!
-//! The license (`precompute_js_ts_file_facts`'s doc comment, W3 §5's second
-//! fence) is stated as "declarations never nest across files", which is claimed
+//! The license (`precompute_js_ts_file_facts`'s doc comment) is stated as
+//! "declarations never nest across files", which is claimed
 //! FALSE for C# (partial classes) and C++ (out-of-line member definitions). But
 //! the property the *code* needs is narrower and exactly checkable: pass 2's
 //! scope walk consults the corpus-wide `children_by_parent`/`entity_map` only
@@ -16,13 +16,13 @@
 //! i.e. no entity outside F may name an entity of F as its parent. This probe
 //! measures exactly that, plus:
 //!
-//!   * the *structural* half of the fence, per file: would this file's tree
+//!   * the *structural* half of the property, per file: would this file's tree
 //!     still be needed in pass 2 after the walk's outputs were precomputed?
 //!     That is true iff it contains an import statement kind
 //!     `classify_import_stmt` handles (Python/Rust/Go/Java/TS) or a Python-style
 //!     `call` node (ctor-infer's `scan_constructor_calls`) or is `.swift`
 //!     (`build_swift_call_signatures`).
-//!   * the raw language constructs the fence names, counted from source:
+//!   * the raw language constructs the property names, counted from source:
 //!     C# `partial` type declarations, C++ out-of-line member definitions
 //!     (`Type::member(...)` at declaration position).
 //!   * source bytes per family, which is the memory arithmetic's input
@@ -140,7 +140,7 @@ struct FamilyStats {
     needs_tree_swift: u64,
     needs_tree_any: u64,
     parse_failures: u64,
-    /// language constructs the fence names, counted from source
+    /// language constructs the property names, counted from source
     cs_partial_types: u64,
     cs_files_with_partial: u64,
     cpp_out_of_line_defs: u64,
@@ -193,7 +193,7 @@ fn count_cs_partial(content: &str) -> u64 {
 /// by an identifier chain containing `::` and which is not a call statement
 /// (heuristic: line does not end in `;` before the brace and starts at column 0
 /// or after a return type). Deliberately generous — an over-count is the
-/// conservative direction for a fence census.
+/// conservative direction for this census.
 fn count_cpp_out_of_line(content: &str) -> u64 {
     let mut n = 0u64;
     for line in content.lines() {

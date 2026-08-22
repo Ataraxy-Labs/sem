@@ -9,7 +9,6 @@ homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["diff", "semantic", "git", "cli", "code-review"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
-exclude = ["DATA-FLOW.md"]
 
 [[bin]]
 name = "sem"
@@ -34,7 +33,7 @@ clap_complete_command = "0.6.1"
 mimalloc = "0.1"
 ureq = { version = "2", features = ["json"] }
 indicatif = "0.17"
-# Facts service wire format (commands/diff/facts_remote.rs, semx-9en cloud
+# Facts service wire format (commands/diff/facts_remote.rs, cloud
 # half): same crate + version sem-core's facts_store.rs uses, so a fact
 # payload's CBOR encoding is byte-compatible with sem-cloud's facts service.
 ciborium = "0.2"

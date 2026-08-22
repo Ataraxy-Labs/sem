@@ -16,16 +16,15 @@
 //! every file would be far worse than an exact answer on some files, because
 //! there would be no subset anyone could trust.
 //!
-//! # Identity: kappa here is parser-scoped, and that is a correction to
-//! # KAPPA.md
+//! # Identity: kappa here is parser-scoped, and that is a correction
 //!
-//! `KAPPA.md` describes kappa as "a parser-independent semantic identity",
+//! kappa is documented as "a parser-independent semantic identity",
 //! spec'd so another parser's typed AST could reproduce it. Reimplementing it
-//! here is that spec's first test, and it fails — see `KAPPA.md`'s errata
-//! section. The spec hashes tree-sitter's `kind()` *strings* for internal
+//! here is that spec's first test, and it fails: the spec hashes
+//! tree-sitter's `kind()` *strings* for internal
 //! named nodes, so reproducing a value requires reproducing
 //! tree-sitter-typescript's grammar shape node for node, which is the CST
-//! fidelity `OXC-FASTPATH.md` already proved unreachable. The empirical
+//! fidelity already proved unreachable. The empirical
 //! proof is cheap: the same four bytes of source at `.ts`, `.tsx`, `.js` and
 //! `.jsx` yield **two** distinct kappa values today, because the TypeScript
 //! and JavaScript grammars wrap parameters differently. A hash that changes
@@ -123,7 +122,7 @@ fn source_type_for(file_path: &str) -> Option<SourceType> {
 
 /// Hash an entity's source slice as a canonical token stream.
 ///
-/// This is `KAPPA.md`'s canonicalization discipline applied to tokens instead
+/// This is canonicalization discipline applied to tokens instead
 /// of to a CST: comments and whitespace are dropped because they are not
 /// semantics; `;` and `,` are dropped because they are the two punctuation
 /// marks a formatter (or ASI) legitimately adds and removes without changing

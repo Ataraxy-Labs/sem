@@ -1,18 +1,18 @@
-//! The build plane's warm-cache tier, and `index.sem`'s writer (semx-gpu
-//! census, QUERY-INDEX.md §15; the SQL `DiskCache` itself moved to
-//! `sem_core::persist::disk_cache` under semx-r94 — see that module's doc for
+//! The build plane's warm-cache tier, and `index.sem`'s writer (
+//! the SQL `DiskCache` itself moved to
+//! `sem_core::persist::disk_cache` under — see that module's doc for
 //! why `sem-core`, and for the divergences the unification reconciled).
 //!
 //! This crate is now a thin consumer: `DiskCache`/`PartialCache`/
 //! `FileCacheColumns`/`CacheSourceScope` are re-exported from `sem-core`
 //! unchanged, and this file keeps only what is genuinely `sem-cli`'s own —
 //! `write_query_index`/`write_index_only` (`index.sem` is never written by
-//! `sem-mcp`, per QUERY-INDEX.md §15.3's superseding note), the profiling
+//! `sem-mcp`, per the superseding note), the profiling
 //! marks gated by `SEM_PROFILE_CACHE=1`, and three small orchestration
 //! wrappers (`save_full_with_index`/`save_topology_with_index`/
 //! `save_incremental_with_index`) that call the unified `DiskCache`'s SQL-only
 //! save methods and then write `index.sem` from the same corpus read,
-//! preserving the single-read fusion (semx-3tb) the old, since-deleted
+//! preserving the single-read fusion the old, since-deleted
 //! `sem-cli`-local `DiskCache::save_with_test_dirs`/`save_topology` used to
 //! perform internally — `DiskCache` itself couldn't keep doing that once it
 //! also had to serve `sem-mcp`, which never writes `index.sem` at all
@@ -38,7 +38,7 @@ use sem_core::parser::graph::{EntityInfo, EntityInfoMap, EntityRef, RefType};
 // `PartialCache` is used only structurally by callers (`partial.stale_files`
 // etc., never named), so this bin crate's unused-import lint flags it even
 // though it's part of the re-exported surface — same shape `pub struct
-// PartialCache` had here before semx-r94 moved its definition to `sem-core`.
+// PartialCache` had here before moved its definition to `sem-core`.
 #[allow(unused_imports)]
 pub use shared_cache::{CacheSourceScope, DiskCache, FileCacheColumns, PartialCache};
 
@@ -50,7 +50,7 @@ use crate::corpus_columns::CorpusColumns;
 /// single cached bool load; never changes what is written, only what is
 /// printed to stderr.
 ///
-/// Coarser than before semx-r94 for the SQL phase specifically: the unified
+/// Coarser than before for the SQL phase specifically: the unified
 /// `DiskCache::save_with_test_dirs_precomputed`'s own sub-phase marks
 /// (`corpus_columns_single_read`'s SQL-side siblings — file insert, manifest
 /// refresh, import refresh, entity/edge insert, test-flag write, commit) no
@@ -59,7 +59,7 @@ use crate::corpus_columns::CorpusColumns;
 /// (`sqlite_save_total`) instead. `insert_entities_with_content_store`'s own
 /// marks (`file_reads_parallel`/`entity_inserts_serial`/`compress_parallel`/
 /// `file_contents_insert_serial`) are unaffected — they were already living
-/// in the shared substrate before this bead.
+/// in the shared substrate before this change.
 fn cache_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("SEM_PROFILE_CACHE").as_deref() == Ok("1"))
@@ -74,7 +74,7 @@ pub(crate) fn cache_profile_mark(phase: &str, t0: std::time::Instant) {
     }
 }
 
-/// Byte spans for every entity that has one (semx-a3w), keyed by entity id —
+/// Byte spans for every entity that has one, keyed by entity id —
 /// the shape `index::build_with_trigrams_and_dirs_and_tests_and_spans` wants
 /// for its `entity_byte_spans` parameter. The datum lives on `SemanticEntity`
 /// (`start_byte`/`end_byte`), which the index writer never sees (it only
@@ -113,27 +113,26 @@ fn to_file_cache_columns(columns: &CorpusColumns) -> Vec<FileCacheColumns> {
 }
 
 /// Write *only* the on-disk query index for a finished build — no SQLite
-/// connection, no schema, no `cache.db` (semx-4ex, RESOLUTION-PROFILE.md
-/// W4.5).
+/// connection, no schema, no `cache.db`.
 ///
 /// This is what `sem graph`'s cold/dirty build path does now. It is the whole
 /// save plane that path's own answers need: `sem graph` is served forever
-/// after from `index.sem` (`try_index_graph`), and W4's cache.db-deleted
+/// after from `index.sem` (`try_index_graph`), and cache.db-deleted
 /// experiment measured every other verb byte-identical and equally fast from
 /// the index too. Producing the SQL mirror there was a write with no reader on
 /// the verb that paid for it — the biggest single item in the cold build
-/// (linux 24.3 s pre-W4, ~9 s post-W4).
+/// (linux 24.3 s pre-~9 s post-).
 ///
 /// The three inputs `write_query_index` cannot derive for itself are computed
 /// here exactly as `save_full_with_index` computes them, and by the same
 /// functions, so the image this writes is byte-identical to the one a full
 /// save would have written beside its tables:
 ///
-/// * the one post-graph corpus read (`CorpusColumns::read`, semx-3tb),
+/// * the one post-graph corpus read (`CorpusColumns::read`),
 /// * the test classification (`filter_test_entities_with_custom_dirs` — the
 ///   same call `DiskCache`'s save methods make before inserting
 ///   `entity_flags`),
-/// * the entity byte spans (semx-a3w).
+/// * the entity byte spans.
 ///
 /// Callers that *do* need the SQL mirror (the content-hydrating verbs, and
 /// anyone who opts back in with `SEM_BUILD_CACHE=1`) keep calling
@@ -195,11 +194,11 @@ pub(crate) fn write_query_index(
         return;
     }
 
-    // semx-3tb: the index's two inputs — the fingerprint's `content_hash`
-    // (`parser::incremental::content_hash`, xxh3-64; QUERY-INDEX.md §3.5
+    // the index's two inputs — the fingerprint's `content_hash`
+    // (`parser::incremental::content_hash`, xxh3-64;
     // pins the index to it so Verified freshness can compare against what a
     // re-extraction would produce) and the TRIGRAM tier's per-file trigram
-    // sets (S3, semx-az9) — are two columns of the build's *one* corpus
+    // sets (S3) — are two columns of the build's *one* corpus
     // read, which the save path performed before calling this. Only a caller
     // with no save behind it (`commands::query`'s index-only cold path)
     // passes `None` and reads here; then this *is* that one read, not a
@@ -210,7 +209,7 @@ pub(crate) fn write_query_index(
 
     let fingerprints = columns.fingerprints();
 
-    // DIRS (semx-ykf, `Complete` freshness — QUERY-INDEX.md §2/§10.6): every
+    // DIRS (`Complete` freshness —): every
     // distinct ancestor directory of every fingerprinted file, all levels
     // (`writer::DirFingerprint`'s doc explains why leaf parents alone aren't
     // enough), plus the repo root itself (`""`) so an empty corpus still has
@@ -247,7 +246,7 @@ fn ancestors_of(path: &str) -> impl Iterator<Item = String> + '_ {
 
 /// Stat every distinct ancestor directory of `fingerprints`' paths, in
 /// parallel — the same `stat` primitive `rows` above already used for files,
-/// just over a much smaller set (directories, not files: §1.6's measured
+/// just over a much smaller set (directories, not files: measured
 /// ratio on the monster is 40,877 files to a few thousand directories).
 /// Directories whose mtime can't be read (raced away between the file walk
 /// and here) are silently dropped: a `DirFingerprint` this build never
@@ -284,7 +283,7 @@ fn build_dir_fingerprints(
 }
 
 /// Full save (`cache.db`'s content tables) plus `index.sem`, from one corpus
-/// read shared between both writes (semx-3tb, preserved across semx-r94's
+/// read shared between both writes (preserved across 's
 /// move of the SQL half to `sem-core` — see this module's doc).
 pub(crate) fn save_full_with_index(
     disk: &DiskCache,
@@ -397,7 +396,7 @@ pub(crate) fn save_incremental_with_index(
     // No classification available here: the incremental path never
     // recomputes `entity_flags` either, so handing `None` keeps the two
     // stores honest about the same gap rather than stamping a stale
-    // classification into the image (semx-zvq).
+    // classification into the image.
     write_query_index(root, all_files, graph, None, None, None);
     Ok(())
 }
@@ -1380,8 +1379,8 @@ mod tests {
         }
     }
 
-    /// v1.1 (semx-2i2): kappa must round-trip through the on-disk SQLite
-    /// entity cache, which previously always dropped it (KAPPA.md's
+    /// v1.1: kappa must round-trip through the on-disk SQLite
+    /// entity cache, which previously always dropped it (
     /// "coverage gaps" section, closed here by the `entities.kappa` column
     /// and the `CACHE_SCHEMA_VERSION` bump). Uses REAL extraction (the
     /// actual `CodeParserPlugin`, not a hand-built entity) so this proves

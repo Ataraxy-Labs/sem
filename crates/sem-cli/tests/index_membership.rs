@@ -1,7 +1,6 @@
-//! The new-file battery for `Complete` freshness (semx-ykf, `QUERY-INDEX.md`
-//! §2/§10.6): black-box, CLI-level proof that the index-backed verbs
+//! The new-file battery for `Complete` freshness: black-box, CLI-level proof that the index-backed verbs
 //! (`find`/`callers`/`refs`/`grep`) see a file created, deleted, or renamed
-//! *after* the index was built — the membership blind spot the bead exists
+//! *after* the index was built — the membership blind spot the change exists
 //! to close. Every test primes an index first (any index-backed command
 //! that finds nothing self-heals by writing one, per `commands::query`'s
 //! module doc), mutates the filesystem, then re-runs the verb and asserts
@@ -46,7 +45,7 @@ fn sem(repo: &Path, cache: &Path, args: &[&str]) -> Output {
 
 /// Prime an index for `repo` (`cache`'s per-repo `index.sem`) by running any
 /// index-backed verb once — `commands::query`'s cold-build fallback always
-/// self-heals by writing a fresh index (`QUERY-INDEX.md` §4.1's write-path
+/// self-heals by writing a fresh index (write-path
 /// wiring), so a first call on an empty cache is exactly "build the index".
 fn prime_index(repo: &Path, cache: &Path) {
     assert_success(
@@ -56,7 +55,7 @@ fn prime_index(repo: &Path, cache: &Path) {
 }
 
 /// Wait until `dir`'s mtime has visibly moved past `before` — the POSIX
-/// signal `Complete` freshness (`QUERY-INDEX.md` §2) leans on: creating,
+/// signal `Complete` freshness leans on: creating,
 /// deleting, or renaming a directory entry bumps the directory's own mtime.
 /// Mirrors `impact_direct_deps.rs`'s `rewrite_after_mtime_tick`, but for a
 /// directory rather than a file's content.

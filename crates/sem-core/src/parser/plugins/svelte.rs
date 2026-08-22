@@ -610,7 +610,7 @@ impl<'a> SvelteLowerer<'a> {
             structural_hash,
             // Svelte's markup-node entities aren't extracted from the
             // tree-sitter `code` plugin's node-based path -- kappa isn't
-            // computed for this plugin in v1. See KAPPA.md's coverage note.
+            // computed for this plugin in v1.
             kappa: None,
             content,
             start_line,

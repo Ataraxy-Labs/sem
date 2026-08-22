@@ -1,7 +1,7 @@
-//! Invariant witnesses for the single-pass columnar build (semx-3tb / W1).
+//! Invariant witnesses for the single-pass columnar build.
 //!
 //! These are **invariant tests, not example tests**: each one states an
-//! equation from `SINGLE-PASS.md` and samples it over generated inputs. The
+//! equation from and samples it over generated inputs. The
 //! unfused side of every equation is real production code kept alive as the
 //! specification, so a test cannot degrade into "the new code agrees with
 //! itself".
@@ -76,7 +76,7 @@ impl Gen {
     }
 }
 
-/// **L-HASH-ENC** (`SINGLE-PASS.md` §1.3)
+/// **L-HASH-ENC**
 ///
 /// ```text
 /// ∀ b : bytes.  utils::hash::content_hash_bytes(b) = hex₁₆(incremental::content_hash_bytes(b))
@@ -86,7 +86,7 @@ impl Gen {
 /// `FileFingerprint.content_hash` are the same xxh3-64 in two encodings, not
 /// two hashes. This is the equation that licenses deleting an entire
 /// full-corpus read and an entire full-corpus hash from the save path — both
-/// `build_cache.rs`'s prior comment and semx-ccg's commit message asserted
+/// `build_cache.rs`'s prior comment and commit message asserted
 /// the two were distinct, so the invariant is asserted here rather than
 /// believed.
 ///
@@ -147,7 +147,7 @@ fn hash_bytes_extends_hash_str() {
     );
 }
 
-/// **L-TRIGRAM-SRC** (`SINGLE-PASS.md` §2, pass L; the fold-fusion witness
+/// **L-TRIGRAM-SRC** (pass L; the fold-fusion witness
 /// for the trigram half of the fused read)
 ///
 /// ```text

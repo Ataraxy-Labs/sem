@@ -1,4 +1,4 @@
-//! W2 (semx-au8) parse-ceiling probe: where does parse wall-clock actually go,
+//! parse-ceiling probe: where does parse wall-clock actually go,
 //! and is it work-bound or span-bound?
 //!
 //! Not part of the public API and not wired into any product code path. It
@@ -27,7 +27,7 @@
 /// allocator; a plain example gets macOS's system allocator instead. Since the
 /// whole question here is whether parse is work-bound or contention-bound, the
 /// probe has to run on the allocator the product runs on, or it measures the
-/// wrong ceiling. semx-au8.
+/// wrong ceiling.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

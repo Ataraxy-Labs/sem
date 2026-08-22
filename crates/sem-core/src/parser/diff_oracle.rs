@@ -2,7 +2,7 @@
 //!
 //! # Why the gate lives here and not at the hash level
 //!
-//! `OXC-FASTPATH.md` declined an oxc fast path because `structural_hash` is
+//! declined an oxc fast path because `structural_hash` is
 //! defined by a walk over tree-sitter's *concrete* syntax tree — every
 //! grammar production, including anonymous punctuation — and a typed AST has
 //! no such nodes to walk. That is true and unfixable, and it is also the
@@ -30,7 +30,7 @@
 //! is not a softening: kappa's values are defined by a walk over tree-sitter
 //! node-kind strings, so they are grammar-shaped, and demanding value equality
 //! across parsers would demand CST fidelity through the back door — the exact
-//! thing `OXC-FASTPATH.md` proved unreachable. What kappa is *for* is deciding
+//! thing proved unreachable. What kappa is *for* is deciding
 //! which entities share a semantic identity; that is what gets compared.
 //!
 //! # Vacuity
@@ -69,12 +69,12 @@ use crate::parser::registry::ParserRegistry;
 /// Deliberately excludes `content_hash`, `structural_hash` **and the kappa
 /// value**: those are per-parser hash *conventions*, not user-visible facts,
 /// and requiring their values to match is exactly the field-identity bar
-/// `OXC-FASTPATH.md` proved unreachable. Their *behaviour* is covered
+/// proved unreachable. Their *behaviour* is covered
 /// elsewhere and in full — `structural_hash` by every decision it drives
 /// landing in the `DiffResult` layer, and kappa by the
 /// [`Layer::KappaPartition`] check, which compares the equivalence relation
 /// kappa induces rather than the hashes that encode it. (See
-/// `KAPPA.md`'s errata: kappa's values are grammar-shaped, so demanding value
+/// errata: kappa's values are grammar-shaped, so demanding value
 /// equality across parsers demands CST fidelity through the back door.)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct EntityFingerprint {
@@ -541,7 +541,7 @@ pub enum Mutation {
     RenameEntities,
     /// Blank `structural_hash`. Models an extractor that cannot produce a
     /// rename-insensitive structural signal — the exact failure mode
-    /// `OXC-FASTPATH.md` predicted for an AST-based path.
+    /// predicted for an AST-based path.
     DropStructuralHash,
     /// Blank `kappa`. Models an extractor that gets the diff right but loses
     /// the parser-independent identity the facts layer stores.

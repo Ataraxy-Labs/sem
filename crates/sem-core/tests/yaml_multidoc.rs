@@ -1,7 +1,7 @@
-//! semx-vlg / semx-kkk: a multi-document YAML file (documents separated by
+//! a multi-document YAML file (documents separated by
 //! `---`) with same-named top-level keys in different documents used to
 //! collapse onto one `build_entity_id` output — a genuine oracle failure on
-//! llvm (11 "Args" entities sharing one id, TESTS_ORACLE semx-kkk), making
+//! llvm (11 "Args" entities sharing one id, TESTS_ORACLE), making
 //! which document's data (including `is_test`) a corpus-wide id collision
 //! kept depend on processing order.
 //!

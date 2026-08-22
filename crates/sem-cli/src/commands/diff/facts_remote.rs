@@ -1,4 +1,4 @@
-//! Cross-machine facts service client (semx-9en cloud half): sem-cloud's
+//! Cross-machine facts service client (cloud half): sem-cloud's
 //! `POST /v1/facts/{query,download,put}` API from the CLI side. See
 //! sem-cloud's `docs/architecture/FACTS-SERVICE.md` for the protocol this
 //! wraps (key scheme, consent, wire format, trust boundary).
@@ -14,7 +14,7 @@
 //! callees, and consults `graph.rs`'s own local `FactsStore`/`FactsCorpus`
 //! caches already).
 //!
-//! # Closing Phase B's last mile (semx-bhc)
+//! # Closing Phase B's last mile
 //!
 //! Known files' downloaded payloads used to be decoded purely to verify the
 //! wire round trip — nothing downstream consumed the entities, because
@@ -124,9 +124,9 @@ pub(crate) struct PutFactsResponse {
 // Key derivation
 // ---------------------------------------------------------------------------
 //
-// semx-0lj: this used to hand-mirror `sem-core/src/parser/facts_store.rs`'s
+// this used to hand-mirror `sem-core/src/parser/facts_store.rs`'s
 // `LANGUAGE_SALTS` table and its `language_salt`/`producer_language_salt`/
-// `effective_language_salt` functions verbatim (per semx-2o8's cloud-tier
+// `effective_language_salt` functions verbatim (per the cloud-tier
 // handoff comment, which offered mirroring or taking the salt verbatim from
 // the uploading client). That duplication had no real justification: unlike
 // `examples/facts_corpus_probe.rs` (which deliberately simulates an
@@ -326,7 +326,7 @@ fn run_background(
     let registry = super::super::create_registry(&cwd);
 
     // Known files: download, decode, key-validate, and ingest into the
-    // local `FactsCorpus` (semx-bhc) — the corpus `commands/graph.rs`'s
+    // local `FactsCorpus` — the corpus `commands/graph.rs`'s
     // `build_graph_with_facts_store` already consults on every full-repo
     // build, so a later build for this repo (or any other repo on this
     // machine sharing the file's content) genuinely skips re-extracting

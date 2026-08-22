@@ -1,9 +1,9 @@
-//! Thin re-export of `sem_core::persist::disk_cache` (semx-r94).
+//! Thin re-export of `sem_core::persist::disk_cache`.
 //!
 //! `sem-mcp` used to hand-roll its own `struct DiskCache` here, independently
 //! of `sem-cli`'s `build_cache.rs` copy, over the same `cache.db` schema —
-//! the duplicate-authority finding QUERY-INDEX.md §15.3 disclosed and left
-//! open ("semx-r94 stands"). The schema, freshness/manifest handling, content
+//! the duplicate-authority finding disclosed and left
+//! open (" stands"). The schema, freshness/manifest handling, content
 //! store, semantic commit index and the `DiskCache` constructor family now
 //! live once, in `sem-core::persist::disk_cache` (see that module's doc for
 //! the ownership rationale and the divergences this unification reconciled —
@@ -15,7 +15,7 @@
 //! `sem-cli`, it never writes `index.sem` or a facts-store corpus, so there
 //! is nothing here to keep local beyond this re-export. The test module below
 //! is this crate's own behavioral spec for the re-exported surface (kept
-//! local rather than folded into `sem-core`'s tests, per semx-r94's
+//! local rather than folded into `sem-core`'s tests, per 's
 //! instruction that each consumer's existing cache tests keep running
 //! unchanged) — it needs the same supporting imports the pre-unification
 //! `DiskCache` implementation here used to.
@@ -1077,7 +1077,7 @@ mod tests {
         }
     }
 
-    /// v1.1 (semx-2i2): kappa must round-trip through sem-mcp's own on-disk
+    /// v1.1: kappa must round-trip through sem-mcp's own on-disk
     /// SQLite entity cache too -- a separate `DiskCache`/`save`/`load` from
     /// sem-cli's, sharing only the schema/insert helpers in this module
     /// (`initialize_schema`, `insert_entities_with_content_store`), so it

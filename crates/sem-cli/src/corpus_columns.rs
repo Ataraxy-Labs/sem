@@ -1,6 +1,6 @@
 //! The build's **one** post-graph corpus read, and the columns derived from
-//! it (semx-3tb / W1; the design is `sem-core/SINGLE-PASS.md`, this is §3's
-//! columnar form and §2's collapse of census passes H, I and L).
+//! it (; the design is `sem-core/, this is
+//! columnar form and collapse of census passes H, I and L).
 //!
 //! Before this module the save path read every file's bytes **three** times:
 //!
@@ -22,13 +22,13 @@
 //!    xxh3-64 of the same bytes, one rendered hex. So `hash` below is
 //!    computed once and serves both artifacts; `hex16` is the injection into
 //!    `cache.db`'s column. (Both this file's predecessor comment and
-//!    semx-ccg's commit message asserted they were distinct hashes. They are
-//!    not; `SINGLE-PASS.md` §1.3 has the derivation, and
+//! commit message asserted they were distinct hashes. They are
+//! not; has the derivation, and
 //!    `hash_encoding_identity` in `build_cache.rs`'s tests witnesses it.)
 //! 2. **Trigrams and import scans are folds over those same bytes.** By the
 //!    fold-fusion invariant (`⟨cata f, cata g⟩ = cata ⟨f,g⟩`) they are components
 //!    of one walk, so they run inside the read closure — and the bytes are
-//!    dropped *there*, never collected (`SINGLE-PASS.md` §1.1 S2: the byte
+//! dropped *there*, never collected (S2: the byte
 //!    string is the fused walk's intermediate, not a column).
 //!
 //! Behaviour is preserved file-for-file, including the two asymmetries the
@@ -53,7 +53,7 @@ use sem_mcp::cache as shared_cache;
 
 /// One file's columns, all derived from a single visit to its bytes.
 ///
-/// `⊕` (`SINGLE-PASS.md` §1.1 S3) is disjoint-key union over `path`: the
+/// `⊕` (S3) is disjoint-key union over `path`: the
 /// closure that builds a row reads nothing but that file, which is what makes
 /// the read coordination-free and the row order irrelevant to correctness
 /// (it is still `files` order — rayon's `collect` preserves it — because two
@@ -81,7 +81,7 @@ pub(crate) struct FileColumns {
 
 impl FileColumns {
     /// `cache.db`'s `files.content_hash` rendering — the injection
-    /// `hex₁₆ : u64 ↣ String` (`SINGLE-PASS.md` §1.3).
+    /// `hex₁₆: u64 ↣ String`.
     pub fn hash_hex(&self) -> String {
         format!("{:016x}", self.hash)
     }
@@ -103,7 +103,7 @@ impl CorpusColumns {
     /// `shared_cache::refresh_file_import_entries` took, with the same
     /// manifest filter, so the resolved targets are identical.
     pub fn read(root: &Path, files: &[String], all_files: &[String]) -> Self {
-        // Built once per corpus, not once per file — semx-ccg's O(1)
+        // Built once per corpus, not once per file — O(1)
         // membership fix, carried across unchanged.
         let candidate_files = sem_core::parser::ImportCandidates::new(
             all_files
@@ -187,7 +187,7 @@ impl CorpusColumns {
 mod tests {
     use super::*;
 
-    /// **L-COLUMNS-FUSE** (`SINGLE-PASS.md` §6, W1-F1 — the fold-fusion
+    /// **L-COLUMNS-FUSE** (— the fold-fusion
     /// witness for the fused corpus read)
     ///
     /// ```text

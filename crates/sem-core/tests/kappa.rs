@@ -1,5 +1,5 @@
 //! The acceptance demo for kappa (κ), the semantic identity hash computed
-//! additively alongside `structural_hash`. See `crates/sem-core/KAPPA.md` for
+//! additively alongside `structural_hash`. See `crates/sem-core/ for
 //! the spec these tests pin.
 //!
 //! Four v1 properties, each proven on real entities extracted through the
@@ -17,7 +17,7 @@
 //! v1.1 adds two more sections, both against real entities through the real
 //! plugin:
 //!
-//! (e) the declaration-keyword discriminator fix (KAPPA.md v1.1 §1): `let`
+//! (e) the declaration-keyword discriminator fix (v1.1): `let`
 //!     vs `const` (TS/JS, including the multi-declarator path) and Java's
 //!     multi-modifier `public final` vs `private final` no longer collide,
 //!     while formatting-invariance still holds for the same declaration
@@ -455,7 +455,7 @@ fn typescript_method_modifiers_all_differ() {
     // Found by the corpus collision sweep, not the original per-language
     // sibling sweep: `kappa_stats` on the TypeScript-monster corpus
     // surfaced a real group merging `foo() {}` and `get foo() {}` under one
-    // kappa (see KAPPA.md v1.1's collision analysis). Root cause is the
+    // kappa (see v1.1's collision analysis). Root cause is the
     // exact same shape as `let`/`const`: `method_definition` is the node
     // kind for a plain method, a getter, a setter, a static method, and an
     // async method alike -- `get`/`set`/`static`/`async` are anonymous,

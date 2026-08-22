@@ -62,15 +62,15 @@ pub fn parse_tree(
 /// `ts_parser__do_all_potential_reductions`, and `ts_parser__recover` ->
 /// `ts_stack_pop_count`) goes super-linear on large inputs that end up in an
 /// error-recovery parse (deliberately malformed compiler-fixture files; or,
-/// per semx-zcq, a pathologically deep/adversarial data fixture that a
+/// per, a pathologically deep/adversarial data fixture that a
 /// grammar never designed for such depth also drives into error recovery --
-/// see `crates/sem-core/RESOLUTION-PROFILE.md`, "C# pathology
+/// see `crates/sem-core/, "C# pathology
 /// (dotnet-runtime)"). Shared with `scope_resolve.rs`'s pass-2 reparse loop,
-/// which established this mechanism first (semx-022) for exactly the
+/// which established this mechanism first for exactly the
 /// TypeScript-fixture shape of this same failure mode; this is the pass-1
 /// (initial parse) sibling.
 ///
-/// semx-zcq: raised from semx-022's original 2s to 10s after this budget
+/// raised from the original 2s to 10s after this budget
 /// started spawning a supervisor thread (see `parse_tree_within_budget`'s doc
 /// comment) whose wall-clock timing is scheduler-sensitive under load, not
 /// just tree-sitter's own progress-callback cancellation. dotnet-runtime
@@ -89,12 +89,12 @@ pub fn parse_tree(
 /// legitimate file with a >=3.5x margin while still bounding the genuinely
 /// pathological one to a small fraction of its unbounded cost.
 ///
-/// semx-jo1: no longer read from either hot path (pass 1's
+/// no longer read from either hot path (pass 1's
 /// `extract_entities_with_tree`, pass 2's `scope_resolve.rs` reparse loop) --
 /// both now use [`is_pathological_large_file`], a deterministic content-shape
 /// predicate, as their sole give-up decision. A hybrid was tried first
 /// (predicate ahead of this budget, budget kept as fallback for whatever the
-/// predicate didn't flag) and *measured* to still reproduce semx-4w1's
+/// predicate didn't flag) and *measured* to still reproduce 's
 /// chunk-boundary edge-count nondeterminism on dotnet-runtime -- proof some
 /// file other than the one confirmed pathological one was still racing this
 /// clock. Left defined, undeleted: still correct machinery, still worth
@@ -111,7 +111,7 @@ pub const PARSE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_sec
 /// this document's corpora contain and comfortably below the multi-megabyte
 /// generated/fixture files that have actually been observed pathological.
 ///
-/// semx-jo1: no longer read from either hot path -- see [`PARSE_TIME_BUDGET`]'s
+/// no longer read from either hot path -- see [`PARSE_TIME_BUDGET`]'s
 /// doc comment. Left defined, undeleted: the thread-oversubscription finding
 /// this constant's doc comment records is still true and still worth
 /// knowing if a future call site wants a bounded-wall-clock parse, and
@@ -121,13 +121,13 @@ pub const LARGE_FILE_BUDGET_THRESHOLD: u64 = 128 * 1024;
 
 /// Parse `content` for `config` with a hard wall-clock ceiling of `budget`.
 ///
-/// semx-jo1: no longer called from pass 1 (`extract_entities_with_tree`) or
+/// no longer called from pass 1 (`extract_entities_with_tree`) or
 /// pass 2 (`scope_resolve.rs`'s reparse loop) -- both use
 /// [`is_pathological_large_file`], a deterministic content-shape predicate,
 /// as their sole give-up decision instead. See that function's doc comment
 /// for why a hybrid (predicate ahead of this function, this function kept as
 /// fallback) was tried and rejected: measured directly against
-/// dotnet-runtime at two chunk sizes, the hybrid still reproduced semx-4w1's
+/// dotnet-runtime at two chunk sizes, the hybrid still reproduced 's
 /// chunk-boundary edge-count nondeterminism, so any file still able to reach
 /// this wall-clock race keeps the underlying bug alive regardless of what
 /// the predicate catches. Kept working, not deleted: a future caller that
@@ -141,11 +141,11 @@ pub const LARGE_FILE_BUDGET_THRESHOLD: u64 = 128 * 1024;
 /// [`CodeParserPlugin::extract_entities_with_tree`] already returns for any
 /// other unparseable file, so callers need no new handling for this case.
 ///
-/// semx-zcq: this runs the parse on a supervisor thread and races it against
+/// this runs the parse on a supervisor thread and races it against
 /// `budget` with `recv_timeout`, rather than tree-sitter's own
 /// `parse_with_options` + `progress_callback` cancellation mechanism (what an
 /// earlier revision of this function used, mirroring the pass-2 reparse loop
-/// this budget was first built for in semx-022). That callback-based read API
+/// this budget was first built for in). That callback-based read API
 /// turned out to have a correctness bug independent of timing: on at least
 /// one small, fast-to-parse but adversarially-crafted file in the
 /// dotnet-runtime corpus (`EncryptedXmlSample5.xml`, 5,586 bytes -- an XML
@@ -162,8 +162,7 @@ pub const LARGE_FILE_BUDGET_THRESHOLD: u64 = 128 * 1024;
 ///
 /// A supervisor thread per call means every pass-1 file pays one thread
 /// spawn+join even on the overwhelming majority of files that never approach
-/// `budget` -- measured net win regardless (see the C# pathology section of
-/// `RESOLUTION-PROFILE.md`): thread spawn/join is microseconds, the
+/// `budget` -- measured net win regardless (see the C# pathology section above): thread spawn/join is microseconds, the
 /// pathology it bounds was tens of seconds on a single file.
 pub fn parse_tree_within_budget(
     config: &'static languages::LanguageConfig,
@@ -199,7 +198,7 @@ pub fn parse_tree_within_budget(
 /// The shape threshold [`is_pathological_large_file`] classifies on: the
 /// longest single `\n`-delimited run in a file's content, in bytes.
 ///
-/// semx-jo1 (`RESOLUTION-PROFILE.md`, "Memory attribution" section):
+/// ("Memory attribution" section):
 /// measured directly with `examples/parse_time_probe.rs` (sequential,
 /// zero-contention, single-file-at-a-time -- the wall-clock time a file
 /// actually costs to parse, isolated from anything [`PARSE_TIME_BUDGET`]'s
@@ -254,7 +253,7 @@ fn max_line_len(content: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Deterministic, pure-per-file pre-filter (semx-jo1) that removes the one
+/// Deterministic, pure-per-file pre-filter that removes the one
 /// *confirmed* source of [`parse_tree_within_budget`]'s wall-clock race from
 /// pass-1's and pass-2's large-file give-up decision, before that race ever
 /// starts.
@@ -269,7 +268,7 @@ fn max_line_len(content: &str) -> usize {
 /// `SCOPE_RESOLVE_FILE_CHUNK_SIZE` (a different chunk size batches `rayon`
 /// work differently, changing how many large files land in the same chunk
 /// together, changing contention). This was not hypothetical: shrinking
-/// dotnet-runtime's chunk size from 5,000 to 1,000 files (semx-4w1) moved
+/// dotnet-runtime's chunk size from 5,000 to 1,000 files moved
 /// the corpus's resolved edge count by exactly +1, reproducibly, with no
 /// other change to the input.
 ///
@@ -285,9 +284,9 @@ fn max_line_len(content: &str) -> usize {
 /// thread is spawned* -- a pure function of the file's own bytes, identical
 /// on every call, on every machine, under any concurrent load, forever.
 /// Removing dotnet-runtime's one heaviest, always-present contention source
-/// is expected to remove the specific +1-edge nondeterminism semx-4w1
+/// is expected to remove the specific +1-edge nondeterminism
 /// measured (that borderline file's own solo parse time is nowhere near
-/// 10s -- see `parse_time_probe`'s measurements in `RESOLUTION-PROFILE.md`
+/// 10s -- see `parse_time_probe`'s measurements
 /// -- so its flip was contention-driven, not intrinsic).
 ///
 /// This is *not* a claim that every conceivable pathological file is now
@@ -416,20 +415,20 @@ impl SemanticParserPlugin for CodeParserPlugin {
             return (Vec::new(), None);
         };
 
-        // semx-zcq gave pass 1 a wall-clock ceiling for large files (a single
+        // gave pass 1 a wall-clock ceiling for large files (a single
         // pathological file could otherwise pin pass 1 for tens of seconds).
-        // semx-jo1 replaced it outright with a deterministic, pure-per-file
+        // replaced it outright with a deterministic, pure-per-file
         // predicate -- see `is_pathological_large_file`'s doc comment for why
         // a hybrid (predicate-then-budget-fallback) was tried first and
         // measurement disproved it: with the fallback still in place, the
-        // exact dotnet-runtime chunk-boundary edge-count flip semx-4w1 found
+        // exact dotnet-runtime chunk-boundary edge-count flip found
         // still reproduced (981,283 at a 5,000-file chunk vs 981,284 at a
         // 1,000-file chunk, stable across repeat runs at each size) --
         // proof the flipping file was never `EncryptedXmlSample4.xml`, and
         // that *any* file still going through `parse_tree_within_budget`'s
         // wall-clock race keeps the bug alive regardless of the predicate.
         // With the fallback removed entirely, both chunk sizes produce
-        // identical entities/edges -- see `RESOLUTION-PROFILE.md`. No
+        // identical entities/edges. No
         // thread is spawned on this path any more for any file: flagged
         // content is rejected before a parse is attempted, and every other
         // file -- including every large-but-healthy file the old budget

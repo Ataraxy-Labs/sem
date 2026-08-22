@@ -9,34 +9,21 @@ homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["diff", "semantic", "tree-sitter", "ast", "code-analysis"]
 categories = ["development-tools", "parser-implementations"]
 readme = "../../README.md"
-exclude = [
-    "DATA-FLOW-AUDIT.md",
-    "DATA-TOPOLOGY-AUDIT.md",
-    "INCREMENTAL-PARSE.md",
-    "KAPPA.md",
-    "MUL-DESIGN.md",
-    "OXC-FASTPATH.md",
-    "QUERY-INDEX.md",
-    "RESOLUTION-PROFILE.md",
-    "SINGLE-PASS.md",
-    "WEAVE-INTEGRATION.md",
-]
 
 [features]
 default = ["git", "parallel", "grammar-all", "mmap"]
 git = ["dep:git2"]
 parallel = ["dep:rayon"]
 wasm = []
-# Memory-mapped reads for the query index (parser-adjacent; see QUERY-INDEX.md).
+# Memory-mapped reads for the query index (parser-adjacent).
 # Kept behind a feature, and the reader is defined over `&[u8]` regardless, so
 # `wasm` — where mmap does not exist — builds the same format code with the
 # owned-bytes constructor and no dependency.
 mmap = ["dep:memmap2"]
 
-# The unified `cache.db` persistence layer (semx-r94): schema, freshness,
+# The unified `cache.db` persistence layer: schema, freshness,
 # manifest handling and the `DiskCache` constructor family that `sem-cli` and
-# `sem-mcp` both used to hand-roll separately (QUERY-INDEX.md §15.3's
-# disclosed duplicate-authority finding). Off by default and behind its own
+# `sem-mcp` both used to hand-roll separately (a disclosed duplicate-authority finding). Off by default and behind its own
 # feature — same reasoning as `git`/`mmap` above — because `rusqlite`'s
 # `bundled` feature compiles libsqlite3 from C source, which the `wasm`
 # feature's whole point is to stay clear of. Depends on `git` for
@@ -44,7 +31,7 @@ mmap = ["dep:memmap2"]
 disk-cache = ["dep:rusqlite", "dep:zstd", "git"]
 
 # Spike: an oxc-based fast path for TS/JS entity extraction. Off by default.
-# See OXC-FASTPATH.md for the measurement and verdict.
+# The measurement and verdict.
 oxc-fastpath = [
     "dep:oxc_parser", "dep:oxc_ast", "dep:oxc_ast_visit",
     "dep:oxc_allocator", "dep:oxc_span", "dep:oxc_syntax",
@@ -156,7 +143,7 @@ tree-sitter-d = { version = "0.8.2", optional = true }
 tree-sitter-lua = { version = "0.5.0", optional = true }
 tree-sitter-fish = { version = "3.6", optional = true }
 rustc-hash = "2"
-# On-disk persistence for the red-green facts layer (semx-9en, parser::facts_store).
+# On-disk persistence for the red-green facts layer (parser::facts_store).
 # Pure Rust, no C dependency (keeps the `wasm` feature viable). CBOR, not
 # bincode: `SemanticEntity` (persisted inside `FileFacts`) uses
 # `#[serde(skip_serializing_if = "Option::is_none")]` on several fields —
@@ -176,7 +163,7 @@ ciborium = "0.2"
 # `wasm` feature keeps building.
 memmap2 = { version = "0.9", optional = true }
 
-# `disk-cache` feature (semx-r94): the unified `cache.db` layer, moved here
+# `disk-cache` feature: the unified `cache.db` layer, moved here
 # from `sem-cli`/`sem-mcp`, which both depended on this exact version+feature
 # pair already. `bundled` is a C dependency (compiles libsqlite3), so this
 # stays optional rather than joining `default`.
@@ -185,7 +172,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # same version both consumer crates already pinned.
 zstd = { version = "0.13", optional = true }
 
-# oxc-fastpath spike (see OXC-FASTPATH.md). Pinned exact versions so the
+# oxc-fastpath spike. Pinned exact versions so the
 # equivalence-pinning tests aren't chasing a moving upstream AST.
 oxc_parser = { version = "=0.143.0", optional = true }
 oxc_ast = { version = "=0.143.0", optional = true }
@@ -202,14 +189,14 @@ criterion = "0.5"
 # on the parse/hash primitives sem-core uses internally.
 tree-sitter = "0.26"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-# semx-4w1 / semx-au8: dev-only, used by `parse_probe`/`mul_census` to give
+# Dev-only, used by `parse_probe`/`mul_census` to give
 # examples the same global allocator the production binaries (`sem`,
 # `sem-mcp`) install, so allocator-fragmentation effects measured there
 # reflect real behavior instead of macOS's system allocator ceiling. Not
 # proposed as sem-core's own allocator — that decision belongs to whichever
 # binary embeds this library.
 mimalloc = "0.1"
-# semx-kkk: the multi-document YAML determinism witness needs to run the
+# The multi-document YAML determinism witness needs to run the
 # same cold build under two differently-sized *scoped* rayon pools within
 # one test process (a real `RAYON_NUM_THREADS` env var only takes effect
 # once, at the global pool's first use, so it can't vary within a process).

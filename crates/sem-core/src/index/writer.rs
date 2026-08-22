@@ -1,4 +1,4 @@
-//! Building an index image from a built graph. See `QUERY-INDEX.md` §4.1.
+//! Building an index image from a built graph.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,7 +53,7 @@ macro_rules! maybe_par_sort_unstable_by {
 /// `SEM_PROFILE_CACHE=1` — the same `OnceLock<bool>` shape
 /// `resolve_profile::enabled()` and `sem-cli`'s `cache_profile_mark` use, and
 /// the same contract: zero cost when unset, never changes a written byte,
-/// only what goes to stderr. Added for W4 (semx-431): `build_image` was a
+/// only what goes to stderr. Added because `build_image` was a
 /// single `write_query_index_build_image` mark worth 0.6-7.0 s per giant with
 /// no attribution inside it.
 fn image_profile_enabled() -> bool {
@@ -83,8 +83,7 @@ pub struct FileFingerprint {
 /// One file's deduped trigram set, extracted once from that file's bytes.
 ///
 /// The point of the type is *when* it is built, not what it holds: a caller
-/// that already has a file's bytes in hand (`sem-cli`'s single corpus read,
-/// `SINGLE-PASS.md` §3) extracts this inside the same parallel closure that
+/// that already has a file's bytes in hand (`sem-cli`'s single corpus read) extracts this inside the same parallel closure that
 /// read them and then drops the bytes — the deforestation step, so the
 /// corpus's content is never simultaneously resident. Handing the writer
 /// pre-extracted sets rather than a `contents` map is what makes that
@@ -116,7 +115,7 @@ pub enum TrigramSource<'a> {
 }
 
 /// A directory's freshness fingerprint at build time — the `Complete`
-/// freshness tier's unit (semx-ykf, `QUERY-INDEX.md` §2/§10.6). `path` is
+/// freshness tier's unit. `path` is
 /// root-relative with no trailing slash, `""` for the repo root itself (the
 /// repo root is always present so a corpus that starts empty still has one
 /// directory whose mtime bumps the moment a first file is added).
@@ -128,7 +127,7 @@ pub struct DirFingerprint {
 }
 
 /// Build the image. Pure: bytes in, bytes out, no filesystem, no clock. No
-/// file content — `TRIGRAM` is written zero-length ("tier absent", §9),
+/// file content — `TRIGRAM` is written zero-length ("tier absent"),
 /// exactly the pre-S3 skeleton contract.
 pub fn build(graph: &EntityGraph, files: &[FileFingerprint]) -> Vec<u8> {
     build_image(
@@ -143,7 +142,7 @@ pub fn build(graph: &EntityGraph, files: &[FileFingerprint]) -> Vec<u8> {
     .0
 }
 
-/// The content-and-directory-aware entry point (S3, semx-az9 + semx-ykf):
+/// The content-and-directory-aware entry point (S3 +):
 /// `contents` maps a file's path (matching `FileFingerprint.path`) to its raw
 /// bytes, which is what lets the writer extract trigram postings without
 /// re-reading the filesystem — the caller (`sem-cli`'s `write_query_index`)
@@ -179,7 +178,7 @@ pub fn build_with_content_and_dirs(
 }
 
 /// [`build_with_content_and_dirs`] plus the corpus's test classification
-/// (semx-zvq). `test_entity_ids` is the set `EntityGraph::
+///. `test_entity_ids` is the set `EntityGraph::
 /// filter_test_entities_with_custom_dirs` produces — the *same* value the
 /// SQLite cache already writes into `entity_flags.is_test`, handed in rather
 /// than recomputed, because the predicate needs `SemanticEntity.content` and
@@ -208,7 +207,7 @@ pub fn build_with_content_and_dirs_and_tests(
     )
 }
 
-/// The widest content-based entry point (semx-a3w) — everything
+/// The widest content-based entry point — everything
 /// [`build_with_content_and_dirs_and_tests`] carries, plus each entity's byte
 /// span (`EntityRec.start_byte`/`end_byte`, `FORMAT_VERSION` 3).
 /// `entity_byte_spans` maps an entity id to `(start_byte, end_byte)` — the
@@ -239,7 +238,7 @@ pub fn build_with_content_and_dirs_and_tests_and_spans(
 }
 
 /// [`build_with_content_and_dirs_and_tests_and_spans`] fed **pre-extracted**
-/// trigrams instead of raw content (semx-3tb, `SINGLE-PASS.md` §2 pass L) —
+/// trigrams instead of raw content (pass L) —
 /// the entry point `sem-cli`'s `write_query_index` uses.
 ///
 /// The caller extracts each file's trigrams inside the same parallel closure
@@ -364,7 +363,7 @@ pub(crate) fn build_image(
     }
 
     // NAMES: entity indices sorted by name bytes, so a name query is an
-    // equal_range rather than a scan (QUERY-INDEX.md §3.8). The tie-break on
+    // equal_range rather than a scan. The tie-break on
     // index keeps the table a deterministic function of the graph, which is
     // what the consistency oracle's byte-equality property needs.
     image_mark("entities_section", __entbytes_t0);
@@ -412,7 +411,7 @@ pub(crate) fn build_image(
         kind_bytes.extend_from_slice(&len.to_le_bytes());
     }
 
-    // REFS (S2, semx-gis; typed edges added semx-zvq): a serialization of
+    // REFS (S2; typed edges added): a serialization of
     // `graph.edges` grouped by `from_entity` (forward — "refs", what an
     // entity calls) and by `to_entity` (reverse — "callers", who calls it),
     // keyed through the same `entity_index` used for `parent` above. Built
@@ -424,14 +423,14 @@ pub(crate) fn build_image(
     // reproduces the identical per-entity target order those maps already
     // have, while also carrying the kind. The index is a transport, not a
     // re-derivation: a mismatch here is a serialization bug, never a
-    // resolution one (QUERY-INDEX.md §4.2's "extraction identity" obligation).
+    // resolution one ("extraction identity" obligation).
     image_mark("files_and_kinds_section", __files_t0);
     let refs_typed = entities.len() <= format::refs::MAX_ENTITIES;
     let __refs_t0 = std::time::Instant::now();
     let refs_bytes = build_refs_section(&entities, &entity_index, graph, refs_typed);
     image_mark("refs_section", __refs_t0);
 
-    // TRIGRAM (S3, semx-az9): postings over **file** indices (§9), built from
+    // TRIGRAM (S3): postings over **file** indices, built from
     // whatever `contents` the caller supplied. A file with no content entry
     // (fingerprint-only, or the caller opted out entirely via `build`)
     // contributes nothing — never a partial or guessed posting — which is
@@ -441,7 +440,7 @@ pub(crate) fn build_image(
     let (trigram_bytes, trigram_stats) = build_trigram_section(&file_paths, &trigram_source);
     image_mark("trigram_section", __trig_t0);
 
-    // DIRS (semx-ykf, `Complete` freshness — QUERY-INDEX.md §2/§10.6): sorted
+    // DIRS (`Complete` freshness —): sorted
     // by path bytes, same convention FILES uses, though the reader's
     // parallel-stat sweep doesn't need the ordering — sorting only buys
     // determinism for the consistency oracle's byte-equality property.
@@ -493,8 +492,8 @@ pub(crate) fn build_image(
     (bytes, trigram_stats)
 }
 
-/// `REFS` section bytes: CSR in both directions (QUERY-INDEX.md §3.8, typed
-/// postings added semx-zvq).
+/// `REFS` section bytes: CSR in both directions (typed
+/// postings added).
 ///
 /// ```text
 ///  0  fwd_edge_count u32     8  fwd_offsets  (entity_count+1) x u32
@@ -526,10 +525,10 @@ fn build_refs_section(
     // reproduces the identical per-entity order those maps already have.
     // The forward and reverse halves read the same immutable inputs and share
     // no mutable state — separation-algebra disjointness, exactly the
-    // condition `SINGLE-PASS.md` §1 already uses to license a `par_iter` —
+    // condition already uses to license a `par_iter` —
     // so building each half is one closure and the two run under a `join`.
     // Each half still walks `entities` in the identical order it did before,
-    // so both CSRs are byte-identical to the serial version. (W4, semx-431:
+    // so both CSRs are byte-identical to the serial version. (:
     // `refs_section` was 0.8-1.4 s of a wholly serial image build.)
     let build_half = |key_of: fn(&EntityRef) -> (&str, &str)| {
         let mut adj: HashMap<&str, Vec<(&str, &RefType)>> =
@@ -598,10 +597,10 @@ fn ref_kind_u8(ref_type: &RefType) -> u8 {
     }
 }
 
-/// Whole-`TRIGRAM`-section budget (QUERY-INDEX.md §3.3: "if the postings
+/// Whole-`TRIGRAM`-section budget (: "if the postings
 /// exceed 40 MB the fallback is to index only files under a size cap and
 /// declare the tier partial in `flags`, never to blow the budget silently").
-/// This bead's chosen fallback (see `stop_list_to_budget` below) is
+/// This change's chosen fallback (see `stop_list_to_budget` below) is
 /// stop-listing the highest-document-frequency trigrams rather than dropping
 /// whole files, because a dropped file would silently make `sem grep` miss
 /// real matches in that file — a correctness regression a caller has no way
@@ -614,7 +613,7 @@ fn ref_kind_u8(ref_type: &RefType) -> u8 {
 pub const TRIGRAM_BUDGET_BYTES: usize = 40 * 1024 * 1024;
 
 /// What `build_trigram_section` measured, for `index_probe`'s `WRITE` line
-/// and `QUERY-INDEX.md`'s reported build cost — a caller should never have to
+/// and reported build cost — a caller should never have to
 /// infer this from a wall-clock delta around the whole image build.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrigramBuildStats {
@@ -630,8 +629,8 @@ pub struct TrigramBuildStats {
 /// Every 3-byte window of `content`, deduped — the unit `TRIGRAM` postings
 /// are keyed on. Whole-byte-stream windows (not per-line): a cross-line match
 /// still needs its trigrams findable, and `grep::required_trigrams` is what
-/// decides whether a pattern can use this prefilter at all (QUERY-INDEX.md
-/// §9's "the text tier can answer without the entity tier" boundary — this
+/// decides whether a pattern can use this prefilter at all (
+/// "the text tier can answer without the entity tier" boundary — this
 /// function has no opinion on patterns, only on bytes).
 fn extract_trigrams(content: &[u8]) -> FxHashSet<u32> {
     let mut set = FxHashSet::default();
@@ -713,7 +712,7 @@ fn build_trigram_section_with_budget(
 
     if trigram_count == 0 {
         // Genuinely zero-length, not a header-only 12-byte section: a
-        // zero-length section is what `SectionRef::is_absent` (§9) reads as
+        // zero-length section is what `SectionRef::is_absent` reads as
         // "tier absent", and no content (or content too short to have a
         // single trigram) must degrade to exactly that contract, not a
         // slightly-larger empty tier that behaves the same but breaks the
@@ -932,8 +931,7 @@ fn clamp(text: &str) -> &str {
 
 /// Temp file + rename, verbatim the `FactsStore::save` discipline: no lock
 /// (a write is a whole-image replacement, so nothing can be lost-updated) and
-/// no `fsync` (a torn image is a clean miss and the next build rewrites it —
-/// see `QUERY-INDEX.md` §3.6).
+/// no `fsync` (a torn image is a clean miss and the next build rewrites it).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = path.parent() {

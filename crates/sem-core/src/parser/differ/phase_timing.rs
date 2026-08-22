@@ -1,5 +1,5 @@
 //! Behavior-neutral, zero-cost-off phase timing for `compute_semantic_diff`'s
-//! internal work (semx-cc3, the `sem diff` attribution campaign).
+//! internal work (the `sem diff` attribution campaign).
 //!
 //! `compute_semantic_diff` fans out per-file work across a rayon `par_iter`
 //! (see `maybe_par_iter!` in `differ.rs`), so there is no single call stack

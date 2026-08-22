@@ -229,7 +229,7 @@ pub(super) fn maybe_upload_cloud_diff_snapshot(
         return;
     };
 
-    // Cross-machine facts service (semx-9en cloud half): batch-query before
+    // Cross-machine facts service (cloud half): batch-query before
     // extraction, extract+upload only the files sem cloud doesn't already
     // know. Fire-and-forget, on its own client (facts_remote spawns a
     // detached thread that outlives this function) -- never blocks the diff

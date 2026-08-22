@@ -4,7 +4,7 @@
 //!
 //! `sem`'s entity extraction is tree-sitter-shaped end to end: a concrete
 //! syntax tree (CST) is parsed, then `entity_extractor.rs` walks it with
-//! ~3,700 lines of per-grammar node-kind rules. `OXC-FASTPATH.md` measured
+//! ~3,700 lines of per-grammar node-kind rules. measured
 //! that a typed-AST parser (oxc) is 20-49x faster than that pipeline on real
 //! TypeScript, and then declined to ship it, because the deliverable at the
 //! time was *field-identical* output — including `structural_hash`, which is
@@ -66,7 +66,7 @@
 //!   written by one extractor generation can never satisfy a lookup made by
 //!   another.
 //!
-//! `OXC-FASTPATH.md`'s "Cache-key reasoning" section is the argument for
+//! "Cache-key reasoning" section is the argument for
 //! this; it is honored here rather than deferred.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -1,4 +1,4 @@
-//! Zero-copy reads over an index image. See `QUERY-INDEX.md` §5.
+//! Zero-copy reads over an index image.
 //!
 //! Nothing here allocates per entity. `lookup` returns a range of indices and
 //! the accessors hand back `&str` borrowed straight from the mapping, so the
@@ -18,7 +18,7 @@ use super::format::{self, *};
 /// this so a caller that hands over an OS-native (backslash) path — which
 /// happens on Windows whenever a `Path::to_string_lossy()` result reaches
 /// this API without its own separator conversion — still gets a correct
-/// match instead of a silent miss (semx-q344).
+/// match instead of a silent miss.
 fn normalize_index_key(key: &str) -> Cow<'_, str> {
     if key.contains('\\') {
         Cow::Owned(key.replace('\\', "/"))
@@ -71,7 +71,7 @@ pub enum TrigramPosting {
 impl QueryIndex {
     /// `mmap` the image. `None` — never an error — for absent, truncated,
     /// stale-salt, or garbage files: the query plane is strictly optional and
-    /// a miss just means the caller uses the build plane (§3.5).
+    /// a miss just means the caller uses the build plane.
     #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn open(path: &Path) -> Option<QueryIndex> {
         Self::open_with_salt(path, crate::parser::facts_store::corpus_identity_salt())
@@ -80,7 +80,7 @@ impl QueryIndex {
     #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn open_with_salt(path: &Path, salt: u64) -> Option<QueryIndex> {
         let file = std::fs::File::open(path).ok()?;
-        // SAFETY: the image is replaced only by rename (§3.6), so this inode
+        // SAFETY: the image is replaced only by rename, so this inode
         // is immutable for the lifetime of the mapping — a later writer
         // creates a new inode and leaves ours intact until it is dropped.
         let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
@@ -113,7 +113,7 @@ impl QueryIndex {
             && index.section(SEC_KINDS).len() as u64
                 == index.header.kind_count as u64 * KIND_REC_LEN as u64
             // DIRS is either absent (zero-length — "Complete unavailable on
-            // this image", semx-ykf) or a well-formed array of exactly
+            // this image") or a well-formed array of exactly
             // dir_count records — same "tier absent or exactly right, never
             // torn" discipline REFS/TRIGRAM use.
             && (index.section(SEC_DIRS).is_empty()
@@ -125,7 +125,7 @@ impl QueryIndex {
             .filter(QueryIndex::trigram_section_is_sound)
     }
 
-    /// `REFS` is either absent (zero-length — "tier not built yet", §9) or a
+    /// `REFS` is either absent (zero-length — "tier not built yet") or a
     /// well-formed CSR whose declared edge counts account for every byte in
     /// the section. A torn or truncated REFS section is a clean miss on the
     /// whole image, same discipline as `counts_agree` above, not a panic the
@@ -153,7 +153,7 @@ impl QueryIndex {
     }
 
     /// `false` until S2 lands a real image (skeleton images write REFS
-    /// zero-length, §9's "tier absent" contract).
+    /// zero-length, "tier absent" contract).
     pub fn has_refs(&self) -> bool {
         !self.header.sections[SEC_REFS].is_absent()
     }
@@ -240,19 +240,19 @@ impl QueryIndex {
 
     /// Every file under `prefix`, a root-relative directory path already
     /// normalized to end in `/` (or `""` for the whole repo) — the
-    /// query-path file-discovery reroute, `QUERY-INDEX.md` §7 item 1.
-    /// `FILES` is sorted by path (§3.2, the same key-table property
+    /// query-path file-discovery reroute,.
+    /// `FILES` is sorted by path (the same key-table property
     /// `entities_in_file`/`file_fingerprint` already rely on), so every file
     /// under a directory is one contiguous slot range: a `partition_point`
     /// for the range start, then a linear `starts_with` scan to its end. No
     /// separate directory index is needed, which is why this lands without a
     /// `DIRS` section.
     ///
-    /// **`Verified`-level only** (§2's freshness split): this proves the
+    /// **`Verified`-level only** (freshness split): this proves the
     /// returned set is exactly what the index's own `FILES` table contains
     /// under `prefix` — it does **not** prove no file was added under
     /// `prefix` since the index was last built (that is `Complete`'s job,
-    /// which needs the still-reserved `DIRS` section, §9, not built by this
+    /// which needs the still-reserved `DIRS` section, not built by this
     /// capability). A file created after the index's last build is invisible
     /// here until the next full rebuild repairs the image — the same
     /// membership tradeoff `sem find`/`callers`/`refs` (S2) already ship
@@ -296,7 +296,7 @@ impl QueryIndex {
     }
 
     /// Same as [`Self::refs_of`], but pairs each target with its `ref_type`
-    /// (semx-zvq). If [`Self::refs_are_typed`] is `false` (the
+    ///. If [`Self::refs_are_typed`] is `false` (the
     /// `format::refs::MAX_ENTITIES`-overflow fallback), every kind reads
     /// `RefType::Calls` regardless of the edge's real kind — callers that
     /// need typed edges must check `refs_are_typed` first, exactly like
@@ -317,7 +317,7 @@ impl QueryIndex {
     /// on every image built today (no measured corpus is within three orders
     /// of magnitude of `format::refs::MAX_ENTITIES`, see that constant's
     /// doc); `false` only for the fail-safe overflow fallback, or for any
-    /// image built before semx-zvq — which `format_version`'s bump to `2`
+    /// image built before — which `format_version`'s bump to `2`
     /// already makes unreadable by this code at all (`Header::read` rejects
     /// it), so in practice this only ever reads `false` for the overflow
     /// case, never a stale-format one.
@@ -326,9 +326,9 @@ impl QueryIndex {
     }
 
     /// Whether [`Entity::is_test`] is an answer on this image rather than an
-    /// uncomputed zero (semx-zvq). `false` on any image whose writer had no
+    /// uncomputed zero. `false` on any image whose writer had no
     /// classification to hand in — `commands::query`'s cold-build write, or
-    /// any pre-semx-zvq image — and a caller that needs test-shaped answers
+    /// any prior image — and a caller that needs test-shaped answers
     /// must check this first, exactly as `has_refs`/`has_trigram`/
     /// `refs_are_typed` gate their own tiers. This is the index's analogue of
     /// the SQLite cache's `test_flags_computed` metadata key, and it exists
@@ -392,7 +392,7 @@ impl QueryIndex {
     }
 
     /// Total forward postings in `REFS` — the corpus's edge count, read from
-    /// the section's sub-header rather than by summing rows (semx-zvq, for
+    /// the section's sub-header rather than by summing rows (for
     /// `sem graph`'s `stats.edgeCount` and its counts-only terminal output).
     /// `0` when the tier is absent, the same "tier absent reads as nothing"
     /// contract `refs_of` uses.
@@ -428,7 +428,7 @@ impl QueryIndex {
     }
 
     /// Entities of one file, as a slice of the entity table — no search, by
-    /// construction (`FileRec.entity_lo..entity_hi`, §3.2).
+    /// construction (`FileRec.entity_lo.entity_hi`).
     pub fn entities_in_file(&self, path: &str) -> Vec<Entity<'_>> {
         let path = normalize_index_key(path);
         let files = self.section(SEC_FILES);
@@ -449,7 +449,7 @@ impl QueryIndex {
     }
 
     /// The stored freshness fingerprint for `path` — `None` if the index has
-    /// never seen this file. This is what Verified freshness (§5.1) stats
+    /// never seen this file. This is what Verified freshness stats
     /// against: a caller compares this against the file's *current* mtime,
     /// falling through to content-hash comparison only on a difference,
     /// exactly as `shared_cache::file_freshness` does for the build plane.
@@ -471,9 +471,8 @@ impl QueryIndex {
         })
     }
 
-    /// `true` once a build supplies directory fingerprints (`write_query_index`,
-    /// semx-ykf). `false` for any image built via the dirs-less writer entry
-    /// point (`build`) or a pre-semx-ykf image — `Complete` freshness is
+    /// `true` once a build supplies directory fingerprints (`write_query_index`). `false` for any image built via the dirs-less writer entry
+    /// point (`build`) or a prior image — `Complete` freshness is
     /// simply unavailable on such an image, same "tier absent" contract
     /// `has_refs`/`has_trigram` already use.
     pub fn has_dirs(&self) -> bool {
@@ -586,7 +585,7 @@ impl QueryIndex {
 /// A borrowed view of one entity. Every field is read on demand from the
 /// mapping; nothing is materialized until asked for, and `id()` is the only
 /// accessor that allocates (it has to — the id is stored with its file-path
-/// prefix elided, §3.4).
+/// prefix elided).
 pub struct Entity<'a> {
     index: usize,
     owner: &'a QueryIndex,
@@ -641,7 +640,7 @@ impl<'a> Entity<'a> {
         format::entity::end_line(rec).unwrap_or(0) as usize
     }
 
-    /// The entity's byte span in its file (semx-a3w, `FORMAT_VERSION` 3),
+    /// The entity's byte span in its file (`FORMAT_VERSION` 3),
     /// `None` if the writer had none to record — see [`format::entity`]'s
     /// doc for why that's a per-record, not per-image, signal. `context.rs`'s
     /// index reroute is the only consumer today: it must decline (not

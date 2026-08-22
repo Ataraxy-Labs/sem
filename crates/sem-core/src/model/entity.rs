@@ -28,13 +28,13 @@ pub struct SemanticEntity {
     /// and is rename-*sensitive* — it is meant as a parser-independent
     /// semantic identity, not a rename-detection signal. Formatting-only
     /// changes (whitespace, comments, trailing commas, brace style) leave it
-    /// unchanged. See `crates/sem-core/KAPPA.md` for the full spec,
+    /// unchanged. See `crates/sem-core/ for the full spec,
     /// measurements, and collision analysis.
     ///
     /// `None` for entities from parsers that don't expose byte spans (most
     /// non-tree-sitter plugins) and for a couple of tree-sitter-code
     /// error-recovery fallback paths that don't operate over a single clean
-    /// AST subtree (see KAPPA.md's compat/coverage section).
+    /// AST subtree (see compat/coverage section).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kappa: Option<String>,
     pub start_line: usize,
@@ -50,7 +50,7 @@ pub struct SemanticEntity {
     /// (exclusive), matching tree-sitter's `end_byte()`. `None` when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_byte: Option<usize>,
-    /// A `BTreeMap`, not a `HashMap` (semx-vfh): this is serialized directly
+    /// A `BTreeMap`, not a `HashMap`: this is serialized directly
     /// — into the factpack's CBOR and into `cache.db`'s `metadata_json`
     /// column via `serde_json` — and `std::HashMap`'s per-instance random
     /// hasher key makes that serialization nondeterministic even across two
@@ -128,9 +128,9 @@ pub fn build_entity_id_disambiguated_by_document(
 mod tests {
     use super::*;
 
-    /// semx-vfh: `metadata`'s JSON serialization (what `sem-mcp`'s and
+    /// `metadata`'s JSON serialization (what `sem-mcp`'s and
     /// `sem-cli`'s `cache.db` writers store as `metadata_json`) must not
-    /// depend on which order the map happens to iterate in. The bead's
+    /// depend on which order the map happens to iterate in. The change's
     /// evidence is 78 differing rows between two runs of the *same binary at
     /// the same HEAD* — this reproduces the mechanism directly: build the
     /// same key/value pairs, in the same insertion order, into two separate
@@ -179,7 +179,7 @@ mod tests {
 
         assert_eq!(
             a_json, b_json,
-            "semx-vfh: identical metadata content serialized to different \
+            "identical metadata content serialized to different \
              metadata_json bytes across two map instances built the same way — \
              this is what makes cache.db table-dump gates non-reproducible"
         );

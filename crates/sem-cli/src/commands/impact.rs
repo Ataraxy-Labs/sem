@@ -31,8 +31,7 @@ pub enum ImpactMode {
 
 /// Shared output shape for every `sem impact` tier — the index fast paths
 /// (`try_index_impact_deps` and friends) and the `EntityGraph`-hydrate
-/// fallback both build one of these. Moved out of `build_cache` (semx-gpu
-/// census, QUERY-INDEX.md §15): neither this struct nor
+/// fallback both build one of these. Moved out of `build_cache`: neither this struct nor
 /// `CACHED_TEST_IMPACT_LIMIT` below depend on `DiskCache` — this file is
 /// their only producer and only consumer, so `build_cache.rs` carrying them
 /// was surface with no build-plane reason to live there.
@@ -59,7 +58,7 @@ pub(crate) const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 /// are the same function (`entity_matches_qualified`'s qualifier clause can
 /// only fire on a separator), which is precisely why the fast paths need no
 /// `--entity-id`/`--file` gate to be safe on a name-only query: the
-/// `candidates.len() != 1` ambiguity check is the whole guarantee (semx-4ex).
+/// `candidates.len != 1` ambiguity check is the whole guarantee.
 fn is_qualified_name(name: &str) -> bool {
     name.contains('.') || name.contains("::")
 }
@@ -91,30 +90,30 @@ pub fn impact_command(opts: ImpactOptions) {
     let mut timings = Timings::from_env("impact");
 
     // The index-backed Deps fast path goes first: it used to bypass the
-    // sidecar (QUERY-INDEX.md §7 item 5, now deleted — semx-woe) and still
-    // bypasses the SQLite `query_impact_topology` fast path (§7 item 4)
+    // sidecar (now deleted —) and still
+    // bypasses the SQLite `query_impact_topology` fast path (item 4)
     // entirely, for the entity-scoped `--deps` shape those two existed to
     // serve. It answers `false` (never a wrong answer) for anything it
     // isn't confident about, and everything below is unchanged for that
-    // case (semx-gis item 2).
+    // case (item 2).
     if try_index_impact_deps(&opts, &mut timings) {
         return;
     }
-    // Same fast path, reverse direction (semx-zvq, QUERY-INDEX.md §12.1's
+    // Same fast path, reverse direction (the
     // "impact.rs non---deps modes" reroute — the `Dependents` half of it:
-    // like `Deps`, it is a direct-edge, depth-1, no-BFS shape (§7's table
+    // like `Deps`, it is a direct-edge, depth-1, no-BFS shape (the table
     // has no `depth` involvement for either), so it mirrors
     // `try_index_impact_deps` exactly but for `callers_of` instead of
     // `refs_of`. `All`/`Tests` need a transitive multi-hop walk
-    // (`impact_entities`'s BFS) this bead did not reroute — see that
-    // function's doc and QUERY-INDEX.md §12's table entry for why.
+    // (`impact_entities`'s BFS) this change did not reroute — see that
+    // function's doc for why.
     if try_index_impact_dependents(&opts, &mut timings) {
         return;
     }
-    // The transitive half (semx-zvq): `All` and `Tests`, the two modes that
+    // The transitive half: `All` and `Tests`, the two modes that
     // need `impact_entities`' multi-hop BFS rather than one CSR row. See
     // `try_index_impact_transitive` for the ordering-parity argument and
-    // QUERY-INDEX.md §12.2's derivation.
+    // derivation.
     if try_index_impact_transitive(&opts, &mut timings) {
         return;
     }
@@ -135,7 +134,7 @@ pub fn impact_command(opts: ImpactOptions) {
         .as_deref()
         .map(|file| super::normalize_repo_relative_path(Path::new(&opts.cwd), root, file));
     // Cloud is a capability — cross-repo xref, repos with no local index/cache
-    // (QUERY-INDEX.md §7 item 7) — not a latency tier, so it must not race a
+    // — not a latency tier, so it must not race a
     // local answer over the network. It used to run before even the
     // entity-scoped local fast path above; now it only gets a turn once both
     // local fast paths (index-backed Deps, cache-first entity scope) have
@@ -366,15 +365,15 @@ pub fn impact_command(opts: ImpactOptions) {
     super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
 }
 
-/// Index-backed fast path for `sem impact --deps <entity>` (semx-gis item 2).
+/// Index-backed fast path for `sem impact --deps <entity>` (item 2).
 /// Gated on Deps mode and the default source scope, so it never answers a
 /// query shape the index doesn't cover — a custom `--file-exts`/
-/// `--no-default-excludes` scope isn't recorded in the image, and no bead has
+/// `--no-default-excludes` scope isn't recorded in the image, and no change has
 /// extended the format to carry one. Any uncertainty — index absent, zero or
 /// more than one match, a stale related file — returns `false` and the
 /// caller falls through to the unchanged legacy path unchanged below.
 ///
-/// **The `--entity-id`-or-`--file`-required gate is gone (semx-4ex).** It was
+/// **The `--entity-id`-or-`--file`-required gate is gone.** It was
 /// inherited verbatim from the SQLite `query_dependency_impact_topology` fast
 /// path this replaced, and it was redundant with the ambiguity check below:
 /// `resolve_by_name_indices` narrows by file only when a hint is given, and
@@ -384,10 +383,10 @@ pub fn impact_command(opts: ImpactOptions) {
 /// `entity_matches_qualified`'s extra clause needs a qualifier separator to
 /// fire, so it degenerates to `entity_matches_query`, which is exactly what
 /// `resolve_by_name_indices` computes — and a set of size 1 on one side is a
-/// set of size 1 on the other. `try_index_impact_transitive` (semx-zvq) has
+/// set of size 1 on the other. `try_index_impact_transitive` has
 /// always resolved name-only queries this way; this restores the same rule
 /// here, which is what leaves the incremental rebuild as `cache.db`'s only
-/// remaining reader on this verb (RESOLUTION-PROFILE.md W4 §2, W4.5).
+/// remaining reader on this verb.
 ///
 /// A name carrying `.` or `::` declines outright, the rule
 /// `try_index_impact_transitive` already applies for the same reason: the
@@ -441,10 +440,10 @@ fn try_index_impact_deps(opts: &ImpactOptions, timings: &mut Timings) -> bool {
         return false;
     };
 
-    // Membership sweep (semx-dev, QUERY-INDEX.md §13's `Complete` tier),
+    // Membership sweep (`Complete` tier),
     // run concurrently with the resolution above's freshness work exactly
     // like `commands::query::index_answer` already does for `find`/
-    // `callers`/`refs` (semx-ykf) — the *same* mechanism, not a second one.
+    // `callers`/`refs` — the *same* mechanism, not a second one.
     // The bug this closes: a `b.ts` that already said `import './optional'`
     // has an unresolved ref at build time (no entity in `optional.ts` to
     // point at yet), so `refs_of(at)` never carried an edge to it, and
@@ -455,7 +454,7 @@ fn try_index_impact_deps(opts: &ImpactOptions, timings: &mut Timings) -> bool {
     // file: a new file can supply a new edge this CSR (built at the last
     // full index write) has no way to represent. Decline to the legacy path,
     // which re-walks and re-resolves `entity`'s imports fresh and so folds
-    // the new target's refs in "for free" (QUERY-INDEX.md §13.2's own
+    // the new target's refs in "for free" (own
     // phrase for the identical `callers`/`refs` case).
     let registry = super::create_registry(&opts.cwd);
     let (resolved, complete) = rayon::join(
@@ -467,7 +466,7 @@ fn try_index_impact_deps(opts: &ImpactOptions, timings: &mut Timings) -> bool {
                 .map(index::Entity::to_entity_info)
                 .collect();
 
-            // Verified freshness (§5.1) over the entity's own file plus every
+            // Verified freshness over the entity's own file plus every
             // direct dependency's file. A stale dependency target means
             // `refs_of(at)` may itself be wrong (the edit could add/remove a
             // call), which a per-file re-extract of the *target* can't
@@ -493,7 +492,7 @@ fn try_index_impact_deps(opts: &ImpactOptions, timings: &mut Timings) -> bool {
     );
     let (entity, dependencies, touched_stale) = resolved;
     // A *new* file is the only membership signal this fast path must
-    // decline on (semx-dev): it can supply an edge the CSR predates and so
+    // decline on: it can supply an edge the CSR predates and so
     // has no way to represent. An unrelated *deletion* elsewhere in the
     // corpus cannot manufacture a new edge, so it is deliberately not a
     // decline reason here — the pre-existing `_answers_from_the_index_
@@ -518,16 +517,16 @@ fn try_index_impact_deps(opts: &ImpactOptions, timings: &mut Timings) -> bool {
     true
 }
 
-/// Reverse-direction mirror of [`try_index_impact_deps`] (semx-zvq): direct
+/// Reverse-direction mirror of [`try_index_impact_deps`]: direct
 /// callers of an entity, via `callers_of` instead of `refs_of`. `Dependents`
 /// has the identical direct-edge, depth-1 shape `Deps` does (`print_cached_
 /// dependents` takes no `depth` parameter, same as `print_cached_deps`), so
-/// nothing here needed the typed CSR added in this bead's FORMAT step —
+/// nothing here needed the typed CSR added in this change's FORMAT step —
 /// `refs_of`/`callers_of` (untyped) already carried what this shape needs.
 /// The typed accessors matter for a future `--ref-type` filter on `impact`,
 /// not for this reroute.
 ///
-/// Carries the same gate closure as [`try_index_impact_deps`] (semx-4ex):
+/// Carries the same gate closure as [`try_index_impact_deps`]:
 /// this function inherited the identical `--entity-id`-or-`--file` decline by
 /// being written as that one's mirror, so it inherited the same redundancy.
 /// Leaving it here would have left `sem impact --dependents <name>` as a
@@ -575,7 +574,7 @@ fn try_index_impact_dependents(opts: &ImpactOptions, timings: &mut Timings) -> b
         return false;
     };
 
-    // Same membership-sweep discipline as `try_index_impact_deps` (semx-dev),
+    // Same membership-sweep discipline as `try_index_impact_deps`,
     // mirrored to the reverse direction: a brand-new file that *calls* an
     // already-indexed entity is a new edge `callers_of(at)` cannot carry
     // (the CSR predates the file), and no per-file staleness check below can
@@ -616,7 +615,7 @@ fn try_index_impact_dependents(opts: &ImpactOptions, timings: &mut Timings) -> b
     );
     let (entity, dependents, touched_stale) = resolved;
     // A *new* file is the only membership signal this fast path must
-    // decline on (semx-dev): it can supply an edge the CSR predates and so
+    // decline on: it can supply an edge the CSR predates and so
     // has no way to represent. An unrelated *deletion* elsewhere in the
     // corpus cannot manufacture a new edge, so it is deliberately not a
     // decline reason here — the pre-existing `_answers_from_the_index_
@@ -642,12 +641,12 @@ fn try_index_impact_dependents(opts: &ImpactOptions, timings: &mut Timings) -> b
 }
 
 /// Index-backed fast path for `sem impact` in `All` and `Tests` mode
-/// (semx-zvq) — the transitive reroute §12.2 left open, replacing
+/// — the transitive reroute left open, replacing
 /// `query_fresh_impact_topology`'s recursive SQL walk.
 ///
 /// **Ordering parity.** The bar is byte-identical output, and the legacy
 /// order is not incidental — it is spelled out in three `ORDER BY` clauses.
-/// Derived first, reproduced second (QUERY-INDEX.md §12.3 carries the full
+/// Derived first, reproduced second (carries the full
 /// derivation):
 ///
 /// - `direct_dependencies`: `ORDER BY edges.to_entity, edges.ref_type`, one

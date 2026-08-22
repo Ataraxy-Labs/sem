@@ -584,7 +584,7 @@ fn visit_node(
                             // SwiftPropertyBinding is a synthesized text segment
                             // (multi-declarator `let a, b: Int` split), not a
                             // single clean AST subtree -- kappa isn't computed
-                            // for this recovery path in v1. See KAPPA.md.
+                            // for this recovery path in v1.
                             kappa: None,
                             content: binding.content,
                             start_line: binding.start_line,
@@ -1077,8 +1077,8 @@ fn recover_swift_conditional_compilation_containers(
             parent_id: None,
             content_hash: content_hash(&content),
             structural_hash: Some(struct_hash),
-            // ERROR-node text recovery, not a clean AST subtree -- see
-            // KAPPA.md's coverage section for why kappa is skipped here.
+            // ERROR-node text recovery, not a clean AST subtree, so kappa
+            // is skipped here.
             kappa: None,
             content,
             start_line: container.start_line,
@@ -1550,7 +1550,7 @@ fn sibling_function_body(node: Node) -> Option<Node> {
 }
 
 /// Compute `structural_hash` and kappa (the semantic identity hash; see
-/// `crates/sem-core/KAPPA.md`) for an entity in a single tree walk.
+/// `crates/sem-core/) for an entity in a single tree walk.
 ///
 /// The structural half is exactly what the pre-kappa code computed --
 /// `structural_hash_excluding_range(node, source, name_start, name_end)`
@@ -3571,7 +3571,7 @@ fn find_test_callback(node: Node) -> Option<Node> {
 #[cfg(test)]
 mod kappa_regression_tests {
     //! Proves the "structural_hash stays completely untouched" compat story
-    //! from KAPPA.md at the unit level: `compute_structural_hash_and_kappa`'s
+    //! from at the unit level: `compute_structural_hash_and_kappa`'s
     //! structural half must be byte-identical, on every node in a real tree
     //! (not just entity nodes), to what the pre-kappa code computed --
     //! `structural_hash_excluding_range` when a name token is found,

@@ -1,5 +1,5 @@
 //! A long-lived graph build session: cold once, then warm rebuilds that redo
-//! work only for changed files and their blast radius (semx-022).
+//! work only for changed files and their blast radius.
 //!
 //! # Why a session and not a free function
 //!
@@ -11,7 +11,7 @@
 //! case. For a *fresh* process — a `sem` CLI invocation, which does not live
 //! across requests — [`GraphSession::export_persisted`] and
 //! [`GraphSession::warm_start`] are the disk-crossing pair
-//! `crate::parser::facts_store::FactsStore` sits behind (semx-9en):
+//! `crate::parser::facts_store::FactsStore` sits behind:
 //! [`FileFacts`], `PrecomputedFileFacts`, and `CachedFileResolution` are all
 //! `serde`-serializable for exactly this. [`GraphSession::export_facts`]
 //! remains the narrower, entities-only export.
@@ -30,10 +30,10 @@
 //! # What is conservative here
 //!
 //! * Only files whose detected language is JS/TS, Python, Go, or Rust may reuse
-//!   resolution results (semx-kzy extended this past JS/TS-only, semx-022's
+//! resolution results (extended this past JS/TS-only, 's
 //!   original scope). Every other language is held permanently RED: slower,
 //!   never wrong. See [`crate::parser::import_resolution::is_reuse_eligible_file`]
-//!   and RESOLUTION-PROFILE.md's "Universal GREEN eligibility" section for the
+//! and "Universal GREEN eligibility" section for the
 //!   full per-language verdict and why each remaining language stayed
 //!   conservative.
 //! * A change to the *file list* (an add or a delete) disables reuse entirely on
@@ -68,7 +68,7 @@ use crate::parser::scope_resolve::PrecomputedFileFacts;
 /// builds and wasm). [`GraphSession::warm_start`] uses this for its per-file
 /// content-hash check — reading and hashing every file in a large corpus
 /// serially would reintroduce exactly the kind of single-threaded loop
-/// semx-022 spent an entire fix phase eliminating from pass 1.
+/// spent an entire fix phase eliminating from pass 1.
 macro_rules! maybe_par_iter {
     ($slice:expr) => {{
         #[cfg(feature = "parallel")]
@@ -96,18 +96,18 @@ pub struct GraphSession {
     resolution: HashMap<String, CachedFileResolution>,
     fingerprints: TableFingerprints,
     stats: RebuildStats,
-    /// Per-file cached import scans (JS/TS only) — semx-h1s.
+    /// Per-file cached import scans (JS/TS only) —.
     import_scans: HashMap<String, CachedImportScan>,
     /// The import table itself, maintained in place across rebuilds instead
-    /// of rebuilt whole — semx-h1s.
+    /// of rebuilt whole —.
     import_table: HashMap<(String, String), String>,
     /// Every producing file's current set of `import_table` keys, so a
     /// changed file's stale entries can be removed without a full-table
-    /// scan — semx-h1s.
+    /// scan —.
     import_keys: HashMap<String, Vec<(String, String)>>,
     /// `symbol_table`/`class_members`/`owner_members`/`entity_ranges`,
     /// maintained in place across rebuilds instead of rebuilt whole every
-    /// time — semx-4an, generalizing the `import_table`/`import_keys`
+    /// time —, generalizing the `import_table`/`import_keys`
     /// pattern above to `PreBuiltLookups`'s other tables. `entity_map` has
     /// no field of its own here: it round-trips through `graph.entities`
     /// instead (see `run()`), since that is already the field's permanent,
@@ -117,14 +117,14 @@ pub struct GraphSession {
     owner_members: HashMap<String, Vec<(String, String)>>,
     entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
     /// Bag-of-words' parent → child-position index, session-owned and
-    /// maintained by the same function as the four above (semx-4an). Not
+    /// maintained by the same function as the four above. Not
     /// persisted by `FactsStore`: it is derivable from the entities that store
     /// already holds, and re-deriving it once on the first rebuild after a
     /// warm start costs less than serializing ~450k byte spans.
     child_ranges: crate::parser::graph::ChildRangeIndex,
     /// The five corpus tables' fingerprints plus their Python wildcard-import
     /// XOR guard, carried across rebuilds so a warm rebuild updates only the
-    /// keys it touched (semx-4an). Not persisted: `PersistedFacts` already
+    /// keys it touched. Not persisted: `PersistedFacts` already
     /// carries the *whole* fingerprint map a warm start needs, and a fresh
     /// process re-derives this split copy on its first (whole-rebuild) build.
     corpus_fp: crate::parser::incremental::TableFingerprints,
@@ -135,7 +135,7 @@ pub struct GraphSession {
     /// comment for the staleness hazard this guards against.
     entity_lookups_primed: bool,
     /// Build counter, incremented once per `run`. `resolution` is moved through
-    /// each build rather than rebuilt (semx-4an), and this is what tells an
+    /// each build rather than rebuilt, and this is what tells an
     /// entry that build produced from one it merely carried — see
     /// `incremental::Incremental`'s doc comment.
     generation: u64,
@@ -263,7 +263,7 @@ impl GraphSession {
             }
         }
 
-        // semx-4an: *moved*, not borrowed. `Incremental` mutates this map in
+        // *moved*, not borrowed. `Incremental` mutates this map in
         // place and hands it back below, so a GREEN file's cached edges,
         // consumed words and read set stay exactly where they are for the whole
         // build instead of being deep-cloned out of a `prev` map and back into a
@@ -277,7 +277,7 @@ impl GraphSession {
         let mut import_scans = std::mem::take(&mut self.import_scans);
         let mut import_table = std::mem::take(&mut self.import_table);
         let mut import_keys = std::mem::take(&mut self.import_keys);
-        // semx-4an: `entity_map` round-trips through `self.graph.entities` —
+        // `entity_map` round-trips through `self.graph.entities` —
         // that is already its permanent home (`EntityGraph`'s public field),
         // so there is no separate session field to take it from/give it back
         // to; `build_incremental_core` moves the (possibly incrementally
@@ -386,7 +386,7 @@ impl GraphSession {
         // it is `O(corpus)` and used to happen silently at the end of this
         // function, past every timer in `resolve_profile` — see
         // `SESSION_DROP_NS`. The per-file resolution cache used to be freed here
-        // too, and was the largest of the three; semx-4an moved it through the
+        // too, and was the largest of the three; moved it through the
         // build instead of copying it, so there is nothing left of it to free.
         let __session_drop_t0 = std::time::Instant::now();
         drop(prev_fingerprints);
@@ -465,7 +465,7 @@ impl GraphSession {
     }
 
     /// Export this session's *entire* facts layer in the cross-process
-    /// persistable form `facts_store::FactsStore` writes to disk (semx-9en):
+    /// persistable form `facts_store::FactsStore` writes to disk:
     /// [`export_facts`](Self::export_facts)'s entities, plus each file's
     /// precomputed scope facts and cached resolution (edges + read sets), plus
     /// the corpus-wide table fingerprints a future warm rebuild's read-set
@@ -475,12 +475,12 @@ impl GraphSession {
     /// everything, because it would have no cached edges or read sets to judge
     /// GREEN against.
     ///
-    /// A **view borrowing this session** (semx-ws6, audit D2): building it is
+    /// A **view borrowing this session**: building it is
     /// O(files) pointer work — no entity body, precomputed source text or
     /// cached edge list is copied, where it used to deep-clone all three into
     /// an owned `PersistedFacts` (a full second copy of the corpus, held at
     /// peak alongside the session that still owned the originals; one of the
-    /// facts plane's measured RSS bands, RESOLUTION-PROFILE.md semx-w5k §5).
+    /// facts plane's measured RSS bands).
     /// `PersistedFacts` remains the deserialize type (`FactsStore::load` /
     /// [`Self::warm_start`]); this is the serialize shape both savers take.
     pub fn export_persisted(&self) -> PersistedFactsRef<'_> {
@@ -502,7 +502,7 @@ impl GraphSession {
         }
     }
 
-    /// Cross-process warm start (semx-9en): build a session from a
+    /// Cross-process warm start: build a session from a
     /// [`PersistedFacts`] snapshot loaded from disk by a *different* process
     /// than the one that saved it — the disk is the only channel between
     /// them, exactly like `facts_store::FactsStore`'s own oracle tests prove.
@@ -520,7 +520,7 @@ impl GraphSession {
     ///
     /// Does **not** restore the import table (`import_scans`/`import_table`):
     /// that is not part of what `FactsStore` persists (see
-    /// `RESOLUTION-PROFILE.md`'s "## Persisted facts" for the measurement that
+    /// "## Persisted facts" for the measurement that
     /// led to dropping it from the store). The first rebuild after a
     /// `warm_start` therefore always rebuilds the import table from scratch,
     /// even for a no-op corpus; every subsequent in-process `rebuild` after
@@ -534,7 +534,7 @@ impl GraphSession {
         // Read + hash + look-up-in-`loaded` every file in parallel, then fold
         // the (small, per-file) results into the session's maps serially.
         // Reading 40k+ files one at a time here would reintroduce exactly the
-        // serial-loop cost semx-022 spent a whole fix phase eliminating from
+        // serial-loop cost spent a whole fix phase eliminating from
         // pass 1 — this warm start must not reintroduce it on the way in.
         struct Reused {
             entities: Vec<SemanticEntity>,
@@ -667,7 +667,7 @@ mod tests {
 
     /// The oracle's ground truth: entity ids, edge triples, and a hash of the
     /// sorted edge dump. Two builds agreeing on all three is what "bit-identical"
-    /// means for this bead.
+    /// means for this change.
     #[derive(Debug, PartialEq, Eq)]
     struct GraphFingerprint {
         entities: Vec<String>,
@@ -959,7 +959,7 @@ mod tests {
     /// The necessary condition is narrower and sharper: **every file whose edges
     /// differ between a cold build of state A and a cold build of state B must be
     /// RED.** A file that stays GREEN while its edges should have changed is
-    /// exactly the stale-edge failure this bead must never ship. That is what is
+    /// exactly the stale-edge failure this change must never ship. That is what is
     /// asserted here, for several different mutations.
     #[test]
     fn every_file_whose_edges_change_is_red() {
@@ -1107,7 +1107,7 @@ mod tests {
 
     /// A fixture that extracts zero entities from a file proves nothing
     /// about that file's resolution -- so every per-language GREEN-
-    /// eligibility fixture (semx-14b) must show a positive entity count for
+    /// eligibility fixture must show a positive entity count for
     /// every one of its files, not just a non-empty aggregate.
     fn assert_every_file_has_entities(entities: &[SemanticEntity], files: &[String]) {
         for f in files {
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Incremental import-table maintenance (semx-h1s)
+    // Incremental import-table maintenance
     // -----------------------------------------------------------------
 
     /// `write_fixture`'s corpus, layered with structures that specifically
@@ -1186,7 +1186,7 @@ mod tests {
     /// way `assert_warm_matches_cold` already checks (entities, edges, edge
     /// hash) *and* in the table fingerprints
     /// `build_import_table_incremental` maintains — including
-    /// `Table::TsExportSurface`, new in this bead. Fingerprint parity is the
+    /// `Table::TsExportSurface`, new in this change. Fingerprint parity is the
     /// more direct claim: it is what keeps every future GREEN determination
     /// honest, independent of whether *this* scenario's edge set happens to
     /// expose a divergence.
@@ -1228,7 +1228,7 @@ mod tests {
         );
         assert_eq!(warm_b.edge_hash, cold_b.edge_hash, "{label}: edge hash");
 
-        // Fingerprint parity, per this bead's own gate: the incrementally
+        // Fingerprint parity, per this change's own gate: the incrementally
         // maintained session's table fingerprints must equal a *fresh cold
         // session's* on the same end state — not just the graph they imply.
         let cold_session = GraphSession::build(root, &files_b, &registry);
@@ -1325,7 +1325,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Universal GREEN eligibility (semx-kzy): per-language oracle fixtures
+    // Universal GREEN eligibility: per-language oracle fixtures
     // for the languages extended past JS/TS-only — Python (named imports,
     // the bare `import module` whole-table guard, and constructor-parameter
     // inference across files), Go (the package index and the
@@ -1712,7 +1712,7 @@ mod tests {
     /// every language already shares, empirically confirmed (see
     /// `is_reuse_eligible_file`'s doc comment for the bash detour this
     /// avoided: bash's own call nodes are never even collected as refs, a
-    /// pre-existing, unrelated extraction gap this bead found and surfaced
+    /// pre-existing, unrelated extraction gap this change found and surfaced
     /// rather than routing around silently).
     fn write_kotlin_fixture(root: &Path) -> Vec<String> {
         write(
@@ -2631,7 +2631,7 @@ mod tests {
     /// `collect_all_file_refs`'s call-node branch never fires for a
     /// statement-body call like `return ping();`. This is a real
     /// entity/ref-extraction gap in Dart specifically (not a scope-
-    /// resolution eligibility question), out of this bead's scope to fix.
+    /// resolution eligibility question), out of this change's scope to fix.
     /// Proven here rather than assumed: if this ever starts producing edges
     /// (e.g. `collect_all_file_refs` gains real call-expression support for
     /// Dart), this test will fail loudly and say so.
@@ -2662,19 +2662,19 @@ mod tests {
             "expected zero Calls edges for ordinary block-bodied Dart calls \
              (DART_SCOPE_CONFIG's call_nodes only matches arrow bodies) -- \
              found {call_edges:?}. If this now fails, Dart's ref extraction \
-             gained real call-expression support and the RED verdict in \
-             RESOLUTION-PROFILE.md needs revisiting."
+             gained real call-expression support and the RED verdict here \
+             needs revisiting."
         );
     }
 
-    // --- Bash (whitelisted, not attributed; semx-ocj) --------------------
+    // --- Bash (whitelisted, not attributed;) --------------------
 
     /// Bash has no import mechanism at all -- no `extract_imports_from_ast`
     /// branch matches any bash node kind, and `source`d files aren't tracked
     /// as edges. Every cross-file call here resolves through the same
     /// generic `Table::SymbolTable` bare-call fallback Kotlin's fixture
     /// already proved out; this fixture exists to prove it for bash
-    /// specifically, now that semx-ocj has fixed `extract_call_ref` to
+    /// specifically, now that has fixed `extract_call_ref` to
     /// collect bash calls as refs in the first place.
     fn write_bash_fixture(root: &Path) -> Vec<String> {
         write(
@@ -2778,7 +2778,7 @@ mod tests {
         }
     }
 
-    // --- Fish (whitelisted, not attributed; semx-ocj) ---------------------
+    // --- Fish (whitelisted, not attributed;) ---------------------
 
     /// Fish, like bash, has no import mechanism `extract_imports_from_ast`
     /// recognizes -- cross-file calls resolve through the same generic
@@ -2886,7 +2886,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Bash/fish call-ref extraction bug (semx-ocj): `extract_call_ref`'s
+    // Bash/fish call-ref extraction bug: `extract_call_ref`'s
     // fast path only ever recognized `.kind()` of `"identifier"` /
     // `"simple_identifier"` / `"type_identifier"` for a callee node. Bash's
     // `command` node hands it a `command_name` wrapper (one level above the
@@ -2894,9 +2894,9 @@ mod tests {
     // directly. Neither kind was recognized, so bash/fish calls were never
     // collected as `AstRefKind::Call` at all -- not a resolution-precision
     // gap, an *extraction* gap: the ref never existed to resolve, cold or
-    // warm, in every graph ever built. See RESOLUTION-PROFILE.md's
+    // warm, in every graph ever built. See
     // "Universal GREEN eligibility" section, which found and documented
-    // this without fixing it (out of that bead's scope); semx-ocj is the
+    // this without fixing it (out of that change's scope); is the
     // fix.
     // -----------------------------------------------------------------
 
@@ -2963,8 +2963,8 @@ mod tests {
     }
 
     /// The same bug class, found while auditing the other whitelist
-    /// candidates for semx-14b (not shell-family, but "any language whose
-    /// call syntax the extractor special-cases", which semx-ocj's mandate
+    /// candidates for (not shell-family, but "any language whose
+    /// call syntax the extractor special-cases", which mandate
     /// also covers): tree-sitter-php's plain-identifier node kind for a
     /// bare `ping()` call's callee is `"name"`, not `"identifier"` --
     /// `extract_call_ref`'s fast path didn't recognize that kind either, so
@@ -3006,11 +3006,11 @@ mod tests {
         );
     }
 
-    // --- Swift whole-corpus GREEN-eligibility guard (semx-bvu) ---------
+    // --- Swift whole-corpus GREEN-eligibility guard ---------
 
     /// A corpus with exactly one `.swift` file (never touched by any test
     /// below) plus a small TypeScript hub/leaf group -- the shape that
-    /// flagged this bead: vscode's fleet warm-reload measured 0/13,292 files
+    /// flagged this change: vscode's fleet warm-reload measured 0/13,292 files
     /// GREEN on a zero-change reload, traced to `resolve_with_scopes_full_
     /// inner`'s old `swift_active = !swift_call_signatures.is_empty()` gate
     /// in `scope_resolve.rs`, which forced *every* eligible file RED simply
@@ -3020,7 +3020,7 @@ mod tests {
     /// `scope_resolve.rs`'s `swift_signatures_changed` doc comment for the
     /// fix (compare the whole-table guard's fingerprint across builds,
     /// exactly like every other whole-table guard already does) and
-    /// RESOLUTION-PROFILE.md's vscode case study for the measured numbers.
+    /// vscode case study for the measured numbers.
     fn write_swift_guard_fixture(root: &Path) -> Vec<String> {
         write(
             root,
@@ -3046,7 +3046,7 @@ mod tests {
 
     #[test]
     fn swift_guard_no_op_rebuild_still_greens_unrelated_ts_files() {
-        // The regression this bead fixes: before it, a corpus's mere
+        // The regression this change fixes: before it, a corpus's mere
         // *possession* of a `.swift` file (regardless of whether it ever
         // changed) permanently disabled reuse for every eligible file, so
         // `files_green` was always 0 here -- even on a no-op reload with
@@ -3083,7 +3083,7 @@ mod tests {
 
     #[test]
     fn swift_guard_changing_swift_signatures_still_reds_everything() {
-        // The guard's actual job, unchanged by this bead: when the Swift
+        // The guard's actual job, unchanged by this change: when the Swift
         // call-signature table's *value* genuinely changes, every eligible
         // file must still lose its cache -- `resolve_ref`'s Swift-overload
         // branch is corpus-wide and not attributed to any one file's read
@@ -3092,7 +3092,7 @@ mod tests {
         // bit-for-bit regardless of which files went RED to get there; this
         // additionally asserts the guard still actually fires -- nothing
         // stays falsely GREEN across a real Swift-signature edit, which is
-        // the fail-toward-MISS half of this bead's fix.
+        // the fail-toward-MISS half of this change's fix.
         let stats = assert_warm_matches_cold_for(
             "swift-guard-signature-change",
             write_swift_guard_fixture,

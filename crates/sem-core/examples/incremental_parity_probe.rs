@@ -1,4 +1,4 @@
-//! semx-hpe: reproduce (or rule out) a lost edge between a cold build and a
+//! reproduce (or rule out) a lost edge between a cold build and a
 //! warm incremental rebuild of the same tree, on a real corpus.
 //!
 //! Usage:
@@ -100,7 +100,7 @@ fn dump_edges(graph: &EntityGraph, out_path: &Path) -> usize {
 /// being so large it dominates a single file's own chunk.
 fn padding_comment(round: usize) -> String {
     let mut s = String::with_capacity(2 * 1024 * 1024 + 64);
-    s.push_str(&format!("\n/* semx-hpe multiround pad round {round}\n"));
+    s.push_str(&format!("\n/* multiround pad round {round}\n"));
     let line = "x".repeat(78);
     while s.len() < 2 * 1024 * 1024 {
         s.push_str(&line);

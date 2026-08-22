@@ -3,7 +3,7 @@
 //! Reads a Claude Code UserPromptSubmit event from stdin and extracts
 //! identifier-shaped tokens from the prompt. Used to resolve them against
 //! the resident sem MCP server's socket sidecar; that sidecar is deleted
-//! (QUERY-INDEX.md §7 item 5 / GREP-KILLER S4, semx-woe — §1.5 measured it
+//! (GREP-KILLER S4, — measured it
 //! at 0% availability in production, so this path was already always a
 //! silent no-op in practice) and `socket_lookup` now always returns `None`.
 //! Kept registered rather than removed: its own documented contract already
@@ -108,8 +108,8 @@ fn candidates(prompt: &str) -> Vec<String> {
 }
 
 /// Used to be a one-call context lookup against the resident server's socket
-/// sidecar (QUERY-INDEX.md §7 item 5 / GREP-KILLER S4, semx-woe — deleted:
-/// see sem-mcp/src/lib.rs). §1.5's own measurement found that socket never
+/// sidecar (GREP-KILLER S4, — deleted:
+/// see sem-mcp/src/lib.rs). own measurement found that socket never
 /// answered in production (0% availability), so this always returned `None`
 /// in practice already — deleting the dead connection attempt changes no
 /// observable behavior. `sem hook prompt-submit` stays registered (its

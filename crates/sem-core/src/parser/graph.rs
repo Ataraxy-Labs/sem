@@ -31,7 +31,7 @@ struct Pass1FileProduct<'a> {
 }
 
 /// Everything a warm rebuild carries into [`EntityGraph::build_incremental_core`]
-/// (semx-022). Absent on a cold build, in which case every stage takes its
+///. Absent on a cold build, in which case every stage takes its
 /// original path and the cost is one `Option` check per stage.
 pub(crate) struct BuildCarry<'a, 'i> {
     /// Red-green state: previous fingerprints and per-file results in, this
@@ -57,12 +57,12 @@ pub(crate) struct BuildCarry<'a, 'i> {
     /// Filled in by the build: `(path, start, len)` spans into `all_entities`.
     pub(crate) entity_spans: Vec<(String, usize, usize)>,
     /// Session-owned cache of each JS/TS file's import scan + the read set its
-    /// production consulted (semx-h1s). Updated in place; see
+    /// production consulted. Updated in place; see
     /// `build_import_table_incremental`.
     pub(crate) import_scans: &'a mut HashMap<String, CachedImportScan>,
     /// The import table itself, maintained in place across rebuilds rather
     /// than rebuilt whole: GREEN files' entries are left untouched, RED
-    /// files' old entries are removed and their new ones inserted (semx-h1s).
+    /// files' old entries are removed and their new ones inserted.
     pub(crate) import_table: &'a mut HashMap<(String, String), String>,
     /// Every producing file's current set of `import_table` keys, so a RED
     /// file's stale entries can be removed in `O(that file's own key count)`
@@ -73,7 +73,7 @@ pub(crate) struct BuildCarry<'a, 'i> {
     pub(crate) import_keys: &'a mut HashMap<String, Vec<(String, String)>>,
     /// Session-owned entity/symbol lookup tables, maintained in place across
     /// rebuilds on the non-retain path instead of rebuilt whole every time —
-    /// semx-4an, generalizing the `import_table`/`import_keys` pattern above.
+    /// generalizing the `import_table`/`import_keys` pattern above.
     /// See `maintain_entity_lookups_incremental`'s doc comment.
     pub(crate) symbol_table: &'a mut HashMap<String, Vec<String>>,
     pub(crate) entity_map: &'a mut HashMap<String, EntityInfo>,
@@ -82,7 +82,7 @@ pub(crate) struct BuildCarry<'a, 'i> {
     pub(crate) entity_ranges: &'a mut HashMap<String, Vec<(usize, usize, String)>>,
     /// Bag-of-words' parent → child-position index, session-owned for the same
     /// reason and maintained by the same function. Rebuilding it whole was the
-    /// single most expensive item in the pre-bead Pass A/B bucket (~335ms of
+    /// single most expensive item in the pre-change Pass A/B bucket (~335ms of
     /// ~575ms on the monster, flat across 1/50/500 changed files) because it
     /// searches each child's source text inside its parent's.
     pub(crate) child_ranges: &'a mut ChildRangeIndex,
@@ -223,14 +223,14 @@ use crate::parser::scope_resolve;
 pub(crate) const PARSED_FILE_REUSE_LIMIT: usize = 20_000;
 #[cfg(test)]
 pub(crate) const PARSED_FILE_REUSE_LIMIT: usize = 8;
-// semx-4w1: was 5_000, then 1_000 (a blunt, file-count-only knob — the
+// was 5_000, then 1_000 (a blunt, file-count-only knob — the
 // tree-cost-per-file multiplier is per-language and isn't modeled by a file
 // count at all, so a chunk that happens to contain the corpus's largest
-// files spikes memory regardless of the constant's value). semx-g6t
+// files spikes memory regardless of the constant's value).
 // replaced the file-count knob with `chunk_files_by_byte_budget` below,
 // which bounds chunks by cumulative *source bytes* instead — see that
 // function's doc comment for why bytes are the right unit (Finding 3 in
-// RESOLUTION-PROFILE.md's "Memory attribution" section: a live
+// "Memory attribution" section: a live
 // `tree_sitter::Tree` costs 24.5x-40x its source bytes in RSS,
 // grammar-dependent, so peak per-chunk tree memory is bounded by
 // `budget_bytes * worst-measured-multiplier` regardless of which files land
@@ -245,7 +245,7 @@ const SCOPE_RESOLVE_BYTE_BUDGET: u64 = 150;
 /// than `budget_bytes` of cumulative on-disk source size, except that a
 /// single file larger than `budget_bytes` always gets a singleton chunk of
 /// its own rather than being dropped or merged (see the loop body: a chunk
-/// only closes early once it already holds >=1 file). semx-g6t.
+/// only closes early once it already holds >=1 file).
 ///
 /// Deterministic and a pure function of `file_paths` and each file's size on
 /// disk (`std::fs::metadata`, not content — cheap, no read/parse; per-file
@@ -289,7 +289,7 @@ fn chunk_files_by_byte_budget(
 /// filter needs it.
 ///
 /// `file_path` is an `Arc<str>` rather than a `&'a str` borrowed out of
-/// `all_entities` (semx-4an): the index below is `GraphSession`-owned and
+/// `all_entities`: the index below is `GraphSession`-owned and
 /// survives across rebuilds, and `all_entities` is rebuilt (GREEN-moved or
 /// RED-fresh) every build, so a borrow could not outlive it. One `Arc` is
 /// allocated per *file*, not per child, and cloning it is a refcount bump —
@@ -630,8 +630,8 @@ pub struct EntityGraph {
     pub entities: EntityInfoMap,
     /// Edges: from_entity → [(to_entity, ref_type)]
     pub edges: Vec<EntityRef>,
-    /// The two adjacency maps, derived from `edges` **on first demand**
-    /// (semx-ws6, audit D7). Every cold `sem graph` build used to
+    /// The two adjacency maps, derived from `edges` **on first demand**.
+    /// Every cold `sem graph` build used to
     /// materialize them eagerly — four id-String clones per edge — and then
     /// never read them: the index writer builds REFS directly from `edges`,
     /// and every warm `impact`/`context` answer comes from `index.sem`'s CSR
@@ -646,7 +646,7 @@ pub struct EntityGraph {
 
 /// The pair [`EntityGraph::adjacency`] materializes: `entity_id -> referencing
 /// ids` (dependents) and `entity_id -> referenced ids` (dependencies), in
-/// `edges` order — the same content and order the pre-D7 eager loop built.
+/// `edges` order — the same content and order the formerly-eager loop built.
 #[derive(Debug, Default)]
 struct EdgeAdjacency {
     dependents: EntityAdjacencyMap,
@@ -721,7 +721,7 @@ fn sort_symbol_table_targets_by_source(
 }
 
 /// Same tie-break as [`sort_symbol_table_targets_by_source`], factored out to
-/// a single bucket so semx-4an's incremental maintenance can re-sort just the
+/// a single bucket so incremental maintenance can re-sort just the
 /// name(s) a rebuild actually touched instead of the whole table. A bucket
 /// that was already sorted and only had elements *removed* stays sorted
 /// (removal preserves relative order) — this only needs calling after an
@@ -730,7 +730,7 @@ fn sort_symbol_table_targets_by_source(
 /// already-resolved `EntityInfo` (or `None` when the id is not in
 /// `entity_map`). Split out so the two sorters below can *decorate* each
 /// element with one map lookup instead of paying two per comparison —
-/// `n log n` lookups become `n` (semx-4an; the monster's hottest symbol-table
+/// `n log n` lookups become `n` (; the monster's hottest symbol-table
 /// bucket holds ~10.5k ids, i.e. ~280k lookups collapsing to ~10k), with the
 /// resulting order unchanged because the key each comparison uses is
 /// unchanged.
@@ -786,7 +786,7 @@ fn sort_one_symbol_table_bucket(
 /// unrelated types sharing an owner name in different files). A whole
 /// rebuild never sorts these buckets explicitly; their order falls out of
 /// iterating `all_entities` in `file_paths`' given order — which in every
-/// caller in this crate (and every corpus/fixture this bead validated
+/// caller in this crate (and every corpus/fixture this change validated
 /// against) is itself sorted by `file_path`, making this tie-break exactly
 /// reproduce that order. `maintain_entity_lookups_incremental` cannot reuse
 /// "just iterate all_entities" (it only sees the touched files' entities,
@@ -827,7 +827,7 @@ fn sort_members_bucket_by_source(
     members.extend(decorated.into_iter().map(|(_, pair)| pair));
 }
 
-/// semx-yk5: apply [`sort_members_bucket_by_source`]'s canonical
+/// apply [`sort_members_bucket_by_source`]'s canonical
 /// `(file_path, start_line, end_line, id)` tie-break to every bucket in a
 /// `class_members`/`owner_members`-shaped map, for `PreBuiltLookups`
 /// construction sites that (unlike `maintain_entity_lookups_incremental`'s
@@ -838,7 +838,7 @@ fn sort_members_bucket_by_source(
 /// derived `Ord`). Both were *usually* order-equivalent to this canonical
 /// sort (iteration order coincides with it whenever `file_paths` is itself
 /// file-path-sorted, which every caller in this crate already ensures) but
-/// neither was a *stated*, enforced invariant — see RESOLUTION-PROFILE.md's
+/// neither was a *stated*, enforced invariant — see
 /// "Resolver tie-break contract" section for the measured effect of making
 /// it one.
 fn sort_all_member_buckets_by_source(
@@ -850,7 +850,7 @@ fn sort_all_member_buckets_by_source(
     }
 }
 
-/// semx-yk5: apply the same `(start_line, end_line, id)` source-position
+/// apply the same `(start_line, end_line, id)` source-position
 /// tie-break `maintain_entity_lookups_incremental`'s phase 2
 /// (`ranges.sort_unstable()`, graph.rs) already applies per touched file, to
 /// every bucket in an `entity_ranges`-shaped map. `file_path` is not part of
@@ -885,7 +885,7 @@ fn dedupe_resolved_edges(
     }
     drop(seen_edges);
 
-    // In-place survivor compaction (semx-ws6, audit D8): the `drop` above
+    // In-place survivor compaction: the `drop` above
     // already released the `&str` borrows, so `combined` can be mutated —
     // the old `into_iter().filter_map().collect()` built a whole second
     // edge vector (both live at the `collect`, a transient ~150-200 MB at
@@ -904,7 +904,7 @@ fn sort_resolved_refs(refs: &mut [(String, String, RefType)]) {
     // `par_sort_by`, not `par_sort_unstable_by`: rayon's stable parallel sort
     // has the same order semantics as the `sort_by` this replaces, element for
     // element, so nothing downstream can tell the difference — only the wall
-    // time changes (semx-4an; ~196k edges, whole-graph, redone every build
+    // time changes (; ~196k edges, whole-graph, redone every build
     // however few files were RED).
     #[cfg(feature = "parallel")]
     refs.par_sort_by(|left, right| {
@@ -1263,14 +1263,14 @@ fn build_imports_by_file<'a>(
 type SymbolTableByFile<'a> = HashMap<&'a str, HashMap<&'a str, Vec<&'a str>>>;
 
 /// Pre-bucket every `symbol_table` candidate list by the file each candidate
-/// id belongs to (semx-h19). Built once per build, over the same
+/// id belongs to. Built once per build, over the same
 /// `symbol_table` + `entity_map` data the O(candidates) scan it replaces
 /// already reads — see `resolve_entity_references`'s `context
 /// .symbol_table_by_file.get(ref_name)` call site, the bag-of-words
 /// candidate-scan hot path this eliminates (measured: `ref_match_ns`, the
 /// single largest true "linear scan over a shared candidate list" cost in
 /// the bag-of-words resolver, ~1.48s of aggregate CPU time on the TypeScript
-/// monster corpus — see `RESOLUTION-PROFILE.md`).
+/// monster corpus —).
 ///
 /// **Why this is a pure work-elimination, not a behavior change.** The scan
 /// it replaces was `target_ids.iter().find(|id| *id != &entity.id &&
@@ -1282,7 +1282,7 @@ type SymbolTableByFile<'a> = HashMap<&'a str, HashMap<&'a str, Vec<&'a str>>>;
 /// none). Grouping by file does not change *which* candidate wins: within a
 /// file, `symbol_table`'s existing sort discipline
 /// (`sort_symbol_table_targets_by_source`: `(file_path, start_line, end_line,
-/// id)` — semx-6rd) means every file's candidates already form a contiguous,
+/// id)` —) means every file's candidates already form a contiguous,
 /// internally-ordered run in the source `Vec`; splitting that `Vec` into
 /// per-file buckets preserves each bucket's relative order exactly, so
 /// `bucket.iter().find(|id| *id != &entity.id)` returns the identical id the
@@ -1311,7 +1311,7 @@ fn build_symbol_table_by_file<'a>(
 }
 
 struct ReferenceResolutionContext<'a> {
-    // semx-h19: `symbol_table`'s per-name candidate list, pre-bucketed by
+    // `symbol_table`'s per-name candidate list, pre-bucketed by
     // file path (see `build_symbol_table_by_file`) so the bag-of-words
     // global-ref match in `resolve_entity_references` is O(candidates in
     // the resolving entity's own file) instead of O(all candidates for that
@@ -1340,7 +1340,7 @@ struct PerFileBowResult<'a> {
     reused: bool,
 }
 
-// semx-bkz: re-adds `root` (needed again for the disk-read fallback) on top
+// re-adds `root` (needed again for the disk-read fallback) on top
 // of the pre-existing 7 arguments, matching the same allow already used by
 // `resolve_scopes_in_file_chunks` for the same reason.
 #[allow(clippy::too_many_arguments)]
@@ -1351,7 +1351,7 @@ fn resolve_references_with_file_indexes<'a>(
     needs_resolution: Option<&HashSet<&'a str>>,
     context: &ReferenceResolutionContext<'a>,
     mut incremental: Option<&mut Incremental<'_>>,
-    // semx-bkz: content pass 1 already read for this file, snapshotted by
+    // content pass 1 already read for this file, snapshotted by
     // `snapshot_bow_content` before `parsed_files` moved into scope
     // resolution. `build_file_reference_index` still builds each file's
     // index here, on demand, fused with that file's own resolve step — only
@@ -1386,7 +1386,7 @@ fn resolve_references_with_file_indexes<'a>(
     sorted_file_paths.sort_unstable();
     sorted_file_paths.dedup();
 
-    // semx-022: decided before the closure runs, against a fingerprint map that
+    // decided before the closure runs, against a fingerprint map that
     // already covers every table bag-of-words can read (the caller fingerprints
     // them right before calling).
     let green_bow: HashSet<&str> = match incremental.as_deref() {
@@ -1412,7 +1412,7 @@ fn resolve_references_with_file_indexes<'a>(
     let per_file: Vec<PerFileBowResult<'a>> = maybe_par_iter!(sorted_file_paths)
         .filter_map(|file_path| {
             GRAPH_RESOLVE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // semx-4an: the same single-copy rule as the scope stage — this clone
+            // the same single-copy rule as the scope stage — this clone
             // feeds `result` (build-scoped), the cache entry stays where it is,
             // and the merge below writes nothing back for a GREEN file.
             if green_bow.contains(*file_path) {
@@ -1495,15 +1495,15 @@ fn resolve_references_with_file_indexes<'a>(
     result
 }
 
-// semx-bkz: `pre_parsed_content` carries whatever content pass 1 already has
+// `pre_parsed_content` carries whatever content pass 1 already has
 // in hand for this file — keyed the same way `import_source_content`'s
 // established pattern already does for the import table. A file only falls
 // through to `read_to_string` when pass 1 discarded its content (non-JS/TS
 // files beyond `PARSED_FILE_REUSE_LIMIT`). Still called on-demand, fused with
 // this file's own `resolve_entity_references` loop, exactly like before this
-// bead — see `snapshot_bow_content`'s doc comment for why that fusion matters
-// (a first attempt at this bead split index-build into its own barrier-
-// separated phase and *regressed* wall time; see RESOLUTION-PROFILE.md).
+// change — see `snapshot_bow_content`'s doc comment for why that fusion matters
+// (a first attempt at this change split index-build into its own barrier-
+// separated phase and *regressed* wall time).
 fn build_file_reference_index(
     root: &Path,
     file_path: &str,
@@ -1526,7 +1526,7 @@ fn build_file_reference_index(
     Some(index)
 }
 
-/// semx-bkz: restores the single-visit invariant for bag-of-words's content, without
+/// restores the single-visit invariant for bag-of-words's content, without
 /// re-reading disk. Takes a one-time, cheap (memcpy-bound, no strip/tokenize)
 /// snapshot of every file's content pass 1 already retained — `parsed_files`'s
 /// `(path, content, tree)` triples on the retain path,
@@ -1535,14 +1535,14 @@ fn build_file_reference_index(
 /// called right before `parsed_files` is moved into scope resolution. A file
 /// whose content pass 1 discarded (non-JS/TS beyond `PARSED_FILE_REUSE_LIMIT`)
 /// is simply absent here; `build_file_reference_index` falls back to a disk
-/// read for it, same as before this bead.
+/// read for it, same as before this change.
 ///
 /// **Deliberately just a content copy, not an index build.** A first version
-/// of this bead built every file's whole `FileReferenceIndex` here — the
+/// of this change built every file's whole `FileReferenceIndex` here — the
 /// natural-looking "build bow's index during pass 1" reading of the task —
 /// and *regressed* wall time on vscode (measured: build_total_ms +5% to +8%,
 /// resolve_phase_ms +8% to +17%, reproducible across 3 paired runs; see
-/// RESOLUTION-PROFILE.md for the numbers). Root cause: that design inserted a
+/// for the numbers). Root cause: that design inserted a
 /// hard `.collect()` barrier between "build every file's index" and "resolve
 /// every file's references," so every file's resolve step had to wait for the
 /// *slowest* file's index build, corpus-wide, instead of just its own —
@@ -1597,13 +1597,13 @@ fn resolve_scopes_in_file_chunks(
     let mut all_edges = Vec::new();
     let mut all_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
-    // semx-6rd CUT 2: `entities_by_file`/`children_by_parent` are a pure
+    // CUT 2: `entities_by_file`/`children_by_parent` are a pure
     // function of `all_entities`, unchanged across chunks — build them once
     // here instead of once per chunk inside `resolve_with_scopes_full_inner`.
     let __entity_index_t0 = std::time::Instant::now();
     let entity_index = scope_resolve::PrebuiltEntityIndex::build(all_entities);
     resolve_profile::add_chunk_entity_index_ns(__entity_index_t0.elapsed());
-    // semx-nuv: corpus-wide, computed once (same "once per corpus, not once
+    // corpus-wide, computed once (same "once per corpus, not once
     // per chunk" pattern as `entity_index` above) so every chunk's
     // `swift_call_signatures` gate answers the same question regardless of
     // which chunk a `.swift` file happens to land in. See
@@ -1611,7 +1611,7 @@ fn resolve_scopes_in_file_chunks(
     let corpus_has_swift = all_entities
         .iter()
         .any(|entity| entity.file_path.ends_with(".swift"));
-    // semx-la2: the two import-handler indexes, hoisted across chunks like
+    // the two import-handler indexes, hoisted across chunks like
     // `entity_index` above — pure functions of `(symbol_table, entity_map,
     // constant extensions)`, all corpus-invariant across chunks (see
     // `ChunkedResolveInputs::top_level_entities`'s doc comment). Created
@@ -1694,13 +1694,13 @@ fn resolve_entity_references(
     entity: &SemanticEntity,
     reference_index: Option<&FileReferenceIndex>,
     context: &ReferenceResolutionContext<'_>,
-    // semx-022 red-green: records every read that can reach another file's data.
+    // red-green: records every read that can reach another file's data.
     // Reads keyed by this entity's *own* id are deliberately not recorded — an
     // id is `{file_path}::…` by construction, so anything keyed by one is a pure
     // function of this file's own content, which the own-content check already
     // covers. See `incremental::Incremental`.
     rec: &mut Recorder,
-    // semx-h19: opt-in sub-phase timing + candidate-scan sampling, gated the
+    // opt-in sub-phase timing + candidate-scan sampling, gated the
     // same way `rec` is (a cheap `None` on the cold/non-profiled path — no
     // extra `Instant::now()` calls happen unless `SEM_PROFILE_RESOLVE=1`).
     // See `resolve_profile::BowFileAccum`.
@@ -1915,7 +1915,7 @@ fn resolve_entity_references(
         }
 
         rec.one(Table::SymbolTable, ref_name);
-        // semx-h19: `symbol_table_by_file` pre-groups every name's candidates
+        // `symbol_table_by_file` pre-groups every name's candidates
         // by file, so this only scans the candidates that were ever eligible
         // (this entity's own file) instead of every candidate for `ref_name`
         // in the whole corpus. See `build_symbol_table_by_file`'s doc comment
@@ -1988,7 +1988,7 @@ fn resolve_entity_references(
 impl EntityGraph {
     /// Assemble a graph from its two owned parts; the adjacency maps are
     /// derived from `edges` lazily, on first [`Self::dependents`] /
-    /// [`Self::dependencies`] demand (semx-ws6, audit D7).
+    /// [`Self::dependencies`] demand.
     fn assemble(entities: EntityInfoMap, edges: Vec<EntityRef>) -> Self {
         EntityGraph {
             entities,
@@ -2004,14 +2004,14 @@ impl EntityGraph {
     }
 
     /// Reverse index: entity_id → entities that reference it. Derived from
-    /// [`Self::edges`] on first call (audit D7) — identical content and
+    /// [`Self::edges`] on first call — identical content and
     /// bucket order to the eagerly-built map it replaces.
     pub fn dependents(&self) -> &EntityAdjacencyMap {
         &self.adjacency().dependents
     }
 
     /// Forward index: entity_id → entities it references. Derived from
-    /// [`Self::edges`] on first call (audit D7).
+    /// [`Self::edges`] on first call.
     pub fn dependencies(&self) -> &EntityAdjacencyMap {
         &self.adjacency().dependencies
     }
@@ -2035,7 +2035,7 @@ impl EntityGraph {
     }
 
     /// The one implementation behind both a cold [`EntityGraph::build`] and a
-    /// warm [`crate::parser::session::GraphSession::rebuild`] (semx-022).
+    /// warm [`crate::parser::session::GraphSession::rebuild`].
     ///
     /// There is deliberately no second code path: a warm rebuild runs exactly
     /// these stages in exactly this order, and differs only in that (a) pass 1
@@ -2061,7 +2061,7 @@ impl EntityGraph {
         // Small and medium repos reuse parse trees in scope resolution; large repos
         // keep peak memory bounded by reparsing scope chunks.
         //
-        // semx-6rd CUT 1: for JS/TS files beyond `PARSED_FILE_REUSE_LIMIT`, the
+        // CUT 1: for JS/TS files beyond `PARSED_FILE_REUSE_LIMIT`, the
         // tree is still parsed here (same underlying tree-sitter call
         // `extract_entities` makes internally, just not discarded) and, while
         // it's in hand, `scope_resolve::precompute_js_ts_file_facts` collects
@@ -2070,8 +2070,8 @@ impl EntityGraph {
         // comment for exactly which tree-touching computations this covers
         // and why it's safe to skip for every other language). This is what
         // lets `resolve_scopes_in_file_chunks` skip re-parsing those files
-        // entirely instead of just parallelizing the re-parse (semx-022).
-        // semx-022: a warm rebuild re-extracts only files it already knows are
+        // entirely instead of just parallelizing the re-parse.
+        // a warm rebuild re-extracts only files it already knows are
         // dirty. Everything else is served from the facts layer — no disk read,
         // no tree-sitter parse, no extraction — and the extraction cache makes
         // even a dirty file whose bytes did not actually change nearly free.
@@ -2098,14 +2098,14 @@ impl EntityGraph {
                 // those files fall through and re-parse (their entities still
                 // come back free from the content-addressed extraction cache).
                 //
-                // semx-4an: the *entity* half of this reuse is not JS/TS-specific.
+                // the *entity* half of this reuse is not JS/TS-specific.
                 // `registry.extract_entities` is a pure function of (path,
                 // content, registry config), so an unchanged non-JS/TS file's
                 // entities are byte-identical to a re-extraction — and on the
                 // chunked path nothing downstream needs its tree either
                 // (`resolve_scopes_in_file_chunks` re-reads and re-parses every
                 // file that has no `PrecomputedFileFacts` entry anyway, and
-                // bag-of-words re-reads its content). Before this bead these
+                // bag-of-words re-reads its content). Before this change these
                 // files were re-read from disk and re-extracted on *every*
                 // rebuild — 1,577 of the monster's 40,872 files, ~220ms of pass 1
                 // — and, worse, that left them in `prev_entities`, forcing
@@ -2185,23 +2185,22 @@ impl EntityGraph {
                         content_hash: hash,
                     })
                 } else if {
-                    // MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md
-                    // §6.2 Phase 1, §6.1's GO/NO-GO table): C++ and C# are
+                    // MUL Phase 1's GO/NO-GO table: C++ and C# are
                     // the only families phase 1 is verdicted on — the only
-                    // two whose `LANGUAGE_SALTS` entries that bead bumps
-                    // (I5/F2). `precompute_scope_resolvable_file_facts` is
+                    // two whose `LANGUAGE_SALTS` entries that change bumps.
+                    // `precompute_scope_resolvable_file_facts` is
                     // written generically (any scope-resolvable, non-Swift
-                    // language — matching I3's structural, not per-language,
-                    // TREELESS decision), so phases 2/3 widen the *admission
+                    // language — matching TREELESS's structural, not per-language,
+                    // decision), so phases 2/3 widen the *admission
                     // predicate* alone; narrowing it outside the function is
                     // what keeps the blast radius to exactly the families
                     // that were measured and salted. Python/Go/Java/Rust's
                     // producer output is therefore byte-identical to before
-                    // that bead — still always `precomputed: None` from this
+                    // that change — still always `precomputed: None` from this
                     // closure — so their `LANGUAGE_SALTS` entries are
                     // correctly left untouched.
                     //
-                    // The predicate itself lives in `scope_resolve` (semx-w5k.2)
+                    // The predicate itself lives in `scope_resolve`
                     // because the facts corpus's salt has to agree with it
                     // file-for-file; see `scope_resolve::mul_precompute_admits`
                     // for why C++ is unconditional and C# is not.
@@ -2251,7 +2250,7 @@ impl EntityGraph {
         // GREEN file's entities back by *moving* them rather than cloning half a
         // million entity bodies on every rebuild.
         let mut entity_spans: Vec<(String, usize, usize)> = Vec::new();
-        // semx-5sw: same (path, start, len) shape as `entity_spans` above, but
+        // same (path, start, len) shape as `entity_spans` above, but
         // captured unconditionally (not gated on `carry`) and only for files
         // that got fresh precomputed facts this round — the CLEAN gate's own
         // candidate set. Free to record here (pure bookkeeping against
@@ -2294,7 +2293,7 @@ impl EntityGraph {
                 fresh_precomputed.insert(product.file_path.to_string(), f);
             }
         }
-        // semx-mul phase-2 W0: `all_entities` is now fully assembled — every
+        // MUL phase 2: `all_entities` is now fully assembled — every
         // file's entities are present — so this is the earliest point the
         // one cross-file entity rewrite this crate performs can run. Moved
         // here (was after the carry-destructuring split below, well after
@@ -2308,7 +2307,7 @@ impl EntityGraph {
         // CLEAN by omission, keeping stale file-local precomputed facts for a
         // file that is not, in fact, clean (per `mul_precompute_admits`'s own
         // `.go` never reaching `clean_gate_candidate_spans` today, so this
-        // was latent, not live — see the semx-mul bead). Moving this rewrite
+        // was latent, not live — see the MUL change). Moving this rewrite
         // earlier changes nothing for C++/C#/JS/TS: `is_go_file` guards every
         // mutation this function makes, so their entities are byte-for-byte
         // what they were before the move — see `clean_gate_scoping_matches_
@@ -2317,7 +2316,7 @@ impl EntityGraph {
         // not just the claim.
         let go_parents_resolved: GoParentsResolved =
             resolve_go_method_parent_ids(&mut all_entities);
-        // semx-dm5t: the id-staleness species, Go instance. Pass 1's
+        // the id-staleness species, Go instance. Pass 1's
         // per-file precompute (`precompute_scope_resolvable_file_facts`,
         // called per-file inside the loop above, before `all_entities` was
         // complete enough for the rewrite above to run) built each file's
@@ -2333,7 +2332,7 @@ impl EntityGraph {
         // no-op — the common case, since it is nonempty only when this
         // build actually contains a cross-file Go receiver method (most
         // corpora have none; Go's precompute path itself runs
-        // unconditionally as of semx-bpn2).
+        // unconditionally as of).
         if !go_parents_resolved.rekeyed_ids().is_empty() {
             for file_path in go_parents_resolved.rekeyed_files() {
                 if let Some(facts) = fresh_precomputed.get_mut(file_path) {
@@ -2341,9 +2340,8 @@ impl EntityGraph {
                 }
             }
         }
-        // MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md §4.1 step 2,
-        // I1/I6): the CLEAN gate. Pass 1's precompute (both
-        // `precompute_js_ts_file_facts` and, as of this bead,
+        // MUL Phase 1: the CLEAN gate. Pass 1's precompute (both
+        // `precompute_js_ts_file_facts` and, as of this change,
         // `precompute_scope_resolvable_file_facts`) can only ever see this
         // file's own entities — the corpus-wide `children_by_parent` doesn't
         // exist until every file's entities are assembled, which is exactly
@@ -2356,15 +2354,14 @@ impl EntityGraph {
         // other-scope-resolvable files, and every warm rebuild where nothing
         // fresh was precomputed this round).
         //
-        // semx-5sw: scoped to `fresh_precomputed`'s own keys — the only files
+        // scoped to `fresh_precomputed`'s own keys — the only files
         // this gate's verdict is ever read for (the `retain` below discards
         // every other file's answer anyway) — instead of building a
         // full-corpus `PrebuiltEntityIndex` to answer a question about a
         // handful of files. See `scope_resolve::clean_gate_dirty_files`'s doc
-        // comment for the soundness argument and RESOLUTION-PROFILE.md's
-        // semx-5sw section for the measurements.
+        // comment for the soundness argument.
         //
-        // semx-mul phase-2 W0: `clean_gate_dirty_files` now requires a
+        // MUL phase 2: `clean_gate_dirty_files` now requires a
         // `GoParentsResolved` token by value — obtainable only by calling
         // `resolve_go_method_parent_ids` first — so this call site cannot be
         // reordered ahead of the rewrite above without failing to compile.
@@ -2396,14 +2393,14 @@ impl EntityGraph {
             }
             c.precomputed.retain(|path, _| c.known.contains(path));
             c.content_hashes.retain(|path, _| c.known.contains(path));
-            // Cloned, not moved: semx-4an's `maintain_entity_lookups_incremental`
+            // Cloned, not moved: `maintain_entity_lookups_incremental`
             // needs its own read of these spans later in this function, after
             // `carry.entity_spans` has already been handed to the caller here.
             // Cheap — one small tuple per *file*, not per entity.
             c.entity_spans = entity_spans.clone();
         }
         resolve_profile::add_assemble_ns(__assemble_t0.elapsed());
-        // semx-022: split the carry once, here, into the three pieces the rest
+        // split the carry once, here, into the three pieces the rest
         // of the build needs. Doing it in one place keeps the incremental state
         // borrowed mutably while the precomputed facts stay borrowed immutably,
         // which the borrow checker will not allow if the split is done twice.
@@ -2500,10 +2497,10 @@ impl EntityGraph {
             ),
         };
 
-        // semx-4an: measure Pass A + Pass B (below) as one bucket — see
+        // measure Pass A + Pass B (below) as one bucket — see
         // `ENTITY_LOOKUP_BUILD_NS`'s doc comment. Stopped right before
         // `PreBuiltLookups` is constructed, so it covers exactly the same span
-        // the inventory in RESOLUTION-PROFILE.md's "Delta-proportional warm"
+        // the inventory "Delta-proportional warm"
         // section measured.
         let __entity_lookup_build_t0 = std::time::Instant::now();
         // A retain-mode build never writes `carry_symbol_table`/etc (see
@@ -2529,10 +2526,10 @@ impl EntityGraph {
         // incrementality — `all_entities` itself is only ever reconstructed
         // whole (GREEN-moved or RED-fresh) per build, never carried forward
         // as a persistent structure the way the owned, `String`-keyed maps
-        // below are. Not part of this bead's scope; see RESOLUTION-
+        // below are. Not part of this change's scope; see RESOLUTION-
         // PROFILE.md's "Delta-proportional warm" section.
         let __lookup_pass_a_t0 = std::time::Instant::now();
-        // No `id_to_name` here (semx-4an): Pass B below needs `id -> name`
+        // No `id_to_name` here: Pass B below needs `id -> name`
         // only for parent ids, and `entity_map` — built just after this loop
         // and, on a warm rebuild, not rebuilt at all — already *is* that map
         // (`EntityInfo::name`), over exactly the same key set (both are
@@ -2600,7 +2597,7 @@ impl EntityGraph {
         resolve_profile::add_lookup_pass_a_ns(__lookup_pass_a_t0.elapsed());
 
         // Owned, `String`-keyed lookups: session-maintained incrementally on
-        // the non-retain path (semx-4an), rebuilt whole otherwise — see
+        // the non-retain path, rebuilt whole otherwise — see
         // `maintain_entity_lookups_incremental`'s doc comment for why only
         // these five (not the borrowed maps above) are candidates for that.
         let symbol_table_plain: HashMap<String, Vec<String>>;
@@ -2636,7 +2633,7 @@ impl EntityGraph {
             ));
             symbol_table_plain = symbol_table_owned;
         } else {
-            // Unchanged from before semx-4an: whole rebuild, single pass over
+            // Unchanged from before: whole rebuild, single pass over
             // all_entities for symbol_table/entity_map/entity_ranges, a
             // second pass (needs entity_map complete) for class/owner
             // members.
@@ -2647,7 +2644,7 @@ impl EntityGraph {
             let mut owned_entity_ranges: HashMap<String, Vec<(usize, usize, String)>> =
                 HashMap::default();
             for entity in &all_entities {
-                // No eager `entry(key.clone())` (semx-ws6, audit D4): `entry`
+                // No eager `entry(key.clone)`: `entry`
                 // demands an owned key up front, so the old spelling allocated
                 // `name`/`file_path` Strings that were immediately dropped on
                 // every hit — `file_path` once per entity in the file. Same
@@ -2713,7 +2710,7 @@ impl EntityGraph {
                 }
             }
             sort_symbol_table_targets_by_source(&mut symbol_table_owned, &owned_entity_map);
-            // semx-yk5: same canonical (file_path, start_line, end_line, id)
+            // same canonical (file_path, start_line, end_line, id)
             // tie-break as `symbol_table`, made explicit here instead of
             // relying on `all_entities` already being in file-path order
             // (true today, but unstated/unenforced at this site) — see
@@ -2795,7 +2792,7 @@ impl EntityGraph {
         resolve_profile::add_lookup_go_pkg_ns(__lookup_go_pkg_t0.elapsed());
         resolve_profile::add_entity_lookup_build_ns(__entity_lookup_build_t0.elapsed());
 
-        // semx-4w1 checkpoint 1: "post-pass-1" — all_entities plus every
+        // checkpoint 1: "post-pass-1" — all_entities plus every
         // corpus-wide lookup table pass 1's output feeds (entity_map,
         // symbol_table, class/owner_members, entity_ranges, child_ranges),
         // before scope resolution (pass 2) or import-table build add
@@ -2861,12 +2858,12 @@ impl EntityGraph {
         // evaluated. A read set names keys, not tables, so the comparison is only
         // meaningful once the map it compares against is complete for the tables
         // that stage can reach. `SymbolTable`/`EntityMap` are fingerprinted here,
-        // *before* the import table is built (semx-h1s moved this up from after),
+        // *before* the import table is built (moved this up from after),
         // because `build_import_table_incremental`'s own GREEN test needs them
         // already populated in `cur_fp`.
         if let Some(state) = inc.as_deref_mut() {
             let __fingerprint_corpus_tables_t0 = std::time::Instant::now();
-            // semx-4an: the five corpus tables' fingerprints live in their own
+            // the five corpus tables' fingerprints live in their own
             // session-owned map (`carry_corpus_fp`), maintained key-by-key
             // alongside the tables themselves and then *copied* into this
             // build's `cur_fp`, which the rest of the build adds the
@@ -2901,7 +2898,7 @@ impl EntityGraph {
                     *carry_corpus_fp = fresh;
                 }
             }
-            // Parity gate (semx-4an). Off by default and costed at exactly one
+            // Parity gate. Off by default and costed at exactly one
             // env lookup; with `SEM_FP_PARITY=1` every build additionally does
             // the whole fold it just avoided and panics unless the two maps and
             // the guard agree entry-for-entry. This is what the "parity vs
@@ -2937,7 +2934,7 @@ impl EntityGraph {
         //
         // A session build (`inc.is_some()`) maintains `import_table_carry`
         // in place across rebuilds instead of rebuilding it whole — see
-        // `build_import_table_incremental`'s doc comment (semx-h1s). Every
+        // `build_import_table_incremental`'s doc comment. Every
         // other caller (`inc.is_none()`) is untouched: the original pure
         // function, byte-for-byte.
         let import_table_owned;
@@ -2970,13 +2967,13 @@ impl EntityGraph {
             fingerprint_import_table(import_table, &mut state.cur_fp);
         }
 
-        // semx-bkz: snapshot every file's content now, while pass 1's
+        // snapshot every file's content now, while pass 1's
         // (`parsed_files`/`precomputed_facts`) is still in hand and before
         // `parsed_files` is moved into scope resolution just below. See
         // `snapshot_bow_content`'s doc comment.
         let pre_parsed_content = snapshot_bow_content(file_paths, &parsed_files, precomputed_facts);
 
-        // semx-4w1 checkpoint 2: "peak-resolve" — right before scope
+        // checkpoint 2: "peak-resolve" — right before scope
         // resolution (pass 2) starts. Everything checkpoint 1 held is still
         // live, plus `import_table` (just built) and `pre_parsed_content`
         // (bag-of-words's content snapshot, just taken). This is the
@@ -3060,7 +3057,7 @@ impl EntityGraph {
         };
         resolve_profile::add_scope_wall_ns(__scope_wall_t0.elapsed());
 
-        // semx-4w1 checkpoint 2.5: "post-scope-resolve" — right after pass 2's
+        // checkpoint 2.5: "post-scope-resolve" — right after pass 2's
         // scope-resolution stage returns. Everything checkpoint 2 held is
         // gone or shrinking (per-chunk trees/content freed chunk by chunk),
         // but `scope_edges` and, especially, `scope_consumed_words`
@@ -3191,8 +3188,8 @@ impl EntityGraph {
         // ms and ~450 MB on the giants — were written on every cold build
         // and never read by it (the index writer builds REFS from `edges`;
         // warm impact/context answers come from `index.sem`). They are now
-        // derived lazily from `edges` on first demand (semx-ws6, audit D7;
-        // see `EntityGraph::adjacency`).
+        // derived lazily from `edges` on first demand
+        // (see `EntityGraph::adjacency`).
         let __edge_index_t0 = std::time::Instant::now();
         let edges: Vec<EntityRef> = all_resolved
             .into_iter()
@@ -3205,11 +3202,11 @@ impl EntityGraph {
         resolve_profile::add_edge_index_ns(__edge_index_t0.elapsed());
         resolve_profile::add_post_resolve_ns(__post_resolve_t0.elapsed());
 
-        // Moved, not re-collected (semx-4an): `EntityInfoMap` is the exact
+        // Moved, not re-collected: `EntityInfoMap` is the exact
         // type of `entity_map`, so no hash table is rebuilt here.
         let graph = EntityGraph::assemble(entity_map, edges);
 
-        // semx-4w1 checkpoint 3: "post-build" — everything transient to
+        // checkpoint 3: "post-build" — everything transient to
         // resolution (precomputed_facts, pre_parsed_content, import_table,
         // parsed_files, the pre-move class/owner_members/entity_ranges) has
         // already been dropped or reclaimed into the session carry by this
@@ -3229,7 +3226,7 @@ impl EntityGraph {
                         mem_profile::entity_map_bytes(&graph.entities),
                     ),
                     mem_profile::entry("graph.edges", mem_profile::entity_refs_bytes(&graph.edges)),
-                    // Honest zeros post-D7: the adjacency maps are no longer
+                    // Honest zeros: the adjacency maps are no longer
                     // materialized by the build; they cost nothing until a
                     // consumer demands them (and this checkpoint reports the
                     // graph as built, not as a hypothetical consumer sees it).
@@ -3395,7 +3392,7 @@ impl EntityGraph {
         }
         sort_symbol_table_targets_by_source(&mut symbol_table, &entity_map);
         let symbol_table = Arc::new(symbol_table);
-        // semx-yk5: same canonical tie-break as `symbol_table` above, made
+        // same canonical tie-break as `symbol_table` above, made
         // explicit for `scope_class_members`/`scope_owner_members`/
         // `scope_entity_ranges` too — see `sort_all_member_buckets_by_source`'s
         // doc comment.
@@ -3430,7 +3427,7 @@ impl EntityGraph {
 
         let scope_file_paths = if file_paths.len() > PARSED_FILE_REUSE_LIMIT {
             let mut scoped = Vec::new();
-            // semx-g6t: same byte-budget partition as `resolve_scopes_in_file_chunks`
+            // same byte-budget partition as `resolve_scopes_in_file_chunks`
             // (no `scope_tag`/incremental state threaded through this path, so
             // there is no cross-call consistency requirement here — this is
             // purely a re-parse batching/locality heuristic, same RSS-bounding
@@ -3497,13 +3494,13 @@ impl EntityGraph {
                 .collect(),
         };
 
-        // semx-bkz: same as `build_incremental_core` — snapshot content from
+        // same as `build_incremental_core` — snapshot content from
         // `parsed_files` before it's moved into scope resolution just below.
         // No `PrecomputedFileFacts` mechanism exists on this API, so files
         // outside `parsed_files` fall back to a disk read, unchanged from
-        // before this bead.
+        // before this change.
         // Bound the empty facts map to a local so the borrowed content map
-        // (semx-3tb) can outlive the call — this API has no precomputed
+        // can outlive the call — this API has no precomputed
         // facts, so every entry here is `Cow::Owned` exactly as before.
         let no_precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
             HashMap::default();
@@ -3566,7 +3563,7 @@ impl EntityGraph {
         let mut all_resolved = dedupe_resolved_edges(combined);
         sort_resolved_refs(&mut all_resolved);
 
-        // Adjacency derived lazily from `edges` on demand (audit D7), same
+        // Adjacency derived lazily from `edges` on demand, same
         // as the whole-corpus build path.
         let edges: Vec<EntityRef> = all_resolved
             .into_iter()
@@ -4208,7 +4205,7 @@ impl EntityGraph {
                 }
             }
         }
-        // semx-yk5: canonical (file_path, start_line, end_line, id)
+        // canonical (file_path, start_line, end_line, id)
         // source-position tie-break, not the previous plain lexicographic
         // `(member_name, member_id)` sort — see `sort_all_member_buckets_by_source`'s
         // doc comment.
@@ -4231,13 +4228,13 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
-        // semx-bkz: snapshot content from `parsed_files` (the stale files this
+        // snapshot content from `parsed_files` (the stale files this
         // call reparsed) before it's consumed by `.into_iter()` just below.
         // Clean files' content isn't retained on this legacy incremental API,
         // so they fall back to a disk read here, unchanged from before this
-        // bead.
+        // change.
         // Bound the empty facts map to a local so the borrowed content map
-        // (semx-3tb) can outlive the call — this API has no precomputed
+        // can outlive the call — this API has no precomputed
         // facts, so every entry here is `Cow::Owned` exactly as before.
         let no_precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
             HashMap::default();
@@ -4516,7 +4513,7 @@ impl EntityGraph {
     /// Filter entities to those that look like tests.
     /// Uses name heuristics, file path patterns, and content patterns.
     ///
-    /// Borrows the ids out of `entities` (semx-ws6, audit D5): every consumer
+    /// Borrows the ids out of `entities`: every consumer
     /// — the index writer's per-entity flag lookup, the SQL `entity_flags`
     /// insert, `test_impact`'s membership check — only ever *reads* the set
     /// while `entities` is still alive, so an owned `String` per test entity
@@ -4726,7 +4723,7 @@ impl EntityGraph {
         });
 
         // Clean up dependency/dependent indexes — only if they were ever
-        // materialized (audit D7). An unbuilt adjacency needs no maintenance:
+        // materialized. An unbuilt adjacency needs no maintenance:
         // whenever it is later demanded, it derives from the already-pruned
         // `edges`, which is exactly the state this loop maintains toward.
         if let Some(adj) = self.adjacency.get_mut() {
@@ -4819,7 +4816,7 @@ impl EntityGraph {
                         ref_type,
                     });
                     // Mirror into the adjacency maps only if they were ever
-                    // materialized (audit D7) — an unbuilt adjacency derives
+                    // materialized — an unbuilt adjacency derives
                     // this exact edge from `edges` on later demand.
                     if let Some(adj) = self.adjacency.get_mut() {
                         adj.dependents
@@ -5006,7 +5003,7 @@ struct PendingNamespaceImport {
 }
 
 /// A named import or named re-export before it is resolved against
-/// `symbol_table`: everything `resolve_named_import_tracked` (semx-h1s) needs
+/// `symbol_table`: everything `resolve_named_import_tracked` needs
 /// to redo that resolution later without re-reading or re-scanning the file's
 /// content, so a file whose only invalidating change is "a name it imports
 /// moved elsewhere" can be re-resolved from its cached scan instead of
@@ -5874,7 +5871,7 @@ fn build_import_table_with_default_export_paths(
 }
 
 // ---------------------------------------------------------------------------
-// Incremental import-table maintenance (semx-h1s)
+// Incremental import-table maintenance
 // ---------------------------------------------------------------------------
 
 /// One JS/TS file's cached import-table contribution: its scan (including the
@@ -5986,7 +5983,7 @@ fn ts_export_surface_value(
 /// (`scope_class_members`), `owner_members` (`scope_owner_members`),
 /// `entity_ranges` (`scope_entity_ranges`) and `child_ranges` across a
 /// `GraphSession` rebuild, instead of rebuilding all six from a whole-corpus
-/// scan of `all_entities` every time (semx-4an, generalizing semx-h1s's
+/// scan of `all_entities` every time (generalizing 's
 /// import-table pattern).
 ///
 /// Also returns the [`scope_resolve::TouchedCorpusKeys`] the caller needs to
@@ -5994,10 +5991,10 @@ fn ts_export_surface_value(
 ///
 /// # Why this exists
 ///
-/// RESOLUTION-PROFILE.md's "Delta-proportional warm" section measured the
+/// "Delta-proportional warm" section measured the
 /// combined Pass A/B loop this replaces (`entity_lookup_build_ms`) at
 /// ~700ms, *flat* whether 1, 50, or 500 files changed — a pure `O(corpus)`
-/// floor, and after semx-h1s/semx-h19 collapsed the import table and
+/// floor, and after collapsed the import table and
 /// bag-of-words, the single largest attributable bucket left in a warm
 /// rebuild on the TypeScript monster corpus.
 ///
@@ -6345,14 +6342,14 @@ fn maintain_entity_lookups_incremental(
 }
 
 /// Incrementally maintain the import table across a `GraphSession` rebuild
-/// instead of rebuilding it whole (semx-h1s).
+/// instead of rebuilding it whole.
 ///
 /// # Why this exists
 ///
 /// `build_import_table_with_default_export_paths` (used by every other
 /// caller, unchanged by this function's existence) is a pure function: scan
 /// every file, merge, done. On a warm rebuild that is wasteful —
-/// RESOLUTION-PROFILE.md's red-green section measured it as the single
+/// red-green section measured it as the single
 /// largest bucket left after scope resolution and bag-of-words collapsed
 /// 33x/4x: 1,471ms of a 3,438ms warm rebuild on the TypeScript monster
 /// corpus, rebuilding the same ~230k entries for ~39,000 files whose imports
@@ -6415,7 +6412,7 @@ fn maintain_entity_lookups_incremental(
 /// `default_export` itself needs no read-set entry: `scan_import_file`
 /// resolves it by filtering `symbol_table.get(name)` down to entities in the
 /// *same file*, so its value is a pure function of the file's own content —
-/// the same self-invariant RESOLUTION-PROFILE.md's red-green section already
+/// the same self-invariant red-green section already
 /// relies on for a file's own `entity_map`/`entity_ranges` reads.
 ///
 /// # What is conservative
@@ -6423,14 +6420,14 @@ fn maintain_entity_lookups_incremental(
 /// * **Only JS/TS files are ever cached or reuse-eligible for import-table
 ///   purposes**, matching every other red-green boundary in this crate.
 ///   Python/Rust/Go/Clojure imports are re-scanned and their entries
-///   re-inserted on every build, exactly as before this bead — slower, never
+/// re-inserted on every build, exactly as before this change — slower, never
 ///   wrong.
 /// * **A bare/package specifier default or namespace import
 ///   (`import x from 'lodash'`) forces its whole owning file's contribution
 ///   to be recomputed every build.** `find_import_file`'s fallback for a bare
 ///   specifier is a whole-corpus stem scan, not a bounded candidate list —
 ///   precisely tracking "would a new local file start matching this stem" is
-///   possible but out of this bead's budget; over-invalidating a file with
+/// possible but out of this change's budget; over-invalidating a file with
 ///   one is safe, just not free. Named imports/re-exports and relative
 ///   default/namespace imports (the common case for a repo's own cross-file
 ///   dependencies) are unaffected.
@@ -8288,7 +8285,7 @@ function outer() {
         );
     }
 
-    /// semx-nuv determinism invariant: whether an ambiguous bare-name call
+    /// determinism invariant: whether an ambiguous bare-name call
     /// resolves must be a pure function of the whole corpus's content, never
     /// of which chunk happens to hold which file. Before the fix, whether
     /// `resolve_ref`'s Swift-overload-aware branch ran at all for a given
@@ -11502,7 +11499,7 @@ fn caller() {
 
     #[test]
     fn test_rust_module_alias_qualified_call_resolves_edge() {
-        // semx-gla: `use crate::parser::scope_resolve;` imports the MODULE
+        // `use crate::parser::scope_resolve;` imports the MODULE
         // `scope_resolve`, not an item named `scope_resolve` — the qualified
         // call `scope_resolve::resolve_it()` must still produce an edge to
         // the real function it names. Before the fix, `extract_rust_use`
@@ -12237,7 +12234,7 @@ mod single_pass_invariants {
     use super::*;
     use crate::parser::plugins::create_default_registry;
 
-    /// **L-BOW-SHARE** (`SINGLE-PASS.md` §2, pass D; the deforestation
+    /// **L-BOW-SHARE** (pass D; the deforestation
     /// witness for bag-of-words's content column)
     ///
     /// ```text
@@ -12246,7 +12243,7 @@ mod single_pass_invariants {
     /// ```
     ///
     /// The first conjunct is representation-invariance: what bag-of-words
-    /// reads is unchanged. The second is the whole point — before semx-3tb
+    /// reads is unchanged. The second is the whole point — before
     /// `snapshot_bow_content` did `facts.content().to_string()` for every
     /// file on the chunked path, a full second copy of the corpus's JS/TS
     /// content (136 MB on the TypeScript monster) held live from here through

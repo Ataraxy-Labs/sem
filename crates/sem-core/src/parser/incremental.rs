@@ -1,11 +1,11 @@
 //! Red-green incremental resolution: per-file facts, resolve-time read sets, and
 //! the invalidation rule that decides which files must be re-resolved after an
-//! edit (semx-022).
+//! edit.
 //!
 //! # The invariant this module exists to enforce
 //!
 //! A cached resolution result is valid only if the file's *own* facts **and**
-//! everything its resolution actually read are unchanged (KAPPA.md's closure
+//! everything its resolution actually read are unchanged (closure
 //! reasoning: "kappa alone authorizes no hit"). Over-approximating the read set
 //! is merely slow. Under-approximating it silently serves stale edges, which is
 //! the one unforgivable failure — so every lookup that can reach another file's
@@ -17,7 +17,7 @@
 //! * **Facts layer.** [`FileFacts`] is the content-addressed per-file bundle:
 //!   content hash, extracted entities, and the tree-independent scope/ref facts
 //!   (`PrecomputedFileFacts`) resolution needs. It is `serde`-serializable so the
-//!   on-disk corpus bead (semx-9en) can persist it unchanged.
+//! on-disk corpus change can persist it unchanged.
 //! * **Read sets.** During resolution every file accumulates a [`ReadSet`]: the
 //!   set of `(table, key)` pairs its resolution consulted, hashed to a `u64`.
 //!   Recording happens at the lookup site, so a key is recorded whether the
@@ -97,7 +97,7 @@ pub(crate) enum Table {
     BowParentChildPairs = 15,
     /// TS/JS export surface of one file, keyed by that file's own path:
     /// `(default export target id, sorted named exports, sorted top-level
-    /// entities)` folded into one hash (`import_table_incremental`, semx-h1s).
+    /// entities)` folded into one hash (`import_table_incremental`).
     /// A default/namespace import elsewhere records a read of every path its
     /// module specifier could resolve to (hit or miss), so this file
     /// gaining, losing, or changing its default/named exports invalidates
@@ -107,7 +107,7 @@ pub(crate) enum Table {
     /// `.swift` sources, in which case any change forces a full re-resolve).
     GuardSwiftCallSignatures = 200,
     /// Whole-table guard: Python's bare `import module` / `import module as m`
-    /// form (`register_namespace_import`, semx-kzy). That function scans *every*
+    /// form (`register_namespace_import`). That function scans *every*
     /// entry of `symbol_table`/`entity_map` looking for ones whose file matches
     /// the imported module — an unbounded read no `(table, key)` pair can name,
     /// because a symbol added anywhere in the corpus could start (or stop)
@@ -116,7 +116,7 @@ pub(crate) enum Table {
     /// guard costs nothing for files that don't use the pattern.
     GuardPyWildcardImport = 201,
     /// Whole-table guard: Rust's relative module-alias `use` form
-    /// (`register_rust_module_import`, semx-gla) — `use crate::a::module_name;`
+    /// (`register_rust_module_import`) — `use crate::a::module_name;`
     /// / `use super::module_name;` / `use self::module_name;` followed by a
     /// qualified call `module_name::item()`. Same unbounded-read shape as
     /// `GuardPyWildcardImport` immediately above (a symbol added anywhere in
@@ -141,7 +141,7 @@ impl Table {
     ///
     /// `resolve_with_scopes_full_inner` rebuilds the return-type and
     /// instance-attribute maps from only the files in the chunk it is currently
-    /// resolving (see RESOLUTION-PROFILE.md's semx-6rd CUT-2 note: they are
+    /// resolving (see CUT-2 note: they are
     /// deliberately *not* hoisted, because hoisting them would change which
     /// functions' return types are visible across a chunk boundary). So the same
     /// key can legitimately hold different values in two different chunks, and a
@@ -330,7 +330,7 @@ impl Recorder {
 ///
 /// `entries` stays a `HashMap` (`FxHashMap`, fixed-seed) because `put`/`get`/
 /// `remove` are on the hot incremental-build path and don't care about order.
-/// `Serialize` is hand-written below instead of derived (semx-1ut) because the
+/// `Serialize` is hand-written below instead of derived because the
 /// derive would encode the map in its own iteration order, which depends on
 /// *insertion sequence*, not just key content — two builds of the identical
 /// logical corpus can fold the same (key, value) pairs in different orders
@@ -373,7 +373,7 @@ impl TableFingerprints {
 
     /// Drop a key entirely, so it reads back as "absent" rather than as its
     /// stale value. Used only by touched-key incremental fingerprinting
-    /// (semx-4an): a table key that *disappeared* must fingerprint as absent,
+    ///: a table key that *disappeared* must fingerprint as absent,
     /// because [`ReadSet::unchanged`] compares `Option`s and a lingering stale
     /// value would keep a file GREEN whose lookup now misses.
     #[inline]
@@ -488,13 +488,13 @@ pub fn content_hash(content: &str) -> u64 {
 }
 
 /// [`content_hash`] over raw bytes, for a caller holding a file it has not
-/// (yet) proven is UTF-8 — `sem-cli`'s single corpus read
-/// (`SINGLE-PASS.md` §3), which must fingerprint every readable file for
+/// (yet) proven is UTF-8 — `sem-cli`'s single corpus read,
+/// which must fingerprint every readable file for
 /// `cache.db` while only UTF-8 files reach the index.
 ///
 /// This is the same xxh3-64 `utils::hash::content_hash_bytes` renders as hex
-/// for `cache.db`'s `files.content_hash` column: one number, two encodings
-/// (`SINGLE-PASS.md` §1.3), not two hashes.
+/// for `cache.db`'s `files.content_hash` column: one number, two encodings,
+/// not two hashes.
 pub fn content_hash_bytes(content: &[u8]) -> u64 {
     let mut h = Xxh3::new();
     h.update(content);
@@ -505,7 +505,7 @@ pub fn content_hash_bytes(content: &[u8]) -> u64 {
 ///
 /// Content-hash keyed: the same bytes at the same path always produce the same
 /// facts, exactly like `parser::cache`'s extraction cache (whose keying
-/// discipline this follows). `serde`-serializable so semx-9en can persist a
+/// discipline this follows). `serde`-serializable so can persist a
 /// corpus of these without changing the shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileFacts {
@@ -524,7 +524,7 @@ pub struct FileFacts {
 /// for the same entities, so reusing edges without reusing the words it took to
 /// produce them would change the next stage's answer.
 ///
-/// `serde`-serializable so `facts_store` (semx-9en) can persist a warm session's
+/// `serde`-serializable so `facts_store` can persist a warm session's
 /// per-file resolution outputs across a process restart, not just within one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CachedScopeResult {
@@ -607,18 +607,18 @@ pub struct RebuildStats {
 /// so the cold path pays one `Option` check per stage.
 ///
 /// **Reuse eligibility.** Files whose *detected* language is JS/TS, Python, Go,
-/// or Rust may go GREEN (semx-kzy extended this past JS/TS-only, semx-022's
+/// or Rust may go GREEN (extended this past JS/TS-only, 's
 /// original scope — see [`crate::parser::import_resolution::
 /// is_reuse_eligible_file`]). Every other language's resolution reaches
 /// cross-file data through paths this crate does not yet attribute per file
 /// (Swift call signatures, or a generic-table read never exercised by a
 /// dedicated fixture). Rather than guess at their read sets, those files are
-/// held permanently RED: slower, never wrong. See RESOLUTION-PROFILE.md's
+/// held permanently RED: slower, never wrong. See
 /// "Universal GREEN eligibility" section for the full per-language verdict.
 ///
 /// # Ownership: the cache is *moved* through a build, not copied
 ///
-/// There is one per-file cache map, not a `prev` and a `next` (semx-4an). The
+/// There is one per-file cache map, not a `prev` and a `next`. The
 /// session hands its map over at the start of a build and takes it back at the
 /// end; a GREEN file's entry is therefore **already** in the right place holding
 /// exactly the right value, and reuse costs no write at all. Before this, a

@@ -1,4 +1,4 @@
-//! On-disk persistence for the red-green facts layer (semx-9en): the missing
+//! On-disk persistence for the red-green facts layer: the missing
 //! half of [`crate::parser::session::GraphSession`]'s promise that "a verified
 //! fact must not die with its process." Everything a warm rebuild needs to
 //! treat an unchanged file as GREEN — its extracted entities, its precomputed
@@ -24,7 +24,7 @@
 //!   wrong shape here. Loading a 40k-file corpus would mean 40k `open` +
 //!   `read` + `close` syscalls. Measured on the monster corpus's own facts
 //!   (below): that syscall overhead alone is on the order of the entire
-//!   rebuild savings this bead is chasing — sharding a bulk-transfer
+//! rebuild savings this change is chasing — sharding a bulk-transfer
 //!   workload does not "decisively beat rebuilding," it competes with it.
 //! * **Single SQLite database**: a real alternative (`sem-mcp`'s own
 //!   per-repo cache already uses one, for a genuinely point-lookup access
@@ -62,11 +62,10 @@
 //!   bulk-load access pattern (no string escaping/UTF-8 validation on every
 //!   field, no number-to-string-and-back for every hash and byte offset).
 //!
-//! Measured save/load/size numbers for both corpora are in
-//! `RESOLUTION-PROFILE.md`'s "## Persisted facts" section, including the one
-//! result that *didn't* make the cut: see that section for what was measured
-//! and dropped rather than shipped, per this bead's own instruction to drop
-//! (and report) any component that loads slower than it rebuilds.
+//! Measured save/load/size numbers for both corpora, including one result
+//! that didn't make the cut, showed what was measured and dropped rather
+//! than shipped, per this change's own instruction to drop (and report) any
+//! component that loads slower than it rebuilds.
 //!
 //! # Keying and versioning
 //!
@@ -112,9 +111,9 @@
 //! directory defaults to and how it is disabled — lives in `sem-cli`, not
 //! here.
 //!
-//! # Coordination note (semx-9en)
+//! # Coordination note
 //!
-//! A concurrent bead is adding serde-additive optional fields to `FileFacts`
+//! A concurrent change is adding serde-additive optional fields to `FileFacts`
 //! (bow-token work). Because this store is CBOR (self-describing, field-keyed
 //! — chosen *because* of this concern, see "Format" above), a genuinely
 //! additive `Option<T>` field with `#[serde(default)]` decodes fine against
@@ -166,7 +165,7 @@ macro_rules! maybe_par_iter {
 /// See the module doc's "Keying and versioning" section for why this can't be
 /// inferred from a decode failure alone.
 ///
-/// 1 -> 2 (semx-mul phase 2, MUL-DESIGN.md §4.3 Field 10): `PrecomputedFileFacts`
+/// 1 -> 2 (MUL phase 2): `PrecomputedFileFacts`
 /// grew `import_stmts: Vec<ImportStmtFacts>`. Purely additive in content
 /// (every producer today writes an empty `Vec` — see that field's own doc
 /// comment for why it is provably empty for both languages that reach a
@@ -176,7 +175,7 @@ macro_rules! maybe_par_iter {
 /// entries become a clean miss (rebuilt), never a misdecode, on the very next
 /// warm start against a binary carrying this field.
 ///
-/// 2 -> 3 (semx-mul phase 2 W5, MUL-DESIGN.md §4.3 Field 11):
+/// 2 -> 3 (MUL phase 2):
 /// `PrecomputedFileFacts` grew `ctor_call_sites: Vec<CtorCallFacts>` — same
 /// shape as the 1 -> 2 bump (a new type, `CtorCallFacts`, reachable from
 /// `PersistedFacts`; every producer but Python's still writes an empty
@@ -209,7 +208,7 @@ pub(crate) struct PersistedFile {
     pub(crate) resolution: Option<CachedFileResolution>,
 }
 
-/// Borrowing serialize-only twin of [`FileFacts`] (semx-ws6, audit D2).
+/// Borrowing serialize-only twin of [`FileFacts`].
 /// Field names and order match `FileFacts` exactly, so serde encodes a value
 /// of this byte-identically to the owned struct it mirrors.
 #[derive(Serialize)]
@@ -219,7 +218,7 @@ pub(crate) struct FileFactsRef<'a> {
     pub(crate) entities: &'a [SemanticEntity],
 }
 
-/// Borrowing serialize-only twin of [`PersistedFile`] (semx-ws6, audit D2).
+/// Borrowing serialize-only twin of [`PersistedFile`].
 #[derive(Serialize)]
 pub(crate) struct PersistedFileRef<'a> {
     pub(crate) facts: FileFactsRef<'a>,
@@ -228,14 +227,13 @@ pub(crate) struct PersistedFileRef<'a> {
 }
 
 /// The facts layer as a **view borrowing the live session** — what the two
-/// savers ([`FactsStore::save`], [`FactsCorpus::populate_delta`]) consume
-/// (semx-ws6, audit D2). [`PersistedFacts`] stays the *deserialize* type
+/// savers ([`FactsStore::save`], [`FactsCorpus::populate_delta`]) consume.
+/// [`PersistedFacts`] stays the *deserialize* type
 /// (`FactsStore::load` returns it, `GraphSession::warm_start` consumes it by
 /// value); this is the *serialize* shape, so exporting a session's facts for
 /// persistence no longer deep-clones every entity body, precomputed source
 /// text and cached edge list the session still owns — one of the three
-/// corpus copies behind the facts plane's measured RSS band
-/// (RESOLUTION-PROFILE.md, semx-w5k §5).
+/// corpus copies behind the facts plane's measured RSS band.
 pub struct PersistedFactsRef<'a> {
     pub(crate) fingerprints: &'a TableFingerprints,
     pub(crate) files: Vec<PersistedFileRef<'a>>,
@@ -299,7 +297,7 @@ impl PersistedFacts {
     }
 
     /// Number of corpus-wide fingerprint entries this snapshot holds.
-    /// Diagnostic only (semx-bvu): a snapshot whose `file_count` is nonzero
+    /// Diagnostic only: a snapshot whose `file_count` is nonzero
     /// but whose `fingerprint_count` is zero cannot warm *any* file GREEN —
     /// see `crate::parser::incremental::Incremental::new`'s
     /// `reuse && !prev_fp.is_empty()` gate, which disables reuse for the
@@ -310,7 +308,7 @@ impl PersistedFacts {
     }
 
     /// Number of files this snapshot holds a `resolution` (cached scope
-    /// edges + read set) for. Diagnostic only (semx-bvu): `resolve_with_
+    /// edges + read set) for. Diagnostic only: `resolve_with_
     /// scopes_full_inner`'s GREEN filter requires `Incremental::cached` to
     /// return `Some` for a file *in addition to* its read set being
     /// unchanged — a file present in `files` (so it counts toward
@@ -327,7 +325,7 @@ impl PersistedFacts {
     /// says nothing about whether that entry is still fresh (a stale-hash
     /// entry still counts as "known"). Callers deciding whether a path needs
     /// a *different* source of facts (e.g. `sem-cli`'s cross-repo corpus
-    /// consult, semx-2o8) should use this to mean "already has an opinion
+    /// consult) should use this to mean "already has an opinion
     /// here, don't override it" — staleness is `GraphSession::warm_start`'s
     /// own job, not this method's.
     pub fn files_contains(&self, path: &str) -> bool {
@@ -351,8 +349,8 @@ impl PersistedFacts {
             .collect()
     }
 
-    /// This snapshot as the borrowing serialize view the savers consume
-    /// (semx-ws6, audit D2) — for callers (tests, probes) that hold an owned
+    /// This snapshot as the borrowing serialize view the savers consume —
+    /// for callers (tests, probes) that hold an owned
     /// `PersistedFacts` rather than a live `GraphSession`. O(files) pointer
     /// work; no entity body is touched.
     pub fn as_borrowed(&self) -> PersistedFactsRef<'_> {
@@ -482,7 +480,7 @@ impl FactsStore {
             io::Error::new(io::ErrorKind::InvalidData, "failed to encode a facts shard")
         })?;
 
-        // Write-through, no staging copy (semx-ws6, audit D3): the encoded
+        // Write-through, no staging copy: the encoded
         // shards used to be memcpy'd into one contiguous `Vec<u8>` purely so
         // a single `fs::write` could be called — a full second copy of the
         // corpus's CBOR held at peak. Nobody needed the bytes contiguous,
@@ -541,7 +539,7 @@ fn root_key(root: &Path) -> u64 {
 }
 
 // =============================================================================
-// Cross-repo corpus (semx-2o8): Phase B's local tier
+// Cross-repo corpus: Phase B's local tier
 // =============================================================================
 //
 // Everything above is scoped to *one repo root*: `FactsStore` shares facts
@@ -628,12 +626,12 @@ fn root_key(root: &Path) -> u64 {
 // sections); it simply re-resolves cross-file edges fresh, exactly as if
 // those files had been freshly added to an ordinary warm rebuild.
 //
-// See `RESOLUTION-PROFILE.md`'s "## Cross-repo corpus (local tier)" section
+//
 // for the cross-repo proof numbers (reuse counts, time saved, and the
 // negative same-content-different-path test) and the load-speed
 // measurement against the per-repo tier's 220ms bar.
 //
-// ## Coordination note (semx-2o8, mirrors semx-9en's above)
+// ## Coordination note (mirrors 's above)
 //
 // Corpus shard headers reuse `FACTS_SCHEMA_VERSION`/`sem_core_salt()` — the
 // same single version knob the per-repo store uses — rather than a second,
@@ -641,17 +639,17 @@ fn root_key(root: &Path) -> u64 {
 // from types (`FileFacts`, `PrecomputedFileFacts`) that knob already
 // governs. A shape change to either type invalidates both tiers together
 // with one bump, exactly the "bump salt once at the end" coordination this
-// bead's own instructions ask for with any concurrent serde-additive work.
+// change's own instructions ask for with any concurrent serde-additive work.
 
-// ## Shard layout v2 (semx-fqh): why a shard carries its own index
+// ## Shard layout v2: why a shard carries its own index
 //
 // v1 stored a shard as one CBOR array of `CorpusFile`, so *any* consult of a
 // shard — a one-key lookup, a one-entry write — decoded every entry in it.
 // With `CORPUS_BUCKETS` fixed, per-shard size grows linearly with the corpus,
 // so both costs tracked everything the machine had ever indexed. That is not
-// a hypothesis: W5 (semx-gbb) measured the same repo at an identical
+// a hypothesis: measured the same repo at an identical
 // 40,869/40,869 hit rate costing 8.5 s against a 556 MB corpus and 13.4 s
-// against a 7.9 GB one, and this bead's own baseline split the +4.9 s into
+// against a 7.9 GB one, and this change's own baseline split the +4.9 s into
 // +2.3 s of `merge_with_local` and +1.4 s of `populate_delta` — the read
 // side and the write side of exactly this decode.
 //
@@ -704,7 +702,7 @@ fn root_key(root: &Path) -> u64 {
 // is rewritten in v2 on the way past, with no separate migration step.
 // `FACTS_SCHEMA_VERSION` is deliberately *not* bumped: it governs the
 // `CorpusFile`/`PersistedFile` *shape*, which is unchanged here, and it is
-// shared with the per-repo `FactsStore` (untouched by this bead) and
+// shared with the per-repo `FactsStore` (untouched by this change) and
 // validated against the cloud tier's `claimed_schema_version` in
 // `ingest_remote`. Bumping it would invalidate two stores and one wire
 // contract for a change that is purely this file's on-disk framing.
@@ -746,52 +744,51 @@ const SHARD_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// corpus across the grammar bump — a real, documented risk of this design,
 /// not a silently-solved problem.
 ///
-/// The bump is not only for grammar/extractor changes: MUL-DESIGN.md I5/F2
+/// The bump is not only for grammar/extractor changes: the same salt-bump discipline
 /// generalizes it to *any* change in what a language's producer puts into
 /// `PrecomputedFileFacts` for a `content_hash` this table's salt already
 /// covers — because corpus dedup is first-writer-wins, a warm corpus entry
 /// written by the old producer is never regenerated by a build that merely
 /// upgrades `sem-core`, it is silently reused. `typescript`/`tsx`/`javascript`
 /// were bumped (grammar-unchanged, hence the suffix rather than a new
-/// tree-sitter version) by semx-u16, which fixed
+/// tree-sitter version) by a fix that corrected
 /// `precompute_js_ts_file_facts`'s `scopes[0].defs` seed order (extraction
-/// order → `entity_ranges` order, MUL-DESIGN.md I2/F1): a real but narrow
+/// order → `entity_ranges` order): a real but narrow
 /// producer-output change (only 10+-way same-line, same-span, same-name
 /// top-level collisions can differ), still enough to require invalidating
 /// any warm corpus entry for these three languages.
 ///
-/// `cpp`/`csharp` were bumped by semx-mp1 (MUL Phase 1, epic semx-w5k) for
-/// the same reason at a larger scale: before this bead, pass 1's chunked
+/// `cpp`/`csharp` were bumped (as part of MUL Phase 1) for
+/// the same reason at a larger scale: before this change, pass 1's chunked
 /// closure (`graph.rs`) never precomputed facts for these two languages at
 /// all -- every `.cs`/`.cpp` `CorpusFile` ever written carries
-/// `precomputed: None`. semx-mp1 makes pass 1 attempt
+/// `precomputed: None`. This change makes pass 1 attempt
 /// `precompute_scope_resolvable_file_facts` for both (gated per file by
-/// `TREELESS`, MUL-DESIGN.md section 1.2/4.1), so a file that previously got
-/// `None` can now get `Some`. Corpus dedup is first-writer-wins (semx-fqh),
+/// `TREELESS`), so a file that previously got
+/// `None` can now get `Some`. Corpus dedup is first-writer-wins,
 /// so without this bump every pre-existing `.cs`/`.cpp` corpus entry would
-/// silently keep denying the new facts a slot forever -- exactly I5/F2's
-/// warning. Python/Go/Java/Rust are intentionally *not* bumped here: this
-/// bead's `graph.rs` admission test dispatches only `csharp`/`cpp` to the
-/// new precompute function (MUL-DESIGN.md section 6.1's GO/NO-GO table --
-/// those four families are NO-GO as-is), so their producer output is
+/// silently keep denying the new facts a slot forever -- exactly the hazard
+/// the salt-bump discipline exists to prevent. Python/Go/Java/Rust are intentionally *not* bumped here: this
+/// change's `graph.rs` admission test dispatches only `csharp`/`cpp` to the
+/// new precompute function (those four families are NO-GO as-is), so their producer output is
 /// unchanged.
 ///
-/// `yaml` was bumped `handrolled-1` -> `handrolled-2` by semx-vlg/semx-kkk:
+/// `yaml` was bumped `handrolled-1` -> `handrolled-2`:
 /// a multi-document YAML file's same-named top-level keys in different
 /// documents used to collapse onto one `build_entity_id` output (a real
 /// oracle failure — 11 "Args" entities sharing one id in an llvm fixture,
-/// TESTS_ORACLE semx-kkk), making which document's data (including
+/// TESTS_ORACLE), making which document's data (including
 /// `is_test`) a corpus-wide id collision kept depend on processing order.
 /// The fix (`plugins/yaml.rs`) disambiguates colliding ids by document index
 /// via `build_entity_id_disambiguated_by_document`, which changes the `id`
 /// field of every `SemanticEntity` a multi-document YAML file with a
 /// colliding key produces — and `FileFacts.entities` carries that `id`
 /// verbatim into the corpus, so an old-salt entry for such a file is exactly
-/// I5's hazard. Single-document files (and multi-document files with no
+/// the same hazard. Single-document files (and multi-document files with no
 /// colliding key) keep the same ids, but the bump has no cheaper-than-whole-
 /// language granularity, so it covers all `yaml`/`.yml` entries.
 ///
-/// This table is `pub` (semx-0lj) so `sem-cli`'s `facts_remote.rs` — the
+/// This table is `pub` so `sem-cli`'s `facts_remote.rs` — the
 /// same crate graph, version-locked to this `sem-core` via a path
 /// dependency — consumes it directly instead of hand-mirroring a second
 /// copy that can silently drift from this one.
@@ -806,37 +803,37 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("typescript", "ts-0.23-u16"),
     ("tsx", "ts-0.23-u16"),
     ("javascript", "ts-0.23-u16"),
-    // MUL phase 2 (semx-mul, W5): python's producer now emits populated
+    // MUL: python's producer now emits populated
     // import_stmts (Field 10) *and* ctor_call_sites (Field 11) — bumped from
-    // "ts-0.23" following rust's/go's/java's I5/F2 precedent. Shipped
-    // unconditionally at W5 (maxRSS -7.95%/-7.80% on home-assistant/core, a
-    // net decrease) and reconfirmed by F1 (maxRSS -1.63% median, still
-    // negative), but M1 (2026-08-22) found peak memory footprint —
-    // I6's now-corrected ceiling metric — reads +25.29-27.44% against the
+    // "ts-0.23" following rust's/go's/java's salt-bump precedent. Shipped
+    // unconditionally (maxRSS -7.95%/-7.80% on home-assistant/core, a
+    // net decrease) and reconfirmed by a follow-up re-check (maxRSS -1.63% median, still
+    // negative), but a 2026-08-22 re-verification found peak memory footprint —
+    // the now-corrected ceiling metric — reads +25.29-27.44% against the
     // same +15% ceiling, above it. Demoted to gated behind `SEM_MUL_PYTHON`
     // (`MUL_RUNTIME_GATES`'s "python" row carries the pre-switch salt,
     // "ts-0.23"); this table's salt is unchanged — it now serves as the
-    // switched-*on* salt, C++'s/rust's/java's shape (go's too, until
-    // semx-bpn2 admitted it unconditionally and removed its switch
+    // switched-*on* salt, C++'s/rust's/java's shape (go's too, until Go was
+    // admitted unconditionally and removed its switch
     // entirely — see below).
     ("python", "ts-0.23-mp4"),
-    // MUL phase 2 (semx-mul, W3+W4): go's producer now emits populated
+    // MUL: go's producer now emits populated
     // import_stmts (Field 10) — bumped from "ts-0.23" following the same
-    // I5/F2 precedent as rust's mp2 bump. Gated behind `SEM_MUL_GO`
+    // salt-bump discipline as rust's mp2 bump. Gated behind `SEM_MUL_GO`
     // (`MUL_RUNTIME_GATES`'s "go" row carries the pre-switch salt,
-    // "ts-0.23"), and must STAY gated: its memory fence passed but
+    // "ts-0.23"), and must STAY gated: its memory check passed but
     // `edge_dump_probe` found a real, deterministic correctness regression
     // on kubernetes (not bit-identical ON vs OFF) — see
     // `mul_precompute_admits`'s doc comment.
     //
-    // mp3 -> mp5 (semx-u3rk): fixed half of that regression —
+    // mp3 -> mp5: fixed half of that regression —
     // `GoImport::packages` now carries each spec's *full* import path
     // instead of a bare last-`/`-segment reduction, so `register_go_
     // package_imports` can disambiguate same-named packages by declaring
     // directory (kubernetes has dozens of directories literally named
     // `v1`). Producer-visible (the stored `packages` strings' content
     // changed) but not a shape change (`Vec<String>` throughout), so this
-    // is I5/F2's salt-bump case, not a `FACTS_SCHEMA_VERSION` bump — same
+    // is a salt-bump case, not a `FACTS_SCHEMA_VERSION` bump — same
     // category as this table's other content-only producer bumps. Kept
     // even though the switch stays off in production (must not be flipped
     // — see below): a stale mp3-salted entry from a local SEM_MUL_GO=1
@@ -850,7 +847,7 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     // not be flipped in production until that regression is root-caused
     // and fixed.
     //
-    // mp5 -> mp5-dm5t (semx-dm5t): fixed the mechanism `mul_precompute_
+    // mp5 -> mp5-dm5t: fixed the mechanism `mul_precompute_
     // admits`'s doc comment above named as "(2), not fixed" — id-staleness.
     // `registry::resolve_go_method_parent_ids` rewrites a cross-file Go
     // method's `id`/`parent_id`, but ran *after* pass 1 had already keyed
@@ -874,16 +871,16 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     // this entry. `edge_dump_probe` ON vs OFF on kubernetes: bit-identical
     // (0-line diff, was 30,795) for the method-id-rewrite mechanism this
     // fix targets. A second, independent, much smaller mechanism (the
-    // registration-gap species semx-9g8q is chasing, unrelated to Go's id
-    // rewrite) is still open at this point — see that bead.
+    // registration-gap species is chasing, unrelated to Go's id
+    // rewrite) is still open at this point — see that change.
     //
-    // mp5-dm5t -> mp5-dm5t-bpn2 (semx-9g8q + semx-bpn2, go-fence wave):
-    // semx-9g8q closed the registration-gap species named just above
+    // mp5-dm5t -> mp5-dm5t-bpn2 (+ the Go memory-check work):
+    // closed the registration-gap species named just above
     // (function-nested entities never entering any scope's `.defs`) for
     // every language at once, including Go — `ENTITY_SCOPE_LOOKUP`'s
     // `fallback_pct` collapsed 14.01% -> 0.00% on kubernetes. Combined
     // with the id-rekey fix above, both known correctness species were
-    // closed — but the go-fence wave's own precondition check (before
+    // closed — but the Go memory-check work's own precondition check (before
     // trusting that "closed" claim enough to admit Go) found a third,
     // inverted one: `edge_dump_probe` ON vs OFF on kubernetes was *still*
     // not bit-identical (331,120 vs 331,117), 3 dangling edges pointing at
@@ -892,13 +889,13 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     // `entity_inner_scope`/`return_type_map`'s keys but never revisited
     // `Scope::defs`' values or `Scope::owner_id` — the two other places a
     // `Scope` caches an entity id, both populated by the same registration
-    // loops semx-9g8q reinstated. Fixed by walking `self.scopes` too.
+    // loops reinstated. Fixed by walking `self.scopes` too.
     // Producer-visible (`.defs`/`owner_id` values a corpus-cached
     // `PrecomputedFileFacts` carries can now differ from a pre-fix build's)
-    // but not a shape change, so I5/F2's bump case again. `edge_dump_probe`
+    // but not a shape change, so it's a bump case again. `edge_dump_probe`
     // ON vs OFF on kubernetes: bit-identical (331,117 edges both sides).
     // Go's correctness blocker chain is now fully closed, and its memory
-    // fence (three order-swapped pairs, kubernetes, both `/usr/bin/time -l`
+    // check (three order-swapped pairs, kubernetes, both `/usr/bin/time -l`
     // fields) cleared the +15% ceiling (+6.78% to +8.46% peak footprint,
     // maxRSS flat) — so unlike every prior bump on this entry, this one
     // ships with the switch removed, not kept off: Go is admitted
@@ -910,19 +907,19 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     // debugging session before this fix existed) must not silently answer
     // a post-fix lookup now that the enriched path runs on every build.
     ("go", "ts-0.23-mp5-dm5t-bpn2"),
-    // MUL phase 2 (semx-mul, W2): rust's producer now emits populated
+    // MUL: rust's producer now emits populated
     // import_stmts (Field 10) — bumped from "ts-0.23" following
-    // semx-mp1/semx-u16's I5/F2 precedent. Shipped unconditionally at W2
-    // (+11.16%/+11.28% against the +15% ceiling) but semx-j1fw's
+    // the same salt-bump precedent. Shipped unconditionally
+    // (+11.16%/+11.28% against the +15% ceiling) but a later
     // same-binary re-verification found the ceiling actually busted
     // (+17.7-19.6%) — demoted to gated behind `SEM_MUL_RUST`
     // (`MUL_RUNTIME_GATES`'s "rust" row carries the pre-switch salt,
     // "ts-0.23"); this table's salt is unchanged — it now serves as the
-    // switched-*on* salt, C#'s/java's shape (go's too, until semx-bpn2
-    // admitted it unconditionally — see above).
+    // switched-*on* salt, C#'s/java's shape (go's too, until Go was
+    // admitted unconditionally — see above).
     ("rust", "ts-0.23-mp2"),
-    // MUL phase 2 (semx-mul, W3+W4): java's imports classify as GoImport
-    // (finding F4) and are now descriptor-dispatched too — same I5/F2 bump
+    // MUL: java's imports classify as GoImport
+    // and are now descriptor-dispatched too — the same salt-bump
     // as go's original one (go's own entry is now several bumps further —
     // see above). Correctness is clean (bit-identical edge_dump_probe on
     // elasticsearch, full oracle battery) but it busted its own +15%
@@ -930,16 +927,16 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     // `SEM_MUL_JAVA`, pre-switch salt "ts-0.23", C#'s shape.
     ("java", "ts-0.23-mp3"),
     ("c", "ts-0.23"),
-    // MUL phase 1 (semx-mp1): C++'s producer's Field-10-era bump. Shipped
-    // unconditionally at semx-mp1 (+5.8%/+6.5% against the +15% ceiling,
+    // MUL phase 1: C++'s producer's Field-10-era bump. Shipped
+    // unconditionally (+5.8%/+6.5% against the +15% ceiling,
     // without a corrected `--no-cache`/fresh-`SEM_CACHE_DIR` protocol) but
-    // M1's (2026-08-22) corrected-protocol re-verification found both
+    // a 2026-08-22 corrected-protocol re-verification found both
     // fields bust the ceiling on llvm-project (maxRSS +19.98-21.02%,
     // footprint +26.33-28.11%). Demoted to gated behind `SEM_MUL_CPP`
     // (`MUL_RUNTIME_GATES`'s "cpp" row carries the pre-switch salt,
     // "ts-0.23"); this table's salt is unchanged — it now serves as the
     // switched-*on* salt, C#'s/rust's/java's/python's shape (go's too,
-    // until semx-bpn2 admitted it unconditionally — see above).
+    // until Go was admitted unconditionally — see above).
     ("cpp", "ts-0.23-mp1"),
     ("ruby", "ts-0.23"),
     ("csharp", "ts-0.23-mp1"),
@@ -994,26 +991,21 @@ fn language_salt(lang_id: &str) -> &'static str {
 
 /// [`language_salt`], corrected for a producer switch that is decided at run
 /// time rather than by the table — every language registered in
-/// [`crate::parser::scope_resolve::MUL_RUNTIME_GATES`] (MUL phase 1's C#
-/// precompute, off by default; MUL phase 2's Java precompute, semx-mul
-/// W3+W4, off by default and measured — busted its own +15% memory
-/// ceiling; MUL phase 2's Rust precompute, off by default since
-/// semx-j1fw's demotion — its own same-binary re-verification found the
-/// memory ceiling busted too, +17.7-19.6% against +15%, after W2's
-/// original +11% reading had shipped it unconditionally; MUL phase 1's
-/// C++ precompute and MUL phase 2's Python precompute, both off by
-/// default since M1's 2026-08-22 demotion — I6's ceiling was redefined
-/// against peak memory footprint (compressed-page-aware) rather than
-/// plain maxRSS, and both re-measure over it (C++: maxRSS itself busts
-/// the ceiling too, +19.98-21.02%; Python: maxRSS stays negative but
-/// footprint reads +25.29-27.44%) — see
+/// [`crate::parser::scope_resolve::MUL_RUNTIME_GATES`] is gated behind an
+/// opt-in env var because its precompute path costs more peak memory than
+/// the +15% ceiling allows: C#; Java (measured over its ceiling); Rust
+/// (+17.7-19.6% against +15%, after an earlier +11% reading had shipped it
+/// unconditionally and a re-verification found it worse); and C++/Python,
+/// both measured against peak memory footprint (compressed-page-aware)
+/// rather than plain maxRSS — C++'s maxRSS itself busts the ceiling too at
+/// +19.98-21.02%, Python's maxRSS stays negative but its footprint reads
+/// +25.29-27.44% — see
 /// [`crate::parser::scope_resolve::mul_precompute_admits`]). Go's
-/// precompute was also in this table (MUL phase 2, semx-mul W3+W4, off
-/// by default: memory was fine but its edges weren't bit-identical on
-/// kubernetes, a correctness regression) until the go-fence wave
-/// (semx-bpn2, 2026-08-22) closed that regression and cleared the
-/// memory fence on the corrected metric too — it is unconditional now,
-/// the one MUL-phase language that is, and has no row in this table.
+/// precompute was gated too (memory was fine but its edges weren't
+/// bit-identical on kubernetes, a correctness regression) until that
+/// regression was closed and the memory check cleared on the corrected
+/// metric too — it is unconditional now, the only precompute language that
+/// is, and has no row in this table.
 ///
 /// The salt names **the producer that wrote the entry**, so a switch that
 /// changes the producer has to move the salt with it — in *both* directions.
@@ -1024,8 +1016,8 @@ fn language_salt(lang_id: &str) -> &'static str {
 /// rather than a fresh cache generation. With the switch on, the table's
 /// current salt isolates the richer entries from those `None`s — without
 /// this, first-writer-wins would let a switched-off build's `None` entries
-/// permanently deny the facts a slot, which is I5/F2's warning applied to a
-/// switch instead of a version (semx-ys0).
+/// permanently deny the facts a slot — the same hazard the salt-bump
+/// discipline exists to prevent, applied to a switch instead of a version.
 ///
 /// The lookup itself is [`resolve_gated_salt`], kept separate so it is
 /// testable against a synthetic gate — this function's own inputs
@@ -1036,7 +1028,7 @@ fn language_salt(lang_id: &str) -> &'static str {
 ///
 /// [`corpus_identity_salt`] deliberately does *not* track any of this: it
 /// stamps sibling artifacts (the query index) whose content — entities,
-/// edges, edge hashes — semx-mp1 measured bit-identical either way, so a
+/// edges, edge hashes — measured bit-identical either way, so a
 /// memory switch must not invalidate them.
 fn producer_language_salt(lang_id: &str) -> &'static str {
     resolve_gated_salt(
@@ -1055,7 +1047,7 @@ fn producer_language_salt(lang_id: &str) -> &'static str {
 /// synthetic gate — see `facts_store::corpus_tests::resolve_gated_salt_generalizes_beyond_csharp`,
 /// which proves this handles a *second* runtime-gated language, something the
 /// single hand-written `if lang_id == "csharp"` branch this replaces never
-/// could (semx-ys0's "structural, not remembered" ask).
+/// could ("structural, not remembered" ask).
 fn resolve_gated_salt(
     gates: &[crate::parser::scope_resolve::MulRuntimeGate],
     admits: impl Fn(&str) -> bool,
@@ -1074,7 +1066,7 @@ fn resolve_gated_salt(
 ///
 /// Two extractor generations must never satisfy each other's lookups. They
 /// legitimately disagree on `structural_hash` conventions, on kappa values
-/// (which are grammar-shaped — see `KAPPA.md`'s errata), and, while a fast
+/// (which are grammar-shaped, a known limitation), and, while a fast
 /// extractor is still being proven, on entity sets. The corpus already
 /// isolates by grammar version with exactly this mechanism, so extractor
 /// identity belongs in the same string rather than in a second version knob:
@@ -1086,7 +1078,7 @@ fn resolve_gated_salt(
 /// the `oxc-fastpath` feature — this is byte-identical to
 /// [`language_salt`], so no existing corpus entry is invalidated.
 ///
-/// `pub` (semx-0lj) so `sem-cli`'s `facts_remote.rs` computes the exact same
+/// `pub` so `sem-cli`'s `facts_remote.rs` computes the exact same
 /// key sem-core's own `FactsCorpus` would, including the MUL-phase-1
 /// producer-switch correction and the fast-extractor identity suffix,
 /// without re-deriving either from a second copy.
@@ -1104,7 +1096,7 @@ pub fn effective_language_salt(lang_id: &str) -> String {
 /// It lives here rather than in the consumer because [`LANGUAGE_SALTS`] is
 /// this module's table — a caller that folded it itself would silently stop
 /// tracking new entries. Sibling artifacts derived from the same extraction
-/// (see `QUERY-INDEX.md`) stamp this instead of introducing a second version
+/// stamp this instead of introducing a second version
 /// knob to forget to bump.
 pub(crate) fn corpus_identity_salt() -> u64 {
     let mut h = Xxh3::new();
@@ -1249,14 +1241,14 @@ pub(crate) struct CorpusFile {
     pub(crate) lang_salt: String,
 }
 
-/// Borrowing serialize-only twin of [`CorpusFile`] (semx-ws6, audit D1).
+/// Borrowing serialize-only twin of [`CorpusFile`].
 ///
 /// [`FactsCorpus::populate_delta`] used to deep-clone every changed file's
 /// `facts` (entity bodies included) and `precomputed` (the file's whole
 /// source text) into an owned [`CorpusFile`] whose only consumer was the
 /// shard serializer — on a true-cold giant build that clone was total and
 /// transient, one of the three corpus copies behind the facts plane's
-/// measured RSS band (RESOLUTION-PROFILE.md, semx-w5k §5). serde encodes
+/// measured RSS band. serde encodes
 /// `&T` byte-identically to `T` and field order below matches `CorpusFile`
 /// exactly, so shard bytes are unchanged — gated by `facts_corpus_probe`'s
 /// oracles and the shard-byte tests in this module.
@@ -1301,7 +1293,7 @@ pub struct CorpusLookupStats {
     pub shards_read: usize,
     /// Bytes actually read off disk to answer `probed`: every shard's header
     /// and index, plus only the payload ranges the index said could hold a
-    /// probed key (semx-fqh). Under the v1 layout this was necessarily the
+    /// probed key. Under the v1 layout this was necessarily the
     /// whole corpus; it is now proportional to hits, which is what makes a
     /// build's cost independent of how much unrelated content the machine has
     /// stored.
@@ -1314,7 +1306,7 @@ pub struct CorpusPopulateStats {
     /// Files actually written into the corpus this call: new or changed
     /// since `previous` (see `populate_delta`'s doc for why unchanged/GREEN
     /// files are skipped) **and** not already stored under the same key
-    /// (semx-fqh — a second build of the same content re-derives the same
+    /// (— a second build of the same content re-derives the same
     /// entries and the shard index already holds them, so nothing is
     /// rewritten and this reads 0).
     pub files_written: usize,
@@ -1324,14 +1316,14 @@ pub struct CorpusPopulateStats {
 }
 
 // =============================================================================
-// External ingestion (semx-bhc): the cloud tier's local trust boundary
+// External ingestion: the cloud tier's local trust boundary
 // =============================================================================
 //
 // Everything above this point ever writes a `CorpusFile` this *same* process
 // derived from its own local read+hash pass (`populate_delta`) — trustworthy
 // by construction, because the process that computed `facts.path`/
 // `facts.content_hash`/`lang_salt` is the same process about to store them
-// under that key. A cloud client (`sem-cli`'s `facts_remote.rs`, semx-9en's
+// under that key. A cloud client (`sem-cli`'s `facts_remote.rs`, 's
 // cloud half) breaks that assumption: it has a `FileFacts` payload decoded
 // off the wire, plus the `(relative_path, content_hash, language_salt,
 // schema_version)` key it fetched/queried that payload *under* — and no
@@ -1378,7 +1370,7 @@ pub struct RemoteFact {
 /// the one unforgivable failure" means a caller must be able to tell
 /// "genuinely unknown, fall back to extraction" apart from "known, safe to
 /// reuse," and a precise reason is what makes that distinction auditable
-/// (`SEM_FACTS_DEBUG`-style diagnostics, or this bead's tamper-rejection
+/// (`SEM_FACTS_DEBUG`-style diagnostics, or this change's tamper-rejection
 /// proof) rather than merely asserted.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IngestError {
@@ -1388,7 +1380,7 @@ pub enum IngestError {
     #[error("claimed relative_path {claimed:?} does not match the fact's own path {actual:?}")]
     PathMismatch { claimed: String, actual: String },
     /// The claimed `content_hash` disagrees with the payload's own
-    /// `FileFacts::content_hash` — exactly the tamper shape this bead's E2E
+    /// `FileFacts::content_hash` — exactly the tamper shape this change's E2E
     /// proof exercises: a payload whose entities were computed for
     /// different bytes than the key advertises.
     #[error(
@@ -1488,7 +1480,7 @@ impl Drop for ShardLock {
     }
 }
 
-/// A machine-global, cross-repo facts corpus (semx-2o8). No ambient path,
+/// A machine-global, cross-repo facts corpus. No ambient path,
 /// same discipline as [`FactsStore`]: `dir` always comes from the caller —
 /// wiring the *one* real caller (`sem-cli`'s graph/diff path), including
 /// where the directory defaults to and how it is disabled, lives in
@@ -1512,7 +1504,7 @@ impl FactsCorpus {
     /// not exist, or exists with zero entries. One cheap `read_dir` that
     /// short-circuits on its first entry, never a full listing.
     ///
-    /// semx-fd7: `merge_with_local`'s dominant cost on a never-populated
+    /// `merge_with_local`'s dominant cost on a never-populated
     /// corpus (a machine's first-ever build, or a fresh
     /// `SEM_FACTS_CORPUS_DIR`) was never the shard-open path — ws6's
     /// D11 measured that directly and declined both a presence manifest
@@ -1764,7 +1756,7 @@ impl FactsCorpus {
     /// `local`, so a repo whose local snapshot already knows every path
     /// (the common warm-rebuild case) pays nothing extra beyond `local`
     /// itself — this is what keeps the per-repo tier's ~220ms monster
-    /// load-speed bar unregressed (see `RESOLUTION-PROFILE.md`'s
+    /// load-speed bar unregressed (see
     /// "Cross-repo corpus" section for the measurement). Callers should
     /// only invoke this when `local` is `None` or may have gaps; a repo
     /// whose local store is known complete should skip this call entirely
@@ -1785,7 +1777,7 @@ impl FactsCorpus {
             .cloned()
             .collect();
 
-        // semx-fd7: a corpus directory with zero entries can never produce
+        // a corpus directory with zero entries can never produce
         // a hit — skip the whole probe-construction pass (the dominant
         // cost; see `is_definitely_empty`'s doc) rather than pay it just to
         // discover that. `stats.probed` still reports `unknown.len()` (its
@@ -1938,7 +1930,7 @@ impl FactsCorpus {
         current: &PersistedFactsRef<'_>,
         registry: &ParserRegistry,
     ) -> io::Result<CorpusPopulateStats> {
-        // Serialize-from-references (semx-ws6, audit D1): no `CorpusFile`
+        // Serialize-from-references: no `CorpusFile`
         // clone — the shard writer only ever needs to *encode* these, and
         // `current` outlives the call.
         let changed: Vec<CorpusFileRef<'_>> = current
@@ -1964,7 +1956,7 @@ impl FactsCorpus {
         self.write_corpus_files(changed)
     }
 
-    /// Ingest externally-sourced facts (semx-bhc: sem-cli's cloud download,
+    /// Ingest externally-sourced facts (: sem-cli's cloud download,
     /// `facts_remote.rs`) into this corpus, key-validated first — see this
     /// section's module doc for why validation happens here rather than
     /// being left to whatever consults the corpus later. Unlike
@@ -2271,7 +2263,7 @@ mod tests {
         assert!(store.load(root.path()).is_none());
     }
 
-    /// semx-1ut: `TableFingerprints.entries` is a `HashMap<u64, u64>` written
+    /// `TableFingerprints.entries` is a `HashMap<u64, u64>` written
     /// through `#[derive(Serialize)]`, which encodes the map in its own
     /// iteration order. `FxHashMap`'s hasher is fixed-seed — the same insertion
     /// *sequence* always lands the same key set in the same buckets — but a
@@ -2282,7 +2274,7 @@ mod tests {
     /// sequences and land colliding keys in different buckets, producing
     /// byte-different CBOR for facts that are, by every `PartialEq`, the same.
     ///
-    /// This directly reproduces the mechanism the bead's evidence names
+    /// This directly reproduces the mechanism the change's evidence names
     /// ("same binary, same corpus, different factpack bytes across runs on
     /// HA/monster ... entity-level map serialization order") without needing
     /// the real HA/monster corpora: insertion order alone is the variable
@@ -2328,7 +2320,7 @@ mod tests {
 
         assert_eq!(
             forward_bytes, interleaved_bytes,
-            "semx-1ut: identical fingerprint content serialized to different CBOR \
+            "identical fingerprint content serialized to different CBOR \
              bytes depending on insertion order alone — this is the byte-determinism \
              the facts corpus's content-addressed dedup and the perf parity gates \
              both rely on"
@@ -2626,11 +2618,11 @@ mod corpus_tests {
         let _salt_guard = salt_guard();
         // The salt names the producer that wrote the entry. MUL phase 1's C#
         // precompute is a *run-time* switch (memory-gated per
-        // RESOLUTION-PROFILE.md's "dotnet stays GATED"), so unlike every other
+        // "dotnet stays GATED"), so unlike every other
         // row in the table, `csharp`'s effective salt is not a constant — and
         // it must move with the switch in both directions, or first-writer-wins
         // corpus dedup lets one mode's entries permanently answer the other's
-        // lookups (MUL-DESIGN.md I5/F2).
+        // lookups.
         //
         // Walks every registered gate rather than hardcoding "csharp" — this
         // test now covers whatever `MUL_RUNTIME_GATES` grows to (MUL phase
@@ -2652,8 +2644,8 @@ mod corpus_tests {
             );
         }
 
-        // M1 (2026-08-22): every phase-1/phase-2 language is gated now — C++
-        // and Python joined `MUL_RUNTIME_GATES` when I6's ceiling was
+        // 2026-08-22: every phase-1/phase-2 language is gated now — C++
+        // and Python joined `MUL_RUNTIME_GATES` when the ceiling was
         // redefined against peak memory footprint, so both are covered by
         // the loop above like every other gated language; no unconditional
         // survivor remains to special-case here.
@@ -2661,7 +2653,7 @@ mod corpus_tests {
 
     #[test]
     fn resolve_gated_salt_generalizes_beyond_csharp() {
-        // `resolve_gated_salt` is what makes semx-ys0's fix structural rather
+        // `resolve_gated_salt` is what makes fix structural rather
         // than remembered: before it existed, `producer_language_salt` was a
         // single hand-written `if lang_id == "csharp"` branch that could not
         // have honored a second gated language without a second hand-written
@@ -2698,7 +2690,7 @@ mod corpus_tests {
     /// The mechanism this whole module exists to prevent, proven directly:
     /// at a *fixed* key, first-writer-wins denies a later, richer write for
     /// identical content forever — the corpus is stuck at the first writer's
-    /// capability level (semx-ys0's "silently denies producer upgrades").
+    /// capability level ("silently denies producer upgrades").
     /// This is intentional, documented behavior (an anti-poisoning stance,
     /// not a bug) — the reason `producer_language_salt`/`MUL_RUNTIME_GATES`
     /// exist is to make sure a real capability change moves the *key*, not
@@ -2741,7 +2733,7 @@ mod corpus_tests {
         assert!(
             served.precomputed.is_none(),
             "first-writer-wins must still be serving the weak entry at an \
-             unchanged key — this is the exact denial semx-ys0 reports, and \
+             unchanged key — this is the exact denial reported here, and \
              is why a real capability change must move the salt"
         );
     }
@@ -2817,7 +2809,7 @@ mod corpus_tests {
         let _salt_guard = salt_guard();
         // Two extractor generations must never satisfy each other's lookups:
         // they legitimately disagree on structural_hash conventions, on kappa
-        // values (grammar-shaped — see KAPPA.md's errata) and, while one is
+        // values (grammar-shaped, a known limitation) and, while one is
         // still being proven, on entity sets.
         let plain = salt_with_extractor("ts-0.23", None);
         let gen_a = salt_with_extractor("ts-0.23", Some("oxc-0.143.0-r1"));
@@ -2852,7 +2844,7 @@ mod corpus_tests {
             )
             .expect("populate");
 
-        // Python is gated (`SEM_MUL_PYTHON`, off by default since M1) — the
+        // Python is gated (`SEM_MUL_PYTHON`, off by default since the 2026-08-22 demotion) — the
         // effective salt this default-settings populate wrote under is the
         // gate's pre-switch salt, not `LANGUAGE_SALTS`'s raw table entry
         // ("ts-0.23-mp4", the switched-*on* salt). Deriving it via
@@ -2871,10 +2863,10 @@ mod corpus_tests {
 
     #[test]
     fn yaml_salt_bump_denies_the_old_handrolled_1_entry() {
-        // semx-vlg/semx-kkk: the yaml plugin's id fix (multi-document files
+        // the yaml plugin's id fix (multi-document files
         // no longer collide same-named keys in different documents onto one
         // id) is a producer-visible change to FileFacts.entities' `id`
-        // field, so I5/F2 requires the `yaml` salt to move — it did,
+        // field, so the salt-bump discipline requires the `yaml` salt to move — it did,
         // `handrolled-1` -> `handrolled-2`. This is the concrete, per-
         // language instance of `corpus_isolates_by_language_salt`'s general
         // proof: an entry a pre-fix binary wrote (under `handrolled-1`) must
@@ -2995,7 +2987,7 @@ mod corpus_tests {
         );
     }
 
-    /// semx-fqh's migration story: a shard left behind by the v1 layout must
+    /// migration story: a shard left behind by the v1 layout must
     /// read as a clean miss, not a decode of the wrong shape — the same path
     /// every other unreadable shard takes, so an old corpus degrades to a
     /// cold build and is rewritten in v2 on the way past.
@@ -3054,7 +3046,7 @@ mod corpus_tests {
 
     /// The write half of corpus-size independence: re-populating content the
     /// corpus already holds writes nothing and touches no shard. This is what
-    /// takes `populate_delta` off the corpus-size curve — W5's known-content
+    /// takes `populate_delta` off the corpus-size curve — known-content
     /// scenario re-derives every entry with no local snapshot to diff
     /// against, and under v1 that rewrote every shard it touched.
     #[test]
@@ -3104,7 +3096,7 @@ mod corpus_tests {
         assert_eq!(stats.hits, 2, "both entries must survive the no-op write");
     }
 
-    /// The read half, stated as the invariant the bead exists to establish: what a
+    /// The read half, stated as the invariant the change exists to establish: what a
     /// lookup reads off disk tracks the entries it asked for, not the size of
     /// the corpus around them. Under v1 this was false by construction — a
     /// shard was one CBOR array, so touching it decoded all of it.
@@ -3344,7 +3336,7 @@ mod corpus_tests {
     }
 
     // -------------------------------------------------------------------
-    // ingest_remote (semx-bhc): external ingestion + key validation
+    // ingest_remote: external ingestion + key validation
     // -------------------------------------------------------------------
 
     fn remote_fact(path: &str, source: &str, lang_salt: &str) -> RemoteFact {
@@ -3422,7 +3414,7 @@ mod corpus_tests {
     #[test]
     fn ingest_remote_rejects_content_hash_mismatch() {
         let _salt_guard = salt_guard();
-        // The tamper shape this bead's E2E proof cares about most: a
+        // The tamper shape this change's E2E proof cares about most: a
         // payload whose entities disagree with the hash the key claims —
         // exactly what a compromised/buggy server response could look like.
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1,10 +1,8 @@
 //! The text tier: `sem grep <pattern>` — literal and basic-regex search
 //! served from `TRIGRAM` postings when the pattern makes that possible.
-//! See `QUERY-INDEX.md`'s trigram section for the design rationale, the
-//! measured budget outcome, and the `sem`-vs-`rg` benchmark table.
 //!
-//! Pipeline, matching Google Code Search / zoekt's shape (`QUERY-INDEX.md`
-//! §9's prior art):
+//! Pipeline, matching Google Code Search / zoekt's shape (
+//! prior art):
 //!
 //! ```text
 //! pattern -> required trigram query (DNF: OR of AND-sets, §`derive`)
@@ -23,18 +21,18 @@
 //! **Freshness.** `verify` reads each candidate file's bytes fresh from disk
 //! on every call — there is no cached content anywhere in this module, so a
 //! *matched* line is always current by construction ("text freshness is
-//! simpler than entity freshness: just scan the current bytes", the bead's
+//! simpler than entity freshness: just scan the current bytes", the change's
 //! own framing).
 //!
-//! **Membership** (semx-ykf): `search` runs `complete::complete_check`
+//! **Membership**: `search` runs `complete::complete_check`
 //! concurrently with trigram candidate derivation (`rayon::join`) — the same
 //! parallel-stat sweep `commands::query`'s verbs use. A brand-new file joins
 //! the candidate set unconditionally (there is no trigram data for it yet,
 //! so it cannot be prefiltered — it goes straight to `verify`, same as any
 //! `Stopped`-trigram candidate); a deleted file is dropped from the
 //! candidate set before `verify` wastes a read on it. This closes the direct
-//! analogue of §2's membership gap for the text tier. What is **still** out
-//! of scope, and unclosed by this bead: a file *edited* since the index was
+//! analogue of membership gap for the text tier. What is **still** out
+//! of scope, and unclosed by this change: a file *edited* since the index was
 //! built such that it newly contains a required trigram it didn't contain
 //! before is not discovered by the membership sweep (its mtime changed, but
 //! it isn't new or deleted, so neither `FILES`-existence nor
@@ -42,7 +40,7 @@
 //! are only as fresh as the last `write_query_index`. Detecting *content*
 //! drift on every already-known file would mean stat-ing (or re-deriving
 //! trigrams for) the whole corpus per query, which is exactly the
-//! corpus-proportional cost §1 spent 85% of the query budget removing — so
+//! corpus-proportional cost spent 85% of the query budget removing — so
 //! this module still does not attempt that half, and says so here rather
 //! than silently.
 
@@ -212,7 +210,7 @@ fn candidate_files(
     if case_insensitive || !idx.has_trigram() || has_inline_group_flags(pattern) {
         // Case folding means a stored (case-sensitive) trigram no longer
         // proves anything about what the pattern needs — out of scope for
-        // this bead's trigram tier (§ QUERY-INDEX.md, out-of-scope list).
+        // this change's trigram tier.
         // `has_inline_group_flags` covers the same hazard when it's spelled
         // inline (`(?i)...`) rather than via `-i`: an un-parsed `(?x)` could
         // also make our literal-run text not correspond to what the compiled
@@ -360,8 +358,7 @@ fn split_top_level(pattern: &str, sep: char) -> Vec<&str> {
 /// is guaranteed to be present verbatim whenever the fragment matches.
 ///
 /// This is a conservative, *sound* approximation, not a full regex-AST
-/// analysis (that is Code Search's actual approach, and out of scope here —
-/// see `QUERY-INDEX.md`'s out-of-scope list): it walks the pattern once,
+/// analysis (that is Code Search's actual approach, and out of scope here): it walks the pattern once,
 /// accumulating literal characters, and flushes the current run into the
 /// result on any metacharacter. A quantifier (`*`, `+`, `?`, `{n,m}`)
 /// additionally **drops the last accumulated character** before flushing,

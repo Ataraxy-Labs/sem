@@ -34,10 +34,10 @@ pub fn graph_command(opts: GraphOptions) {
     let ext_filter = normalize_exts(&opts.file_exts);
     let source_scope = cache_source_scope(root, &ext_filter, opts.no_default_excludes);
 
-    // Index fast path (semx-zvq): the whole-corpus dump, straight out of the
+    // Index fast path: the whole-corpus dump, straight out of the
     // image — no walk, no SQL, no graph hydration. This is the *only*
     // discovery-skipping tier now: the git-oracle pair that used to sit here
-    // (`oracle_fresh_topology`/`oracle_fresh_counts`) is deleted, on §1.4's
+    // (`oracle_fresh_topology`/`oracle_fresh_counts`) is deleted, on
     // measurement that the oracle was strictly dominated — 157 ms of
     // shell-outs against the 12 ms parallel stat this path's freshness proof
     // costs, for a *weaker* guarantee (git says nothing about files it does
@@ -129,13 +129,13 @@ fn write_graph_json(graph: &EntityGraph) -> serde_json::Result<()> {
     stdout.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-/// `sem graph` from the index (semx-zvq) — §12.2's second open reroute, and
+/// `sem graph` from the index — second open reroute, and
 /// the last query-plane caller of `write_graph_json_topology` /
 /// `oracle_fresh_topology` / `oracle_fresh_counts`.
 ///
-/// **Output-shape parity.** §12.1 named the blocker precisely: the JSON
+/// **Output-shape parity.** named the blocker precisely: the JSON
 /// serializes each edge's `ref_type`, "which the `REFS` CSR tier does not
-/// carry". It does now (semx-zvq's FORMAT step), so the shape is
+/// carry". It does now (FORMAT step), so the shape is
 /// reproducible in full. What has to match, exactly:
 ///
 /// - `{"entities":[…],"edges":[…],"stats":{"entityCount":N,"edgeCount":M}}`
@@ -145,7 +145,7 @@ fn write_graph_json(graph: &EntityGraph) -> serde_json::Result<()> {
 ///   is BINARY-collated and Rust's `str` ordering is the same byte order, so
 ///   one sort reproduces both the SQL path's and `write_graph_json`'s.
 /// - edges: **forward only** — one row per `(from, to, ref_type)`, never the
-///   reverse direction as well (§12.2 flagged double-counting as the risk) —
+/// reverse direction as well (flagged double-counting as the risk) —
 ///   sorted by `(from_entity, to_entity, ref_type)` with
 ///   `calls < imports < typeref`. Emitting each entity's forward CSR row, in
 ///   entity-id order, produces exactly that: the row is already in
@@ -324,11 +324,11 @@ pub fn cache_source_scope(
 
 /// The single place `sem-cli`'s graph/diff/impact/entities/context path falls
 /// back to a cold `EntityGraph::build` after `DiskCache` misses (both full
-/// and partial). Wired through `sem-core`'s on-disk facts store (semx-9en) so
+/// and partial). Wired through `sem-core`'s on-disk facts store so
 /// a cold miss in *this* process can still warm-start from facts a *previous*
 /// `sem` invocation left on disk, instead of always paying the full
 /// parse+resolve cost `EntityGraph::build` pays from nothing. Also wired
-/// through the machine-global cross-repo corpus (semx-2o8): a repo with *no*
+/// through the machine-global cross-repo corpus: a repo with *no*
 /// local snapshot of its own (a fresh checkout — the case above still falls
 /// all the way to a cold build) gets one more chance, filling in facts for
 /// any file whose content a *different* repo on this machine already built,
@@ -364,7 +364,7 @@ fn build_graph_with_facts_store(
     // saw, but skipping the call outright when `local` already covers every
     // path avoids even the bucket-grouping overhead on the common
     // already-warm rebuild, keeping that path byte-for-byte what it was
-    // before this bead (see `facts_store.rs`'s "Cross-repo corpus" doc for
+    // before this change (see `facts_store.rs`'s "Cross-repo corpus" doc for
     // the measurement this protects).
     let corpus = facts_corpus_for(root, no_cache);
     let has_gap = match &local {
@@ -375,7 +375,7 @@ fn build_graph_with_facts_store(
     let merged = if has_gap {
         corpus.as_ref().map(|c| {
             // The lookup stats were computed and dropped on the floor here.
-            // W4 (semx-431) needs them: `probed`/`hits` is the *definition* of
+            // needs them: `probed`/`hits` is the *definition* of
             // "known content" for this corpus, and without it a cold-build
             // measurement cannot say whether the machine already knew the
             // blobs it was reading. Printed only under `SEM_PROFILE_CACHE=1`;
@@ -424,7 +424,7 @@ fn build_graph_with_facts_store(
 /// `SEM_PROFILE_CACHE=1` (the same switch the phase timers beside these calls
 /// already use).
 ///
-/// W5 (semx-gbb) priced the facts plane at **+9.23 GB of peak RSS on dotnet**
+/// priced the facts plane at **+9.23 GB of peak RSS on dotnet**
 /// and **+5.78 GB on linux** by differencing whole-process peaks with the
 /// plane on and off — a number no timer and no counter inside `sem-core`
 /// could attribute, because the plane's boundaries are here, in the CLI's
@@ -493,7 +493,7 @@ pub(crate) fn facts_corpus_for(root: &Path, no_cache: bool) -> Option<FactsCorpu
 /// where the per-repo store for *this* root lives (`facts_store_for` above);
 /// stripping `<repo_key>` and `repos` leaves `<cache_root>/sem`, the
 /// machine-global base every repo's per-repo cache already shares, and
-/// `facts-corpus` is this bead's own sibling of `repos` under it — e.g.
+/// `facts-corpus` is this change's own sibling of `repos` under it — e.g.
 /// `~/Library/Caches/sem/facts-corpus` on macOS, `~/.cache/sem/facts-corpus`
 /// on Linux. Reusing `shared_cache::cache_dir_for_repo`'s own resolution
 /// (rather than duplicating its XDG/platform-cache-dir logic here) means
@@ -686,7 +686,7 @@ enum CacheMissSavePolicy {
     /// store) *and* `index.sem`. The only tier that can serve a later
     /// `load_with_source_scope` hydrate or a `load_partial` incremental
     /// rebuild, and the only one that costs 3.3-24.3 s of a giant's cold
-    /// build (RESOLUTION-PROFILE.md W4 §1).
+    /// build.
     Full,
     /// `cache.db`'s topology tables (no bodies, no content store) *and*
     /// `index.sem`.
@@ -695,15 +695,15 @@ enum CacheMissSavePolicy {
     IndexOnly,
 }
 
-/// `SEM_BUILD_CACHE=1` restores the pre-W4.5 behaviour on the
+/// `SEM_BUILD_CACHE=1` restores the prior behaviour on the
 /// [`CacheMissSavePolicy::IndexOnly`] path: the corpus-shaped build writes
 /// `cache.db` again, so `sem graph` on a *dirty* tree can take the
 /// incremental rebuild instead of a full one.
 ///
-/// Default off, on the census in RESOLUTION-PROFILE.md W4.5 §2: on this path
+/// Default off, on the census: on this path
 /// the SQL mirror has no reader. `sem graph` is answered from `index.sem`
-/// (`try_index_graph`); W4's cache.db-deleted experiment measured ten of ten
-/// verbs byte-identical without it and nine of ten equally fast; semx-4ex
+/// (`try_index_graph`); cache.db-deleted experiment measured ten of ten
+/// verbs byte-identical without it and nine of ten equally fast;
 /// closed the tenth (`impact --deps`/`--dependents` name-only) by routing it
 /// onto the index. What survives is the incremental rebuild, and it is
 /// reachable only *after* some earlier invocation has already paid the full
@@ -810,7 +810,7 @@ fn get_or_build_graph_with_cache_policy(
                 }
             }
             // No `DiskCache::open` on this arm at all — the SQLite file is
-            // never even created (semx-4ex).
+            // never even created.
             CacheMissSavePolicy::IndexOnly => {
                 crate::build_cache::write_index_only(
                     root,
@@ -830,7 +830,7 @@ fn get_or_build_graph_with_cache_policy(
 /// The corpus-shaped build: `sem graph`, and `sem impact --deps/--dependents`
 /// once their index tier has declined. Topology is all these callers ask for,
 /// and on a miss they now leave behind exactly what answers them next time —
-/// `index.sem`, and nothing else (semx-4ex, RESOLUTION-PROFILE.md W4.5).
+/// `index.sem`, and nothing else.
 ///
 /// Before this, the miss fell through to [`get_or_build_graph_with_timings`],
 /// whose policy is [`CacheMissSavePolicy::Full`]: a topology-shaped request

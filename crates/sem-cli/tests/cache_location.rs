@@ -36,8 +36,8 @@ fn git(repo: &Path, args: &[&str]) -> Output {
 /// Did a build land its per-repo artifacts *here* (and not in the working
 /// tree)? Either on-disk artifact answers that: `index.sem`, which every
 /// build writes, or `cache.db`, which only the content-hydrating verbs write
-/// now that `sem graph`'s cold miss is `CacheMissSavePolicy::IndexOnly`
-/// (semx-4ex, RESOLUTION-PROFILE.md W4.5). These tests are about *where* the
+/// now that `sem graph`'s cold miss is `CacheMissSavePolicy::IndexOnly`.
+/// These tests are about *where* the
 /// cache directory is, so they must not also pin *which* artifacts a
 /// particular verb chooses to write into it.
 fn contains_cache_artifact(path: &Path) -> bool {

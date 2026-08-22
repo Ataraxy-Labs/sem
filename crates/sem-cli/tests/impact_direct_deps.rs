@@ -460,14 +460,14 @@ fn impact_deps_index_fast_path_folds_in_a_new_import_target() {
         "impact deps after import target appears",
     );
 
-    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
-    // QUERY-INDEX.md §12.3/§13.5). `b.ts`'s ref to `./optional` was
+    // GUARANTEE (repaired from the characterization,
+    //.3/). `b.ts`'s ref to `./optional` was
     // unresolved at the last index build (no entity to point at yet), so
     // `refs_of` never carried the edge and no *known* file's staleness
     // check could catch it. The membership sweep now sees `optional.ts` as
     // a brand-new file and declines the fast path — same "any new file →
     // decline to cold rebuild" mechanism `find`/`callers`/`refs` already use
-    // (QUERY-INDEX.md §13.2) — so the legacy (always-correct) path runs.
+    // — so the legacy (always-correct) path runs.
     //
     // `import './optional';` is a bare **side-effect** import: it binds no
     // name, so neither tier records a symbol-level `EntityRef` for it (the
@@ -507,7 +507,7 @@ fn impact_deps_index_fast_path_folds_in_a_new_import_target() {
     );
 }
 
-/// The bead's exact repro (semx-dev), mirrored to the direction its own
+/// The change's exact repro, mirrored to the direction its own
 /// wording names: "new file imports existing entity → dependents answer
 /// includes it". `try_index_impact_dependents` has the same structural gap
 /// `try_index_impact_deps` had — a brand-new file that calls an
@@ -628,8 +628,8 @@ fn impact_deps_index_fast_path_folds_in_a_new_default_reexport_target() {
         "impact deps after default re-export target appears",
     );
 
-    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
-    // QUERY-INDEX.md §12.3/§13.5). Same repair as
+    // GUARANTEE (repaired from the characterization,
+    //.3/). Same repair as
     // `impact_deps_index_fast_path_folds_in_a_new_import_target`: the
     // membership sweep sees the new target file and declines the fast path,
     // so the legacy path re-resolves the import fresh.
@@ -684,8 +684,8 @@ fn impact_deps_index_fast_path_folds_in_a_new_bare_import_target() {
         "impact deps after bare import target appears",
     );
 
-    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
-    // QUERY-INDEX.md §12.3/§13.5). Same repair as
+    // GUARANTEE (repaired from the characterization,
+    //.3/). Same repair as
     // `impact_deps_index_fast_path_folds_in_a_new_import_target`: the
     // membership sweep sees the new target file and declines the fast path,
     // so the legacy path re-resolves the import fresh.
@@ -740,8 +740,8 @@ fn impact_deps_index_fast_path_folds_in_a_new_python_import_target() {
         "impact deps after python import target appears",
     );
 
-    // GUARANTEE (semx-dev, repaired from semx-zvq's characterization,
-    // QUERY-INDEX.md §12.3/§13.5). Same repair as
+    // GUARANTEE (repaired from the characterization,
+    //.3/). Same repair as
     // `impact_deps_index_fast_path_folds_in_a_new_import_target`: the
     // membership sweep sees the new target file and declines the fast path,
     // so the legacy path re-resolves the import fresh.
@@ -981,7 +981,7 @@ fn impact_deps_index_fast_path_does_not_notice_a_side_effect_import_change() {
             .current_dir(repo.path())
             // `SEM_BUILD_CACHE=1`: this warm-up exists to give the scaffolding
             // below a `cache.db` to doctor. `--deps`'s cold miss is
-            // `CacheMissSavePolicy::IndexOnly` since semx-4ex and writes
+            // `CacheMissSavePolicy::IndexOnly` since and writes
             // `index.sem` only, which is the whole point of that change — so
             // the opt-in is what keeps this test testing what it is about
             // (the *index* tier's freshness characterization) instead of
@@ -1008,12 +1008,12 @@ fn impact_deps_index_fast_path_does_not_notice_a_side_effect_import_change() {
         "impact deps after side-effect import edit",
     );
 
-    // CHARACTERIZATION, not an endorsement (semx-zvq, QUERY-INDEX.md §12.3).
-    // Until this bead this test asserted the opposite, because it set
+    // CHARACTERIZATION, not an endorsement.
+    // Until this change this test asserted the opposite, because it set
     // `SEM_NO_INDEX=1` and so exercised the SQLite tier's import-aware
     // freshness check (`has_fresh_dependency_impact_files`). That tier was
     // never reached in production: `try_index_impact_deps` has run *ahead* of
-    // it since semx-gis, and it proves freshness only over the entity's own
+    // it since, and it proves freshness only over the entity's own
     // file and its known dependencies' files — a brand-new import *target*
     // touches neither, so the index answers, with the pre-change answer.
     // Deleting the SQLite tier did not cause this; it revealed it, and the

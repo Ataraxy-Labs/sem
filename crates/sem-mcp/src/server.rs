@@ -432,7 +432,7 @@ impl SemServer {
     }
 
     /// `sem-mcp`'s port of `sem-cli`'s `entities.rs` directory reroute
-    /// (semx-zvq cascade e; §12.1 item 7 named this port as the prerequisite
+    /// (cascade e; item 7 named this port as the prerequisite
     /// for demoting the cloud site below it, and left it undone precisely
     /// because "gating cloud off there without a fast local replacement would
     /// trade a working-but-backwards-ordered path for an unconditionally
@@ -444,7 +444,7 @@ impl SemServer {
     /// non-default scope (the image is built at default scope only), a
     /// missing/salt-mismatched image, or `SEM_NO_INDEX=1`.
     ///
-    /// Per-file `Verified` freshness (§5.1) with the same self-heal
+    /// Per-file `Verified` freshness with the same self-heal
     /// `sem-cli`'s version uses: a file whose fingerprint no longer matches
     /// disk is re-extracted from the current bytes rather than failing the
     /// whole listing, and a file that vanished since the index listed it is
@@ -464,7 +464,7 @@ impl SemServer {
             crate::cache::cache_dir_for_repo(repo_root)?.join(sem_core::index::INDEX_FILE_NAME);
         let index = sem_core::index::QueryIndex::open(&index_path)?;
 
-        // semx-q344: every other relative-path conversion in this file routes
+        // every other relative-path conversion in this file routes
         // through `path_to_slash` (see its doc comment: "Graph entity
         // `file_path`s are forward-slash, so relative paths must be too or
         // lookups miss on Windows"). This call site was ported from
@@ -1345,12 +1345,12 @@ impl SemServer {
             }
             (entities, false)
         } else if abs_path.is_dir() {
-            // Local index first (semx-zvq cascade e). This site was the last
+            // Local index first (cascade e). This site was the last
             // ungated, production-active instance of the precedence inversion
-            // §7 item 7 / §12.1 item 7 describe: cloud was tried over the
+            // item 7 / item 7 describe: cloud was tried over the
             // network *before* any local answer was attempted. It is now
             // tried only once the local index has declined — matching what
-            // `sem-cli`'s `entities.rs` has done since §12.1, and correct for
+            // `sem-cli`'s `entities.rs` has done since, and correct for
             // the same reason: cloud is a capability (cross-repo xref, repos
             // with no local index), not a latency tier.
             if let Some(entities) = self
@@ -2164,7 +2164,7 @@ impl SemServer {
 // The `#[tool]` methods above still take `&self` — `rmcp`'s tool_router
 // macro requires every registered tool to be a method on the type
 // implementing `ServerHandler` — but each is now a one-line forwarder.
-// (DATA-TOPOLOGY-AUDIT.md L2.)
+// (L2.)
 
 async fn join_review_impl(
     Parameters(params): Parameters<JoinReviewParams>,
@@ -3344,7 +3344,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // --- semx-bz2: single-flight the entity-graph build ---
+    // ---: single-flight the entity-graph build ---
 
     #[tokio::test]
     async fn build_locks_serialize_same_key_but_not_different_keys() {
@@ -3375,7 +3375,7 @@ mod tests {
         );
     }
 
-    /// Pins the fix for semx-bz2: `get_or_build_graph` was check-then-act —
+    /// Pins the fix for: `get_or_build_graph` was check-then-act —
     /// the memory-cache check released its lock before the expensive
     /// `EntityGraph::build(...)` call, so concurrent callers on a cold cache
     /// each redundantly rebuilt the whole graph (thundering herd). Fires many
@@ -3863,7 +3863,7 @@ fn chrono_lite_format(unix_seconds: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m + 1, remaining_days + 1)
 }
 
-/// Verified freshness for one file against the index image (§5.1) — `true`
+/// Verified freshness for one file against the index image — `true`
 /// when the stored fingerprint no longer matches disk (content-hash
 /// confirmed, not just mtime) or the image has never seen the file. The
 /// mirror of `sem-cli`'s `commands::query::is_file_stale`; duplicated rather
@@ -3886,7 +3886,7 @@ fn index_file_is_stale(index: &sem_core::index::QueryIndex, root: &Path, path: &
 }
 
 /// Materialize an index row as the `SemanticEntity` shape the MCP entity
-/// formatter already speaks. Bodies are not in the image (§3.2), and the
+/// formatter already speaks. Bodies are not in the image, and the
 /// listing does not print them — `entity_line` uses name/type/lines only.
 fn entity_info_to_entity(entity: sem_core::parser::graph::EntityInfo) -> SemanticEntity {
     SemanticEntity {

@@ -68,12 +68,12 @@ pub fn entities_command(opts: EntitiesOptions) {
     let root = Path::new(&opts.cwd);
 
     // Cloud is a capability — cross-repo xref, repos with no local index
-    // (QUERY-INDEX.md §7 item 7) — not a latency tier, so it must not race a
+    // — not a latency tier, so it must not race a
     // local index read over the network. It only gets a turn for the
     // whole-repo single listing when there is no local index yet to answer
     // from (first-ever run, or a scope the index was never built for);
     // once a local index exists, the directory loop below answers this
-    // exact shape from it directly (§7 item 1) and cloud is never reached.
+    // exact shape from it directly (item 1) and cloud is never reached.
     let no_local_index_for_default_scope = ext_filter.is_empty()
         && !opts.no_default_excludes
         && super::query::open_index(root).is_none();
@@ -122,8 +122,8 @@ pub fn entities_command(opts: EntitiesOptions) {
             entities.extend(file_entities);
         } else if full_path.is_dir() {
             dir_count += 1;
-            // Query-index reroute first (QUERY-INDEX.md §7 item 1 / §12,
-            // unblocked this bead by `QueryIndex::files_under`): skips the
+            // Query-index reroute first (
+            // unblocked this change by `QueryIndex::files_under`): skips the
             // filesystem walk entirely when the index can answer for this
             // exact scope. `None` — never a wrong answer, only "cannot
             // answer fast" — falls through to the unchanged walk below.
@@ -285,8 +285,8 @@ fn extract_files_entities(
     registry.extract_all_entities_brief(root, file_paths)
 }
 
-/// Reroute of `sem entities <single file>` onto the query index (semx-gis
-/// item 2 / QUERY-INDEX.md §7's "missing path" note: this call used to
+/// Reroute of `sem entities <single file>` onto the query index (
+/// item 2's "missing path" note: this call used to
 /// consult no cache at all and always re-parse, 229ms on the monster). A
 /// `None` here — index absent, file unknown to it, or Verified freshness
 /// finding it stale — falls through to the unchanged `extract_file_entities`
@@ -316,28 +316,28 @@ fn try_index_entities_for_file(cwd: &str, full_path: &Path) -> Option<Vec<Semant
 }
 
 /// Reroute of `sem entities <dir>`'s file discovery onto the query index
-/// (QUERY-INDEX.md §7 item 1, unblocked this bead by `QueryIndex::files_under`
-/// — §12's inherited blocker: "the reader *could* answer it... wiring correct
+/// (unblocked this change by `QueryIndex::files_under`
+/// — inherited blocker: "the reader *could* answer it... wiring correct
 /// output ordering, exclusion semantics, and per-file Verified freshness...
 /// is real feature work"). Replaces the SQLite listing fast path
 /// (`query_entities_listing`/`write_entities_listing_json`, deleted with this
-/// change — §7 item 4, partial) with a direct index read: no walk, no SQL.
+/// change — item 4, partial) with a direct index read: no walk, no SQL.
 ///
 /// `None` — never a wrong answer, only "cannot answer fast" — whenever:
 /// the request doesn't match the index's own build scope (a custom
 /// `--file-exts`/`--no-default-excludes`/`.semignore` combination, i.e.
 /// anything but `CacheSourceScope::Default`, since the index was built once,
 /// at default scope); or the index is absent/stale-salted. On `Some`, every
-/// listed file that is individually Verified-stale (§5.1) is self-healed by
+/// listed file that is individually Verified-stale is self-healed by
 /// a per-file re-extract, the same discipline `query.rs`'s def-side repair
 /// uses — a directory reroute never bails an entire large listing over one
 /// stale file the way the entity-scoped verbs bail an entire *related* set.
 ///
 /// **Disclosed gap, not a regression**: this is `Verified`, not `Complete`
-/// (§2) — a file created under this directory since the index's last build
+/// — a file created under this directory since the index's last build
 /// is invisible until the next full rebuild repairs the image. `DIRS` (the
 /// section `Complete` needs to prove corpus-wide membership cheaply) is
-/// still reserved (§9), so this capability cannot offer more than S2's
+/// still reserved, so this capability cannot offer more than S2's
 /// `find`/`callers`/`refs` verbs already ship with for a name that exists
 /// only in a brand-new file. A future `--complete` flag, if the gap proves
 /// to matter in practice, is the natural way to opt back into the walk.
@@ -434,9 +434,9 @@ fn file_path_for_entity(root: &Path, path: &Path) -> String {
 /// verify a call site or find a string.
 ///
 /// This still runs the full local-graph rebuild path below rather than
-/// `sem grep`'s mmap trigram tier (QUERY-INDEX.md §11) — extending this
+/// `sem grep`'s mmap trigram tier — extending this
 /// entity-addressed shape onto the index is out of GREP-KILLER S4's scope
-/// (semx-woe), not something this deletion could reach; flagged as a
+/// not something this deletion could reach; flagged as a
 /// disclosed follow-on rather than silently left implying it's fast.
 const TEXT_SEARCH_LIMIT: usize = 50;
 

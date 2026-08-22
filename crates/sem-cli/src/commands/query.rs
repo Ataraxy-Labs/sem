@@ -1,11 +1,11 @@
 //! `sem find` / `sem callers` / `sem refs` — query verbs that answer directly
 //! from the mmap query index (`sem_core::index`), never the five doomed
-//! layers `QUERY-INDEX.md` §7 names (query-path file discovery, the git
+//! layers (query-path file discovery, the git
 //! freshness oracle, the per-file corpus scan, the SQLite answer-from-SQL
 //! fast paths, the resident sidecar). Budget: cold process, <10ms on the
-//! monster (§8's per-verb table; semx-gis).
+//! monster (per-verb table;).
 //!
-//! Fallback discipline (§3 of the bead, the simplification): index missing,
+//! Fallback discipline: index missing,
 //! truncated, or salt-mismatched → exactly ONE fallback, the cold build path
 //! (`EntityGraph::build` over a fresh file walk), which then writes a fresh
 //! index so the *next* call hits. Never the SQLite fast paths, never the
@@ -14,18 +14,18 @@
 //! dependency rather than a runtime check. `SEM_NO_INDEX=1` forces the same
 //! cold-build path unconditionally, for A/B measurement against it.
 //!
-//! Freshness (§5.1): after resolving an answer, this module stats exactly
+//! Freshness: after resolving an answer, this module stats exactly
 //! the files the answer touches. A stale *definition* file (the entity's own
-//! file — content-local, §4.2's "extraction identity" obligation) is
+//! file — content-local, per the "extraction identity" obligation) is
 //! repaired in-memory by re-extracting just that one file. A stale *related*
 //! file (a caller/ref target's file) is a non-local concern — resolving it
 //! correctly needs the two-pass symbol table, not a one-file re-extract — so
 //! this module does not attempt a partial patch there; it falls through to
 //! the same cold-build path used for a missing index, which is always
-//! correct and self-heals the on-disk image as a side effect. Patch choice
-//! (§4.2): repairs are in-memory only for the answer being served now; nothing
-//! is appended to an on-disk `index.log` (not implemented by this bead — see
-//! the bead's final report) — the index is instead left to `write_query_index`
+//! correct and self-heals the on-disk image as a side effect. Patch choice:
+//! repairs are in-memory only for the answer being served now; nothing
+//! is appended to an on-disk `index.log` (not implemented by this change — see
+//! the change's final report) — the index is instead left to `write_query_index`
 //! at the next corpus build, which every `graph`/`diff`/`impact` build and
 //! `GraphSession` warm rebuild already triggers (`build_cache.rs`).
 
@@ -128,7 +128,7 @@ pub(crate) fn open_index(root: &Path) -> Option<QueryIndex> {
     QueryIndex::open(&index_path(root))
 }
 
-/// Verified freshness for one file (§5.1): `true` means the index's stored
+/// Verified freshness for one file: `true` means the index's stored
 /// fingerprint no longer matches disk (content-hash-confirmed, not just
 /// mtime) or the index has never seen this file at all.
 pub(crate) fn is_file_stale(idx: &QueryIndex, root: &Path, path: &str) -> bool {
@@ -137,7 +137,7 @@ pub(crate) fn is_file_stale(idx: &QueryIndex, root: &Path, path: &str) -> bool {
 
 /// Whole-corpus freshness, proven from the index alone — the index-side
 /// analogue of `cache::DiskCache::has_fresh_cache`, and the gate every
-/// *corpus-shaped* index answer needs (semx-zvq: `sem impact --all/--tests`'
+/// *corpus-shaped* index answer needs (: `sem impact --all/--tests`'
 /// transitive walk, `sem graph`'s whole-repo dump, `sem context`'s subgraph).
 ///
 /// The entity-scoped verbs (`find`/`callers`/`refs`/`impact --deps`) get away
@@ -147,7 +147,7 @@ pub(crate) fn is_file_stale(idx: &QueryIndex, root: &Path, path: &str) -> bool {
 /// the closure, so the only honest gate is the one the SQL path already
 /// used — the whole corpus, membership and content both.
 ///
-/// - membership: `index::complete_check` (§2's `Complete` tier), which needs
+/// - membership: `index::complete_check` (`Complete` tier), which needs
 ///   `DIRS`; an image without it is refused outright rather than trusted,
 ///   because `complete_check` over an empty `DIRS` finds no drifted
 ///   directories and would report a *false* clean.
@@ -185,16 +185,16 @@ struct Answer {
 }
 
 /// Resolve `opts.query` against the index, repair any content-staleness the
-/// answer touches (§5.1), and prove membership-freshness against the whole
-/// corpus (§2's `Complete` tier, semx-ykf) — closing the blind spot where a
+/// answer touches, and prove membership-freshness against the whole
+/// corpus (`Complete` tier) — closing the blind spot where a
 /// name that exists only in a brand-new file was invisible until the next
 /// full build. `None` means "cannot answer from the index as-is": either the
 /// existing non-local (related-file) content staleness the verified path
 /// already declines on, or the same decline extended to *any* membership
 /// change touching `Callers`/`Refs` (a new file could be a new edge, which
-/// this bead cannot patch into `REFS`'s CSR without the two-pass symbol
-/// table it deliberately doesn't have — §10.3's rule, applied to membership
-/// instead of content), or an inconclusive sweep (fail-toward-MISS: an
+/// this change cannot patch into `REFS`'s CSR without the two-pass symbol
+/// table it deliberately doesn't have — the same limitation applied to
+/// membership instead of content), or an inconclusive sweep (fail-toward-MISS: an
 /// unresolved race is treated as "prove it the slow way", never as "assume
 /// nothing changed"). Every case falls through to `cold_build_answer`, which
 /// is always correct because it walks the corpus fresh.
@@ -244,7 +244,7 @@ fn index_answer(idx: &QueryIndex, root: &Path, opts: &QueryOptions, verb: Verb) 
     Some(answer)
 }
 
-/// The pre-semx-ykf verified-only answer: content-freshness only (§5.1), no
+/// The prior verified-only answer: content-freshness only, no
 /// membership proof. Kept as its own function so `index_answer` can run it
 /// concurrently with the `Complete` sweep rather than serially after it.
 fn index_answer_verified(
@@ -256,7 +256,7 @@ fn index_answer_verified(
     let registry = super::create_registry(&opts.cwd);
     let mut defs = resolve_defs(idx, &opts.query, opts.file.as_deref());
 
-    // Definition-side freshness: content-local, repaired in place per §4.2.
+    // Definition-side freshness: content-local, repaired in place.
     let def_files: Vec<String> = defs.iter().map(|e| e.file_path.clone()).collect();
     for path in dedup(def_files) {
         if file_is_stale(idx, root, &path) {
@@ -347,13 +347,13 @@ fn cold_build_answer(root: &Path, opts: &QueryOptions, verb: Verb) -> Answer {
     };
 
     // Self-heal: a repo that reaches this fallback now has a fresh index for
-    // every subsequent query (QUERY-INDEX.md §4.1 / the bead's item 4).
+    // every subsequent query (the change's item 4).
     // `None` for the test classification: this path builds topology only and
     // has no `SemanticEntity` bodies, which `is_test_entity` needs. The image
     // it writes therefore carries no `FLAG_ENTITY_TESTS`, and `sem impact
     // --tests`/`--all`'s index fast path declines on it rather than reading
-    // an uncomputed field as "no tests" (semx-zvq). Same reasoning for `None`
-    // byte spans (semx-a3w): no bodies in scope, so `sem context`'s index
+    // an uncomputed field as "no tests". Same reasoning for `None`
+    // byte spans: no bodies in scope, so `sem context`'s index
     // reroute declines on this image exactly like the test-flag readers do.
     write_query_index(root, &file_paths, &graph, None, None, None);
 
@@ -404,7 +404,7 @@ pub(crate) fn resolve_by_name_indices(
 /// prefix as a candidate, shortest first, and confirming against `FILES`
 /// (`QueryIndex::file_fingerprint`, an exact-match binary search — never a
 /// guess left unconfirmed). Needed because the index has no id→entity
-/// section (`QUERY-INDEX.md` §3's `NAMES` tier is name-keyed only); this is
+/// section (`NAMES` tier is name-keyed only); this is
 /// the CLI-side substitute, correct by construction because a false-positive
 /// candidate simply fails the final id equality check and the search moves
 /// on to the next `"::"` boundary.

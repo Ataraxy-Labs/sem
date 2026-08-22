@@ -162,8 +162,8 @@ fn collect_local_caches() -> LocalSection {
             let dir = entry.path();
             let db = dir.join("cache.db");
             // `index.sem` is now the artifact every build writes and
-            // `cache.db` the one only the content-hydrating verbs write
-            // (semx-4ex, RESOLUTION-PROFILE.md W4.5), so keying this listing
+            // `cache.db` the one only the content-hydrating verbs write,
+            // so keying this listing
             // on `cache.db` would hide an indexed repo entirely and
             // under-report the disk of every repo that has both.
             if !db.exists() && !dir.join("index.sem").exists() {
@@ -255,7 +255,7 @@ fn print_local(local: &LocalSection) {
         let label = match &c.repo_root {
             Some(root) => root.clone(),
             // The `repo_root` stamp lives in `cache.db`'s `cache_metadata`,
-            // so an index-only cache (semx-4ex) has no label to read — say
+            // so an index-only cache has no label to read — say
             // that, rather than blaming the pre-stamp caches this message was
             // written for.
             None => format!(

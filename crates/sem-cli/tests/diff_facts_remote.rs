@@ -1,5 +1,5 @@
 //! `sem diff`'s cross-machine facts sync (`commands/diff/facts_remote.rs`,
-//! semx-9en cloud half): drives the real `sem` binary against a stub
+//! cloud half): drives the real `sem` binary against a stub
 //! sem-cloud, same pattern `diff_cloud_relations.rs` already established
 //! (see `tests/support/mod.rs`) — a fresh stub axum server per test,
 //! `sem diff` run as a subprocess with `SEM_CLOUD_ENDPOINT` pointed at it.
@@ -206,7 +206,7 @@ async fn diff_queries_and_uploads_novel_facts_for_touched_files() {
         keys[0]["contentHash"].is_string(),
         "content_hash travels as decimal text"
     );
-    // semx-mul phase 2 (MUL-DESIGN.md §4.3 Field 10): FACTS_SCHEMA_VERSION
+    // MUL phase 2: FACTS_SCHEMA_VERSION
     // bumped 1 -> 2 for `PrecomputedFileFacts::import_stmts`.
     assert_eq!(
         keys[0]["schemaVersion"],
