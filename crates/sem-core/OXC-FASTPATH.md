@@ -197,8 +197,14 @@ knowingly-divergent hash: doing so would require a cache-key migration and a
   `cargo bench -p sem-core --bench oxc_spike --features oxc-fastpath`.
 
 No entity-mapping code, no equivalence-pinning test suite: there is no
-shipped code path for one to pin. The bench **is** the pinned record, the
-same role `benches/incremental.rs` plays for `INCREMENTAL-PARSE.md`.
+shipped code path for one to pin. The bench **was** the pinned record, the
+same role `benches/incremental.rs` plays for `INCREMENTAL-PARSE.md` —
+`benches/oxc_spike.rs` was removed in the 2026-08-21 subtraction pass
+(superseded by `diff_oracle` for equivalence and `perf_probe` for the
+end-to-end share; see the removal ledger in `RESOLUTION-PROFILE.md`). This
+document is the number's sole remaining provenance: the 20-49x and honest
+end-to-end figures below are the closed record, not a live, re-runnable
+measurement.
 
 ## The honest end-to-end number
 
@@ -245,7 +251,8 @@ Two independent things would have to change, not one:
 
 If both happen, this document's numbers say there's 20-49x of headroom on
 the walk itself to spend on closing that gap before the win disappears. The
-bench is committed and will say so.
+bench that measured it is gone (see the note above); reproducing the number
+would mean writing a new one from this section's four-leg design.
 
 ---
 

@@ -273,7 +273,7 @@ sem setup
 
 Now `git diff` shows entity-level changes instead of line-level. No prompts, no agent configuration needed. Everything that calls `git diff` gets sem output automatically. Also installs a pre-commit hook that shows entity-level blast radius of staged changes.
 
-On macOS and Linux, `sem setup` also wires sem into your Claude Code sessions (free, local, no login): a **warm resident graph** so structural queries answer in single-digit milliseconds instead of rebuilding each time, and **prompt-time context** so the code an agent would otherwise forage for arrives at the start of the turn. It edits `~/.claude/settings.json` idempotently, backs it up first, and leaves any hooks you already have untouched.
+On macOS and Linux, `sem setup` also registers a Claude Code `UserPromptSubmit` hook (`sem hook prompt-submit`) for prompt-time context injection. It edits `~/.claude/settings.json` idempotently, backs it up first, and leaves any hooks you already have untouched.
 
 To disable and go back to normal git diff (also removes the session hooks):
 
@@ -306,7 +306,7 @@ No config, no API keys, never fails your build. See [action/](action/) for detai
 
 ## Cloud acceleration (for scale and teams)
 
-Local is always free and, after `sem setup`, always warm — the resident graph keeps your repo hot on your own machine, so day-to-day queries are instant with no login. You do not pay to make your laptop fast.
+Local is always free and always fast — the on-disk index answers day-to-day queries in single-digit milliseconds even from a cold process, so there's nothing to keep warm and no login required. You do not pay to make your laptop fast.
 
 Cloud is for what a laptop can't do. On a very large monorepo the first local graph build can take a few seconds; a shared team graph shouldn't be rebuilt per developer; and CI wants the graph without checking anything out. `sem login` connects those cases to sem cloud, which keeps a warm, pre-built graph for your registered repos and serves the heavy queries from it (on a large repo like deno, an `impact` query is ~86ms from the cloud vs ~573ms rebuilt locally).
 

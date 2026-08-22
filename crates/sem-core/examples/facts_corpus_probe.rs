@@ -307,19 +307,27 @@ fn cmd_consume(root: &Path, corpus_dir: &Path, label: &str) {
 // =============================================================================
 
 /// Mirrors `sem-core/src/parser/facts_store.rs::LANGUAGE_SALTS` verbatim —
-/// this probe stands *outside* the crate's private detection helpers on
-/// purpose (an example only sees `pub` items, exactly like a real `sem-cli`
-/// client does), so it duplicates the same hand-maintained table `sem-cli`'s
-/// `facts_remote.rs` already duplicates, for the same reason (see that
-/// file's own doc comment on its copy of this table).
+/// deliberately, unlike `sem-cli`'s `facts_remote.rs` (semx-0lj retired that
+/// mirror: it is the same crate graph, version-locked to this `sem-core` via
+/// a path dependency, so it now imports the real
+/// `facts_store::effective_language_salt` instead of hand-copying the
+/// table). This probe's `remote-populate`/`remote-consume` commands
+/// specifically exercise `ingest_remote`'s server-side salt *validation* —
+/// they simulate an independent uploading client computing its own salt for
+/// a file, so the ingest side can reject or accept it against sem-core's own
+/// answer. Calling `facts_store::effective_language_salt` here directly
+/// would make that check tautological (a value compared to itself). So this
+/// copy is kept, but guarded: [`language_salts_match_sem_core_table`] below
+/// asserts byte-equality against the real table on every test run, turning
+/// "can silently drift" into "fails a build the moment it drifts."
 const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("typescript", "ts-0.23-u16"),
     ("tsx", "ts-0.23-u16"),
     ("javascript", "ts-0.23-u16"),
-    ("python", "ts-0.23"),
-    ("go", "ts-0.23"),
-    ("rust", "ts-0.23"),
-    ("java", "ts-0.23"),
+    ("python", "ts-0.23-mp4"),
+    ("go", "ts-0.23-mp5-dm5t-bpn2"),
+    ("rust", "ts-0.23-mp2"),
+    ("java", "ts-0.23-mp3"),
     ("c", "ts-0.23"),
     ("cpp", "ts-0.23-mp1"),
     ("ruby", "ts-0.23"),
@@ -352,7 +360,7 @@ const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("toml", "handrolled-1"),
     ("csv", "handrolled-1"),
     ("json", "handrolled-1"),
-    ("yaml", "handrolled-1"),
+    ("yaml", "handrolled-2"),
     ("markdown", "handrolled-1"),
     ("latex", "handrolled-1"),
     ("vue", "handrolled-1"),
@@ -361,12 +369,26 @@ const LANGUAGE_SALTS: &[(&str, &str)] = &[
 const DEFAULT_LANGUAGE_SALT: &str = "unmapped-1";
 
 fn language_salt(lang_id: &str) -> &'static str {
-    // Mirrors `facts_store::producer_language_salt`: MUL phase 1's C#
-    // precompute is a run-time producer switch, so the salt this probe
-    // predicts has to follow it, or the oracle reports a miss against a
-    // corpus entry that is in fact correct.
-    if lang_id == "csharp" && !sem_core::parser::scope_resolve::mul_precompute_admits("csharp") {
-        return "ts-0.23";
+    // Mirrors `facts_store::producer_language_salt` / `resolve_gated_salt`:
+    // any language registered in `MUL_RUNTIME_GATES` (MUL phase 1's C#/C++
+    // precomputes, MUL phase 2's Go/Java/Rust/Python precomputes — C++ and
+    // Python joined the table at M1, 2026-08-22, demoted from their prior
+    // unconditional admissions once I6's ceiling was redefined against peak
+    // memory footprint) has a run-time producer switch, so the salt this
+    // probe predicts has to follow it, or the oracle reports a miss against
+    // a corpus entry that is in fact correct. Consulting the real table
+    // (semx-ys0) replaces what used to be this file's own independent
+    // `if lang_id == "csharp"` copy — a second hand-written branch that
+    // would have needed updating in lockstep with `facts_store.rs`'s, and
+    // wouldn't have been, for any future gated language neither file's
+    // author remembered to touch.
+    if let Some(gate) = sem_core::parser::scope_resolve::MUL_RUNTIME_GATES
+        .iter()
+        .find(|g| g.lang_id == lang_id)
+    {
+        if !sem_core::parser::scope_resolve::mul_precompute_admits(lang_id) {
+            return gate.pre_switch_salt;
+        }
     }
     LANGUAGE_SALTS
         .iter()
@@ -662,5 +684,32 @@ fn main() {
             eprintln!("unknown mode {other:?}\n{USAGE}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LANGUAGE_SALTS;
+
+    /// semx-0lj: this probe's `LANGUAGE_SALTS` is a deliberate, independent
+    /// copy (see the doc comment on the const above for why it must stay a
+    /// real second computation rather than calling
+    /// `facts_store::effective_language_salt` directly). "Deliberate" must
+    /// not mean "silently allowed to drift" — this is the guard: it fails
+    /// the moment this table and sem-core's real one disagree on any
+    /// language, catching exactly the hand-bump-discipline lapse the salt
+    /// table's own doc comment warns about (bump a grammar dependency or a
+    /// hand-rolled plugin's extraction shape, forget to bump the salt here).
+    #[test]
+    fn language_salts_match_sem_core_table() {
+        let real = sem_core::parser::facts_store::LANGUAGE_SALTS;
+        assert_eq!(
+            LANGUAGE_SALTS, real,
+            "this probe's LANGUAGE_SALTS mirror has drifted from \
+             sem_core::parser::facts_store::LANGUAGE_SALTS — bump this \
+             table to match (see the doc comment on this file's \
+             LANGUAGE_SALTS for why it is a deliberate independent copy \
+             rather than a direct import)"
+        );
     }
 }

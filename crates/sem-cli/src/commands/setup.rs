@@ -175,9 +175,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &Outcome::Done("aliased globally".into()),
     );
 
-    // Step 2 — the Claude Code session hooks: a warm resident graph and
-    // prompt-time context injection, so structural queries are instant and the
-    // code an agent would forage for arrives at turn zero.
+    // Step 2 — the Claude Code session hook: registers `sem hook prompt-submit`
+    // as a UserPromptSubmit hook. (This used to also install a SessionStart
+    // hook that forked `sem mcp --resident` detached on every session; that
+    // resident server was deleted (QUERY-INDEX.md §7 item 5), so the hook was
+    // forking a no-op process per session for no benefit. Removed here.)
     let pb = step_spinner("Claude Code hooks");
     let hooks = install_session_hooks();
     finish_step(pb, "Claude Code hooks", &hooks);
@@ -194,7 +196,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "restart your Claude Code session".bold()
     );
     println!(
-        "     {} warm graph + prompt-time context · entity-level git diff · blast-radius pre-commit",
+        "     {} Claude Code hooks · entity-level git diff · blast-radius pre-commit",
         "·".dimmed()
     );
     println!("     revert anytime:  {}\n", "sem unsetup".cyan());
@@ -210,9 +212,13 @@ fn claude_settings_path() -> PathBuf {
     PathBuf::from(home).join(".claude").join("settings.json")
 }
 
-/// True for the exact hook commands `sem setup` installs. These substrings are
-/// sem-specific (no other tool ships `mcp --resident` or `hook prompt-submit`),
-/// so matching them will not remove a user's unrelated hooks.
+/// True for the exact hook commands `sem setup` installs or has ever
+/// installed. `sem setup` no longer installs a SessionStart hook running
+/// `mcp --resident` (see `add_session_hooks`), but the substring stays here
+/// so `sem unsetup` still recognizes and removes a SessionStart hook left
+/// behind by an older `sem setup` run. These substrings are sem-specific (no
+/// other tool ships `mcp --resident` or `hook prompt-submit`), so matching
+/// them will not remove a user's unrelated hooks.
 fn is_sem_hook_command(cmd: &str) -> bool {
     cmd.contains("mcp --resident") || cmd.contains("hook prompt-submit")
 }
@@ -232,10 +238,18 @@ fn entry_is_sem_hook(entry: &Value) -> bool {
         })
 }
 
-/// Add the two session hooks to a parsed settings object, preserving every
-/// other key and every user-defined hook. Idempotent: returns the number of
-/// hooks newly added (0 if both were already present).
-fn add_session_hooks(root: &mut Value, resident_cmd: &str, prompt_cmd: &str) -> usize {
+/// Add the session hook to a parsed settings object, preserving every other
+/// key and every user-defined hook. Idempotent: returns the number of hooks
+/// newly added (0 if already present).
+///
+/// Installs only the `UserPromptSubmit` hook (`sem hook prompt-submit`). It
+/// deliberately does not install a `SessionStart` hook: that used to run
+/// `mcp --resident` detached, but the resident server it started is gone
+/// (QUERY-INDEX.md §7 item 5) — the flag is kept only as a no-op for
+/// backward compatibility, so installing a hook that runs it would fork a
+/// process that does nothing, once per session, for every user who runs
+/// `sem setup` from here on.
+fn add_session_hooks(root: &mut Value, prompt_cmd: &str) -> usize {
     let Some(obj) = root.as_object_mut() else {
         return 0;
     };
@@ -243,30 +257,18 @@ fn add_session_hooks(root: &mut Value, resident_cmd: &str, prompt_cmd: &str) -> 
     let Some(hooks) = hooks.as_object_mut() else {
         return 0;
     };
-    let mut added = 0;
-
-    let session = hooks.entry("SessionStart").or_insert_with(|| json!([]));
-    if let Some(arr) = session.as_array_mut() {
-        if !arr.iter().any(entry_is_sem_hook) {
-            arr.push(json!({
-                "matcher": "",
-                "hooks": [{ "type": "command", "command": resident_cmd }]
-            }));
-            added += 1;
-        }
-    }
 
     let prompt = hooks.entry("UserPromptSubmit").or_insert_with(|| json!([]));
-    if let Some(arr) = prompt.as_array_mut() {
-        if !arr.iter().any(entry_is_sem_hook) {
-            arr.push(json!({
-                "hooks": [{ "type": "command", "command": prompt_cmd }]
-            }));
-            added += 1;
-        }
+    let Some(arr) = prompt.as_array_mut() else {
+        return 0;
+    };
+    if arr.iter().any(entry_is_sem_hook) {
+        return 0;
     }
-
-    added
+    arr.push(json!({
+        "hooks": [{ "type": "command", "command": prompt_cmd }]
+    }));
+    1
 }
 
 /// Remove only the sem-installed session hooks from a parsed settings object,
@@ -313,8 +315,6 @@ fn install_session_hooks() -> Outcome {
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "sem".to_string());
-    // Detach the resident server so the SessionStart hook returns immediately.
-    let resident = format!("nohup {sem} mcp --resident >/dev/null 2>&1 &");
     let prompt = format!("{sem} hook prompt-submit");
 
     let path = claude_settings_path();
@@ -348,7 +348,7 @@ fn install_session_hooks() -> Outcome {
         }
     }
 
-    let added = add_session_hooks(&mut root, &resident, &prompt);
+    let added = add_session_hooks(&mut root, &prompt);
     if added == 0 {
         return Outcome::Done("already installed".into());
     }
@@ -360,7 +360,7 @@ fn install_session_hooks() -> Outcome {
     }
     match serde_json::to_string_pretty(&root) {
         Ok(s) if fs::write(&path, format!("{s}\n")).is_ok() => {
-            Outcome::Done("resident warm graph + prompt-time prefetch".into())
+            Outcome::Done("prompt-submit hook installed".into())
         }
         _ => Outcome::Warn("couldn't write settings.json — skipped".into()),
     }
@@ -414,12 +414,15 @@ mod session_hook_tests {
                 ]
             }
         });
-        let n = add_session_hooks(&mut root, "nohup sem mcp --resident &", "sem hook prompt-submit");
-        assert_eq!(n, 2, "both hooks added on a fresh config");
+        let n = add_session_hooks(&mut root, "sem hook prompt-submit");
+        assert_eq!(n, 1, "the prompt hook is added on a fresh config");
         assert_eq!(root["model"], "opus", "unrelated keys preserved");
         assert_eq!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo hi");
-        let n2 =
-            add_session_hooks(&mut root, "nohup sem mcp --resident &", "sem hook prompt-submit");
+        assert!(
+            root["hooks"].get("SessionStart").is_none(),
+            "no SessionStart hook is installed (mcp --resident is a dead no-op)"
+        );
+        let n2 = add_session_hooks(&mut root, "sem hook prompt-submit");
         assert_eq!(n2, 0, "second install adds nothing (idempotent)");
     }
 
@@ -432,28 +435,52 @@ mod session_hook_tests {
                 ]
             }
         });
-        add_session_hooks(&mut root, "nohup sem mcp --resident &", "sem hook prompt-submit");
+        add_session_hooks(&mut root, "sem hook prompt-submit");
         assert!(remove_session_hooks(&mut root));
         assert_eq!(
             root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo hi",
             "user hook survives removal"
         );
-        assert!(
-            root["hooks"].get("SessionStart").is_none(),
-            "sem SessionStart hook removed and empty array cleaned"
-        );
+        assert!(root["hooks"].get("SessionStart").is_none());
         assert!(root["hooks"].get("UserPromptSubmit").is_none());
     }
 
     #[test]
     fn add_then_remove_roundtrips_to_no_hooks() {
         let mut root = json!({});
-        add_session_hooks(&mut root, "a mcp --resident", "a hook prompt-submit");
+        add_session_hooks(&mut root, "a hook prompt-submit");
         remove_session_hooks(&mut root);
         assert!(
             root.as_object().unwrap().get("hooks").is_none(),
             "empty hooks object removed so shape matches the original"
         );
+    }
+
+    #[test]
+    fn remove_cleans_up_a_legacy_resident_session_start_hook() {
+        // Proves `sem unsetup` still cleans up a SessionStart hook left behind
+        // by an older `sem setup` that installed `mcp --resident` (before this
+        // fix stopped installing it) — `is_sem_hook_command` still matches the
+        // command even though `add_session_hooks` no longer writes it.
+        let mut root = json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": "nohup sem mcp --resident >/dev/null 2>&1 &" }]
+                    }
+                ],
+                "UserPromptSubmit": [
+                    { "hooks": [{ "type": "command", "command": "sem hook prompt-submit" }] }
+                ]
+            }
+        });
+        assert!(remove_session_hooks(&mut root));
+        assert!(
+            root["hooks"].get("SessionStart").is_none(),
+            "legacy resident SessionStart hook is removed"
+        );
+        assert!(root["hooks"].get("UserPromptSubmit").is_none());
     }
 
     #[test]

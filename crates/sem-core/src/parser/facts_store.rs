@@ -165,7 +165,24 @@ macro_rules! maybe_par_iter {
 /// Bump whenever any type reachable from [`PersistedFacts`] changes shape.
 /// See the module doc's "Keying and versioning" section for why this can't be
 /// inferred from a decode failure alone.
-pub const FACTS_SCHEMA_VERSION: u32 = 1;
+///
+/// 1 -> 2 (semx-mul phase 2, MUL-DESIGN.md §4.3 Field 10): `PrecomputedFileFacts`
+/// grew `import_stmts: Vec<ImportStmtFacts>`. Purely additive in content
+/// (every producer today writes an empty `Vec` — see that field's own doc
+/// comment for why it is provably empty for both languages that reach a
+/// precompute producer), but it is still a *shape* change reachable from
+/// `PersistedFacts`, so the version bumps per this doc's own rule rather than
+/// relying on CBOR's forward-compatible decode of a new field: an old store's
+/// entries become a clean miss (rebuilt), never a misdecode, on the very next
+/// warm start against a binary carrying this field.
+///
+/// 2 -> 3 (semx-mul phase 2 W5, MUL-DESIGN.md §4.3 Field 11):
+/// `PrecomputedFileFacts` grew `ctor_call_sites: Vec<CtorCallFacts>` — same
+/// shape as the 1 -> 2 bump (a new type, `CtorCallFacts`, reachable from
+/// `PersistedFacts`; every producer but Python's still writes an empty
+/// `Vec`), so it gets the identical clean-miss treatment rather than relying
+/// on CBOR's forward-compatible decode.
+pub const FACTS_SCHEMA_VERSION: u32 = 3;
 
 const MAGIC: &[u8; 8] = b"SEMFACT1";
 
@@ -758,15 +775,171 @@ const SHARD_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// new precompute function (MUL-DESIGN.md section 6.1's GO/NO-GO table --
 /// those four families are NO-GO as-is), so their producer output is
 /// unchanged.
-const LANGUAGE_SALTS: &[(&str, &str)] = &[
+///
+/// `yaml` was bumped `handrolled-1` -> `handrolled-2` by semx-vlg/semx-kkk:
+/// a multi-document YAML file's same-named top-level keys in different
+/// documents used to collapse onto one `build_entity_id` output (a real
+/// oracle failure — 11 "Args" entities sharing one id in an llvm fixture,
+/// TESTS_ORACLE semx-kkk), making which document's data (including
+/// `is_test`) a corpus-wide id collision kept depend on processing order.
+/// The fix (`plugins/yaml.rs`) disambiguates colliding ids by document index
+/// via `build_entity_id_disambiguated_by_document`, which changes the `id`
+/// field of every `SemanticEntity` a multi-document YAML file with a
+/// colliding key produces — and `FileFacts.entities` carries that `id`
+/// verbatim into the corpus, so an old-salt entry for such a file is exactly
+/// I5's hazard. Single-document files (and multi-document files with no
+/// colliding key) keep the same ids, but the bump has no cheaper-than-whole-
+/// language granularity, so it covers all `yaml`/`.yml` entries.
+///
+/// This table is `pub` (semx-0lj) so `sem-cli`'s `facts_remote.rs` — the
+/// same crate graph, version-locked to this `sem-core` via a path
+/// dependency — consumes it directly instead of hand-mirroring a second
+/// copy that can silently drift from this one.
+/// `examples/facts_corpus_probe.rs` keeps its own copy deliberately (see
+/// that file's doc comment on its mirror): it is simulating an independent
+/// uploading client for the `ingest_remote` wire-protocol test, so computing
+/// the salt from this same table there would make that test tautological.
+/// That mirror instead carries its own test asserting byte-equality against
+/// this table, so drift between the two is a build failure, not a silent
+/// divergence.
+pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("typescript", "ts-0.23-u16"),
     ("tsx", "ts-0.23-u16"),
     ("javascript", "ts-0.23-u16"),
-    ("python", "ts-0.23"),
-    ("go", "ts-0.23"),
-    ("rust", "ts-0.23"),
-    ("java", "ts-0.23"),
+    // MUL phase 2 (semx-mul, W5): python's producer now emits populated
+    // import_stmts (Field 10) *and* ctor_call_sites (Field 11) — bumped from
+    // "ts-0.23" following rust's/go's/java's I5/F2 precedent. Shipped
+    // unconditionally at W5 (maxRSS -7.95%/-7.80% on home-assistant/core, a
+    // net decrease) and reconfirmed by F1 (maxRSS -1.63% median, still
+    // negative), but M1 (2026-08-22) found peak memory footprint —
+    // I6's now-corrected ceiling metric — reads +25.29-27.44% against the
+    // same +15% ceiling, above it. Demoted to gated behind `SEM_MUL_PYTHON`
+    // (`MUL_RUNTIME_GATES`'s "python" row carries the pre-switch salt,
+    // "ts-0.23"); this table's salt is unchanged — it now serves as the
+    // switched-*on* salt, C++'s/rust's/java's shape (go's too, until
+    // semx-bpn2 admitted it unconditionally and removed its switch
+    // entirely — see below).
+    ("python", "ts-0.23-mp4"),
+    // MUL phase 2 (semx-mul, W3+W4): go's producer now emits populated
+    // import_stmts (Field 10) — bumped from "ts-0.23" following the same
+    // I5/F2 precedent as rust's mp2 bump. Gated behind `SEM_MUL_GO`
+    // (`MUL_RUNTIME_GATES`'s "go" row carries the pre-switch salt,
+    // "ts-0.23"), and must STAY gated: its memory fence passed but
+    // `edge_dump_probe` found a real, deterministic correctness regression
+    // on kubernetes (not bit-identical ON vs OFF) — see
+    // `mul_precompute_admits`'s doc comment.
+    //
+    // mp3 -> mp5 (semx-u3rk): fixed half of that regression —
+    // `GoImport::packages` now carries each spec's *full* import path
+    // instead of a bare last-`/`-segment reduction, so `register_go_
+    // package_imports` can disambiguate same-named packages by declaring
+    // directory (kubernetes has dozens of directories literally named
+    // `v1`). Producer-visible (the stored `packages` strings' content
+    // changed) but not a shape change (`Vec<String>` throughout), so this
+    // is I5/F2's salt-bump case, not a `FACTS_SCHEMA_VERSION` bump — same
+    // category as this table's other content-only producer bumps. Kept
+    // even though the switch stays off in production (must not be flipped
+    // — see below): a stale mp3-salted entry from a local SEM_MUL_GO=1
+    // debugging session must not silently answer a post-fix lookup.
+    // Correctness is *closer* but not closed: fixing this collision
+    // collapsed a large class of cross-package false-positive edges
+    // (kubernetes's own OFF-path edge count dropped ~9%, all confirmed
+    // spurious), but `edge_dump_probe` ON vs OFF is still not
+    // bit-identical — a second, still-unfixed mechanism (see
+    // `mul_precompute_admits`'s doc comment) means the switch just must
+    // not be flipped in production until that regression is root-caused
+    // and fixed.
+    //
+    // mp5 -> mp5-dm5t (semx-dm5t): fixed the mechanism `mul_precompute_
+    // admits`'s doc comment above named as "(2), not fixed" — id-staleness.
+    // `registry::resolve_go_method_parent_ids` rewrites a cross-file Go
+    // method's `id`/`parent_id`, but ran *after* pass 1 had already keyed
+    // that file's `PrecomputedFileFacts.entity_scope_map`/
+    // `entity_inner_scope`/`return_type_map` by the pre-rewrite id — a
+    // pass-2 lookup by the post-rewrite id missed, silently defaulting to
+    // scope 0 (`ENTITY_SCOPE_LOOKUP`'s honest-miss counter: kubernetes
+    // fallback_pct 27.10% -> 0.00%). The fix re-keys this build's fresh
+    // facts for exactly the files the rewrite touched
+    // (`GoParentsResolved::rekeyed_ids`/`rekeyed_files`,
+    // `PrecomputedFileFacts::rekey_entity_ids`) immediately after the
+    // rewrite runs, and additionally cascades a rewritten method's new id
+    // down through every descendant whose `parent_id` embedded the old id
+    // as a literal prefix (`build_entity_id`'s own contract) — previously
+    // only the method's own id/parent_id were rewritten, leaving nested
+    // locals' `parent_id` dangling. Both are `SemanticEntity`/
+    // `PrecomputedFileFacts` content changes for `.go` files specifically
+    // (`is_go_file` guards every mutation both fixes make), hence this
+    // entry's bump, not a table-wide one — kept even though the switch
+    // stays off in production, same discipline as every prior bump on
+    // this entry. `edge_dump_probe` ON vs OFF on kubernetes: bit-identical
+    // (0-line diff, was 30,795) for the method-id-rewrite mechanism this
+    // fix targets. A second, independent, much smaller mechanism (the
+    // registration-gap species semx-9g8q is chasing, unrelated to Go's id
+    // rewrite) is still open at this point — see that bead.
+    //
+    // mp5-dm5t -> mp5-dm5t-bpn2 (semx-9g8q + semx-bpn2, go-fence wave):
+    // semx-9g8q closed the registration-gap species named just above
+    // (function-nested entities never entering any scope's `.defs`) for
+    // every language at once, including Go — `ENTITY_SCOPE_LOOKUP`'s
+    // `fallback_pct` collapsed 14.01% -> 0.00% on kubernetes. Combined
+    // with the id-rekey fix above, both known correctness species were
+    // closed — but the go-fence wave's own precondition check (before
+    // trusting that "closed" claim enough to admit Go) found a third,
+    // inverted one: `edge_dump_probe` ON vs OFF on kubernetes was *still*
+    // not bit-identical (331,120 vs 331,117), 3 dangling edges pointing at
+    // ids no entity held. Root cause: `PrecomputedFileFacts::rekey_entity_
+    // ids` (the mp5-dm5t fix above) rekeyed `entity_scope_map`/
+    // `entity_inner_scope`/`return_type_map`'s keys but never revisited
+    // `Scope::defs`' values or `Scope::owner_id` — the two other places a
+    // `Scope` caches an entity id, both populated by the same registration
+    // loops semx-9g8q reinstated. Fixed by walking `self.scopes` too.
+    // Producer-visible (`.defs`/`owner_id` values a corpus-cached
+    // `PrecomputedFileFacts` carries can now differ from a pre-fix build's)
+    // but not a shape change, so I5/F2's bump case again. `edge_dump_probe`
+    // ON vs OFF on kubernetes: bit-identical (331,117 edges both sides).
+    // Go's correctness blocker chain is now fully closed, and its memory
+    // fence (three order-swapped pairs, kubernetes, both `/usr/bin/time -l`
+    // fields) cleared the +15% ceiling (+6.78% to +8.46% peak footprint,
+    // maxRSS flat) — so unlike every prior bump on this entry, this one
+    // ships with the switch removed, not kept off: Go is admitted
+    // unconditionally, [`crate::parser::scope_resolve::MUL_RUNTIME_GATES`]
+    // no longer carries a "go" row, and this table's salt is what every
+    // build now writes under, not a switched-*on* value waiting for a
+    // switch. Bumped regardless of that, per the same discipline: a
+    // pre-bpn2 corpus entry (written under a local `SEM_MUL_GO=1`
+    // debugging session before this fix existed) must not silently answer
+    // a post-fix lookup now that the enriched path runs on every build.
+    ("go", "ts-0.23-mp5-dm5t-bpn2"),
+    // MUL phase 2 (semx-mul, W2): rust's producer now emits populated
+    // import_stmts (Field 10) — bumped from "ts-0.23" following
+    // semx-mp1/semx-u16's I5/F2 precedent. Shipped unconditionally at W2
+    // (+11.16%/+11.28% against the +15% ceiling) but semx-j1fw's
+    // same-binary re-verification found the ceiling actually busted
+    // (+17.7-19.6%) — demoted to gated behind `SEM_MUL_RUST`
+    // (`MUL_RUNTIME_GATES`'s "rust" row carries the pre-switch salt,
+    // "ts-0.23"); this table's salt is unchanged — it now serves as the
+    // switched-*on* salt, C#'s/java's shape (go's too, until semx-bpn2
+    // admitted it unconditionally — see above).
+    ("rust", "ts-0.23-mp2"),
+    // MUL phase 2 (semx-mul, W3+W4): java's imports classify as GoImport
+    // (finding F4) and are now descriptor-dispatched too — same I5/F2 bump
+    // as go's original one (go's own entry is now several bumps further —
+    // see above). Correctness is clean (bit-identical edge_dump_probe on
+    // elasticsearch, full oracle battery) but it busted its own +15%
+    // peak-RSS ceiling (+20.97%/+21.01%, both pairs) — gated behind
+    // `SEM_MUL_JAVA`, pre-switch salt "ts-0.23", C#'s shape.
+    ("java", "ts-0.23-mp3"),
     ("c", "ts-0.23"),
+    // MUL phase 1 (semx-mp1): C++'s producer's Field-10-era bump. Shipped
+    // unconditionally at semx-mp1 (+5.8%/+6.5% against the +15% ceiling,
+    // without a corrected `--no-cache`/fresh-`SEM_CACHE_DIR` protocol) but
+    // M1's (2026-08-22) corrected-protocol re-verification found both
+    // fields bust the ceiling on llvm-project (maxRSS +19.98-21.02%,
+    // footprint +26.33-28.11%). Demoted to gated behind `SEM_MUL_CPP`
+    // (`MUL_RUNTIME_GATES`'s "cpp" row carries the pre-switch salt,
+    // "ts-0.23"); this table's salt is unchanged — it now serves as the
+    // switched-*on* salt, C#'s/rust's/java's/python's shape (go's too,
+    // until semx-bpn2 admitted it unconditionally — see above).
     ("cpp", "ts-0.23-mp1"),
     ("ruby", "ts-0.23"),
     ("csharp", "ts-0.23-mp1"),
@@ -798,7 +971,7 @@ const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("toml", "handrolled-1"),
     ("csv", "handrolled-1"),
     ("json", "handrolled-1"),
-    ("yaml", "handrolled-1"),
+    ("yaml", "handrolled-2"),
     ("markdown", "handrolled-1"),
     ("latex", "handrolled-1"),
     ("vue", "handrolled-1"),
@@ -819,34 +992,80 @@ fn language_salt(lang_id: &str) -> &'static str {
         .unwrap_or(DEFAULT_LANGUAGE_SALT)
 }
 
-/// The `csharp` salt from before semx-mp1 bumped it.
-const CSHARP_PRE_MP1_SALT: &str = "ts-0.23";
-
 /// [`language_salt`], corrected for a producer switch that is decided at run
-/// time rather than by the table. There is exactly one today: MUL phase 1's C#
-/// precompute, which is off by default
-/// ([`crate::parser::scope_resolve::mul_precompute_admits`]).
+/// time rather than by the table — every language registered in
+/// [`crate::parser::scope_resolve::MUL_RUNTIME_GATES`] (MUL phase 1's C#
+/// precompute, off by default; MUL phase 2's Java precompute, semx-mul
+/// W3+W4, off by default and measured — busted its own +15% memory
+/// ceiling; MUL phase 2's Rust precompute, off by default since
+/// semx-j1fw's demotion — its own same-binary re-verification found the
+/// memory ceiling busted too, +17.7-19.6% against +15%, after W2's
+/// original +11% reading had shipped it unconditionally; MUL phase 1's
+/// C++ precompute and MUL phase 2's Python precompute, both off by
+/// default since M1's 2026-08-22 demotion — I6's ceiling was redefined
+/// against peak memory footprint (compressed-page-aware) rather than
+/// plain maxRSS, and both re-measure over it (C++: maxRSS itself busts
+/// the ceiling too, +19.98-21.02%; Python: maxRSS stays negative but
+/// footprint reads +25.29-27.44%) — see
+/// [`crate::parser::scope_resolve::mul_precompute_admits`]). Go's
+/// precompute was also in this table (MUL phase 2, semx-mul W3+W4, off
+/// by default: memory was fine but its edges weren't bit-identical on
+/// kubernetes, a correctness regression) until the go-fence wave
+/// (semx-bpn2, 2026-08-22) closed that regression and cleared the
+/// memory fence on the corrected metric too — it is unconditional now,
+/// the one MUL-phase language that is, and has no row in this table.
 ///
 /// The salt names **the producer that wrote the entry**, so a switch that
 /// changes the producer has to move the salt with it — in *both* directions.
-/// With the switch off, pass 1 emits `precomputed: None` for `.cs` exactly as a
-/// pre-semx-mp1 binary does, so the honest salt is the pre-semx-mp1 one: the
-/// two builds then share corpus entries, which is correct (their output is
-/// identical) and is what makes "off" a true revert rather than a fresh cache
-/// generation. With the switch on, `ts-0.23-mp1` isolates the richer entries
-/// from those `None`s — without this, first-writer-wins would let a switched-off
-/// build's `None` entries permanently deny the facts a slot, which is I5/F2's
-/// warning applied to a switch instead of a version.
+/// With a registered language's switch off, pass 1 emits `precomputed: None`
+/// exactly as a pre-switch binary does, so the honest salt is the gate's
+/// `pre_switch_salt`: the two builds then share corpus entries, which is
+/// correct (their output is identical) and is what makes "off" a true revert
+/// rather than a fresh cache generation. With the switch on, the table's
+/// current salt isolates the richer entries from those `None`s — without
+/// this, first-writer-wins would let a switched-off build's `None` entries
+/// permanently deny the facts a slot, which is I5/F2's warning applied to a
+/// switch instead of a version (semx-ys0).
 ///
-/// [`corpus_identity_salt`] deliberately does *not* track this: it stamps
-/// sibling artifacts (the query index) whose content — entities, edges,
-/// edge hashes — semx-mp1 measured bit-identical either way, so a memory switch
-/// must not invalidate them.
+/// The lookup itself is [`resolve_gated_salt`], kept separate so it is
+/// testable against a synthetic gate — this function's own inputs
+/// (`MUL_RUNTIME_GATES`, `mul_precompute_admits`) are process-global and, for
+/// the switch, cached in a `OnceLock` for the process's lifetime, so no test
+/// can flip them mid-run to prove the mechanism generalizes beyond the one
+/// language currently registered.
+///
+/// [`corpus_identity_salt`] deliberately does *not* track any of this: it
+/// stamps sibling artifacts (the query index) whose content — entities,
+/// edges, edge hashes — semx-mp1 measured bit-identical either way, so a
+/// memory switch must not invalidate them.
 fn producer_language_salt(lang_id: &str) -> &'static str {
-    if lang_id == "csharp" && !crate::parser::scope_resolve::mul_precompute_admits("csharp") {
-        return CSHARP_PRE_MP1_SALT;
+    resolve_gated_salt(
+        crate::parser::scope_resolve::MUL_RUNTIME_GATES,
+        crate::parser::scope_resolve::mul_precompute_admits,
+        lang_id,
+        language_salt(lang_id),
+    )
+}
+
+/// Pure core of [`producer_language_salt`]: given a table of runtime-gated
+/// languages, an admission predicate, and the table's own (post-switch)
+/// salt for `lang_id`, decide which salt an entry for `lang_id` must be
+/// keyed under right now. Decoupled from the real global gate table and the
+/// real (env-var-cached) admission function precisely so a test can inject a
+/// synthetic gate — see `facts_store::corpus_tests::resolve_gated_salt_generalizes_beyond_csharp`,
+/// which proves this handles a *second* runtime-gated language, something the
+/// single hand-written `if lang_id == "csharp"` branch this replaces never
+/// could (semx-ys0's "structural, not remembered" ask).
+fn resolve_gated_salt(
+    gates: &[crate::parser::scope_resolve::MulRuntimeGate],
+    admits: impl Fn(&str) -> bool,
+    lang_id: &str,
+    table_salt: &'static str,
+) -> &'static str {
+    match gates.iter().find(|g| g.lang_id == lang_id) {
+        Some(gate) if !admits(lang_id) => gate.pre_switch_salt,
+        _ => table_salt,
     }
-    language_salt(lang_id)
 }
 
 /// The salt a corpus entry is actually written and looked up under: the
@@ -866,7 +1085,12 @@ fn producer_language_salt(lang_id: &str) -> &'static str {
 /// With no fast extractor installed — the default, and every build without
 /// the `oxc-fastpath` feature — this is byte-identical to
 /// [`language_salt`], so no existing corpus entry is invalidated.
-pub(crate) fn effective_language_salt(lang_id: &str) -> String {
+///
+/// `pub` (semx-0lj) so `sem-cli`'s `facts_remote.rs` computes the exact same
+/// key sem-core's own `FactsCorpus` would, including the MUL-phase-1
+/// producer-switch correction and the fast-extractor identity suffix,
+/// without re-deriving either from a second copy.
+pub fn effective_language_salt(lang_id: &str) -> String {
     salt_with_extractor(
         producer_language_salt(lang_id),
         crate::parser::fast_extractor::identity_salt().as_deref(),
@@ -1284,6 +1508,38 @@ impl FactsCorpus {
         self.dir.join(format!("shard-{bucket:04}.factshard"))
     }
 
+    /// `true` only when this corpus directory is *provably* empty — does
+    /// not exist, or exists with zero entries. One cheap `read_dir` that
+    /// short-circuits on its first entry, never a full listing.
+    ///
+    /// semx-fd7: `merge_with_local`'s dominant cost on a never-populated
+    /// corpus (a machine's first-ever build, or a fresh
+    /// `SEM_FACTS_CORPUS_DIR`) was never the shard-open path — ws6's
+    /// D11 measured that directly and declined both a presence manifest
+    /// and blaming shard opens. It is the probe-construction pass itself:
+    /// a full `read_to_string` + content hash + salt lookup for every
+    /// candidate file, paid unconditionally before a single shard is ever
+    /// consulted, entirely wasted when the corpus holds nothing a probe
+    /// could possibly match. This check proves "nothing to match" in
+    /// O(1) disk operations instead of O(candidate files), so
+    /// `merge_with_local` can skip that pass outright. Any entry at all —
+    /// a real shard, a stray lock file, anything — is treated as "might
+    /// have data" and falls through to the exact, unchanged probe path:
+    /// this only ever short-circuits the case where a hit is impossible
+    /// by construction, never a case where one might exist.
+    fn is_definitely_empty(&self) -> bool {
+        match std::fs::read_dir(&self.dir) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            // Some other I/O condition (permission denied, a transient
+            // mount error) — can't prove emptiness, so don't claim it;
+            // fall through to the full path, which handles an unreadable
+            // corpus gracefully on its own (each `open_shard` call simply
+            // misses).
+            Err(_) => false,
+        }
+    }
+
     /// Open one shard and read *only* its header and index — never the
     /// payload region. Any anomaly — missing file, bad magic, schema
     /// mismatch, a v1 shard, truncated/garbage bytes — is a clean miss
@@ -1528,6 +1784,30 @@ impl FactsCorpus {
             })
             .cloned()
             .collect();
+
+        // semx-fd7: a corpus directory with zero entries can never produce
+        // a hit — skip the whole probe-construction pass (the dominant
+        // cost; see `is_definitely_empty`'s doc) rather than pay it just to
+        // discover that. `stats.probed` still reports `unknown.len()` (its
+        // documented meaning is "candidates local didn't already have," not
+        // "candidates this call actually read"), and the returned
+        // `PersistedFacts` is exactly what the full path below would build
+        // with an empty `hits` map — this is that same result, reached
+        // without touching disk for any of `unknown`.
+        if !unknown.is_empty() && self.is_definitely_empty() {
+            let mut files: Vec<PersistedFile> = Vec::new();
+            if let Some(l) = local {
+                files.extend(l.files.values().cloned());
+            }
+            let fingerprints = local.map(|l| l.fingerprints.clone()).unwrap_or_default();
+            let stats = CorpusLookupStats {
+                probed: unknown.len(),
+                hits: 0,
+                shards_read: 0,
+                bytes_read: 0,
+            };
+            return (PersistedFacts::new(fingerprints, files), stats);
+        }
 
         struct Probe {
             path: String,
@@ -1991,6 +2271,70 @@ mod tests {
         assert!(store.load(root.path()).is_none());
     }
 
+    /// semx-1ut: `TableFingerprints.entries` is a `HashMap<u64, u64>` written
+    /// through `#[derive(Serialize)]`, which encodes the map in its own
+    /// iteration order. `FxHashMap`'s hasher is fixed-seed — the same insertion
+    /// *sequence* always lands the same key set in the same buckets — but a
+    /// real build's corpus-wide fingerprints are folded from per-file/per-table
+    /// work whose *completion order* depends on scheduling (thread count,
+    /// work-stealing), not on key order. Two builds of the identical logical
+    /// corpus can insert the identical (key, value) pairs in different
+    /// sequences and land colliding keys in different buckets, producing
+    /// byte-different CBOR for facts that are, by every `PartialEq`, the same.
+    ///
+    /// This directly reproduces the mechanism the bead's evidence names
+    /// ("same binary, same corpus, different factpack bytes across runs on
+    /// HA/monster ... entity-level map serialization order") without needing
+    /// the real HA/monster corpora: insertion order alone is the variable
+    /// under test, isolated from parallelism's own nondeterminism.
+    #[test]
+    fn factpack_fingerprint_bytes_are_independent_of_insertion_order() {
+        let n: u64 = 4000;
+        let value_of = |k: u64| k.wrapping_mul(2_654_435_761);
+
+        let mut forward = TableFingerprints::default();
+        for k in 0..n {
+            forward.put(k, value_of(k));
+        }
+
+        // A different, still-total insertion sequence over the exact same key
+        // set — standing in for a different thread-completion order over one
+        // build's corpus-wide tables. A xorshift-driven Fisher-Yates shuffle,
+        // not just a coarse reordering, so the insertion sequence is genuinely
+        // decorrelated from key order.
+        let mut order: Vec<u64> = (0..n).collect();
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        for i in (1..order.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        let mut interleaved = TableFingerprints::default();
+        for k in order {
+            interleaved.put(k, value_of(k));
+        }
+
+        assert_eq!(
+            forward, interleaved,
+            "sanity: both maps hold the same logical (key, value) pairs"
+        );
+
+        let mut forward_bytes = Vec::new();
+        ciborium::into_writer(&forward, &mut forward_bytes).expect("encode forward");
+        let mut interleaved_bytes = Vec::new();
+        ciborium::into_writer(&interleaved, &mut interleaved_bytes).expect("encode interleaved");
+
+        assert_eq!(
+            forward_bytes, interleaved_bytes,
+            "semx-1ut: identical fingerprint content serialized to different CBOR \
+             bytes depending on insertion order alone — this is the byte-determinism \
+             the facts corpus's content-addressed dedup and the perf parity gates \
+             both rely on"
+        );
+    }
+
     #[test]
     fn schema_version_mismatch_is_a_clean_miss() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2255,12 +2599,18 @@ mod corpus_tests {
         // suffix must contribute nothing, or landing this code would have
         // invalidated every existing corpus entry on disk.
         //
-        // `csharp` is the one deliberate exception, and is pinned in both
-        // directions by `csharp_salt_tracks_the_mul_phase1_switch` below: its
-        // table entry describes the producer that only runs when phase 1's C#
-        // switch is on, which by default it is not.
+        // Every language registered in `MUL_RUNTIME_GATES` is a deliberate
+        // exception, pinned in both directions by
+        // `csharp_salt_tracks_the_mul_phase1_switch` below: its table entry
+        // describes the producer that only runs when its switch is on, which
+        // by default it is not. Skipping by table membership (rather than a
+        // hardcoded `"csharp"`) means this test keeps covering every
+        // *ungated* language automatically as `MUL_RUNTIME_GATES` grows.
         for (id, salt) in LANGUAGE_SALTS.iter() {
-            if *id == "csharp" {
+            if crate::parser::scope_resolve::MUL_RUNTIME_GATES
+                .iter()
+                .any(|g| g.lang_id == *id)
+            {
                 continue;
             }
             assert_eq!(&effective_language_salt(id), salt);
@@ -2281,24 +2631,185 @@ mod corpus_tests {
         // it must move with the switch in both directions, or first-writer-wins
         // corpus dedup lets one mode's entries permanently answer the other's
         // lookups (MUL-DESIGN.md I5/F2).
-        let admitted = crate::parser::scope_resolve::mul_precompute_admits("csharp");
-        let expected = if admitted {
-            "ts-0.23-mp1"
-        } else {
-            CSHARP_PRE_MP1_SALT
-        };
-        assert_eq!(effective_language_salt("csharp"), expected);
-        assert_ne!(
-            CSHARP_PRE_MP1_SALT,
-            language_salt("csharp"),
-            "the pre-mp1 salt and the table's mp1 salt must stay distinct, or \
-             the switch isolates nothing"
-        );
+        //
+        // Walks every registered gate rather than hardcoding "csharp" — this
+        // test now covers whatever `MUL_RUNTIME_GATES` grows to (MUL phase
+        // 2/3), not just today's one entry.
+        for gate in crate::parser::scope_resolve::MUL_RUNTIME_GATES {
+            let admitted = crate::parser::scope_resolve::mul_precompute_admits(gate.lang_id);
+            let table_salt = language_salt(gate.lang_id);
+            let expected = if admitted {
+                table_salt
+            } else {
+                gate.pre_switch_salt
+            };
+            assert_eq!(effective_language_salt(gate.lang_id), expected);
+            assert_ne!(
+                gate.pre_switch_salt, table_salt,
+                "{}'s pre-switch salt and the table's current salt must stay \
+                 distinct, or the switch isolates nothing",
+                gate.lang_id
+            );
+        }
 
-        // C++ has no switch: it is verdicted GO unconditionally, so its salt is
-        // the table's, always.
-        assert!(crate::parser::scope_resolve::mul_precompute_admits("cpp"));
-        assert_eq!(effective_language_salt("cpp"), "ts-0.23-mp1");
+        // M1 (2026-08-22): every phase-1/phase-2 language is gated now — C++
+        // and Python joined `MUL_RUNTIME_GATES` when I6's ceiling was
+        // redefined against peak memory footprint, so both are covered by
+        // the loop above like every other gated language; no unconditional
+        // survivor remains to special-case here.
+    }
+
+    #[test]
+    fn resolve_gated_salt_generalizes_beyond_csharp() {
+        // `resolve_gated_salt` is what makes semx-ys0's fix structural rather
+        // than remembered: before it existed, `producer_language_salt` was a
+        // single hand-written `if lang_id == "csharp"` branch that could not
+        // have honored a second gated language without a second hand-written
+        // branch. This test proves the generalized function does — with a
+        // synthetic gate, since the real `MUL_RUNTIME_GATES` has only one row
+        // today and the real switch is cached in a `OnceLock` for the whole
+        // process (can't be flipped mid test to prove the same point live).
+        let gates = [crate::parser::scope_resolve::MulRuntimeGate {
+            lang_id: "kotlin",
+            pre_switch_salt: "ts-1.1",
+        }];
+        let table_salt = "ts-1.1-newgen";
+
+        assert_eq!(
+            resolve_gated_salt(&gates, |_| false, "kotlin", table_salt),
+            "ts-1.1",
+            "switch off: entries a switched-off build wrote must stay \
+             reachable under the pre-switch salt"
+        );
+        assert_eq!(
+            resolve_gated_salt(&gates, |_| true, "kotlin", table_salt),
+            table_salt,
+            "switch on: the richer producer's entries must isolate under the \
+             table's current salt, never collide with the pre-switch entries"
+        );
+        // A language absent from the gate table is untouched by it, whatever
+        // `admits` says — the table, not the predicate, decides applicability.
+        assert_eq!(
+            resolve_gated_salt(&gates, |_| false, "python", "ts-0.23"),
+            "ts-0.23"
+        );
+    }
+
+    /// The mechanism this whole module exists to prevent, proven directly:
+    /// at a *fixed* key, first-writer-wins denies a later, richer write for
+    /// identical content forever — the corpus is stuck at the first writer's
+    /// capability level (semx-ys0's "silently denies producer upgrades").
+    /// This is intentional, documented behavior (an anti-poisoning stance,
+    /// not a bug) — the reason `producer_language_salt`/`MUL_RUNTIME_GATES`
+    /// exist is to make sure a real capability change moves the *key*, not
+    /// to make same-key overwrites acceptable.
+    #[test]
+    fn weak_entry_at_a_fixed_key_permanently_denies_a_later_strong_write() {
+        let _salt_guard = salt_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = FactsCorpus::open(dir.path());
+        let source = "class C {}";
+        let hash = content_hash(source);
+        let fixed_salt = "ts-0.23-mp1";
+
+        let weak = CorpusFile {
+            facts: FileFacts {
+                path: "C.cs".to_string(),
+                content_hash: hash,
+                entities: vec![entity("C.cs", "C")],
+            },
+            precomputed: None,
+            lang_salt: fixed_salt.to_string(),
+        };
+        corpus
+            .write_corpus_files(vec![CorpusFileRef::of(&weak)])
+            .expect("write weak");
+
+        let strong = CorpusFile {
+            precomputed: Some(
+                crate::parser::scope_resolve::dummy_precomputed_facts_for_test("richer"),
+            ),
+            ..weak.clone()
+        };
+        corpus
+            .write_corpus_files(vec![CorpusFileRef::of(&strong)])
+            .expect("write strong (denied)");
+
+        let served = corpus
+            .get("C.cs", hash, fixed_salt)
+            .expect("a hit at this key");
+        assert!(
+            served.precomputed.is_none(),
+            "first-writer-wins must still be serving the weak entry at an \
+             unchanged key — this is the exact denial semx-ys0 reports, and \
+             is why a real capability change must move the salt"
+        );
+    }
+
+    /// The fix, proven end-to-end: a producer-capability upgrade (simulated
+    /// via `MUL_RUNTIME_GATES`'s registered csharp gate, the same mechanism
+    /// pass 1's real switch drives) moves the *key*, so the weak write and
+    /// the strong write never collide — and a switched-on reader gets the
+    /// strong facts instead of being denied them forever.
+    #[test]
+    fn mul_runtime_gate_upgrade_reaches_the_switched_on_reader() {
+        let _salt_guard = salt_guard();
+        let gate = crate::parser::scope_resolve::MUL_RUNTIME_GATES
+            .iter()
+            .find(|g| g.lang_id == "csharp")
+            .expect("csharp is the one registered MUL runtime gate today");
+        let on_salt = language_salt("csharp");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = FactsCorpus::open(dir.path());
+        let source = "class C {}";
+        let hash = content_hash(source);
+
+        // A switched-off build wrote this file's facts with no precompute,
+        // under the pre-switch salt.
+        let weak = CorpusFile {
+            facts: FileFacts {
+                path: "C.cs".to_string(),
+                content_hash: hash,
+                entities: vec![entity("C.cs", "C")],
+            },
+            precomputed: None,
+            lang_salt: gate.pre_switch_salt.to_string(),
+        };
+        corpus
+            .write_corpus_files(vec![CorpusFileRef::of(&weak)])
+            .expect("write weak (pre-switch)");
+
+        // A switched-on build computes richer facts for identical content,
+        // under the table's current (post-switch) salt.
+        let strong = CorpusFile {
+            facts: weak.facts.clone(),
+            precomputed: Some(
+                crate::parser::scope_resolve::dummy_precomputed_facts_for_test("richer"),
+            ),
+            lang_salt: on_salt.to_string(),
+        };
+        corpus
+            .write_corpus_files(vec![CorpusFileRef::of(&strong)])
+            .expect("write strong (isolated key, not denied)");
+
+        // The switched-off salt still safely serves the pre-switch build's
+        // own entry — untouched, never corrupted by the upgrade.
+        let off_hit = corpus
+            .get("C.cs", hash, gate.pre_switch_salt)
+            .expect("pre-switch lookup still hits its own entry");
+        assert!(off_hit.precomputed.is_none());
+
+        // The switched-on salt serves the strong facts: the upgrade reached
+        // the reader instead of being denied by the pre-switch entry.
+        let on_hit = corpus
+            .get("C.cs", hash, on_salt)
+            .expect("post-switch lookup hits the upgraded entry");
+        assert!(
+            on_hit.precomputed.is_some(),
+            "a producer upgrade must reach a switched-on reader, not be \
+             denied by a switched-off entry at a different key"
+        );
     }
 
     #[test]
@@ -2341,14 +2852,78 @@ mod corpus_tests {
             )
             .expect("populate");
 
-        assert!(corpus.get("a.py", hash, "ts-0.23").is_some());
+        // Python is gated (`SEM_MUL_PYTHON`, off by default since M1) — the
+        // effective salt this default-settings populate wrote under is the
+        // gate's pre-switch salt, not `LANGUAGE_SALTS`'s raw table entry
+        // ("ts-0.23-mp4", the switched-*on* salt). Deriving it via
+        // `effective_language_salt` rather than hardcoding keeps this test
+        // honest about whichever state the switch is in.
+        let py_salt = effective_language_salt("python");
+        assert!(corpus.get("a.py", hash, &py_salt).is_some());
         assert!(
             corpus.get("a.py", hash, "ts-0.24-bumped").is_none(),
             "a grammar-bump salt change must miss the old entry"
         );
         // A different language's entry sharing the same bucket space is
         // simply a different key; unaffected by the above.
-        assert!(corpus.get("a.ts", hash, "ts-0.23").is_none());
+        assert!(corpus.get("a.ts", hash, &py_salt).is_none());
+    }
+
+    #[test]
+    fn yaml_salt_bump_denies_the_old_handrolled_1_entry() {
+        // semx-vlg/semx-kkk: the yaml plugin's id fix (multi-document files
+        // no longer collide same-named keys in different documents onto one
+        // id) is a producer-visible change to FileFacts.entities' `id`
+        // field, so I5/F2 requires the `yaml` salt to move — it did,
+        // `handrolled-1` -> `handrolled-2`. This is the concrete, per-
+        // language instance of `corpus_isolates_by_language_salt`'s general
+        // proof: an entry a pre-fix binary wrote (under `handrolled-1`) must
+        // be a clean miss against a post-fix binary's lookup (under
+        // `language_salt("yaml")`, now `handrolled-2`), never silently
+        // served stale ids.
+        let _salt_guard = salt_guard();
+        const YAML_PRE_VLG_SALT: &str = "handrolled-1";
+        assert_ne!(
+            language_salt("yaml"),
+            YAML_PRE_VLG_SALT,
+            "the table's current yaml salt must differ from the pre-fix one, \
+             or the bump isolates nothing"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = FactsCorpus::open(dir.path());
+        let source = "name: my-app\nversion: 1.0.0\n";
+        let hash = content_hash(source);
+        let entities = vec![entity("config.yaml", "name")];
+
+        // A pre-fix binary's entry, written under the old salt.
+        // `populate_delta` always computes *today's* salt for a `.yaml`
+        // file, so simulating an old binary's write means going one level
+        // below it, to the same `write_corpus_files` populate_delta itself
+        // calls, with an explicit stale `lang_salt`.
+        corpus
+            .write_corpus_files(vec![CorpusFileRef {
+                facts: FileFactsRef {
+                    path: "config.yaml",
+                    content_hash: hash,
+                    entities: &entities,
+                },
+                precomputed: None,
+                lang_salt: YAML_PRE_VLG_SALT.to_string(),
+            }])
+            .expect("populate");
+
+        assert!(
+            corpus.get("config.yaml", hash, YAML_PRE_VLG_SALT).is_some(),
+            "sanity: the pre-fix entry itself must be readable under its own salt"
+        );
+        assert!(
+            corpus
+                .get("config.yaml", hash, language_salt("yaml"))
+                .is_none(),
+            "a post-fix build must treat the old-salt yaml entry as a miss, \
+             never serve its stale ids"
+        );
     }
 
     #[test]

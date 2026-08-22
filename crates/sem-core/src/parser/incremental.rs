@@ -115,6 +115,19 @@ pub(crate) enum Table {
     /// import form; every other file's read set never touches this key, so this
     /// guard costs nothing for files that don't use the pattern.
     GuardPyWildcardImport = 201,
+    /// Whole-table guard: Rust's relative module-alias `use` form
+    /// (`register_rust_module_import`, semx-gla) — `use crate::a::module_name;`
+    /// / `use super::module_name;` / `use self::module_name;` followed by a
+    /// qualified call `module_name::item()`. Same unbounded-read shape as
+    /// `GuardPyWildcardImport` immediately above (a symbol added anywhere in
+    /// the corpus could start or stop matching the aliased module's stem), and
+    /// in fact folds the exact same `(name, file_path)` data — kept as its own
+    /// tag rather than reusing `GuardPyWildcardImport` purely so a Rust file's
+    /// read set doesn't read as "depends on a Python guard" (and so a
+    /// mixed-language corpus's read sets stay self-describing); the two guards
+    /// always change together regardless. Recorded only by the one file whose
+    /// AST actually contains this import form.
+    GuardRustModuleAlias = 202,
 }
 
 impl Table {
@@ -314,9 +327,42 @@ impl Recorder {
 ///
 /// Diffing two of these yields exactly the keys whose value changed, including
 /// keys that appeared or disappeared (compared as `Option`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `entries` stays a `HashMap` (`FxHashMap`, fixed-seed) because `put`/`get`/
+/// `remove` are on the hot incremental-build path and don't care about order.
+/// `Serialize` is hand-written below instead of derived (semx-1ut) because the
+/// derive would encode the map in its own iteration order, which depends on
+/// *insertion sequence*, not just key content — two builds of the identical
+/// logical corpus can fold the same (key, value) pairs in different orders
+/// (thread-count-dependent scheduling) and land colliding keys in different
+/// `hashbrown` buckets, producing byte-different CBOR for facts that are the
+/// same by every `PartialEq`. That breaks the facts corpus's content-addressed
+/// dedup and the perf parity gates, both of which assume identical content
+/// serializes identically. Canonicalizing happens only here, at the cold
+/// write boundary — not in the hot `HashMap` the rest of this module reads
+/// and writes through.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct TableFingerprints {
     entries: HashMap<u64, u64>,
+}
+
+impl Serialize for TableFingerprints {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        // A `BTreeMap` view of the same entries, built fresh at encode time:
+        // its iteration order is a pure function of key value, independent of
+        // whatever order the entries were `put` in. Same wire shape as the
+        // derive would have produced (a struct with one map-valued field), so
+        // an old store written before this change still decodes fine.
+        let sorted: std::collections::BTreeMap<u64, u64> =
+            self.entries.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut state = serializer.serialize_struct("TableFingerprints", 1)?;
+        state.serialize_field("entries", &sorted)?;
+        state.end()
+    }
 }
 
 impl TableFingerprints {

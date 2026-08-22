@@ -3,6 +3,10 @@
 //! `CodeParserPlugin::extract_entities` goes through the cache;
 //! `extract_entities_with_tree` does not. Any divergence between them is a bug
 //! in the cache, so these tests pin them together over real fixture files.
+//!
+//! The harness runs these tests concurrently against one process, so each
+//! test binds its own cache instance (`cache::install_test_instance`): a
+//! sibling's `clear()` or counter bumps cannot race a test's own observations.
 
 use sem_core::parser::cache;
 use sem_core::parser::plugin::SemanticParserPlugin;
@@ -78,6 +82,7 @@ fn assert_same(
 
 #[test]
 fn cached_extraction_matches_the_uncached_path() {
+    cache::install_test_instance();
     let plugin = CodeParserPlugin;
     for (path, content) in fixtures() {
         // The uncached reference: `extract_entities_with_tree` never consults
@@ -94,6 +99,7 @@ fn cached_extraction_matches_the_uncached_path() {
 
 #[test]
 fn a_cache_hit_is_recorded_for_a_repeated_blob() {
+    cache::install_test_instance();
     if !cache::is_enabled() {
         return; // SEM_PARSE_CACHE=0 in the environment; nothing to assert.
     }
@@ -101,8 +107,8 @@ fn a_cache_hit_is_recorded_for_a_repeated_blob() {
     let path = "hit_counter_probe.py";
     let content = "def probe(x):\n    return x + 1\n";
 
-    // Prime, then measure only the repeat so a concurrent test cannot inflate
-    // the delta beyond the >= assertion.
+    // Prime, then measure only the repeat. On the private instance the delta
+    // is exact: no sibling can bump the counter or drop the primed entry.
     plugin.extract_entities(content, path);
     let before = cache::stats().hits;
     plugin.extract_entities(content, path);
@@ -116,6 +122,7 @@ fn a_cache_hit_is_recorded_for_a_repeated_blob() {
 
 #[test]
 fn an_edit_to_the_content_is_a_different_key() {
+    cache::install_test_instance();
     let plugin = CodeParserPlugin;
     let path = "edit_probe.py";
     let before = plugin.extract_entities("def alpha():\n    pass\n", path);
@@ -129,6 +136,7 @@ fn an_edit_to_the_content_is_a_different_key() {
 
 #[test]
 fn the_same_bytes_at_a_different_path_get_their_own_entities() {
+    cache::install_test_instance();
     let plugin = CodeParserPlugin;
     let content = "def shared():\n    pass\n";
     let a = plugin.extract_entities(content, "pkg/a.py");
@@ -141,6 +149,7 @@ fn the_same_bytes_at_a_different_path_get_their_own_entities() {
 
 #[test]
 fn structural_hash_is_stable_across_repeats() {
+    cache::install_test_instance();
     let plugin = CodeParserPlugin;
     let path = "structural_probe.rs";
     let content = "pub fn probe(x: u8) -> u8 { x + 1 }\n";
@@ -161,6 +170,7 @@ fn structural_hash_is_stable_across_repeats() {
 
 #[test]
 fn the_registry_path_is_cached_and_still_correct() {
+    cache::install_test_instance();
     let registry = create_default_registry();
     for (path, content) in fixtures() {
         let first = registry.extract_entities(&path, &content);
@@ -179,6 +189,7 @@ fn the_registry_path_is_cached_and_still_correct() {
 
 #[test]
 fn clearing_the_cache_does_not_change_results() {
+    cache::install_test_instance();
     let plugin = CodeParserPlugin;
     let path = "clear_probe.ts";
     let content = "export function probe(n: number): number {\n  return n * 2;\n}\n";

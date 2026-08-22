@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::model::entity::{build_entity_id, build_entity_id_disambiguated, SemanticEntity};
 use crate::parser::plugin::SemanticParserPlugin;
@@ -435,7 +435,7 @@ impl SemanticParserPlugin for LatexParserPlugin {
             // Find the deepest (highest-level number) section containing this environment
             let parent_id = find_parent_section_id(env.start_line, &section_ranges, &section_ids);
 
-            let mut metadata = HashMap::new();
+            let mut metadata = BTreeMap::new();
             metadata.insert("environment_type".to_string(), env.env_type.clone());
 
             entities.push(SemanticEntity {

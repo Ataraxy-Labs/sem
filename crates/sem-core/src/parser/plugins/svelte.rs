@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -571,7 +571,7 @@ impl<'a> SvelteLowerer<'a> {
         parent_id: Option<String>,
         node: TsNode<'_>,
         structural_hash: Option<String>,
-        metadata: Option<HashMap<String, String>>,
+        metadata: Option<BTreeMap<String, String>>,
     ) -> SemanticEntity {
         self.make_ranged_entity(
             kind,
@@ -596,7 +596,7 @@ impl<'a> SvelteLowerer<'a> {
         start_line: usize,
         end_line: usize,
         structural_hash: Option<String>,
-        metadata: Option<HashMap<String, String>>,
+        metadata: Option<BTreeMap<String, String>>,
     ) -> SemanticEntity {
         let entity_type = kind.as_str().to_string();
         let content = text_for_byte_range(self.source, start, end).to_string();
@@ -772,8 +772,8 @@ fn extract_svelte_module_entities(
     entities
 }
 
-fn base_metadata(kind: SvelteEntityKind) -> HashMap<String, String> {
-    HashMap::from([(
+fn base_metadata(kind: SvelteEntityKind) -> BTreeMap<String, String> {
+    BTreeMap::from([(
         SVELTE_KIND_KEY.to_string(),
         kind.metadata_kind().to_string(),
     )])

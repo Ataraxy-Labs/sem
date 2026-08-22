@@ -1775,8 +1775,8 @@ fn run_diff_pipeline(
     // carry another session's uncommitted WIP this campaign must not touch.
     let t5 = Instant::now();
     cloud_upload::maybe_upload_cloud_diff_snapshot(
-        opts,
-        parsed,
+        cloud_upload::DiffCloudFields::from_opts(opts),
+        &parsed.scope,
         from_stdin,
         &file_changes,
         &result,

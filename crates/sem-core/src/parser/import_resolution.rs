@@ -883,7 +883,7 @@ import './missing';
 }
 
 #[cfg(test)]
-mod single_pass_laws {
+mod single_pass_invariants {
     use super::*;
 
     /// xorshift64*, so a failure is reproducible from its seed.

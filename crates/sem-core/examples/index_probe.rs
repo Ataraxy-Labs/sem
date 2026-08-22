@@ -182,6 +182,7 @@ fn write_mode(root: &Path, index_path: &Path) {
     tests_oracle(&entities, &index);
     trigram_oracle(&index, &root, &contents);
     mutation_test(&index, &bytes_for_mutation, &root, &contents);
+    refs_mutation_test(&graph, &bytes_for_mutation);
 }
 
 fn read_one(root: &Path, path: &str) -> Option<(String, Vec<u8>)> {
@@ -295,7 +296,9 @@ fn oracle(graph: &EntityGraph, bytes: Vec<u8>) -> QueryIndex {
         std::process::exit(1);
     }
 
-    refs_oracle(graph, &index);
+    if !refs_oracle(graph, &index) {
+        std::process::exit(1);
+    }
     index
 }
 
@@ -315,17 +318,49 @@ fn ref_type_label(rt: &sem_core::parser::graph::RefType) -> &'static str {
     }
 }
 
+/// Outcome of one exhaustive pass of [`refs_check`] — kept separate from
+/// printing/exit-code decisions so the same O(n) check can back both the
+/// gating `REFS_ORACLE` line and [`refs_mutation_test`]'s corruption proof.
+struct RefsCheckStats {
+    checked: usize,
+    mismatched: usize,
+    kind_mismatched: usize,
+    refs_typed: bool,
+}
+
 /// S2's Property 1 analogue (`QUERY-INDEX.md` §6, extended for semx-gis, and
 /// again for semx-zvq's typed `REFS`): for every entity in the graph,
 /// `index.refs_of`/`callers_of` equals the graph's own
 /// `dependencies`/`dependents` maps, as a sorted id multiset — **and**
 /// `index.refs_of_typed`/`callers_of_typed` equals `graph.edges`' own
 /// `ref_type` for every one of those edges, as a sorted `(id, kind)`
-/// multiset. Entity-index lookup goes through `NAMES` (already
-/// oracle-checked above) rather than a second id→index table, so this also
-/// re-exercises Property 1 on every entity that participates in an edge.
-fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
-    let started = Instant::now();
+/// multiset.
+///
+/// semx-o0x: entity→index-slot resolution used to go through
+/// `index.lookup(&entity.name)` (a NAMES binary search) followed by a linear
+/// `.find()` over that name's whole bucket, once per graph entity. That
+/// reads as O(n) at a glance, but the real cost is `Σ over names x of
+/// count(x)²` — every entity sharing a hub name (`test_setup`,
+/// `async_setup`, `visit`, operator overloads, …) re-scans that name's
+/// *entire* bucket. Measured on home-assistant/core (318,638 entities,
+/// 95,580 distinct names, avg bucket ~3.3): 586.7M cumulative bucket-scan
+/// iterations — a 1841x blowup over entity count, not the ~3x an O(n) walk
+/// would produce. On the TypeScript monster (714,819 entities) the ratio
+/// climbed to 2806x, tracking wall time (24.5s → 100.5s, a 4.1x jump for
+/// only 2.24x more entities) far more tightly than entity count does. This
+/// is the documented llvm pathology (semx-o0x): ref-dense, hub-heavy
+/// corpora pay quadratic-shaped cost for a lookup path a *different*,
+/// already-exhaustive check (`oracle()` above, over every *distinct* name)
+/// had already fully proven correct — this function's own name-bucket walk
+/// added zero incremental NAMES coverage, only cost.
+///
+/// The fix: resolve every entity's index slot through one id→slot map built
+/// in a single O(n) pass over the index's own `ENTITIES` table, instead of
+/// re-deriving a name bucket per entity. Coverage is unchanged and still
+/// exhaustive — every entity, every edge, both directions, both id and
+/// typed-kind agreement — only the resolution step's complexity class
+/// drops, from `Σ count(x)²` to `O(n)`.
+fn refs_check(graph: &EntityGraph, index: &QueryIndex) -> RefsCheckStats {
     let mut checked = 0usize;
     let mut mismatched = 0usize;
     let mut kind_mismatched = 0usize;
@@ -348,12 +383,18 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
 
     let refs_typed = index.refs_are_typed();
 
+    // One pass over the index's own ENTITIES table (O(n)) replaces the old
+    // per-entity NAMES-bucket rescan (Σ count(name)²). This is a plain
+    // id→slot map, not a second NAMES table — it re-derives nothing NAMES
+    // already answers, it just avoids asking NAMES the same question
+    // `entity_count()` separate times.
+    let mut id_to_index: HashMap<String, usize> = HashMap::with_capacity(index.entity_count());
+    for slot in 0..index.entity_count() {
+        id_to_index.insert(index.entity(slot).id(), slot);
+    }
+
     for entity in graph.entities.values() {
-        let Some(hit) = index
-            .lookup(&entity.name)
-            .into_iter()
-            .find(|e| e.id() == entity.id)
-        else {
+        let Some(&at) = id_to_index.get(entity.id.as_str()) else {
             mismatched += 1;
             if mismatched <= 3 {
                 println!("REFS_ORACLE_MISS id={:?}", entity.id);
@@ -367,7 +408,7 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
             .map(|v| v.iter().map(String::as_str).collect())
             .unwrap_or_default();
         want_deps.sort_unstable();
-        let mut got_deps: Vec<String> = index.refs_of(hit.index()).iter().map(|e| e.id()).collect();
+        let mut got_deps: Vec<String> = index.refs_of(at).iter().map(|e| e.id()).collect();
         got_deps.sort();
         let deps_ok = got_deps == want_deps;
 
@@ -377,11 +418,7 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
             .map(|v| v.iter().map(String::as_str).collect())
             .unwrap_or_default();
         want_callers.sort_unstable();
-        let mut got_callers: Vec<String> = index
-            .callers_of(hit.index())
-            .iter()
-            .map(|e| e.id())
-            .collect();
+        let mut got_callers: Vec<String> = index.callers_of(at).iter().map(|e| e.id()).collect();
         got_callers.sort();
         let callers_ok = got_callers == want_callers;
 
@@ -406,7 +443,7 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
                 .unwrap_or_default();
             want_deps_typed.sort_unstable();
             let mut got_deps_typed: Vec<(String, &'static str)> = index
-                .refs_of_typed(hit.index())
+                .refs_of_typed(at)
                 .into_iter()
                 .map(|(e, k)| (e.id(), ref_type_label(&k)))
                 .collect();
@@ -423,7 +460,7 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
                 .unwrap_or_default();
             want_callers_typed.sort_unstable();
             let mut got_callers_typed: Vec<(String, &'static str)> = index
-                .callers_of_typed(hit.index())
+                .callers_of_typed(at)
                 .into_iter()
                 .map(|(e, k)| (e.id(), ref_type_label(&k)))
                 .collect();
@@ -447,23 +484,32 @@ fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) {
         checked += 1;
     }
 
-    println!(
-        "REFS_ORACLE entities={} checked={} mismatched={} kind_mismatched={} typed={} ms={:.1} verdict={}",
-        graph.entities.len(),
+    RefsCheckStats {
         checked,
         mismatched,
         kind_mismatched,
         refs_typed,
-        ms(started),
-        if mismatched == 0 && kind_mismatched == 0 {
-            "PASS"
-        } else {
-            "FAIL"
-        }
-    );
-    if mismatched != 0 || kind_mismatched != 0 {
-        std::process::exit(1);
     }
+}
+
+/// Runs [`refs_check`], prints the gating `REFS_ORACLE` line, and reports
+/// pass/fail — exiting is the caller's call (so [`refs_mutation_test`] can
+/// reuse the same check on a deliberately corrupted image without dying).
+fn refs_oracle(graph: &EntityGraph, index: &QueryIndex) -> bool {
+    let started = Instant::now();
+    let stats = refs_check(graph, index);
+    let ok = stats.mismatched == 0 && stats.kind_mismatched == 0;
+    println!(
+        "REFS_ORACLE entities={} checked={} mismatched={} kind_mismatched={} typed={} ms={:.1} verdict={}",
+        graph.entities.len(),
+        stats.checked,
+        stats.mismatched,
+        stats.kind_mismatched,
+        stats.refs_typed,
+        ms(started),
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
 }
 
 /// `QUERY-INDEX.md` §7 item 1's Property 1 analogue: `QueryIndex::files_under`
@@ -843,6 +889,90 @@ fn corrupt_posting_for_file(bytes: &[u8], trigram: [u8; 3], target_file: u32) ->
     let target_off = section_ref.offset as usize + format::trigram::targets_at(count) + at * 4;
     mutated[target_off..target_off + 4].copy_from_slice(&replacement.to_le_bytes());
     Some(mutated)
+}
+
+/// The `REFS` section's sub-header length (`fwd_edge_count` +
+/// `rev_edge_count`, each `u32`) — mirrors `reader::REFS_SUB_HEADER_LEN`,
+/// private to `sem-core`. Duplicated here for the same reason
+/// `corrupt_posting_for_file` duplicates `TRIGRAM`'s row layout: a probe
+/// corrupting raw bytes has to know the wire format, and `format::refs`
+/// deliberately stays dependency-free (`pack`/`target_of`/`kind_of` only —
+/// no row/offset helpers), so this constant is the layout knowledge a real
+/// reader never needs past `reader.rs` itself.
+const REFS_SUB_HEADER_LEN: usize = 8;
+
+/// Flips one forward-CSR posting's target entity, keeping its packed
+/// `ref_type` bits intact (`format::refs::pack`) — semx-o0x's negative for
+/// `REFS_ORACLE`: proof the now-O(n) [`refs_check`] still catches a
+/// corrupted posting exhaustively, the same "wrong answer, not a wrong byte
+/// nobody would notice" shape `corrupt_posting_for_file` proves for
+/// `TRIGRAM`. Picks the first entity with a non-empty forward row and
+/// rewrites its first posting to point at a different (but still in-range)
+/// entity.
+fn corrupt_refs_posting(bytes: &[u8]) -> Option<Vec<u8>> {
+    use sem_core::index::format::{self, SEC_REFS};
+    let header = format::Header::read(bytes, u64::from_le_bytes(bytes[16..24].try_into().ok()?))?;
+    let section_ref = header.sections[SEC_REFS];
+    if section_ref.is_absent() {
+        return None;
+    }
+    let section =
+        &bytes[section_ref.offset as usize..(section_ref.offset + section_ref.len) as usize];
+    let n = header.entity_count as usize;
+    if n < 2 {
+        return None; // no distinct replacement target exists
+    }
+    let fwd_offsets_at = REFS_SUB_HEADER_LEN;
+    let fwd_targets_at = fwd_offsets_at + (n + 1) * 4;
+
+    let at = (0..n).find(|&at| {
+        let lo = format::u32_at(section, fwd_offsets_at + at * 4).unwrap_or(0);
+        let hi = format::u32_at(section, fwd_offsets_at + (at + 1) * 4).unwrap_or(0);
+        hi > lo
+    })?;
+    let slot = format::u32_at(section, fwd_offsets_at + at * 4)? as usize;
+
+    let packed = format::u32_at(section, fwd_targets_at + slot * 4)?;
+    let target = format::refs::target_of(packed);
+    let kind = format::refs::kind_of(packed);
+    let replacement = (target + 1) % n as u32;
+    let mutated_packed = format::refs::pack(replacement, kind);
+
+    let mut mutated = bytes.to_vec();
+    let target_off = section_ref.offset as usize + fwd_targets_at + slot * 4;
+    mutated[target_off..target_off + 4].copy_from_slice(&mutated_packed.to_le_bytes());
+    Some(mutated)
+}
+
+/// semx-o0x negative: corrupt one `REFS` posting and confirm the (now O(n))
+/// `refs_check` still screams — proof the complexity fix didn't trade away
+/// exhaustiveness. Mirrors `mutation_test`'s TRIGRAM proof shape: mutate,
+/// rebuild a `QueryIndex` over the corrupted bytes, run the exact check the
+/// gate runs, and require a mismatch.
+fn refs_mutation_test(graph: &EntityGraph, bytes: &[u8]) {
+    let started = Instant::now();
+    let Some(mutated) = corrupt_refs_posting(bytes) else {
+        println!("REFS_MUTATION skipped=no_refs_row_to_corrupt");
+        return;
+    };
+    let Some(corrupt_index) = QueryIndex::from_bytes(mutated) else {
+        // A corrupt posting that instead broke section soundness enough to
+        // fail `open` is caught even earlier than the oracle — also a pass.
+        println!("REFS_MUTATION verdict=PASS caught_at=open");
+        return;
+    };
+    let stats = refs_check(graph, &corrupt_index);
+    let caught = stats.mismatched != 0 || stats.kind_mismatched != 0;
+    println!(
+        "REFS_MUTATION ms={:.1} mismatched={} kind_mismatched={} verdict={}",
+        ms(started),
+        stats.mismatched,
+        stats.kind_mismatched,
+        if caught { "PASS" } else { "FAIL" }
+    );
+    if !caught {
+        std::process::exit(1);
+    }
 }
 
 fn grep_mode(index_path: &Path, root: &Path, pattern: &str, entered: Instant) {

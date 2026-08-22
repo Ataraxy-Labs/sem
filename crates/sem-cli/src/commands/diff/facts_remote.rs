@@ -71,7 +71,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::facts_store::{RemoteFact, FACTS_SCHEMA_VERSION};
+use sem_core::parser::facts_store::{effective_language_salt, RemoteFact, FACTS_SCHEMA_VERSION};
 use sem_core::parser::incremental::{content_hash, FileFacts};
 use sem_core::parser::plugins::code::languages::get_language_config;
 use sem_core::parser::registry::ParserRegistry;
@@ -121,98 +121,20 @@ pub(crate) struct PutFactsResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Key derivation — mirrors sem-core's LANGUAGE_SALTS table verbatim
+// Key derivation
 // ---------------------------------------------------------------------------
-
-/// Mirrors `sem-core/src/parser/facts_store.rs::LANGUAGE_SALTS` verbatim,
-/// per semx-2o8's cloud-tier handoff comment (point 3: "either mirror
-/// LANGUAGE_SALTS ... or take it verbatim from the uploading client" — this
-/// client mirrors it, so its own keys agree with what a future sem-core
-/// corpus-ingest API would compute for the same file). Hand-bump discipline:
-/// whoever bumps a grammar dependency in sem-core's Cargo.toml (or changes a
-/// hand-rolled plugin's extraction shape) must bump both tables. Drift here
-/// is always safe, never wrong: it can only produce a false miss against
-/// another client's keys, never a wrong hit (the cloud service treats
-/// `language_salt` as opaque and never validates it — see
-/// FACTS-SERVICE.md's "Key" section).
-const LANGUAGE_SALTS: &[(&str, &str)] = &[
-    ("typescript", "ts-0.23-u16"),
-    ("tsx", "ts-0.23-u16"),
-    ("javascript", "ts-0.23-u16"),
-    ("python", "ts-0.23"),
-    ("go", "ts-0.23"),
-    ("rust", "ts-0.23"),
-    ("java", "ts-0.23"),
-    ("c", "ts-0.23"),
-    ("cpp", "ts-0.23-mp1"),
-    ("ruby", "ts-0.23"),
-    ("csharp", "ts-0.23-mp1"),
-    ("php", "ts-0.23"),
-    ("fortran", "ts-0.5"),
-    ("swift", "ts-0.7"),
-    ("elixir", "ts-0.3"),
-    ("bash", "ts-0.23"),
-    ("hcl", "ts-1.1"),
-    ("kotlin", "ts-1.1"),
-    ("xml", "ts-0.7"),
-    ("dart", "ts-0.2.0"),
-    ("perl", "ts-1.1"),
-    ("sql", "ts-0.3"),
-    ("ocaml", "ts-0.24"),
-    ("ocaml_interface", "ts-0.24"),
-    ("scala", "ts-0.26"),
-    ("zig", "ts-1.1.2"),
-    ("nix", "ts-0.3"),
-    ("haskell", "ts-0.23"),
-    ("elm", "ts-5.9"),
-    ("edn", "ts-0.2.5"),
-    ("clojure", "ts-0.2.5"),
-    ("d", "ts-0.8.2"),
-    ("lua", "ts-0.5.0"),
-    ("fish", "ts-3.6"),
-    ("svelte", "ts-0.1.7"),
-    ("erb", "ts-0.25"),
-    ("toml", "handrolled-1"),
-    ("csv", "handrolled-1"),
-    ("json", "handrolled-1"),
-    ("yaml", "handrolled-1"),
-    ("markdown", "handrolled-1"),
-    ("latex", "handrolled-1"),
-    ("vue", "handrolled-1"),
-    ("fallback", "handrolled-1"),
-];
-const DEFAULT_LANGUAGE_SALT: &str = "unmapped-1";
-
-fn language_salt(lang_id: &str) -> &'static str {
-    LANGUAGE_SALTS
-        .iter()
-        .find(|(id, _)| *id == lang_id)
-        .map(|(_, salt)| *salt)
-        .unwrap_or(DEFAULT_LANGUAGE_SALT)
-}
-
-/// Mirrors `facts_store::producer_language_salt`: MUL phase 1's C# precompute
-/// is a run-time producer switch, so the salt has to follow it in both
-/// directions. The switch itself is sem-core's, not a second copy.
-fn producer_language_salt(lang_id: &str) -> &'static str {
-    if lang_id == "csharp" && !sem_core::parser::scope_resolve::mul_precompute_admits("csharp") {
-        return "ts-0.23";
-    }
-    language_salt(lang_id)
-}
-
-/// Must stay byte-identical to `sem_core::parser::facts_store`'s
-/// `effective_language_salt`, which the server-side ingest validates against.
-/// The suffix and the MUL-phase-1 producer switch are both read from sem-core
-/// rather than recomputed here, so only the (already-duplicated)
-/// `LANGUAGE_SALTS` table can drift.
-fn effective_language_salt(lang_id: &str) -> String {
-    let base = producer_language_salt(lang_id);
-    match sem_core::parser::fast_extractor::identity_salt() {
-        Some(identity) => format!("{base}+{identity}"),
-        None => base.to_string(),
-    }
-}
+//
+// semx-0lj: this used to hand-mirror `sem-core/src/parser/facts_store.rs`'s
+// `LANGUAGE_SALTS` table and its `language_salt`/`producer_language_salt`/
+// `effective_language_salt` functions verbatim (per semx-2o8's cloud-tier
+// handoff comment, which offered mirroring or taking the salt verbatim from
+// the uploading client). That duplication had no real justification: unlike
+// `examples/facts_corpus_probe.rs` (which deliberately simulates an
+// independent external client for the `ingest_remote` wire-protocol test),
+// this crate already depends on `sem-core` via a path dependency, version-
+// locked to the exact same build — there is no wire boundary between them to
+// simulate. `effective_language_salt` is now consumed directly, so there is
+// exactly one hand-maintained `LANGUAGE_SALTS` table in the whole workspace.
 
 /// Same detection sem-core's own (crate-private) `facts_store::detect_language_id`
 /// uses, built from the same PUBLIC primitives

@@ -38,6 +38,7 @@
 //!
 //! Environment is read once, on first use.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -298,32 +299,81 @@ impl<T: Clone> Shard<T> {
 type EntityShards = [Mutex<Shard<Arc<Vec<SemanticEntity>>>>; SHARDS];
 type StructuralShards = [Mutex<Shard<Arc<str>>>; SHARDS];
 
-fn entity_shards() -> &'static EntityShards {
-    static SHARDS_TABLE: OnceLock<EntityShards> = OnceLock::new();
-    SHARDS_TABLE.get_or_init(|| {
-        let budget = config().capacity_bytes / SHARDS;
-        std::array::from_fn(|_| Mutex::new(Shard::new(budget.max(1))))
-    })
+/// Everything the cache owns: the two sharded stores and the hit/miss
+/// counters. Production runs one process-global instance ([`global`]); tests
+/// can bind a private one to their thread ([`install_test_instance`]) so
+/// concurrently running tests cannot evict each other's entries or move each
+/// other's counters.
+struct Cache {
+    entities: EntityShards,
+    structural: StructuralShards,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    disk_hits: AtomicU64,
+    disk_writes: AtomicU64,
 }
 
-fn structural_shards() -> &'static StructuralShards {
-    static SHARDS_TABLE: OnceLock<StructuralShards> = OnceLock::new();
-    SHARDS_TABLE.get_or_init(|| {
+impl Cache {
+    fn new() -> Self {
+        let entity_budget = config().capacity_bytes / SHARDS;
         // Structural hashes are tiny; a small slice of the budget is plenty.
-        let budget = (config().capacity_bytes / 64 / SHARDS).max(64 * 1024);
-        std::array::from_fn(|_| Mutex::new(Shard::new(budget)))
-    })
+        let structural_budget = (config().capacity_bytes / 64 / SHARDS).max(64 * 1024);
+        Self {
+            entities: std::array::from_fn(|_| Mutex::new(Shard::new(entity_budget.max(1)))),
+            structural: std::array::from_fn(|_| Mutex::new(Shard::new(structural_budget))),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            disk_hits: AtomicU64::new(0),
+            disk_writes: AtomicU64::new(0),
+        }
+    }
+
+    fn entity_shard(&self, key: u128) -> &Mutex<Shard<Arc<Vec<SemanticEntity>>>> {
+        &self.entities[shard_index(key)]
+    }
+
+    fn structural_shard(&self, key: u128) -> &Mutex<Shard<Arc<str>>> {
+        &self.structural[shard_index(key)]
+    }
+}
+
+fn global() -> &'static Cache {
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    CACHE.get_or_init(Cache::new)
+}
+
+thread_local! {
+    /// The calling thread's private [`Cache`], installed by
+    /// [`install_test_instance`]. Leaked, so reads are a pointer copy.
+    static INSTANCE: Cell<Option<&'static Cache>> = const { Cell::new(None) };
+}
+
+/// Run `f` against the cache this thread is bound to: the process-global
+/// instance, or the private one from [`install_test_instance`] when installed.
+fn with<R>(f: impl FnOnce(&Cache) -> R) -> R {
+    match INSTANCE.with(Cell::get) {
+        Some(cache) => f(cache),
+        None => f(global()),
+    }
+}
+
+/// Test support: give the calling thread its own private cache instance.
+///
+/// Every entry point of this module routes through the thread's bound
+/// instance, so a test that calls this sees its own entries and counters
+/// alone: siblings sharing the global instance can neither evict its entries
+/// nor inflate its counts. Production never calls this and keeps the single
+/// process-global instance.
+#[doc(hidden)]
+pub fn install_test_instance() {
+    let leaked: &'static Cache = Box::leak(Box::new(Cache::new()));
+    INSTANCE.with(|slot| slot.set(Some(leaked)));
 }
 
 #[inline]
 fn shard_index(key: u128) -> usize {
     (key >> 120) as usize % SHARDS
 }
-
-static HITS: AtomicU64 = AtomicU64::new(0);
-static MISSES: AtomicU64 = AtomicU64::new(0);
-static DISK_HITS: AtomicU64 = AtomicU64::new(0);
-static DISK_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// A snapshot of cache counters and occupancy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -343,27 +393,29 @@ pub struct CacheStats {
 
 /// Snapshot the cache counters. Cheap; intended for tests and diagnostics.
 pub fn stats() -> CacheStats {
-    let cfg = config();
-    let mut entries = 0;
-    let mut bytes = 0;
-    if cfg.enabled {
-        for shard in entity_shards().iter() {
-            let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-            entries += shard.len();
-            bytes += shard.bytes();
+    with(|cache| {
+        let cfg = config();
+        let mut entries = 0;
+        let mut bytes = 0;
+        if cfg.enabled {
+            for shard in cache.entities.iter() {
+                let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+                entries += shard.len();
+                bytes += shard.bytes();
+            }
         }
-    }
-    CacheStats {
-        enabled: cfg.enabled,
-        disk_enabled: cfg.disk_dir.is_some(),
-        hits: HITS.load(Ordering::Relaxed),
-        misses: MISSES.load(Ordering::Relaxed),
-        disk_hits: DISK_HITS.load(Ordering::Relaxed),
-        disk_writes: DISK_WRITES.load(Ordering::Relaxed),
-        entries,
-        bytes,
-        capacity_bytes: cfg.capacity_bytes,
-    }
+        CacheStats {
+            enabled: cfg.enabled,
+            disk_enabled: cfg.disk_dir.is_some(),
+            hits: cache.hits.load(Ordering::Relaxed),
+            misses: cache.misses.load(Ordering::Relaxed),
+            disk_hits: cache.disk_hits.load(Ordering::Relaxed),
+            disk_writes: cache.disk_writes.load(Ordering::Relaxed),
+            entries,
+            bytes,
+            capacity_bytes: cfg.capacity_bytes,
+        }
+    })
 }
 
 /// Drop every in-process entry. Does not touch the on-disk tier.
@@ -371,20 +423,24 @@ pub fn clear() {
     if !config().enabled {
         return;
     }
-    for shard in entity_shards().iter() {
-        shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-    for shard in structural_shards().iter() {
-        shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
+    with(|cache| {
+        for shard in cache.entities.iter() {
+            shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        for shard in cache.structural.iter() {
+            shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    });
 }
 
 /// Zero the hit/miss counters. Intended for benchmarks and tests.
 pub fn reset_stats() {
-    HITS.store(0, Ordering::Relaxed);
-    MISSES.store(0, Ordering::Relaxed);
-    DISK_HITS.store(0, Ordering::Relaxed);
-    DISK_WRITES.store(0, Ordering::Relaxed);
+    with(|cache| {
+        cache.hits.store(0, Ordering::Relaxed);
+        cache.misses.store(0, Ordering::Relaxed);
+        cache.disk_hits.store(0, Ordering::Relaxed);
+        cache.disk_writes.store(0, Ordering::Relaxed);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +458,7 @@ fn disk_load(dir: &Path, key: u128) -> Option<Vec<SemanticEntity>> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn disk_store(dir: &Path, key: u128, entities: &[SemanticEntity]) {
+fn disk_store(cache: &Cache, dir: &Path, key: u128, entities: &[SemanticEntity]) {
     let path = disk_path(dir, key);
     let Some(parent) = path.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
@@ -421,7 +477,7 @@ fn disk_store(dir: &Path, key: u128, entities: &[SemanticEntity]) {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-        DISK_WRITES.fetch_add(1, Ordering::Relaxed);
+        cache.disk_writes.fetch_add(1, Ordering::Relaxed);
     } else {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -453,39 +509,41 @@ where
         return extract();
     }
 
-    let key = key_for(plugin_id, file_path, content);
-    let shard = &entity_shards()[shard_index(key)];
+    with(|cache| {
+        let key = key_for(plugin_id, file_path, content);
+        let shard = cache.entity_shard(key);
 
-    if let Some(hit) = shard.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
-        HITS.fetch_add(1, Ordering::Relaxed);
-        return (*hit).clone();
-    }
-
-    if let Some(dir) = cfg.disk_dir.as_deref() {
-        if let Some(entities) = disk_load(dir, key) {
-            DISK_HITS.fetch_add(1, Ordering::Relaxed);
-            HITS.fetch_add(1, Ordering::Relaxed);
-            let bytes = entities_bytes(&entities);
-            let arc = Arc::new(entities);
-            shard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, Arc::clone(&arc), bytes);
-            return (*arc).clone();
+        if let Some(hit) = shard.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            return (*hit).clone();
         }
-    }
 
-    MISSES.fetch_add(1, Ordering::Relaxed);
-    let entities = extract();
-    let bytes = entities_bytes(&entities);
-    if let Some(dir) = cfg.disk_dir.as_deref() {
-        disk_store(dir, key, &entities);
-    }
-    shard
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, Arc::new(entities.clone()), bytes);
-    entities
+        if let Some(dir) = cfg.disk_dir.as_deref() {
+            if let Some(entities) = disk_load(dir, key) {
+                cache.disk_hits.fetch_add(1, Ordering::Relaxed);
+                cache.hits.fetch_add(1, Ordering::Relaxed);
+                let bytes = entities_bytes(&entities);
+                let arc = Arc::new(entities);
+                shard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, Arc::clone(&arc), bytes);
+                return (*arc).clone();
+            }
+        }
+
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+        let entities = extract();
+        let bytes = entities_bytes(&entities);
+        if let Some(dir) = cfg.disk_dir.as_deref() {
+            disk_store(cache, dir, key, &entities);
+        }
+        shard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::new(entities.clone()), bytes);
+        entities
+    })
 }
 
 /// Cached wrapper for `SemanticParserPlugin::structural_hash_content`, which
@@ -504,33 +562,35 @@ where
         return compute();
     }
 
-    let key = structural_key_for(plugin_id, file_path, content);
-    let shard = &structural_shards()[shard_index(key)];
+    with(|cache| {
+        let key = structural_key_for(plugin_id, file_path, content);
+        let shard = cache.structural_shard(key);
 
-    if let Some(hit) = shard.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
-        HITS.fetch_add(1, Ordering::Relaxed);
-        // An empty marker means "the plugin returned None"; an empty *hash* is
-        // a real result and is stored as "\0".
-        return match &*hit {
-            "" => None,
-            "\0" => Some(String::new()),
-            s => Some(s.to_string()),
+        if let Some(hit) = shard.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            // An empty marker means "the plugin returned None"; an empty *hash* is
+            // a real result and is stored as "\0".
+            return match &*hit {
+                "" => None,
+                "\0" => Some(String::new()),
+                s => Some(s.to_string()),
+            };
+        }
+
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+        let computed = compute();
+        let stored: Arc<str> = match computed.as_deref() {
+            None => Arc::from(""),
+            Some("") => Arc::from("\0"),
+            Some(s) => Arc::from(s),
         };
-    }
-
-    MISSES.fetch_add(1, Ordering::Relaxed);
-    let computed = compute();
-    let stored: Arc<str> = match computed.as_deref() {
-        None => Arc::from(""),
-        Some("") => Arc::from("\0"),
-        Some(s) => Arc::from(s),
-    };
-    let bytes = 32 + stored.len() + 16;
-    shard
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, stored, bytes);
-    computed
+        let bytes = 32 + stored.len() + 16;
+        shard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, stored, bytes);
+        computed
+    })
 }
 
 #[cfg(test)]
@@ -644,7 +704,7 @@ mod tests {
         let entities = vec![entity("disk_a"), entity("disk_b")];
 
         assert!(disk_load(dir.path(), key).is_none(), "cold dir must miss");
-        disk_store(dir.path(), key, &entities);
+        disk_store(&Cache::new(), dir.path(), key, &entities);
 
         let loaded = disk_load(dir.path(), key).expect("stored entry must load");
         assert_eq!(loaded.len(), 2);

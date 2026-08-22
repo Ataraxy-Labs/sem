@@ -6,7 +6,7 @@ use crate::model::entity::{
     SemanticEntity,
 };
 use crate::utils::hash::{content_hash, structural_and_semantic_hash};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub fn extract_entities(
     tree: &Tree,
@@ -223,7 +223,7 @@ fn attach_go_package_metadata(root: Node, source: &[u8], entities: &mut [Semanti
     for entity in entities {
         entity
             .metadata
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(BTreeMap::new)
             .insert("go.package".to_string(), package_name.clone());
     }
 }
@@ -930,7 +930,7 @@ fn emit_js_ts_re_export_entities(
                 }
 
                 let content = node_text(node, source).to_string();
-                let mut metadata = HashMap::new();
+                let mut metadata = BTreeMap::new();
                 metadata.insert("export.source".to_string(), source_path.to_string());
                 if !original.is_empty() {
                     metadata.insert("export.original".to_string(), original);

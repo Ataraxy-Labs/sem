@@ -15,8 +15,6 @@ use std::path::Path;
 use sem_core::git::bridge::GitBridge;
 use sem_core::parser::differ::DiffResult;
 
-use super::DiffOptions;
-
 /// `true` when the relations payload has nothing to report — either no
 /// callers/callees were found, or the budgeted pass timed out (in which case
 /// [`build_changed_entity_relations`] has already printed the degradation
@@ -39,7 +37,8 @@ pub(super) fn relations_is_empty(relations: &serde_json::Value) -> bool {
 /// and the degradation is reported on stderr rather than silently stalling the
 /// command after its output has already been printed.
 pub(super) fn build_changed_entity_relations(
-    opts: &DiffOptions,
+    cwd: &str,
+    file_exts: &[String],
     result: &DiffResult,
     budget_override_ms: Option<u64>,
 ) -> serde_json::Value {
@@ -48,8 +47,8 @@ pub(super) fn build_changed_entity_relations(
     // Own every input so the work can run on a detached thread: the budget is
     // only enforceable if we can stop waiting on a pass we cannot interrupt.
     let input = RelationsInput {
-        cwd: opts.cwd.clone(),
-        file_exts: opts.file_exts.clone(),
+        cwd: cwd.to_string(),
+        file_exts: file_exts.to_vec(),
         changed: result
             .changes
             .iter()
@@ -73,7 +72,7 @@ pub(super) fn build_changed_entity_relations(
         return empty();
     }
 
-    let (budget, source) = relations_time_budget(&opts.cwd, budget_override_ms);
+    let (budget, source) = relations_time_budget(cwd, budget_override_ms);
     match rx.recv_timeout(budget) {
         Ok(Some(relations)) => relations,
         Ok(None) => empty(),

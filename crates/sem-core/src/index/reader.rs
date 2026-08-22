@@ -5,9 +5,27 @@
 //! cost of a query is the cost of the pages the answer touches — which is the
 //! answer-cost invariant expressed in the type rather than in a comment.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use super::format::{self, *};
+
+/// Normalizes a caller-supplied path/prefix key to the form `FILES` always
+/// stores it in — repo-relative, forward-slash-separated (every writer call
+/// site normalizes before an entry ever reaches this image; see
+/// `crate::index::writer`). The key-comparing reader methods
+/// (`files_under`, `entities_in_file`, `file_fingerprint`) route through
+/// this so a caller that hands over an OS-native (backslash) path — which
+/// happens on Windows whenever a `Path::to_string_lossy()` result reaches
+/// this API without its own separator conversion — still gets a correct
+/// match instead of a silent miss (semx-q344).
+fn normalize_index_key(key: &str) -> Cow<'_, str> {
+    if key.contains('\\') {
+        Cow::Owned(key.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(key)
+    }
+}
 
 /// Byte length of the `REFS` section's sub-header (`fwd_edge_count` +
 /// `rev_edge_count`, each `u32`). See `writer::build_refs_section`.
@@ -241,6 +259,7 @@ impl QueryIndex {
     /// with for a name that exists only in a brand-new file. Callers that
     /// need corpus-wide membership freshness must not use this path.
     pub fn files_under(&self, prefix: &str) -> Vec<&str> {
+        let prefix = normalize_index_key(prefix);
         let files = self.section(SEC_FILES);
         let count = self.header.file_count as usize;
         if prefix.is_empty() {
@@ -411,6 +430,7 @@ impl QueryIndex {
     /// Entities of one file, as a slice of the entity table — no search, by
     /// construction (`FileRec.entity_lo..entity_hi`, §3.2).
     pub fn entities_in_file(&self, path: &str) -> Vec<Entity<'_>> {
+        let path = normalize_index_key(path);
         let files = self.section(SEC_FILES);
         let count = self.header.file_count as usize;
         let key = path.as_bytes();
@@ -434,6 +454,7 @@ impl QueryIndex {
     /// falling through to content-hash comparison only on a difference,
     /// exactly as `shared_cache::file_freshness` does for the build plane.
     pub fn file_fingerprint(&self, path: &str) -> Option<super::writer::FileFingerprint> {
+        let path = normalize_index_key(path);
         let files = self.section(SEC_FILES);
         let count = self.header.file_count as usize;
         let key = path.as_bytes();
@@ -443,7 +464,7 @@ impl QueryIndex {
         }
         let rec = &files[at * FILE_REC_LEN..(at + 1) * FILE_REC_LEN];
         Some(super::writer::FileFingerprint {
-            path: path.to_string(),
+            path: path.into_owned(),
             mtime_secs: format::file::mtime_secs(rec)?,
             mtime_nanos: format::file::mtime_nanos(rec)?,
             content_hash: format::file::content_hash(rec)?,

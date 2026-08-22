@@ -2646,3 +2646,116 @@ GB per repo unwritten — with `index.sem` byte-size identical on all five and
 sha256-identical on rails and tiptap. Full numbers, the mechanism comparison,
 the dirty-rebuild trade and the residuals: RESOLUTION-PROFILE.md "W4.5: the
 conditional write".
+
+### 15.8 semx-r94 resolved: one `DiskCache`, in `sem-core`
+
+§15.3's disclosed finding — `sem-cli`'s `build_cache.rs` and `sem-mcp`'s
+`cache.rs` each hand-rolling their own `struct DiskCache` over the identical
+`cache.db` schema — stood unaddressed through 15.4-15.7. This bead closed it.
+
+**Divergence inventory.** Function-by-function comparison of the two copies
+at the sha this bead started from found:
+
+- **`entity_flags` gap (real, production).** `sem-cli`'s `DiskCache::save`
+  was `#[cfg(test)]`-only, delegating to `save_with_test_dirs` (which always
+  wrote `entity_flags`). `sem-mcp`'s own `save` — called in production by
+  `server.rs`'s `get_or_build_graph` — never called the test-classification
+  write at all. A `cache.db` last written by `sem mcp` had a permanently
+  empty `entity_flags`, silently breaking `sem impact --tests`/`--all`'s
+  "covered by N tests" answer for any CLI invocation that later hit that same
+  cache (the two consumers share one `cache.db` per repo, cross-load-tested
+  by this file's own `cli_and_mcp_caches_share_manifest_entries`). `sem-cli`
+  wins; the unified `save()` now always routes through
+  `save_with_test_dirs(&[])`.
+- **Single-corpus-read fusion (real, perf, one-sided).** `sem-cli`'s
+  `save_with_test_dirs`/`save_topology` read every file's bytes once
+  (`CorpusColumns::read`, semx-3tb / commit 53e3b09) and derived `files`'
+  fingerprint, `file_imports`' resolution and `index.sem`'s trigrams from
+  that one read. `sem-mcp`'s `save` still paid 2-3 separate reads: a serial
+  `file_fingerprint` per file, plus `refresh_file_import_entries`'s own
+  parallel read of the same bytes. `sem-cli` wins on mechanism; the unified
+  `DiskCache::save_with_test_dirs_precomputed`/`save_topology_precomputed`
+  take an optional `FileCacheColumns` slice — `sem-cli`'s wrapper (now in
+  `build_cache.rs`'s `save_full_with_index`/`save_topology_with_index`)
+  projects its own `CorpusColumns` read into it (no second read, same as
+  before), and the `None` path (`sem-mcp`, and every bare `save()`/
+  `save_topology()` caller) performs the same fused read internally via the
+  new `read_file_cache_columns`, closing the gap instead of leaving it.
+- **O(1) import-candidate membership (already shared, not actually
+  divergent).** Recorded here because the bead's brief named it: semx-ccg's
+  fix lives in `refresh_file_import_entries` itself, which was already part
+  of the "shared substrate" both copies compiled against (`sem_mcp::cache`)
+  before this bead — not duplicated. No action needed; verified by reading
+  the function, not assumed.
+- **`has_fresh_*` gates (composition, not behavior).** `sem-cli` factored
+  freshness checks into four reusable private methods; `sem-mcp` inlined the
+  same logic twice (once in `load_with_source_scope`, once in
+  `load_graph_topology_with_source_scope`). Same observable behavior, `sem-
+  cli`'s factoring wins; the unified struct uses it.
+- **`index_commits`/`entity_changes_for` (additive, no conflict).**
+  `sem-mcp`-only (the semantic commit index); `sem-cli`'s copy had no
+  equivalent. Both crates' `EntityChanges`/`GitBridge`/`compute_semantic_diff`
+  dependencies are already `sem_core` types, so this carried into the unified
+  struct with zero new coupling — `sem-cli` simply never calls it.
+- **`save_topology`/`load_graph_topology_with_test_ids*` (additive, no
+  conflict).** `sem-cli`-only (large-repo `sem impact`'s topology-only tier);
+  `sem-mcp` had no equivalent and never will (it always needs entity bodies).
+  Carried into the unified struct; `sem-mcp` never calls it.
+- **`store_repo_origin` error handling (real, small, `sem-cli` wins).**
+  `sem-cli`'s save methods swallowed `set_cache_repo_root`'s error (`let _ =
+  ...`); `sem-mcp`'s propagated it (`?`), which would fail an otherwise-
+  successful save over a failure to write `sem repos`' best-effort labeling
+  metadata. The unified struct swallows it, `sem-cli`-style.
+- **`PartialCache` / the `DiskCache` struct shape itself.** Byte-identical
+  field lists in both copies; no divergence, just the duplicate declaration
+  semx-r94 exists to delete.
+
+**Ownership: `sem-core`, not `sem-mcp`.** The pre-existing "shared substrate"
+(schema, freshness, manifest handling, content store) already lived in
+`sem-mcp/src/cache.rs`, with `sem-cli` importing it as `sem_mcp::cache as
+shared_cache` — an accident of which crate got to `cache.rs` first, not a
+real dependency: every symbol in it touches only `sem_core` types
+(`EntityGraph`, `SemanticEntity`, `GitBridge`, `compute_semantic_diff`,
+`ParserRegistry`). `sem-cli` depends on both `sem-core` and `sem-mcp`;
+`sem-mcp` depends on `sem-core` only (a binary crate must never be a
+dependency of the library/server crate). `sem-core` is the only crate both
+already depend on. Moved to `sem_core::persist::disk_cache`, behind a new
+`disk-cache` feature (`rusqlite`'s `bundled` feature is a C dependency, kept
+optional the same way `git`/`mmap` already are, so `wasm` keeps building
+without it).
+
+The one design decision this forced: `index.sem` writing (`write_query_index`
+et al.) used to live *inside* `sem-cli`'s copy of `save_with_test_dirs`/
+`save_topology`, sharing their corpus read. `sem-mcp` never writes
+`index.sem`. A verbatim move would have made the shared `DiskCache` need
+`index.sem` machinery `sem-mcp` has no business depending on
+(`Needs(DiskCache) ⊋ declared(DiskCache)`). Fixed by decoupling: the unified
+save methods return the test-entity-id classification instead of consuming
+it internally, and `sem-cli`'s `build_cache.rs` (now genuinely thin) keeps
+`write_query_index` plus three small wrappers
+(`save_full_with_index`/`save_topology_with_index`/
+`save_incremental_with_index`) that call the SQL-only save and then write the
+index from the same read — preserving semx-3tb's fusion for `sem-cli`
+exactly, with nothing `sem-mcp`-facing added.
+
+**Compatibility proof.** A `cache.db` built by the pre-unification `sem`
+binary (HEAD 9393625) loads byte-for-byte identically (`load_with_source_
+scope`/`load_graph_topology`/`load_partial`, entity/edge sets compared
+sorted) through the post-unification binary. See the worked proof recorded
+against this sha for the exact repo/commands.
+
+**Tests.** Both crates' existing cache test modules run unchanged (mechanical
+adaptation only: `cache.conn` → the new `DiskCache::connection()` accessor,
+since the struct's private field is no longer in the same module as tests
+that used to reach into it directly — `sem-core`'s `disk_cache.rs` adds a
+small module of its own covering the three reconciled divergences above:
+`entity_flags` always gets marked computed by bare `save()`, the precomputed
+and internal-fusion code paths produce identical loadable results, and a save
+still commits even though the repo-root stamp is best-effort). The
+`sem-mcp`↔`sem-cli` cross-load tests in `sem-cli`'s test module now exercise
+one implementation reading its own output rather than two independent ones —
+expected, since eliminating that distinction is the point of this bead, not
+a loss of coverage.
+
+**Net LOC and gates:** see the close-out comment on this bead's tracker
+(`br comments`) for the measured numbers at this sha.

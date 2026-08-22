@@ -342,6 +342,80 @@ mod tests {
         assert_eq!(index.files_under("src/"), vec!["src/a.ts"]);
     }
 
+    // semx-q344: `FILES` always stores repo-relative paths with forward
+    // slashes (every writer call site normalizes before it ever reaches this
+    // image — `sem-cli`'s `file_path_for_entity`, `sem-mcp`'s `path_to_slash`).
+    // But the reader methods that key off a caller-supplied path string
+    // (`files_under`, `entities_in_file`, `file_fingerprint`) do a raw byte
+    // comparison against that key with no normalization of their own — they
+    // trust every caller, present and future, to remember the same
+    // discipline. A caller that instead hands over an OS-native (backslash)
+    // path — which is exactly what happens on Windows if a `to_string_lossy()`
+    // result reaches this API without its own `.replace('\\', "/")`, a
+    // mistake this same audit found live in `sem-mcp`'s directory reroute —
+    // gets a silent empty/`None` answer instead of a match. These are
+    // literal-string injections (no OS path semantics involved), so they run
+    // identically on every host; the fix normalizes at the choke point so no
+    // caller has to get this right on its own.
+    #[test]
+    fn files_under_normalizes_a_backslash_prefix() {
+        let graph = graph_of(vec![entity(
+            "src/sub/a.ts::function::alpha",
+            "alpha",
+            "function",
+            "src/sub/a.ts",
+            1,
+        )]);
+        let index = round_trip(&graph);
+
+        assert_eq!(
+            index.files_under("src\\sub\\"),
+            vec!["src/sub/a.ts"],
+            "a backslash-separated prefix must match the same forward-slash-keyed \
+             FILES entries a forward-slash prefix already matches"
+        );
+    }
+
+    #[test]
+    fn entities_in_file_normalizes_a_backslash_path() {
+        let index = round_trip(&sample());
+        let rows = index.entities_in_file("a.ts");
+        assert!(!rows.is_empty(), "sanity: forward-slash lookup must still work");
+
+        let graph = graph_of(vec![entity(
+            "src\\sub/a.ts::function::alpha",
+            "alpha",
+            "function",
+            "src/sub/a.ts",
+            1,
+        )]);
+        let index = round_trip(&graph);
+        let rows = index.entities_in_file("src\\sub\\a.ts");
+        assert_eq!(
+            rows.iter().map(|e| e.name()).collect::<Vec<_>>(),
+            vec!["alpha"],
+            "a backslash-separated path must find the same entities the \
+             forward-slash-keyed path does"
+        );
+    }
+
+    #[test]
+    fn file_fingerprint_normalizes_a_backslash_path() {
+        let graph = graph_of(vec![entity(
+            "src/sub/a.ts::function::alpha",
+            "alpha",
+            "function",
+            "src/sub/a.ts",
+            1,
+        )]);
+        let index = round_trip(&graph);
+        assert!(
+            index.file_fingerprint("src\\sub\\a.ts").is_some(),
+            "a backslash-separated path must find the same fingerprint the \
+             forward-slash-keyed path does"
+        );
+    }
+
     #[test]
     fn ids_that_break_the_prefix_rule_fall_back_to_whole_ids() {
         // The JSON plugin emits `package.json::/name`, which does start with

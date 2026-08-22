@@ -1,6 +1,6 @@
 [package]
 name = "sem-mcp"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for entity-level semantic code intelligence. 6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context."
@@ -15,21 +15,18 @@ name = "sem-mcp"
 path = "src/main.rs"
 
 [dependencies]
-sem-core = { path = "../sem-core", version = "0.22.1" }
-sem-cloud-client = { path = "../sem-cloud-client", version = "0.22.1" }
+sem-core = { path = "../sem-core", version = "0.23.0", features = ["disk-cache"] }
+sem-cloud-client = { path = "../sem-cloud-client", version = "0.23.0" }
 git2 = "0.20"
 lru = "0.16"
 rmcp = { version = "1", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
-zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
 schemars = "1"
 ignore = "0.4"
 notify = "8"
-rayon = "1.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
@@ -39,6 +36,11 @@ ureq = { version = "2", features = ["json"] }
 [dev-dependencies]
 tempfile = "3.24.0"
 axum = "0.8"
+# The cache test module (src/cache.rs) asserts against raw `rusqlite` types
+# directly (schema/row-level checks predating semx-r94's DiskCache move to
+# sem-core); production code no longer touches `rusqlite` itself, so this is
+# dev-only now.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 default = []

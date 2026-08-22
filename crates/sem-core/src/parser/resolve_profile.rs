@@ -143,6 +143,107 @@ static SB_ENTITIES_SPANNED: AtomicU64 = AtomicU64::new(0);
 static SB_SCOPES_BUILT: AtomicU64 = AtomicU64::new(0);
 /// AST refs collected/cloned, summed.
 static SB_REFS_COLLECTED: AtomicU64 = AtomicU64::new(0);
+/// MUL Phase 2 (semx-mul, W2): files whose precomputed facts carried
+/// nonempty `import_stmts`, dispatched without a tree.
+static SB_PRECOMPUTED_IMPORT_FILES: AtomicU64 = AtomicU64::new(0);
+/// MUL Phase 2 (semx-mul, W2): total `import_stmts` descriptors dispatched
+/// from precomputed facts, summed across those files.
+static SB_PRECOMPUTED_IMPORT_DESCRIPTORS: AtomicU64 = AtomicU64::new(0);
+/// MUL Phase 2 (semx-mul, W5; MUL-DESIGN.md §4.3 Field 11): files whose
+/// precomputed facts carried nonempty `ctor_call_sites`, applied without a
+/// tree (`infer_constructor_param_types`, not `ScopeBuildAccum` — this scan
+/// runs once per build in its own pass-1b step, not per file inside pass 2's
+/// closure, so it is bumped directly rather than through
+/// [`merge_scope_build`]).
+static SB_PRECOMPUTED_CTOR_CALL_FILES: AtomicU64 = AtomicU64::new(0);
+/// MUL Phase 2 (semx-mul, W5): total `ctor_call_sites` descriptors applied
+/// from precomputed facts, summed across those files.
+static SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS: AtomicU64 = AtomicU64::new(0);
+
+/// MUL Phase 2 (semx-mul, W5; MUL-DESIGN.md §4.3 Field 11): record that one
+/// file's precomputed `ctor_call_sites` were applied without a tree.
+/// Engagement proof, not inference — called only when
+/// `infer_constructor_param_types` actually sourced a file's descriptors
+/// from `PrecomputedFileFacts` and that `Vec` was nonempty, mirroring
+/// `ScopeBuildAccum::precomputed_import_descriptors`'s discipline for Field
+/// 10.
+pub fn add_precomputed_ctor_call_engagement(files: u64, descriptors: u64) {
+    if !enabled() {
+        return;
+    }
+    SB_PRECOMPUTED_CTOR_CALL_FILES.fetch_add(files, Ordering::Relaxed);
+    SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS.fetch_add(descriptors, Ordering::Relaxed);
+}
+
+// ---- pass-2 diagnostic counters (entity scope-index lookups + type-directed
+// method resolution). Same zero-cost-when-off contract as everything above;
+// like the phase timers they are on at `SEM_PROFILE_RESOLVE=1` *and* `=2`,
+// and their call sites decide any extra gating themselves.
+//
+// The scope-index pair exists because the JS/TS precomputed path clones its
+// scope maps from `PrecomputedFileFacts`, and nothing observed whether the
+// clone actually contains every entity the ref loop then asks about: an
+// entity missing from both maps silently resolves against scope 0 (module),
+// which is either correct (a genuine module-level entity) or a silent
+// misattribution. Counted only for precomputed files so the denominator stays
+// the population the question is about.
+
+/// Entity scope-index lookups in pass 2's per-entity loop, summed across files
+/// whose scopes were cloned from `PrecomputedFileFacts`. Every entity in such
+/// a file bumps this once, hit or miss.
+static ENTITY_SCOPE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+/// Of [`ENTITY_SCOPE_LOOKUPS`], how many missed **both**
+/// `entity_inner_scope` and `entity_scope_map` and took the `unwrap_or(0)`
+/// default. A hit on scope 0 itself does not count — only the miss path.
+static ENTITY_SCOPE_LOOKUP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one entity scope-index lookup from a precomputed-facts file.
+/// `fell_back_to_scope_zero` is `true` exactly when both map lookups missed
+/// and resolution defaulted the entity into scope 0.
+pub fn add_entity_scope_lookup(fell_back_to_scope_zero: bool) {
+    if !enabled() {
+        return;
+    }
+    ENTITY_SCOPE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    if fell_back_to_scope_zero {
+        ENTITY_SCOPE_LOOKUP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ---- resolve_ref's type-directed MethodCall path (`receiver.method()` ->
+// look up the receiver's type via `lookup_type_before_class_scope`, then match
+// `method` in that type's `class_members`). Attempt/success split answers "how
+// much of type tracking is even attempted, and how often does it land" —
+// neither of which the wall-time buckets can express.
+
+/// MethodCall references where the receiver was a plain identifier handed to
+/// `lookup_type_before_class_scope` (the type-directed attempt), summed.
+static RESOLVE_REF_TYPE_DIRECTED_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+/// Of [`RESOLVE_REF_TYPE_DIRECTED_ATTEMPTED`], how many resolved the receiver
+/// to a type *and* matched the method in that type's `class_members` (the
+/// `"type_tracking"` edge).
+static RESOLVE_REF_TYPE_DIRECTED_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one type-directed MethodCall attempt: the receiver was a plain
+/// identifier candidate handed to `lookup_type_before_class_scope`. Exactly
+/// one call per attempt, at the attempt site; the success counter fires
+/// separately at the (early-returning) match site.
+pub fn add_resolve_ref_type_directed_attempt() {
+    if !enabled() {
+        return;
+    }
+    RESOLVE_REF_TYPE_DIRECTED_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record that a type-directed MethodCall attempt (one already counted by
+/// [`add_resolve_ref_type_directed_attempt`]) produced the `"type_tracking"`
+/// edge: receiver resolved to a type and `class_members` matched the method.
+pub fn add_resolve_ref_type_directed_success() {
+    if !enabled() {
+        return;
+    }
+    RESOLVE_REF_TYPE_DIRECTED_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Per-file scope_build sub-phase accumulator. Plain integers mutated inside
 /// one rayon closure with no locking or allocation, merged once per file by
@@ -165,6 +266,13 @@ pub struct ScopeBuildAccum {
     pub entities_spanned: u64,
     pub scopes_built: u64,
     pub refs_collected: u64,
+    /// MUL Phase 2 (semx-mul, W2): number of `PrecomputedFileFacts::import_stmts`
+    /// descriptors dispatched for this file without a tree — nonzero only
+    /// when `precomputed` is `Some` *and* those descriptors were nonempty,
+    /// i.e. proof (not assumption) that a phase-2-admitted language's
+    /// import-bearing file actually took the descriptor fast path instead of
+    /// falling back to `record_import_stmts_pruned` against a re-parsed tree.
+    pub precomputed_import_descriptors: u64,
 }
 
 /// Merge one file's scope_build decomposition into the global counters.
@@ -193,6 +301,11 @@ pub fn merge_scope_build(a: ScopeBuildAccum) {
     SB_ENTITIES_SPANNED.fetch_add(a.entities_spanned, Ordering::Relaxed);
     SB_SCOPES_BUILT.fetch_add(a.scopes_built, Ordering::Relaxed);
     SB_REFS_COLLECTED.fetch_add(a.refs_collected, Ordering::Relaxed);
+    if a.precomputed_import_descriptors > 0 {
+        SB_PRECOMPUTED_IMPORT_FILES.fetch_add(1, Ordering::Relaxed);
+        SB_PRECOMPUTED_IMPORT_DESCRIPTORS
+            .fetch_add(a.precomputed_import_descriptors, Ordering::Relaxed);
+    }
 }
 static REF_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
 static REF_LOOP_NS: AtomicU64 = AtomicU64::new(0);
@@ -794,6 +907,10 @@ pub fn reset() {
         &SB_ENTITIES_SPANNED,
         &SB_SCOPES_BUILT,
         &SB_REFS_COLLECTED,
+        &SB_PRECOMPUTED_IMPORT_FILES,
+        &SB_PRECOMPUTED_IMPORT_DESCRIPTORS,
+        &SB_PRECOMPUTED_CTOR_CALL_FILES,
+        &SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -803,6 +920,10 @@ pub fn reset() {
     CACHE_HIT.store(0, Ordering::Relaxed);
     CACHE_MISS.store(0, Ordering::Relaxed);
     FILES_PROCESSED.store(0, Ordering::Relaxed);
+    ENTITY_SCOPE_LOOKUPS.store(0, Ordering::Relaxed);
+    ENTITY_SCOPE_LOOKUP_FALLBACKS.store(0, Ordering::Relaxed);
+    RESOLVE_REF_TYPE_DIRECTED_ATTEMPTED.store(0, Ordering::Relaxed);
+    RESOLVE_REF_TYPE_DIRECTED_SUCCEEDED.store(0, Ordering::Relaxed);
     CHUNK_ENTITY_INDEX_NS.store(0, Ordering::Relaxed);
     RETURN_TYPES_BY_NAME_NS.store(0, Ordering::Relaxed);
     SCOPE_MERGE_NS.store(0, Ordering::Relaxed);
@@ -947,13 +1068,41 @@ pub fn maybe_print_report() {
         ms(SCOPE_BUILD_NS.load(Ordering::Relaxed).saturating_sub(sb_sum)),
     );
     eprintln!(
-        "SCOPE_BUILD_WORK files_precomputed={} files_ast={} files_fused={} entities_spanned={} scopes_built={} refs_collected={}",
+        "SCOPE_BUILD_WORK files_precomputed={} files_ast={} files_fused={} entities_spanned={} scopes_built={} refs_collected={} files_precomputed_with_imports={} precomputed_import_descriptors={} files_precomputed_with_ctor_calls={} precomputed_ctor_call_descriptors={}",
         SB_FILES_PRECOMPUTED.load(Ordering::Relaxed),
         SB_FILES_AST.load(Ordering::Relaxed),
         SB_FILES_FUSED.load(Ordering::Relaxed),
         SB_ENTITIES_SPANNED.load(Ordering::Relaxed),
         SB_SCOPES_BUILT.load(Ordering::Relaxed),
         SB_REFS_COLLECTED.load(Ordering::Relaxed),
+        SB_PRECOMPUTED_IMPORT_FILES.load(Ordering::Relaxed),
+        SB_PRECOMPUTED_IMPORT_DESCRIPTORS.load(Ordering::Relaxed),
+        SB_PRECOMPUTED_CTOR_CALL_FILES.load(Ordering::Relaxed),
+        SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS.load(Ordering::Relaxed),
+    );
+
+    // Pass-2 diagnostic counters. The scope-index pair covers precomputed-file
+    // entities only (see the statics' doc comments); fallback_pct is the share
+    // of those lookups that silently defaulted into scope 0.
+    let es_total = ENTITY_SCOPE_LOOKUPS.load(Ordering::Relaxed);
+    let es_fallback = ENTITY_SCOPE_LOOKUP_FALLBACKS.load(Ordering::Relaxed);
+    let es_pct = if es_total > 0 {
+        es_fallback as f64 / es_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "ENTITY_SCOPE_LOOKUP precomputed_file_lookups={es_total} fallback_default0={es_fallback} fallback_pct={es_pct:.2}"
+    );
+    let td_attempted = RESOLVE_REF_TYPE_DIRECTED_ATTEMPTED.load(Ordering::Relaxed);
+    let td_succeeded = RESOLVE_REF_TYPE_DIRECTED_SUCCEEDED.load(Ordering::Relaxed);
+    let td_pct = if td_attempted > 0 {
+        td_succeeded as f64 / td_attempted as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "RESOLVE_REF_TYPE_DIRECTED attempted={td_attempted} succeeded={td_succeeded} succeed_pct={td_pct:.2}"
     );
 
     eprintln!(

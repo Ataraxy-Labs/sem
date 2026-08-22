@@ -42,7 +42,7 @@ use sem_core::parser::differ::{BinaryFileChange, DiffResult};
 use sem_core::git::types::FileChange;
 
 use super::relations::{build_changed_entity_relations, relations_is_empty};
-use super::{DiffOptions, ParsedArgs, ParsedScope};
+use super::{DiffOptions, ParsedScope};
 
 /// `true` when `SEM_RELATIONS_LOCAL=1` is set — the escape hatch back to the
 /// pre-instant-upload behavior: compute relations first (budgeted), then
@@ -88,12 +88,12 @@ impl DiffCloudContext {
     /// local, no git remote, no consent for this repo (`sem cloud
     /// enable`/`share`, or the `SEM_CLOUD=1` CI override), or not logged in
     /// (`SEM_TOKEN` or `~/.sem/credentials.json` via `sem login`).
-    fn resolve(opts: &DiffOptions, from_stdin: bool) -> Option<Self> {
+    fn resolve(cwd: &str, from_stdin: bool) -> Option<Self> {
         if from_stdin || super::super::cloud::is_local_forced() {
             return None;
         }
 
-        let git = GitBridge::open(Path::new(&opts.cwd)).ok()?;
+        let git = GitBridge::open(Path::new(cwd)).ok()?;
         let remote = git.get_remote_url()?;
         if !super::super::consent::cloud_enabled_for(&remote) {
             return None;
@@ -107,6 +107,38 @@ impl DiffCloudContext {
             relations_local: relations_forced_local(),
             relations_budget_override_ms: relations_budget_override_ms(),
         })
+    }
+}
+
+/// The 7 of `DiffOptions`'s 14 fields this module's cloud-upload/relations
+/// chain ever reads (confirmed by grep across this file and `relations.rs`):
+/// `cwd`, `staged`, `commit`, `from`, `to`, `label`, `file_exts`. Built once,
+/// at the call site in `diff::mod` (`DiffOptions` -> [`DiffCloudFields::from_opts`]),
+/// the same destructure-at-the-call-site shape `impact.rs`'s
+/// `print_cached_result` already uses — so nothing below this point has to
+/// carry, or prove it doesn't secretly depend on, the other 7 fields
+/// (`format`, `stdin`, `patch`, `verbose`, `profile`, `no_cosmetics`, `args`).
+pub(super) struct DiffCloudFields<'a> {
+    pub(super) cwd: &'a str,
+    pub(super) staged: bool,
+    pub(super) commit: Option<&'a str>,
+    pub(super) from: Option<&'a str>,
+    pub(super) to: Option<&'a str>,
+    pub(super) label: Option<&'a str>,
+    pub(super) file_exts: &'a [String],
+}
+
+impl<'a> DiffCloudFields<'a> {
+    pub(super) fn from_opts(opts: &'a DiffOptions) -> Self {
+        Self {
+            cwd: &opts.cwd,
+            staged: opts.staged,
+            commit: opts.commit.as_deref(),
+            from: opts.from.as_deref(),
+            to: opts.to.as_deref(),
+            label: opts.label.as_deref(),
+            file_exts: &opts.file_exts,
+        }
     }
 }
 
@@ -151,19 +183,20 @@ impl RelationsPlan {
 /// warning and returning `None` on failure so callers can just early-return.
 #[allow(clippy::too_many_arguments)]
 fn upload_diff_snapshot_or_warn(
-    ctx: &DiffCloudContext,
+    client: &super::super::cloud::CloudClient,
+    remote: &str,
+    label: Option<&str>,
     head_sha: Option<&str>,
-    opts: &DiffOptions,
     git_context: &serde_json::Value,
     file_changes: &[FileChange],
     result: &DiffResult,
     binary_changes: &[BinaryFileChange],
     relations: &serde_json::Value,
 ) -> Option<super::super::cloud::CloudDiffSnapshotResponse> {
-    match ctx.client.upload_diff_snapshot(
-        &ctx.remote,
+    match client.upload_diff_snapshot(
+        remote,
         head_sha,
-        opts.label.as_deref(),
+        label,
         git_context,
         file_changes,
         result,
@@ -185,14 +218,14 @@ fn upload_diff_snapshot_or_warn(
 /// for the local computation, which is unconditionally never run before the
 /// upload — that's the whole point: the upload must never block on it).
 pub(super) fn maybe_upload_cloud_diff_snapshot(
-    opts: &DiffOptions,
-    parsed: &ParsedArgs,
+    fields: DiffCloudFields<'_>,
+    scope: &Option<ParsedScope>,
     from_stdin: bool,
     file_changes: &[FileChange],
     result: &DiffResult,
     binary_changes: &[BinaryFileChange],
 ) {
-    let Some(ctx) = DiffCloudContext::resolve(opts, from_stdin) else {
+    let Some(ctx) = DiffCloudContext::resolve(fields.cwd, from_stdin) else {
         return;
     };
 
@@ -207,7 +240,7 @@ pub(super) fn maybe_upload_cloud_diff_snapshot(
     // this call only happens inside the branch that already resolved all of
     // that, and additionally respects its own SEM_FACTS_REMOTE=0 kill switch.
     if let Some(facts_client) = super::super::cloud::CloudClient::from_credentials() {
-        let registry = super::super::create_registry(&opts.cwd);
+        let registry = super::super::create_registry(fields.cwd);
         let touched: Vec<String> = file_changes.iter().map(|c| c.file_path.clone()).collect();
         super::facts_remote::sync(
             ctx.git.repo_root(),
@@ -219,7 +252,14 @@ pub(super) fn maybe_upload_cloud_diff_snapshot(
     }
 
     let head_sha = ctx.git.get_head_sha().ok();
-    let git_context = build_git_context(&ctx.git, opts, parsed);
+    let git_context = build_git_context(
+        &ctx.git,
+        fields.staged,
+        fields.commit,
+        fields.from,
+        fields.to,
+        scope,
+    );
 
     let flow = if ctx.relations_local {
         UploadFlow::InlineRelations
@@ -231,7 +271,7 @@ pub(super) fn maybe_upload_cloud_diff_snapshot(
         UploadFlow::InlineRelations => run_inline_relations_flow(
             &ctx,
             head_sha.as_deref(),
-            opts,
+            &fields,
             &git_context,
             file_changes,
             result,
@@ -240,7 +280,7 @@ pub(super) fn maybe_upload_cloud_diff_snapshot(
         UploadFlow::UploadFirst => run_upload_first_flow(
             &ctx,
             head_sha.as_deref(),
-            opts,
+            &fields,
             &git_context,
             file_changes,
             result,
@@ -255,17 +295,23 @@ pub(super) fn maybe_upload_cloud_diff_snapshot(
 fn run_inline_relations_flow(
     ctx: &DiffCloudContext,
     head_sha: Option<&str>,
-    opts: &DiffOptions,
+    fields: &DiffCloudFields<'_>,
     git_context: &serde_json::Value,
     file_changes: &[FileChange],
     result: &DiffResult,
     binary_changes: &[BinaryFileChange],
 ) {
-    let relations = build_changed_entity_relations(opts, result, ctx.relations_budget_override_ms);
+    let relations = build_changed_entity_relations(
+        fields.cwd,
+        fields.file_exts,
+        result,
+        ctx.relations_budget_override_ms,
+    );
     if let Some(resp) = upload_diff_snapshot_or_warn(
-        ctx,
+        &ctx.client,
+        &ctx.remote,
+        fields.label,
         head_sha,
-        opts,
         git_context,
         file_changes,
         result,
@@ -284,7 +330,7 @@ fn run_inline_relations_flow(
 fn run_upload_first_flow(
     ctx: &DiffCloudContext,
     head_sha: Option<&str>,
-    opts: &DiffOptions,
+    fields: &DiffCloudFields<'_>,
     git_context: &serde_json::Value,
     file_changes: &[FileChange],
     result: &DiffResult,
@@ -292,9 +338,10 @@ fn run_upload_first_flow(
 ) {
     let empty_relations = serde_json::json!({});
     let Some(resp) = upload_diff_snapshot_or_warn(
-        ctx,
+        &ctx.client,
+        &ctx.remote,
+        fields.label,
         head_sha,
-        opts,
         git_context,
         file_changes,
         result,
@@ -309,14 +356,14 @@ fn run_upload_first_flow(
     eprintln!("sem cloud diff: {url}");
 
     let plan = RelationsPlan::from_status(resp.relations_status.as_deref());
-    execute_relations_plan(plan, ctx, opts, result, &resp.id);
+    execute_relations_plan(plan, ctx, fields, result, &resp.id);
 }
 
 /// Carry out a [`RelationsPlan`] decided by [`RelationsPlan::from_status`].
 fn execute_relations_plan(
     plan: RelationsPlan,
     ctx: &DiffCloudContext,
-    opts: &DiffOptions,
+    fields: &DiffCloudFields<'_>,
     result: &DiffResult,
     diff_id: &str,
 ) {
@@ -335,8 +382,12 @@ fn execute_relations_plan(
             // the fast upload already happened, so the closest equivalent to
             // "today's behavior" is still running the local pass and getting
             // the result attached, just via PUT instead of inline.
-            let relations =
-                build_changed_entity_relations(opts, result, ctx.relations_budget_override_ms);
+            let relations = build_changed_entity_relations(
+                fields.cwd,
+                fields.file_exts,
+                result,
+                ctx.relations_budget_override_ms,
+            );
             if !relations_is_empty(&relations) {
                 match ctx.client.put_diff_relations(diff_id, &relations) {
                     Ok(()) => eprintln!("semantics: computed locally and attached"),
@@ -361,62 +412,64 @@ fn execute_relations_plan(
 /// uploaded changes do not exist at a GitHub commit yet.
 fn build_git_context(
     git: &GitBridge,
-    opts: &DiffOptions,
-    parsed: &ParsedArgs,
+    staged: bool,
+    commit: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    parsed_scope: &Option<ParsedScope>,
 ) -> serde_json::Value {
     let branch = git.get_current_branch();
     let head_commit = git.get_head_sha().ok();
 
-    let (scope, base_ref, head_ref, base_sha, comparison_head_sha) =
-        if let Some(commit) = &opts.commit {
-            (
-                "commit",
-                Some(format!("{commit}^")),
-                Some(commit.clone()),
-                git.resolve_ref_sha(&format!("{commit}^")),
-                git.resolve_ref_sha(commit),
-            )
-        } else if let (Some(from), Some(to)) = (&opts.from, &opts.to) {
-            (
+    let (scope, base_ref, head_ref, base_sha, comparison_head_sha) = if let Some(commit) = commit {
+        (
+            "commit",
+            Some(format!("{commit}^")),
+            Some(commit.to_string()),
+            git.resolve_ref_sha(&format!("{commit}^")),
+            git.resolve_ref_sha(commit),
+        )
+    } else if let (Some(from), Some(to)) = (from, to) {
+        (
+            "range",
+            Some(from.to_string()),
+            Some(to.to_string()),
+            git.resolve_ref_sha(from),
+            git.resolve_ref_sha(to),
+        )
+    } else {
+        match parsed_scope.as_ref() {
+            Some(ParsedScope::RefToWorking(base)) => (
+                if staged { "staged" } else { "working" },
+                Some(base.clone()),
+                Some(if staged { "INDEX" } else { "WORKTREE" }.into()),
+                git.resolve_ref_sha(base),
+                None,
+            ),
+            Some(ParsedScope::Range(from, to)) => (
                 "range",
                 Some(from.clone()),
                 Some(to.clone()),
                 git.resolve_ref_sha(from),
                 git.resolve_ref_sha(to),
-            )
-        } else {
-            match parsed.scope.as_ref() {
-                Some(ParsedScope::RefToWorking(base)) => (
-                    if opts.staged { "staged" } else { "working" },
-                    Some(base.clone()),
-                    Some(if opts.staged { "INDEX" } else { "WORKTREE" }.into()),
-                    git.resolve_ref_sha(base),
-                    None,
-                ),
-                Some(ParsedScope::Range(from, to)) => (
-                    "range",
-                    Some(from.clone()),
-                    Some(to.clone()),
-                    git.resolve_ref_sha(from),
-                    git.resolve_ref_sha(to),
-                ),
-                Some(ParsedScope::MergeBaseRange(from, to)) => (
-                    "merge-base",
-                    Some(from.clone()),
-                    Some(to.clone()),
-                    git.resolve_merge_base(from, to).ok(),
-                    git.resolve_ref_sha(to),
-                ),
-                Some(ParsedScope::FileCompare { .. }) => ("files", None, None, None, None),
-                None => (
-                    if opts.staged { "staged" } else { "working" },
-                    Some("HEAD".into()),
-                    Some(if opts.staged { "INDEX" } else { "WORKTREE" }.into()),
-                    head_commit.clone(),
-                    None,
-                ),
-            }
-        };
+            ),
+            Some(ParsedScope::MergeBaseRange(from, to)) => (
+                "merge-base",
+                Some(from.clone()),
+                Some(to.clone()),
+                git.resolve_merge_base(from, to).ok(),
+                git.resolve_ref_sha(to),
+            ),
+            Some(ParsedScope::FileCompare { .. }) => ("files", None, None, None, None),
+            None => (
+                if staged { "staged" } else { "working" },
+                Some("HEAD".into()),
+                Some(if staged { "INDEX" } else { "WORKTREE" }.into()),
+                head_commit.clone(),
+                None,
+            ),
+        }
+    };
 
     serde_json::json!({
         "branch": branch,

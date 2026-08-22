@@ -4,6 +4,45 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-22
+
+### Changed
+
+- **C++ and Python's precomputed-facts fast paths are now opt-in (`SEM_MUL_CPP=1`, `SEM_MUL_PYTHON=1`), and Rust's stays opt-in (`SEM_MUL_RUST=1`).** These fast paths trade memory for speed by skipping a second parse of files whose facts are already known. Re-measuring peak memory footprint (the metric that actually tracks memory pressure and swap risk, as opposed to resident-set size, which can look artificially low once memory has been compressed) found C++ costing ~25-28% more than a default build on llvm-project and Python ~22-25% more on home-assistant/core — both above the project's +15% admission ceiling, even after a follow-up trim narrowed the gap. Rust independently re-measured at ~33% over. Cold builds on large C++/Python repos are correspondingly slower by default than in 0.22.1, but use less memory; set the relevant env var if you have RAM headroom and want the speed.
+- **Go's fast path is now on by default**, no configuration needed. It cleared the same ceiling (+6.8% to +8.5% peak memory footprint on Kubernetes, well under +15%) once the correctness fixes below landed, and delivers a 12-17% faster cold build on Kubernetes as a result.
+
+### Fixed
+
+- **Go call resolution no longer merges same-named packages from different API groups.** Kubernetes has dozens of packages literally named `v1` — one per API group (`kubeadm`, `bootstraptoken`, `pod-security-admission`, and more) — and import resolution used to key packages only by their bare directory name, so a call like `DeepCopyInto` from one API group's type could resolve to a same-named method in a completely unrelated package. Packages are now disambiguated by their full import path. This alone removes roughly 32,000 false cross-package edges on Kubernetes, and (combined with the fix below) makes Kubernetes cold builds 28-30% faster.
+- **Go resolution no longer confuses a source file's own name with a standard-library package it happens to share a name with.** Large Go codebases routinely contain files literally named `os.go` or `time.go`; a secondary lookup route used to treat a file's own bare filename as if it were an importable package, so calls like `os.Stat()` or `time.Now()` could resolve to the local file instead of the real standard-library package. That route has been removed entirely — only the correct, directory-based lookup remains.
+- **Rust call resolution no longer confuses an external standard-library import with a same-named local module.** `use std::cmp;` followed by `cmp::max(...)` could previously resolve to an unrelated local `cmp.rs` instead of the real standard-library function. Imports rooted at `std`/`core`/`alloc` are now excluded from local-module matching outright (an external import can never legitimately resolve to a file in your own repo), and a genuine same-named local-module collision is now disambiguated per the specific item being called rather than per whole-file bucket, falling back to an honest miss instead of guessing when it can't be told apart.
+- **Fixed a scope-resolution precedence bug affecting every supported language: a nested closure or sibling function could resolve a call to the wrong same-named target** — for example, a TypeScript call landing on a sibling closure's function of the same name instead of the one actually being called. A function's own locally declared bindings now always take precedence over an outer scope's binding of the same name, and nested locals inside a plain function (not just a class or module) are now registered for lookup at all, closing a gap where they were invisible to their own siblings.
+- **Go's cross-file method resolution is now internally consistent when the fast path is enabled.** Rewriting a method's identity to reflect its true cross-file package location left other places that cache that identity out of date, which could push a call through an unrelated fallback path instead of the correct local lookup. Every place an entity's identity is cached is now kept in sync with the rewrite, and the fast-path build is now bit-identical to the default build on Kubernetes.
+- **Multi-document YAML files (`---`-separated) no longer lose entities to id collisions.** Top-level keys sharing a name across different documents in the same file used to collapse onto one generated id, silently dropping all but one from the graph — including whether it was a test. Each document is now part of the generated id whenever a real collision exists; ordinary single-document files are unaffected.
+- **`sem entities`'s index-backed listings no longer come back empty on Windows.** An absolute path built by ordinary path-joining wasn't normalized the same way as the repository root before comparison, and Windows always prepends its extended-path marker during normalization, so the two could never match. Two related normalization gaps in the MCP server and the index reader were fixed alongside it.
+- **Fixed a parse-cache test flake** caused by tests sharing global cache state under parallel execution; the cache is now injectable per test/thread, with no change to production behavior.
+- **`sem setup` no longer installs a SessionStart hook that forks `mcp --resident`.** That resident server was deleted in 0.22.0 (`--resident` is kept only as a no-op flag for old installs), so every fresh `sem setup` was forking a process that does nothing, once per Claude Code session. `sem setup` now installs only the `UserPromptSubmit` hook (`sem hook prompt-submit`); `sem unsetup` still recognizes and removes a legacy `mcp --resident` SessionStart hook from an older install.
+- **Caches written by the MCP server no longer silently drop test-coverage flags read by the CLI.** `sem-cli` and `sem-mcp` each maintained their own copy of the on-disk cache format, and a prior perf fix landed on only one of the two copies — any cache last written by the MCP server ended up with permanently empty test flags. The two copies are now one shared implementation, so both read and write the same, complete cache.
+
+### Added
+
+- **New internal diagnostics**: a dangling-edge check that catches any graph edge pointing at an entity id nothing declared (always a bug, never legitimate), plus a set of resolution counters behind `SEM_PROFILE_RESOLVE` for measuring how often lookups fall back to slower paths. Development/debugging aids, not user-facing commands.
+- **The internal reference-consistency checker used by sem's own test suite got dramatically faster** — from about 100 seconds to well under a second on a large TypeScript codebase — by resolving each entity through one lookup table instead of a per-entity search. Not user-facing, but it makes sem's own correctness checks practical to run at scale.
+- **Per-field memory attribution** for the experimental fast-path facts, letting future memory work target the specific data structure responsible for a footprint regression instead of guessing.
+
+### Performance
+
+- **Kubernetes cold builds are 28-30% faster**, from the same package-index disambiguation fix described above.
+- **Builds against an empty or fresh facts cache no longer pay a needless per-file cost.** Recognizing an empty cache directory now takes one directory read instead of checking every candidate file, cutting cache-merge time on an empty cache from ~245ms to ~0.4ms and making a full cold build roughly 7% faster.
+- **The experimental fast-path facts now use about 17% less memory**, by trimming unused capacity left over from incremental construction and deduplicating repeated identifier strings within each file. Wall-clock time is unaffected.
+
+### Removed
+
+- **The Go package-index builder's second, hand-duplicated copy** — one shared implementation is now used everywhere a build needs it.
+- **Five internal, already-closed measurement tools** (micro-benchmarks and one-off memory/timing probes) whose results were already recorded elsewhere and are no longer needed to reproduce them.
+- **`sem-mcp`'s own duplicate disk-cache implementation** — superseded by the shared implementation described above.
+- **The file-stem Go package-resolution route** — see Fixed, above; only the directory-based route remains.
+
 ## [0.22.1] - 2026-08-16
 
 ### Added

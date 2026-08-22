@@ -108,7 +108,8 @@ pub fn context_command(opts: ContextOptions) {
         &entity.name,
         &entity.entity_type,
         &entity.id,
-        &opts,
+        opts.json,
+        opts.budget,
         &context_result,
     );
     timings.finish();
@@ -123,14 +124,15 @@ fn render_context(
     entity_name: &str,
     entity_type: &str,
     entity_id: &str,
-    opts: &ContextOptions,
+    json: bool,
+    budget: usize,
     context_result: &sem_core::parser::context::ContextResult,
 ) {
-    if opts.json {
+    if json {
         let output = serde_json::json!({
             "entity": entity_name,
             "entityId": entity_id,
-            "budget": opts.budget,
+            "budget": budget,
             "total_tokens": context_result.total_tokens,
             "truncated": context_result.truncated,
             "target_omitted": context_result.target_omitted,
@@ -156,7 +158,7 @@ fn render_context(
             "context for".green().bold(),
             entity_type.dimmed(),
             entity_name.bold(),
-            opts.budget,
+            budget,
             context_result.total_tokens,
         );
 
@@ -353,7 +355,8 @@ fn try_index_context(opts: &ContextOptions, timings: &mut crate::timings::Timing
         &target_name,
         &target_type,
         &target_id,
-        opts,
+        opts.json,
+        opts.budget,
         &context_result,
     );
     true

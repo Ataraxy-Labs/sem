@@ -1,6 +1,6 @@
 [package]
 name = "sem-core"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Entity-level semantic diff engine. Extracts functions, classes, and methods from 28 languages via tree-sitter and diffs at the entity level."
@@ -11,6 +11,7 @@ categories = ["development-tools", "parser-implementations"]
 readme = "../../README.md"
 exclude = [
     "DATA-FLOW-AUDIT.md",
+    "DATA-TOPOLOGY-AUDIT.md",
     "INCREMENTAL-PARSE.md",
     "KAPPA.md",
     "MUL-DESIGN.md",
@@ -31,6 +32,16 @@ wasm = []
 # `wasm` — where mmap does not exist — builds the same format code with the
 # owned-bytes constructor and no dependency.
 mmap = ["dep:memmap2"]
+
+# The unified `cache.db` persistence layer (semx-r94): schema, freshness,
+# manifest handling and the `DiskCache` constructor family that `sem-cli` and
+# `sem-mcp` both used to hand-roll separately (QUERY-INDEX.md §15.3's
+# disclosed duplicate-authority finding). Off by default and behind its own
+# feature — same reasoning as `git`/`mmap` above — because `rusqlite`'s
+# `bundled` feature compiles libsqlite3 from C source, which the `wasm`
+# feature's whole point is to stay clear of. Depends on `git` for
+# `index_commits`' `GitBridge`/semantic-diff use.
+disk-cache = ["dep:rusqlite", "dep:zstd", "git"]
 
 # Spike: an oxc-based fast path for TS/JS entity extraction. Off by default.
 # See OXC-FASTPATH.md for the measurement and verdict.
@@ -128,7 +139,7 @@ ts-parser-perl = { version = "1.1", optional = true }
 tree-sitter-scala = { version = "0.26", optional = true }
 # DerekStride/tree-sitter-sql, published as tree-sitter-sequel. See #339.
 tree-sitter-sequel = { version = "0.3", optional = true }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
@@ -165,6 +176,15 @@ ciborium = "0.2"
 # `wasm` feature keeps building.
 memmap2 = { version = "0.9", optional = true }
 
+# `disk-cache` feature (semx-r94): the unified `cache.db` layer, moved here
+# from `sem-cli`/`sem-mcp`, which both depended on this exact version+feature
+# pair already. `bundled` is a C dependency (compiles libsqlite3), so this
+# stays optional rather than joining `default`.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# Entity content-store compression (`insert_entities_with_content_store`),
+# same version both consumer crates already pinned.
+zstd = { version = "0.13", optional = true }
+
 # oxc-fastpath spike (see OXC-FASTPATH.md). Pinned exact versions so the
 # equivalence-pinning tests aren't chasing a moving upstream AST.
 oxc_parser = { version = "=0.143.0", optional = true }
@@ -182,14 +202,21 @@ criterion = "0.5"
 # on the parse/hash primitives sem-core uses internally.
 tree-sitter = "0.26"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-# semx-4w1: dev-only, used by the `mem_single_probe` example to test the
-# system-allocator-fragmentation hypothesis for the giant-corpus RSS blowout
-# (many small, short-lived tree-sitter/extraction allocations across a highly
-# parallel cold build; macOS's default allocator does not always return freed
-# arena pages to the OS promptly, which shows up as RSS that never comes back
-# down between chunks). Not proposed as sem-core's own allocator — that
-# decision belongs to whichever binary embeds this library.
+# semx-4w1 / semx-au8: dev-only, used by `parse_probe`/`mul_census` to give
+# examples the same global allocator the production binaries (`sem`,
+# `sem-mcp`) install, so allocator-fragmentation effects measured there
+# reflect real behavior instead of macOS's system allocator ceiling. Not
+# proposed as sem-core's own allocator — that decision belongs to whichever
+# binary embeds this library.
 mimalloc = "0.1"
+# semx-kkk: the multi-document YAML determinism witness needs to run the
+# same cold build under two differently-sized *scoped* rayon pools within
+# one test process (a real `RAYON_NUM_THREADS` env var only takes effect
+# once, at the global pool's first use, so it can't vary within a process).
+# `sem-core` already depends on `rayon` under the default `parallel`
+# feature; this is the same crate + version, just also reachable from an
+# integration test, which only sees `[dev-dependencies]`.
+rayon = "1.10"
 
 [[bench]]
 name = "parse_profile"
@@ -198,15 +225,6 @@ harness = false
 [[bench]]
 name = "incremental"
 harness = false
-
-[[bench]]
-name = "interning"
-harness = false
-
-[[bench]]
-name = "oxc_spike"
-harness = false
-required-features = ["oxc-fastpath"]
 
 # Replays real commits through the full `sem diff` pipeline twice (fast path
 # off vs on) and compares. Needs a git repository to read history from.

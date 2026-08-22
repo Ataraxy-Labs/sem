@@ -639,7 +639,8 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
                         registry,
                     );
                 timings.mark("incremental_graph_rebuild");
-                let _ = disk.save_incremental_with_repair_metadata(
+                let _ = crate::build_cache::save_incremental_with_index(
+                    &disk,
                     root,
                     file_paths,
                     &partial.stale_files,
@@ -661,7 +662,8 @@ pub fn get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
 
     if !no_cache {
         if let Ok(disk) = DiskCache::open(root) {
-            let _ = disk.save_topology(
+            let _ = crate::build_cache::save_topology_with_index(
+                &disk,
                 root,
                 file_paths,
                 &graph,
@@ -755,7 +757,8 @@ fn get_or_build_graph_with_cache_policy(
                         registry,
                     );
                 timings.mark("incremental_graph_rebuild");
-                let _ = disk.save_incremental_with_repair_metadata(
+                let _ = crate::build_cache::save_incremental_with_index(
+                    &disk,
                     root,
                     file_paths,
                     &partial.stale_files,
@@ -780,7 +783,8 @@ fn get_or_build_graph_with_cache_policy(
         match save_policy {
             CacheMissSavePolicy::Full => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save_with_test_dirs(
+                    let _ = crate::build_cache::save_full_with_index(
+                        &disk,
                         root,
                         file_paths,
                         &graph,
@@ -793,7 +797,8 @@ fn get_or_build_graph_with_cache_policy(
             }
             CacheMissSavePolicy::Topology => {
                 if let Ok(disk) = DiskCache::open(root) {
-                    let _ = disk.save_topology(
+                    let _ = crate::build_cache::save_topology_with_index(
+                        &disk,
                         root,
                         file_paths,
                         &graph,

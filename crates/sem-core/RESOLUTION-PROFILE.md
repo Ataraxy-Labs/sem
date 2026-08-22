@@ -8352,7 +8352,7 @@ count is reported as it is rather than manufactured by deleting prose.
   `REFS_ORACLE` 316,476 PASS, `FILES_ORACLE` 8 prefixes PASS,
   `TESTS_ORACLE` 316,476 checked / 50,201 tests PASS, `TRIGRAM_ORACLE` 6
   patterns PASS.
-- **Law tests (new, all green)**: `L-HASH-ENC`, `L-HASH-UTF8`,
+- **Invariant tests (new, all green)**: `L-HASH-ENC`, `L-HASH-UTF8`,
   `L-TRIGRAM-SRC` (`sem-core/tests/single_pass_invariants.rs`); `L-COLUMNS-FUSE`
   (`sem-cli/src/corpus_columns.rs`); `L-STEM-INDEX` + its public-boundary
   sibling (`import_resolution.rs`); `L-BOW-SHARE` (`graph.rs`). Each states
@@ -12034,3 +12034,3224 @@ trigram tier is answering the same thing it was measured answering.
 
 Bead: semx-tuy. Epic: semx-w5k. Prior full table: W5 §2 (semx-gbb). Preceding
 section: semx-5sw.
+
+## FALSE-THINGS A6: the +12ms verb-regression, attributed, one fix tried and
+falsified by measurement, left in place
+
+The campaign's own §12.1/§13.4 (semx-tuy) already named this: `find`/
+`callers`/`refs`/`grep` picked up `complete_check`'s ~12-13ms membership
+sweep after semx-ykf landed, dropping `grep`'s monster speedup from the
+39-132× class to 11-26×, still comfortably inside the <50ms `grep` budget
+and the <20ms `find`/`callers`/`refs` budget (thin margin, per §13.4's own
+words) but a real, disclosed cost — not an accident, since §13.1 records S1
+predicting this exact number (12ms) a year before `complete_check` was
+built. This bead re-confirmed that attribution and tried one fix.
+
+**Attribution, re-confirmed today.** `complete_check`
+(`sem-core/src/index/complete.rs`) runs two sweeps every `find`/`callers`/
+`refs`/`grep` call: a parallel `stat` over every path in `FILES` (40,869 on
+the monster, proving deletions) and a parallel `stat` over every path in
+`DIRS` (2,743, proving addition-drift via the POSIX
+create/delete/rename-bumps-mtime guarantee). The doc's own §13.1 table
+(S1, prior bead) already measured the FILES pass alone at 12ms and the
+combined sweep at 13ms; nothing about that number has drifted since —
+it is the cost of proving whole-corpus membership freshness without a
+resident daemon (§13.1 explicitly declined the daemon alternative, on
+simplicity-mandate grounds: a watcher would only buy back a budget this
+sweep already clears).
+
+**Fix attempted: batch the FILES-deletion pass by directory.** The
+per-file `stat` sweep looked like the obvious target — 40,869 individual
+syscalls to prove a fact `DIRS`'s own mtime-drift guarantee already implies
+for most of them "for free" once grouped correctly (deleting a file bumps
+its own direct parent's mtime, same POSIX guarantee the addition side
+already leans on). Implemented: group `FILES`' already-sorted paths into
+contiguous per-parent-directory runs (one linear pass, no I/O), then for
+each run do one `read_dir` on that directory and diff its current entries
+against the run's known files — deletion detection as a direct existence
+check (immune to mtime coalescing, so the pre-existing `deleted_file_is_
+found` unit test, which deletes with **no** settle sleep unlike every
+new-file test, keeps passing with zero change) rather than an mtime proxy,
+just batched: one syscall per directory instead of one per file. All 6
+`complete.rs` unit tests green, all 638 `sem-core` + 249 `sem-cli` release
+tests green, unchanged.
+
+**Measured: 19× slower, not faster.** Interleaved A/B, `sem find/callers/
+refs createProgram --file src/compiler/program.ts` and `sem grep
+createProgram/getEmitFlags --json` on the monster, median-of-7,
+warm page cache, load 6.0-7.3:
+
+| verb | before (per-file `stat`, unchanged) | after (per-directory `read_dir`) | outputs match |
+|---|---:|---:|---|
+| `find` | 22.11 ms | 418.83 ms | yes |
+| `callers` | 22.01 ms | 420.91 ms | yes |
+| `refs` | 21.40 ms | 414.39 ms | yes |
+| `grep createProgram` | 29.89 ms | 425.19 ms | yes |
+| `grep getEmitFlags` | 27.76 ms | 422.70 ms | yes |
+
+Correctness held on every case (byte-identical stdout, both binaries) — this
+is a pure performance falsification, not a bug. Cause, confirmed directly:
+`tests/baselines/reference` is one flat directory of **53,049 entries**
+(`ls | wc -l`), larger than the entire indexed corpus (40,869 files). A
+standalone `read_dir` over just that one directory measured **~30ms**
+(Python `os.scandir`, same order in Rust). Because the batched pass runs
+*unconditionally* on every query (deletion-freshness can't be gated behind
+`DIRS`' mtime-drift signal without losing the mtime-independence the
+no-sleep test proves — mtime is exactly the granularity a coalesced
+create+delete inside one second can hide), any query that touches even one
+known file under that directory pays the full 53,049-entry listing cost,
+every time. This isn't tunable away: **proving a file's absence via
+directory listing structurally requires scanning the whole directory** —
+there is no early-exit, because a missing target is exactly the case where
+you can't stop partway through and be sure. Per-path `stat` is O(1)
+regardless of sibling count; `read_dir`-based batching is O(directory size)
+with no safe upper bound once a corpus has even one large, flat directory
+(test-baseline dirs, generated-code dirs, and vendored-fixture trees are
+common real-world instances of exactly this shape — not a pathology specific
+to this repo).
+
+**Decision: reverted, nothing shipped.** The per-file `stat` sweep's
+O(1)-per-known-file property — the thing that looked like the naive,
+"unoptimized" choice — is actually the robust one: it is immune to
+directory-shape skew, where the batched alternative is not and can regress
+by orders of magnitude on corpora this campaign's own control set already
+contains. `git checkout -- crates/sem-core/src/index/complete.rs`;
+rebuilt and re-verified 638/249 green at the reverted (original) sha. No
+production code changed by this bead.
+
+**What's left, honestly.** A genuinely safe lever exists in principle —
+`fstatat` relative to an open directory fd instead of `root.join(p)` +
+`symlink_metadata()`, which would cut the per-file `PathBuf` allocation
+`join` currently pays 40,869 times without changing the O(1)-per-file
+shape — but it needs `unsafe` platform-specific code (this crate ships
+Windows support; semx-q344 landed Windows path-scoping fixes this same
+campaign) with a POSIX/Windows split, for an unmeasured, likely-modest
+win against an already-~300ns-per-syscall floor. Not attempted this bead:
+the risk/reward didn't clear the bar with the daemon-free alternative
+already inside budget. Reported rather than forced, per this campaign's
+own discipline — a fix only ships on a measured win, and the only one
+tried here measured the wrong way.
+
+Bead: semx-tuy (re-check, this campaign: perf/false-things A6). No sha
+change — working tree returned to HEAD `0d4e4b5`.
+
+## 2026-08-21: semx-mul phase-2 W0 — the CLEAN gate moved past `resolve_go_method_parent_ids`
+
+The `semx-mul` bead recorded a hazard against this section's own gate: `graph.rs`'s
+CLEAN gate call site (`clean_gate_dirty_files`, added semx-mp1, scoped semx-5sw
+above) ran *before* `resolve_go_method_parent_ids` — the one cross-file entity
+rewrite this crate performs. Harmless while `mul_precompute_admits` never
+admits `.go` (`_ => false`), because no Go file ever reaches
+`clean_gate_candidate_spans`. Unsound the day phase 2 admits Go: a Go method's
+`parent_id` is unset until that rewrite runs, so a candidate file gated before
+it would show zero cross-file children for its receiver type and pass CLEAN
+by omission, keeping stale file-local precomputed facts for a file that is
+not, in fact, clean — the false-negative CLEAN(F) this section's own soundness
+argument (semx-5sw, above) assumes cannot happen.
+
+**Fix.** `resolve_go_method_parent_ids(&mut all_entities)` moved from its old
+call site (after the carry-destructuring split, well after the gate) to
+immediately after pass 1's assembly loop — the earliest point `all_entities`
+is complete — so the gate that follows it always adjudicates against the
+complete cross-file parent-edge set. `is_go_file` guards every mutation the
+rewrite makes, so C++/C#/JS/TS entities are untouched by the move; this is
+checked, not just argued (below).
+
+**Pin.** `clean_gate_dirty_files` now takes a `GoParentsResolved` token by
+value (`registry.rs`) — a zero-sized type constructible only by calling
+`resolve_go_method_parent_ids`. A future refactor that reorders the gate
+ahead of the rewrite fails to compile rather than silently regressing; the
+ordering invariant is structural, not remembered (the same move this
+document's semx-ys0 section made for the MUL runtime-switch salt). A new
+test, `go_parent_repair_must_run_before_clean_gate_adjudication`
+(`scope_resolve.rs`), drives the two real functions directly on a two-file Go
+fixture (`Hub` in `hub.go`, `Ping`'s cross-file receiver in `ping.go`): the
+gate is shown unsound against the pre-rewrite entity set (misses `hub.go`)
+and sound against the post-rewrite one (catches it) — the exact hazard and
+its fix, at the entity-content grain the gate itself operates on. End-to-end
+forcing through `EntityGraph::build` was not achievable: `mul_precompute_
+admits` is a plain match with a hardcoded `_ => false` arm for Go, not a
+predicate any test can override (unlike `csharp`'s runtime-gated arm — and
+even that one is a process-global `OnceLock`, unflippable mid-test per
+`resolve_gated_salt_generalizes_beyond_csharp`'s own doc comment). Admitting
+Go for real is phase 2's own decision, out of this bead's scope.
+
+**Gates.** `cargo test -p sem-core --release --lib`: **642/642** (641 +
+the new test). `cargo test -p sem-cli --release`: **249/249**.
+`clean_gate_scoping_matches_corpus_wide_verdict_per_candidate` and the other
+two existing CLEAN-gate unit tests green, each updated to thread a real
+`GoParentsResolved` token through (`resolve_go_method_parent_ids` run first,
+a no-op on their all-`.cs` fixtures — matching production order exactly).
+
+**Live corpora, not just unit tests.** `SEM_FP_PARITY=1 cargo run --release
+--example incr_probe -- <root> all <label>`:
+
+* **home-assistant-core** (22,397 files, cold `entities=259399 edges=310723
+  edge_hash=b82d199d21e45b47`): 8/8 `ORACLE … ok` — cold-vs-build plus all 7
+  named warm scenarios (`none`, `leaf`, `mixed50`, `hub`, `hubrename`,
+  `tests`, `importchurn`), zero mismatches.
+* **C++, real corpus** — `llvm-project`'s cached checkout had no working
+  tree (`blob:none` partial clone, broken `HEAD` symref); repaired
+  (`git symbolic-ref HEAD refs/heads/main`) and sparse-checked-out
+  `clang/lib/Analysis` + `clang/include/clang/Analysis` (68 `.cpp` + 82
+  `.h`, real out-of-line member definitions) rather than the whole repo.
+  Built the pre-move sha (`55f764f`, this campaign's HEAD before this bead)
+  in a throwaway `git worktree` and ran the identical `incr_probe`
+  invocation with `SEM_PROFILE_RESOLVE=1` before and after the move:
+
+  | | before (55f764f) | after (this bead) |
+  |---|---|---|
+  | entities / edges | 4477 / 4979 | 4477 / 4979 |
+  | edge_hash | `b99cdff8fd5069b2` | `b99cdff8fd5069b2` |
+  | `MUL_CLEAN_GATE files_dropped` | 0 | 0 |
+  | ORACLE (cold-vs-build, warm none) | ok / ok | ok / ok |
+
+  Bit-identical, both metrics. `files_dropped=0` on both sides matches
+  MUL-A's census verdict (§1 of MUL-DESIGN.md): C++ out-of-line member
+  definitions produce zero cross-file `parent_id` links, so the gate has
+  nothing to catch either way — this run is a neutrality check, not a
+  positive detection case (Go's `pkgA` cross-file receiver fixture, sub-file
+  grain, is what exercises detection above).
+
+**Close-out.** `br comments add semx-mul` records the moved sha; the bead
+stays open (phase-2 epic). No language admission changed — `mul_precompute_
+admits` still returns `false` for `.go`; this bead only removes the ordering
+hazard that would otherwise block admitting it.
+
+Bead: semx-mul (phase-2 W0). Epic: semx-w5k. Prior: semx-mp1 (implemented
+the gate), semx-5sw (scoped it), semx-ys0 (structural-not-remembered
+precedent for the runtime-gate salt, same technique applied here).
+
+## 2026-08-21: subtraction pass — five closed-question probes removed (R1-R5)
+
+Standing removal mandate ("nothing left to take away"): a read-only audit
+walked every bench/example in `sem-core` plus `sem-cli setup.rs` and
+verified, item by item, which measurement tools answer a question that is
+already closed and recorded in prose, versus which ones are load-bearing
+gates or reproduction paths still in active use. This bead executes the
+audit's mechanical removal ledger. Every number the removed tools produced
+stays exactly where it already lived — in this doc, KAPPA.md, MUL-DESIGN.md
+§5, and OXC-FASTPATH.md — only the runnable machinery goes. Consumer-count
+verified by grep for every item before deletion (doc/comment mentions of a
+tool's name, which are historical citations of where a number came from, do
+not count as consumers).
+
+**R1 — the interning micro-bench, closed.** Deleted `benches/interning.rs`
+(478 LOC, `semx-5nc`) and `examples/key_shape_probe.rs` (195 LOC), plus the
+`[[bench]] name = "interning"` Cargo.toml entry. This was 918f12a's
+explicitly-left-undone micro-benchmark of `String` vs `u32` interning for
+the cold resolve join's two hash-map keys (the Interning section above,
+`semx-4an` second pass) — it ran, the numbers are recorded above (`id_len`
+p50/p90/p99, `bucket_size` distribution, `INTERN_BUILD` timing, the
+micro-bench results table), and the verdict was negative (interning does
+not pay for itself at this join shape). Nothing else in the tree referenced
+either file outside of doc-comment citations of where the numbers came
+from.
+
+**R2 — kappa_stats, already overdue.** Deleted `examples/kappa_stats.rs`
+(177 LOC, `semx-n8c`). Its own module doc said so: "Throwaway analysis tool
+... used once to gather KAPPA.md's collision numbers on real corpora, then
+deleted." `tests/kappa.rs` and `src/utils/hash.rs` cite `kappa_stats`
+samples in doc comments explaining *why* specific node-kind rules exist
+(real collisions it found on the TS-monster and django corpora) — those
+citations are historical provenance, not a dependency on the tool; they are
+untouched.
+
+**R3 — the shipping bug: `sem setup` was forking a no-op every session.**
+`crates/sem-cli/src/commands/setup.rs`'s `install_session_hooks` still
+installed `nohup {sem} mcp --resident >/dev/null 2>&1 &` as a Claude Code
+SessionStart hook. The resident server that command used to start was
+deleted (QUERY-INDEX.md §7 item 5 / semx-woe); `--resident` is kept only as
+a backward-compatible no-op flag (`sem-mcp/src/lib.rs`) so an
+*already-installed* hook wouldn't start erroring. QUERY-INDEX.md's own item-5
+entry flagged this exact wiring as in-flight and unresolved at the time.
+Fixed: `add_session_hooks` no longer installs a SessionStart hook at all;
+`sem setup` now installs only the `UserPromptSubmit` hook
+(`sem hook prompt-submit`). `is_sem_hook_command`'s `mcp --resident` matcher
+is kept (commented as to why) so `sem unsetup` still cleans up a legacy
+SessionStart hook from an older install — added a regression test for
+exactly that cleanup path. Reworded the two "Done" strings and the `run()`
+summary line that promised a "warm graph" / "resident warm graph +
+prompt-time prefetch" to describe what setup actually installs, and aligned
+the same false claim in README.md's two "warm resident graph" passages
+(the second one's *conclusion* — day-to-day queries are fast — is still
+true, just via the on-disk mmap index per the 0.22.1 CHANGELOG entry, not a
+resident process; reworded to say so).
+
+Second finding, surfaced not fixed (out of this bead's audited scope):
+`sem hook prompt-submit` — the hook this fix keeps installing — is *also*
+currently a full no-op. `commands/hook.rs`'s `socket_lookup` is hardcoded to
+return `None` (the resident socket sidecar it used to query is the same
+deleted subsystem R3 is fixing the installer for), so `candidates()`'s regex
+work always ends in an empty `blocks` and the hook never prints anything.
+This is a second, deeper instance of the same shipping bug, not audited or
+scoped here — it needs its own decision (reimplement prefetch against the
+mmap index, or stop installing the hook too) rather than a silent fix
+bundled into this ledger item.
+
+**R4 — four one-bead memory/timing probes, all closed.** Deleted
+`examples/parse_time_probe.rs` (107 LOC, `semx-jo1`), `mem_single_probe.rs`
+(96 LOC), `mem_single_probe_mimalloc.rs` (95 LOC), and `tree_mem_probe.rs`
+(78 LOC) — 376 LOC total, all `semx-jo1`/`semx-4w1` decisions closed and
+their numbers preserved in this doc's Memory attribution section and
+MUL-DESIGN.md §5. Checked both docs for a "re-run X to reproduce" pointer
+naming any of the four as the standing reproduction path for an open
+question — found only narrative past-tense citations ("confirmed directly
+with `tree_mem_probe`", "`mem_single_probe`, same frozen snapshots") of
+what was already run, never an instruction to re-run one. `Cargo.toml`'s
+`mimalloc` dev-dependency comment named `mem_single_probe` as its reason to
+exist; reworded to name `parse_probe`/`mul_census` instead (both KEEP-listed,
+both still use `mimalloc` as their global allocator, `semx-au8`) since that
+comment would otherwise go stale pointing at a deleted file.
+
+**R5 — the oxc spike bench, superseded.** Deleted `benches/oxc_spike.rs`
+(249 LOC) + its `[[bench]]` Cargo.toml entry (`required-features =
+["oxc-fastpath"]`). Superseded by `diff_oracle` (end-to-end equivalence) and
+`perf_probe` (the honest wall-clock share, "6.1% of cold build" —
+OXC-FASTPATH.md's own honest-end-to-end section already used `perf_probe`,
+not this bench, for that number). The bench's own headline numbers (20-49x
+parse+walk, the four-leg comparison table) are preserved verbatim in
+OXC-FASTPATH.md; added a note there recording the bench's removal at this
+commit and that this doc is now the number's sole provenance. The
+`oxc-fastpath` cargo feature, its pinned `oxc_*` deps, and `oxc_extractor.rs`
+are untouched — this removal is the bench only.
+
+**KEEP-verdict summary from the audit (unchanged by this bead, recorded so
+the next auditor doesn't re-walk it).** `fast_extractor.rs`, `diff_oracle.rs`
++ its example, `oxc_extractor.rs`, the `oxc_*` deps and `oxc-fastpath`
+feature are kept: the oxc seam was already declined once on field-identity
+grounds (the section above this one) and a second time on equivalence
+grounds (the "revival" section, `semx-r63`) — both declines are load-bearing
+decision records, not dead code, and `diff_oracle`/`oxc_extractor.rs` are
+what a future third attempt would build on. `index_probe`,
+`facts_corpus_probe`, `edge_dump_probe`, `incremental_parity_probe`,
+`facts_probe`, `incr_probe`, `perf_probe`, and `mul_census` are kept as live
+gates — every one of them is invoked by name in a still-open bead's
+verification steps elsewhere in this doc (e.g. `incr_probe` above, this same
+bead's W0 section), not a closed question. `build_cache.rs`'s `DiskCache`,
+the `sem mcp --resident` no-op flag itself, and
+`SEM_MUL_CSHARP`/`SEM_RELATIONS_LOCAL`/`SEM_INCR_PROBE_SESSION_ONLY`/
+`SEM_FP_PARITY` are kept unchanged — only R3 touched anything downstream of
+the `--resident` flag, and only its *installation site*, per the explicit
+KEEP list for this bead.
+
+**Net LOC.** R1 673 (478+195) + R2 177 + R4 376 + R5 249 = **-1,475** LOC of
+probe/bench machinery deleted, zero numbers lost. R3 is a net-small behavior
+fix (a few lines removed from `add_session_hooks`/`install_session_hooks`,
+a few doc lines reworded, one regression test added) rather than a LOC
+subtraction — its value is the deleted per-session fork, not line count.
+
+Bead: subtraction pass, R-wave 1. Prior: `subtract-audit` (read-only ledger
+this bead executes verbatim except where evidence disagreed — none did).
+
+## 2026-08-21: semx-mul phase-2 W2 — Rust admitted to the precomputed-facts fast path, unconditionally
+
+MUL-DESIGN.md §6.1 verdicted Rust NO-as-is (13.74% FASTPATH byte share, gated
+behind Field 10's `import_stmts` descriptors). W1 mechanized Field 10 but
+left it unconsumed: `PrecomputedFileFacts::import_stmts` was always empty
+because TREELESS still rejected any file with a real import, and the one
+pass-2 dispatch site required a live tree, so a precomputed file's
+descriptors (had they existed) would never have been read. This bead is the
+admission — wiring both ends and measuring the real corpus.
+
+**The decision point.** `precompute_scope_resolvable_file_facts`'s TREELESS
+gate (`scope_resolve.rs:~1650`) used to be `if !import_starts.is_empty() ||
+saw_call_node { return None; }` — unconditional rejection of any import. It's
+now `if (!import_starts.is_empty() && !mul_precompute_consumes_imports(lang_
+config.id)) || saw_call_node`, where `mul_precompute_consumes_imports`
+(`matches!(lang_id, "rust")` today) is the new predicate naming which
+languages have a real pass-2 consumer for the recorded descriptors — kept
+deliberately separate from `mul_precompute_admits` (whether the producer
+runs at all) because a language could in principle be admitted to the
+producer before its import handlers were ported to descriptors. Pass 2's
+dispatch site (`scope_resolve.rs:~2519`) used to be a single `if let
+(Some(tree), Some(import_starts)) = (reparsed, &fused_import_starts)` —
+reachable only from the re-parse path. It's now `if let Some(facts) =
+precomputed { … dispatch facts.import_stmts directly, no tree … } else if
+let (Some(tree), Some(import_starts)) = … { … the old tree-driven path … }`.
+
+**Fast-path engagement, proven not assumed.** Two new `SCOPE_BUILD_WORK`
+counters, `files_precomputed_with_imports`/`precomputed_import_descriptors`,
+increment only inside the new `Some(facts)` branch when `facts.import_stmts`
+is nonempty. On rust-lang/rust (38,598 files): OFF
+`files_precomputed=209 files_ast=38389 files_precomputed_with_imports=0`; ON
+`files_precomputed=38420 files_ast=178 files_precomputed_with_imports=14499
+precomputed_import_descriptors=59131` — 14,499 files took the descriptor
+dispatch fast path against MUL-DESIGN.md's census prediction of 14,446 (the
+~0.4% gap is corpus drift since the census commit, not a gate miss).
+
+**Admission: unconditional (C++'s shape, not C#'s).** The design doc's own
+I6 instruction is explicit: under the +15% peak-RSS ceiling, admit
+unconditionally; over it, gate behind an env switch (C#'s
+`SEM_MUL_CSHARP` precedent). `/usr/bin/time -l` on rust-lang/rust, cold, two
+independent pairs with run order swapped:
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 3,105,947,648 B | 3,452,534,784 B | **+11.16%** |
+| 2 | ON→OFF | 3,149,545,472 B | 3,504,734,208 B | **+11.28%** |
+
+Both pairs comfortably under +15%, reproducibly — so `mul_precompute_admits`
+gained a plain `"rust" => true` arm, no `SEM_MUL_RUST` switch, no
+`MUL_RUNTIME_GATES` row (there is no switched-off state to preserve corpus
+compatibility with). `facts_store.rs`'s `LANGUAGE_SALTS` bumped
+`("rust", "ts-0.23")` → `("rust", "ts-0.23-mp2")` (I5/F2), mirrored in
+`examples/facts_corpus_probe.rs`'s independent copy (its own byte-equality
+test against the real table catches drift). An intermediate version of this
+bead shipped Rust behind `SEM_MUL_RUST` (mirroring C#) specifically so the
+fence could be measured without committing to the outcome first; once both
+pairs cleared the ceiling the switch was removed rather than left as unused
+scaffolding — this doc records the final, unconditional shape only.
+
+**Correctness.** `edge_dump_probe` sha256, ON vs OFF: bit-identical on
+rust-lang/rust (309,429 edges) and on this worktree's own `crates/` (8,631
+edges, measured against a frozen `git worktree` snapshot of the pre-bead
+commit so the corpus wasn't a moving target while this bead's own source
+files were being edited — the first attempt at this comparison, against the
+live worktree, showed a spurious 42-line diff that was the source tree
+changing mid-measurement, not a graph divergence; re-run against the frozen
+snapshot came back sha256-identical). `SEM_FP_PARITY=1 incr_probe … all` on
+rust-lang/rust: 8/8 `ORACLE ok` (cold-vs-build + all 7 warm scenarios).
+`facts_probe` save/load cross-process on rust-lang/rust: 4/4 `ORACLE ok`.
+`facts_corpus_probe` populate/consume on a real two-copy `library/` subset
+(2,150 files): `corpus_hits=2150/2150`, `ORACLE ok`, negative probe `ok`. The
+I5/F2 salt-bump was proven adversarially, not just asserted: populated a
+pure-Rust corpus (41 files, `library/core/src`) with a binary built from the
+pre-bead commit (salt `"ts-0.23"`), consumed it with this bead's binary
+(salt `"ts-0.23-mp2"`) — `corpus_hits=0`, a clean miss, `ORACLE ok` proving
+the resulting fresh build was still correct despite the miss.
+`cargo test --release`: sem-core lib 647/647 (+3 new tests), full sem-core
+suite 719/719, sem-cli 250/250, zero new warnings.
+
+**The prize.** Same `SEM_PROFILE_RESOLVE=2` run as the engagement proof
+above: `reparse_ms` 939.52 → 30.07 ms (**−96.8%**), `fused_walk_ms` 3,214.54
+→ 23.45 ms (**−99.3%**, the walk moved to pass 1, not eliminated — a corpus
+hit is what actually eliminates it, see below), `scope_build_ms` 6,238.47 →
+3,213.17 ms (**−48.5%**), `pass2_wall_ms` 499.57 → 271.01 ms (**−45.7%**).
+`entities_spanned` identical both sides (329,799) — same graph, cheaper
+path. Cold-build wall (`sem find`, fresh `SEM_CACHE_DIR`, pre-bead vs.
+this-bead binaries, 6 interleaved pairs, order swapped across the two
+batches): OLD median 10.90s, NEW median 9.25s, **−15.1%**, direction
+unanimous across all 6 pairs (range −10.1% to −22.0%) — noisy per pair,
+same n=small disclosure phase 1's dotnet/llvm wall numbers carried, but
+one-directional and consistent with the counter collapse above.
+**Known-content** (facts served from the corpus, no walk at all — not even
+pass 1's) was not measured through `sem find` directly: its cold-build path
+routes through the mmap query index, not `build_graph_with_facts_store` —
+confirmed by adding `SEM_PROFILE_CACHE=1` and seeing no `FACTS_CORPUS` line
+print, a wiring question this bead did not chase further. Proven instead at
+the mechanism level by the `facts_corpus_probe` run above (100% cross-repo
+hit rate, `ORACLE ok`); per MUL-DESIGN.md §5.1's framing, a corpus hit's win
+is `fused_walk_ms`'s full cold-side value (3,214.54 ms) on top of the
+already-measured cold win, since pass 1's precompute is skipped entirely
+rather than merely relocated.
+
+**Gates run.** `cargo build --release` clean on `sem-core`, `sem-cli`, and
+every touched example (`mul_census` untouched by this bead;
+`facts_corpus_probe`/`facts_probe`/`edge_dump_probe`/`incr_probe` all
+rebuilt clean) — two pre-existing, unrelated `sem-cli` warnings
+(`commands/setup.rs`, `corpus_columns.rs`) unchanged. `cargo test --release`:
+sem-core lib 647/647, full sem-core suite 719/719 (647 + d_smoke 0/1 ignored
++ elm_smoke 2 + graph_accuracy 2 + kappa 3 + parse_cache 42 + scope_resolve_
+bench 7 + single_pass_invariants 15 + facts_corpus_probe/facts_probe/edge_
+dump_probe test binaries), sem-cli 250/250. `edge_dump_probe` sha256
+bit-identical ×2 corpora. `incr_probe` `SEM_FP_PARITY=1` 8/8. `facts_probe`
+4/4. `facts_corpus_probe` 2/2 plus the adversarial salt-clean-miss run.
+
+**Close-out.** `mul_precompute_admits`'s doc comment, the `MulRuntimeGate`
+table's surrounding prose, and `facts_store.rs`'s `producer_language_salt`
+doc comment all updated to describe Rust's final (unconditional) shape —
+no stale references to a `SEM_MUL_RUST` switch that didn't ship. Go and Java
+are MUL-DESIGN.md §4.3's other named Field-10 beneficiaries and are future
+rows on the same two predicates (`mul_precompute_admits`,
+`mul_precompute_consumes_imports`), not a new mechanism; Python's own
+Field-10 share is the smaller half of its need (Field 11's
+`ctor_call_sites`, phase 3, is still unbuilt).
+
+Bead: semx-mul (phase-2 W2). Epic: semx-w5k. Prior: semx-mp1 (MUL P1,
+implemented the C++/C# gate this bead's admission machinery reused
+verbatim), semx-mul phase-2 W0 (CLEAN gate ordering fix), semx-mul phase-2
+W1 (Field 10 mechanized: descriptors recorded but, until this bead,
+unconsumed).
+
+## 2026-08-21 — semx-mul phase-2 W3+W4: Go and Java measured, both stay gated
+
+W2's Rust template applied verbatim to the two other Field-10 beneficiaries:
+`mul_precompute_consumes_imports` widened to `"go" | "java"`,
+`LANGUAGE_SALTS`/`facts_corpus_probe.rs` bumped `("go", "ts-0.23-mp3")` /
+`("java", "ts-0.23-mp3")`. Unlike Rust, **neither promotes to unconditional**
+— each independently fails a different half of I6's two-gate test, exactly
+the "ship them differently" outcome the epic's own framing anticipated.
+
+**The decision point** is unchanged from W2 in shape: `mul_precompute_
+consumes_imports` now returns `true` for `"rust" | "go" | "java"`, all three
+riding the same six `ImportStmtFacts` variants W1 built. Go's is `GoImport`;
+Java's imports classify as `GoImport` too (`classify_import_stmt`'s doc
+comment: `import_declaration` is a grammar kind shared by Go/Java/Swift) and
+dispatch through `register_go_package_imports`, which only ever matches
+`.go`-suffixed entities in `go_pkg_index` — a pre-existing, documented no-op
+for Java (finding F4). So there was **no Java-specific import handler to
+build** — the task's own speculative concern turned out to be moot on
+inspection, confirmed (not just argued) by this bead's correctness battery.
+
+### Java
+
+**Correctness: clean.** `edge_dump_probe` on elasticsearch (35,906 files,
+release binary): **sha256 bit-identical ON vs OFF**, 1,257,229 edges both
+sides (`bcc3aeb6…` both). `SEM_FP_PARITY=1 incr_probe … all` on
+elasticsearch (cold: `files=35906 entities=833596 edges=1257249
+edge_hash=587981caa323ce55`): **8/8 `ORACLE ok`** — cold-vs-build plus all 7
+named warm scenarios (`none`, `leaf`, `mixed50`, `hub`, `hubrename`,
+`tests`, `importchurn`), zero mismatches; `hub`/`mixed50`'s highest-fan-in
+file is `test/framework/.../ESTestCase.java` with 7,728 dependents.
+`facts_probe` save/load, cross-process, on elasticsearch: **4/4
+`ORACLE ok`** (`none`, `leaf`, `mixed50`, `hub`). `facts_corpus_probe`
+populate/consume, cross-repo, on a real two-copy `server/.../action/`
+subset (861 files, two independent copies of the same directory):
+**`corpus_hits=861/861`**, `ORACLE ok`, negative probe `ok`
+(renamed-path miss). **I5/F2 salt-bump proof**: populated the same
+two-copy corpus with a binary built from this campaign's pre-W3+W4 commit
+(`adde06a`, java salt `"ts-0.23"`), consumed it with this bead's binary
+(salt `"ts-0.23-mp3"`) — **`corpus_hits=0`**, a clean miss exactly as I5
+requires, `ORACLE ok` proving the resulting fresh build was still correct
+despite the miss.
+
+**The memory fence fails.** `/usr/bin/time -l`, elasticsearch, cold (fresh
+`SEM_CACHE_DIR` each run), two independent pairs with run order swapped:
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 5,469,716,480 B (5.09 GiB) | 6,616,678,400 B (6.16 GiB) | **+20.97%** |
+| 2 | ON→OFF | 5,465,309,184 B (5.09 GiB) | 6,613,762,048 B (6.16 GiB) | **+21.01%** |
+
+Both pairs reproducibly bust the +15% ceiling by a wide margin — closer to
+dotnet's phase-1 overshoot (+21-33%) than Rust's phase-2 pass (+11.16%/
++11.28%). MUL-A §2.3's own census explains why: Java's pre-Field-10
+TREELESS-by-bytes share was the *smallest* of any language measured
+(**0.98%**), so admission moves nearly all of elasticsearch's Java bytes
+onto the fast path in one step — the same shape that busted dotnet's
+ceiling in phase 1. Per I6 ("under the ceiling → admit unconditionally;
+over it → gate"), `mul_precompute_admits("java")` stays a runtime switch
+(`SEM_MUL_JAVA`, off by default, `MUL_RUNTIME_GATES` row with
+`pre_switch_salt = "ts-0.23"`) — C#'s shape, not Rust's.
+
+**The prize, measured anyway** (so the cost of staying gated is on the
+record). `SEM_PROFILE_RESOLVE=2`, `sem find <nonexistent>`, elasticsearch
+(30,241 files at measurement time):
+
+| counter | OFF | ON | Δ |
+|---|---:|---:|---:|
+| `files_precomputed` | 43 | 30,220 | — |
+| `files_ast` | 30,198 | 21 | — |
+| `files_precomputed_with_imports` | 12 | 29,219 | — |
+| `precomputed_import_descriptors` | 121 | 494,577 | — |
+| `reparse_ms` | 1,329.19 | 114.94 | **−91.4%** |
+| `fused_walk_ms` | 7,299.51 | 1.93 | **−99.97%** |
+| `scope_build_ms` | 8,409.06 | 1,340.16 | **−84.1%** |
+| `pass2_wall_ms` | 797.71 | 803.76 | ~flat |
+
+`entities_spanned` identical both sides (506,794) — matches the bit-identical
+sha256 above; same graph, and (with the switch off) the same cost, cheaper
+only when flipped. Cold-build wall (`sem find`, fresh `SEM_CACHE_DIR`, 6
+interleaved pairs, order swapped across two batches of 3): OFF values
+{21.99, 12.01, 23.35, 15.82, 15.68, 10.40}s, ON values {11.69, 12.41, 20.62,
+17.53, 13.43, 11.56}s — medians OFF 15.75s / ON 12.92s (**−17.9%**), but
+per-pair direction was **not unanimous** (2 of 6 pairs went the other way,
+e.g. pair 4 ON 17.53s vs OFF 15.82s). Disclosed rather than smoothed over:
+this session ran heavy concurrent `cargo build`/`cargo test` activity on the
+same box throughout the whole bead, which the mechanism-level counters above
+are immune to (they measure CPU-time inside one process) but end-to-end wall
+time is not. The counters are the trustworthy number here; the wall-clock
+median points the same direction but is noisy, not a clean n=6 win the way
+W2's Rust numbers were.
+
+### Go
+
+**The memory fence passes.** `/usr/bin/time -l`, kubernetes, cold, two
+independent pairs with run order swapped:
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 3,769,679,872 B | 3,716,251,648 B | **−1.42%** |
+| 2 | ON→OFF | 3,731,324,928 B | 3,752,509,440 B | **+0.57%** |
+
+Comfortably under +15%, both pairs, one of them even a net *decrease* —
+consistent with kubernetes's own pre-Field-10 FASTPATH share already being
+the largest non-JS/TS non-C++/C# share on bytes among the four NO-GO-as-is
+families measured in MUL-A (§2.3: dotnet/llvm ≈100%, rust 13.74%, kubernetes
+5.24%, elasticsearch 0.98%, HA 0.23% — Go was already carrying some fast-path
+weight in the pre-Field-10 two-tier gate's own file-count sense before this
+bead).
+
+**Correctness fails — this is the actual blocker, not memory.**
+`edge_dump_probe` on kubernetes (13,619 files):
+
+| | OFF | ON |
+|---|---:|---:|
+| edges | 366,905 | 363,487 |
+| sha256 | `2db4539a907e763b…` | `c37dfdc01e8d2c8d…` |
+
+Not bit-identical: a 30,801-line diff. Fully **deterministic** — re-ran OFF
+twice (0-line diff between the two OFF runs) and ON twice (0-line diff
+between the two ON runs) before concluding this, ruling out a parallel-hash
+-map-iteration race as the cause. A representative wrong edge:
+
+```
+OFF (correct): cmd/kubeadm/app/apis/kubeadm/types.go::type::ClusterConfiguration::DeepCopyInto
+  Calls cmd/kubeadm/app/apis/kubeadm/v1/types.go::type::ClusterConfiguration::DeepCopyInto
+ON  (wrong):   cmd/kubeadm/app/apis/kubeadm/types.go::type::ClusterConfiguration::DeepCopyInto
+  Calls staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go::type::PodSecurityExemptions::DeepCopyInto
+```
+
+Dozens of unrelated `X::DeepCopyInto`/`X::DeepCopy` call sites, across
+entirely different packages (`cmd/kube-apiserver`, `cmd/kube-proxy`,
+`cmd/kubeadm/...`), all collapse onto the *same one* wrong target when ON —
+a strong signal of a single shared, deterministic mis-resolution mechanism
+rather than scattered noise.
+
+W0's `GoParentsResolved`-token ordering fix (CLEAN gate runs after
+`resolve_go_method_parent_ids`) is **confirmed still sound** — this is the
+first bead where `mul_precompute_admits("go")` is real enough (behind
+`SEM_MUL_GO=1`) to exercise that ordering end-to-end for the first time, and
+`go_parent_repair_must_run_before_clean_gate_adjudication` stays green
+throughout. The regression is not that hazard resurfacing.
+
+**Root cause: located but not fully isolated.** Three repros were tried
+against the mechanism and did **not** reproduce the divergence:
+
+1. A single-package, three-type fixture (`Foo`/`Bar` cross-file
+   struct-then-methods split, plus a same-package `APIServer`-typed field
+   with a nested `in.Server.DeepCopyInto(&out.Server)` call) — bit-identical
+   ON vs OFF.
+2. A 29-file slice copied directly out of kubernetes —
+   `cmd/kubeadm/app/apis/kubeadm/{,v1}/*.go` plus the exact
+   `staging/src/k8s.io/pod-security-admission/admission/api/v1/*.go` package
+   the wrong edges above target — also bit-identical, 400/400 edges matching.
+
+The bug needs corpus scale to manifest, which is itself informative.
+Chasing it, `SEM_PROFILE_RESOLVE=2` on the *full* kubernetes corpus surfaced
+a second, independent finding: `extract_imports_ms` costs **~83-88 seconds**
+(87,804.79 ms OFF, 82,762.28 ms ON) — larger than `reparse_ms` itself, and
+present **identically on both ON and OFF**, i.e. a pre-existing cost, not
+caused by this bead. Reading `build_go_pkg_index`/`register_go_package_
+imports` (`scope_resolve.rs`) explains both the cost and a plausible
+correctness mechanism for the edge divergence: packages are keyed by their
+**bare last-path-segment string** ("v1", "util", …), with no disambiguation
+by full import path. kubernetes has dozens of packages literally named
+`v1` (one per API group: `kubeadm/v1`, `bootstraptoken/v1`,
+`pod-security-admission/.../v1`, …), and `build_go_pkg_index` merges *all*
+of their exported symbols — methods included, since `symbol_table` indexes
+every entity by bare name — into one `go_pkg_index["v1"]` bucket, sorted and
+inserted last-write-wins by `register_go_package_imports`. On the AST path
+this is **latent**: type-directed (`class_members`-based) resolution
+normally succeeds first for a `DeepCopyInto` call, so the polluted
+`import_table_by_name.get("DeepCopyInto")` fallback (checked only as a last
+resort, gated to `.go` files, in the "Go package-qualified call" branch) is
+populated but never consulted. The working hypothesis — code-read-confirmed
+for the collision half, **not yet directly instrumented** for the other
+half — is that something about the fast path's file-local
+`entity_map`/`children_by_parent` substitution measurably increases how
+often that type-directed resolution fails for Go specifically, pushing more
+calls into the already-polluted fallback. Neither half is fixed by this
+bead.
+
+Per I6, `mul_precompute_admits("go")` stays a runtime switch (`SEM_MUL_GO`,
+off by default, `MUL_RUNTIME_GATES` row, `pre_switch_salt = "ts-0.23"`) —
+but unlike a normal memory-gated language, **the switch must not be flipped
+even for re-measurement** until the correctness regression above is
+root-caused and fixed; its own doc comment in `scope_resolve.rs` says so
+explicitly, so a future reader finding the switch does not mistake it for
+"just needs a rebuild to try." The `"ts-0.23-mp3"` salt bump is kept
+regardless — correct and load-bearing for any future producer change,
+independent of whether the switch is ever turned on.
+
+### Mechanism proofs (both languages, unconditional on the admission decision)
+
+- `mul_phase2_go_java_default_matches_the_measured_verdict` (scope_resolve.rs)
+  pins both defaults against the measured verdicts above.
+- `precompute_scope_resolvable_file_facts_some_for_go_with_imports` /
+  `_java_with_imports`: a multi-spec `import (...)` block (Go) and two
+  `import` statements (Java) each get fast-path facts with the right
+  descriptor count and variant (`GoImport` for both).
+- `precompute_scope_resolvable_file_facts_go_call_expression_stays_treeless`
+  / `_java_method_invocation_stays_treeless`: Go's `call_expression` and
+  Java's `method_invocation` are not the literal `"call"` Field 11's
+  (unbuilt, Python-only) ctor-infer scan hardcodes to — the call half of
+  TREELESS is untouched by this bead, same pin Rust's W2 test made.
+- `fused_triple_walk_matches_three_sequential_walks`: extended with a
+  `gen_java` fixture (6th family) alongside the pre-existing `gen_go`
+  multi-spec `import ("fmt"; u "example.com/pkg/util")` fixture — both now
+  assert non-vacuity (`family_imports[3] > 0` for Go, a gap that predated
+  this bead and was closed here since it was already touching this exact
+  test; `family_imports[5] == 0` for Java, pinning the no-op). This is the
+  task's requested "record-vs-direct equivalence test" for Java, confirming
+  by construction (not just by the elasticsearch battery) that
+  record-then-dispatch and dispatch-direct agree on Java's no-op descriptor
+  path.
+- The existing `test_go_method_parent_resolves_across_files_in_graph`
+  (`graph.rs`) and the session-level Go oracle suite
+  (`go_oracle_no_op_rebuild_is_green`, `go_oracle_touch_a_leaf`,
+  `go_oracle_touch_the_pkg_index_hub`) all stay green — but with
+  `SEM_MUL_GO` off by default (unset in the test process), none of them
+  exercise the actual fast path, so they do **not** contradict the
+  divergence found above; they were not expected to.
+
+### Gates
+
+`cargo build --release -p sem-core --lib --examples -p sem-cli --bin sem`:
+clean (two pre-existing, unrelated `sem-cli` warnings unchanged).
+`cargo test --release -p sem-core`: **727/727** (652 lib, +5 new tests over
+W2's 647 baseline: the go/java default-verdict pin, two TREELESS-with-imports
+positives, two call-node-stays-TREELESS negatives; `fused_triple_walk_
+matches_three_sequential_walks` extended in place, not counted as new).
+`cargo test --release -p sem-cli`: **250/250**. `rustfmt --check` clean on
+every touched file. `cargo clippy --release --lib --examples`: 151 warnings
+before this bead, 151 after — zero attributable to this bead (verified by
+diffing the pre-bead warning count in a stashed tree against the same
+command post-bead).
+
+**Close-out.** `br comments add semx-mul` records both languages' fence and
+prize numbers. No language admission changed in production terms — both
+`SEM_MUL_GO` and `SEM_MUL_JAVA` are unset by default, so `mul_precompute_
+admits` returns `false` for both exactly as it did before this bead; what
+changed is that the decision is now *measured* instead of *unmade*, and Go's
+correctness regression is now a documented, load-bearing blocker rather than
+an unknown.
+
+Bead: semx-mul (phase-2 W3+W4). Epic: semx-w5k. Prior: semx-mp1 (MUL P1,
+C#/C++), semx-mul phase-2 W0 (CLEAN gate ordering), W1 (Field 10
+mechanized), W2 (Rust admitted unconditionally — this bead's template).
+
+## 2026-08-21 — semx-mul phase-2 W5: Field 11 built, Python admitted unconditionally — the last planned admission
+
+MUL-DESIGN.md §4.3 named Field 11 (`ctor_call_sites`) as Python's own
+tree-need, the larger half already closed by Field 10's import descriptors
+(§2.3's census: 16,559 of HA's 18,145 scope-resolvable files need the tree
+for imports, 16,088 for `"call"` nodes — mostly the same files needing both).
+This bead builds Field 11, extends `mul_precompute_consumes_imports` to
+Python, adds the sibling `mul_precompute_consumes_calls` predicate, and
+measures the real corpus — completing the four admissions §6.2 planned
+(JS/TS+C++ phase 1, Rust W2, Go/Java W3+W4 gated, Python this bead).
+
+### What moved into `CtorCallFacts` vs stayed corpus-side
+
+`scan_constructor_calls`'s tree-walk read exactly two things per `"call"`
+node: the callee identifier (filtered to "identifier node, uppercase first
+character" — a purely syntactic pre-filter) and, per argument, whether that
+argument was itself a `"call"` node whose own `function` field was a bare
+identifier (`infer_expr_type`'s only non-`None` case). Both are recorded
+verbatim by the new `record_ctor_call_sites`/`record_arg_call_shape` at
+precompute time — `CtorCallFacts { callee: String, arg_shapes: Vec<Option
+<String>> }`, one descriptor per qualifying call, in the same
+`push_named_children_rev` worklist order the old direct walk used. What
+stays corpus-side, unconditionally, in the new `apply_ctor_call_facts`: the
+`init_params.get(&facts.callee)` lookup (which params exist for this
+class), `attr_to_param_index` (which `self.attr = param` assignments this
+constructor makes), and `func_name_returns` (a lowercase argument callee's
+declared return type) — none of these exist until every file in the corpus
+has contributed its own `init_params`/`attr_to_param`/`return_type_map`,
+which is why the *handler* stays in pass 2 while what it reads *from the
+tree* moved to pass 1, exactly as §4.3 specified. `infer_arg_type_from_shape`
+is the one-line replay of `infer_expr_type`'s resolved half: uppercase
+recorded name → the name itself; lowercase → `func_name_returns.get(name)`.
+
+The old `scan_constructor_calls`/`infer_expr_type` were deleted outright
+(the W1 subtraction bar) — no independent traversal spec was kept alongside
+the replacement. Unlike Field 10's `extract_imports_from_ast` (which
+*predates* BS3's fused-walk refactor and was deliberately retained across
+it as the executable spec `record_import_stmts_pruned` +
+`dispatch_import_stmts_from_facts` are checked against), no such
+predecessor existed for ctor-call scanning — this is the first record/apply
+split this scan has ever had, so there was nothing to keep. The
+record-vs-direct equivalence proof the task asked for
+(`record_then_apply_matches_direct_scan_for_ctor_calls`) instead writes a
+fresh, deliberately verbatim transcription of the pre-refactor functions as
+a test-local closure, never touched by production code, and asserts the
+production `record_ctor_call_sites` + `apply_ctor_call_facts` composition
+lands on the identical `instance_attr_types` map.
+
+`infer_constructor_param_types` (the pass-1b corpus-wide scan) had to
+change shape regardless of Field 11: before this bead it walked
+`parsed_files` only, so a fast-path file — one whose tree died at the end of
+pass 1 — could never contribute a ctor-call site at all. It now takes
+`precomputed_facts`/`file_paths` too, and merges in `file_paths` order (not
+`parsed_files`'s own order) — on the production chunked-resolve path
+`parsed_files` is already exactly `file_paths` with declined files filtered
+out (no `pre_parsed` group to interleave there), so this is order-preserving
+for the path `edge_dump_probe` measures, and it is the only order that can
+name both a precomputed-facts file and a freshly re-parsed one uniformly.
+
+### Schema and salt mechanics
+
+`FACTS_SCHEMA_VERSION` 2 → 3 (`PrecomputedFileFacts` grew
+`ctor_call_sites: Vec<CtorCallFacts>`, a new type reachable from
+`PersistedFacts` — same shape as W1's 1 → 2 bump for `import_stmts`, so it
+gets the identical clean-miss treatment). `LANGUAGE_SALTS`'s python entry
+bumped `"ts-0.23"` → `"ts-0.23-mp4"` (I5/F2), mirrored in
+`examples/facts_corpus_probe.rs`'s independent copy (byte-equality test
+against the real table catches drift, `corpus_isolates_by_language_salt`
+updated to the new literal since it drives `populate_delta` through the
+real `producer_language_salt` path). `mul_precompute_consumes_imports`
+widened to `"rust" | "go" | "java" | "python"`; the new sibling
+`mul_precompute_consumes_calls` is `matches!(lang_id, "python")` — Python
+needs *both* predicates to clear TREELESS, since its census share was
+imports-larger, calls-smaller, and either alone still fails almost every
+real HA file on the other half.
+
+### Engagement, proven not assumed
+
+`SCOPE_BUILD_WORK` gained `files_precomputed_with_ctor_calls`/
+`precomputed_ctor_call_descriptors`, bumped from `infer_constructor_param_
+types` itself (not `ScopeBuildAccum` — this scan runs once per build in its
+own pass-1b step, not per file inside pass 2's closure). `SEM_PROFILE_
+RESOLVE=2`, `sem graph --no-cache`, home-assistant/core (22,397 files at
+measurement time):
+
+| counter | OFF (pre-bead binary) | ON (this bead, default) |
+|---|---:|---:|
+| `files_precomputed` | 2 | 18,210 |
+| `files_ast` | 18,211 | 3 |
+| `files_precomputed_with_imports` | 0 | 16,625 |
+| `precomputed_import_descriptors` | 0 | 156,559 |
+| `files_precomputed_with_ctor_calls` | — | 11,374 |
+| `precomputed_ctor_call_descriptors` | — | 78,702 |
+| `fused_walk_ms` | 2,852.23 | 0.08 |
+| `extract_imports_ms` | 1,494.50 | 1,315.50 |
+| `SCOPE_BUILD_NS total_ms` | 4,564.94 | 1,564.95 |
+
+16,625 files with import descriptors is close to the census's 16,559
+prediction (drift since the original commit, same ~0.4% class W2 saw for
+Rust). `files_precomputed_with_ctor_calls=11,374` is smaller than the
+census's "16,088 files contain a `call` node" because that count measures
+*any* call node, while the engagement counter (matching the import
+counter's own discipline) only fires when a file's recorded
+`ctor_call_sites` is nonempty — i.e. it actually contains an
+uppercase-identifier constructor-shaped call, not merely some call. Files
+with call nodes but zero ctor-shaped calls still take the fast path
+(`files_precomputed` counts them); they just don't count toward this
+narrower engagement metric, by design.
+
+### Correctness
+
+`edge_dump_probe` sha256, this bead's binary vs the pre-bead commit
+(7679764): **bit-identical on home-assistant/core** (310,398 edges, sha
+`7744ae4a…`, both sides) and **bit-identical on the control corpus**,
+rust-lang/rust (309,429 edges, sha `36890018…`, both sides) — proving the
+`infer_constructor_param_types` reshape left every non-Python language
+untouched (their own `"call"`-literal scan is a structural no-op regardless
+of merge order, since it produces nothing to merge). `SEM_FP_PARITY=1
+incr_probe … all` on home-assistant/core (22,397 files): **8/8 `ORACLE
+ok`** (cold-vs-build plus all 7 warm scenarios: none, leaf, mixed50, hub,
+hubrename, tests, importchurn). `facts_probe` save/load cross-process on
+HA: **4/4 `ORACLE ok`**. `facts_corpus_probe` populate/consume on a real
+two-copy corpus (`homeassistant/helpers`, 109 files): **109/109 hits**,
+`ORACLE ok`, negative probe `ok` (same-content-different-path miss). The
+I5/F2 salt-bump adversarial proof: populated with a binary built from the
+pre-bead commit (python salt `"ts-0.23"`), consumed with this bead's binary
+(salt `"ts-0.23-mp4"`) — **`corpus_hits=0`**, a clean miss, `ORACLE ok`
+regardless (the resulting fresh build was still correct despite the miss).
+
+### The memory fence
+
+Measured twice, independently: first via the interim runtime-gated code
+(`SEM_MUL_PYTHON` toggle within one binary), then again via the pre-bead
+vs. this-bead binary comparison after the code was promoted to
+unconditional (matching how the toggle is actually exercised in
+production). `/usr/bin/time -l`, home-assistant/core, cold (fresh
+`SEM_CACHE_DIR` each run):
+
+| measurement | order | OFF maxRSS | ON maxRSS | Δ |
+|---|---|---:|---:|---:|
+| toggle, pair 1 | OFF→ON | 2,283,257,856 B | 2,101,854,208 B | **-7.95%** |
+| toggle, pair 2 | ON→OFF | 2,285,600,768 B | 2,107,244,544 B | **-7.80%** |
+| binary, pair 1 | OLD→NEW | 2,255,454,208 B | 2,148,761,600 B | **-4.73%** |
+| binary, pair 2 | NEW→OLD | 2,296,283,136 B | 2,118,828,032 B | **-7.73%** |
+
+All four pairs, unanimous direction: a net **decrease**, not merely under
+the +15% ceiling. This tracks MUL-A §2.3's own numbers in the opposite
+direction from Java's/C#'s overshoot: HA's pre-Field-10/11 FASTPATH byte
+share was the *smallest* of any family measured (0.23%), meaning almost the
+entire corpus's chunked-path tree retention — a `(path, content, tree)`
+triple per file for ~18k Python files — gets deleted by this admission in
+one step, and on a corpus HA's size that deletion outweighs the small
+facts residency Field 10+11 add (projected ~0.27 GB, MUL-DESIGN.md §5.3).
+Java's and C#'s overshoot came from the same "admission moves nearly all
+bytes onto the fast path in one step" shape, but on corpora (elasticsearch,
+dotnet) large enough that the *added* facts residency dominated instead of
+the *removed* tree retention — the sign of the effect depends on which side
+is bigger at a given corpus scale, not on the admission mechanism itself.
+
+### The prize
+
+`sem graph --no-cache`, `SEM_TIMINGS=1`, home-assistant/core, fresh
+`SEM_CACHE_DIR` each run, 4 interleaved pairs (order swapped), pre-bead vs.
+this-bead binaries:
+
+| pair | order | OLD `full_graph_build` | NEW `full_graph_build` | Δ |
+|---|---|---:|---:|---:|
+| 1 | OLD→NEW | 3,602.038 ms | 2,627.422 ms | **-27.1%** |
+| 2 | NEW→OLD | 3,623.432 ms | 2,688.507 ms | **-25.8%** |
+| 3 | OLD→NEW | 3,763.907 ms | 2,795.103 ms | **-25.7%** |
+| 4 | NEW→OLD | 3,862.709 ms | 2,776.485 ms | **-28.1%** |
+
+Median: OLD 3,693.7 ms, NEW 2,732.3 ms, **-26.4% of `full_graph_build`** —
+direction unanimous across all 4 pairs (range -25.7% to -28.1%), exceeding
+MUL-DESIGN.md §5.1's own predicted -14.8% (that number was itself disclosed
+as an upper-bound ratio from a different, slower box, re-derived from a
+gate-only measurement before Field 10/11 existed; the actual admitted
+corpus apparently gets more of the win than the pre-implementation estimate
+priced in — plausibly the `bow_index_io` elimination and the full-corpus
+`fused_walk_ms` collapse compounding more favorably at HA's file-count
+scale than the arithmetic in §5.1 modeled). Total wall time (`file_
+discovery` + `full_graph_build` + `cli_output_serialization`) moved from a
+3.76s/2.80s single-pair sample by roughly the same ratio (**-25.6%**).
+
+### Gates
+
+`cargo test --release -p sem-core`: **731/731** (656 lib, +9 net over
+W3+W4's 652 baseline — the two mul_precompute_admits/consumes verdict
+pins for Python, the some-for-python-with-imports-and-calls positive, the
+imports-only positive replacing the pre-Field-10/11 "none when imports"
+negative that this bead's admission made stale, the record_ctor_call_sites
+filter test, and the record-vs-direct equivalence test; `mul_phase1_
+default_matches_the_measured_verdict`'s per-language loop updated in place,
+not counted as new). `cargo test --release -p sem-cli`: **250/250**.
+`rustfmt --check` clean on every touched file (`scope_resolve.rs`,
+`facts_store.rs`, `resolve_profile.rs`, `examples/facts_corpus_probe.rs`).
+`cargo clippy --release --lib --examples`: 151 warnings before this bead,
+**150 after** — net *fewer* (the old `scan_constructor_calls`'s manual
+`arg_idx` counter, a lint clippy already flagged at the pre-bead commit,
+was replaced by `.enumerate()` inside `apply_ctor_call_facts`), zero new
+warnings attributable to this bead (verified by diffing the pre-bead
+warning locations against the post-bead ones in the same file regions).
+`cargo build --release` clean on `sem-core`, `sem-cli`, and every touched
+example — two pre-existing, unrelated `sem-cli` warnings unchanged.
+
+### Close-out
+
+Python is admitted unconditionally (`mul_precompute_admits("python") ==
+true`, no env switch, no `MUL_RUNTIME_GATES` row) — the same shape as
+phase-2 W2's Rust, not Java's/C#'s gated one, per I6's own fail-safe
+instruction ("under the ceiling → admit unconditionally"). This completes
+MUL-DESIGN.md §6.2's planned admissions: JS/TS+C++ shipped unconditionally
+in phase 1, C# stays gated on memory, Rust and now Python ship
+unconditionally in phase 2, Go stays gated on a real correctness
+regression (not yet root-caused) and Java stays gated on memory. Every
+scope-resolvable language this codebase supports has now been measured
+against the two-tier fast path at least once; what remains open is Go's
+correctness bug (a future bead's job, explicitly not this one's) and
+whichever memory levers (§5.3's two named ones, or a new one) might one day
+promote Java.
+
+`br comments add semx-mul` records this bead's numbers.
+
+Bead: semx-mul (phase-2 W5). Epic: semx-w5k. Prior: semx-mp1 (MUL P1,
+C#/C++), semx-mul phase-2 W0 (CLEAN gate ordering), W1 (Field 10
+mechanized), W2 (Rust admitted unconditionally), W3+W4 (Go/Java measured,
+both stay gated).
+
+## 2026-08-21 — FINALE: the eight-corpus matrix, both deferred verifications, campaign close
+
+W6, the last wave of the MUL phase-2 + subtraction campaign. Two binaries,
+both `sem 0.22.1` by version string (unbumped), distinguished by commit:
+**baseline** = pre-campaign tip `dev-main-022-full`@`fbfc2c3` (worktree
+`.worktrees/sem-baseline-0221`, its own `target/`); **campaign** =
+`perf/mul-phase2`@`9c80258` (worktree `.worktrees/sem-false-things`, shared
+`CARGO_TARGET_DIR` under `sem/crates/target`). Both build clean; `--version`
+sanity confirmed on each.
+
+### The matrix
+
+Protocol: interleaved baseline/campaign cold pairs (order alternated pair
+to pair), fresh `SEM_CACHE_DIR` per run, `--no-cache` (which also disables
+`SEM_FACTS_CORPUS_DIR`/`FactsStore` — cold means cold, no cross-run facts
+persistence engaged on either side). Full-CLI wall = wall-clock around
+`sem graph --no-cache --json <repo> > /dev/null`. Engine = `SEM_TIMINGS=1`'s
+`full_graph_build` phase from the same invocation. 3 pairs (6 cold runs) per
+corpus, median ± spread (max−min across the 3 same-binary runs). Warm
+rebuild: one pair, persistent `SEM_CACHE_DIR` primed then re-measured
+(hits `index_fast_path`, the SQLite entity-cache path — not
+`full_graph_build` — on both binaries identically). Peak RSS: one
+order-swapped pair via `/usr/bin/time -l`, `--no-cache` cold. `uptime`
+logged at the start and end of every batch.
+
+**Cold (median of 3 interleaved pairs):**
+
+| corpus | wall base (ms) | wall camp (ms) | Δwall | engine base (ms) | engine camp (ms) | Δengine | expectation |
+|---|---:|---:|---:|---:|---:|---:|---|
+| home-assistant/core | 4,832 | 3,546 | **-26.6%** | 4,293.6 | 3,010.4 | **-29.9%** | ≈-26% engine (W5) |
+| microsoft/TypeScript | 10,015 | 9,694 | -3.2% | 9,034.3 | 8,818.8 | -2.4% | flat (P1 unconditional, unchanged) |
+| rust-lang/rust | 11,436 | 9,939 | **-13.1%** | 10,537.2 | 8,984.6 | **-14.7%** | ≈-15% cold (W2) |
+| kubernetes/kubernetes | 14,957 | 15,263 | +2.0% | 13,462.0 | 14,178.1 | +5.3%† | flat (Go gated) |
+| elastic/elasticsearch | 11,572 | 11,992 | +3.6%† | 9,553.9 | 9,958.9 | +4.2%† | flat (Java gated) |
+| dotnet/runtime | 38,918 | 39,674 | +1.9% | 36,610.6 | 37,452.3 | +2.3% | flat (C# gated) |
+| torvalds/linux | 21,703 | 21,496 | -1.0% | 17,714.6 | 17,498.8 | -1.2% | flat (C, untouched) |
+| llvm/llvm-project | 23,889 | 23,836 | -0.2% | 20,886.0 | 20,902.2 | +0.1% | flat (C++, P1 unconditional) |
+
+† kubernetes and elasticsearch both crossed the >3% flat-corpus
+investigation threshold on first pass — see **Attribution: the two
+flat-corpus flags** below. Both were re-run and resolved as load noise, not
+regressions; the table above reports the original first-pass numbers
+per the "report absolute numbers, don't average away" rule, with the
+resolution documented separately rather than silently folded in.
+
+**Warm rebuild (1 pair, index-cache hit path, both binaries):**
+
+| corpus | wall base (ms) | wall camp (ms) | Δ |
+|---|---:|---:|---:|
+| home-assistant/core | 209 | 208 | -0.5% |
+| microsoft/TypeScript | 289 | 287 | -0.7% |
+| rust-lang/rust | 302 | 305 | +1.0% |
+| kubernetes/kubernetes | 374 | 373 | -0.3% |
+| elastic/elasticsearch | 802 | 673 | -16.1% |
+| dotnet/runtime | 959 | 795 | -17.1% |
+| torvalds/linux | 1,447 | 1,285 | -11.2% |
+| llvm/llvm-project | 993 | 822 | -17.2% |
+
+Every warm run on both binaries hits `index_fast_path` (the SQLite
+entity-cache path), which phase 2 never touches — there is no engineering
+reason for baseline and campaign to differ here. The four double-digit
+deltas above (elasticsearch/dotnet/linux/llvm, all -11% to -17%, all
+*favoring* campaign) are a single unreplicated sample apiece, taken while
+`uptime` load averages were 10–21 (§ caveats) — read as noise, not signal.
+Flagging rather than hiding it: a real, unexplained warm-path win this
+size would be worth its own investigation, but one sample under load is
+not evidence of one.
+
+**Peak RSS (1 order-swapped pair, `/usr/bin/time -l`, cold):**
+
+| corpus | RSS base (bytes) | RSS camp (bytes) | Δ | expectation |
+|---|---:|---:|---:|---|
+| home-assistant/core | 1,845,329,920 | 1,803,354,112 | **-2.3%** | net decrease (W5, confirmed) |
+| microsoft/TypeScript | 2,398,552,064 | 2,381,021,184 | -0.7% | flat |
+| rust-lang/rust | 2,554,904,576 | 3,095,281,664 | **+21.2%** | ≈+11% (W2) — **see finding below** |
+| kubernetes/kubernetes | 3,653,156,864 | 3,640,426,496 | -0.3% | flat |
+| elastic/elasticsearch | 4,973,494,272 | 5,050,892,288 | +1.6% | flat (Java gated) |
+| dotnet/runtime | 8,360,673,280 | 8,533,671,936 | +2.1% | flat (C# gated) |
+| torvalds/linux | 7,094,206,464 | 7,254,392,832 | +2.3% | flat |
+| llvm/llvm-project | 7,185,137,664 | 7,173,406,720 | -0.2% | flat |
+
+### Finding: Rust's memory fence re-measures above W2's original ceiling
+
+W2 (phase-2, `adde06a`) measured Rust's admission at **+11.16%/+11.28%**,
+two order-swapped `/usr/bin/time -l` pairs on rust-lang/rust, safely under
+the +15% ceiling that separated "unconditional" (Rust, Python) from "gated"
+(Java, C#). This wave's re-measurement, same corpus, same protocol, **two
+independent order-swapped pairs**, both above that same ceiling:
+
+| pair | order | base maxRSS | camp maxRSS | Δ |
+|---|---|---:|---:|---:|
+| 1 | base→camp | 2,554,904,576 B | 3,095,281,664 B | **+21.15%** |
+| 2 | camp→base | 2,575,794,176 B | 3,045,064,704 B | **+18.22%** |
+
+Unanimous direction, both above +15%, both well above W2's +11% — not a
+one-off. Investigated (not fixed — outside this wave's lane): the obvious
+hypothesis is W5's `FACTS_SCHEMA_VERSION` 2→3 bump, which added a new
+`ctor_call_sites: Vec<CtorCallFacts>` field to the shared
+`PrecomputedFileFacts` struct (`scope_resolve.rs:1157`) — a field every
+precomputed file's facts record now carries, Rust's included, even though
+`mul_precompute_consumes_calls` is Python-only and the field stays an empty
+`Vec` for every Rust file. Ruled out by back-of-envelope: an empty `Vec` is
+24 bytes (ptr+cap+len) on this target; rust-lang/rust's own W2 engagement
+census was ~38,420 precomputed files, so the field's own footprint is
+≈920 KB corpus-wide — three orders of magnitude too small to move a
+multi-GB RSS by double-digit percentage points. No other diff touches
+Rust's own producer/consumer path between `adde06a` and `9c80258` (the
+intervening commits are W3+W4's Go/Java work and W5's Field 11/Python
+work, `git log adde06a..HEAD -- crates/sem-core/src` shows exactly two
+commits, both reviewed above). Root cause not found this wave — **filed as
+an open question**, not silently accepted: Rust shipped unconditionally on
+W2's numbers, and this wave's numbers say the memory ceiling that decision
+rested on no longer clearly holds. Recommend a follow-up bead re-running
+W2's exact toggle-based comparison (interim env-gate on/off within one
+binary, not pre-bead-vs-this-bead across two) to isolate whether this is a
+genuine drift in Rust's own cost or an artifact of comparing binaries eight
+commits apart instead of one flag apart.
+
+### Attribution: the two flat-corpus flags (kubernetes, elasticsearch)
+
+Both crossed the >3% engine-metric threshold on their first pass
+(kubernetes engine +5.3%, elasticsearch wall +3.6%/engine +4.2%) — both
+flat-expected (Go and Java stay gated off by default; the fast path is not
+engaged on either corpus by either binary). Per this wave's own
+instruction ("investigate, don't average away"), both were re-run as a
+fresh 3-pair batch once `uptime` showed load had dropped (from 17–25 down
+to 5.5):
+
+| corpus | 1st-pass Δengine | load during 1st pass | re-run Δengine | load during re-run |
+|---|---:|---|---:|---|
+| kubernetes | +5.3% | 7.95→17.02 | **-0.9%** | 5.57→19.15 |
+| elasticsearch | +4.2% | 14.36→17.98 | **-1.4%** | 17.45→19.20 |
+
+Pooled medians across both batches (6 pairs each): kubernetes wall
++1.9%/engine +1.9%; elasticsearch wall -1.7%/engine +0.3% — both flat
+within noise. **Attribution: load, not a regression.** `uptime` climbed
+steadily across the whole matrix run, 7.6 at the first (home-assistant)
+batch to a peak of 25.5 during the linux batch, before settling back to
+5.5 by the time the re-runs started — this session's sibling waves
+(a3b-rust-edges through w5-python, per the team roster) were running
+concurrently on the same box for at least part of this wave, which the
+campaign's own measurement discipline calls out as exactly the confound
+interleaving controls for *within* a pair but not *across* corpora
+measured at different points in a rising-load window. Conclusion holds:
+kubernetes and elasticsearch are flat, as their gated-off status predicts.
+
+### Oracle battery (campaign binary, `index_probe write`)
+
+| corpus | ORACLE (names) | REFS_ORACLE | FILES_ORACLE | TESTS_ORACLE | TRIGRAM_ORACLE | REFS_MUTATION |
+|---|---|---|---|---|---|---|
+| home-assistant/core | PASS 95,580 | PASS 318,638 | PASS | PASS 318,638/50,853 | PASS 6 patterns | PASS (mismatched=1 injected, caught) |
+| microsoft/TypeScript | PASS 86,796 | PASS 714,819 | PASS | PASS 714,819/4,295 | PASS 6 patterns | PASS (caught) |
+| llvm/llvm-project | PASS 560,360 | PASS 2,760,885 | PASS | PASS 2,760,885/326,111 | PASS 6 patterns | PASS (caught) |
+
+`SEM_FP_PARITY=1 incr_probe … all` (8 scenarios: none/leaf/mixed50/hub/
+hubrename/tests/importchurn/cold-vs-build), cold and warm cache, campaign
+binary:
+
+| corpus | cold | warm |
+|---|---|---|
+| home-assistant/core | 8/8 `ORACLE ok` | 8/8 `ORACLE ok` |
+| rust-lang/rust | 8/8 `ORACLE ok` | 8/8 `ORACLE ok` |
+
+Zero mismatches anywhere in the battery. No oracle FAIL, no MUTATION
+false-negative.
+
+### Deferred verification (a): semx-kkk, TESTS_ORACLE at llvm scale
+
+Predicted by the YAML multi-doc id fix (`39e33c3`, semx-vlg/semx-kkk/
+semx-0lj): llvm-project's original 1/2,751,958 `is_test` mismatch, caused
+by YAML documents' top-level keys colliding across `---`-separated
+documents in the id-uniqueness scheme, disappears once the fix lands. Now
+verified directly, not inferred: `TESTS_ORACLE checked=2,760,885
+tests=326,111 mismatched=0 ms=2026.2 verdict=PASS` on the full llvm-project
+checkout with the campaign binary. **0/2,760,885 — clean.** (Entity/test
+counts differ slightly from the original sweep's 2,751,958/325,529, tracked
+to upstream corpus drift on the llvm-project checkout since the original
+sweep — every other oracle in the same run also passes, so this is not a
+new correctness gap.) `semx-kkk` closed via `br close` with this number in
+the closing comment.
+
+### Deferred verification (b): semx-o0x, REFS_ORACLE wall-time at llvm scale
+
+The pre-fix pathology: `REFS_ORACLE` on llvm-project took **1,634.7s**
+(27.2 min), a Σcount(name)² blowup from a per-entity NAMES-bucket re-scan.
+The O(n) id→slot-map fix (`2fff39e`) measured 40–135x cuts on
+home-assistant/core and the TypeScript monster, but llvm itself was
+unavailable at fix time — left as the bead's own "LLVM PENDING" note. Now
+measured directly: `REFS_ORACLE entities=2,760,885 checked=2,760,885
+mismatched=0 kind_mismatched=0 typed=true ms=4454.5 verdict=PASS` —
+**4.45 seconds**, a **~367x** wall-time cut, exceeding the 40–135x range
+measured on the two smaller corpora. Addendum comment added to the
+(already-closed) `semx-o0x` bead with this number.
+
+### Admission scoreboard (final)
+
+| language | status | cold win | memory | correctness |
+|---|---|---|---|---|
+| JS/TS | unconditional (P1) | — (P1 baseline) | — | clean |
+| C++ | unconditional (P1) | flat on llvm/linux (already admitted) | — | clean |
+| Rust | unconditional (W2) | -13.1% to -14.7% cold, this wave | **+18–21% re-measured, above the +15% ceiling — open finding** | clean |
+| Python | unconditional (W5) | -26.4% engine (HA, W5); -26.6%/-29.9% this wave | net decrease (HA) | clean |
+| C# | gated (`SEM_MUL_CSHARP`), off by default | n/a while gated | +21–33% over ceiling (P1) | clean |
+| Java | gated (`SEM_MUL_JAVA`), off by default | n/a while gated | +21% over ceiling (W3+W4) | clean |
+| Go | gated (`SEM_MUL_GO`), **must not be flipped even for re-measurement** | n/a while gated | passes (-1.4%/+0.6%, W3+W4) | **fails** — `edge_dump_probe` diverges on kubernetes at scale (semx-u3rk, unfixed) |
+
+### Subtraction tally (campaign-wide, W1–W6 of this session's arc)
+
+FALSE-THINGS (8 waves) + subtraction passes + the unified `DiskCache`
+(semx-r94) removed a net **-1,271 LOC** from `sem-core` ahead of this
+wave's phase-2 additions — MUL phase 2 itself is net-additive (new
+required surface: Field 10 `+386`/`+83` excl. tests at W1, Field 11's own
+addition at W5), by design (§4.3's fields are new required semantics, not
+removable duplication). The campaign's net shape: subtract dead weight
+first, then add only the semantics the measured bottleneck actually
+required.
+
+### Caveats
+
+- **Load.** This box ran other agents' work concurrently for parts of this
+  wave (`uptime` 1-minute load average ranged 5.5–25.5 across the full
+  matrix run, roster: a3b-rust-edges through w5-python). The campaign's own
+  measurement discipline — interleave within a pair — controls for load
+  *within* each pair but not for a rising-load trend *across* corpora
+  measured sequentially at different points in that trend. Two flat-corpus
+  candidates (kubernetes, elasticsearch) crossed the 3% investigation
+  threshold on first pass and were re-run once load dropped; both resolved
+  to flat. See the attribution section above.
+- **llvm partial-clone provenance.** llvm-project was mid-re-materialization
+  from a partial clone at the start of this wave; verified ready before use
+  (182,424 tracked files, 39,042 `.cpp` files, both above the readiness
+  bar) and used for the full matrix plus both deferred verifications.
+- **Rust memory finding.** See the dedicated section above — an open
+  question, not resolved this wave, surfaced rather than averaged away.
+- **Warm-path deltas.** Single-sample, under load, on a code path phase 2
+  never touches — noted, not claimed as a real effect (see the warm-rebuild
+  table above).
+
+### Gates
+
+`cargo test --release -p sem-core`: 731/731 (unchanged from W5 — no source
+touched this wave). `cargo test --release -p sem-cli`: 250/250. Both
+re-run this wave to confirm, both green, zero regressions.
+
+Bead: semx-mul (finale, W6). Epic: semx-w5k. Deferred verifications closed:
+semx-kkk (closed), semx-o0x (addendum, already closed). Prior: semx-mp1,
+W0–W5 (this file, above).
+
+## 2026-08-22 — Rust demoted to a gated switch (semx-j1fw)
+
+The W6 finale's re-measurement (above) and semx-j1fw's own follow-up
+(reproduced in its bead comments, both quoted here) agree: Rust's
+same-binary peak-RSS delta no longer clears the +15% ceiling that
+justified W2's unconditional admission. This bead demotes it —
+`mul_precompute_admits("rust")` now routes through an env-gated
+`rust_precompute_enabled()` (`SEM_MUL_RUST`), same shape as
+`csharp_precompute_enabled`/`go_precompute_enabled`/`java_precompute_enabled`,
+and `MUL_RUNTIME_GATES` gained a `"rust"` row with `pre_switch_salt =
+"ts-0.23"` — the pre-W2 salt, so a switched-off build shares corpus
+entries with the pre-Field-10 world exactly as C#'s/Go's/Java's rows do.
+`LANGUAGE_SALTS`'s `("rust", "ts-0.23-mp2")` is unchanged: per
+`resolve_gated_salt`, that table entry now serves as the switched-**on**
+salt (isolating richer entries from the pre-switch `None`s), the same
+role W2 originally gave it as an unconditional bump.
+
+**The numbers being acted on** (semx-j1fw's own re-verification, isolating
+the admission variable exactly — one throwaway worktree at campaign HEAD
+`602dc6e`, `mul_precompute_admits("rust")` flipped `true`→`false` in place,
+built OFF and ON from the identical source tree otherwise, `--no-cache` to
+remove the shared-corpus-warmth confound RESOLUTION-PROFILE.md's own W4
+section already documented):
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 2,574,876,672 B | 3,031,154,688 B | **+17.72%** |
+| 2 | ON→OFF | 2,559,868,928 B | 3,062,611,968 B | **+19.64%** |
+| 3 | OFF→ON | 2,567,471,104 B | 3,064,283,136 B | **+19.35%** |
+
+Unanimous direction, all three above the +15% ceiling, closely matching
+the finale's own +18.2%/+21.2% reading — not a binaries-eight-commits-apart
+artifact (everything but the one predicate was held fixed). W2's original
++11.16%/+11.28% same-binary reading is the outlier that needs explaining,
+not this one: W2's protocol used bare "fresh `SEM_CACHE_DIR`" with `sem
+find <nonexistent>`, not `--no-cache`, and RESOLUTION-PROFILE.md's own later
+W4 finding ("every 'cold' build this campaign has measured was already a
+known-content build" — `SEM_CACHE_DIR`'s parent aliases the facts-corpus dir
+across runs sharing a tmp root) means the ON side of W2's original
+measurement plausibly benefited from partial corpus warmth that a true
+`--no-cache` run does not get, understating W2's own delta. Cold wall stays
+consistent with W2's direction throughout (ON still ~16% faster than OFF)
+— only the RSS magnitude moved, not the wall-time tradeoff shape.
+
+### Gates
+
+`edge_dump_probe` sha256, rust-lang/rust, this bead's binary: **bit-identical
+OFF vs ON** (309,429 edges, single matching sha256 both sides) — matches W2's
+original correctness proof exactly; the demotion is a gating decision, not a
+behavior change, so this was expected rather than newly discovered.
+
+`facts_corpus_probe` populate/consume, a real two-copy corpus
+(`library/core`, 317 files — 288 `.rs` + 29 non-Rust siblings such as
+`Cargo.toml`): OFF/OFF **317/317 hits**, `ORACLE ok`, negative probe `ok`;
+ON/ON **317/317 hits**, `ORACLE ok`, negative probe `ok`. Adversarial
+cross-salt proof (populate with the OFF-salt corpus, consume with
+`SEM_MUL_RUST=1`): **`corpus_hits=29/317`** — exactly the 29 non-Rust files
+(their own languages' salts are untouched by this gate), **zero** of the
+288 Rust files hit, `ORACLE ok` (the resulting rebuild is still correct
+despite the miss). This is a sharper proof than W2's original pure-Rust
+corpus gave (a flat `corpus_hits=0`): it demonstrates the salt bump's
+isolation is scoped to Rust specifically, not an accidental corpus-wide
+miss.
+
+`cargo test --release -p sem-core`: 656/656 lib (unchanged count — the
+gate-table tests that generalize over `MUL_RUNTIME_GATES`
+(`csharp_salt_tracks_the_mul_phase1_switch` in `facts_store.rs`, the
+skip-by-table-membership salt-parity test) pick up the new `"rust"` row
+automatically; the two tests that hardcode a per-language default
+(`mul_phase2_rust_default_matches_the_measured_verdict` in
+`scope_resolve.rs`, plus a fixed comment in
+`mul_phase1_default_matches_the_measured_verdict`) were edited in place to
+assert the new default). `cargo test --release -p sem-cli`: 250/250.
+`cargo test --release -p sem-core --example facts_corpus_probe`:
+`language_salts_match_sem_core_table` still passes (the mirror table's
+`("rust", "ts-0.23-mp2")` entry is untouched — only `MUL_RUNTIME_GATES`,
+which that probe already consults dynamically, changed). `cargo build
+--release -p sem-core --lib --examples -p sem-cli --bin sem`: clean (the
+same two pre-existing, unrelated `sem-cli` warnings, unchanged count).
+
+**Admission scoreboard, corrected**: Rust moves from "unconditional" to
+"gated (`SEM_MUL_RUST`), off by default" — memory-blocked like C#/Java, not
+correctness-blocked like Go. Python is now the only phase-2 language shipped
+unconditionally.
+
+Bead: semx-j1fw. Epic: semx-w5k. Prior: semx-mul phase-2 W2 (original
+admission), W6 finale (re-opened the question).
+
+## 2026-08-22 — Python's fence re-derived with semx-j1fw's corrected protocol (F1)
+
+Rust's demotion above leaves an obvious loose end: W5's Python memory
+fence (§ above, "-7.95%/-7.80%, a net decrease") was measured the same way
+W2's Rust fence originally was — `/usr/bin/time -l`, "cold (fresh
+`SEM_CACHE_DIR` each run)", **no `--no-cache`**. That is exactly the gap
+this section's own W4 finding says silently aliases a shared facts-corpus
+dir across runs sharing a tmp root, and exactly the gap semx-j1fw named as
+the most plausible explanation for W2's Rust reading being an outlier. If
+it inflated Rust's favorable-looking number into an artifact, it could
+just as easily have inflated Python's.
+
+**Protocol** (semx-j1fw's, applied verbatim): throwaway worktree at
+campaign HEAD `7607f39`, `mul_precompute_admits("python")` flipped
+`true`→`false` in place (`scope_resolve.rs`; the sole call site is
+`graph.rs:2212`, `lang_id.is_some_and(scope_resolve::mul_precompute_admits)`
+— confirmed by reading `mul_precompute_consumes_imports`/
+`mul_precompute_consumes_calls`, both of which are only ever consulted
+from inside `precompute_scope_resolvable_file_facts`, the producer this
+gate already prevents from running at all when admission is `false`; no
+companion flip needed for a clean OFF, same as Rust). OFF built in the
+throwaway worktree (its own `CARGO_TARGET_DIR`); ON built from the
+unmodified campaign worktree against the shared cache
+(`sem/crates/target`, already current — 0.31s no-op build). Both binaries
+confirmed distinct by hash. `/usr/bin/time -l <bin> graph --no-cache --json
+<HA-checkout> >/dev/null`, fresh `SEM_CACHE_DIR` per run, home-assistant/core
+(`e9737b7271`, clean).
+
+Three order-swapped pairs were run first, per protocol. They came back
+sign-mixed (-1.63%, +0.79%, -2.39%) — nothing like W5's unanimous
+same-direction reading — so two more order-swapped pairs were added before
+writing anything down, rather than reporting an n=3 result that could
+itself have been a coin flip:
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 1,854,275,584 B | 1,824,112,640 B | **-1.63%** |
+| 2 | ON→OFF | 1,847,754,752 B | 1,862,320,128 B | **+0.79%** |
+| 3 | OFF→ON | 1,869,561,856 B | 1,824,882,688 B | **-2.39%** |
+| 4 | ON→OFF | 1,841,954,816 B | 1,826,177,024 B | **-0.86%** |
+| 5 | OFF→ON | 1,858,584,576 B | 1,812,840,448 B | **-2.46%** |
+
+Median **-1.63%**, 4 of 5 pairs negative, one positive. `instructions
+retired` (also captured by `/usr/bin/time -l`) is a cleaner corroborating
+signal that the flip is doing what it should regardless of the noisy RSS
+read: OFF consistently ~519-520B instructions, ON consistently ~398-401B
+— unanimous and tight across all five pairs, confirming ON is doing
+materially less work (the fast path firing) even though its peak-RSS
+footprint barely moves relative to OFF's on this corpus at this scale.
+
+**This does not reproduce W5's claimed magnitude or its full unanimity.**
+-1.63% median is roughly a fifth of -7.95%/-7.80%, and one of five pairs
+inverted sign entirely — a materially weaker and less certain result than
+"a net decrease, not merely under the ceiling" as W5's own section
+characterized it. The likely mechanism is the same one semx-j1fw named for
+Rust: W5's protocol lacked `--no-cache`, so its OFF and/or ON runs
+plausibly inherited partial corpus warmth from `SEM_CACHE_DIR`'s aliased
+parent, which would distort the reading in either direction depending on
+which side benefited more from residual warmth — unlike Rust, where the
+distortion happened to flip a passing number into a failing one, here it
+plausibly inflated an already-passing number into a much larger
+favorable-looking one. `SEM_MUL_PYTHON`'s toggle-based first measurement in
+W5 shares the identical gap and is not independently trustworthy either.
+
+**Verdict (I6): STANDS.** The +15% ceiling was never in play for Python
+under either protocol — the corrected reading (-2.46% to +0.79%) is as far
+from the ceiling as W5's claimed reading was. Unlike Rust, there is no
+ceiling-crossing to act on, so no demotion, no gate, no `MUL_RUNTIME_GATES`
+row, no salt change. This bead's contribution is exclusively to the
+record's honesty: `mul_precompute_admits("python")` stays `true`
+unconditionally, but the doc's characterization of *why* is corrected from
+"a net decrease" to "no measurable peak-RSS cost either way, comfortably
+inside the ceiling regardless."
+
+No code change; no commit required beyond this doc pair. No suites to
+re-run — nothing in `mul_precompute_admits`, `mul_precompute_consumes_
+imports`, or `mul_precompute_consumes_calls` was touched (the throwaway
+worktree's flip was never merged and is deleted after this section is
+written). Correctness of the admission itself was already proven
+bit-identical by W5's own `edge_dump_probe`/`incr_probe`/`facts_probe`/
+`facts_corpus_probe` gates, none of which this re-derivation had reason to
+re-run since nothing about *what* the fast path produces was in question —
+only the memory-fence number was.
+
+**Admission scoreboard, unchanged**: Python remains the only phase-2
+language shipped unconditionally — the number behind that decision has now
+actually survived the corrected protocol, where before this bead it had
+only survived W5's own (uncorrected) one.
+
+Bead: F1 (memory campaign re-derivation task; no new tracker bead filed —
+posted as a comment on semx-bpn2 instead, per the task's own instruction,
+since the outcome here is "confirmed as-is" rather than a new finding that
+would warrant its own record). Epic: semx-w5k. Prior: semx-mul phase-2 W5
+(original admission and its memory-fence claim), semx-j1fw (the corrected
+protocol this bead reuses verbatim).
+
+## 2026-08-22 — go_pkg_index's bare-segment collision, half-fixed (semx-u3rk)
+
+W3+W4 (above) named two compounding issues: (1) `build_go_pkg_index` keys
+packages by bare last-path-segment, colliding kubernetes's dozens of `v1`
+directories into one bucket; (2) something fast-path-specific increases how
+often type-directed resolution fails for Go, exposing (1) more often. This
+bead fixes (1), confirms (2) is real and separate, and measures both halves.
+
+### The fix
+
+`ImportStmtFacts::GoImport { packages: Vec<String> }` now records each
+import spec's *full* path (previously reduced to its bare last `/` segment
+at recording time, in both `collect_go_import_pkg_names` and
+`build_import_stmt_facts`'s string-literal branch). `build_go_pkg_index`'s
+bucket values grew a third field — the entity's declaring directory
+(`registry::go_package_dir`, made `pub(crate)` to share the exact notion
+`resolve_go_method_parent_ids` already uses for same-package cross-file
+pairing) — via a new `GoPkgIndex` type alias,
+`HashMap<String, Vec<(String, String, String)>>`. `register_go_package_
+imports` derives the bare bucket key from the full import path (unchanged
+O(1) lookup), then — only when the bucket holds more than one distinct
+declaring directory — picks the one whose trailing path segments overlap
+the import path's trailing segments longest (`select_go_pkg_candidate`,
+ties broken by lexicographically smaller directory) and inserts only that
+candidate's entries into the file's `import_table`. A single-directory
+bucket (the common case) short-circuits without calling the comparator at
+all.
+
+Two production call sites needed the same fix: `scope_resolve::build_go_
+pkg_index` (used by warm/incremental rebuild paths) and a second,
+hand-duplicated inline copy inside `EntityGraph::build`'s own cold-build
+path (`graph.rs`, ~line 2760) that never called the shared function at
+all. Both now carry `decl_dir` per entry. **Secondary finding, not fixed
+here:** the inline copy has no `.go`-extension filter (unlike `scope_
+resolve::build_go_pkg_index`, which excludes non-`.go` entities before
+indexing) — a pre-existing divergence between the two implementations,
+flagged for a follow-up bead rather than silently patched, since fixing it
+changes behavior beyond this bug's scope and needs its own oracle proof.
+
+`Table::GoPkgIndex`'s read-set fingerprint (`hash_member_list`, a
+2-tuple-only hasher shared with `class_members`/`owner_members`) gained a
+sibling, `hash_go_pkg_entries`, so the new `decl_dir` field is covered by
+incremental invalidation rather than silently dropped from the hash.
+
+### RED → GREEN (unit level)
+
+Two new tests in `scope_resolve.rs`'s test module reproduce the exact
+kubeadm/pod-security-admission collision as a minimal fixture — two
+distinct Go packages, each declared in a directory literally named `v1`,
+each with a `DeepCopyInto` method sharing the same bare exported name:
+
+- `go_package_index_collision_is_real_before_disambiguation`: proves the
+  raw index collision exists (`index.get("v1")` returns both entries, one
+  per declaring directory).
+- `register_go_package_imports_resolves_the_file_own_import_not_a_same_
+  named_collision`: proves a file importing kubeadm's `v1` (full path)
+  resolves `DeepCopyInto` to kubeadm's own method, and — the mirror case,
+  proving this is genuine per-file disambiguation and not a fixture-order
+  coincidence — a *different* file importing pod-security-admission's `v1`
+  resolves to pod-security-admission's own method.
+
+RED proven empirically, not just asserted: temporarily disabling the
+disambiguation (`winner` forced to never match any `decl_dir`, reverting to
+"insert the whole bucket") reproduces the exact predicted failure —
+
+```
+assertion `left == right` failed: a file importing kubeadm's v1 must resolve
+DeepCopyInto to kubeadm's own method, never pod-security-admission's
+  left: Some(".../pod-security-admission/admission/api/v1/types.go::method::DeepCopyInto")
+ right: Some("cmd/kubeadm/app/apis/kubeadm/v1/types.go::method::DeepCopyInto")
+```
+
+Restoring the fix turns it GREEN.
+
+### Corpus-scale proof: RED baseline reproduced, not fully collapsed
+
+Reproduced W3+W4's original RED baseline first, on the actual pre-fix
+binary (this campaign's `dff6de5`, i.e. after the Rust demotion but before
+this bead), on the current kubernetes checkout:
+
+| | OFF | ON |
+|---|---:|---:|
+| edges | 366,905 | 363,487 |
+| sha256 | `2db4539a…` | `c37dfdc0…` |
+
+Bit-for-bit matching W3+W4's original numbers — same edge counts, same
+hashes, confirming the checkout and reproduction protocol line up exactly.
+`diff` between the two: **30,801 lines**, matching W3+W4's own count.
+
+After the fix (same checkout, same corpus, this bead's binary):
+
+| | OFF | ON |
+|---|---:|---:|
+| edges | 334,664 | 331,190 |
+| sha256 | `2e81feac…` | `29a6031f…` |
+
+`diff`: **30,795 lines** — essentially unchanged from the 30,801-line
+baseline, even though both sides' absolute edge counts dropped by ~32k
+each. This is the fix's own signature: it removed a large class of
+cross-package false-positive edges that were present on *both* ON and OFF
+equally (so they never showed up in the ON-vs-OFF diff to begin with),
+while leaving finding (2)'s own ON/OFF-specific divergence essentially
+untouched.
+
+Sampling the remaining diff confirms this reading, not just the line
+count:
+
+```
+cmd/kubeadm/app/apis/kubeadm/types.go::type::ClusterConfiguration::DeepCopy
+  OFF (now correct): Calls cmd/kubeadm/app/apis/kubeadm/v1/types.go::type::ClusterConfiguration::DeepCopyInto
+  ON  (still wrong):  Calls cmd/kubeadm/app/apis/bootstraptoken/v1/types.go::type::BootstrapToken::DeepCopyInto
+```
+
+Two things worth naming precisely: first, `ClusterConfiguration::DeepCopy`
+and `ClusterConfiguration::DeepCopyInto` are declared in the *same*
+package (`cmd/kubeadm/app/apis/kubeadm/`, `types.go` and `zz_generated.
+deepcopy.go` respectively) — a same-package, cross-file method call that
+should resolve via type-directed (`class_members`) tracking and never touch
+`go_pkg_index`/`import_table` at all. OFF gets this right post-fix. ON
+still gets it wrong, and wrong *differently* than before this bead (it
+used to land on `pod-security-admission`'s method pre-fix; now it lands on
+`bootstraptoken`'s v1 instead — still a same-named-package collision, just
+resolved through a different, still-unfixed avenue). Second: `go_pkg_index`
+itself is corpus-wide and built once per `EntityGraph::build` call,
+independent of any single file's admission state, and `register_go_
+package_imports` receives the identical `import_path`/`file_path` on both
+ON and OFF — so this file's own `import_table` entries should be identical
+either way. That they are not confirms finding (2) is real: something about
+the fast path causes this call to reach `go_pkg_index`'s fallback (or a
+wrong branch of it) at all, when a correctly-functioning type-directed
+resolution never should have. Root cause of (2) not isolated this bead —
+handed off as-is, matching the "under-scoped writeup surfaced back" norm
+rather than a silent partial fix.
+
+### Perf: extract_imports_ms
+
+`SEM_PROFILE_RESOLVE=2`, `sem find <nonexistent>`, kubernetes, fresh
+`SEM_CACHE_DIR` per run, `SEM_MUL_GO` unset (OFF — the tax existed on both
+paths per W3+W4, and OFF is the only path anyone runs in production today):
+
+| binary | extract_imports_ms | import_rekey_ms | fused_walk_ms | total scope_build_ms |
+|---|---:|---:|---:|---:|
+| pre-fix (`dff6de5`) | 83,185.67 | 3,227.48 | 3,595.17 | 90,289.63 |
+| post-fix | 24,290.78 | 232.87 | 3,655.73 | 28,444.61 |
+| Δ | **-70.8%** | **-92.8%** | ~flat | **-68.5%** |
+
+For reference, `SEM_MUL_GO=1` (ON) on the post-fix binary: extract_imports_ms
+24,002.11ms, essentially identical to OFF's 24,290.78ms — the fast path
+was never the source of this particular cost; the bare-segment collision
+was, on both paths equally, exactly as W3+W4's own attribution said.
+
+Cold wall (`sem find`, fresh `SEM_CACHE_DIR`, `SEM_MUL_GO` unset, 4
+interleaved pairs, order swapped):
+
+| pair | order | pre-fix | post-fix | Δ |
+|---|---|---:|---:|---:|
+| 1 | pre→post | 12.36s | 8.85s | -28.4% |
+| 2 | pre→post | 12.33s | 8.89s | -27.9% |
+| 3 | pre→post | 12.91s | 9.06s | -29.9% |
+| 4 | post→pre | 8.40s | 12.09s | -30.5% (post still faster) |
+
+Unanimous direction across all 4 pairs, order-swap included.
+
+### Admission decision
+
+Per I6's two-gate test: memory passes (W3+W4's own reading,
+`-1.42%/+0.57%` on kubernetes, not re-checked this bead — the correctness
+gate below already fails on its own, making a fresh RSS re-check moot for
+the decision). Correctness **fails** — `edge_dump_probe` ON vs OFF is
+still not bit-identical (30,795-line diff, above). Go **stays gated**
+(`SEM_MUL_GO`, off by default); `MUL_RUNTIME_GATES`'s "go" row is
+unchanged.
+
+### Salt
+
+`ImportStmtFacts::GoImport::packages`'s *content* changed (full path
+instead of a bare-segment reduction) while its *type* did not
+(`Vec<String>` throughout) — the same category W2/W3+4/W5's own bumps
+established: a content-only producer change gets a `LANGUAGE_SALTS` bump,
+not a `FACTS_SCHEMA_VERSION` bump (which is reserved for shape changes —
+see `facts_store.rs`'s own module doc). `LANGUAGE_SALTS`'s go entry bumped
+`"ts-0.23-mp3"` → `"ts-0.23-mp5"` (mirrored in `facts_corpus_probe.rs`) —
+kept even though the switch stays off in production, so a stale mp3-salted
+entry from a local `SEM_MUL_GO=1` debugging session cannot silently answer
+a post-fix lookup.
+
+### Gates
+
+`cargo build --release -p sem-core --lib --examples -p sem-cli --bin sem`:
+clean (two pre-existing, unrelated `sem-cli` warnings unchanged). `cargo
+test --release -p sem-core`: **658/658** lib (2 new tests over the prior
+656 baseline), all example/integration binaries green. `cargo test
+--release -p sem-cli`: **250/250** across all 21 binaries. `rustfmt
+--check`: clean on every touched file. `cargo clippy --release --lib
+--examples`: 151 warnings before this bead, 151 after — zero attributable.
+
+`edge_dump_probe` on the TypeScript control corpus (microsoft/TypeScript,
+196,175 edges): bit-identical sha256 before/after this bead's change —
+confirms the fix is a structural no-op for every language but Go.
+
+`SEM_FP_PARITY=1 incr_probe … all` (cold-vs-build plus 7 warm scenarios),
+post-fix binary, `SEM_MUL_GO` unset:
+
+| corpus | result |
+|---|---|
+| kubernetes (21,430 files, 546,389 entities, 334,648 edges) | 8/8 `ORACLE ok` |
+| home-assistant/core (22,397 files, 259,399 entities, 310,723 edges) | 8/8 `ORACLE ok` |
+
+`facts_probe` save/load, cross-process, on a real 13-file Go subset
+(kubeadm's `v1` package plus `types.go`/`zz_generated.deepcopy.go` — the
+exact files the collision example above lives in): **4/4 `ORACLE ok`**
+(`none`, `leaf`, `mixed50`, `hub`).
+
+`facts_corpus_probe` populate/consume, cross-repo, on a real two-copy
+corpus of that same 13-file subset: **13/13 hits** OFF/OFF, **13/13 hits**
+ON/ON, `ORACLE ok` both, negative probe `ok` both. I5/F2 adversarial
+salt-clean-miss proof (populate with the OFF/pre-switch-salted binary,
+consume with `SEM_MUL_GO=1`): **`corpus_hits=0/13`**, a clean miss,
+`ORACLE ok` regardless (the resulting rebuild is still correct despite the
+miss).
+
+### Honest residuals
+
+- Finding (2) — the fast-path-specific increase in type-directed
+  resolution failures — is real, evidenced (the `ClusterConfiguration::
+  DeepCopy` sample above), and **not fixed**. A same-package cross-file
+  method call that needs no import resolution at all is landing in the
+  Go-import fallback on the fast path; it should never reach that branch.
+  Follow-up bead should instrument `resolve_ref`'s type-directed branch
+  directly (a hit/miss counter alongside the existing `SCOPE_BUILD_NS`
+  counters) rather than inferring it from `edge_dump_probe` diffs, which
+  this bead's own investigation shows is an unreliable signal once (1)'s
+  noise is removed — the diff line count barely moved even though the
+  underlying correctness improved substantially.
+- The inline `go_pkg_index` duplicate in `graph.rs`'s cold-build path
+  (missing `.go` filter, flagged above) is a second, independent, smaller
+  finding — surfaced, not fixed, per this bead's own scope discipline.
+- RSS was not re-measured post-fix; the correctness gate alone already
+  keeps Go gated, so this was not load-bearing for the decision. A
+  follow-up bead re-measuring RSS after (2) is fixed should do the
+  re-check the admission decision actually needs.
+
+Bead: semx-u3rk. Epic: semx-w5k. Prior: semx-mul phase-2 W3+W4 (original
+finding), W0 (`GoParentsResolved` ordering — confirmed still sound, this
+bead's oracle suite exercises it the same way W3+W4's did).
+
+## 2026-08-22 — M1: the ceiling was measured against the wrong metric — C++
+## and Python demoted, peak memory footprint adopted as standard (I6)
+
+Every MUL admission so far — including both languages shipped
+**unconditionally** (C++ at phase 1, Python at phase 2) — quoted `/usr/bin/
+time -l`'s **`maximum resident set size`** (`getrusage` `ru_maxrss`) against
+the +15% ceiling. macOS's `/usr/bin/time -l` also emits **`peak memory
+footprint`** (`task_info` `phys_footprint`) on the same run, and the two
+fields measure different things: maxRSS counts resident pages, and a page
+the VM compressor has swapped into the compressor **vanishes** from it
+(it is no longer resident); footprint is Apple's own memory-pressure
+accounting and **counts** compressed pages, because that is what actually
+drives jetsam/swap and what a user "runs out of memory" against. One early
+section of this document (the BOW-content "RSS delta" table, dated earlier
+in this file) even labeled a footprint reading "RSS" — the ceiling has been
+calibrated against a mixture of the two metrics throughout the campaign
+without anyone naming the distinction. This bead (M1) re-reads every
+admission against both fields, adopts footprint as I6's standard ceiling
+metric going forward (maxRSS reported alongside for continuity), and
+executes whatever verdicts flip as a result.
+
+### Why this specific pair of languages, and why now
+
+M0's metric audit and F1's Python re-derivation (above) found maxRSS and
+footprint disagreeing in **sign**, not just magnitude, on Python's admission
+— maxRSS read a small decrease, footprint a large increase — and named the
+mechanism: Python's fast-path facts are exactly the kind of content (short,
+repetitive identifier strings — `self`, `hass`, `async_setup`, import
+targets) a page compressor eats, while C++'s original phase-1 fence had a
+similarly thin, single-run, non-`--no-cache` original measurement
+(semx-mp1: +5.8%/+6.5%, no `--no-cache`, no fresh `SEM_CACHE_DIR` per run —
+precisely the protocol gap semx-j1fw named for Rust's own outlier +11%
+reading). Since these are the *only two* languages shipped unconditionally,
+this is the highest-stakes pair to re-verify before trusting the new metric
+enough to act on it for anyone else.
+
+### Step 1 — the allocator probe: does `ps` diverge, and does mere
+### compressibility diverge the two `/usr/bin/time -l` fields?
+
+A standalone Rust program (scratch dir, not the repo — three small binaries:
+`mixed`, `compressible`, `random`) allocated and held large contiguous
+buffers of two kinds — a single short pattern tiled across the whole buffer
+(page-uniform, the easy case for any compressor) vs. xorshift64-derived
+high-entropy bytes — sampling `ps -o rss=` on its own pid at each stage and
+reporting `/usr/bin/time -l`'s own two fields at exit. Machine: this Mac,
+64 GB RAM, **under real load** for the whole probe (concurrent campaign
+lanes; `load averages: 8.76 30.55 40.55` at the time of writing, `top`
+showing 18-29 live `cargo`/`rustc` processes throughout) — not an idle
+control, deliberately, since the real question is what this shared machine
+actually does under the conditions every other lane's measurement also ran
+under.
+
+**`ps` family, answered directly and exactly.** Every run showed `ps
+-o rss=` matching `maximum resident set size` bit-for-bit — e.g. the mixed
+probe's `just_before_exit` sample, `ps_rss_kb=14167824` → ×1024 =
+`14,507,884,544` B (v1, before a design fix below) and, on the corrected
+v2 run, `ps_rss_kb=4196144` → ×1024 = `4,296,851,456` B against
+`/usr/bin/time -l`'s own `maximum resident set size: 4296851456` for the
+*same run* — exact equality, not approximate. **`ps -o rss=` is in the
+maxRSS/`getrusage` family, not the footprint family.** Any of sem's own
+internal instrumentation that shells out to `ps` for a resident-memory
+reading (`mem_profile.rs`'s attribution denominators, if it does) inherits
+maxRSS's blind spot to compressed pages, not footprint's.
+
+**v1 design bug, caught and fixed before trusting any number from it:** the
+first `compressible` design used `Vec<Vec<u8>>` — millions of tiny
+individually-heap-allocated short strings — and ballooned to ~14 GB
+resident for a nominal 2 GiB of content purely from per-allocation malloc
+metadata overhead, not from anything about compression. Rewritten to a
+**single contiguous buffer** with the pattern tiled across it (what a real
+page compressor actually sees), which behaved exactly as sized (2 GiB in →
+~2.0-2.1 GB resident) — this is recorded because a false-negative "no
+compression" reading building on the confounded v1 design would have been
+worse than no reading at all.
+
+**Does mere compressibility of actively-held, touched content diverge the
+two fields? On this machine, right now: no — not without inducing real
+memory pressure or letting the content go idle under pressure.** Three
+independent v2 runs — a 2 GiB compressible + 2 GiB random `mixed` probe, a
+standalone 4 GiB-each `compressible` vs. `random` comparison, and a 3 GiB
+`compressible` buffer held **idle** (untouched, no further CPU work) for 20
+seconds under the same real system load — all showed **zero** divergence:
+maxRSS and footprint tracked each other to within ~0.03% (a small, constant,
+non-compression-related offset — plausibly some always-mapped bookkeeping
+footprint counts and getrusage does not) in every case, and `vm_stat`'s own
+`Pages stored in compressor`/`Compressions` counters did not move at all
+during the 20-second idle-hold window (`445,192` → `445,148`, i.e. *other*
+processes' pages got decompressed, none of this probe's own pages got
+compressed). `vm_stat` also confirms the compressor mechanism is real and
+live on this machine independent of the probe — **552,351** total lifetime
+compressions, **445k+** pages resident in the compressor from other
+processes, observed throughout. `top` showed `PhysMem: 57G used ... 3063M
+compressor, 5990M unused` at the time — genuine free headroom, which is
+exactly why a bounded, safety-conscious probe did not reproduce the
+divergence: **this machine is shared with ~20-29 concurrent campaign
+build lanes**, and deliberately forcing tens of GB of additional pressure
+to chase a bigger effect risked destabilizing sibling lanes' builds (their
+own `rustc`/`cargo`/checkout processes), so this bead capped every
+probe allocation at 2-4 GiB and did not escalate further.
+
+**Refined mechanism (not a refutation of the theory — a sharpening of it):**
+the VM compressor targets pages the kernel has reason to reclaim
+(inactive/aged-out, or under active pressure), not merely "pages holding
+compressible bytes while a process actively touches them." A short-lived
+synthetic probe that allocates and immediately holds content never gives
+the kernel that reason. A real corpus build populates facts early (e.g. an
+import table for a file processed early in the pass) and then leaves them
+untouched for the remainder of a multi-second-to-minute build while later
+phases run — exactly the aging/inactivity condition the compressor acts on
+— which a bounded synthetic probe correctly declined to force. Step 2/3's
+real corpus-build results below (Python: maxRSS -1 to -4%, footprint
++25-27%; C++: maxRSS +20-21%, footprint +26-28%) are the direct evidence
+that the mechanism does fire at real corpus-build scale, on this exact
+machine, even though the bounded synthetic probe (correctly, deliberately)
+did not manufacture it.
+
+### Step 2 — Python re-read, both fields
+
+Protocol: F1's exact protocol, verbatim (throwaway worktree at campaign
+HEAD `b11415d`, `mul_precompute_admits("python")` flipped `true`→`false`
+in place, OFF built in its own `CARGO_TARGET_DIR`, ON built from the
+unmodified campaign worktree against the shared cache — confirmed a 0.35s
+no-op, i.e. already current — binaries confirmed distinct by sha256).
+`/usr/bin/time -l <bin> graph --no-cache --json <HA-checkout>`, fresh
+`SEM_CACHE_DIR` per run, home-assistant/core. Both `/usr/bin/time -l`
+fields captured per run this time, not just maxRSS.
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | OFF→ON | 1,837,940,736 B | 1,818,853,376 B | **-1.04%** | 1,396,016,832 B | 1,759,234,160 B | **+26.02%** |
+| 2 | ON→OFF | 1,881,620,480 B | 1,806,630,912 B | **-3.99%** | 1,394,378,456 B | 1,746,929,752 B | **+25.29%** |
+| 3 | OFF→ON | 1,842,905,088 B | 1,811,415,040 B | **-1.71%** | 1,391,085,296 B | 1,772,816,520 B | **+27.44%** |
+
+maxRSS: unanimous negative, median **-1.71%**, closely reproducing F1's own
+**-1.63% median** (four of five negative) — this bead's maxRSS reading is
+not new information, it confirms F1's stood. Footprint: unanimous
+**+25.29% to +27.44%**, spread 2.15 points across three order-swapped
+pairs — tight, not noise — and comfortably above the +15% ceiling under
+I6's corrected metric. The two fields disagree in *sign*: Python's
+admission is a maxRSS win and a footprint loss, exactly the mechanism named
+above (its fast path populates many short, repetitive identifier/import
+strings that the compressor eats once they go idle mid-build, dropping out
+of maxRSS's resident count while still counting against footprint's
+task-level commitment).
+
+**Verdict (I6, corrected metric): Python demoted.** `mul_precompute_admits
+("python")` now routes through `python_precompute_enabled()`
+(`SEM_MUL_PYTHON`), off by default, `MUL_RUNTIME_GATES` gained a `"python"`
+row with `pre_switch_salt = "ts-0.23"` — the pre-W5 salt. `LANGUAGE_SALTS`'s
+`("python", "ts-0.23-mp4")` is unchanged: it now serves as the switched-*on*
+salt, the same role every other gated language's table entry already plays.
+
+### Step 3 — C++ re-read, both fields
+
+Same shape: throwaway worktree at campaign HEAD `b11415d`,
+`mul_precompute_admits("cpp")` flipped `true`→`false` in place, OFF built in
+its own `CARGO_TARGET_DIR`, ON the unmodified campaign worktree's shared-
+cache binary (confirmed distinct by sha256 from OFF). `/usr/bin/time -l
+<bin> graph --no-cache --json <llvm-project-checkout>`, fresh
+`SEM_CACHE_DIR` per run, the **full** llvm/llvm-project checkout (not a
+subdirectory) — llvm colds run ~2-3 minutes each on this loaded machine,
+budgeted for accordingly (three order-swapped pairs, not more).
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | OFF→ON | 6,024,822,784 B | 7,228,571,648 B | **+19.98%** | 5,313,401,920 B | 6,712,367,128 B | **+26.33%** |
+| 2 | ON→OFF | 6,013,321,216 B | 7,246,020,608 B | **+20.50%** | 5,286,253,608 B | 6,748,018,688 B | **+27.65%** |
+| 3 | OFF→ON | 6,006,734,848 B | 7,268,892,672 B | **+21.02%** | 5,273,572,392 B | 6,755,702,832 B | **+28.11%** |
+
+**This is not merely a metric-definition story for C++ — it re-measures
+above the ceiling on the *old* metric too.** maxRSS: unanimous
+**+19.98% to +21.02%**, ~1 point of spread, already above +15% before
+footprint enters the picture at all. Footprint: unanimous **+26.33% to
++28.11%**, ~1.8 points of spread. semx-mp1's original same-binary reading
+(+5.8%/+6.5%, without `--no-cache` or a fresh `SEM_CACHE_DIR` per run) was,
+in hindsight, the same class of artifact semx-j1fw diagnosed for Rust's W2
+outlier — a shared-corpus-warmth confound suppressing the measured delta,
+not a property of the admission itself. Correcting the *protocol* alone
+would have already demoted C++; correcting the *metric* on top makes the
+margin wider still.
+
+**Verdict (I6, corrected metric and protocol): C++ demoted.**
+`mul_precompute_admits("cpp")` now routes through `cpp_precompute_enabled()`
+(`SEM_MUL_CPP`), off by default, `MUL_RUNTIME_GATES` gained a `"cpp"` row
+with `pre_switch_salt = "ts-0.23"` — the pre-MP1 salt. `LANGUAGE_SALTS`'s
+`("cpp", "ts-0.23-mp1")` is unchanged: it now serves as the switched-*on*
+salt.
+
+### Step 4 — cheap re-reads on the already-gated four (confirmations, not
+### decisions)
+
+One order-swapped-equivalent pair each, ON binary + runtime env-var flip
+(no rebuild needed — these three are already runtime-gated switches):
+
+| language | corpus | maxRSS Δ | footprint Δ | verdict |
+|---|---|---:|---:|---|
+| Rust | rust-lang/rust | +20.10% | **+32.92%** | stays gated (footprint makes it worse) |
+| C# | dotnet/runtime | +25.29% | **+29.88%** | stays gated |
+| Java | elasticsearch | +24.19% | **+31.57%** | stays gated |
+
+All three were already known-bad on maxRSS; footprint reads worse in every
+case, consistent with the same compressible-content mechanism (each
+language's fast path populates short repeated tokens — type names, package
+segments, method names — the compressor eats). No demotion needed (already
+gated); recorded for the two-metric record.
+
+### Step 5 — proof battery for both demotions
+
+**`edge_dump_probe` (correctness, bit-identical OFF vs. ON):**
+
+- C++, llvm/llvm-project (full checkout): **982,429 edges**, matching
+  sha256 both sides (OFF default env, ON `SEM_MUL_CPP=1`, same binary — the
+  switch is now runtime, like Rust/C#/Go/Java).
+- Python, home-assistant/core: **310,398 edges**, matching sha256 both
+  sides (OFF default env, ON `SEM_MUL_PYTHON=1`) — the same count W5's
+  original admission measured, confirming nothing about *what* the fast
+  path produces changed, only the default gate state.
+
+**`facts_corpus_probe` (I5/F2 salt correctness), real two-copy corpora:**
+
+- C++ (`llvm/lib/Support`, 219 files after normalization): OFF/OFF
+  **219/219 hits**, `ORACLE ok`, negative probe `ok`; ON/ON **219/219
+  hits**, `ORACLE ok`, negative probe `ok`. Adversarial (populate OFF-salt,
+  consume `SEM_MUL_CPP=1`): **`corpus_hits=49/219`** — the non-C++-source
+  siblings in that directory (headers, `README.md`, build files) whose own
+  salts are untouched by this gate; zero of the C++ source files leak
+  across the salt boundary, `ORACLE ok` regardless.
+- Python (`homeassistant/helpers`, F1's exact 109-file corpus): OFF/OFF
+  **109/109 hits**, `ORACLE ok`, negative probe `ok`; ON/ON **109/109
+  hits**, `ORACLE ok`, negative probe `ok`. Adversarial: **`corpus_hits=
+  0/109`** — a fully clean miss (this corpus is all-Python, so 0 is the
+  correct signature, sharper than C++'s partial-miss reading since there
+  are no untouched-language siblings to leak through), `ORACLE ok`
+  regardless.
+
+**Suites:** `cargo test --release -p sem-core --lib`: **658/658** (two
+pre-existing tests updated in place — `csharp_salt_tracks_the_mul_phase1_
+switch`'s hardcoded "C++ is unconditional" assertion removed, now covered
+generically by the same gate-table loop every other language uses;
+`corpus_isolates_by_language_salt`'s hardcoded `"ts-0.23-mp4"` expectation
+replaced with a live `effective_language_salt("python")` call, since that
+literal was always Python's *switched-on* salt and Python defaults to
+switched-off now). `mul_phase1_default_matches_the_measured_verdict` and
+`mul_phase2_python_default_matches_the_measured_verdict` both updated in
+place to assert the new gated defaults, following the same discipline
+`dff6de5` established for Rust. `cargo test --release -p sem-cli`:
+**250/250**. `rustfmt --check` on all three touched files: clean.
+`cargo clippy --release -p sem-core -p sem-cli`: **zero** warnings
+attributable to any of the three touched files (the repo-wide count moved
+from `dff6de5`'s 151 baseline to 170, entirely pre-existing drift from
+other campaign work landed on this branch since that commit — three
+commits' worth, unrelated to this bead — verified by grepping the full
+clippy output for the touched files' paths and finding no hits).
+`cargo build --release -p sem-core --lib --examples -p sem-cli --bin sem`:
+clean.
+
+### The policy, standing
+
+I6's ceiling is now defined against **peak memory footprint**
+(`task_info`/`phys_footprint`), with maxRSS reported alongside every future
+measurement for continuity and cross-checking, not as the decision metric.
+Every language `mul_precompute_admits` covers is gated as of this bead —
+**no admission remains unconditional**: C# (`SEM_MUL_CSHARP`), Rust
+(`SEM_MUL_RUST`), Go (`SEM_MUL_GO`, additionally correctness-blocked), Java
+(`SEM_MUL_JAVA`), C++ (`SEM_MUL_CPP`, new), Python (`SEM_MUL_PYTHON`, new).
+A future memory lever (MUL-DESIGN.md §5.3 names two, both untaken) could
+promote any of them back to unconditional, but that promotion must be
+measured against footprint from the start, not maxRSS.
+
+**Caveat, stated plainly rather than buried:** this entire two-field
+distinction (`ru_maxrss` vs. `phys_footprint`, and the VM compressor
+mechanics behind their divergence) is **Darwin-specific** —
+`task_info`/`phys_footprint` is a macOS API, and macOS's VM compressor
+behavior (compress-before-swap, opportunistic background compression of
+aged pages) has no exact Linux equivalent by default (Linux's zswap/zram
+are opt-in, not the default path `/usr/bin/time -v`'s `Maximum resident
+set size` measures against, and Linux's `/usr/bin/time -v` does not emit a
+footprint-equivalent second field at all). Every number in this section was
+measured on this one Mac. **Linux re-validation of the ceiling under this
+same two-metric discipline is a separate, explicitly open task** — the
+"12.5-14.2GB default-run linux" figures referenced elsewhere in this
+campaign's in-session discussion are maxRSS-only readings from a different
+measurement session on Linux and must not be read as already covering this
+gap.
+
+### Ledger discipline
+
+Measurement stability was checked before any demotion was executed, per
+this bead's own instruction: footprint's spread across order-swapped pairs
+was ≤2.2 points for Python and ≤1.8 points for C++, both well under the
+5%-spread noise-abort threshold — these are stable, actionable readings,
+not measurement noise dressed up as a policy finding.
+
+Bead: M1 (memory campaign overnight wave). Epic: semx-w5k. Prior: M0
+(metric audit), F1 (Python's corrected-protocol maxRSS re-derivation,
+reused verbatim here with footprint added), semx-j1fw (Rust's demotion —
+the template this bead's code changes and proof battery follow exactly),
+semx-mp1 (C++'s original phase-1 admission), semx-mul W5 (Python's original
+phase-2 admission).
+
+## 2026-08-22 — semx-dm5t: the id-staleness species, closed for Go; the
+## registration-gap sibling attempted and reverted (species generalizes,
+## fix does not — yet)
+
+The re-key wave picked up where semx-u3rk's own honest residual left off:
+"(2) is not fixed by this bead... root cause not isolated this bead." (2)
+was the fast-path-specific increase in Go type-directed resolution
+failures — `ClusterConfiguration::DeepCopy`, a same-package cross-file
+method call needing no import resolution at all, landing in the Go-import
+fallback under `SEM_MUL_GO=1`.
+
+### Root cause, confirmed
+
+`registry::resolve_go_method_parent_ids` — the one cross-file entity
+rewrite this crate performs, moved earlier in the build by W0 so the CLEAN
+gate sees it — rewrites a Go method's `id`/`parent_id` when its receiver
+type is declared in a *different* file of the same package (kubernetes has
+many of these: `internalContainerLifecycleImpl` in
+`internal_container_lifecycle.go`, `PreCreateContainer` implemented per-OS
+in sibling files; `ValidatingAdmissionPolicyStatusControllerOptions`, etc.).
+It runs *after* pass 1's precompute (`precompute_scope_resolvable_file_
+facts`) has already built that file's `PrecomputedFileFacts.entity_scope_
+map`/`entity_inner_scope`/`return_type_map`, keyed by the pre-rewrite id.
+Pass 2 (`scope_resolve.rs`, `entity_inner_scope.get(&entity.id).or_else(||
+entity_scope_map.get(&entity.id))`) looks the entity up by the *post*-
+rewrite id — a clean miss, `.unwrap_or(0)` silently defaulting `scope_idx`
+to the module scope. From scope 0, `resolve_ref`'s type-directed branch
+(the one `in.DeepCopyInto(out)` needs) can't find the real local binding,
+and the call falls through to the Go package-qualified fallback instead —
+exactly the shape of the `ClusterConfiguration::DeepCopy` divergence
+semx-u3rk documented, a distinct mechanism from the bare-segment collision
+it had already fixed.
+
+The counter this bead's prior verification batch landed
+(`ENTITY_SCOPE_LOOKUP`, `SEM_PROFILE_RESOLVE=2`) confirmed it in isolation
+before any fix: kubernetes `SEM_MUL_GO=1` read `fallback_pct=27.10%`
+(44,390/163,779), zero on `SEM_MUL_GO` unset and zero on Python's own
+gated-on precompute (a healthy admitted language) — the id-staleness
+signature, present only where the Go rewrite runs, absent everywhere else.
+
+### The fix (shipped)
+
+Two parts, both scoped to `.go` files by construction (`is_go_file` guards
+every mutation either makes):
+
+1. `resolve_go_method_parent_ids` now returns, alongside the
+   `GoParentsResolved` proof token `clean_gate_dirty_files` requires, the
+   old-id -> new-id map for every entity it actually rewrote
+   (`rekeyed_ids`) and the set of files any of them live in
+   (`rekeyed_files`). The build's call site (`graph.rs`,
+   `EntityGraph::build_incremental_core`) re-keys this build's fresh
+   `PrecomputedFileFacts` for exactly those files
+   (`PrecomputedFileFacts::rekey_entity_ids`, `scope_resolve.rs`)
+   immediately after the rewrite runs and before the CLEAN gate or the
+   session's carried store ever reads them.
+2. The rewrite cascades a method's new id down through every descendant
+   whose `parent_id` embedded the method's old id as a literal prefix
+   (`model/entity.rs::build_entity_id`'s own contract: a child's id is
+   `format!("{parent_id}::{name}")`). Discovered mid-bead: without this,
+   a rewritten method's *own* nested locals/constants/types were left with
+   a dangling `parent_id` — pointing at an id no entity in `all_entities`
+   held any more — which the CLEAN gate's own dirty-file marking
+   (`clean_gate_dirty_files`) then reads directly (`entity.parent_id`
+   against `id_owner`), and which a second attempt at closing the
+   registration-gap species (below) exposed as a live correctness gap on
+   kubernetes itself (`internalContainerLifecycleImpl::PreCreateContainer`,
+   a cross-file method with three nested locals — `allocatedCPUs`,
+   `allNumaNodeCPUs`, `finalCPUSet` — whose `TypeRef` edges depend on
+   correctly-scoped sibling lookups). The cascade is a fixpoint loop over
+   `entities` (bounded by nesting depth, typically 2-4 iterations): an
+   entity whose `parent_id` still names an already-rewritten id gets
+   re-parented and its own id gets the same prefix swap, verbatim suffix
+   (`::name`, any `@Lxx`/`#n` disambiguator) carried over, and its own
+   old->new pair is added to the same map so the next pass can find and
+   fix *its* children in turn.
+
+### Proof
+
+`edge_dump_probe`, kubernetes, `SEM_MUL_GO=1` vs unset, same binary:
+**bit-identical — 0-line diff, sha256 match, 330,558 edges both sides**
+(was 334,664 vs 331,190, a ~30,795-line diff at semx-u3rk's own
+handoff). `ENTITY_SCOPE_LOOKUP`'s honest-miss counter, precomputed-path
+lookups only: `fallback_pct` **27.10% -> 0.00%** for Go's own id-rewrite
+signature.
+
+Unit test: `go_parent_rewrite_id_survives_precomputed_scope_lookup_after_
+rekey` (`scope_resolve.rs`), modeled on W0's own `Hub`/`Ping` cross-file
+receiver fixture — a `PrecomputedFileFacts` with `entity_scope_map`/
+`entity_inner_scope`/`return_type_map` entries seeded under the
+pre-rewrite id, `resolve_go_method_parent_ids` run, then
+`rekey_entity_ids` — asserts the pre-repair state is the bug (all three
+maps miss the post-rewrite id) and the post-repair state is the fix (all
+three hit under the new id, the stale key gone rather than left as a
+dangling duplicate).
+
+Control corpora, same binary, unchanged by construction (`is_go_file`
+guards every mutation) — verified, not assumed: `edge_dump_probe`
+bit-identical before/after this bead's whole diff on **microsoft/
+TypeScript** (196,175 edges, sha256 match), **home-assistant/core**
+(310,398 edges, sha256 match), and **rust-lang/rust** (307,653 edges,
+sha256 match). `SEM_FP_PARITY=1 incr_probe … all` on home-assistant/core:
+**8/8 `ORACLE ok`** (cold-vs-build plus all 7 warm scenarios), cold
+`entities=259399 edges=310723 edge_hash=b82d199d21e45b47` — identical to
+W0's own recorded reading.
+
+### A second, independent species — found, generalized, fix attempted and
+### reverted
+
+The counter's post-fix residual on kubernetes wasn't zero:
+**`fallback_pct=14.01%` (22,953/163,779)**, and every one of the missing
+entity types sampled was `variable`/`constant`/`type` — never `method` —
+nested inside a plain top-level Go *function* (`checkFeatureGateMaps`,
+`extractFeatures`, `stripHeader`, ...), never touched by
+`resolve_go_method_parent_ids` at all. Traced to `scope_visit_node`
+(`scope_resolve.rs`): its class-like and `mod_item` branches both register
+`children_by_parent`'s entries into the scope they create; its
+function-like branch (`is_function_like`) never did — a plain code
+omission, not a conditional failure, present on both the fused walk
+(`precompute_scope_resolvable_file_facts`, everyone but JS/TS) and the
+unfused walk (`build_scopes_from_ast`, JS/TS's `precompute_js_ts_file_
+facts`), since both call the same function. This is exactly semx-9g8q's
+own code-level lead (`scope_visit_node` ~3961, "only registers children
+when `find_at_line` locates the owning class/interface entity") — now
+confirmed to be broader than TS-only and broader than the class-like
+branch's `find_at_line` miss: the function-like branch has no
+registration path *at all*, for any language.
+
+Adding the missing registration loop (mirroring the class-like branch
+exactly) collapsed kubernetes's counter to `fallback_pct=0.00%` too, and
+was the direct trigger for finding the cascade fix above (a rewritten Go
+method's own children only matter once something actually reads
+`children_by_parent` for them). But the decisive experiment on
+microsoft/TypeScript — before/after `edge_dump_probe`, per semx-9g8q's own
+spec — came back **CHANGED, not identical**: 196,175 -> 196,018 edges,
+1,979 diff lines (649 removed, 492 added — not a clean superset in either
+direction). Sampling both sides:
+
+- **Real gains**: `src/compiler/checker.ts`'s deeply-nested
+  `createTypeChecker::getTypeFromTypeNode` (previously invisible to local
+  scope resolution) is now correctly found as the `Calls` target from
+  dozens of sibling functions inside the same closure that reference it —
+  new edges, textually correct.
+- **Real regressions**: `scripts/eslint/rules/no-keywords.cjs`'s
+  `create::checkElements` (a `const NAME = (...) => {...}` arrow function,
+  one of several nested inside a factory `create`) loses its real `Calls`
+  edge to sibling `create::isKeyword` — line 68 of the source,
+  `isKeyword(element.name)`, an unambiguous, present-day-correct call —
+  present before the fix, gone after. Several more of the same shape in
+  the same file and `argument-trivia.cjs`/`debug-assert.cjs`/
+  `jsdoc-format.cjs`.
+
+Root cause of the regression not fully isolated this bead (arrow functions
+have no AST "name" field of their own — `find_at_line`'s own name lookup
+for such a node returns `None` — so a sibling arrow-function-typed child's
+*own* function-like visit never independently registers anything, and its
+resolution depends entirely on inheriting the *parent* function's
+registration; something in that interaction, not yet pinned down, drops
+the sibling lookup for at least this bucket). Per the bead's own gate ("the
+delta must be all improvements before you land it" — CHANGED with any
+non-improvement means STOP-AND-REPORT), **the function-like registration
+fix was reverted** (`scope_visit_node`'s `is_function_like` branch is back
+to its pre-bead shape) rather than shipped with a known regression on a
+path that runs unconditionally for every JS/TS file today. `LANGUAGE_SALTS`
+bumps for the eight non-Go languages that would have needed one for this
+change were reverted alongside it; `go`'s own bump (`ts-0.23-mp5` ->
+`ts-0.23-mp5-dm5t`) stayed, since the rekey + cascade fix's own content
+change (Go-only) is real and shipped regardless.
+
+**semx-9g8q stays open**, now with a materially sharper finding than it
+started with: the missing registration is in the function-like branch
+specifically (not the class-like `find_at_line`-miss lead originally
+suspected as primary), it is demonstrably language-general (confirmed live
+on Go, not just TS), and a naive fix regresses at least one real bucket
+(sibling arrow-function closures) that needs its own root-cause pass before
+a general fix is safe to land.
+
+### Salt / I5
+
+`PrecomputedFileFacts` (`scope_resolve.rs`, `#[derive(Serialize,
+Deserialize)]`) is part of the persisted pack format (`PersistedFile.
+precomputed`, `facts_store.rs`) — not purely an in-memory session
+artifact, contrary to this bead's own opening assumption. Both shipped
+changes are `SemanticEntity`/`PrecomputedFileFacts` *content* changes for
+`.go` files specifically (neither is a shape change —
+`FACTS_SCHEMA_VERSION` untouched), so `LANGUAGE_SALTS`'s `go` entry bumped
+`ts-0.23-mp5` -> `ts-0.23-mp5-dm5t`, following the same "bump even though
+the switch stays off in production" discipline the mp3->mp5 bump already
+established (a stale entry from a local `SEM_MUL_GO=1` debugging session
+must not silently answer a post-fix lookup). `examples/facts_corpus_
+probe.rs`'s deliberate mirror and every hardcoded `"ts-0.23-mp5"`/
+`"ts-0.23-u16"` test literal that needed to track a real table entry were
+updated in lockstep (`corpus_isolates_by_language_salt`-style drift proof
+stayed green throughout, not just at the end).
+
+### Gates
+
+`cargo test --release -p sem-core --lib`: **662/662** (661 + this bead's
+one new test). `cargo test --release -p sem-cli`: **141 + 21 integration
+binaries, all green**. `stem_collision_ground_truth`: **7/7**. Full
+`cargo test --release -p sem-core` (all binaries): green throughout,
+including `scope_resolve_bench` (15), `kappa` (42), `single_pass_
+invariants` (3), `graph_accuracy` (3). `rustfmt --check`: zero diffs
+attributable to any line this bead touched (checked by literal
+line-range/content cross-reference against the pre-bead `HEAD` copy of
+both touched files — the same pre-existing counts, 2 and 6 diffs, in both
+`graph.rs` and `scope_resolve.rs` before and after). `cargo clippy
+--release --lib --examples`: zero warnings attributable to any touched
+file. `SEM_FP_PARITY=1 incr_probe … all` on home-assistant/core: 8/8
+`ORACLE ok`. `edge_dump_probe` bit-identical (sha256) on kubernetes
+(SEM_MUL_GO ON vs OFF), microsoft/TypeScript, home-assistant/core, and
+rust-lang/rust (all before-vs-after this bead's full diff).
+
+Bead: semx-dm5t (closed) / semx-9g8q (still open, sharper finding
+recorded). Epic: semx-w5k. Prior: semx-u3rk (this bead's direct
+handoff — "(2), not fixed"), semx-mul phase-2 W0 (the `GoParentsResolved`
+ordering fix this bead's token threads through unchanged).
+
+## 2026-08-22 — Card 2: the facts plane re-measured at giant scale, D1/D2/D3
+## verified beyond sem-repo, the nested-walk instrument gap sized and mostly
+## falsified as the unattributed-RSS explanation
+
+W5 (semx-gbb) priced the facts plane's marginal peak-RSS cost at **+9.23 GB
+(+86%) on dotnet-runtime** and **+5.78 GB (+49%) on linux**, with no re-read
+since. `DATA-FLOW-AUDIT.md`'s D1/D2/D3 (`populate_delta` serializes from
+references, `export_persisted` returns a borrowing view, shard save streams)
+were verified fixed only at sem-on-sem scale (R5: D2's corpus clone reads
+**+0.0 MB**, was +8.2 MB on a 6,279-entity corpus, "scaled to ~1.3 GB on
+dotnet" but never actually re-measured there). Separately, M1 (I6) replaced
+maxRSS with **peak memory footprint** (`task_info` `phys_footprint`) as the
+admission-ceiling metric, and this HEAD (`26a5b56`) carries a new
+`approx_heap_bytes` nested-string walk aimed at a specific unconfirmed
+hypothesis from the MUL P1 memory-lever bead: that `PrecomputedFileFacts`'
+`return_type_map`/`instance_attr_types`/`init_params`/`attr_to_param` fields'
+**undercounted nested `String` contents** explained the "52-75%
+unattributed" RSS gap that bead found. This card re-prices the plane at
+giant scale under both fields, and closes that hypothesis.
+
+### Method
+
+Binary built once from this worktree's exact `HEAD` (`26a5b56`, `cargo build
+--release -p sem-cli`, 55.75 s), then copied out of the shared
+`CARGO_TARGET_DIR` to a private path (sha256
+`e8e83a03…967d612c`) so concurrent lanes rebuilding into the same target dir
+mid-batch could not silently swap the binary under this card's runs — every
+run below used that one pinned copy. `sem graph --json <root>`, fresh
+`SEM_CACHE_DIR` **and** fresh `SEM_FACTS_CORPUS_DIR` per run (W5's own
+definition of true-cold, `FACTS_CORPUS probed=N hits=0` confirmed on every
+plane-ON run), `/usr/bin/time -l` capturing both `maximum resident set size`
+and `peak memory footprint`.
+
+**The isolation flag.** Read `graph.rs:454-489` rather than assumed:
+`facts_store_for`/`facts_corpus_for` are gated by `no_cache ||
+!env_flag("SEM_FACTS_CACHE", true) || …` — `--no-cache` and
+`SEM_FACTS_CACHE=0` are **not equivalent**: `--no-cache` (`opts.no_cache`)
+*also* disables the on-disk index-image cache (`try_index_graph` at
+`graph.rs:45`, the `if !no_cache { … }` index-write guards at `:607` etc.),
+a completely different tier. `SEM_FACTS_CACHE=0` alone is the flag that
+isolates *only* the facts plane, matching W5's own "true-cold,
+`SEM_FACTS_CACHE=0`" row exactly. This card used the env var, never
+`--no-cache`, for every plane-OFF run.
+
+**Residual noted, not touched**: `~/.cache/checkouts/github.com/torvalds/
+linux` carries 13 modified files (netfilter headers + one litmus test) from
+an earlier bead's fixture use. Small (13/95,453 files), stable across every
+run below, and per W5 §6's own precedent this card left it alone rather than
+risk another lane's in-flight fixture.
+
+### 1. The plane's marginal cost, both metrics — D1/D2/D3 shrank it hard,
+### did not eliminate it
+
+**dotnet-runtime** (3 order-swapped pairs — a 3rd pair was added mid-batch
+because pair 1 and 2 disagreed and the machine's load was visibly climbing;
+see honesty note below):
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint | load (approx, at ON) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | OFF→ON | 9,256,681,472 B | 11,698,028,544 B | **+26.4%** | 8,453,021,376 B | 11,823,623,016 B | **+39.9%** | 3.4 |
+| 2 | ON→OFF | 9,196,847,104 B | 13,939,507,200 B | **+51.6%** | 7,531,421,064 B | 12,200,864,808 B | **+62.0%** | 5.1 |
+| 3 | OFF→ON | 9,340,731,392 B | 14,594,228,224 B | **+56.2%** | 7,567,826,456 B | 12,632,878,792 B | **+66.9%** | 8.6 |
+
+OFF is tight across all three (8.57-8.70 GB maxRSS, 7.01-7.87 GB footprint —
+a stable baseline). **ON climbs with load** (10.90 → 12.98 → 13.59 GB maxRSS
+as background load rose 3.4 → 5.1 → 8.6 across the batch, other campaign
+lanes ramping mid-session) — the plane's own extra allocation traffic reads
+as more load-sensitive than the baseline build. Pair 1, taken at the
+lowest load, is the most trustworthy single reading.
+
+**linux** (2 order-swapped pairs, tight agreement despite load climbing
+6.96 → 13.7 across the window):
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | OFF→ON | 10,880,352,256 B | 12,398,821,376 B | **+14.0%** | 10,555,548,384 B | 11,519,239,672 B | **+9.1%** |
+| 2 | ON→OFF | 10,879,254,528 B | 12,551,258,112 B | **+15.4%** | 10,582,467,368 B | 11,647,133,344 B | **+10.1%** |
+
+Both OFF and ON are stable pair-to-pair on linux (10.13 GB / 11.55-11.69 GB
+maxRSS) even as load nearly doubled — the two pairs agree to ~1.4 points on
+both metrics.
+
+**Verdict: D1/D2/D3 shrank the plane hard at giant scale — it did not
+disappear.** Against the recorded baselines:
+
+| repo | old plane cost (maxRSS) | new plane cost (maxRSS) | shrinkage |
+|---|---:|---:|---:|
+| dotnet-runtime | +9.23 GB (+86%) | **+2.3 to +4.9 GB (+26% to +56%)** | roughly half to three-quarters gone, even at the noisy high end |
+| linux | +5.78 GB (+49%) | **+1.4 to +1.6 GB (+14% to +15%)** | roughly three-quarters gone, tight across both pairs |
+
+Linux's reading is the cleaner of the two (agreement despite heavy load
+drift); dotnet's range is wide but every single pair — including the
+noisiest one — is still well under half the old +9.23 GB figure. **D1/D2/D3
+generalize beyond sem-repo scale**: the sem-repo-only verification in
+`DATA-FLOW-AUDIT.md` R5 was not an overclaim.
+
+### 2. Attribution under the checkpoint table, and the nested-walk hypothesis
+### test
+
+Two flag combinations, both compatible and combined in one run:
+`SEM_PROFILE_MEM=1 SEM_PROFILE_CACHE=1 SEM_PROFILE_RESOLVE=2 SEM_TIMINGS=1`.
+`SEM_PROFILE_CACHE=1` prints `facts_rss_mark`'s five boundaries
+(`entry`/`after_corpus_merge`/`after_warm_start`/`after_export_persisted`/
+`after_populate_delta`); `SEM_PROFILE_MEM=1` prints the four
+`mem_profile::checkpoint` tables inside `full_graph_build`
+(`post-pass-1`/`peak-resolve`/`post-scope-resolve`/`post-build`) that sit
+*inside* the `after_corpus_merge → after_warm_start` span.
+
+**Default mode (every `SEM_MUL_*` off, as this HEAD ships)**, one run each,
+plane ON:
+
+| checkpoint | dotnet attributed/RSS | linux attributed/RSS |
+|---|---:|---:|
+| post-pass-1 | 35% (3,082.2 / 8,696.7 MB) | 48% (3,749.7 / 7,789.7 MB) |
+| peak-resolve | 29% (2,568.9 / 8,832.6 MB) | 40% (3,266.3 / 8,154.5 MB) |
+| post-scope-resolve | 5% (483.4 / 10,242.5 MB) | 0% (16.3 / 8,252.7 MB) |
+| post-build | 25% (2,614.5 / 10,646.3 MB) | 33% (3,189.3 / 9,674.1 MB) |
+
+`precomputed_facts` reads **4.6 MB (dotnet) / 0.0 MB (linux)** at every
+checkpoint — because every `SEM_MUL_*` gate is off by default at this HEAD,
+the MUL fast path barely runs, so this is mostly semx-4w1's original
+pre-MUL baseline (~20-30% attributed) showing through unchanged, not a
+new finding.
+
+**Facts-plane save/populate_delta, both giants (the boundaries a full-CLI
+timer can't see)**:
+
+| boundary | dotnet rss_mb | linux rss_mb |
+|---|---:|---:|
+| entry | 20.5 | 23.3 |
+| after_corpus_merge | 24.2 (+3.7) | 25.1 (+1.8) |
+| after_warm_start | 10,646.3 | 9,674.1 |
+| after_export_persisted | **10,646.3 (+0.0)** | **9,674.1 (+0.0)** |
+| after_populate_delta | 12,339.8 (+1,693.5) | 11,032.2 (+1,358.1) |
+| true peak (`/usr/bin/time -l`) | maxRSS 14,313.8 / footprint 12,598.8 | maxRSS 12,247.3 / footprint 11,199.4 |
+
+**D2 confirmed again, at giant scale, to the same +0.0 MB R5 found on
+sem-repo**: `export_persisted`'s borrowing view costs nothing measurable on
+either giant. **D1 and D3 are not separable by any existing mark** —
+`store.save()` (D3) and `corpus.populate_delta()` (D1) both run between
+`after_export_persisted` and `after_populate_delta` with no boundary between
+them — the combined +1,693.5 MB (dotnet) / +1,358.1 MB (linux) is D1+D3
+together, not attributable to either alone. **A residual gap exists past the
+last mark**: true peak maxRSS exceeds `after_populate_delta`'s sampled RSS
+by ~1.97 GB (dotnet) / ~1.21 GB (linux) — either a transient spike inside
+save/populate_delta that point-sampling missed, or (more likely, since no
+mark covers it) the JSON-serialization-to-stdout step after
+`session.into_parts()` returns, which this instrumentation does not bracket
+at all. Naming this as a gap, not measuring it further — out of this card's
+scope.
+
+**The nested-walk hypothesis, tested directly.** The MUL P1 memory-lever
+bead's leading (explicitly unconfirmed) hypothesis for its own 52-75%
+unattributed gap was `approx_heap_bytes`' undercount of
+`return_type_map`/`instance_attr_types`/`init_params`/`attr_to_param`'s
+nested `String` contents. This HEAD's walk fixes exactly that. Reproducing
+that bead's own scenario (`SEM_MUL_CSHARP=1`, dotnet-runtime, same
+instrument) to compare directly:
+
+| | old (pre-walk, `44c0b4c`) | new (nested walk, `26a5b56`) |
+|---|---:|---:|
+| `precomputed_facts` | 1,089.1 MB | **1,264.5 MB (+175.4 MB, +16.1%)** |
+| post-pass-1 attributed/RSS | 43-48% | **40%** |
+| peak-resolve attributed/RSS | 38-40% | **35%** |
+| post-scope-resolve attributed/RSS | 5% | **4%** |
+| post-build attributed/RSS | 25-29% | **22%** |
+
+**The hypothesis is mostly falsified.** The walk recovered +175 MB of real,
+previously-missed bytes — directionally correct, `precomputed_facts` is now
+in fact the **single largest named structure** at post-pass-1 (1,264.5 MB,
+edging out `all_entities.content`'s 1,053.4 MB) — but +175 MB against an
+~11-12 GB process is under 2% of RSS, and the attributed fraction did not
+improve; if anything it reads slightly lower than the old run (different
+corpus/load state, not a like-for-like rerun, so treat this as a bound, not
+a precise before/after). **The 52-75%-unattributed gap survives this fix
+almost entirely intact.** It is not `PrecomputedFileFacts`' nested strings.
+The remaining unattributed mass is consistent with semx-4w1's original,
+pre-MUL finding (named structures explain ~20-30% of RSS baseline) —
+allocator/heap overhead (`mimalloc` fragmentation, `tree_sitter` arena
+residue behind `Tree`'s opaque handle, thread-local caches) that no
+`.capacity()`-based structural walk can see, named but not sized by this
+card.
+
+### 3. The admission question: what would C++/Python need to shed
+
+The ceiling (I6) is a same-binary delta test: `(ON - OFF) / OFF ≤ 15%`,
+peak footprint. Two levers, both already measured by M0/M1 — this card adds
+one honest negative result rather than a third number.
+
+**C++ (M1's own llvm-project reading — authoritative; this card could not
+add a giant-scale C++ reading of its own)**. `mul_precompute_admits("cpp")`
+is gated behind `SEM_MUL_CPP`, keyed to files with the **`.cpp`/`.cc`/
+`.cxx`/`.hpp`** extension only (`registry.rs:632`, `("cpp", ".cpp")`) — a
+**distinct** `language_id` from `"c"` (`registry.rs:631`), and
+`mul_precompute_admits` has no `"c"` arm at all (falls to `_ => false`).
+**linux is 37,144 `.c` + 27,014 `.h` files against 7 `.cpp`-family files** —
+this card's own `SEM_MUL_CPP=1` vs `=0` pair on linux (+1.27% maxRSS,
++0.31% footprint, both inside noise) is a **null test, not a giant-scale
+confirmation that C++'s cost is now small** — it tests a corpus that is not
+C++. Flagging this rather than reporting it as a finding. M1's llvm-project
+reading stands: OFF footprint 5.27-5.31 GB, ON 6.71-6.76 GB, Δ ≈ **+1.44 to
++1.48 GB (+26.3% to +28.1%)**. To land at the 15% ceiling, allowed ON ≤
+OFF × 1.15 ≈ 6.06-6.11 GB — **C++ needs to shed ≈0.65-0.70 GB, roughly 45-48%
+of its current footprint overshoot**, to re-admit.
+
+**Python (M1's own home-assistant reading)**. OFF footprint 1.391-1.396 GB,
+ON 1.747-1.773 GB, Δ ≈ **+0.36 to +0.38 GB (+25.3% to +27.4%)**. Allowed ON
+≤ OFF × 1.15 ≈ 1.60-1.61 GB — **Python needs to shed ≈0.14-0.17 GB, roughly
+43-45% of its current footprint overshoot**.
+
+**Third lever, from this card's own data: `precomputed_facts` is the
+biggest named structure but not the dominant cost, so trimming its fields
+is a bounded lever, not a large one.** On dotnet with `SEM_MUL_CSHARP=1`,
+`precomputed_facts` totals 1,264.5 MB across 46,905 files (~27 KB/file
+average) — comparable in *order of magnitude* to Python's and C++'s entire
+footprint overshoot (0.14-0.70 GB), meaning even fully eliminating
+`import_stmts`/`ctor_call_sites` (Fields 10/11 — already empty for C++,
+populated only for Python's fast path per the field's own doc comment)
+could plausibly close a meaningful fraction of Python's ≈0.16 GB gap, but
+cannot touch C++'s ≈0.68 GB gap because those two fields are structurally
+empty for C++ already. **Ranked**: (1) Python's Field 10/11 trim — cheapest,
+directly targets the field that's actually populated for Python,
+plausibly closes a large fraction of its ≈0.16 GB gap; (2) C++'s gap has no
+lever this card's data points at — its overshoot lives in `scopes`/
+`ast_refs`/`return_type_map`-family fields this card did not get a
+C++-heavy corpus to attribute; (3) the plane's own residual D1+D3 cost
+(§1-2 above, +1.4-4.9 GB depending on giant and load) is *not* a lever
+still on the table — it is what's left after D1/D2/D3, and the corpus-
+sharding fix W5 §3 named (open shards by content hash instead of reading
+every shard) is a **wall-time** lever per its own writeup, not verified
+here as a memory lever — do not spend it against the footprint ceiling
+without a fresh measurement.
+
+### Honesty notes
+
+1. **dotnet's ON-side climbed with background load across the batch**
+   (3.4 → 5.1 → 8.6); OFF stayed flat. Pair 1 (lowest load) is the most
+   trustworthy single reading; the range +2.3 to +4.9 GB is reported rather
+   than a false-precision single number.
+2. **The `SEM_MUL_CPP` test on linux is a null result** (wrong language mix
+   — see §3) and must not be read as a giant-scale C++ re-verification.
+3. **D1 and D3 are not separable** by any mark that exists at this HEAD —
+   reported as a combined figure, not split.
+4. **The peak-vs-last-checkpoint gap** (~1.2-2.0 GB past
+   `after_populate_delta`) is named, not measured further — plausibly the
+   unbracketed JSON-serialization step.
+5. **linux's 13-file dirty checkout** (an earlier bead's fixture) was left
+   untouched; stable across every run, unlikely to move giant-scale numbers
+   materially.
+6. Machine load ranged 3.4-13.7 across this card's whole batch (other
+   campaign lanes active throughout, confirmed via `top`/`ps` — not this
+   card's own processes idling between runs). Every delta reported above is
+   either from an order-swapped pair (drift cancels) or explicitly flagged
+   where it does not.
+
+Bead: semx-bpn2. Epic: semx-w5k. Binary: `26a5b56`
+(sha256 `e8e83a03…967d612c`, private copy, immune to concurrent
+`CARGO_TARGET_DIR` rebuilds mid-batch).
+
+## 2026-08-22 — semx-9g8q closed: the shadow-precedence fix, reinstating the
+## registration loop it once regressed, and a wrong prediction corrected
+
+### The fix
+
+Root cause (research spec, this bead's own prior session): the earlier
+reverted registration-loop attempt's regression was never arrow-function
+naming — it was a pre-existing precedence bug in `resolve_ref`.
+`is_local_binding_in_scopes_cached` (the `.bindings` shadow gate)
+unconditionally short-circuited *before* `lookup_scope_chain_cached`
+(`.defs`) ever ran, so once the registration loop made both maps
+co-populate the same scope for the same name, the shadow gate killed the
+correct resolution outright. The grammar admits no redeclaration, so
+same-scope-index co-population can only be the same declaration — the def
+must win, never be read as a shadow.
+
+Fix: `ScopeChainLookup`, one combined per-scope-level walk (`.defs`
+consulted before `.bindings` at each level; a `.bindings`-only hit with no
+`.defs` at that level is `Shadowed`), replaces the old two-primitive,
+two-call-site pattern at the two sites that need it (the `Call` arm,
+`MethodCall`'s static-receiver branch) — language-agnostic; the other
+four `is_local_binding_in_scopes_cached` gate sites are untouched. The
+function-like branch's registration loop (mirroring the class-like/
+`mod_item` branches exactly — `children_by_parent` into `.defs` +
+`entity_scope_map`) is reinstated on top of the fixed primitive, placed
+before `scan_assignments` as before. Two unit tests in `scope_resolve.rs`:
+same-scope `.defs`+`.bindings` co-population resolves `Defined`, not
+`Shadowed`; an inner `.bindings`-only hit still shadows an ancestor `.defs`
+across multiple scope levels — the property the old gate protected.
+
+### Verification (two-phase: line review + suites, then a four-corpus
+### before/after battery)
+
+`cargo test --release -p sem-core --lib`: 664/664. All 9 sem-core
+integration binaries green, incl. `stem_collision_ground_truth` 7/7.
+`cargo test --release -p sem-cli`: 250/250. Re-gated identically on the
+merged tree (`e517edc`) after landing.
+
+`edge_dump_probe`, before (`2292e4c`, docs-only past `26a5b56` — verified
+via `git diff --stat`) vs after, four independent-language corpora. Every
+sampled delta on every corpus traces to one of two shapes: a
+wrong-edge-to-correct-edge repoint, or a wrong-edge-to-honest-miss
+removal — never a lost correct edge:
+
+- **microsoft/TypeScript** (196,175 -> 196,126 edges; 623 removed / 574
+  added — not a clean superset). `no-keywords.cjs`'s
+  `create::checkElements -> create::isKeyword` (the prior attempt's own
+  named regression bucket) is present and byte-identical on both sides.
+  `checker.ts`'s `getTypeFromTypeNode` (132 call sites both sides)
+  re-points from `createNodeBuilder`'s nested definition (line 6498 — not
+  lexically visible to the actual callers; verified against source that
+  `createNodeBuilder` and its callers are *siblings* inside
+  `createTypeChecker`, indentation-confirmed) to `createTypeChecker`'s own
+  definition (line 20432) — correct. Same interface-declaration-or-wrong-
+  sibling -> own-real-implementation repoint pattern independently
+  verified in `emitHelpers.ts`, `scanner.ts`, `resolutionCache.ts`,
+  `classifier.ts` (cleanest case: `getEncodedSyntacticClassifications`'s
+  nested `classifyDisabledCodeToken` calling `pushClassification` moves
+  from the *other* factory function `getEncodedSemanticClassifications`'s
+  same-named helper to its own enclosing function's). Pure removals in
+  `narrowingOfQualifiedNames.ts`/`keyofAndIndexedAccess.js` traced to a
+  local parameter (`init2(foo: DeepOptional)`) or a local closure
+  (`getTestPod := ...`-style) wrongly resolving to an unrelated same-named
+  symbol elsewhere in the file/repo — honest misses now.
+- **kubernetes** (330,558 -> 331,117 default / 331,120 under
+  `SEM_MUL_GO=1`; net +559/+562). **Not a clean zero-removed superset —
+  139-140 lines removed.** Every sampled removal traces to Go's
+  `helper := func(...) {...}` local-closure-in-table-test idiom (e.g.
+  `TestValidateControllerRevision`'s `newControllerRevision := func(...)`):
+  before, the call wrongly resolved to a same-named, **unexported**
+  function in an unrelated package (`pkg/controller/daemon`,
+  `pkg/registry/apps/controllerrevision`, ...) — illegal under Go
+  visibility rules, not even callable across packages; after, `Shadowed`
+  correctly recognizes the local closure binding and the call falls
+  through to an honest miss instead. `ENTITY_SCOPE_LOOKUP`'s
+  `fallback_pct` (`SEM_MUL_GO=1`, the still-gated precomputed path):
+  **14.01% -> 0.00%**, reproducing this bead's own prior-session residual
+  and then collapsing it exactly as its root-cause writeup predicted.
+- **home-assistant/core** (310,398 -> 310,394; 287 removed / 283 added)
+  and **rust-lang/rust** (307,653 -> 307,597; 723 removed / 667 added):
+  same repoint signature, independently sampled and consistent (e.g. HA's
+  `test_pipeline_from_audio_stream_auto::audio_data` wrongly shared across
+  sibling test functions before, each resolving its own `audio_data`
+  after; Rust's `stack_val_align` TypeRef re-pointed from a sibling's
+  local type to its own). `SEM_FP_PARITY=1 incr_probe <HA> all`: 8/8
+  `ORACLE ok`.
+
+**A wrong prediction, corrected on the record.** This bead's own
+verification brief predicted kubernetes would come back a "clean
+superset, zero removed" — it did not. The fix's *correct* behavior
+includes converting impossible edges (cross-package calls to unexported
+Go symbols, sibling-closure repoints resolved via a scope that was never
+lexically reachable) into honest misses, not only adding edges that were
+previously invisible. The actual acceptance evidence is the four-corpus
+convergent signature — the identical wrong-edge-to-correct-edge/honest-
+miss shape appearing independently on Go, TypeScript/JS, Python, and
+Rust — not a raw "lines removed" count. A future reader re-running this
+probe and seeing non-zero removed lines on any corpus should check
+*what* was removed (repoint vs. genuine loss) before treating it as a
+regression signal.
+
+Credit chain: research spec (root cause + fix design) -> `ox/impl`
+(primitive, call-site collapse, registration loop, unit tests) ->
+two-phase verification (line review + suites, then the corpus battery
+above).
+
+### Note for the Go re-admission record (cross-ref: semx-bpn2, this
+### file's own §"Attribution"/footprint-ceiling sections above)
+
+Combined with `semx-dm5t`'s id-rekey fix (`fallback_pct` 27.10% -> 0.00%
+for the id-staleness species) and this bead's own registration-loop fix
+(the second, independent species — function-nested entities — collapsed
+to 0.00% as recorded just above), **Go's entire known correctness
+blocker chain for `SEM_MUL_GO` is now closed**: both confirmed
+`ENTITY_SCOPE_LOOKUP` residuals are at 0.00%, and `edge_dump_probe`
+before/after this bead's whole diff is bit-identical on every non-Go
+control corpus this session touched (Go's own mutations are gated behind
+`is_go_file`/`SEM_MUL_GO`, verified not to leak). Go's re-admission to
+the multi-language pass now waits on exactly one thing: a footprint
+fence run against the ≤15%-overshoot ceiling this card's own
+Attribution section established for C++/Python — Go has not had that
+measurement taken at giant scale yet. File the footprint fence run as
+the next step on whichever bead tracks `SEM_MUL_GO` re-admission
+(`semx-bpn2` if a dedicated Go footprint bead does not already exist).
+
+Bead: semx-9g8q (closed). Epic: semx-w5k. Prior: semx-dm5t (closed,
+`26a5b56`), semx-u3rk (this bead's direct handoff). Commits: `88b4fee`
+(`ox/impl`), `e517edc` (merge into `perf/mul-phase2`).
+
+## 2026-08-22 — semx-bpn2 (go-fence wave): the "closed" claim contained its
+## own contradiction; a third, inverted species; Go admitted unconditionally
+
+### The read-past-numbers finding
+
+This file's own semx-9g8q close-out (immediately above) claimed Go's
+correctness blocker chain was fully closed and directed the next bead to
+"file the footprint fence run." Before spending the fence, this wave's
+precondition check re-ran `edge_dump_probe` on kubernetes, `SEM_MUL_GO=1`
+vs unset, at that exact HEAD (`6ccd4b5`) — and it was **not**
+bit-identical: 331,120 (ON) vs 331,117 (OFF), a reproducible 3-edge
+divergence (verified deterministic across repeated runs of each side).
+The numbers that would have shown this were already sitting in
+semx-9g8q's own verification battery two paragraphs up ("kubernetes
+(330,558 -> 331,117 default / 331,120 under `SEM_MUL_GO=1`") — the bead
+compared before-vs-after-the-fix at each of the two admission states
+separately, but never cross-checked the two post-fix states against each
+other, so the divergence was recorded without being read. Filed here
+because it is exactly the self-fooling failure mode the campaign has
+named more than once (unverified "closed" claims, predictions not
+checked against the evidence already in hand) — not to relitigate
+semx-9g8q's fix, which was itself correct and necessary.
+
+### Root cause: a fourth id-valued `Scope` field the id-staleness repair
+### never rekeyed — and it was inverted from the working hypothesis
+
+Isolated with a throwaway entity-id dump (`entity_probe.rs`, built and
+run, never committed) and a scoped, reverted `eprintln!` in
+`resolve_ref`'s `Call` arm (added, used to trace the exact mechanism,
+then removed before committing anything). All 3 edges are **dangling**:
+their `to_entity` is not the id of any entity in the graph, and it is not
+even OFF's honest miss vs. ON's found edge — it is ON pointing at a
+ghost. `PrecomputedFileFacts::rekey_entity_ids` (semx-dm5t) rekeys
+`entity_scope_map`/`entity_inner_scope`/`return_type_map`'s *keys*, but
+never revisits `Scope::defs`' *values* or `Scope::owner_id` — the two
+other places a `Scope` caches an entity id, both populated by
+`scope_visit_node`'s registration loops (the class-like/mod_item/
+function-like branches; the function-like one is semx-9g8q's own
+reinstated loop) during pass 1's precompute, which runs *before* the
+cross-file rewrite + cascade. A rewritten method's nested locals (all
+three cases: a `var f, g func(...) bool` declaration inside a cross-file
+Go method — `Kubelet::sortPodIPs::validPrimaryIP`,
+`Scheduler::bindingCycle::podInPreBindCancel`,
+`TContext::newAsyncAssertion::finalize`) kept a pre-rewrite `.defs` value
+once the rewrite ran, surviving into a `Calls` edge whose target no
+entity held any more.
+
+The dangling id also incidentally evaded an *existing* correctness
+check: `scope_resolve.rs`'s pass-2 ref loop suppresses a `Calls` edge
+when the target is the caller's own parent or child (`is_parent_child`,
+~line 3405) — correctly recognizing that a method calling its own
+locally-declared entity is containment, not a cross-entity call.
+`entity_map.get(&target_id)` on a dangling id returns `None`, so the
+filter fails open instead of firing. Traced (not assumed) post-fix: both
+ON and OFF now resolve the 3 calls to their valid rekeyed ids, and both
+then correctly suppress them via that same filter — the ghosts are dead
+everywhere, no new edges gained anywhere, `edge_dump_probe` ON vs OFF on
+kubernetes bit-identical again (331,117 edges both sides, matching
+sha256).
+
+Fix: `rekey_entity_ids` now also walks `self.scopes` and rewrites exactly
+`Scope::defs`' values and `Scope::owner_id` — the two other id-valued
+fields, by `Scope`'s own field doc comments. Every other `Scope` field
+(`bindings`, `binding_rows`, `types`, `pending_call_types`,
+`pending_field_types`) holds a plain name string by its own doc comment,
+never compared against `entity_map`/`all_entities` by id, and is
+deliberately left untouched — rewriting a name field on an accidental
+string collision with a rewritten id would corrupt real data, not fix
+anything.
+
+### DANGLING_EDGE_ORACLE
+
+Added to `edge_dump_probe`: every `EntityRef`'s `from_entity`/`to_entity`
+must name a real id in the same build's own entity set — `resolve_ref`
+only ever returns ids it read out of this build's own tables, so an edge
+naming an id nothing declared is always a bug, never a legitimate case.
+Prints one `DANGLING_EDGE` line per offender plus a gating
+`DANGLING_EDGE_ORACLE ... verdict=ok|MISMATCH` summary, matching this
+crate's other probes' `ORACLE` convention. Clean (`dangling=0`) on
+kubernetes both switch states (331,117 edges / 554,548 entities each)
+plus three controls: rust-lang/rust (307,597 / 522,921),
+microsoft/TypeScript (196,126 / 714,832), home-assistant/core (310,394 /
+318,638) — zero edge-count movement on all three non-Go corpora versus
+semx-9g8q's own post-fix counts, exactly as expected (`rekey_entity_ids`
+is a structural no-op whenever `rekey` is empty, which it always is
+absent a Go cross-file rewrite).
+
+### The memory fence
+
+`/usr/bin/time -l sem graph --no-cache --json`, same binary
+(`SEM_MUL_GO=1` vs unset), fresh `SEM_CACHE_DIR` + isolated
+`SEM_FACTS_CORPUS_DIR` per run, 3 order-swapped pairs on kubernetes, both
+`/usr/bin/time -l` fields per M1's corrected-metric protocol (`uptime`
+logged around each run; load averages 3.6–13.1 throughout, unremarkable
+for this shared box):
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | OFF→ON | 3,217,178,624 B | 3,234,611,200 B | +0.54% | 2,838,072,416 B | 3,078,229,184 B | **+8.46%** |
+| 2 | ON→OFF | 3,233,054,720 B | 3,214,868,480 B | -0.56% | 2,841,185,400 B | 3,048,574,096 B | **+7.30%** |
+| 3 | OFF→ON | 3,225,468,928 B | 3,232,776,192 B | +0.23% | 2,873,560,160 B | 3,068,398,784 B | **+6.78%** |
+
+maxRSS flat, noise-band. Footprint unanimous **+6.78% to +8.46%**, tight
+(<1.7 points of spread), comfortably under the +15% ceiling on every
+pair — Go clears both fields, unlike every one of C++/Python/Rust/Java,
+all of which busted the ceiling on at least one field this campaign.
+
+### Verdict and execution (I6): admitted unconditionally
+
+W2's own close-out precedent applied verbatim, no unused scaffolding
+left behind: `mul_precompute_admits` gained a plain `"go" => true` arm;
+`go_precompute_enabled`/`SEM_MUL_GO` deleted; `MUL_RUNTIME_GATES`'s "go"
+row deleted (no switched-off state left to preserve corpus compatibility
+with). `LANGUAGE_SALTS`'s go entry bumped `ts-0.23-mp5-dm5t` ->
+`ts-0.23-mp5-dm5t-bpn2` (I5/F2: `rekey_entity_ids`'s new `.defs`/
+`owner_id` rewriting is a content-only producer change, same category as
+every prior bump on this entry — a stale pre-fix corpus entry from a
+local `SEM_MUL_GO=1` debugging session must not silently answer a
+post-fix lookup now that the enriched path runs on every build),
+mirrored byte-for-byte in `facts_corpus_probe.rs`'s independent copy. All
+doc comments/tests that described Go as gated updated to match,
+including one now-provably-stale claim
+(`producer_language_salt`'s "every phase-1/phase-2 language is gated as
+of M1; none remain unconditional") and one test split
+(`mul_phase2_go_java_default_matches_the_measured_verdict`'s Go half
+retired into its own `mul_phase2_go_default_matches_the_measured_verdict`
+asserting the opposite verdict, mirroring `mul_phase2_rust_default_
+matches_the_measured_verdict`'s own shape).
+
+**Full battery, all against the final post-promotion binary:**
+- `edge_dump_probe`/`DANGLING_EDGE_ORACLE`: kubernetes with
+  `SEM_MUL_GO=1` and unset both produce byte-identical output to each
+  other and to the pre-promotion verified-correct state (sha256
+  `40a0ef24...`) — the switch's removal changed nothing behaviorally,
+  only the default.
+- Adversarial salt-isolation proof (I5/F2, mirroring W2's/semx-j1fw's own
+  precedent): populated a pure-Go corpus (`pkg/kubelet/pleg`, 6 files)
+  with a pre-bpn2 binary (throwaway worktree at `6ccd4b5`, isolated
+  `CARGO_TARGET_DIR`) under `SEM_MUL_GO=1` (old salt), consumed with this
+  bead's binary (new salt) — `corpus_hits=0`, a clean miss, `ORACLE ok`
+  (the resulting rebuild is still correct despite the miss). A first
+  attempt against a larger, mixed-content directory
+  (`pkg/kubelet`, 724 files) read `corpus_hits=22` — not a red flag: that
+  directory carries 80 non-`.go` files whose own languages' salts are
+  untouched by this bump, and the pure-Go control isolates exactly that.
+- Suites: `sem-core` release lib 665/665 (+1 new test), all 9 integration
+  binaries green incl. `stem_collision_ground_truth` 7/7; `sem-cli`
+  release 250/250.
+- `SEM_FP_PARITY=1 incr_probe`, all 8 scenarios: kubernetes 8/8
+  `ORACLE ok`, home-assistant/core 8/8 `ORACLE ok`.
+- Clippy: zero new warnings (174 before and after, same wider scope:
+  `--lib --examples -p sem-cli --bin sem`).
+
+**The wall-time prize, honestly measured.** 3 interleaved cold pairs,
+old gated-off-by-default binary (pre-bpn2, `SEM_MUL_GO` unset — the
+shipped default before this wave) vs. the new unconditional binary,
+kubernetes, fresh `SEM_CACHE_DIR` + isolated `SEM_FACTS_CORPUS_DIR` per
+run: **-12.0%/-17.0%/-12.1%**, unanimous direction. This is not a new
+win — it reproduces the `extract_imports` win semx-u3rk already banked
+(kubernetes ~83s → ~24s import-extraction time) whenever `SEM_MUL_GO=1`
+was set by hand; admission's own prize is that this now requires no
+configuration, by default, for every future build.
+
+Bead: semx-bpn2 (closed). Epic: semx-w5k. Prior: semx-u3rk, semx-dm5t
+(closed, `26a5b56`), semx-9g8q (closed, `88b4fee`). Commits: `30b9e84`
+(`Scope::defs`/`owner_id` rekey fix), `5aa8dca` (`DANGLING_EDGE_ORACLE`),
+`66177f8` (unconditional admission + salt bump + doc/test close-out).
+
+## 2026-08-22 — semx-bpn2 (python-fence wave): Fields 10/11 are not the
+## dominant term after all, a zero-risk trim closes part of the gap,
+## Python stays gated, and C++'s own dominant term named
+
+Continuation of the memory campaign (M1/Card 2, above): with Go closed,
+this wave was handed the two languages M1 demoted for busting the
+footprint ceiling — Python (needs to shed ≈0.14-0.17GB, ≈43-45% of its
+overshoot) and C++ (needs ≈0.65-0.70GB, ≈45-48%) — plus a prerequisite:
+no C++-heavy corpus had ever been attributed field-by-field (dotnet is
+C#, linux is C, both null results for `cpp`'s own gate). The task's own
+premise named Fields 10/11 (`import_stmts`/`ctor_call_sites`) as the
+lever, per the field doc comment's own claim that they're "what Python
+actually populates." Stage 1 below shows that premise was true but
+incomplete — Fields 10/11 are real, but not dominant.
+
+### Stage 1 — attribution: the per-field breakdown didn't exist, so it
+### was built first
+
+`PrecomputedFileFacts::approx_heap_bytes` (Card 2's own nested-string
+walk) only ever returned one summed `usize` — there was no way to ask
+"which field" without instrumenting one first. Split it into
+`field_heap_bytes()`, returning a new `PrecomputedFieldBytes` struct
+(one entry per field group); `approx_heap_bytes()` is now a one-line
+`.total()` wrapper, so nothing downstream needed to change. While
+rebuilding the walk field-by-field, found and fixed a real gap: Fields
+10/11 were counted only via `size_of::<ImportStmtFacts>() *
+import_stmts.capacity()` — the enum's own stack shape — never the heap
+bytes owned by the `String`s and `Vec`s *inside* each variant
+(`PyFromImport { module, specifiers: Vec<(String,String)> }` etc.),
+unlike the four maps (`return_type_map`/`instance_attr_types`/
+`init_params`/`attr_to_param`) Card 2 already fixed. `field_heap_bytes`
+now walks every `ImportStmtFacts`/`CtorCallFacts` variant's nested
+payloads the same way. Wired into `mem_profile.rs` as
+`precomputed_facts_field_breakdown` — deliberately a separate
+`eprintln` block, not folded into `checkpoint`'s own `attributed_total`,
+since the existing `precomputed_facts` entry there already counts these
+same bytes once; adding the breakdown into that sum would double-count
+against `process_rss`.
+
+**Measured** (`SEM_PROFILE_MEM=1 SEM_MUL_PYTHON=1`, home-assistant/core,
+post-pass-1 checkpoint, one run):
+
+| field | bytes | % of field total |
+|---|---:|---:|
+| content | 111.4MB | 30% |
+| ast_refs | 92.9MB | 25% |
+| scopes | 72.6MB | 20% |
+| import_stmts (Field 10) | 58.1MB | 16% |
+| ctor_call_sites (Field 11) | 15.0MB | 4% |
+| entity_scope_maps | 11.7MB | 3% |
+| init_params | 1.6MB | <1% |
+| instance_attr_types | 1.2MB | <1% |
+| attr_to_param | 1.1MB | <1% |
+| return_type_map | 0.5MB | <1% |
+| **field total** | **366.0MB** | |
+
+(`precomputed_facts`'s own aggregate checkpoint entry reads 376.0MB —
+the ~10MB gap is per-entry hash-table overhead plus file-path key
+bytes, neither of which belongs to any one field.) With the gate off,
+every one of these reads exactly 0.0MB — `PrecomputedFileFacts` entries
+are created *only* for MUL-admitted files, so this table is
+approximately the entire admission cost, not a superset padded by
+work Python would have paid either way.
+
+**The dominant term is not Fields 10/11.** Combined they're 20% of the
+total; `content` (the whole file's source text) and `ast_refs` (call/
+method-call reference sites) each individually outweigh them. `content`
+is not a spare lever, either — it's the *sole* surviving copy of a
+chunked-path file's source once its tree is dropped
+(`snapshot_bow_content`'s own test, `L-BOW-SHARE`, already asserts the
+bag-of-words entry is a pointer-identical borrow of these exact bytes,
+not a copy) — trimming it would mean re-reading from disk mid-build, a
+real architectural change this bead's "no correctness change" mandate
+put out of scope. Re-aiming: `ast_refs`/`scopes`/Fields-10/11 together
+(254.6MB, 70% of the total) are the only fields with genuine
+push/insert-loop-built slack to reclaim.
+
+### Stage 2 — the trim: `shrink_to_fit`, zero risk, real but partial
+
+Every collection `PrecomputedFileFacts` holds is built by repeated
+`push`/`insert` inside a worklist walk (`fused_scope_refs_import_walk`/
+`record_import_stmts_pruned`/`record_ctor_call_sites`) with no
+`with_capacity` hint — the walk can't know a file's eventual descriptor
+count in advance — so `Vec`/`HashMap` growth-doubling leaves real slack
+sitting unused for the rest of the build once these facts are stored.
+`PrecomputedFileFacts::shrink_to_fit()` reclaims it in place: every
+`Scope`'s six internal collections, every `AstRefKind::{Call,MethodCall}`
+argument-labels `Vec`, every `ImportStmtFacts`/`CtorCallFacts` variant's
+own nested `Vec`s. Called once, at both precompute producers'
+construction sites (`precompute_scope_resolvable_file_facts` and
+`precompute_js_ts_file_facts`), right before the facts join the
+corpus-wide map they then live in for the rest of the build.
+
+`shrink_to_fit` is a pure capacity operation on every collection type
+here — it cannot change a value, key, insertion order, or length — so
+it needed no correctness proof beyond what the existing suites already
+give, and **no python-salt bump**: the serialized facts-corpus format
+depends only on logical content (`serde` iterates elements, never
+capacity), never memory layout. Verified this empirically rather than
+only by reasoning: a throwaway pre-trim binary (worktree at this
+section's own prior HEAD, `d718a81`'s parent) populated a facts corpus
+from `homeassistant/helpers` (F1's own 109-file corpus) under the *old*
+salt; the post-trim binary consumed it — `corpus_hits=109/109`,
+`ORACLE ok` — full cross-compatibility, exactly what "no pack-content
+change" predicts.
+
+**Measured** (same instrument, same corpus, post-trim):
+
+| field | before | after | Δ |
+|---|---:|---:|---:|
+| ast_refs | 92.9MB | 68.4MB | -24.5MB (-26.4%) |
+| scopes | 72.6MB | 58.6MB | -14.0MB (-19.3%) |
+| import_stmts | 58.1MB | 40.6MB | -17.5MB (-30.1%) |
+| ctor_call_sites | 15.0MB | 9.8MB | -5.2MB (-34.7%) |
+| entity_scope_maps | 11.7MB | 11.7MB | 0 |
+| content | 111.4MB | 111.4MB | 0 (expected — `read_to_string` doesn't over-allocate) |
+| **field total** | **366.0MB** | **304.7MB** | **-61.3MB (-16.8%)** |
+
+`precomputed_facts`'s own aggregate entry: 376.0MB -> 314.6MB (-61.4MB).
+A real, measured, zero-risk reduction — but well short of the ≈150MB
+this bead was asked to target, because the one field that could have
+supplied the rest (`content`) is structurally not a lever, and the
+remaining slack in `ast_refs`/`scopes`/Fields 10/11 was itself finite.
+
+**A bigger lever exists, named but not attempted this session.** Both
+`import_stmts`' module/specifier strings and (per a quick corpus grep,
+not the shipped code) common Python identifiers repeat *heavily*
+corpus-wide: home-assistant/core's `from X import ...` lines carry
+139,889 module-path occurrences across only 6,814 unique strings (95.1%
+duplicate), and 171,822 specifier names across 17,202 unique (90.0%
+duplicate). A global, corpus-wide string interner (swapping `String`
+for a compact index/handle in `ImportStmtFacts`/`CtorCallFacts`/
+`AstRefKind`) would cut both the duplicate string bytes *and* the
+24-byte `String` stack shape per occurrence — a materially bigger win
+than `shrink_to_fit`'s capacity-only reclaim. Not implemented here:
+it changes `PrecomputedFileFacts`'s serialized shape (a real
+pack-content change, needs a salt bump per I5), needs a
+concurrency-safe shared interner if precompute ever parallelizes across
+files, and is a large enough surface change to warrant its own bead
+rather than a same-session addition on top of an already-verified trim.
+
+### Stage 3 — the fence: real improvement, still over the ceiling
+
+3 order-swapped ON/OFF pairs, home-assistant/core, `/usr/bin/time -l`,
+fresh `SEM_CACHE_DIR` + `SEM_FACTS_CORPUS_DIR` per run, `--no-cache`,
+against the post-trim binary — M1's own protocol, verbatim:
+
+| pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | OFF→ON | 1,891,483,648 B | 1,805,942,784 B | -4.52% | 1,419,790,040 B | 1,739,032,664 B | **+22.48%** |
+| 2 | ON→OFF | 1,853,292,544 B | 1,812,168,704 B | -2.22% | 1,427,850,920 B | 1,768,343,616 B | **+23.85%** |
+| 3 | OFF→ON | 1,857,421,312 B | 1,802,125,312 B | -2.98% | 1,387,120,320 B | 1,740,916,848 B | **+25.51%** |
+
+maxRSS unanimous negative (-2.22% to -4.52%), reproducing F1/M1's own
+compressor-mechanism finding. Footprint unanimous positive, **+22.48%
+to +25.51%**, tight (3.03-point spread, not noise) — down from M1's own
++25.29% to +27.44% (a genuine ~2-3 point improvement, consistent with
+the ~16.8% relative reduction the trim measured on `precomputed_facts`
+alone), but every pair is still comfortably above the +15% ceiling.
+
+**Gap arithmetic, this run's own numbers**: OFF average 1,411,587,093 B;
+allowed ON ≤ OFF × 1.15 = 1,623,325,157 B; actual ON average
+1,749,431,043 B. **Still ≈126MB (≈0.12GB) over the ceiling** after this
+bead's trim — down from M1's own ≈0.14-0.17GB gap, meaning the trim
+closed roughly a fifth to a quarter of the distance, not the ≈45% this
+bead was asked to target.
+
+**Verdict (I6): Python stays gated.** `mul_precompute_admits("python")`
+is unchanged — still routes through `python_precompute_enabled()`
+(`SEM_MUL_PYTHON`, off by default). No demotion (it was already
+demoted, by M1), no promotion, no `MUL_RUNTIME_GATES`/salt/doc changes
+needed for the gate state itself. Per this task's own instruction, the
+trim ships anyway: it is correctness-neutral (proven, not assumed —
+Stage 2's proof battery), reduces real memory pressure on every future
+`SEM_MUL_PYTHON=1` build regardless of whether the language is ever
+re-admitted unconditionally, and costs nothing to keep.
+
+**Full battery** (post-trim binary, both stages' changes together):
+- `edge_dump_probe`/`DANGLING_EDGE_ORACLE`, home-assistant/core: 310,394
+  edges, sha256 `a571149c...` identical `SEM_MUL_PYTHON=1` vs unset,
+  `dangling=0 verdict=ok` both sides, entities=318,638 (matches Card 2's
+  own giant-scale HA entity count exactly).
+- `cargo test --release -p sem-core --lib`: 666/666 (+1: the new
+  `shrink_to_fit_reclaims_capacity_without_changing_values` test, which
+  deliberately over-provisions every collection it exercises so a
+  no-op `shrink_to_fit` would fail the pre-condition asserts, not only
+  the post-condition ones).
+- `cargo test --release -p sem-core --tests`: every integration binary
+  green, incl. `stem_collision_ground_truth` 7/7.
+- `cargo test --release -p sem-cli`: all binaries green.
+- `SEM_FP_PARITY=1 incr_probe`, home-assistant/core, all 6 scenarios
+  (`none`/`leaf`/`mixed50`/`hub`/`tests`/`all`): `ORACLE ok` throughout.
+- `facts_corpus_probe` cross-binary salt-compatibility proof (Stage 2,
+  above): `corpus_hits=109/109`, `ORACLE ok`.
+- Clippy (`-p sem-core -p sem-cli`): 170 warnings, unchanged from this
+  HEAD's own pre-bead baseline, zero attributable to any of the three
+  touched files.
+- `rustfmt --check` on every line this bead touched: clean (pre-existing
+  drift elsewhere in `scope_resolve.rs`, inherited verbatim by copying
+  `approx_heap_bytes`'s body into `field_heap_bytes`, left alone per
+  campaign precedent — not this bead's to fix).
+
+### Stage 4 — C++ attribution (prerequisite, measurement-only): a
+### different, harder shape than Python's
+
+First-ever field-by-field attribution on a real C++-heavy corpus
+(previous readings were null tests — dotnet is C#, linux is 37,144 `.c`
++ 27,014 `.h` against 7 `.cpp`-family files). `SEM_PROFILE_MEM=1
+SEM_MUL_CPP=1`, full `llvm/llvm-project` checkout (39,042 `.cpp` files),
+post-trim binary, post-pass-1 checkpoint:
+
+| field | bytes | % of field total |
+|---|---:|---:|
+| content | 420.1MB | 42% |
+| ast_refs | 394.2MB | 39% |
+| scopes | 161.4MB | 16% |
+| entity_scope_maps | 23.9MB | 2% |
+| import_stmts / ctor_call_sites / the four maps | 0.0MB each | 0% |
+| **field total** | **999.6MB** | |
+
+(`precomputed_facts`'s own aggregate entry: 1020.3MB.) Fields 10/11 and
+the four Python-only maps are confirmed structurally empty for C++
+exactly as their own doc comments claim — `import_stmts` requires the
+TREELESS gate's zero-imports precondition, `ctor_call_sites` requires a
+literal `"call"` node kind C++'s grammar never emits
+(`call_expression`, not `call`). This measurement already reflects
+Stage 2's `shrink_to_fit` trim, since it runs unconditionally on every
+admitted file regardless of language — C++ gets that same (partial)
+benefit for free, no separate change needed.
+
+**C++'s dominant term is `ast_refs` (394.2MB, 39%)** — not `content`
+this time; the two are close, but `ast_refs` is the single largest
+field, edging out even the whole-file source text. A quick corpus check
+(`llvm/lib`, 3,120 `.cpp` files, simple `identifier(` call-site scan)
+found the same heavy-duplication shape Python's imports showed:
+1,202,016 call-identifier occurrences across only 89,006 unique strings
+(92.6% duplicate) — `ast_refs`' `Call`/`MethodCall`/`ScopedCall` name/
+receiver/method strings are a plausible interning target, the same
+lever class named but not attempted in Stage 2.
+
+**GB arithmetic — and an honest ceiling on the lever, not just a
+number.** M1's own llvm-project reading (authoritative, this card
+didn't re-run the full fence): OFF footprint 5.27-5.31GB, ON 6.71-6.76GB,
+Δ+26.3% to +28.1%; target ON ≤ OFF×1.15 ≈ 6.06-6.11GB, needs to shed
+≈0.65-0.70GB. This bead's attribution: every non-`content` field summed
+(`ast_refs`+`scopes`+`entity_scope_maps`) = 579.5MB ≈ 0.566GB — **even a
+theoretical 100% elimination of every trimmable field falls ≈84-134MB
+short of the low end of what's needed.** Unlike Python (where Fields
+10/11 undersold the true lever but a real one existed in `ast_refs`/
+`scopes`), C++'s gap cannot be closed by `PrecomputedFileFacts`
+field-trimming alone at any achievable trim ratio — confirming, with
+real numbers this time, Card 2's own earlier finding ("C++'s gap has no
+lever this card's data points at"). Closing it would need either a
+`content`-side reduction (the same architectural change Python's
+`content` also ruled out of this bead's scope) or accepting C++ cannot
+reach unconditional admission through this lever family at all.
+
+**Not implemented — measurement-only per this bead's own scope.** Named
+here for the next wave: `ast_refs` interning is worth attempting (real,
+large duplication, same mechanism Stage 2 named for Python), but the
+GB arithmetic above means it should be scoped as "shrinks the gap," not
+promised as "closes it."
+
+### Close-out
+
+No gate/salt/doc changes for either language beyond what Stage 2's
+commit already covers (Python's own gate state is unchanged by this
+bead; C++'s is untouched entirely — measurement-only). Comment posted
+on semx-bpn2 with this section's summary.
+
+Bead: semx-bpn2 (python-fence wave). Epic: semx-w5k. Prior: M1 (both
+demotions), Card 2 (the nested-walk instrument this bead extends to
+Fields 10/11, and the C++ null-result trap this bead's Stage 4 resolves
+with a real corpus). Commit: `d718a81` (attribution + trim + test).
+
+## 2026-08-22 — semx-taq6 (interning-for-memory wave): `ast_refs`
+## per-file interned, both memory fences narrowed, neither closed, wall
+## time clean — the two-questions distinction, made explicit
+
+**This is not a re-walk of `semx-5nc`'s decline.** `semx-5nc` (see
+"Interning", above) asked and answered a *wall-time* question — does
+`u32`-interning `entity_map`/`symbol_table` speed up `resolve_ref`'s
+join — and declined it because the join is 0.11–2.29% of cold build time
+on every corpus measured, decisively below its own materiality bar. This
+bead asks a different, never-measured question the python-fence wave
+(semx-bpn2) surfaced but did not attempt: 92–95% of the strings in
+`PrecomputedFileFacts`' heavy fields are duplicates (that wave's own
+numbers: HA imports 95.1%/90.0% duplicate; a quick `ast_refs` scan on
+llvm found 92.6% duplicate) — does *interning to reclaim that duplicate
+memory* clear the two languages' own footprint ceilings? Different
+question, different mechanism (per-file dedup vs. a build-scope join
+cache), different corpus (real duplication rates vs. a synthetic
+key-shape bench). Anyone reading this as "the interning question was
+already declined" is reading the wrong bead.
+
+### Stage 0 — the deciding measurement: duplication is dominated by
+### within-file repeats, everywhere measured
+
+Instrumented (`mem_profile::precomputed_facts_duplicate_split`, gated
+behind the existing `SEM_PROFILE_MEM=1`, no new env var) the exact split
+the design choice hinges on: for every candidate string a per-node
+interner would replace with a token (`ast_refs`' `Call.name`/
+`ScopedCall.{path,name}`/`MethodCall.{receiver,method}`; `import_stmts`'
+module/specifier/path strings), what fraction of *duplicate bytes* are
+repeats *within one file* versus repeats *across files*. The
+decomposition is exact, not estimated: for a value `v` with per-file
+counts summing to a corpus-wide total `n` across `k` distinct files, a
+corpus-wide interner's total saving is `len(v) * (n - 1)`; a per-file
+table's saving (dedup within each file only) is `len(v) * Σ(c_i - 1)`;
+the difference, `len(v) * (k - 1)`, is exactly the cross-file share — so
+`within_file + cross_file == total_dup` by construction. New accessor
+methods `PrecomputedFileFacts::{ast_ref_intern_candidates,
+import_stmt_intern_candidates}` (diagnostic-only, called nowhere outside
+the profiling gate) supply the strings; `mem_profile.rs` does the
+counting.
+
+**Measured** (`SEM_PROFILE_MEM=1`, post-pass-1 checkpoint, one run each):
+
+| corpus | field | occurrences | distinct | total dup bytes | within-file | cross-file |
+|---|---|---:|---:|---:|---:|---:|
+| home-assistant/core (`SEM_MUL_PYTHON=1`) | `ast_refs` | 1,019,964 | 61,103 | 10.6MB | 7.7MB (**72.4%**) | 2.9MB (27.6%) |
+| home-assistant/core | `import_stmts` | 925,375 | 39,640 | 13.6MB | 8.2MB (**60.2%**) | 5.4MB (39.8%) |
+| llvm/llvm-project (`SEM_MUL_CPP=1`) | `ast_refs` | 5,731,499 | 417,210 | 44.2MB | 35.0MB (**79.3%**) | 9.1MB (20.7%) |
+| llvm/llvm-project | `import_stmts` | 0 | 0 | — | — | — |
+
+(llvm's `import_stmts` is structurally empty — confirmed by Card 2/
+semx-bpn2 Stage 4, reconfirmed here: C++'s grammar never populates it.)
+
+**Verdict: design (a), per-file string tables.** Within-file repeats are
+the dominant share everywhere measured (60–79%), dwarfing the cross-file
+share a corpus-wide interner would additionally reach. A per-file table
+captures most of the reclaimable duplication with *zero* concurrency
+cost (no shared lock, no sharded map, no cross-file synchronization even
+if precompute ever parallelizes across files) — the smaller-blast-radius
+option is also the higher-yield one here, not a tradeoff. The
+STOP-AND-REPORT condition this bead's brief named (duplicates mostly
+cross-file *and* design (b)'s concurrency cost measuring ugly) never
+triggered: duplicates are mostly within-file, so design (b) was never
+seriously in contention.
+
+### Stage 1 — design (a), implemented on `ast_refs` (the dominant field)
+
+`ast_refs` chosen over `import_stmts` per the brief's own instruction
+("the ONE dominant field first") — Card 2/semx-bpn2 Stage 1 already
+established `ast_refs` (not Fields 10/11) as the largest non-`content`
+field on both HA (68.4MB post-trim) and llvm (394.2MB, C++'s single
+largest field, edging out `content` itself).
+
+**Mechanism.** `AstRefKind`'s `name`/`path`/`receiver`/`method` fields
+are now `Arc<str>`, not `String`. A new `AstRefCollector`
+(`scope_resolve.rs`) wraps the `Vec<AstRef>` every ref-emitting function
+already threaded through, adding a transient, file-scoped `&str ->
+Arc<str>` table (`intern`) so repeated identifiers within one file share
+one heap allocation. Construction sites (`collect_all_file_refs`'s
+unfused walk and `fused_scope_refs_import_walk`'s fused one, both
+funneling through `refs_visit_node` -> `extract_call_ref` ->
+`extract_member_call_ref`/`push_method_call_ref`) call
+`push_call`/`push_scoped_call`/`push_method_call` instead of building
+`AstRef` literals directly — six functions and one closure touched, zero
+signature growth (the accumulator's *type* changed, not the parameter
+count). The interner is discarded per file (`into_refs`) — no cross-file
+sharing, matching Stage 0's finding.
+
+**Wire compatibility, proven before implementing further.** Before
+committing to this shape, `examples/arc_str_wire_probe.rs` (throwaway,
+still in the tree) proved `Arc<str>` and `String` serialize to
+byte-identical CBOR under `ciborium` with serde's `rc` feature
+(`Cargo.toml`: `serde = { features = ["derive", "rc"] }`, the one new
+dependency-config change this bead makes), and cross-decode cleanly in
+both directions — `impl<T: Serialize> Serialize for Arc<T>` simply
+delegates to `T`'s own impl, so an `Arc<str>` and a `String` holding the
+same text produce the identical wire bytes. This was then re-verified
+end-to-end on the real `FactsStore` machinery (Stage 2, below) rather
+than trusted on the toy probe alone. **No `FACTS_SCHEMA_VERSION` bump**
+— a genuine "no salt bump" outcome, the property the brief's design (b)
+was expected to have, achieved here by design (a) instead because the
+wire format for a scalar string field doesn't care whether the in-memory
+handle behind it is `String` or `Arc<str>`.
+
+`field_heap_bytes`'s `ast_refs` accounting was made dedup-aware (tracks
+seen `Arc::as_ptr` addresses per file so a shared allocation is counted
+once, not once per occurrence, plus the 16-byte strong/weak refcount
+header every `Arc<str>` allocation carries) — otherwise the instrument
+would silently under-report the real win.
+
+**`import_stmts` extension: sized, not attempted.** The brief allowed
+extending "as data justifies." HA's `import_stmts` total duplicate bytes
+(13.6MB, 8.2MB within-file) is real but small relative to HA's own
+remaining footprint gap (below), and C++'s `import_stmts` is
+structurally empty — extending there buys C++ nothing. A second
+six-variant-enum refactor (`ImportStmtFacts` has `PyFromImport`/
+`PyModuleImport`/`TsImport`/`TsReExport`/`RustUse`/`GoImport`, each with
+its own nested `Vec`/`(String,String)` shape) for a single-digit-MB
+expected win, on top of an already-substantial `ast_refs` change, was
+judged not worth the correctness-review budget this session had left —
+named here for a future bead rather than silently skipped.
+
+### Stage 2 — correctness
+
+- **Bit-identical edge SHAs**, baseline (`ceb80ca`) vs. campaign binary,
+  `edge_dump_probe` (sorted `from\tref_type\tto` dump), 4 corpora:
+
+  | corpus | gate | sha256 (both binaries) | entities | edges | dangling |
+  |---|---|---|---:|---:|---:|
+  | home-assistant/core | `SEM_MUL_PYTHON=1` | `a571149c…` (matches semx-bpn2's own recorded sha) | 318,638 | 310,394 | 0 |
+  | llvm/llvm-project | `SEM_MUL_CPP=1` | `1e9f1502…` | 2,760,966 | 982,394 | 0 |
+  | kubernetes/kubernetes | unconditional (Go) | `40a0ef24…` | 554,548 | 331,117 | 0 |
+  | microsoft/TypeScript | control (unfused `collect_all_file_refs` path) | `90917ed0…` | 714,832 | 196,126 | 0 |
+
+  Every one of the four corpora this bead's own brief named is
+  bit-identical, `DANGLING_EDGE_ORACLE verdict=ok` on all.
+
+- **Cross-binary `FactsStore` compatibility, both directions, real
+  corpus** (`facts_probe`, `homeassistant/helpers`, 109 files,
+  `SEM_MUL_PYTHON=1`, matching F1's own corpus): baseline `save` ->
+  campaign `load`: `files_green=109`, `changed=0`, `edge_hash` identical
+  cold vs. warm (`28fc15379fb2607b`), `ORACLE ok`. Reverse direction
+  (campaign `save` -> baseline `load`): same `edge_hash`, same
+  `store_bytes` (4,192,645, identical both directions), `ORACLE ok`. Old
+  and new binaries read each other's stores with zero reds — direct
+  proof the "no schema bump" claim above holds at the real `FactsStore`
+  layer, not only the isolated wire probe.
+
+- `cargo test --release -p sem-core --lib`: 666/666 (unchanged count —
+  no new test added this bead; the record-vs-direct equivalence tests
+  Stage 2 asked for are pre-existing suite members, exercised here
+  unmodified). `cargo test --release -p sem-core --tests`: every
+  integration binary green (incl. `stem_collision_ground_truth` 7/7,
+  `yaml_multidoc` 1/1). `cargo test --release -p sem-cli`: every binary
+  green (141+ in the main suite alone).
+- `SEM_FP_PARITY=1 incr_probe`, home-assistant/core, all scenarios
+  (`none`/`leaf`/`mixed50`/`hub`/`tests`/`all` — `all` itself expands to
+  8 sub-scenarios incl. `hubrename`/`importchurn`): `ORACLE ok`
+  throughout, no `MISMATCH`.
+- Clippy (`-p sem-core -p sem-cli`): 170 warnings total, unchanged from
+  this HEAD's own baseline; verified — not eyeballed — that zero fall
+  inside this bead's changed line ranges (parsed clippy's own
+  `file:line` against the actual diff hunks, since insertions shift
+  everything below them and a naive line-number comparison across
+  pre/post trees is unreliable).
+- `rustfmt --check` on every line this bead touched: clean (two spots
+  needed an explicit multi-line reformat after the `.as_str()` ->
+  `.as_ref()`/comparison fixes pushed them over the line-length limit,
+  fixed by hand rather than a blanket `cargo fmt` — pre-existing drift
+  elsewhere in `scope_resolve.rs`, same lines semx-bpn2 already declined
+  to fix, left alone per campaign precedent).
+
+### Stage 3 — the fences
+
+3 order-swapped OFF/ON pairs, campaign binary only (OFF-state behavior
+is provably unchanged by this bead — `PrecomputedFileFacts` entries only
+exist for MUL-admitted files, so an ungated language never touches
+`AstRefCollector` at all), `/usr/bin/time -l`, fresh `SEM_CACHE_DIR` +
+`--no-cache` per run, footprint = "peak memory footprint" (`phys_footprint`,
+the metric M1/I6 established as standard, not `maximum resident set
+size`):
+
+**home-assistant/core (`SEM_MUL_PYTHON`):**
+
+| pair | order | OFF footprint | ON footprint | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 1,419,363,984 B | 1,729,480,792 B | +21.85% |
+| 2 | ON→OFF | 1,419,790,016 B | 1,730,496,576 B | +21.88% |
+| 3 | OFF→ON | 1,386,333,864 B | 1,737,148,504 B | +25.31% |
+
+OFF avg 1,408,495,955 B; ceiling (OFF×1.15) 1,619,770,348 B; ON avg
+1,732,375,291 B. **Still ≈112.6MB (0.11GB) over the ceiling** — down
+from semx-bpn2's own post-trim gap of ≈126MB, essentially the same
+range as that wave's own fence (+22.48–25.51%) once pair-to-pair spread
+is accounted for. The `ast_refs` win at HA's scale (≈10MB of total
+duplicate bytes) is real (Stage 0/1) but too small relative to HA's
+~1.4GB OFF footprint to move this verdict outside its own noise band.
+**Verdict: Python stays gated** (`SEM_MUL_PYTHON`, off by default,
+unchanged).
+
+**llvm/llvm-project (`SEM_MUL_CPP`):**
+
+| pair | order | OFF footprint | ON footprint | Δ |
+|---|---|---:|---:|---:|
+| 1 | OFF→ON | 5,205,087,152 B | 6,621,386,680 B | +27.21% |
+| 2 | ON→OFF | 5,194,765,352 B | 6,534,059,936 B | +25.79% |
+| 3 | OFF→ON | 5,175,088,096 B | 6,473,815,848 B | +25.10% |
+
+OFF avg 5,191,646,867 B; ceiling (OFF×1.15) 5,970,393,897 B; ON avg
+6,543,087,488 B. **Still ≈572.7MB (0.57GB) over the ceiling** — down
+from semx-bpn2 Stage 4's own arithmetic (a ≈650–700MB shortfall even
+under a *theoretical 100% elimination* of every trimmable field), a real
+~18–20% reduction in the gap from a change that reclaims only part of
+one field's duplicate bytes. **Verdict: C++ stays gated**
+(`SEM_MUL_CPP`, off by default, unchanged) — an honest shortfall, not a
+failure to execute the design: this bead's own brief named this as an
+acceptable outcome ("that's physics, name it"), and semx-bpn2 Stage 4
+already showed field-trimming alone cannot close C++'s gap at any
+achievable ratio. **What would close it**: per semx-bpn2 Stage 4's own
+finding, `content` (the whole file's source text, C++'s largest single
+field at 420.1MB, structurally un-trimmable without a real architecture
+change — it's the sole surviving copy of a chunked file's source once
+its tree is dropped) is the only field large enough on its own to close
+the remaining ≈573MB gap. Streaming/phase-scoping `content` itself
+(M0's lever (ii)) is the only reasonable lever left; nothing in the
+`PrecomputedFileFacts` field family (scopes/ast_refs/maps) has enough
+slack remaining after this bead's own change to get there.
+
+### Stage 4 — wall-time guard
+
+Interleaved cold pairs, baseline vs. campaign, 3 pairs each corpus
+(order alternated pair to pair), full-CLI wall clock:
+
+| corpus | pair | Δ (camp vs base) |
+|---|---|---:|
+| home-assistant/core | 1/2/3 | +3.83% / +0.08% / -4.68% |
+| llvm/llvm-project | 1/2/3 | -9.63% / +0.28% / +1.26% |
+
+Medians: HA -1.54%, llvm -1.06% — both comfortably inside the ≤3%
+budget, no consistent regression direction (the one outlier, llvm
+pair 1's -9.63%, is a *speedup*, not a concern). **No wall-time
+regression** — the memory win does not cost the wall-time budget the
+original `semx-5nc` decline was protecting. Both questions (semx-5nc's
+wall-time join question; this bead's memory-duplication question) now
+have independent, measured answers.
+
+### Close-out
+
+Neither language crosses its footprint ceiling; neither gate state
+changes (`SEM_MUL_PYTHON`/`SEM_MUL_CPP` both stay off by default,
+unchanged from M1/I6). The `ast_refs` interning ships anyway, same
+reasoning semx-bpn2's `shrink_to_fit` trim used: correctness-neutral
+(proven, not assumed — the full battery above), reduces real memory
+pressure whenever either gate is flipped on regardless of whether either
+language is ever re-admitted, costs nothing to keep, and narrows both
+gaps for whatever bead reopens either ceiling question next (Python:
+112.6MB left to find; C++: 572.7MB left to find, and the only
+architecturally plausible lever is `content` streaming, not another
+`PrecomputedFileFacts` field). `import_stmts` extension sized and
+deferred, not silently skipped (Stage 1, above).
+
+Pathspec: `crates/sem-core/Cargo.toml` (serde `rc` feature),
+`crates/sem-core/src/parser/scope_resolve.rs` (`AstRefKind`/
+`AstRefCollector`, `field_heap_bytes` dedup accounting, the two Stage-0
+accessor methods, six construction-site call sites, the
+resolve/self-ref/test comparison fixups the type change required),
+`crates/sem-core/src/parser/mem_profile.rs`
+(`precomputed_facts_duplicate_split`), `crates/sem-core/src/parser/graph.rs`
+(one call-site wiring the split into the existing post-pass-1
+checkpoint), `crates/sem-core/examples/arc_str_wire_probe.rs` (new,
+throwaway — left in the tree as the artifact backing the wire-compat
+claim, same convention `semx-5nc` set for its own probe/bench).
+
+Bead: semx-taq6 (interning-for-memory wave). Epic: semx-w5k. Prior:
+semx-5nc (the wall-time interning question, declined — a different
+question, see the framing above), Card 2 + semx-bpn2 (both memory
+demotions, the field attribution and duplicate-rate finding this bead
+acts on). Sibling: semx-bpn2 (fence outcomes reported back per this
+bead's own brief).

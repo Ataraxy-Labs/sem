@@ -69,8 +69,22 @@ pub fn normalize_repo_relative_path(cwd: &Path, repo_root: &Path, path: &str) ->
     let cwd_base = normalize_existing_prefix(cwd).unwrap_or_else(|| normalize_lexical(cwd));
     let repo_root_base =
         normalize_existing_prefix(repo_root).unwrap_or_else(|| normalize_lexical(repo_root));
+    // semx-q344: an already-absolute `path` must be canonicalized the same
+    // way `cwd`/`repo_root` are above, or `strip_prefix` below compares two
+    // representations of the same directory that were resolved through
+    // different rules and can permanently disagree. On Windows this is not
+    // an edge case: `std::fs::canonicalize` unconditionally prepends the
+    // `\\?\` extended-path marker, so an absolute `path` built by ordinary
+    // joining (never canonicalized) can never share a prefix with a
+    // canonicalized `repo_root` — `strip_prefix` fails on every call, and the
+    // function falls back to returning the *whole absolute path* instead of
+    // a repo-relative one. Every caller that feeds this fn an already-joined
+    // absolute path (e.g. `entities.rs`'s directory reroute, which computes
+    // `full_dir = root.join(path_arg)` before calling here) inherits that
+    // bogus non-relative answer, and a downstream `files_under` prefix search
+    // then matches nothing.
     let absolute = if path.is_absolute() {
-        normalize_lexical(path)
+        normalize_existing_prefix(path).unwrap_or_else(|| normalize_lexical(path))
     } else {
         normalize_lexical(&cwd_base.join(path))
     };
@@ -433,6 +447,62 @@ mod tests {
         let normalized = normalize_repo_relative_path(&symlinked_cwd, &repo_root, "foo.py");
 
         assert_eq!(normalized, "sub/foo.py");
+        fs::remove_dir_all(temp).expect("remove temp dir");
+    }
+
+    // semx-q344: `path` arrives already-absolute at this call site whenever the
+    // caller pre-joins it (e.g. `entities.rs`'s directory reroute does
+    // `root.join(path_arg)` before calling here). The absolute branch used to
+    // skip `normalize_existing_prefix` — i.e. it never canonicalized `path`
+    // the way `cwd`/`repo_root` are canonicalized just above it — so an
+    // absolute `path` reached through a symlink boundary that `cwd`/`repo_root`
+    // resolve past produces an `absolute` PathBuf that can never share a
+    // prefix with the canonicalized `repo_root`, and `strip_prefix` always
+    // fails. The real-world trigger is Windows-only (`std::fs::canonicalize`
+    // unconditionally prepends the `\\?\` extended-path marker there, so
+    // *every* absolute path reaching this branch mismatches the canonicalized
+    // `repo_root`, even with zero symlinks involved) — this test reproduces
+    // the same "canonicalize changes the representation but only one side
+    // gets it" shape on Unix via a real symlink, which is the nearest
+    // platform-portable proof available without a Windows host.
+    #[cfg(unix)]
+    #[test]
+    fn normalize_repo_relative_path_resolves_absolute_path_through_symlinked_repo_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "sem-normalize-abs-path-symlink-test-{}-{id}",
+            std::process::id()
+        ));
+        let real_repo_root = temp.join("real-repo");
+        let real_sub = real_repo_root.join("sub");
+        let linked_repo_root = temp.join("linked-repo");
+        fs::create_dir_all(&real_sub).expect("create real repo root");
+        symlink(&real_repo_root, &linked_repo_root).expect("create symlinked repo root");
+
+        // `cwd` and `repo_root` are both given through the symlink (exactly
+        // how `entities.rs` calls this: both args come from the same `root`
+        // string), but `path` is an ALREADY-ABSOLUTE path also built through
+        // the symlink — mirroring `full_dir = root.join(path_arg)` upstream.
+        let cwd = linked_repo_root.clone();
+        let repo_root = linked_repo_root.clone();
+        let absolute_path_arg = linked_repo_root.join("sub").to_string_lossy().into_owned();
+
+        let normalized = normalize_repo_relative_path(&cwd, &repo_root, &absolute_path_arg);
+
+        assert_eq!(
+            normalized, "sub",
+            "expected the symlink-traversed absolute path to resolve to a \
+             repo-relative path, got {normalized:?} (a non-relative fallback \
+             here is exactly the semx-q344 empty-listing shape: the caller's \
+             `files_under` prefix then matches nothing)"
+        );
         fs::remove_dir_all(temp).expect("remove temp dir");
     }
 

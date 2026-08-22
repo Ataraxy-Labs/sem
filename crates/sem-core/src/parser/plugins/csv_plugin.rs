@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::entity::{build_entity_id, SemanticEntity};
 use crate::parser::plugin::SemanticParserPlugin;
@@ -36,7 +36,7 @@ impl SemanticParserPlugin for CsvParserPlugin {
             };
             let name = format!("row[{row_id}]");
 
-            let mut metadata = HashMap::new();
+            let mut metadata = BTreeMap::new();
             for (j, header) in headers.iter().enumerate() {
                 metadata.insert(header.clone(), cells.get(j).cloned().unwrap_or_default());
             }

@@ -215,7 +215,7 @@ use crate::parser::incremental::{
     ValueHasher,
 };
 use crate::parser::mem_profile;
-use crate::parser::registry::{resolve_go_method_parent_ids, ParserRegistry};
+use crate::parser::registry::{resolve_go_method_parent_ids, GoParentsResolved, ParserRegistry};
 use crate::parser::resolve_profile;
 use crate::parser::scope_resolve;
 
@@ -1620,12 +1620,14 @@ fn resolve_scopes_in_file_chunks(
     // instead of being rebuilt corpus-sized once per chunk.
     let top_level_entities = OnceLock::new();
     let py_top_level_entities = OnceLock::new();
+    let rust_top_level_entities = OnceLock::new();
     let chunked = scope_resolve::ChunkedResolveInputs {
         facts: precomputed_facts,
         entity_index: &entity_index,
         corpus_has_swift,
         top_level_entities: &top_level_entities,
         py_top_level_entities: &py_top_level_entities,
+        rust_top_level_entities: &rust_top_level_entities,
     };
 
     let byte_budget_chunks =
@@ -2292,6 +2294,53 @@ impl EntityGraph {
                 fresh_precomputed.insert(product.file_path.to_string(), f);
             }
         }
+        // semx-mul phase-2 W0: `all_entities` is now fully assembled — every
+        // file's entities are present — so this is the earliest point the
+        // one cross-file entity rewrite this crate performs can run. Moved
+        // here (was after the carry-destructuring split below, well after
+        // the CLEAN gate) so the gate immediately below always adjudicates
+        // against the *complete* cross-file parent-edge set, Go's included.
+        // Before this move, a Go file admitted into `mul_precompute_admits`
+        // would have its CLEAN verdict decided against entities whose
+        // cross-file method→receiver-type `parent_id`s hadn't been rewritten
+        // yet — a Go method's `parent_id` is unset until this call runs, so
+        // the gate would see zero children for the receiver type and pass it
+        // CLEAN by omission, keeping stale file-local precomputed facts for a
+        // file that is not, in fact, clean (per `mul_precompute_admits`'s own
+        // `.go` never reaching `clean_gate_candidate_spans` today, so this
+        // was latent, not live — see the semx-mul bead). Moving this rewrite
+        // earlier changes nothing for C++/C#/JS/TS: `is_go_file` guards every
+        // mutation this function makes, so their entities are byte-for-byte
+        // what they were before the move — see `clean_gate_scoping_matches_
+        // corpus_wide_verdict_per_candidate` and `go_parent_repair_must_run_
+        // before_clean_gate_adjudication` below for the checked argument,
+        // not just the claim.
+        let go_parents_resolved: GoParentsResolved =
+            resolve_go_method_parent_ids(&mut all_entities);
+        // semx-dm5t: the id-staleness species, Go instance. Pass 1's
+        // per-file precompute (`precompute_scope_resolvable_file_facts`,
+        // called per-file inside the loop above, before `all_entities` was
+        // complete enough for the rewrite above to run) built each file's
+        // `entity_scope_map`/`entity_inner_scope`/`return_type_map` keyed by
+        // the pre-rewrite entity id. The rewrite just above changes a Go
+        // method's id when its receiver type lives in another file of the
+        // same package — so those three maps, for exactly the files that
+        // happened, are now keyed by ids pass 2 will never look up again.
+        // Re-key this build's fresh facts (the only ones the rewrite could
+        // have raced with — every carried-over file's facts predate this
+        // build's own entity ids) before the CLEAN gate or the session's
+        // store ever reads them. `rekeyed_ids()` empty is a guaranteed
+        // no-op — the common case, since it is nonempty only when this
+        // build actually contains a cross-file Go receiver method (most
+        // corpora have none; Go's precompute path itself runs
+        // unconditionally as of semx-bpn2).
+        if !go_parents_resolved.rekeyed_ids().is_empty() {
+            for file_path in go_parents_resolved.rekeyed_files() {
+                if let Some(facts) = fresh_precomputed.get_mut(file_path) {
+                    facts.rekey_entity_ids(go_parents_resolved.rekeyed_ids());
+                }
+            }
+        }
         // MUL Phase 1 (semx-mp1, epic semx-w5k; MUL-DESIGN.md §4.1 step 2,
         // I1/I6): the CLEAN gate. Pass 1's precompute (both
         // `precompute_js_ts_file_facts` and, as of this bead,
@@ -2314,10 +2363,21 @@ impl EntityGraph {
         // handful of files. See `scope_resolve::clean_gate_dirty_files`'s doc
         // comment for the soundness argument and RESOLUTION-PROFILE.md's
         // semx-5sw section for the measurements.
+        //
+        // semx-mul phase-2 W0: `clean_gate_dirty_files` now requires a
+        // `GoParentsResolved` token by value — obtainable only by calling
+        // `resolve_go_method_parent_ids` first — so this call site cannot be
+        // reordered ahead of the rewrite above without failing to compile.
+        // The gate now sees the complete cross-file parent-edge set for
+        // every admitted language, exactly what `CLEAN(F)`'s scoping proof
+        // (`clean_gate_dirty_files`'s own doc comment) assumes.
         if !fresh_precomputed.is_empty() {
             let __clean_gate_t0 = std::time::Instant::now();
-            let dirty_files =
-                scope_resolve::clean_gate_dirty_files(&all_entities, &clean_gate_candidate_spans);
+            let dirty_files = scope_resolve::clean_gate_dirty_files(
+                &all_entities,
+                &clean_gate_candidate_spans,
+                go_parents_resolved,
+            );
             if !dirty_files.is_empty() {
                 let before = fresh_precomputed.len();
                 fresh_precomputed.retain(|path, _| !dirty_files.contains(path.as_str()));
@@ -2439,7 +2499,6 @@ impl EntityGraph {
                 &mut empty_entity_lookups_primed,
             ),
         };
-        resolve_go_method_parent_ids(&mut all_entities);
 
         // semx-4an: measure Pass A + Pass B (below) as one bucket — see
         // `ENTITY_LOOKUP_BUILD_NS`'s doc comment. Stopped right before
@@ -2720,45 +2779,16 @@ impl EntityGraph {
 
         let symbol_table = Arc::new(symbol_table_plain);
 
-        // Build owned Go package index for scope resolver
+        // Build owned Go package index for scope resolver. Delegates to the
+        // shared `scope_resolve::build_go_pkg_index`; this closed a divergence:
+        // the old hand-inlined copy here lacked the shared fn's `.go` extension
+        // filter (it stripped any extension), so on mixed corpora non-.go files
+        // were indexed as noise entries keyed by their stripped stems/dirs.
+        // Non-.go files now contribute nothing.
         let __lookup_go_pkg_t0 = std::time::Instant::now();
-        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
+        let owned_go_pkg_index: scope_resolve::GoPkgIndex =
             if file_paths.iter().any(|f| f.ends_with(".go")) {
-                let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::default();
-                for (name, target_ids) in symbol_table.iter() {
-                    for target_id in target_ids {
-                        if let Some(entity) = entity_map.get(target_id) {
-                            let file_stem = entity
-                                .file_path
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(&entity.file_path);
-                            let file_stem = strip_file_ext(file_stem);
-                            idx.entry(file_stem.to_string())
-                                .or_default()
-                                .push((name.clone(), target_id.clone()));
-                            if let Some(parent_start) = entity.file_path.rfind('/') {
-                                let parent_path = &entity.file_path[..parent_start];
-                                if let Some(dir_name_start) = parent_path.rfind('/') {
-                                    let dir_name = &parent_path[dir_name_start + 1..];
-                                    if dir_name != file_stem {
-                                        idx.entry(dir_name.to_string())
-                                            .or_default()
-                                            .push((name.clone(), target_id.clone()));
-                                    }
-                                } else if !parent_path.is_empty() && parent_path != file_stem {
-                                    idx.entry(parent_path.to_string())
-                                        .or_default()
-                                        .push((name.clone(), target_id.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-                for entries in idx.values_mut() {
-                    entries.sort_unstable();
-                }
-                idx
+                scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
             } else {
                 HashMap::default()
             };
@@ -2807,6 +2837,8 @@ impl EntityGraph {
                     ),
                 ],
             );
+            mem_profile::precomputed_facts_field_breakdown("post-pass-1", precomputed_facts);
+            mem_profile::precomputed_facts_duplicate_split("post-pass-1", precomputed_facts);
         }
 
         let pre_built = scope_resolve::PreBuiltLookups {
@@ -3261,7 +3293,7 @@ impl EntityGraph {
                 retained_parsed_files.push(parsed);
             }
         }
-        resolve_go_method_parent_ids(&mut all_entities);
+        let _ = resolve_go_method_parent_ids(&mut all_entities);
 
         let mut symbol_table: HashMap<String, Vec<String>> =
             HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
@@ -3445,7 +3477,7 @@ impl EntityGraph {
             Some(parsed_files.as_slice()),
         );
 
-        let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
+        let owned_go_pkg_index: scope_resolve::GoPkgIndex =
             if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
                 scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
             } else {
@@ -3642,7 +3674,7 @@ impl EntityGraph {
             .collect();
         let entity_ids_before_parent_repair: HashSet<String> =
             all_entities.iter().map(|e| e.id.clone()).collect();
-        resolve_go_method_parent_ids(&mut all_entities);
+        let _ = resolve_go_method_parent_ids(&mut all_entities);
         let parent_repaired_ids: HashSet<&str> = all_entities
             .iter()
             .filter(|e| !entity_ids_before_parent_repair.contains(&e.id))
@@ -4224,7 +4256,7 @@ impl EntityGraph {
             } else {
                 Some(relevant_parsed)
             };
-            let owned_go_pkg_index: HashMap<String, Vec<(String, String)>> =
+            let owned_go_pkg_index: scope_resolve::GoPkgIndex =
                 if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
                     scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
                 } else {
@@ -11469,6 +11501,158 @@ fn caller() {
     }
 
     #[test]
+    fn test_rust_module_alias_qualified_call_resolves_edge() {
+        // semx-gla: `use crate::parser::scope_resolve;` imports the MODULE
+        // `scope_resolve`, not an item named `scope_resolve` — the qualified
+        // call `scope_resolve::resolve_it()` must still produce an edge to
+        // the real function it names. Before the fix, `extract_rust_use`
+        // only ever tried resolving the final `use` segment as an item, so
+        // this qualified call resolved to nothing.
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "parser/scope_resolve.rs",
+            "\
+pub fn resolve_it() -> i32 {
+    1
+}
+",
+        );
+        write_file(
+            root,
+            "parser/graph.rs",
+            "\
+use crate::parser::scope_resolve;
+
+fn caller() -> i32 {
+    scope_resolve::resolve_it()
+}
+",
+        );
+
+        let files = vec!["parser/scope_resolve.rs".to_string(), "parser/graph.rs".to_string()];
+        let (graph, _) = EntityGraph::build(root, &files, &registry);
+
+        let caller_id = graph
+            .entities
+            .iter()
+            .find(|(_, entity)| entity.name == "caller")
+            .map(|(id, _)| id)
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "resolve_it" && d.file_path == "parser/scope_resolve.rs"),
+            "caller should have an edge to scope_resolve::resolve_it via the module-alias import. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rust_super_relative_module_alias_call_resolves_edge() {
+        // Same bug, relative-alias shape: `use super::module_name;` /
+        // `use self::module_name;` (module_name resolved relative to the
+        // current module, not crate-rooted).
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "parser/scope_resolve.rs",
+            "\
+pub fn resolve_it() -> i32 {
+    1
+}
+",
+        );
+        write_file(
+            root,
+            "parser/graph.rs",
+            "\
+use super::scope_resolve;
+
+fn caller() -> i32 {
+    scope_resolve::resolve_it()
+}
+",
+        );
+
+        let files = vec!["parser/scope_resolve.rs".to_string(), "parser/graph.rs".to_string()];
+        let (graph, _) = EntityGraph::build(root, &files, &registry);
+
+        let caller_id = graph
+            .entities
+            .iter()
+            .find(|(_, entity)| entity.name == "caller")
+            .map(|(id, _)| id)
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "resolve_it" && d.file_path == "parser/scope_resolve.rs"),
+            "caller should have an edge to scope_resolve::resolve_it via `use super::scope_resolve;`. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rust_module_alias_does_not_manufacture_edge_for_unimported_module() {
+        // Guard against the "no name-only global guessing" requirement: a
+        // qualified call whose receiver was never actually imported as a
+        // module in this file must NOT resolve, even if a same-named module
+        // exists elsewhere in the corpus and even if the call reads like a
+        // module-qualified call syntactically.
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+
+        write_file(
+            root,
+            "parser/scope_resolve.rs",
+            "\
+pub fn resolve_it() -> i32 {
+    1
+}
+",
+        );
+        write_file(
+            root,
+            "parser/other.rs",
+            "\
+fn caller() -> i32 {
+    scope_resolve::resolve_it()
+}
+",
+        );
+
+        let files = vec![
+            "parser/scope_resolve.rs".to_string(),
+            "parser/other.rs".to_string(),
+        ];
+        let (graph, _) = EntityGraph::build(root, &files, &registry);
+
+        let caller_id = graph
+            .entities
+            .iter()
+            .find(|(_, entity)| entity.name == "caller")
+            .map(|(id, _)| id)
+            .expect("caller entity should exist");
+        let deps = graph.get_dependencies(caller_id);
+        assert!(
+            !deps.iter().any(|d| d.name == "resolve_it"),
+            "caller in other.rs never imported the scope_resolve module, so no edge should exist. Deps: {:?}",
+            deps.iter()
+                .map(|d| (&d.name, &d.file_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_dot_chain_no_false_edges() {
         let (dir, registry) = create_test_repo();
         let root = dir.path();
@@ -12049,7 +12233,7 @@ export function caller() {
 }
 
 #[cfg(test)]
-mod single_pass_laws {
+mod single_pass_invariants {
     use super::*;
     use crate::parser::plugins::create_default_registry;
 

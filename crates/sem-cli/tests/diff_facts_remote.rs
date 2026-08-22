@@ -206,7 +206,12 @@ async fn diff_queries_and_uploads_novel_facts_for_touched_files() {
         keys[0]["contentHash"].is_string(),
         "content_hash travels as decimal text"
     );
-    assert_eq!(keys[0]["schemaVersion"], 1);
+    // semx-mul phase 2 (MUL-DESIGN.md §4.3 Field 10): FACTS_SCHEMA_VERSION
+    // bumped 1 -> 2 for `PrecomputedFileFacts::import_stmts`.
+    assert_eq!(
+        keys[0]["schemaVersion"],
+        i64::from(sem_core::parser::facts_store::FACTS_SCHEMA_VERSION)
+    );
 
     assert_eq!(
         rec.put_bodies.len(),

@@ -145,7 +145,10 @@ pub(crate) fn semantic_entities_bytes(
         meta += e.structural_hash.as_ref().map_or(0, String::capacity);
         meta += e.kappa.as_ref().map_or(0, String::capacity);
         if let Some(md) = &e.metadata {
-            meta += md.capacity() * (std::mem::size_of::<String>() * 2 + 1);
+            // `BTreeMap` has no `capacity()` (no distinct allocation to
+            // query, unlike a hash table) — `len()` is the same kind of
+            // approximation this function already uses elsewhere.
+            meta += md.len() * (std::mem::size_of::<String>() * 2 + 1);
             for (k, v) in md {
                 meta += k.capacity() + v.capacity();
             }
@@ -296,6 +299,145 @@ pub(crate) fn precomputed_facts_bytes<S: BuildHasher>(
         .map(|(k, v)| k.capacity() + v.approx_heap_bytes())
         .sum();
     table_overhead + entries
+}
+
+/// Field-by-field breakdown of `precomputed_facts` (semx-bpn2 Stage 1): which
+/// field actually dominates a MUL-admitted language's fast-path facts, rather
+/// than only the aggregate `precomputed_facts` entry `checkpoint` already
+/// prints. Deliberately its own diagnostic block, not fed through
+/// `checkpoint`/its `attributed_total` — that entry's own `precomputed_facts`
+/// row already counts every one of these bytes once via
+/// `precomputed_facts_bytes`/`approx_heap_bytes`; folding this breakdown into
+/// the same running total would double-count them against `process_rss`.
+pub(crate) fn precomputed_facts_field_breakdown<S: BuildHasher>(
+    label: &str,
+    map: &StdHashMap<String, crate::parser::scope_resolve::PrecomputedFileFacts, S>,
+) {
+    if !enabled() {
+        return;
+    }
+    let totals = map.values().fold(
+        crate::parser::scope_resolve::PrecomputedFieldBytes::default(),
+        |mut acc, facts| {
+            acc.add(&facts.field_heap_bytes());
+            acc
+        },
+    );
+    let rows: [(&str, usize); 9] = [
+        ("scopes", totals.scopes),
+        ("entity_scope_maps", totals.entity_scope_maps),
+        ("ast_refs", totals.ast_refs),
+        ("return_type_map", totals.return_type_map),
+        ("instance_attr_types", totals.instance_attr_types),
+        ("init_params", totals.init_params),
+        ("attr_to_param", totals.attr_to_param),
+        ("import_stmts", totals.import_stmts),
+        ("ctor_call_sites", totals.ctor_call_sites),
+    ];
+    eprintln!(
+        "SEM_PROFILE_MEM[{label}] precomputed_facts_fields content={:.1}MB total={:.1}MB",
+        mb(totals.content),
+        mb(totals.total())
+    );
+    for (name, bytes) in rows {
+        eprintln!(
+            "SEM_PROFILE_MEM[{label}] precomputed_facts_fields   {:<20} {:>10.1}MB",
+            name,
+            mb(bytes)
+        );
+    }
+}
+
+/// Stage-0 instrument (interning-for-memory wave, semx-taq6): decomposes
+/// each candidate field's total duplicate string bytes into within-file
+/// repeats (what a per-file string table, design (a), would reclaim) versus
+/// cross-file repeats (the *additional* bytes a corpus-wide interner,
+/// design (b), would reclaim on top of (a)). The decomposition is exact:
+/// for a value `v` with per-file counts `c_1..c_k` (k = number of distinct
+/// files containing `v`, 0 if absent), design (b)'s total saving is
+/// `len(v) * (Σc_i - 1)`; design (a)'s saving (dedup within each file only)
+/// is `len(v) * Σ(c_i - 1)`; the difference, `len(v) * (k - 1)`, is exactly
+/// the cross-file share — so `within_file + cross_file == total_dup` by
+/// construction, not by measurement error. No production behavior changes;
+/// this only reads strings already held by `precomputed_facts`. Gated
+/// behind `SEM_PROFILE_MEM=1` like every other function in this module —
+/// callers must not compute the (potentially large) intermediate maps this
+/// builds unless `enabled()`.
+pub(crate) fn precomputed_facts_duplicate_split<S: BuildHasher>(
+    label: &str,
+    map: &StdHashMap<String, crate::parser::scope_resolve::PrecomputedFileFacts, S>,
+) {
+    if !enabled() {
+        return;
+    }
+    type Extractor =
+        for<'a> fn(&'a crate::parser::scope_resolve::PrecomputedFileFacts) -> Vec<&'a str>;
+    let fields: [(&str, Extractor); 2] = [
+        (
+            "ast_refs",
+            crate::parser::scope_resolve::PrecomputedFileFacts::ast_ref_intern_candidates,
+        ),
+        (
+            "import_stmts",
+            crate::parser::scope_resolve::PrecomputedFileFacts::import_stmt_intern_candidates,
+        ),
+    ];
+    for (field_name, extract) in fields {
+        let mut global_counts: StdHashMap<&str, u64> = StdHashMap::default();
+        let mut within_file_dup_bytes: u64 = 0;
+        let mut total_occurrences: u64 = 0;
+        let mut total_occurrence_bytes: u64 = 0;
+
+        for facts in map.values() {
+            let strings = extract(facts);
+            if strings.is_empty() {
+                continue;
+            }
+            let mut local_counts: StdHashMap<&str, u64> = StdHashMap::default();
+            for s in &strings {
+                *local_counts.entry(s).or_insert(0) += 1;
+                total_occurrences += 1;
+                total_occurrence_bytes += s.len() as u64;
+            }
+            for (s, count) in &local_counts {
+                if *count > 1 {
+                    within_file_dup_bytes += s.len() as u64 * (*count - 1);
+                }
+                *global_counts.entry(s).or_insert(0) += *count;
+            }
+        }
+
+        let mut total_dup_bytes: u64 = 0;
+        let mut distinct: u64 = 0;
+        for (s, count) in &global_counts {
+            distinct += 1;
+            if *count > 1 {
+                total_dup_bytes += s.len() as u64 * (*count - 1);
+            }
+        }
+        let cross_file_dup_bytes = total_dup_bytes.saturating_sub(within_file_dup_bytes);
+
+        let within_pct = if total_dup_bytes > 0 {
+            100.0 * within_file_dup_bytes as f64 / total_dup_bytes as f64
+        } else {
+            0.0
+        };
+        let cross_pct = if total_dup_bytes > 0 {
+            100.0 * cross_file_dup_bytes as f64 / total_dup_bytes as f64
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "SEM_PROFILE_MEM[{label}] dup_split field={field_name} occurrences={total_occurrences} \
+             distinct={distinct} total_bytes={:.1}MB total_dup_bytes={:.1}MB \
+             within_file_dup_bytes={:.1}MB ({within_pct:.1}%) cross_file_dup_bytes={:.1}MB ({cross_pct:.1}%)",
+            mb(total_occurrence_bytes as usize),
+            mb(total_dup_bytes as usize),
+            mb(within_file_dup_bytes as usize),
+            mb(cross_file_dup_bytes as usize),
+        );
+    }
 }
 
 /// `parsed_files` retained trees (`(path, content, tree)` triples, only ever

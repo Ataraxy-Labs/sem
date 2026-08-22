@@ -94,6 +94,12 @@ struct CachedGraph {
     entities: Arc<Vec<SemanticEntity>>,
 }
 
+/// Not redundant with [`CachedGraph`]: this is a genuinely lighter disk-load
+/// tier (`DiskCache::load_graph_topology_with_source_scope`) that never
+/// deserializes entity bodies, only topology — for callers that only ever
+/// need the graph shape (e.g. [`SemServer::live_topology`]'s fallback below
+/// [`CachedGraph`]) it's checked first and skips [`CachedGraph`]'s
+/// full-entity cost entirely.
 struct CachedTopology {
     manifest_hash: u64,
     graph: Arc<EntityGraph>,
@@ -458,7 +464,16 @@ impl SemServer {
             crate::cache::cache_dir_for_repo(repo_root)?.join(sem_core::index::INDEX_FILE_NAME);
         let index = sem_core::index::QueryIndex::open(&index_path)?;
 
-        let rel = abs_path.strip_prefix(repo_root).ok()?.to_string_lossy();
+        // semx-q344: every other relative-path conversion in this file routes
+        // through `path_to_slash` (see its doc comment: "Graph entity
+        // `file_path`s are forward-slash, so relative paths must be too or
+        // lookups miss on Windows"). This call site was ported from
+        // `sem-cli`'s directory reroute and missed that step — a raw
+        // `to_string_lossy()` keeps Windows' native `\` separators for any
+        // multi-component subdirectory, so `prefix` (e.g. `"src\\sub/"`)
+        // never matches the index's forward-slash-only `FILES` keys and
+        // `files_under` silently returns nothing.
+        let rel = path_to_slash(abs_path.strip_prefix(repo_root).ok()?);
         let prefix = if rel.is_empty() || rel == "." {
             String::new()
         } else {
@@ -2095,46 +2110,9 @@ impl SemServer {
     )]
     async fn join_review(
         &self,
-        Parameters(params): Parameters<JoinReviewParams>,
+        params: Parameters<JoinReviewParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match resolve_agent_review_client() {
-            Ok(c) => c,
-            Err(result) => return Ok(result),
-        };
-        let diff_id = params.diff_id.clone();
-
-        let manifest_client = client.clone();
-        let manifest_diff_id = diff_id.clone();
-        let manifest = run_blocking("join_review", move || {
-            manifest_client.manifest(&manifest_diff_id)
-        })
-        .await?;
-
-        let presence_client = client.clone();
-        let presence_diff_id = diff_id.clone();
-        let presence_result = run_blocking("join_review", move || {
-            presence_client.presence(&presence_diff_id, "listening", Some("claude-code"))
-        })
-        .await?;
-
-        let mut out = String::new();
-        match manifest {
-            Ok(value) => out.push_str(&agent_review::render_manifest_summary(&diff_id, &value)),
-            Err(err) => out.push_str(&format!(
-                "(could not fetch manifest for diff {diff_id}: {err} — continuing anyway, this is not fatal)\n"
-            )),
-        }
-        match presence_result {
-            Ok(()) => out.push_str("Presence announced: listening (label \"claude-code\").\n"),
-            Err(err) => out.push_str(&format!(
-                "(could not announce presence: {err} — continuing anyway)\n"
-            )),
-        }
-
-        out.push('\n');
-        out.push_str(REVIEW_LISTENER_PROTOCOL);
-
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        join_review_impl(params).await
     }
 
     // ── Tool 8: Wait for branch ──
@@ -2145,51 +2123,9 @@ impl SemServer {
     )]
     async fn wait_for_branch(
         &self,
-        Parameters(params): Parameters<WaitForBranchParams>,
+        params: Parameters<WaitForBranchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match resolve_agent_review_client() {
-            Ok(c) => c,
-            Err(result) => return Ok(result),
-        };
-        let diff_id = params.diff_id.clone();
-        let wait_ms = params.wait_seconds() * 1000;
-
-        let result = run_blocking("wait_for_branch", move || {
-            client.next_branch(&diff_id, wait_ms)
-        })
-        .await?;
-
-        match result {
-            Ok(agent_review::AgentNext::Branch(branch)) => {
-                let mut out = serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "branch",
-                    "branch": branch,
-                }))
-                .unwrap_or_default();
-                out.push_str(BRANCH_FOUND_FOLLOWUP);
-                Ok(CallToolResult::success(vec![Content::text(out)]))
-            }
-            Ok(agent_review::AgentNext::Timeout) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::json!({
-                    "status": "timeout",
-                    "instruction": TIMEOUT_INSTRUCTION,
-                })
-                .to_string(),
-            )])),
-            // A 404 here means the DIFF itself is gone (agent_next 404s
-            // before ever looking at individual comments) — deleted or
-            // expired. That's the one legitimate reason for the loop to
-            // stop itself; every other error still says "try again".
-            Err(err) if matches!(&err, agent_review::AgentReviewError::Http { status, .. } if *status == 404) => {
-                Ok(CallToolResult::success(vec![Content::text(
-                    agent_review::review_gone_result().to_string(),
-                )]))
-            }
-            Err(err) => Ok(tool_error(format!(
-                "wait_for_branch: {err} (call wait_for_branch again to keep listening — a transient \
-                 sem-cloud error is not a reason to stop)"
-            ))),
-        }
+        wait_for_branch_impl(params).await
     }
 
     // ── Tool 9: Reply to branch ──
@@ -2200,45 +2136,9 @@ impl SemServer {
     )]
     async fn reply_to_branch(
         &self,
-        Parameters(params): Parameters<ReplyToBranchParams>,
+        params: Parameters<ReplyToBranchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match resolve_agent_review_client() {
-            Ok(c) => c,
-            Err(result) => return Ok(result),
-        };
-        let diff_id = params.diff_id.clone();
-        let comment_id = params.comment_id.clone();
-        let content = params.content.clone();
-        let partial = params.partial;
-
-        let result = run_blocking("reply_to_branch", move || {
-            client.reply(&diff_id, &comment_id, &content, partial)
-        })
-        .await?;
-
-        match result {
-            Ok(()) => {
-                let msg = if partial.unwrap_or(false) {
-                    PARTIAL_REPLY_POSTED.to_string()
-                } else {
-                    REPLY_POSTED.to_string()
-                };
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
-            }
-            // Terminal errors (comment deleted / 404, already-answered or
-            // stale-lease conflict / 409) mean THIS reply's target vanished
-            // out from under it — not that the loop should stop or that the
-            // caller did anything wrong. Hand back a typed, successful
-            // "unanswerable" result instead of an error so the loop can
-            // never wedge retrying a reply that will never land; it just
-            // goes back to wait_for_branch. Non-terminal errors (network,
-            // 5xx) still surface as real errors, since those ARE worth
-            // retrying.
-            Err(err) if err.is_terminal() => Ok(CallToolResult::success(vec![Content::text(
-                agent_review::unanswerable_result(&err).to_string(),
-            )])),
-            Err(err) => Ok(tool_error(format!("reply_to_branch failed: {err}"))),
-        }
+        reply_to_branch_impl(params).await
     }
 
     // ── Tool 10: List open branches (read-only backlog) ──
@@ -2248,32 +2148,183 @@ impl SemServer {
     )]
     async fn list_open_branches(
         &self,
-        Parameters(params): Parameters<ListOpenBranchesParams>,
+        params: Parameters<ListOpenBranchesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match resolve_agent_review_client() {
-            Ok(c) => c,
-            Err(result) => return Ok(result),
-        };
-        let diff_id = params.diff_id.clone();
+        list_open_branches_impl(params).await
+    }
+}
 
-        let result = run_blocking("list_open_branches", move || {
-            client.list_open_branches(&diff_id)
-        })
-        .await?;
+// The four review-listener tool bodies above touch none of `SemServer`'s
+// nine fields (repo context, parser registry, entity/graph/topology caches,
+// build locks, watcher, attention ledger, tool router) — each one's entire
+// job is resolve_agent_review_client() + one blocking sem-cloud call +
+// format the result. Free functions instead of `&self` methods make that
+// fact structural: nothing here can reach into the repo cache, build locks,
+// or watcher, because nothing here holds a reference to `SemServer` at all.
+// The `#[tool]` methods above still take `&self` — `rmcp`'s tool_router
+// macro requires every registered tool to be a method on the type
+// implementing `ServerHandler` — but each is now a one-line forwarder.
+// (DATA-TOPOLOGY-AUDIT.md L2.)
 
-        match result {
-            Ok(branches) => {
-                let count = branches.len();
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "open_branches": branches,
-                        "count": count,
-                    }))
-                    .unwrap_or_default(),
-                )]))
-            }
-            Err(err) => Ok(tool_error(format!("list_open_branches failed: {err}"))),
+async fn join_review_impl(
+    Parameters(params): Parameters<JoinReviewParams>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let client = match resolve_agent_review_client() {
+        Ok(c) => c,
+        Err(result) => return Ok(result),
+    };
+    let diff_id = params.diff_id.clone();
+
+    let manifest_client = client.clone();
+    let manifest_diff_id = diff_id.clone();
+    let manifest = run_blocking("join_review", move || {
+        manifest_client.manifest(&manifest_diff_id)
+    })
+    .await?;
+
+    let presence_client = client.clone();
+    let presence_diff_id = diff_id.clone();
+    let presence_result = run_blocking("join_review", move || {
+        presence_client.presence(&presence_diff_id, "listening", Some("claude-code"))
+    })
+    .await?;
+
+    let mut out = String::new();
+    match manifest {
+        Ok(value) => out.push_str(&agent_review::render_manifest_summary(&diff_id, &value)),
+        Err(err) => out.push_str(&format!(
+            "(could not fetch manifest for diff {diff_id}: {err} — continuing anyway, this is not fatal)\n"
+        )),
+    }
+    match presence_result {
+        Ok(()) => out.push_str("Presence announced: listening (label \"claude-code\").\n"),
+        Err(err) => out.push_str(&format!(
+            "(could not announce presence: {err} — continuing anyway)\n"
+        )),
+    }
+
+    out.push('\n');
+    out.push_str(REVIEW_LISTENER_PROTOCOL);
+
+    Ok(CallToolResult::success(vec![Content::text(out)]))
+}
+
+async fn wait_for_branch_impl(
+    Parameters(params): Parameters<WaitForBranchParams>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let client = match resolve_agent_review_client() {
+        Ok(c) => c,
+        Err(result) => return Ok(result),
+    };
+    let diff_id = params.diff_id.clone();
+    let wait_ms = params.wait_seconds() * 1000;
+
+    let result = run_blocking("wait_for_branch", move || {
+        client.next_branch(&diff_id, wait_ms)
+    })
+    .await?;
+
+    match result {
+        Ok(agent_review::AgentNext::Branch(branch)) => {
+            let mut out = serde_json::to_string_pretty(&serde_json::json!({
+                "status": "branch",
+                "branch": branch,
+            }))
+            .unwrap_or_default();
+            out.push_str(BRANCH_FOUND_FOLLOWUP);
+            Ok(CallToolResult::success(vec![Content::text(out)]))
         }
+        Ok(agent_review::AgentNext::Timeout) => Ok(CallToolResult::success(vec![Content::text(
+            serde_json::json!({
+                "status": "timeout",
+                "instruction": TIMEOUT_INSTRUCTION,
+            })
+            .to_string(),
+        )])),
+        // A 404 here means the DIFF itself is gone (agent_next 404s
+        // before ever looking at individual comments) — deleted or
+        // expired. That's the one legitimate reason for the loop to
+        // stop itself; every other error still says "try again".
+        Err(err) if matches!(&err, agent_review::AgentReviewError::Http { status, .. } if *status == 404) => {
+            Ok(CallToolResult::success(vec![Content::text(
+                agent_review::review_gone_result().to_string(),
+            )]))
+        }
+        Err(err) => Ok(tool_error(format!(
+            "wait_for_branch: {err} (call wait_for_branch again to keep listening — a transient \
+             sem-cloud error is not a reason to stop)"
+        ))),
+    }
+}
+
+async fn reply_to_branch_impl(
+    Parameters(params): Parameters<ReplyToBranchParams>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let client = match resolve_agent_review_client() {
+        Ok(c) => c,
+        Err(result) => return Ok(result),
+    };
+    let diff_id = params.diff_id.clone();
+    let comment_id = params.comment_id.clone();
+    let content = params.content.clone();
+    let partial = params.partial;
+
+    let result = run_blocking("reply_to_branch", move || {
+        client.reply(&diff_id, &comment_id, &content, partial)
+    })
+    .await?;
+
+    match result {
+        Ok(()) => {
+            let msg = if partial.unwrap_or(false) {
+                PARTIAL_REPLY_POSTED.to_string()
+            } else {
+                REPLY_POSTED.to_string()
+            };
+            Ok(CallToolResult::success(vec![Content::text(msg)]))
+        }
+        // Terminal errors (comment deleted / 404, already-answered or
+        // stale-lease conflict / 409) mean THIS reply's target vanished
+        // out from under it — not that the loop should stop or that the
+        // caller did anything wrong. Hand back a typed, successful
+        // "unanswerable" result instead of an error so the loop can
+        // never wedge retrying a reply that will never land; it just
+        // goes back to wait_for_branch. Non-terminal errors (network,
+        // 5xx) still surface as real errors, since those ARE worth
+        // retrying.
+        Err(err) if err.is_terminal() => Ok(CallToolResult::success(vec![Content::text(
+            agent_review::unanswerable_result(&err).to_string(),
+        )])),
+        Err(err) => Ok(tool_error(format!("reply_to_branch failed: {err}"))),
+    }
+}
+
+async fn list_open_branches_impl(
+    Parameters(params): Parameters<ListOpenBranchesParams>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let client = match resolve_agent_review_client() {
+        Ok(c) => c,
+        Err(result) => return Ok(result),
+    };
+    let diff_id = params.diff_id.clone();
+
+    let result = run_blocking("list_open_branches", move || {
+        client.list_open_branches(&diff_id)
+    })
+    .await?;
+
+    match result {
+        Ok(branches) => {
+            let count = branches.len();
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "open_branches": branches,
+                    "count": count,
+                }))
+                .unwrap_or_default(),
+            )]))
+        }
+        Err(err) => Ok(tool_error(format!("list_open_branches failed: {err}"))),
     }
 }
 

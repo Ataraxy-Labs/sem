@@ -2215,7 +2215,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sem-cli"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "axum",
  "ciborium",
@@ -2244,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "sem-cloud-client"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "sem-core"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "ciborium",
  "criterion",
@@ -2269,6 +2269,7 @@ dependencies = [
  "oxc_syntax",
  "rayon",
  "regex",
+ "rusqlite",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -2311,11 +2312,12 @@ dependencies = [
  "tree-sitter-zig",
  "ts-parser-perl",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
 name = "sem-mcp"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "axum",
  "git2",
@@ -2324,7 +2326,6 @@ dependencies = [
  "mimalloc",
  "notify",
  "openssl",
- "rayon",
  "rmcp",
  "rusqlite",
  "schemars",
@@ -2338,12 +2339,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "zstd",
 ]
 
 [[package]]
 name = "sem-plugin"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "sem-core",
  "serde",
