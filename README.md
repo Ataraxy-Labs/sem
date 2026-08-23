@@ -60,6 +60,12 @@ Or via winget on Windows:
 winget install AtaraxyLabs.sem
 ```
 
+Or via Scoop on Windows:
+
+```powershell
+scoop install sem
+```
+
 Or install the npm wrapper into `node_modules`:
 
 ```bash
