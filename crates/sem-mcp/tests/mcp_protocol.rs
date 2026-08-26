@@ -582,3 +582,52 @@ fn callers_refuses_ambiguous_names_with_the_candidate_list() {
     let out: Value = serde_json::from_str(&tool_text(&resp)).expect("disambiguated json");
     assert_eq!(out["entity"]["file"], "src/dup.py");
 }
+
+// ── format:"json" on the entities text-search and query-ranking shapes ──
+
+#[test]
+fn entities_text_search_supports_format_json() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_entities",
+        json!({"text": "needle_target_fn_helper_a():", "format": "json"}),
+    );
+    let rows: Value = serde_json::from_str(&tool_text(&resp)).expect("text-search json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "one hit for a unique needle: {rows:?}");
+    assert_eq!(rows[0]["file"], "src/needle.py");
+    assert_eq!(rows[0]["entity"], "needle_target_fn_helper_a");
+    assert_eq!(rows[0]["type"], "function");
+    assert!(
+        rows[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("needle_target_fn_helper_a"),
+        "the full matched line, not a clipped preview: {rows:?}"
+    );
+    assert!(rows[0]["line"].is_u64());
+}
+
+#[test]
+fn entities_query_mode_supports_format_json() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_entities",
+        json!({"query": "needle_target_fn", "format": "json", "limit": 3}),
+    );
+    let rows: Value = serde_json::from_str(&tool_text(&resp)).expect("query-mode json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 3, "limit honored: {rows:?}");
+    assert_eq!(
+        rows[0]["name"], "needle_target_fn",
+        "exact-name relevance still ranks first in json: {rows:?}"
+    );
+    for row in rows {
+        assert!(row["dependents"].is_u64(), "dependent count carried: {row}");
+        assert!(row["file"].is_string() && row["start_line"].is_u64());
+    }
+}

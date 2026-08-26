@@ -1163,7 +1163,14 @@ impl SemServer {
     /// Entity-addressed text search over in-memory entity bodies. For each
     /// matching line, the innermost (smallest-span) enclosing entity wins, so
     /// a hit inside a method reports the method, not its class.
-    pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
+    /// The matching + innermost-entity-wins + (file, line) ordering behind
+    /// both renderings of the entity-body text search: one hit per matching
+    /// line as `(file, line, entity name, entity type, line text)`, the
+    /// smallest-span (innermost) enclosing entity winning a contested line.
+    fn collect_text_hits<'a>(
+        all_entities: &'a [SemanticEntity],
+        needle: &str,
+    ) -> Vec<(&'a str, usize, &'a str, &'a str, &'a str)> {
         use std::collections::HashMap;
         // (file, absolute line) -> (span, entity name, entity type, line text)
         let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
@@ -1186,21 +1193,28 @@ impl SemServer {
                 }
             }
         }
-        if best.is_empty() {
+        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> = best.into_iter().collect();
+        hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
+        hits.into_iter()
+            .map(|((file, line), (_, name, ty, text))| (file, line, name, ty, text))
+            .collect()
+    }
+
+    pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
+        let hits = Self::collect_text_hits(all_entities, needle);
+        if hits.is_empty() {
             return format!(
                 "no entity contains \"{needle}\" (searches code entity bodies; \
                  comments between entities and non-code files are not covered)"
             );
         }
-        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> = best.into_iter().collect();
-        hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
         let total = hits.len();
-        let files: std::collections::BTreeSet<&str> = hits.iter().map(|(k, _)| k.0).collect();
+        let files: std::collections::BTreeSet<&str> = hits.iter().map(|(file, ..)| *file).collect();
         let mut out = format!(
             "⊕ text \"{needle}\" · {total} hits · {} files\n",
             files.len()
         );
-        for (i, ((file, line), (_, name, ty, text))) in hits.iter().take(limit).enumerate() {
+        for (i, (file, line, name, ty, text)) in hits.iter().take(limit).enumerate() {
             let branch = if i + 1 == total.min(limit) {
                 "╰─▶"
             } else {
@@ -1320,6 +1334,27 @@ impl SemServer {
         // entities, not line numbers in anonymous files.
         if let Some(needle) = params.text() {
             let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
+            if params.format() == "json" {
+                let hits = Self::collect_text_hits(&all_entities, needle);
+                let rows: Vec<serde_json::Value> = hits
+                    .iter()
+                    .take(params.limit())
+                    .map(|(file, line, name, ty, text)| {
+                        serde_json::json!({
+                            "file": file,
+                            "line": line,
+                            "entity": name,
+                            "type": ty,
+                            // The full line, not the clipped preview the text
+                            // renderer shows.
+                            "text": text.trim(),
+                        })
+                    })
+                    .collect();
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&rows).unwrap_or_default(),
+                )]));
+            }
             let text = Self::render_text_hits(&all_entities, needle, params.limit());
             return Ok(CallToolResult::success(vec![Content::text(text)]));
         }
@@ -1363,6 +1398,23 @@ impl SemServer {
             });
             let matched_total = matches.len();
             let shown = matched_total.min(params.limit());
+            if params.format() == "json" {
+                let rows: Vec<serde_json::Value> = matches[..shown]
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "type": e.entity_type,
+                            "file": e.file_path,
+                            "start_line": e.start_line,
+                            "dependents": dependents.get(e.id.as_str()).map_or(0, Vec::len),
+                        })
+                    })
+                    .collect();
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&rows).unwrap_or_default(),
+                )]));
+            }
             // No query echo in the header: the caller knows what it asked for,
             // and repeating it doubles the lines that mention the needle.
             let mut out = format!("⊕ showing {shown} of {matched_total} matching entities\n");
@@ -1412,12 +1464,51 @@ impl SemServer {
                 (entities, true)
             } else {
                 if !params.no_default_excludes() {
-                    if let Some(out) =
+                    if let Some(mut out) =
                         crate::cloud::try_entities(&ctx.git, &ctx.repo_root, &abs_path)
                     {
-                        return Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&out).unwrap_or_default(),
-                        )]));
+                        if params.format() == "json" {
+                            // Field parity with the local json rows: the
+                            // cloud API carries no byte spans, so they are
+                            // honestly null rather than fabricated.
+                            if let Some(rows) = out.as_array_mut() {
+                                for row in rows {
+                                    row["start_byte"] = serde_json::Value::Null;
+                                    row["end_byte"] = serde_json::Value::Null;
+                                }
+                            }
+                            return Ok(CallToolResult::success(vec![Content::text(
+                                serde_json::to_string_pretty(&out).unwrap_or_default(),
+                            )]));
+                        }
+                        // Text (the default): the same compact tree the local
+                        // listing paths render, instead of raw JSON.
+                        let rows = out.as_array().cloned().unwrap_or_default();
+                        let mut text = format!("⊕ {} entities · {}\n", rows.len(), rel_path);
+                        let mut current_file = String::new();
+                        for e in &rows {
+                            let file = e["file"].as_str().unwrap_or("");
+                            if file != current_file {
+                                current_file = file.to_string();
+                                text.push_str(&format!("\n{}\n", file));
+                            }
+                            let start = e["start_line"].as_u64().unwrap_or(0);
+                            let end = e["end_line"].as_u64().unwrap_or(0);
+                            let lines = if end > start {
+                                format!("L{}-{}", start, end)
+                            } else {
+                                format!("L{}", start)
+                            };
+                            let indent = if e["parent_id"].is_string() { "  " } else { "" };
+                            text.push_str(&format!(
+                                "{}{} · {} · {}\n",
+                                indent,
+                                e["name"].as_str().unwrap_or("?"),
+                                e["type"].as_str().unwrap_or("?"),
+                                lines
+                            ));
+                        }
+                        return Ok(CallToolResult::success(vec![Content::text(text)]));
                     }
                 }
                 let file_paths = match Self::walk_dir_files_with_options(
