@@ -4,6 +4,18 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-23
+
+### Added
+
+- **`sem find`, `sem grep`, and `sem context` now accept multiple queries in a single call.** `sem find name1 name2 …` resolves each name independently — a miss on one doesn't affect the others; `sem grep -e pattern1 -e pattern2 …` (rg-style repeated `-e`) keeps each pattern's hits separate; `sem context --entity A --entity B …` packs context for several entities in one invocation, each under the same `--budget`, refusing on an ambiguous or unresolved name the same way the single-entity form does. The MCP `find`, `grep`, and `context` tools gained matching array parameters (`queries[]`, `patterns[]`, `entities[]`). Single-query usage is unchanged.
+- **New `sem_callers` MCP tool**, exposing the same reverse-caller lookup as the CLI's `sem callers`. `sem callers` itself gained `--limit` (cap the result list) and now refuses — listing every candidate — when a name matches more than one definition, instead of silently answering for just one.
+- **A middle zoom level between an outline and full source: `sem entities --signatures` and `sem context --headers`.** Each shows an entity's signature (up to where its body starts) plus the first line of its leading doc comment, instead of either the bare name alone or the full body. Available over MCP as `signatures: true` on `entities` and `mode: "headers"` on `context`.
+
+### Fixed
+
+- **sem-mcp's `format` parameter now applies everywhere `entities` can return results.** It was previously honored on some response shapes but ignored on others: `entities`' free-text and query-ranking modes always rendered human-readable text even when `format=json` was requested, and the cloud-served directory-listing fast path always returned raw JSON even for the default text format.
+
 ## [0.23.1] - 2026-08-22
 
 ### Fixed
