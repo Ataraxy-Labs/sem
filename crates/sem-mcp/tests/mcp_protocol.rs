@@ -482,3 +482,103 @@ fn context_batch_entities_pack_one_block_each() {
     assert_eq!(first["entity"], "needle_target_fn");
     assert_eq!(second["entity"], "unrelated_other");
 }
+
+// ── sem_callers ──
+
+/// Extract the text of a tool-level *error* response — the inverse of
+/// `tool_text`: panics unless the tool reported `isError`.
+fn tool_error_text(resp: &Value) -> String {
+    if let Some(err) = resp.get("error") {
+        panic!("tools/call returned a JSON-RPC error: {err}");
+    }
+    let result = &resp["result"];
+    assert_eq!(
+        result.get("isError"),
+        Some(&Value::Bool(true)),
+        "expected a tool-level error: {result}"
+    );
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool result content[0] is not text: {result}"))
+        .to_string()
+}
+
+/// A repo where `target_fn` has exactly two same-file callers and
+/// `dup_name` is defined in two different files — the two shapes
+/// `sem_callers` has to get right (limit, and the ambiguity refusal).
+fn callers_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@t.com"]);
+    git(root, &["config", "user.name", "test"]);
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/app.py"),
+        "def target_fn():\n    return 0\n\n\ndef caller_a():\n    return target_fn()\n\n\ndef caller_b():\n    return target_fn() + caller_a()\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/dup.py"), "def dup_name():\n    return 1\n").unwrap();
+    std::fs::write(root.join("src/dup2.py"), "def dup_name():\n    return 2\n").unwrap();
+
+    git(root, &["add", "-A"]);
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(["commit", "-q", "-m", "fixture"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    dir
+}
+
+#[test]
+fn callers_lists_direct_callers_and_honors_limit() {
+    let repo = callers_fixture();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_callers",
+        json!({"query": "target_fn", "format": "json"}),
+    );
+    let out: Value = serde_json::from_str(&tool_text(&resp)).expect("callers json");
+    assert_eq!(out["entity"]["name"], "target_fn");
+    assert_eq!(
+        out["callers"].as_array().unwrap().len(),
+        2,
+        "both direct callers listed: {out}"
+    );
+
+    let resp = client.call_tool(
+        "sem_callers",
+        json!({"query": "target_fn", "format": "json", "limit": 1}),
+    );
+    let out: Value = serde_json::from_str(&tool_text(&resp)).expect("capped callers json");
+    assert_eq!(
+        out["callers"].as_array().unwrap().len(),
+        1,
+        "limit caps the caller rows: {out}"
+    );
+}
+
+#[test]
+fn callers_refuses_ambiguous_names_with_the_candidate_list() {
+    let repo = callers_fixture();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool("sem_callers", json!({"query": "dup_name"}));
+    let text = tool_error_text(&resp);
+    assert!(
+        text.contains("src/dup.py") && text.contains("src/dup2.py"),
+        "refusal lists every candidate definition: {text}"
+    );
+
+    // The file param picks one and the same query then answers.
+    let resp = client.call_tool(
+        "sem_callers",
+        json!({"query": "dup_name", "file": "src/dup.py", "format": "json"}),
+    );
+    let out: Value = serde_json::from_str(&tool_text(&resp)).expect("disambiguated json");
+    assert_eq!(out["entity"]["file"], "src/dup.py");
+}

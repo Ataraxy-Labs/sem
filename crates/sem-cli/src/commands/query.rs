@@ -109,8 +109,62 @@ pub fn find_command(opts: QueryOptions) {
     run(opts, Verb::Find);
 }
 
-pub fn callers_command(opts: QueryOptions) {
-    run(opts, Verb::Callers);
+/// `sem callers` answers about exactly one entity, so an ambiguous name is
+/// refused with the full candidate list rather than answered many times over
+/// (`refs` keeps the old show-everything behavior — its answer reads fine
+/// per-def; a caller list only means something once you know *whose* callers
+/// it is). `limit` caps the caller rows shown; text mode says how many were
+/// held back, json is just the capped list the caller asked for.
+pub fn callers_command(opts: QueryOptions, limit: Option<usize>) {
+    let mut answer = resolve(&opts, Verb::Callers);
+    if answer.defs.len() > 1 {
+        refuse_ambiguous(&answer.defs, &opts);
+    }
+
+    let mut hidden = 0;
+    if let Some(cap) = limit {
+        for related in &mut answer.related {
+            if related.len() > cap {
+                hidden += related.len() - cap;
+                related.truncate(cap);
+            }
+        }
+    }
+    render(&answer, Verb::Callers, opts.json, &opts.query);
+    if hidden > 0 && !opts.json {
+        println!("{}", format!("  … {hidden} more (raise --limit)").dimmed());
+    }
+}
+
+/// The callers-verb refusal: every candidate definition listed, exit 1.
+/// Text mode reports on stderr like the no-match case; json emits
+/// `{"resolved": false, "candidates": [...]}` so an agent can pick a file
+/// and retry without re-running discovery.
+fn refuse_ambiguous(defs: &[EntityInfo], opts: &QueryOptions) -> ! {
+    if opts.json {
+        let out = serde_json::json!({
+            "resolved": false,
+            "candidates": defs.iter().map(to_row).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&out).unwrap_or_default());
+    } else {
+        eprintln!(
+            "{} '{}' matches {} definitions; pass --file (or a \"type name\" query) to pick one:",
+            "error:".red().bold(),
+            opts.query,
+            defs.len()
+        );
+        for def in defs {
+            eprintln!(
+                "  {} {} {}:{}",
+                def.entity_type.dimmed(),
+                def.name.bold(),
+                def.file_path,
+                def.start_line
+            );
+        }
+    }
+    std::process::exit(1);
 }
 
 pub fn refs_command(opts: QueryOptions) {

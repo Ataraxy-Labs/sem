@@ -204,12 +204,17 @@ enum Commands {
     /// Show direct callers of an entity (who calls/references it) — the
     /// index's reverse postings, same freshness/fallback discipline as `find`.
     Callers {
-        /// Entity name or id
+        /// Entity name or id. Must resolve to exactly one definition —
+        /// an ambiguous name is refused with the candidate list.
         query: String,
 
         /// Disambiguate by defining file
         #[arg(long)]
         file: Option<String>,
+
+        /// Show at most this many callers (all by default)
+        #[arg(long)]
+        limit: Option<usize>,
 
         /// Output as JSON
         #[arg(long)]
@@ -758,16 +763,24 @@ fn main() {
                 commands::query::find_multi_command(cwd, queries, file, json);
             }
         }
-        Some(Commands::Callers { query, file, json }) => {
-            commands::query::callers_command(commands::query::QueryOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                query,
-                file,
-                json,
-            });
+        Some(Commands::Callers {
+            query,
+            file,
+            limit,
+            json,
+        }) => {
+            commands::query::callers_command(
+                commands::query::QueryOptions {
+                    cwd: std::env::current_dir()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    query,
+                    file,
+                    json,
+                },
+                limit,
+            );
         }
         Some(Commands::Refs { query, file, json }) => {
             commands::query::refs_command(commands::query::QueryOptions {

@@ -2385,6 +2385,132 @@ impl SemServer {
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
+    // ── Callers ──
+
+    #[tool(
+        description = "List the direct callers of one entity (who calls/references it). The query must resolve to exactly one definition — an ambiguous name is refused with the full candidate list so you can disambiguate with file or a \"type name\" query and retry. limit caps the number of callers returned."
+    )]
+    async fn sem_callers(
+        &self,
+        Parameters(params): Parameters<CallersParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ctx = match self.get_context(params.file.as_deref()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let (graph, _) = self.live_graph(&ctx.repo_root).await;
+
+        let query = params.query.trim();
+        if query.is_empty() {
+            return Ok(tool_error("query is required"));
+        }
+        // Same "type name" split and match/sort discipline as sem_find, so
+        // the two tools can never disagree about what a query resolves to.
+        let (name, want_type) = match query.split_once(' ') {
+            Some((t, n)) if !t.is_empty() && !n.is_empty() => (n, Some(t)),
+            _ => (query, None),
+        };
+        let file_filter = params.file();
+        let mut matches: Vec<_> = graph
+            .entities
+            .values()
+            .filter(|e| e.name == name)
+            .filter(|e| want_type.is_none_or(|t| e.entity_type == t))
+            .filter(|e| file_filter.is_none_or(|f| e.file_path == f))
+            .collect();
+        matches.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+        let row = |e: &sem_core::parser::graph::EntityInfo| {
+            serde_json::json!({
+                "id": e.id,
+                "name": e.name,
+                "type": e.entity_type,
+                "file": e.file_path,
+                "start_line": e.start_line,
+                "end_line": e.end_line,
+            })
+        };
+
+        if matches.is_empty() {
+            return Ok(tool_error(format!("no entity named '{query}'")));
+        }
+        if matches.len() > 1 {
+            // A caller list only means something once you know whose callers
+            // it is: refuse, listing every candidate so the next call can
+            // pick one instead of re-running discovery.
+            if params.format() == "json" {
+                let out = serde_json::json!({
+                    "resolved": false,
+                    "candidates": matches.iter().map(|e| row(e)).collect::<Vec<_>>(),
+                });
+                return Ok(CallToolResult::error(vec![Content::text(
+                    serde_json::to_string(&out).unwrap_or_default(),
+                )]));
+            }
+            let mut out = format!(
+                "'{query}' matches {} definitions; pass file (or a \"type name\" query) to pick one:\n",
+                matches.len()
+            );
+            for e in &matches {
+                out.push_str(&format!(
+                    "  {} {} {}:{}\n",
+                    e.entity_type, e.name, e.file_path, e.start_line
+                ));
+            }
+            return Ok(CallToolResult::error(vec![Content::text(out)]));
+        }
+
+        let def = matches[0];
+        let mut callers: Vec<_> = graph
+            .dependents()
+            .get(def.id.as_str())
+            .map(|ids| ids.iter().filter_map(|id| graph.entities.get(id)).collect())
+            .unwrap_or_default();
+        callers.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+        let total = callers.len();
+        if let Some(cap) = params.limit {
+            callers.truncate(cap);
+        }
+
+        if params.format() == "json" {
+            let out = serde_json::json!({
+                "entity": row(def),
+                "callers": callers.iter().map(|e| row(e)).collect::<Vec<_>>(),
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&out).unwrap_or_default(),
+            )]));
+        }
+
+        let mut out = format!(
+            "{} {} {}:{}\n",
+            def.entity_type, def.name, def.file_path, def.start_line
+        );
+        if callers.is_empty() {
+            out.push_str("  (callers: none)\n");
+        }
+        for e in &callers {
+            out.push_str(&format!(
+                "  {} {} {}:{}\n",
+                e.entity_type, e.name, e.file_path, e.start_line
+            ));
+        }
+        if callers.len() < total {
+            out.push_str(&format!(
+                "  … {} more (raise limit)\n",
+                total - callers.len()
+            ));
+        }
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
     // ── Grep ──
 
     #[tool(

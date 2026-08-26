@@ -215,6 +215,31 @@ impl GrepParams {
     }
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CallersParams {
+    #[schemars(
+        description = "Entity whose callers to list, optionally as \"type name\" (e.g. \"function createProgram\") to disambiguate by kind. Must resolve to exactly one definition; an ambiguous name is refused with the full candidate list."
+    )]
+    pub query: String,
+    #[schemars(description = "Restrict to the definition in this file (disambiguates).")]
+    pub file: Option<String>,
+    #[schemars(description = "Return at most this many callers (all by default).")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
+    pub format: Option<String>,
+}
+
+impl CallersParams {
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_deref().filter(|f| !f.is_empty())
+    }
+
+    pub fn format(&self) -> &str {
+        self.format.as_deref().unwrap_or("text")
+    }
+}
+
 // ── Review listener tool parameter structs ──
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -330,6 +355,7 @@ mod tests {
         assert_unknown_fields_return_invalid_params::<ContextParams>();
         assert_unknown_fields_return_invalid_params::<FindParams>();
         assert_unknown_fields_return_invalid_params::<GrepParams>();
+        assert_unknown_fields_return_invalid_params::<CallersParams>();
         assert_unknown_fields_return_invalid_params::<JoinReviewParams>();
         assert_unknown_fields_return_invalid_params::<WaitForBranchParams>();
         assert_unknown_fields_return_invalid_params::<ReplyToBranchParams>();
