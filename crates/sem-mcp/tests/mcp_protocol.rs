@@ -418,3 +418,67 @@ fn entities_and_context_support_format_json_with_cli_fields() {
     assert!(entry.get("name").is_some(), "entry: {entry}");
     assert!(entry.get("content").is_some(), "entry: {entry}");
 }
+
+// ── Batch (multi-query) forms ──
+
+#[test]
+fn find_batch_queries_resolve_independently() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_find",
+        json!({"queries": ["needle_target_fn", "does_not_exist_zzz"], "format": "json"}),
+    );
+    let rows: Value = serde_json::from_str(&tool_text(&resp)).expect("batch find json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 2, "one entry per query, in order: {rows:?}");
+    assert_eq!(rows[0]["query"], "needle_target_fn");
+    assert_eq!(rows[0]["matches"][0]["file"], "src/needle.py");
+    assert_eq!(rows[1]["query"], "does_not_exist_zzz");
+    assert_eq!(
+        rows[1]["matches"].as_array().unwrap().len(),
+        0,
+        "a miss is an empty entry, never an error for the batch"
+    );
+}
+
+#[test]
+fn grep_batch_patterns_report_separately() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_grep",
+        json!({"patterns": ["NEEDLE_GREP_MARKER_XYZ", "no_such_text_zzz"], "format": "json"}),
+    );
+    let results: Value = serde_json::from_str(&tool_text(&resp)).expect("batch grep json");
+    let results = results.as_array().expect("array");
+    assert_eq!(results.len(), 2, "one entry per pattern: {results:?}");
+    assert_eq!(results[0]["pattern"], "NEEDLE_GREP_MARKER_XYZ");
+    assert_eq!(results[0]["hits"][0]["file"], "src/marker.py");
+    assert_eq!(results[1]["pattern"], "no_such_text_zzz");
+    assert_eq!(results[1]["hits"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn context_batch_entities_pack_one_block_each() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_context",
+        json!({"entities": ["needle_target_fn", "unrelated_other"], "format": "json"}),
+    );
+    let text = tool_text(&resp);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "json batch is newline-delimited, one object per entity:\n{text}"
+    );
+    let first: Value = serde_json::from_str(lines[0]).expect("first entity json");
+    let second: Value = serde_json::from_str(lines[1]).expect("second entity json");
+    assert_eq!(first["entity"], "needle_target_fn");
+    assert_eq!(second["entity"], "unrelated_other");
+}

@@ -46,6 +46,58 @@ pub struct QueryOptions {
     pub json: bool,
 }
 
+/// `sem find name1 name2 …` — several lookups in one invocation. Each name
+/// resolves independently through the exact same index/fallback machinery as
+/// a single `sem find`; a miss on one name never affects the others. Exit
+/// code is 1 only when *every* name missed (a batch where anything resolved
+/// is a success, matching the per-name independence contract).
+pub fn find_multi_command(cwd: String, queries: Vec<String>, file: Option<String>, json: bool) {
+    let mut answers: Vec<(String, Answer)> = Vec::with_capacity(queries.len());
+    for query in queries {
+        let opts = QueryOptions {
+            cwd: cwd.clone(),
+            query: query.clone(),
+            file: file.clone(),
+            json,
+        };
+        let answer = resolve(&opts, Verb::Find);
+        answers.push((query, answer));
+    }
+
+    let any_hit = answers.iter().any(|(_, a)| !a.defs.is_empty());
+    if json {
+        let rows: Vec<serde_json::Value> = answers
+            .iter()
+            .map(|(query, answer)| {
+                serde_json::json!({
+                    "query": query,
+                    "matches": answer.defs.iter().map(to_row).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows).unwrap_or_default());
+    } else {
+        for (query, answer) in &answers {
+            if answer.defs.is_empty() {
+                eprintln!("{} no entity named '{}'", "error:".red().bold(), query);
+                continue;
+            }
+            for def in &answer.defs {
+                println!(
+                    "{} {} {}:{}",
+                    def.entity_type.dimmed(),
+                    def.name.bold(),
+                    def.file_path,
+                    def.start_line
+                );
+            }
+        }
+    }
+    if !any_hit {
+        std::process::exit(1);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Verb {
     Find,
@@ -94,21 +146,27 @@ fn to_row(e: &EntityInfo) -> DefRow {
 }
 
 fn run(opts: QueryOptions, verb: Verb) {
+    let answer = resolve(&opts, verb);
+    render(&answer, verb, opts.json, &opts.query);
+}
+
+/// Resolution half of `run`, shared with the multi-query form: index answer
+/// when fresh, cold build otherwise — byte-identical behavior to what `run`
+/// always did, just separated from rendering.
+fn resolve(opts: &QueryOptions, verb: Verb) -> Answer {
     let root = super::repo_root_or_cwd(&opts.cwd);
 
-    let answer = if std::env::var_os("SEM_NO_INDEX").is_some() {
-        cold_build_answer(&root, &opts, verb)
+    if std::env::var_os("SEM_NO_INDEX").is_some() {
+        cold_build_answer(&root, opts, verb)
     } else {
         match index::QueryIndex::open(&index_path(&root)) {
-            Some(idx) => match index_answer(&idx, &root, &opts, verb) {
+            Some(idx) => match index_answer(&idx, &root, opts, verb) {
                 Some(answer) => answer,
-                None => cold_build_answer(&root, &opts, verb),
+                None => cold_build_answer(&root, opts, verb),
             },
-            None => cold_build_answer(&root, &opts, verb),
+            None => cold_build_answer(&root, opts, verb),
         }
-    };
-
-    render(&answer, verb, opts.json, &opts.query);
+    }
 }
 
 fn index_path(root: &Path) -> PathBuf {

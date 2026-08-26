@@ -115,7 +115,11 @@ pub struct ContextParams {
     )]
     pub file_path: Option<String>,
     #[schemars(description = "Name of the target entity")]
-    pub entity_name: String,
+    pub entity_name: Option<String>,
+    #[schemars(
+        description = "Several target entities to pack in one call (batch form of `entity_name`), each packed under the same token_budget. Text output concatenates the per-entity blocks; json output is newline-delimited, one object per entity."
+    )]
+    pub entities: Option<Vec<String>>,
     #[schemars(description = "Maximum token budget. Defaults to 8000.")]
     pub token_budget: Option<usize>,
     #[schemars(
@@ -138,6 +142,11 @@ impl ContextParams {
     pub fn format(&self) -> &str {
         self.format.as_deref().unwrap_or("text")
     }
+
+    /// Batch entries, when the batch form is in use (non-empty `entities`).
+    pub fn entities(&self) -> Option<&[String]> {
+        self.entities.as_deref().filter(|e| !e.is_empty())
+    }
 }
 
 // ── Find / Grep tool parameter structs ──
@@ -148,7 +157,11 @@ pub struct FindParams {
     #[schemars(
         description = "Entity name to look up, optionally as \"type name\" (e.g. \"function createProgram\") to disambiguate by kind."
     )]
-    pub query: String,
+    pub query: Option<String>,
+    #[schemars(
+        description = "Several names to look up in one call (batch form of `query`). Each resolves independently; a miss on one never affects the others."
+    )]
+    pub queries: Option<Vec<String>>,
     #[schemars(description = "Restrict to entities defined in this file.")]
     pub file: Option<String>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
@@ -163,6 +176,11 @@ impl FindParams {
     pub fn format(&self) -> &str {
         self.format.as_deref().unwrap_or("text")
     }
+
+    /// Batch entries, when the batch form is in use (non-empty `queries`).
+    pub fn queries(&self) -> Option<&[String]> {
+        self.queries.as_deref().filter(|q| !q.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -171,7 +189,11 @@ pub struct GrepParams {
     #[schemars(
         description = "Regex or literal pattern to search file contents for (rg-compatible)."
     )]
-    pub pattern: String,
+    pub pattern: Option<String>,
+    #[schemars(
+        description = "Several patterns to search in one call (batch form of `pattern`). Each pattern's hits are reported separately, never merged."
+    )]
+    pub patterns: Option<Vec<String>>,
     #[schemars(description = "Case-insensitive match.")]
     pub case_insensitive: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
@@ -185,6 +207,11 @@ impl GrepParams {
 
     pub fn format(&self) -> &str {
         self.format.as_deref().unwrap_or("text")
+    }
+
+    /// Batch entries, when the batch form is in use (non-empty `patterns`).
+    pub fn patterns(&self) -> Option<&[String]> {
+        self.patterns.as_deref().filter(|p| !p.is_empty())
     }
 }
 

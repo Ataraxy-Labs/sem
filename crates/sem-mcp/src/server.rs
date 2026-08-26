@@ -2021,7 +2021,7 @@ impl SemServer {
     // ── Tool 6: Context ──
 
     #[tool(
-        description = "Pack optimal entity context into a token budget. Priority: target entity > direct dependencies > direct dependents > transitive dependencies > transitive dependents."
+        description = "Pack optimal entity context into a token budget. Priority: target entity > direct dependencies > direct dependents > transitive dependencies > transitive dependents. Pass entities=[...] to pack several targets in one call, each under the same budget."
     )]
     async fn sem_context(
         &self,
@@ -2030,6 +2030,63 @@ impl SemServer {
         // Time the whole handler so the result carries the real latency the
         // agent waited on — let the speed be felt, not claimed.
         let start = Instant::now();
+
+        if let Some(entities) = params.entities() {
+            // Batch form: one block per entity, resolution failures reported
+            // inline per entity (a miss on one never hides the others). The
+            // call is an error only when every entity failed.
+            let mut blocks: Vec<String> = Vec::with_capacity(entities.len());
+            let mut any_ok = false;
+            for name in entities {
+                let result = self.sem_context_one(&params, name, start).await?;
+                let is_err = result.is_error.unwrap_or(false);
+                let text = match result.content.first().map(|c| &c.raw) {
+                    Some(rmcp::model::RawContent::Text(t)) => t.text.clone(),
+                    _ => String::new(),
+                };
+                if is_err {
+                    blocks.push(format!("{name}: {text}"));
+                } else {
+                    any_ok = true;
+                    blocks.push(text);
+                }
+            }
+            // json blocks are single-line objects, so "\n" yields one object
+            // per line; text blocks read better with a blank line between.
+            let sep = if params.format() == "json" {
+                "\n"
+            } else {
+                "\n\n"
+            };
+            let joined = blocks.join(sep);
+            return Ok(if any_ok {
+                CallToolResult::success(vec![Content::text(joined)])
+            } else {
+                CallToolResult::error(vec![Content::text(joined)])
+            });
+        }
+
+        let Some(entity_name) = params
+            .entity_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        else {
+            return Ok(tool_error("either entity_name or entities is required"));
+        };
+        self.sem_context_one(&params, entity_name, start).await
+    }
+
+    /// One entity's packed context — the entire former `sem_context` body,
+    /// shared verbatim by the single-entity call and the batch (`entities`)
+    /// form, which dispatches here once per name. `start` is the whole
+    /// handler's clock so batch entries report honest cumulative latency.
+    async fn sem_context_one(
+        &self,
+        params: &ContextParams,
+        entity_name: &str,
+        start: Instant,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ctx = match self.get_context(params.file_path.as_deref()).await {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
@@ -2062,7 +2119,7 @@ impl SemServer {
         if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
             if let Some(rel_path) = explicit_rel.as_deref() {
                 if let Some(mut out) =
-                    crate::cloud::try_context(&ctx.git, &params.entity_name, rel_path, budget, hops)
+                    crate::cloud::try_context(&ctx.git, entity_name, rel_path, budget, hops)
                 {
                     out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
                     out["source"] = serde_json::json!("cloud");
@@ -2090,13 +2147,11 @@ impl SemServer {
         };
 
         let (entity_id, rel_path) = match explicit_rel {
-            Some(rel_path) => {
-                match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
-                    Ok(entity_id) => (entity_id.to_string(), rel_path),
-                    Err(err) => return Ok(tool_error(err)),
-                }
-            }
-            None => match Self::find_entity_repo_wide(&graph, &params.entity_name) {
+            Some(rel_path) => match Self::find_entity_in_graph(&graph, entity_name, &rel_path) {
+                Ok(entity_id) => (entity_id.to_string(), rel_path),
+                Err(err) => return Ok(tool_error(err)),
+            },
+            None => match Self::find_entity_repo_wide(&graph, entity_name) {
                 Ok(entity) => (entity.id.clone(), entity.file_path.clone()),
                 Err(err) => return Ok(tool_error(err)),
             },
@@ -2130,7 +2185,7 @@ impl SemServer {
                 .ledger_reply(
                     "mcp",
                     entity_id,
-                    &params.entity_name,
+                    entity_name,
                     &rel_path,
                     target_content,
                     &packed_marker,
@@ -2148,7 +2203,7 @@ impl SemServer {
         // still collapse to the one-line ledger reply regardless of format.
         if params.format() == "json" {
             let out = serde_json::json!({
-                "entity": params.entity_name,
+                "entity": entity_name,
                 "entityId": entity_id,
                 "budget": budget,
                 "total_tokens": context_result.total_tokens,
@@ -2193,7 +2248,7 @@ impl SemServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             crate::render::context_text(&serde_json::json!({
-                "entity": params.entity_name,
+                "entity": entity_name,
                 "file": rel_path,
                 "token_budget": budget,
                 "tokens_used": context_result.total_tokens,
@@ -2211,7 +2266,7 @@ impl SemServer {
     // ── Find ──
 
     #[tool(
-        description = "Find entity definitions by exact name across the repo. Supports \"type name\" queries (e.g. \"function createProgram\") to disambiguate by kind, plus an optional file restriction. Returns one \"type name file:start_line\" row per match."
+        description = "Find entity definitions by exact name across the repo. Supports \"type name\" queries (e.g. \"function createProgram\") to disambiguate by kind, plus an optional file restriction. Returns one \"type name file:start_line\" row per match. Pass queries=[...] to batch several lookups in one call."
     )]
     async fn sem_find(
         &self,
@@ -2222,45 +2277,99 @@ impl SemServer {
             Err(err) => return Ok(tool_error(err)),
         };
         let (graph, _) = self.live_graph(&ctx.repo_root).await;
-
-        // Same "type name" split as the CLI's find verb: both halves non-empty
-        // means kind + name, anything else is the whole string as the name.
-        let (name, want_type) = match params.query.split_once(' ') {
-            Some((t, n)) if !t.is_empty() && !n.is_empty() => (n, Some(t)),
-            _ => (params.query.as_str(), None),
-        };
         let file_filter = params.file();
-        let mut matches: Vec<_> = graph
-            .entities
-            .values()
-            .filter(|e| e.name == name)
-            .filter(|e| want_type.is_none_or(|t| e.entity_type == t))
-            .filter(|e| file_filter.is_none_or(|f| e.file_path == f))
-            .collect();
-        matches.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then_with(|| a.start_line.cmp(&b.start_line))
-        });
+
+        // One query's matches, sorted for determinism. Shared by the single
+        // and batch forms so they can never drift apart.
+        let match_one = |query: &str| {
+            // Same "type name" split as the CLI's find verb: both halves
+            // non-empty means kind + name, anything else is the whole string
+            // as the name.
+            let (name, want_type) = match query.split_once(' ') {
+                Some((t, n)) if !t.is_empty() && !n.is_empty() => (n, Some(t)),
+                _ => (query, None),
+            };
+            let mut matches: Vec<_> = graph
+                .entities
+                .values()
+                .filter(|e| e.name == name)
+                .filter(|e| want_type.is_none_or(|t| e.entity_type == t))
+                .filter(|e| file_filter.is_none_or(|f| e.file_path == f))
+                .collect();
+            matches.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+            });
+            matches
+        };
+        let row = |e: &sem_core::parser::graph::EntityInfo| {
+            serde_json::json!({
+                "id": e.id,
+                "name": e.name,
+                "type": e.entity_type,
+                "file": e.file_path,
+                "start_line": e.start_line,
+                "end_line": e.end_line,
+            })
+        };
+
+        if let Some(queries) = params.queries() {
+            // Batch form: each name resolves independently; a miss is an
+            // empty entry, never an error for the whole call.
+            let per_query: Vec<(&str, Vec<_>)> =
+                queries.iter().map(|q| (q.as_str(), match_one(q))).collect();
+
+            if params.format() == "json" {
+                let rows: Vec<serde_json::Value> = per_query
+                    .iter()
+                    .map(|(query, matches)| {
+                        serde_json::json!({
+                            "query": query,
+                            "matches": matches.iter().map(|e| row(e)).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&rows).unwrap_or_default(),
+                )]));
+            }
+
+            let mut out = String::new();
+            for (i, (query, matches)) in per_query.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!("query \"{query}\":\n"));
+                if matches.is_empty() {
+                    out.push_str(&format!("  no entity named '{query}'\n"));
+                }
+                for e in matches {
+                    out.push_str(&format!(
+                        "  {} {} {}:{}\n",
+                        e.entity_type, e.name, e.file_path, e.start_line
+                    ));
+                }
+            }
+            return Ok(CallToolResult::success(vec![Content::text(out)]));
+        }
+
+        let Some(query) = params
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        else {
+            return Ok(tool_error("either query or queries is required"));
+        };
+        let matches = match_one(query);
 
         if matches.is_empty() {
-            return Ok(tool_error(format!("no entity named '{}'", params.query)));
+            return Ok(tool_error(format!("no entity named '{query}'")));
         }
 
         if params.format() == "json" {
-            let rows: Vec<serde_json::Value> = matches
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "id": e.id,
-                        "name": e.name,
-                        "type": e.entity_type,
-                        "file": e.file_path,
-                        "start_line": e.start_line,
-                        "end_line": e.end_line,
-                    })
-                })
-                .collect();
+            let rows: Vec<serde_json::Value> = matches.iter().map(|e| row(e)).collect();
             return Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&rows).unwrap_or_default(),
             )]));
@@ -2279,7 +2388,7 @@ impl SemServer {
     // ── Grep ──
 
     #[tool(
-        description = "Search file contents for a regex or literal pattern across the repo's source files, returning rg-compatible file:line:text hits. Best for strings, error messages, config keys, and non-code files; prefer sem_entities/sem_context for structural questions."
+        description = "Search file contents for a regex or literal pattern across the repo's source files, returning rg-compatible file:line:text hits. Best for strings, error messages, config keys, and non-code files; prefer sem_entities/sem_context for structural questions. Pass patterns=[...] to batch several searches in one call, each pattern's hits kept separate."
     )]
     async fn sem_grep(
         &self,
@@ -2301,28 +2410,88 @@ impl SemServer {
         let opts = sem_core::index::grep::GrepOptions {
             case_insensitive: params.case_insensitive(),
         };
-        let hits = match sem_core::index::grep::full_scan(
-            &ctx.repo_root,
-            &file_paths,
-            &params.pattern,
-            &opts,
-        ) {
-            Ok(hits) => hits,
-            Err(e) => return Ok(tool_error(format!("invalid pattern: {e}"))),
+        let hit_rows = |hits: &[sem_core::index::grep::GrepHit]| {
+            hits.iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "file": h.file,
+                        "line": h.line,
+                        "text": h.text,
+                    })
+                })
+                .collect::<Vec<_>>()
         };
+
+        if let Some(patterns) = params.patterns() {
+            // Batch form: each pattern scanned and reported separately (never
+            // merged); an invalid pattern is reported inline for its own
+            // entry, never aborting the others.
+            let per_pattern: Vec<(&str, Result<Vec<_>, String>)> = patterns
+                .iter()
+                .map(|p| {
+                    (
+                        p.as_str(),
+                        sem_core::index::grep::full_scan(&ctx.repo_root, &file_paths, p, &opts)
+                            .map_err(|e| format!("invalid pattern: {e}")),
+                    )
+                })
+                .collect();
+
+            if params.format() == "json" {
+                let results: Vec<serde_json::Value> = per_pattern
+                    .iter()
+                    .map(|(pattern, outcome)| match outcome {
+                        Ok(hits) => serde_json::json!({
+                            "pattern": pattern,
+                            "hits": hit_rows(hits),
+                            "candidate_files": file_paths.len(),
+                            "total_files": file_paths.len(),
+                            "origin": "full_scan",
+                        }),
+                        Err(e) => serde_json::json!({
+                            "pattern": pattern,
+                            "error": e,
+                        }),
+                    })
+                    .collect();
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&results).unwrap_or_default(),
+                )]));
+            }
+
+            let mut out = String::new();
+            for (i, (pattern, outcome)) in per_pattern.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!("pattern \"{pattern}\":\n"));
+                match outcome {
+                    Ok(hits) => {
+                        if hits.is_empty() {
+                            out.push_str("  (no hits)\n");
+                        }
+                        for hit in hits {
+                            out.push_str(&format!("  {}:{}:{}\n", hit.file, hit.line, hit.text));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("  {e}\n")),
+                }
+            }
+            return Ok(CallToolResult::success(vec![Content::text(out)]));
+        }
+
+        let Some(pattern) = params.pattern.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(tool_error("either pattern or patterns is required"));
+        };
+        let hits =
+            match sem_core::index::grep::full_scan(&ctx.repo_root, &file_paths, pattern, &opts) {
+                Ok(hits) => hits,
+                Err(e) => return Ok(tool_error(format!("invalid pattern: {e}"))),
+            };
 
         if params.format() == "json" {
             let report = serde_json::json!({
-                "hits": hits
-                    .iter()
-                    .map(|h| {
-                        serde_json::json!({
-                            "file": h.file,
-                            "line": h.line,
-                            "text": h.text,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
+                "hits": hit_rows(&hits),
                 "candidate_files": file_paths.len(),
                 "total_files": file_paths.len(),
                 "origin": "full_scan",
@@ -3026,7 +3195,8 @@ mod tests {
         let server = server_for_repo(&root).await;
         let params = || ContextParams {
             file_path: None,
-            entity_name: "gamma".to_string(),
+            entity_name: Some("gamma".to_string()),
+            entities: None,
             token_budget: Some(2000),
             hops: Some(1),
             no_default_excludes: None,
@@ -3418,7 +3588,8 @@ mod tests {
         let result = server
             .sem_context(Parameters(ContextParams {
                 file_path: Some("src/generated/schema.ts".to_string()),
-                entity_name: "generatedTarget".to_string(),
+                entity_name: Some("generatedTarget".to_string()),
+                entities: None,
                 token_budget: Some(2000),
                 hops: None,
                 no_default_excludes: Some(true),
@@ -3447,7 +3618,8 @@ mod tests {
         let result = server
             .sem_context(Parameters(ContextParams {
                 file_path: Some(file_path.display().to_string()),
-                entity_name: "known_entity".to_string(),
+                entity_name: Some("known_entity".to_string()),
+                entities: None,
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
@@ -3474,7 +3646,8 @@ mod tests {
         let result = server
             .sem_context(Parameters(ContextParams {
                 file_path: Some(file_path.display().to_string()),
-                entity_name: "nonexistent_zzz".to_string(),
+                entity_name: Some("nonexistent_zzz".to_string()),
+                entities: None,
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
@@ -3505,7 +3678,8 @@ mod tests {
         let a = server
             .sem_context(Parameters(ContextParams {
                 file_path: Some(repo_a.join("a.py").display().to_string()),
-                entity_name: "alpha_entity".to_string(),
+                entity_name: Some("alpha_entity".to_string()),
+                entities: None,
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
@@ -3520,7 +3694,8 @@ mod tests {
         let b = server
             .sem_context(Parameters(ContextParams {
                 file_path: Some(repo_b.join("b.py").display().to_string()),
-                entity_name: "beta_entity".to_string(),
+                entity_name: Some("beta_entity".to_string()),
+                entities: None,
                 token_budget: None,
                 hops: None,
                 no_default_excludes: None,
