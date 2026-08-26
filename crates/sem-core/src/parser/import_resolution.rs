@@ -3,6 +3,8 @@ use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
+use rustc_hash::{FxHashMap as HashMapFx, FxHashSet as HashSetFx};
+
 use crate::parser::graph::EntityInfo;
 use regex::Regex;
 
@@ -347,6 +349,288 @@ pub(crate) fn js_ts_named_exports_from_content(content: &str) -> HashSet<String>
     }
 
     names
+}
+
+/// Direct named exports declared in this file (not `export { … } from` re-exports).
+pub(crate) fn js_ts_direct_named_exports_from_content(content: &str) -> HashSet<String> {
+    static NAMED_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\bexport\s+(?:declare\s+)?(?:async\s+)?(?:abstract\s+)?(?:function\s*\*?|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+        )
+        .unwrap()
+    });
+    static VAR_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bexport\s+(?:declare\s+)?(?:const|let|var)\s+([^;\n]+)").unwrap()
+    });
+
+    let mut names = HashSet::new();
+
+    for cap in NAMED_DECL_RE.captures_iter(content) {
+        names.insert(cap.get(1).unwrap().as_str().to_string());
+    }
+
+    for cap in VAR_DECL_RE.captures_iter(content) {
+        for declarator in split_js_ts_var_declarators(cap.get(1).unwrap().as_str()) {
+            if let Some(name) = js_ts_identifier_prefix(declarator) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    names
+}
+
+/// Module specifiers from `export * from './module'` statements, in source order.
+pub(crate) fn js_ts_star_re_exports_from_content(content: &str) -> Vec<String> {
+    static STAR_REEXPORT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"export\s+\*\s+from\s*['"]([^'"]+)['"]"#).unwrap());
+
+    STAR_REEXPORT_RE
+        .captures_iter(content)
+        .map(|cap| cap.get(1).unwrap().as_str().to_string())
+        .collect()
+}
+
+/// Named re-export specifiers: `(original_name, local_export_name, module_path)`.
+pub(crate) fn js_ts_named_re_export_specifiers_from_content(content: &str) -> Vec<(String, String, String)> {
+    static REEXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"export\s+(?:type\s+)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+    });
+
+    let mut specifiers = Vec::new();
+    for cap in REEXPORT_RE.captures_iter(content) {
+        let names_str = cap.get(1).unwrap().as_str();
+        let module_path = cap.get(2).unwrap().as_str().to_string();
+        for name_part in names_str.split(',') {
+            if let Some((original, local)) = parse_js_ts_import_specifier(name_part) {
+                specifiers.push((original.to_string(), local.to_string(), module_path.clone()));
+            }
+        }
+    }
+    specifiers
+}
+
+fn parse_js_ts_import_specifier(name_part: &str) -> Option<(&str, &str)> {
+    let name_part = name_part.trim();
+    if name_part.is_empty() {
+        return None;
+    }
+    let name_part = name_part.strip_prefix("type ").unwrap_or(name_part).trim();
+    if let Some(pos) = name_part.find(" as ") {
+        let original = name_part[..pos].trim();
+        let local = name_part[pos + 4..].trim();
+        if original.is_empty() || local.is_empty() {
+            return None;
+        }
+        Some((original, local))
+    } else {
+        Some((name_part, name_part))
+    }
+}
+
+pub(crate) const JS_TS_STAR_EXPORT_DEPTH_CAP: usize = 32;
+
+/// Expand a JS/TS file's export surface through `export * from` chains.
+///
+/// Precedence (later steps never overwrite an existing key):
+/// 1. Direct declarations in the barrel file.
+/// 2. `export { x } from` named re-exports (resolved against the target module).
+/// 3. `export * from` star re-exports — names spliced in file order; when the same
+///    name arrives from multiple stars, the nearest / first-in-file star wins
+///    (deterministic tie-break).
+pub(crate) fn expand_js_ts_named_export_sources_for_file(
+    file_path: &str,
+    content_by_path: &HashMapFx<String, &str>,
+    candidate_files: &[String],
+    memo: &mut HashMapFx<String, HashMapFx<String, String>>,
+    visiting: &mut HashSetFx<String>,
+    depth: usize,
+) -> HashMapFx<String, String> {
+    if depth > JS_TS_STAR_EXPORT_DEPTH_CAP || visiting.contains(file_path) {
+        return HashMapFx::default();
+    }
+    if let Some(cached) = memo.get(file_path) {
+        return cached.clone();
+    }
+
+    let Some(content) = content_by_path.get(file_path) else {
+        return HashMapFx::default();
+    };
+
+    visiting.insert(file_path.to_string());
+    let mut sources = HashMapFx::default();
+
+    for name in js_ts_direct_named_exports_from_content(content) {
+        sources.insert(name, file_path.to_string());
+    }
+
+    for (original, local, module_path) in js_ts_named_re_export_specifiers_from_content(content) {
+        if sources.contains_key(&local) {
+            continue;
+        }
+        if let Some(target_file) = find_import_file(
+            candidate_files,
+            &module_path,
+            file_path,
+            JS_TS_EXTENSIONS,
+        ) {
+            let nested = expand_js_ts_named_export_sources_for_file(
+                target_file,
+                content_by_path,
+                candidate_files,
+                memo,
+                visiting,
+                depth + 1,
+            );
+            if let Some(src) = nested.get(&original) {
+                sources.insert(local, src.clone());
+            } else if content_by_path
+                .get(target_file)
+                .map(|target_content| {
+                    js_ts_direct_named_exports_from_content(target_content).contains(&original)
+                })
+                .unwrap_or(false)
+            {
+                sources.insert(local, target_file.to_string());
+            }
+        }
+    }
+
+  // Star re-exports: first-in-file order wins when duplicate names arrive via different stars.
+    for module_path in js_ts_star_re_exports_from_content(content) {
+        if let Some(target_file) = find_import_file(
+            candidate_files,
+            &module_path,
+            file_path,
+            JS_TS_EXTENSIONS,
+        ) {
+            let nested = expand_js_ts_named_export_sources_for_file(
+                target_file,
+                content_by_path,
+                candidate_files,
+                memo,
+                visiting,
+                depth + 1,
+            );
+            for (name, src) in nested {
+                sources.entry(name).or_insert(src);
+            }
+        }
+    }
+
+    visiting.remove(file_path);
+    memo.insert(file_path.to_string(), sources.clone());
+    sources
+}
+
+/// Per-file expanded export-name sets, keyed by file path.
+pub(crate) type JsTsNamedExportsByFile = HashMapFx<String, HashSetFx<String>>;
+/// Per-file `export name -> defining source file` maps, keyed by file path.
+pub(crate) type JsTsNamedExportSourcesByFile = HashMapFx<String, HashMapFx<String, String>>;
+
+pub(crate) fn build_js_ts_named_export_sources(
+    file_paths: &[String],
+    content_by_path: &HashMapFx<String, &str>,
+) -> (JsTsNamedExportsByFile, JsTsNamedExportSourcesByFile) {
+    let mut js_ts_files: Vec<String> = file_paths
+        .iter()
+        .filter(|path| is_js_ts_file(path))
+        .cloned()
+        .collect();
+    sort_import_candidate_files(&mut js_ts_files, JS_TS_EXTENSIONS);
+
+    let mut memo: HashMapFx<String, HashMapFx<String, String>> = HashMapFx::default();
+    let mut named_exports_by_file: HashMapFx<String, HashSetFx<String>> = HashMapFx::default();
+    let mut named_export_sources_by_file: HashMapFx<String, HashMapFx<String, String>> =
+        HashMapFx::default();
+
+    for file_path in &js_ts_files {
+        if !content_by_path.contains_key(file_path) {
+            continue;
+        }
+        let mut visiting = HashSetFx::default();
+        let sources = expand_js_ts_named_export_sources_for_file(
+            file_path,
+            content_by_path,
+            &js_ts_files,
+            &mut memo,
+            &mut visiting,
+            0,
+        );
+        named_exports_by_file.insert(file_path.clone(), sources.keys().cloned().collect());
+        named_export_sources_by_file.insert(file_path.clone(), sources);
+    }
+
+    (named_exports_by_file, named_export_sources_by_file)
+}
+
+/// Resolve a JS/TS named import or re-export against the expanded export surface.
+pub(crate) fn resolve_js_ts_named_import_target<S: BuildHasher>(
+    original_name: &str,
+    module_path: &str,
+    file_path: &str,
+    symbol_table: &HashMap<String, Vec<String>, S>,
+    entity_map: &HashMap<String, EntityInfo, S>,
+    named_export_sources_by_file: &HashMapFx<String, HashMapFx<String, String>>,
+    candidate_files: &[String],
+) -> Option<String> {
+    if let Some(target_id) = symbol_table.get(original_name).and_then(|target_ids| {
+        find_import_target(
+            target_ids,
+            module_path,
+            file_path,
+            JS_TS_EXTENSIONS,
+            entity_map,
+        )
+        .cloned()
+    }) {
+        return Some(target_id);
+    }
+
+    let barrel_file = find_import_file(candidate_files, module_path, file_path, JS_TS_EXTENSIONS)?;
+    let source_file = named_export_sources_by_file
+        .get(barrel_file)
+        .and_then(|sources| sources.get(original_name))?;
+
+    symbol_table.get(original_name).and_then(|target_ids| {
+        target_ids
+            .iter()
+            .find(|id| {
+                entity_map
+                    .get(id.as_str())
+                    .is_some_and(|entity| entity.file_path == *source_file && entity.parent_id.is_none())
+            })
+            .cloned()
+    })
+}
+
+/// Resolve one name on a namespace-imported module's export surface.
+///
+/// A named re-export alias (`export { core as publicCore } from './lib'`)
+/// materializes as an export entity in the barrel itself, so the barrel file
+/// is checked first — parity with the named-import path, where
+/// `find_import_target` matches the barrel's own entity. Names that reach the
+/// surface through `export *` have no entity in the barrel and fall back to
+/// the expansion's original source file.
+pub(crate) fn resolve_js_ts_namespace_member_target<S: BuildHasher>(
+    name: &str,
+    barrel_file: &str,
+    source_file: &str,
+    symbol_table: &HashMap<String, Vec<String>, S>,
+    entity_map: &HashMap<String, EntityInfo, S>,
+) -> Option<String> {
+    let find_in = |file: &str| {
+        symbol_table.get(name).and_then(|target_ids| {
+            target_ids.iter().find(|id| {
+                entity_map
+                    .get(id.as_str())
+                    .is_some_and(|entity| {
+                        entity.file_path == file && entity.parent_id.is_none()
+                    })
+            })
+        })
+    };
+    find_in(barrel_file).or_else(|| find_in(source_file)).cloned()
 }
 
 fn split_js_ts_var_declarators(input: &str) -> Vec<&str> {
@@ -753,6 +1037,27 @@ mod tests {
         );
 
         assert_eq!(target, None);
+    }
+
+    #[test]
+    fn js_ts_star_export_expansion_splices_named_exports_through_barrel() {
+        let a_content = "export interface T {}\nexport function f() {}\n";
+        let b_content = "export * from './a';\n";
+        let content_by_path: HashMapFx<String, &str> = HashMapFx::from_iter([
+            ("a.ts".to_string(), a_content),
+            ("b.ts".to_string(), b_content),
+        ]);
+        let file_paths = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let (named_exports, sources) =
+            build_js_ts_named_export_sources(&file_paths, &content_by_path);
+
+        let b_names = named_exports.get("b.ts").expect("b.ts exports");
+        assert!(b_names.contains("T"));
+        assert!(b_names.contains("f"));
+
+        let b_sources = sources.get("b.ts").expect("b.ts sources");
+        assert_eq!(b_sources.get("T").map(String::as_str), Some("a.ts"));
+        assert_eq!(b_sources.get("f").map(String::as_str), Some("a.ts"));
     }
 
     #[test]
