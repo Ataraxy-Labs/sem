@@ -16,6 +16,10 @@ pub struct ContextEntry {
     pub role: String,
     pub content: String,
     pub estimated_tokens: usize,
+    /// The entity's own 1-indexed inclusive line bounds, carried so renderers
+    /// can derive line-addressed views (e.g. headers) without re-resolving.
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 /// Entities deliberately not packed for a role: tests (their one-line
@@ -357,6 +361,8 @@ fn push_entry(
         role: role.to_string(),
         content,
         estimated_tokens: tokens,
+        start_line: entity.start_line,
+        end_line: entity.end_line,
     });
     result.total_tokens += tokens;
     included_ids.insert(entity.id.clone());

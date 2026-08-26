@@ -20,6 +20,9 @@ pub struct ContextOptions {
     pub file_exts: Vec<String>,
     pub no_cache: bool,
     pub no_default_excludes: bool,
+    /// Render each packed entity as its header (signature plus first
+    /// doc-comment line) instead of its body — the middle zoom.
+    pub headers: bool,
 }
 
 pub fn context_command(opts: ContextOptions) {
@@ -110,6 +113,8 @@ pub fn context_command(opts: ContextOptions) {
         opts.json,
         opts.budget,
         &context_result,
+        root,
+        opts.headers,
     );
     timings.finish();
     super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
@@ -119,6 +124,7 @@ pub fn context_command(opts: ContextOptions) {
 /// reroute (`try_index_context`) and this always-correct walk —
 /// one render function is what makes the two byte-identical by
 /// construction rather than by two hand-kept-in-sync copies.
+#[allow(clippy::too_many_arguments)]
 fn render_context(
     entity_name: &str,
     entity_type: &str,
@@ -126,7 +132,28 @@ fn render_context(
     json: bool,
     budget: usize,
     context_result: &sem_core::parser::context::ContextResult,
+    root: &Path,
+    headers: bool,
 ) {
+    // One header per packed entry (`sem_core::parser::header`), reading each
+    // distinct file once under the repo root (`ContextEntry::file_path` is
+    // repo-relative — same convention `hydrate_contents` joins with). Only
+    // computed under `--headers`; when off, both output modes below are
+    // byte-identical to what they always produced.
+    let entry_headers = headers.then(|| {
+        sem_core::parser::header::headers_by_id(
+            root,
+            context_result.entries.iter().map(|e| {
+                (
+                    e.entity_id.as_str(),
+                    e.file_path.as_str(),
+                    e.start_line,
+                    e.end_line,
+                )
+            }),
+        )
+    });
+
     if json {
         let output = serde_json::json!({
             "entity": entity_name,
@@ -140,15 +167,29 @@ fn render_context(
                 "entities": t.entities,
                 "tests": t.tests,
             })).collect::<Vec<_>>(),
-            "entries": context_result.entries.iter().map(|e| serde_json::json!({
-                "entityId": e.entity_id,
-                "name": e.entity_name,
-                "type": e.entity_type,
-                "file": e.file_path,
-                "role": e.role,
-                "tokens": e.estimated_tokens,
-                "content": e.content,
-            })).collect::<Vec<_>>(),
+            "entries": context_result.entries.iter().map(|e| {
+                if let Some(entry_headers) = &entry_headers {
+                    serde_json::json!({
+                        "entityId": e.entity_id,
+                        "name": e.entity_name,
+                        "type": e.entity_type,
+                        "file": e.file_path,
+                        "role": e.role,
+                        "tokens": e.estimated_tokens,
+                        "header": entry_headers.get(e.entity_id.as_str()).cloned().unwrap_or_default(),
+                    })
+                } else {
+                    serde_json::json!({
+                        "entityId": e.entity_id,
+                        "name": e.entity_name,
+                        "type": e.entity_type,
+                        "file": e.file_path,
+                        "role": e.role,
+                        "tokens": e.estimated_tokens,
+                        "content": e.content,
+                    })
+                }
+            }).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
@@ -192,7 +233,18 @@ fn render_context(
             );
             // The target is what you asked to read: print its full body. Related
             // entities stay a one-line signature so the context map stays scannable.
-            if entry.role == "target" {
+            // Under --headers, both zoom to the derived header lines instead.
+            if let Some(entry_headers) = &entry_headers {
+                if let Some(header) = entry_headers.get(entry.entity_id.as_str()) {
+                    for line in header {
+                        if entry.role == "target" {
+                            println!("      {line}");
+                        } else {
+                            println!("      {}", line.dimmed());
+                        }
+                    }
+                }
+            } else if entry.role == "target" {
                 for line in entry.content.lines() {
                     println!("      {line}");
                 }
@@ -357,6 +409,8 @@ fn try_index_context(opts: &ContextOptions, timings: &mut crate::timings::Timing
         opts.json,
         opts.budget,
         &context_result,
+        &root,
+        opts.headers,
     );
     true
 }

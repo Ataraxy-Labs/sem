@@ -1443,6 +1443,23 @@ impl SemServer {
             return Ok(tool_error(format!("Path not found: {}", path)));
         };
 
+        // One header per entity id (`sem_core::parser::header`), computed
+        // only when `signatures` is set; both output shapes below are
+        // byte-identical to before when it isn't.
+        let headers = params.signatures().then(|| {
+            sem_core::parser::header::headers_by_id(
+                &ctx.repo_root,
+                entities.iter().map(|e| {
+                    (
+                        e.id.as_str(),
+                        e.file_path.as_str(),
+                        e.start_line,
+                        e.end_line,
+                    )
+                }),
+            )
+        });
+
         // Compact per-line tree instead of JSON: name · type · lines, children
         // indented under their parent, files as group headers for directory
         // listings. Same information, ~6x fewer tokens for the reading model.
@@ -1450,7 +1467,7 @@ impl SemServer {
             let rows: Vec<serde_json::Value> = entities
                 .iter()
                 .map(|e| {
-                    serde_json::json!({
+                    let mut row = serde_json::json!({
                         "name": e.name,
                         "type": e.entity_type,
                         "start_line": e.start_line,
@@ -1459,7 +1476,11 @@ impl SemServer {
                         "end_byte": e.end_byte,
                         "parent_id": e.parent_id,
                         "file": e.file_path,
-                    })
+                    });
+                    if let Some(header) = headers.as_ref().and_then(|h| h.get(e.id.as_str())) {
+                        row["header"] = serde_json::json!(header);
+                    }
+                    row
                 })
                 .collect();
             return Ok(CallToolResult::success(vec![Content::text(
@@ -1473,7 +1494,13 @@ impl SemServer {
             } else {
                 format!("L{}", e.start_line)
             };
-            format!("{}{} · {} · {}\n", indent, e.name, e.entity_type, lines)
+            let mut row = format!("{}{} · {} · {}\n", indent, e.name, e.entity_type, lines);
+            if let Some(header) = headers.as_ref().and_then(|h| h.get(e.id.as_str())) {
+                for line in header {
+                    row.push_str(&format!("{}  {}\n", indent, line));
+                }
+            }
+            row
         };
         let mut out = format!("⊕ {} entities · {}\n", entities.len(), rel_path);
         if include_file {
@@ -2165,12 +2192,34 @@ impl SemServer {
             hops,
         );
 
+        // Headers mode (`mode: "headers"`): render each packed entity as its
+        // header (signature plus first doc-comment line) instead of its body
+        // — same derivation as the CLI's `--headers`
+        // (`sem_core::parser::header`), file paths joined under the repo
+        // root exactly like `hydrate_contents`. Skips the attention ledger:
+        // a header sweep is a different (and far smaller) shape than a fill,
+        // so collapsing one against the other would be wrong in both
+        // directions.
+        let entry_headers = params.wants_headers().then(|| {
+            sem_core::parser::header::headers_by_id(
+                &ctx.repo_root,
+                context_result.entries.iter().map(|e| {
+                    (
+                        e.entity_id.as_str(),
+                        e.file_path.as_str(),
+                        e.start_line,
+                        e.end_line,
+                    )
+                }),
+            )
+        });
+
         // Attention ledger (MCP path): one MCP server process serves exactly
         // one agent session, so a process-constant session key is correct.
         // Repeats answer as one line, changed entities as a delta against the
         // version the session saw. `fresh: true` bypasses (e.g. after context
         // compaction dropped the earlier fill).
-        if !params.fresh.unwrap_or(false) {
+        if entry_headers.is_none() && !params.fresh.unwrap_or(false) {
             let target_content = all_entities
                 .iter()
                 .find(|e| e.id == entity_id)
@@ -2214,15 +2263,30 @@ impl SemServer {
                     .entries
                     .iter()
                     .map(|e| {
-                        serde_json::json!({
-                            "entityId": e.entity_id,
-                            "name": e.entity_name,
-                            "type": e.entity_type,
-                            "file": e.file_path,
-                            "role": e.role,
-                            "tokens": e.estimated_tokens,
-                            "content": e.content,
-                        })
+                        if let Some(entry_headers) = &entry_headers {
+                            serde_json::json!({
+                                "entityId": e.entity_id,
+                                "name": e.entity_name,
+                                "type": e.entity_type,
+                                "file": e.file_path,
+                                "role": e.role,
+                                "tokens": e.estimated_tokens,
+                                "header": entry_headers
+                                    .get(e.entity_id.as_str())
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            })
+                        } else {
+                            serde_json::json!({
+                                "entityId": e.entity_id,
+                                "name": e.entity_name,
+                                "type": e.entity_type,
+                                "file": e.file_path,
+                                "role": e.role,
+                                "tokens": e.estimated_tokens,
+                                "content": e.content,
+                            })
+                        }
                     })
                     .collect::<Vec<_>>(),
             });
@@ -2235,13 +2299,22 @@ impl SemServer {
             .entries
             .iter()
             .map(|e| {
+                // In headers mode the text renderer prints the header lines
+                // where the body would have gone.
+                let content = match &entry_headers {
+                    Some(entry_headers) => entry_headers
+                        .get(e.entity_id.as_str())
+                        .map(|h| h.join("\n"))
+                        .unwrap_or_default(),
+                    None => e.content.clone(),
+                };
                 serde_json::json!({
                     "entity": e.entity_name,
                     "type": e.entity_type,
                     "file": e.file_path,
                     "role": e.role,
                     "tokens": e.estimated_tokens,
-                    "content": e.content,
+                    "content": content,
                 })
             })
             .collect();
@@ -3328,6 +3401,7 @@ mod tests {
             no_default_excludes: None,
             fresh: None,
             format: None,
+            mode: None,
         };
 
         let first = text_of(server.sem_context(Parameters(params())).await.unwrap());
@@ -3430,6 +3504,7 @@ mod tests {
                 limit: None,
                 text: None,
                 format: None,
+                signatures: None,
             }))
             .await
             .unwrap();
@@ -3457,6 +3532,7 @@ mod tests {
                 limit: None,
                 text: None,
                 format: None,
+                signatures: None,
             }))
             .await
             .unwrap();
@@ -3470,6 +3546,7 @@ mod tests {
                 limit: None,
                 text: None,
                 format: None,
+                signatures: None,
             }))
             .await
             .unwrap();
@@ -3721,6 +3798,7 @@ mod tests {
                 no_default_excludes: Some(true),
                 fresh: None,
                 format: None,
+                mode: None,
             }))
             .await
             .unwrap();
@@ -3751,6 +3829,7 @@ mod tests {
                 no_default_excludes: None,
                 fresh: None,
                 format: None,
+                mode: None,
             }))
             .await
             .unwrap();
@@ -3779,6 +3858,7 @@ mod tests {
                 no_default_excludes: None,
                 fresh: None,
                 format: None,
+                mode: None,
             }))
             .await
             .unwrap();
@@ -3811,6 +3891,7 @@ mod tests {
                 no_default_excludes: None,
                 fresh: None,
                 format: None,
+                mode: None,
             }))
             .await
             .unwrap();
@@ -3827,6 +3908,7 @@ mod tests {
                 no_default_excludes: None,
                 fresh: None,
                 format: None,
+                mode: None,
             }))
             .await
             .unwrap();

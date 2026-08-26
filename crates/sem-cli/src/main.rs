@@ -369,6 +369,12 @@ enum Commands {
         /// matched text). Use instead of grep for strings in code.
         #[arg(long, value_name = "SUBSTRING")]
         text: Option<String>,
+
+        /// Show each entity's header under its row: the signature up to the
+        /// body plus the first doc-comment line — more than a name, far less
+        /// than a body
+        #[arg(long)]
+        signatures: bool,
     },
     /// Show token-budgeted context for an entity
     Context {
@@ -418,6 +424,12 @@ enum Commands {
         /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
+
+        /// Render each packed entity as its header (signature plus first
+        /// doc-comment line) instead of its body — the same budget buys a
+        /// much wider map
+        #[arg(long)]
+        headers: bool,
     },
     /// Show lifetime diff statistics
     Stats,
@@ -863,6 +875,7 @@ fn main() {
             only_kinds,
             except_kinds,
             text,
+            signatures,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -876,6 +889,7 @@ fn main() {
                 only_kinds,
                 except_kinds,
                 text,
+                signatures,
             });
         }
         Some(Commands::Context {
@@ -890,6 +904,7 @@ fn main() {
             file_exts,
             no_cache,
             no_default_excludes,
+            headers,
         }) => {
             let cwd = std::env::current_dir()
                 .unwrap_or_default()
@@ -908,6 +923,7 @@ fn main() {
                     file_exts,
                     no_cache,
                     no_default_excludes,
+                    headers,
                 });
             } else {
                 // Batch form: one packed context per named entity, every
@@ -925,6 +941,7 @@ fn main() {
                         file_exts: file_exts.clone(),
                         no_cache,
                         no_default_excludes,
+                        headers,
                     });
                 }
             }

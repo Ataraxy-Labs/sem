@@ -21,6 +21,10 @@ pub struct EntitiesParams {
         description = "Exact substring to search for inside entity bodies across the whole repo (use instead of grep for strings, error messages, config keys). Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text."
     )]
     pub text: Option<String>,
+    #[schemars(
+        description = "Show each listed entity's header: its signature up to the body plus the first doc-comment line — more than a name, far less than a body."
+    )]
+    pub signatures: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }
@@ -50,6 +54,10 @@ impl EntitiesParams {
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
+    }
+
+    pub fn signatures(&self) -> bool {
+        self.signatures.unwrap_or(false)
     }
 
     pub fn format(&self) -> &str {
@@ -136,6 +144,10 @@ pub struct ContextParams {
     pub fresh: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
+    #[schemars(
+        description = "Set to \"headers\" to render each packed entity as its header (signature plus first doc-comment line) instead of its body — the same token_budget buys a much wider map."
+    )]
+    pub mode: Option<String>,
 }
 
 impl ContextParams {
@@ -146,6 +158,10 @@ impl ContextParams {
     /// Batch entries, when the batch form is in use (non-empty `entities`).
     pub fn entities(&self) -> Option<&[String]> {
         self.entities.as_deref().filter(|e| !e.is_empty())
+    }
+
+    pub fn wants_headers(&self) -> bool {
+        self.mode.as_deref() == Some("headers")
     }
 }
 
