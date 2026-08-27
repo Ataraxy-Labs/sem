@@ -9,7 +9,7 @@ use lix_rs_sdk::{open_lix, OpenLixOptions, RegisterPluginOptions, Value};
 use serde::{Deserialize, Serialize};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
-use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -45,7 +45,7 @@ impl WasmRuntime for SemWasmtimeRuntime {
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         let component = Component::from_binary(&self.engine, &bytes).map_err(lix_err)?;
         let mut linker = Linker::<PluginHostState>::new(&self.engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker).map_err(lix_err)?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(lix_err)?;
         let mut store = Store::new(&self.engine, PluginHostState::default());
         let bindings =
             Plugin::instantiate(&mut store, &component, &linker).map_err(lix_err)?;
@@ -149,15 +149,12 @@ impl Default for PluginHostState {
     }
 }
 
-impl IoView for PluginHostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
 impl WasiView for PluginHostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 
