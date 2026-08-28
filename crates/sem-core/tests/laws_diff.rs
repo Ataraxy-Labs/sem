@@ -27,7 +27,9 @@
 //! The matcher is NOT a stable matching (Gale-Shapley 1962) and NOT an
 //! optimal assignment (Kuhn 1955): phases 1-5 are a greedy layered heuristic.
 //! The `characterize_*` tests pin the heuristic boundary; the `red_*` tests
-//! (all `#[ignore]`, Miller-style headers) witness laws that FAIL on HEAD.
+//! (Miller-style headers) witnessed laws that FAILED on 260e2a1b. All three
+//! are fixed on `fix/diff-law-violations` and un-ignored — they now stand as
+//! permanent regression gates, and each header records its fix.
 //!
 //! Boundary: `sem_core::parser::differ::compute_semantic_diff` — the exact
 //! entry point `sem diff` (crates/sem-cli/src/commands/diff/mod.rs:1720)
@@ -471,9 +473,10 @@ fn characterize_blank_line_insertion_outside_entities_is_invisible() {
 }
 
 // ===========================================================================
-// RED LAWS — witnessed failures on HEAD (commit 260e2a1b, 2026-08-28).
-// All #[ignore]d so the suite stays green; run with --ignored to see them
-// fail. Read-only audit: no fixes here. Miller-style headers below.
+// FORMERLY-RED LAWS — witnessed failures on 260e2a1b (2026-08-28), fixed on
+// `fix/diff-law-violations` and now un-ignored regression gates. Each
+// Miller-style header below keeps the original violation analysis and ends
+// with the fix that closed it.
 // ===========================================================================
 
 /// RED LAW / BUG REPORT (Miller-style)
