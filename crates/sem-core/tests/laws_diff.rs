@@ -534,8 +534,10 @@ fn red_law_soundness_same_line_residue_is_attributed() {
 ///   sort key).
 /// DIRECTION: iterate `after` (a slice, deterministic) in Phase 1, or make
 ///   the final sort key total, e.g. (entity_line, entity_id).
+/// FIXED (fix/diff-law-violations): phase 1 now iterates the `after` slice,
+/// and the final sort key is the total (entity_line, entity_id). Kept
+/// un-ignored as a permanent regression gate.
 #[test]
-#[ignore = "RED on HEAD (260e2a1b): same-line ties ordered by HashMap RandomState; output order not a function of input"]
 fn red_law_diff_output_order_is_deterministic() {
     let before = "function a(){return 1} function b(){return 2} function c(){return 3}\n";
     let after = "function a(){return 10} function b(){return 20} function c(){return 30}\n";

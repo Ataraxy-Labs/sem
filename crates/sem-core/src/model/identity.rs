@@ -223,8 +223,17 @@ pub fn match_entities(
         .chain(after.iter().map(|e| (e.id.as_str(), e)))
         .collect();
 
-    // Phase 1: Exact ID match
-    for (&id, after_entity) in &after_by_id {
+    // Phase 1: Exact ID match.
+    // Iterate the `after` slice, not `after_by_id`: a std HashMap's iteration
+    // order varies per instance (RandomState), and the order changes are
+    // pushed here is the order they are reported. Matching results are
+    // unaffected by the order, but `⟦diff⟧` must be a function of its input
+    // including the order of its output.
+    for after_entity in after {
+        let id = after_entity.id.as_str();
+        if matched_after.contains(id) {
+            continue;
+        }
         if let Some(before_entity) = before_by_id.get(id) {
             matched_before.insert(id);
             matched_after.insert(id);

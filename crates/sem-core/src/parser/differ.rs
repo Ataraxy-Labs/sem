@@ -169,7 +169,14 @@ pub fn compute_semantic_diff(
                 });
                 result.changes.extend(orphans);
 
-                result.changes.sort_by_key(|change| change.entity_line);
+                // Total order: `entity_line` alone is not one — same-line
+                // entities would keep whatever relative order the phases
+                // happened to push them in.
+                result.changes.sort_by(|a, b| {
+                    a.entity_line
+                        .cmp(&b.entity_line)
+                        .then_with(|| a.entity_id.cmp(&b.entity_id))
+                });
 
                 if result.changes.is_empty() {
                     None
