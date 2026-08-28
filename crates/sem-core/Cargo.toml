@@ -204,6 +204,12 @@ mimalloc = "0.1"
 # feature; this is the same crate + version, just also reachable from an
 # integration test, which only sees `[dev-dependencies]`.
 rayon = "1.10"
+# Algebraic-extraction law witnesses (`tests/laws_extraction.rs`,
+# `tests/laws_diff.rs`): property-based tests over generated TS/Python/Rust/
+# JSON sources. `default-features = false, std` keeps the fork/persistence
+# machinery (rusty-fork, tempfile) out; laws here are pure functions of
+# in-memory strings, no process forking or regression-file persistence needed.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "parse_profile"
