@@ -579,8 +579,10 @@ fn red_law_diff_output_order_is_deterministic() {
 /// DIRECTION: make the Moved-parent suppression conditional on the parent's
 ///   own stripped declaration being unchanged (the same test the Modified
 ///   suppression already applies).
+/// FIXED (fix/diff-law-violations): Moved-parent suppression is now
+/// conditioned on the same stripped-own-declaration test the Modified path
+/// applies. Kept un-ignored as a permanent regression gate.
 #[test]
-#[ignore = "RED on HEAD (260e2a1b): false cross-container Move suppresses the old parent's own declaration change"]
 fn red_law_false_move_must_not_suppress_parent_declaration_change() {
     let before = "interface Alpha {\n  createdAt: Date;\n}\n\ninterface Beta extends Base {\n  id: string;\n  label: string;\n}\n";
     let after = "interface Alpha {\n  id: string;\n  createdAt: Date;\n}\n\ninterface Beta {\n  label: string;\n}\n";

@@ -304,6 +304,27 @@ fn suppress_redundant_parents(
 
     let changed_ids: HashSet<&str> = changes.iter().map(|c| c.entity_id.as_str()).collect();
 
+    // Did the container's OWN declaration change — its content with its
+    // children's content stripped out? `None` when the two sides are not
+    // comparable (the container is missing on one side, or its type changed),
+    // i.e. when we cannot tell. Suppression is only ever sound when the
+    // container change is fully explained by the child changes we do report.
+    let own_declaration_changed = |eid: &str| -> Option<bool> {
+        let bp = before_by_id.get(eid)?;
+        let ap = after_by_id.get(eid)?;
+        if bp.entity_type != ap.entity_type {
+            return None;
+        }
+        let b_children: &[&SemanticEntity] =
+            before_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+        let a_children: &[&SemanticEntity] =
+            after_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+        Some(
+            strip_children_content(&bp.content, bp.start_line, b_children)
+                != strip_children_content(&ap.content, ap.start_line, a_children),
+        )
+    };
+
     let mut suppress: HashSet<String> = HashSet::new();
     for change in changes.iter() {
         if !matches!(
@@ -336,14 +357,7 @@ fn suppress_redundant_parents(
         // Modified: only suppress if the container's own declaration is unchanged
         // and the value type didn't transition.
         let should_suppress = if change.change_type == ChangeType::Modified {
-            match (before_by_id.get(eid), after_by_id.get(eid)) {
-                (Some(bp), Some(ap)) if bp.entity_type == ap.entity_type => {
-                    let before_own = strip_children_content(&bp.content, bp.start_line, b_children);
-                    let after_own = strip_children_content(&ap.content, ap.start_line, a_children);
-                    before_own == after_own
-                }
-                _ => false,
-            }
+            own_declaration_changed(eid) == Some(false)
         } else {
             true
         };
@@ -356,10 +370,21 @@ fn suppress_redundant_parents(
     // Suppress an old parent that a Moved child left behind when the old
     // parent itself appears as a change — handles the parent-rename case
     // where the parent itself failed to match.
+    //
+    // But only when the old parent's own declaration did not itself change:
+    // the Moved child does not explain an edit to its former container's
+    // declaration, and a Moved pairing can be a false positive (phase 5
+    // matches on Jaccard >= 0.8 and entity_type alone, with no locality
+    // prior). Suppressing unconditionally dropped e.g. `interface Beta
+    // extends Base` losing its `extends Base` from the change record
+    // entirely. `None` (not comparable) keeps the old unconditional
+    // behaviour, which is what the parent-rename case above relies on.
     for change in changes.iter() {
         if change.change_type == ChangeType::Moved {
             if let Some(ref old_pid) = change.old_parent_id {
-                if changed_ids.contains(old_pid.as_str()) {
+                if changed_ids.contains(old_pid.as_str())
+                    && own_declaration_changed(old_pid) != Some(true)
+                {
                     suppress.insert(old_pid.clone());
                 }
             }
