@@ -315,8 +315,10 @@ fn suppress_redundant_parents(
         if bp.entity_type != ap.entity_type {
             return None;
         }
-        let b_children: &[&SemanticEntity] =
-            before_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+        let b_children: &[&SemanticEntity] = before_children
+            .get(eid)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let a_children: &[&SemanticEntity] =
             after_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
         Some(
@@ -503,9 +505,11 @@ fn normalize_content_for_parent_suppression(content: &str) -> String {
         .join(" ")
 }
 
-/// Detect changes in lines that fall outside any entity span.
+/// Detect changes in the bytes that fall outside every entity span.
 /// These are things like use statements, crate-level attributes, standalone
-/// comments, and macro invocations that aren't tracked as entities.
+/// comments, macro invocations that aren't tracked as entities — and the
+/// residue of a line an entity only partly occupies, such as a trailing
+/// comment after a closing brace.
 fn detect_orphan_changes(
     file: &FileChange,
     before_entities: &[SemanticEntity],
@@ -518,18 +522,8 @@ fn detect_orphan_changes(
     let before_text = file.before_content.as_deref().unwrap_or("");
     let after_text = file.after_content.as_deref().unwrap_or("");
 
-    // Build covered line sets from entity spans
-    let before_covered: HashSet<usize> = before_entities
-        .iter()
-        .flat_map(|e| e.start_line..=e.end_line)
-        .collect();
-    let after_covered: HashSet<usize> = after_entities
-        .iter()
-        .flat_map(|e| e.start_line..=e.end_line)
-        .collect();
-
-    let before_orphans = orphan_segments(before_text, &before_covered);
-    let after_orphans = orphan_segments(after_text, &after_covered);
+    let before_orphans = orphan_segments(before_text, before_entities);
+    let after_orphans = orphan_segments(after_text, after_entities);
     let mut changes = Vec::new();
 
     for (before_idx, after_idx) in orphan_segment_change_pairs(&before_orphans, &after_orphans) {
@@ -627,37 +621,113 @@ struct OrphanSegment {
     content: String,
 }
 
-fn orphan_segments(text: &str, covered_lines: &HashSet<usize>) -> Vec<OrphanSegment> {
-    let mut segments = Vec::new();
-    let mut current_start: Option<usize> = None;
-    let mut current_lines: Vec<&str> = Vec::new();
-    let mut last_line_number = 0;
+/// Byte offset of the start of each line, plus a final sentinel at
+/// `text.len()`. `line_starts[i]` is where line `i + 1` begins.
+fn line_starts_of(text: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    let mut pos = 0usize;
+    for line in text.split_inclusive('\n') {
+        pos += line.len();
+        starts.push(pos);
+    }
+    starts
+}
 
-    for (i, line) in text.lines().enumerate() {
-        let line_number = i + 1;
-        last_line_number = line_number;
-        if covered_lines.contains(&line_number) {
-            if let Some(start_line) = current_start.take() {
-                segments.push(OrphanSegment {
-                    start_line,
-                    end_line: line_number - 1,
-                    content: current_lines.join("\n"),
-                });
-                current_lines.clear();
+/// 1-based line number containing `byte`.
+fn line_of(line_starts: &[usize], byte: usize) -> usize {
+    line_starts.partition_point(|&start| start <= byte).max(1)
+}
+
+/// The byte ranges the entities cover, sorted and merged.
+///
+/// An entity's own `start_byte..end_byte` is used when it actually slices
+/// `text` to that entity's content — the extraction lens's `get` law. When it
+/// does not (a plugin that reports no span, or one whose offsets are relative
+/// to an extracted sub-document, as vue/svelte children are), the range falls
+/// back to the entity's full line span, which is what the orphan cover used
+/// to assume for *every* entity.
+fn covered_byte_ranges(
+    text: &str,
+    entities: &[SemanticEntity],
+    line_starts: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(entities.len());
+
+    for entity in entities {
+        if let (Some(start), Some(end)) = (entity.start_byte, entity.end_byte) {
+            if start < end
+                && end <= text.len()
+                && text.is_char_boundary(start)
+                && text.is_char_boundary(end)
+                && text[start..end] == entity.content
+            {
+                ranges.push((start, end));
+                continue;
             }
-            continue;
         }
 
-        current_start.get_or_insert(line_number);
-        current_lines.push(line);
+        if entity.start_line == 0 || entity.start_line > entity.end_line {
+            continue;
+        }
+        let (Some(&start), Some(&end)) = (
+            line_starts.get(entity.start_line - 1),
+            line_starts.get(entity.end_line),
+        ) else {
+            continue;
+        };
+        if start < end {
+            ranges.push((start, end));
+        }
     }
 
-    if let Some(start_line) = current_start {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, prev_end)) if start <= *prev_end => *prev_end = (*prev_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// The orphan cover: the byte-complement of the entity cover. Together the
+/// two are jointly epic over the file, so every byte difference between two
+/// files is attributed to an entity change or to an orphan change.
+///
+/// Blank runs are dropped here rather than reported: they are the diff's
+/// declared kernel (blank-line-only edits outside entities are invisible),
+/// and the complement is full of one-byte newline slivers between adjacent
+/// entities that carry no information.
+fn orphan_segments(text: &str, entities: &[SemanticEntity]) -> Vec<OrphanSegment> {
+    let line_starts = line_starts_of(text);
+    let mut segments = Vec::new();
+
+    let push = |start: usize, end: usize, segments: &mut Vec<OrphanSegment>| {
+        let slice = &text[start..end];
+        if slice.trim().is_empty() {
+            return;
+        }
+        // Drop the segment's own line terminator, so a whole-line segment
+        // reads as its lines and not as its lines plus a dangling newline.
+        let content = slice.strip_suffix('\n').unwrap_or(slice);
+        let content = content.strip_suffix('\r').unwrap_or(content);
         segments.push(OrphanSegment {
-            start_line,
-            end_line: last_line_number.max(start_line),
-            content: current_lines.join("\n"),
+            start_line: line_of(&line_starts, start),
+            end_line: line_of(&line_starts, end - 1),
+            content: content.to_string(),
         });
+    };
+
+    let mut cursor = 0usize;
+    for (start, end) in covered_byte_ranges(text, entities, &line_starts) {
+        if cursor < start {
+            push(cursor, start, &mut segments);
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < text.len() {
+        push(cursor, text.len(), &mut segments);
     }
 
     segments

@@ -379,8 +379,14 @@ fn same_line_overload_deletion_with_survivor_edit_is_reported() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout should be json");
     assert_eq!(json["summary"]["modified"].as_u64(), Some(1), "{json:?}");
-    assert_eq!(json["summary"]["deleted"].as_u64(), Some(1), "{json:?}");
-    assert_eq!(json["summary"]["total"].as_u64(), Some(2), "{json:?}");
+    // The overload's own deletion, plus the `; ` that separated the two
+    // same-line overloads: those bytes belonged to no entity and really did
+    // disappear. Before the orphan cover became the byte-complement of the
+    // entity cover, every byte on a line an entity touched was treated as
+    // covered, so same-line residue like this separator was invisible.
+    assert_eq!(json["summary"]["deleted"].as_u64(), Some(2), "{json:?}");
+    assert_eq!(json["summary"]["orphan"].as_u64(), Some(1), "{json:?}");
+    assert_eq!(json["summary"]["total"].as_u64(), Some(3), "{json:?}");
 
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(home);
@@ -414,8 +420,12 @@ fn same_line_overload_insertion_with_survivor_edit_is_reported() {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout should be json");
     assert_eq!(json["summary"]["modified"].as_u64(), Some(1), "{json:?}");
-    assert_eq!(json["summary"]["added"].as_u64(), Some(1), "{json:?}");
-    assert_eq!(json["summary"]["total"].as_u64(), Some(2), "{json:?}");
+    // The inserted overload, plus the `; ` now separating the two same-line
+    // overloads — real new bytes belonging to no entity. See the sibling
+    // deletion test for why these became visible.
+    assert_eq!(json["summary"]["added"].as_u64(), Some(2), "{json:?}");
+    assert_eq!(json["summary"]["orphan"].as_u64(), Some(1), "{json:?}");
+    assert_eq!(json["summary"]["total"].as_u64(), Some(3), "{json:?}");
 
     let changes = json["changes"]
         .as_array()

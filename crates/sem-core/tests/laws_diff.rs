@@ -499,8 +499,10 @@ fn characterize_blank_line_insertion_outside_entities_is_invisible() {
 /// DIRECTION (for the fix owner, not applied here): compute orphan segments
 ///   over the byte-complement of entity spans, or additionally compare the
 ///   uncovered residue of boundary lines.
+/// FIXED (fix/diff-law-violations): the orphan cover is now the
+/// byte-complement of the entity cover, so joint epicness is structural.
+/// Kept un-ignored as a permanent regression gate.
 #[test]
-#[ignore = "RED on HEAD (260e2a1b): same-line trailing edit outside entity byte span is invisible to diff"]
 fn red_law_soundness_same_line_residue_is_attributed() {
     let before = "fn foo() { let x = 1; } // old note\n";
     let after = "fn foo() { let x = 1; } // new note\n";
