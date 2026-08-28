@@ -712,9 +712,15 @@ fn orphan_segments(text: &str, entities: &[SemanticEntity]) -> Vec<OrphanSegment
         // reads as its lines and not as its lines plus a dangling newline.
         let content = slice.strip_suffix('\n').unwrap_or(slice);
         let content = content.strip_suffix('\r').unwrap_or(content);
+        // Report the lines the segment's *meaningful* content occupies. A
+        // segment starts at the byte after the preceding entity ends, which is
+        // that entity's own closing line; blaming its line number on this
+        // segment would be misleading. The content still carries every byte.
+        let lead = slice.len() - slice.trim_start().len();
+        let trail = slice.len() - slice.trim_end().len();
         segments.push(OrphanSegment {
-            start_line: line_of(&line_starts, start),
-            end_line: line_of(&line_starts, end - 1),
+            start_line: line_of(&line_starts, start + lead),
+            end_line: line_of(&line_starts, end - trail - 1),
             content: content.to_string(),
         });
     };
