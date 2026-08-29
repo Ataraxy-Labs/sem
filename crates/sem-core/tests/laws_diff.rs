@@ -1,7 +1,7 @@
 //! Law witnesses — entity DIFF as a partial bijection (symmetric inverse
 //! monoid) computed by a layered greedy matching, plus an orphan cover.
 //!
-//! STRUCTURE (see `laws_extraction_DOSSIER.md` for citations and status):
+//! STRUCTURE (see `laws_extraction_NOTES.md` for citations and status):
 //!
 //! `compute_semantic_diff(F, F')` computes a *partial injective matching*
 //! between extract(F) and extract(F') — an element of the symmetric inverse
@@ -27,7 +27,7 @@
 //! The matcher is NOT a stable matching (Gale-Shapley 1962) and NOT an
 //! optimal assignment (Kuhn 1955): phases 1-5 are a greedy layered heuristic.
 //! The `characterize_*` tests pin the heuristic boundary; the `red_*` tests
-//! (Miller-style headers) witnessed laws that FAILED on 260e2a1b. All three
+//! (structured bug-report headers) witnessed laws that FAILED on 260e2a1b. All three
 //! are fixed on `fix/diff-law-violations` and un-ignored — they now stand as
 //! permanent regression gates, and each header records its fix.
 //!
@@ -475,11 +475,11 @@ fn characterize_blank_line_insertion_outside_entities_is_invisible() {
 // ===========================================================================
 // FORMERLY-RED LAWS — witnessed failures on 260e2a1b (2026-08-28), fixed on
 // `fix/diff-law-violations` and now un-ignored regression gates. Each
-// Miller-style header below keeps the original violation analysis and ends
-// with the fix that closed it.
+// structured bug-report header below keeps the original violation analysis
+// and ends with the fix that closed it.
 // ===========================================================================
 
-/// RED LAW / BUG REPORT (Miller-style)
+/// RED LAW / BUG REPORT (structured)
 ///
 /// LAW: Diff soundness — the entity cover + orphan cover must be jointly
 ///   epic: every byte-level change between parseable F and F' is attributed
@@ -518,7 +518,7 @@ fn red_law_soundness_same_line_residue_is_attributed() {
     );
 }
 
-/// RED LAW / BUG REPORT (Miller-style)
+/// RED LAW / BUG REPORT (structured)
 ///
 /// LAW: Diff determinism — compute_semantic_diff is a function: identical
 ///   inputs yield identical DiffResult, including change ORDER, across
@@ -560,7 +560,7 @@ fn red_law_diff_output_order_is_deterministic() {
     );
 }
 
-/// RED LAW / BUG REPORT (Miller-style)
+/// RED LAW / BUG REPORT (structured)
 ///
 /// LAW: Diff soundness under suppression — parent-change suppression may
 ///   only drop a container change that is fully explained by reported child

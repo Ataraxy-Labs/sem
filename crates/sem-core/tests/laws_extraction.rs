@@ -1,7 +1,7 @@
 //! Law witnesses — entity EXTRACTION as a lens family over the free monoid
 //! of source bytes.
 //!
-//! STRUCTURE (see `laws_extraction_DOSSIER.md` for citations and status):
+//! STRUCTURE (see `laws_extraction_NOTES.md` for citations and status):
 //!
 //! Extraction `extract : File -> [Entity]` equips each entity with a byte
 //! span, i.e. a *very well-behaved lens* per entity (Foster et al. 2007,

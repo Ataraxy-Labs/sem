@@ -1,14 +1,14 @@
-# Algebraic Extraction Dossier — entity extraction, identity/matching, and diff (sem-core)
+# Design notes: the algebraic structure of extraction and diff (sem-core)
 
 Commit audited: `260e2a1bff9504042c0d6e39c877013a756d1fd0` (2026-08-28).
-Note: the working tree was on branch `docs/social-card` at audit time (the
-mission named `main`; branch switching is prohibited for this audit, so the
+Note: the working tree was on branch `docs/social-card` at audit time (these
+notes name `main`; branch switching was avoided for this audit, so the
 audit ran against the checked-out HEAD above — the audited files are identical
 to their `main` ancestry unless that branch touched `crates/sem-core`, which
 it does not appear to).
 
-Read-only audit: no production code was modified. Deliverables are this
-dossier plus two witness suites (`tests/laws_extraction.rs`,
+Read-only audit: no production code was modified. Deliverables are these
+notes plus two witness suites (`tests/laws_extraction.rs`,
 `tests/laws_diff.rs`, shared arbitraries in `tests/laws_common/mod.rs`) and
 one dev-dependency (`proptest`, test-only) added to `sem-core/Cargo.toml`.
 
@@ -87,14 +87,14 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
   - Locality/monoid homomorphism: diff over a file coproduct = per-file sum
     (change multiset concat, counters additive) — **HOLDS** (D3).
   - **Injectivity/functionality of the matching is realized; STABILITY and
-    OPTIMALITY are NOT** — see F5 (NOT-THAT).
+    OPTIMALITY are NOT** — see F5 (what it is not).
 - **WITNESS:** `tests/laws_diff.rs::law_d1_*`, `law_d3_*`, `law_d6_*` — GREEN.
 - **Non-composability note:** there is no patch composition
   (`diff(F,F'') ≠ diff(F,F') ⋄ diff(F',F'')` is not even typed here), so this
   is *not* a groupoid or a category of patches (contrast Darcs patch theory /
-  Mimram–Di Giusto 2013). NOT-THAT for "diff as groupoid": only the
-  inverse-monoid fragment (identity + inverse) is present, and only those
-  laws are claimed.
+  Mimram–Di Giusto 2013). What it is not, precisely: as a "diff groupoid",
+  only the inverse-monoid fragment (identity + inverse) is present, and only
+  those laws are claimed.
 
 ### F3 — Reorder detection is Ulam distance via longest non-decreasing subsequence — REALIZED
 
@@ -106,7 +106,7 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
   `1 ≤ |Reordered| ≤ n−1` — **HOLDS** (D4).
 - **WITNESS:** `law_d4_permutation_is_reordered_only`,
   `law_d4_identity_permutation_is_empty` — GREEN.
-- This answers mission law 5's positive half: *moving an entity within a
+- This answers law 5's positive half: *moving an entity within a
   file yields [moved/reordered], not [deleted]+[added]*, unconditionally for
   content-identical entities (phase 1 exact-ID match makes it independent of
   any similarity threshold). The heuristic boundary only matters when content
@@ -127,7 +127,7 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
   files modulo that congruence. Pinned by
   `characterize_blank_line_insertion_outside_entities_is_invisible`.
 
-### F5 — The matcher is a GREEDY LAYERED HEURISTIC, not a stable matching and not an optimal assignment — NOT-THAT (named precisely)
+### F5 — The matcher is a GREEDY LAYERED HEURISTIC, not a stable matching and not an optimal assignment — what it is not (named precisely)
 
 - **What it actually is:** five sequential match layers of decreasing
   evidence: (1) exact ID; (2) exact `content_hash`, then `structural_hash`;
@@ -136,7 +136,7 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
   similarity** (`best_score` starts at −∞ — any candidate wins); (5) fuzzy
   Jaccard ≥ 0.8 grouped by `entity_type` **only** — no name, no parent, no
   locality prior — greedy first-come per after-entity.
-- **NOT-THAT:** this is not Gale–Shapley stable matching (1962) — blocking
+- **What it is not:** this is not Gale–Shapley stable matching (1962) — blocking
   pairs exist because earlier after-entities consume before-entities
   greedily; not Kuhn's Hungarian assignment (1955) — no global objective.
   Naming it "matching" without qualification promises exchange-stability
@@ -158,7 +158,7 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
 
 ### F6 — RED: diff soundness fails at line/byte granularity mismatch — BROKEN
 
-- **LAW (mission law 4):** the entity cover + orphan cover is jointly epic —
+- **LAW (law 4):** the entity cover + orphan cover is jointly epic —
   every byte change between parseable files is attributed somewhere.
 - **VIOLATION:** `detect_orphan_changes` computes coverage as *line sets*
   (`start_line..=end_line`) while entity content is *byte*-granular. Bytes
@@ -174,7 +174,7 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
 
 ### F7 — RED: diff output order is not a function of its input — BROKEN
 
-- **LAW (mission law 2, diff side):** `compute_semantic_diff` is
+- **LAW (law 2, diff side):** `compute_semantic_diff` is
   deterministic including change order, across calls and processes.
 - **VIOLATION:** `match_entities` phase 1 iterates `after_by_id`
   (`std::HashMap`, per-instance `RandomState`) and pushes changes in that
@@ -220,7 +220,7 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
   fallback is *declared* (entity_type "chunk"), never a misparse presented
   as semantic entities.
 - **WITNESS:** `law_e6_fallback_total_line_cover`,
-  `law_d1_diff_identity_fallback` — GREEN (mission law 6).
+  `law_d1_diff_identity_fallback` — GREEN (law 6).
 - **Caveat (documented, not witnessed as RED):** a *parseable-but-broken*
   file for a supported language does not fall back — tree-sitter
   error-recovers and extraction returns whatever survives; and a panic in
@@ -243,15 +243,15 @@ point `sem diff` calls at `crates/sem-cli/src/commands/diff/mod.rs:1720`).
   retained — **HOLDS** (E5, forced Python redefinitions).
 - **WITNESS:** `law_e5_entity_ids_unique_under_collisions` — GREEN.
 
-### F11 — "Extraction as a Galois connection" — NOT-THAT
+### F11 — "Extraction as a Galois connection" — what it is not
 
-The mission hypothesized extraction as a Galois connection between text and
+This audit hypothesized extraction as a Galois connection between text and
 entity space. The adjunction is not there: there is no lattice/order on
 files or entity sets at the boundary for `α ⊣ γ` to live in, and no
 concretization is exposed. What *is* there is stronger where it matters and
 honest where it is weak: a lens family (F1) with a free-monoid factorization
 (F9). Claiming "Galois connection" would promise `α∘γ∘α = α`-style laws no
-test can currently state over the public surface. Verdict: NOT-THAT;
+test can currently state over the public surface. Verdict: not that structure;
 the abstract-interpretation reading adds nothing the lens does not already
 give, and would mis-promise.
 
@@ -272,7 +272,7 @@ give, and would mis-promise.
 This is half the audit's value: the design's central claims are real and
 now have permanent, refactor-proof property witnesses.
 
-## 3. COLLAPSE proposals (ranked; hand to the fix owner, guarded by the green laws)
+## 3. Simplifications this licenses (ranked; hand to the fix owner, guarded by the green laws)
 
 1. **Byte-complement orphan cover** (fixes F6, simplifies): replace the
    line-set arithmetic in `detect_orphan_changes` with the byte-interval
