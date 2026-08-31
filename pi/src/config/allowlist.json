@@ -1,0 +1,39 @@
+{
+  "servers": {
+    "sem": {
+      "command": "sem",
+      "args": ["mcp"],
+      "tools": {
+        "sem_impact": {
+          "name": "sem_impact",
+          "description": "Deps, dependents, transitive impact, and affected tests for one entity. Call before editing, renaming, or deleting it.",
+          "promptGuidelines": [
+            "Call sem_impact before editing, renaming, or deleting an entity to see everything that could break."
+          ]
+        },
+        "sem_diff": {
+          "name": "sem_diff",
+          "description": "Entity-level diff between two refs (or working tree vs HEAD): which functions/classes changed, not which lines.",
+          "promptGuidelines": [
+            "Use sem_diff instead of a line diff when you need to know which entities changed, not which lines."
+          ]
+        }
+      }
+    },
+    "weave": {
+      "command": "weave-mcp",
+      "args": [],
+      "tools": {
+        "weave_impact_analysis": {
+          "name": "weave_impact",
+          "description": "Full transitive blast radius of changing one entity -- every dependent of every dependent, not just direct callers.",
+          "promptGuidelines": [
+            "Use weave_impact before a wide or risky edit to see the full transitive blast radius."
+          ]
+        }
+      }
+    }
+  },
+  "activeBuiltins": ["bash", "write"],
+  "systemPromptAddendum": "The loop: outline -> choose -> read one entity -> edit that entity -> check impact. Never read a whole file.\nOutline: sem_outline lists one file's entities (headings/functions/classes/keys), nested by parent, sized.\nFind: sem_find looks up an entity by name across the repo; sem_grep searches text/regex across the repo.\nRead: sem_read reads just that entity with a SMALL budget (1500) first -- only widen it if the result is truncated.\nEdit: weave_edit is the entity-level editor -- give it the entity's full new source; it claims and releases automatically.\nImpact: before editing, sem_callers lists direct call sites cheaply; sem_impact / weave_impact show the full blast radius.\nFor blast radius, dependency chains, or change history use sem_graph / sem_path / sem_cochange before grepping.\nbash is for running things (tests, builds, git, scripts) -- never for reading or searching files. If a file has no structure, sem_outline still gives line chunks.\nBatch: for several independent lookups, issue them in ONE turn -- parallel calls, or array params like sem_grep patterns=[...] -- never verify file-by-file across separate turns."
+}
