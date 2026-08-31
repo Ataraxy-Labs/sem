@@ -1,0 +1,33 @@
+{
+  "name": "pi-sem",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pi distribution wiring sem (read/search) and weave (edit) as MCP-backed tools, replacing pi's built-in read/edit/grep/find/ls.",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/bridge/**/*.test.ts' 'test/tools/**/*.test.ts' 'test/codemode/**/*.test.ts' 'test/laws/**/*.test.ts'",
+    "test:scripts": "node --test 'test/scripts/**/*.test.ts'",
+    "verify:pin": "node scripts/verify-pin.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^26.2.0",
+    "typebox": "^1.3.7",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
