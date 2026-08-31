@@ -93,7 +93,7 @@ pub fn history_command(opts: HistoryOptions) {
         }
     };
 
-    let limit = if opts.limit == 0 { 500 } else { opts.limit };
+    let limit = effective_scan_limit(opts.limit);
     // Semantic commit index first: each commit is diffed once, ever; later
     // queries are lookups plus a delta of new commits. Falls back to the
     // live walk only when the cache is unusable.
@@ -420,6 +420,10 @@ pub fn log_command(opts: LogOptions) {
             opts.verbose,
         );
     }
+}
+
+fn effective_scan_limit(requested: usize) -> usize {
+    requested
 }
 
 fn history_limit_with_baseline(limit: usize) -> usize {
@@ -1025,6 +1029,12 @@ mod tests {
         let mut entries = trace_back_to_origin(&bridge, &registry, &commits, seed.clone());
         entries.extend(trace_forward_from_seed(&bridge, &registry, &commits, seed));
         entries
+    }
+
+    #[test]
+    fn effective_scan_limit_preserves_zero_as_unlimited() {
+        assert_eq!(effective_scan_limit(0), 0);
+        assert_eq!(effective_scan_limit(200), 200);
     }
 
     #[test]

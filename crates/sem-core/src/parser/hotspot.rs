@@ -103,7 +103,12 @@ pub fn compute_history_analytics(
     file_path: Option<&str>,
     max_commits: usize,
 ) -> HistoryAnalytics {
-    let commits = match git.get_log(max_commits + 1) {
+    let log_limit = if max_commits == 0 {
+        0
+    } else {
+        max_commits.saturating_add(1)
+    };
+    let commits = match git.get_log(log_limit) {
         Ok(c) => c,
         Err(_) => return empty_analytics(),
     };

@@ -474,7 +474,12 @@ pub fn history_analytics_from_store(
     file_path: Option<&str>,
     max_commits: usize,
 ) -> Option<HistoryAnalytics> {
-    let commits = git.get_log(max_commits.saturating_add(1)).ok()?;
+    let log_limit = if max_commits == 0 {
+        0
+    } else {
+        max_commits.saturating_add(1)
+    };
+    let commits = git.get_log(log_limit).ok()?;
     if commits.len() < 2 {
         return Some(aggregate_history_analytics(&[], file_path));
     }
