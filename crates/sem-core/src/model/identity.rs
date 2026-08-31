@@ -103,6 +103,20 @@ fn default_similarity_from_tokens(a: &ContentTokens<'_>, b: &ContentTokens<'_>) 
     jaccard_similarity(&a.unique_tokens, &b.unique_tokens)
 }
 
+/// True when the entity id carries a line-number disambiguator (`@L{line}` or
+/// `@L{line}#{ordinal}`) from [`build_entity_id_disambiguated`]. Those ids shift
+/// when unrelated edits change line numbers above, so an exact-id match with
+/// differing content is often a false positive rather than a real modification.
+fn is_line_disambiguated_id(id: &str) -> bool {
+    let Some((_, suffix)) = id.rsplit_once("@L") else {
+        return false;
+    };
+    suffix
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit())
+}
+
 fn classify_match(before: &SemanticEntity, after: &SemanticEntity) -> ChangeType {
     if before.file_path != after.file_path {
         ChangeType::Moved
@@ -234,20 +248,29 @@ pub fn match_entities(
         if matched_after.contains(id) {
             continue;
         }
-        if let Some(before_entity) = before_by_id.get(id) {
-            matched_before.insert(id);
-            matched_after.insert(id);
+        let Some(before_entity) = before_by_id.get(id) else {
+            continue;
+        };
+        if before_entity.content_hash != after_entity.content_hash
+            && is_line_disambiguated_id(id)
+        {
+            // Defer to content-hash / same-signature matching — line-derived ids
+            // can collide across revisions when entities shift vertically.
+            continue;
+        }
 
-            if before_entity.content_hash != after_entity.content_hash {
-                changes.push(make_change(
-                    after_entity,
-                    ChangeType::Modified,
-                    Some(before_entity),
-                    commit_sha,
-                    author,
-                    &combined_by_id,
-                ));
-            }
+        matched_before.insert(id);
+        matched_after.insert(id);
+
+        if before_entity.content_hash != after_entity.content_hash {
+            changes.push(make_change(
+                after_entity,
+                ChangeType::Modified,
+                Some(before_entity),
+                commit_sha,
+                author,
+                &combined_by_id,
+            ));
         }
     }
 
@@ -1571,6 +1594,60 @@ mod tests {
         assert!(
             result.changes[0].entity_name == "alpha" || result.changes[0].entity_name == "beta"
         );
+    }
+
+    #[test]
+    fn test_line_disambiguated_id_shift_matches_by_content_not_position() {
+        let int_stub = "@overload\ndef polyval(x: int) -> int: ...";
+        let float_stub = "@overload\ndef polyval(x: float) -> float: ...";
+        let str_stub = "@overload\ndef polyval(x: str) -> str: ...";
+        let impl_body = "def polyval(x):\n    return x";
+
+        let before = vec![
+            make_entity_at("mod.py::function::polyval@L6", "polyval", int_stub, "mod.py", 6),
+            make_entity_at("mod.py::function::polyval@L8", "polyval", float_stub, "mod.py", 8),
+            make_entity_at("mod.py::function::polyval@L10", "polyval", str_stub, "mod.py", 10),
+            make_entity_at("mod.py::function::polyval@L12", "polyval", impl_body, "mod.py", 12),
+        ];
+        let after = vec![
+            make_entity_at("mod.py::function::polyval@L8", "polyval", int_stub, "mod.py", 8),
+            make_entity_at("mod.py::function::polyval@L10", "polyval", float_stub, "mod.py", 10),
+            make_entity_at("mod.py::function::polyval@L12", "polyval", str_stub, "mod.py", 12),
+            make_entity_at("mod.py::function::polyval@L14", "polyval", impl_body, "mod.py", 14),
+        ];
+
+        let result = match_entities(&before, &after, "mod.py", None, None, None);
+
+        assert_eq!(
+            result.changes.len(),
+            0,
+            "unchanged overload bodies shifted by line insertions should not diff: {:?}",
+            result.changes
+        );
+    }
+
+    #[test]
+    fn test_line_disambiguated_id_in_place_edit_is_modified() {
+        let before = vec![make_entity_at(
+            "mod.py::function::polyval@L6",
+            "polyval",
+            "@overload\ndef polyval(x: int) -> int: ...",
+            "mod.py",
+            6,
+        )];
+        let after = vec![make_entity_at(
+            "mod.py::function::polyval@L6",
+            "polyval",
+            "@overload\ndef polyval(x: int) -> str: ...",
+            "mod.py",
+            6,
+        )];
+
+        let result = match_entities(&before, &after, "mod.py", None, None, None);
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        assert_eq!(result.changes[0].entity_name, "polyval");
     }
 
     #[test]
