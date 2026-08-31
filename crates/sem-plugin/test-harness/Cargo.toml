@@ -9,8 +9,8 @@ publish = false
 [dependencies]
 lix_rs_sdk = { git = "https://github.com/opral/lix", branch = "plugin-api", package = "lix_rs_sdk" }
 lix_engine = { git = "https://github.com/opral/lix", branch = "plugin-api", package = "lix_engine" }
-wasmtime = { version = "30", features = ["component-model"] }
-wasmtime-wasi = "30"
+wasmtime = { version = "36", features = ["component-model"] }
+wasmtime-wasi = "36"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros"] }
 serde = { version = "1", features = ["derive"] }
