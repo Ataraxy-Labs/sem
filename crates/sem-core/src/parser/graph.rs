@@ -205,9 +205,11 @@ macro_rules! maybe_into_par_iter {
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
 use crate::parser::import_resolution::{
-    build_stem_index, find_import_file, find_import_target, import_file_candidates,
-    import_source_matches_file, is_js_ts_file, js_ts_import_source_files_from_content,
-    js_ts_named_exports_from_content, resolve_bare_import_stem, sort_import_candidate_files,
+    build_js_ts_named_export_sources, build_stem_index, find_import_file, find_import_target,
+    import_file_candidates, import_source_matches_file, is_js_ts_file,
+    js_ts_import_source_files_from_content, js_ts_named_exports_from_content,
+    resolve_bare_import_stem, resolve_js_ts_named_import_target,
+    resolve_js_ts_namespace_member_target, sort_import_candidate_files,
     JS_TS_EXTENSIONS,
 };
 use crate::parser::incremental::{
@@ -5785,11 +5787,32 @@ fn build_import_table_with_default_export_paths(
         }
     }
     resolve_ts_default_re_exports(&mut default_exports, re_exports, symbol_table, entity_map);
+    let js_ts_content_owned: HashMap<String, String> = content_file_paths
+        .iter()
+        .filter(|file_path| is_js_ts_file(file_path))
+        .filter_map(|file_path| {
+            import_source_content(root, &pre_parsed_content_map, file_path)
+                .map(|content| (file_path.clone(), content.to_string()))
+        })
+        .collect();
+    let js_ts_content_by_path: HashMap<String, &str> = js_ts_content_owned
+        .iter()
+        .map(|(path, content)| (path.clone(), content.as_str()))
+        .collect();
+    let (expanded_named_exports, named_export_sources_by_file) =
+        build_js_ts_named_export_sources(&content_file_paths, &js_ts_content_by_path);
+    for (file_path, names) in expanded_named_exports {
+        named_exports_by_file.insert(file_path, names);
+    }
+    let js_ts_candidate_files: Vec<String> = {
+        let mut files: Vec<String> = js_ts_content_by_path.keys().cloned().collect();
+        sort_import_candidate_files(&mut files, JS_TS_EXTENSIONS);
+        files
+    };
     let ts_default_exports = TsDefaultExportTable {
         sorted_files: sorted_default_export_files(&default_exports),
         exports_by_file: default_exports,
     };
-    let ts_top_level_entities = OnceLock::new();
     resolve_profile::add_import_table_export_build_ns(__export_build_t0.elapsed());
 
     let __insert_t0 = std::time::Instant::now();
@@ -5808,6 +5831,9 @@ fn build_import_table_with_default_export_paths(
         .map(|scan| {
             let mut entries: Vec<((String, String), String)> = Vec::new();
             for (key, val) in scan.local_imports {
+                if is_js_ts_file(&key.0) {
+                    continue;
+                }
                 entries.push((key, val));
             }
             for pending in scan.default_imports {
@@ -5820,38 +5846,71 @@ fn build_import_table_with_default_export_paths(
                 }
             }
             for pending in scan.namespace_imports {
-                let ts_top_level_entities = ts_top_level_entities
-                    .get_or_init(|| build_ts_top_level_entity_table(entity_map));
+                // Resolve against every parsed JS/TS file, not just files with
+                // top-level entities: a pure star barrel (`export * from`)
+                // declares nothing itself but is a valid namespace-import
+                // target whose surface is its expanded re-exports (#478).
                 let Some(target_file) = find_import_file(
-                    &ts_top_level_entities.sorted_files,
+                    &js_ts_candidate_files,
                     &pending.module_path,
                     &pending.file_path,
                     JS_TS_EXTENSIONS,
                 ) else {
                     continue;
                 };
-                let Some(target_entries) = ts_top_level_entities.entities_by_file.get(target_file)
-                else {
+                let Some(export_sources) = named_export_sources_by_file.get(target_file) else {
                     continue;
                 };
-                let Some(exported_names) = named_exports_by_file.get(target_file) else {
-                    continue;
-                };
-                for (name, target_id) in target_entries {
-                    if !exported_names.contains(name) {
-                        continue;
+                for (name, source_file) in export_sources {
+                    let target_id = resolve_js_ts_namespace_member_target(
+                        name,
+                        target_file,
+                        source_file,
+                        symbol_table,
+                        entity_map,
+                    );
+                    if let Some(target_id) = target_id {
+                        entries.push((
+                            (
+                                pending.file_path.clone(),
+                                format!("{}.{}", pending.alias, name),
+                            ),
+                            target_id,
+                        ));
                     }
+                }
+            }
+            for pending in scan.pending_named_re_export {
+                if let Some(target_id) = resolve_js_ts_named_import_target(
+                    &pending.original_name,
+                    &pending.module_path,
+                    &pending.file_path,
+                    symbol_table,
+                    entity_map,
+                    &named_export_sources_by_file,
+                    &js_ts_candidate_files,
+                ) {
                     entries.push((
-                        (
-                            pending.file_path.clone(),
-                            format!("{}.{}", pending.alias, name),
-                        ),
-                        target_id.clone(),
+                        (pending.file_path.clone(), pending.local_name.clone()),
+                        target_id,
                     ));
                 }
             }
-            for (key, val) in scan.re_export_imports {
-                entries.push((key, val));
+            for pending in scan.pending_named_local {
+                if let Some(target_id) = resolve_js_ts_named_import_target(
+                    &pending.original_name,
+                    &pending.module_path,
+                    &pending.file_path,
+                    symbol_table,
+                    entity_map,
+                    &named_export_sources_by_file,
+                    &js_ts_candidate_files,
+                ) {
+                    entries.push((
+                        (pending.file_path.clone(), pending.local_name.clone()),
+                        target_id,
+                    ));
+                }
             }
             entries
         })
@@ -5909,20 +5968,23 @@ fn resolve_named_import_tracked(
     pending: &PendingNamedImport,
     symbol_table: &HashMap<String, Vec<String>>,
     entity_map: &HashMap<String, EntityInfo>,
+    named_export_sources_by_file: &HashMap<String, HashMap<String, String>>,
+    js_ts_candidate_files: &[String],
     read_set: &mut ReadSet,
 ) -> Option<((String, String), String)> {
     read_set.record(key1(Table::SymbolTable, 0, &pending.original_name));
-    let target_ids = symbol_table.get(pending.original_name.as_str())?;
-    let target_id = find_import_target(
-        target_ids,
+    let target_id = resolve_js_ts_named_import_target(
+        &pending.original_name,
         &pending.module_path,
         &pending.file_path,
-        JS_TS_EXTENSIONS,
+        symbol_table,
         entity_map,
+        named_export_sources_by_file,
+        js_ts_candidate_files,
     )?;
     Some((
         (pending.file_path.clone(), pending.local_name.clone()),
-        target_id.clone(),
+        target_id,
     ))
 }
 
@@ -5955,6 +6017,7 @@ fn ts_export_surface_value(
     file_path: &str,
     default_exports: &HashMap<String, String>,
     named_exports_by_file: &HashMap<String, HashSet<String>>,
+    named_export_sources_by_file: &HashMap<String, HashMap<String, String>>,
     top_level: Option<&TsTopLevelEntityTable>,
 ) -> u64 {
     let mut h = ValueHasher::new();
@@ -5967,6 +6030,13 @@ fn ts_export_surface_value(
         sorted.sort();
         for n in sorted {
             h.s(n);
+        }
+    }
+    if let Some(sources) = named_export_sources_by_file.get(file_path) {
+        let mut sorted: Vec<(&String, &String)> = sources.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, src) in sorted {
+            h.s(name).s(src);
         }
     }
     if let Some(table) = top_level {
@@ -6594,6 +6664,28 @@ fn build_import_table_incremental(
         symbol_table,
         entity_map,
     );
+    let js_ts_content_owned: HashMap<String, String> = content_file_paths
+        .iter()
+        .filter(|file_path| is_js_ts_file(file_path))
+        .filter_map(|file_path| {
+            import_source_content(root, &pre_parsed_content_map, file_path)
+                .map(|content| (file_path.clone(), content.to_string()))
+        })
+        .collect();
+    let js_ts_content_by_path: HashMap<String, &str> = js_ts_content_owned
+        .iter()
+        .map(|(path, content)| (path.clone(), content.as_str()))
+        .collect();
+    let (expanded_named_exports, named_export_sources_by_file) =
+        build_js_ts_named_export_sources(&content_file_paths, &js_ts_content_by_path);
+    for (file_path, names) in expanded_named_exports {
+        named_exports_by_file.insert(file_path, names);
+    }
+    let js_ts_candidate_files: Vec<String> = {
+        let mut files: Vec<String> = js_ts_content_by_path.keys().cloned().collect();
+        sort_import_candidate_files(&mut files, JS_TS_EXTENSIONS);
+        files
+    };
     let ts_default_exports = TsDefaultExportTable {
         sorted_files: sorted_default_export_files(&default_exports),
         exports_by_file: default_exports,
@@ -6633,6 +6725,7 @@ fn build_import_table_incremental(
                 file_path,
                 &ts_default_exports.exports_by_file,
                 &named_exports_by_file,
+                &named_export_sources_by_file,
                 ts_top_level_entities.as_ref(),
             );
             sink.one(Table::TsExportSurface, file_path, value);
@@ -6684,6 +6777,8 @@ fn build_import_table_incremental(
                         pending,
                         symbol_table,
                         entity_map,
+                        &named_export_sources_by_file,
+                        &js_ts_candidate_files,
                         &mut read_set,
                     ) {
                         entries.push(entry);
@@ -6694,6 +6789,8 @@ fn build_import_table_incremental(
                         pending,
                         symbol_table,
                         entity_map,
+                        &named_export_sources_by_file,
+                        &js_ts_candidate_files,
                         &mut read_set,
                     ) {
                         entries.push(entry);
@@ -6701,12 +6798,45 @@ fn build_import_table_incremental(
                 }
             } else {
                 // Freshly scanned this build (or not eligible for the pending
-                // path at all): the scan's own resolution is trustworthy.
+                // path at all): resolve JS/TS named imports from the expanded
+                // export surface, not the scan's direct `find_import_target`.
                 for (key, val) in &result.scan.local_imports {
+                    if is_js_ts_file(&key.0) {
+                        continue;
+                    }
                     entries.push((key.clone(), val.clone()));
                 }
-                for (key, val) in &result.scan.re_export_imports {
-                    entries.push((key.clone(), val.clone()));
+                for pending in &result.scan.pending_named_re_export {
+                    if let Some(target_id) = resolve_js_ts_named_import_target(
+                        &pending.original_name,
+                        &pending.module_path,
+                        &pending.file_path,
+                        symbol_table,
+                        entity_map,
+                        &named_export_sources_by_file,
+                        &js_ts_candidate_files,
+                    ) {
+                        entries.push((
+                            (pending.file_path.clone(), pending.local_name.clone()),
+                            target_id,
+                        ));
+                    }
+                }
+                for pending in &result.scan.pending_named_local {
+                    if let Some(target_id) = resolve_js_ts_named_import_target(
+                        &pending.original_name,
+                        &pending.module_path,
+                        &pending.file_path,
+                        symbol_table,
+                        entity_map,
+                        &named_export_sources_by_file,
+                        &js_ts_candidate_files,
+                    ) {
+                        entries.push((
+                            (pending.file_path.clone(), pending.local_name.clone()),
+                            target_id,
+                        ));
+                    }
                 }
                 if result.eligible {
                     for pending in &result.scan.pending_named_local {
@@ -6755,16 +6885,16 @@ fn build_import_table_incremental(
                     &mut read_set,
                 );
                 has_bare |= is_bare;
-                let Some(table) = ts_top_level_entities.as_ref() else {
-                    continue;
-                };
                 let target_file = if is_bare {
                     namespace_stem_index.as_ref().and_then(|idx| {
                         resolve_bare_import_stem(idx, &pending.module_path, JS_TS_EXTENSIONS)
                     })
                 } else {
+                    // All parsed JS/TS files, not just entity-bearing ones: a
+                    // pure star barrel declares no entities but is a valid
+                    // namespace-import target (#478).
                     find_import_file(
-                        &table.sorted_files,
+                        &js_ts_candidate_files,
                         &pending.module_path,
                         &pending.file_path,
                         JS_TS_EXTENSIONS,
@@ -6773,23 +6903,26 @@ fn build_import_table_incremental(
                 let Some(target_file) = target_file else {
                     continue;
                 };
-                let Some(target_entries) = table.entities_by_file.get(target_file) else {
+                let Some(export_sources) = named_export_sources_by_file.get(target_file) else {
                     continue;
                 };
-                let Some(exported_names) = named_exports_by_file.get(target_file) else {
-                    continue;
-                };
-                for (name, target_id) in target_entries {
-                    if !exported_names.contains(name) {
-                        continue;
+                for (name, source_file) in export_sources {
+                    let target_id = resolve_js_ts_namespace_member_target(
+                        name,
+                        target_file,
+                        source_file,
+                        symbol_table,
+                        entity_map,
+                    );
+                    if let Some(target_id) = target_id {
+                        entries.push((
+                            (
+                                pending.file_path.clone(),
+                                format!("{}.{}", pending.alias, name),
+                            ),
+                            target_id,
+                        ));
                     }
-                    entries.push((
-                        (
-                            pending.file_path.clone(),
-                            format!("{}.{}", pending.alias, name),
-                        ),
-                        target_id.clone(),
-                    ));
                 }
             }
 

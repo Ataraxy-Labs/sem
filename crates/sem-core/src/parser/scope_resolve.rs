@@ -822,14 +822,13 @@ struct TsDefaultReExport {
 
 pub(crate) struct TopLevelEntityIndex {
     entities_by_file: HashMap<String, Vec<(String, String)>>,
-    sorted_files: Vec<String>,
-    /// `sorted_files`, indexed by file stem, for callers that need
+    /// Entity-bearing files indexed by file stem, for callers that need
     /// *every* stem-matching file (bare/package specifier resolution's
     /// union-of-matches semantics — see [`match_bare_import_stem`]) rather
-    /// than [`find_import_file`]'s single best match. Built alongside
-    /// `sorted_files` unconditionally (cheap relative to `entities_by_file`
-    /// itself); unused by the JS/TS namespace-import path, which still goes
-    /// through `find_import_file`/`sorted_files` exactly as before.
+    /// than [`find_import_file`]'s single best match. Relative-path
+    /// namespace resolution does NOT go through this index: a pure star
+    /// barrel declares no entities, so those targets resolve against all
+    /// parsed files instead (#478).
     stem_index: HashMap<String, Vec<String>>,
 }
 
@@ -7527,7 +7526,6 @@ fn build_top_level_entity_index(
 
     TopLevelEntityIndex {
         entities_by_file,
-        sorted_files,
         stem_index,
     }
 }
@@ -8795,17 +8793,30 @@ fn register_ts_namespace_import<'a>(
 ) {
     let top_level_entities = top_level_entities
         .get_or_init(|| build_top_level_entity_index(symbol_table, entity_map, extensions));
-    let Some(candidate_file) = find_import_file(
-        &top_level_entities.sorted_files,
-        source_path,
-        file_path,
-        extensions,
-    ) else {
+    // Resolve the module path against every parsed JS/TS file, not just files
+    // that declare top-level entities: a pure star barrel (`export * from`)
+    // declares nothing itself, so it is absent from `sorted_files`, yet it is
+    // a perfectly valid namespace-import target whose surface is the expanded
+    // star re-exports (issue #478).
+    let all_candidate_files: Vec<String> = {
+        let mut files: Vec<String> = parsed_files
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .filter(|path| extensions.iter().any(|ext| path.ends_with(ext)))
+            .collect();
+        sort_import_candidate_files(&mut files, extensions);
+        files
+    };
+    let Some(candidate_file) =
+        find_import_file(&all_candidate_files, source_path, file_path, extensions)
+    else {
         return;
     };
-    let Some(entries) = top_level_entities.entities_by_file.get(candidate_file) else {
-        return;
-    };
+    let empty_entries: Vec<(String, String)> = Vec::new();
+    let entries = top_level_entities
+        .entities_by_file
+        .get(candidate_file)
+        .unwrap_or(&empty_entries);
     let exported_names = {
         let mut cache = exported_names_by_file.lock().unwrap();
         cache
@@ -8831,6 +8842,50 @@ fn register_ts_namespace_import<'a>(
         if !exported_names.contains(name) {
             continue;
         }
+        let qualified_name = format!("{alias}.{name}");
+        import_table
+            .entry((file_path.to_string(), qualified_name))
+            .or_insert_with(|| target_id.clone());
+    }
+
+    // Star barrels: `entries` above are the candidate file's OWN top-level
+    // entities, so a file that is only `export * from './x'` contributes
+    // nothing there. Expand its star re-exports (issue #478) and register
+    // each expanded name against the entity in the file that actually
+    // declares it. `.entry().or_insert_with()` keeps the barrel's own
+    // declarations winning over star-provided names.
+    let content_by_file = content_by_file.get_or_init(|| {
+        parsed_files
+            .iter()
+            .map(|(file_path, content, _)| (file_path.as_str(), content.as_str()))
+            .collect()
+    });
+    let expanded = {
+        let content_by_path: rustc_hash::FxHashMap<String, &str> = content_by_file
+            .iter()
+            .map(|(path, content)| ((*path).to_string(), *content))
+            .collect();
+        let mut memo = rustc_hash::FxHashMap::default();
+        let mut visiting = rustc_hash::FxHashSet::default();
+        crate::parser::import_resolution::expand_js_ts_named_export_sources_for_file(
+            candidate_file,
+            &content_by_path,
+            &all_candidate_files,
+            &mut memo,
+            &mut visiting,
+            0,
+        )
+    };
+    for (name, source_file) in expanded {
+        if source_file == candidate_file {
+            continue; // own declarations already handled above
+        }
+        let Some(source_entries) = top_level_entities.entities_by_file.get(&source_file) else {
+            continue;
+        };
+        let Some((_, target_id)) = source_entries.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
         let qualified_name = format!("{alias}.{name}");
         import_table
             .entry((file_path.to_string(), qualified_name))
