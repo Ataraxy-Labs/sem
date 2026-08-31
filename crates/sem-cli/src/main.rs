@@ -1,6 +1,6 @@
 mod build_cache;
-mod corpus_columns;
 mod commands;
+mod corpus_columns;
 mod formatters;
 mod hyperlinks;
 mod progress;
@@ -40,7 +40,8 @@ enum ColorMode {
 #[derive(Subcommand)]
 enum Commands {
     /// Show semantic diff of changes (supports git diff syntax). Untracked files are excluded, matching git behavior.
-    #[command(long_about = "Show semantic diff of changes (supports git diff syntax). Untracked files are excluded, matching git behavior.\n\n\
+    #[command(
+        long_about = "Show semantic diff of changes (supports git diff syntax). Untracked files are excluded, matching git behavior.\n\n\
         Cloud upload (when this repo has cloud consent — `sem cloud enable`/`share`, or SEM_CLOUD=1):\n\
         the local diff above is always computed and printed first, unaffected by anything below. If \
         consent is on, the diff is then uploaded to sem cloud immediately, WITHOUT first computing \
@@ -57,7 +58,8 @@ enum Commands {
         it always wins over the adaptive curve.\n\
         Set SEM_RELATIONS_LOCAL=1 to always compute relations locally before uploading (the old, \
         single-upload behavior), instead of the above. With cloud consent off, none of this runs: no \
-        network, no relations upload, identical to running with no cloud account at all.")]
+        network, no relations upload, identical to running with no cloud account at all."
+    )]
     Diff {
         /// Display path label for direct file comparison
         #[arg(long, hide = true)]
@@ -185,8 +187,11 @@ enum Commands {
     /// when one exists (cold-process, <10ms on a large repo); falls back to
     /// a fresh build otherwise, which then leaves an index for next time.
     Find {
-        /// Entity name, optionally as "type name" (e.g. "function createProgram")
-        query: String,
+        /// Entity name(s), each optionally as "type name" (e.g. "function
+        /// createProgram"). Several names run as one batch: each resolves
+        /// independently, and a miss on one doesn't affect the others.
+        #[arg(required = true, num_args = 1..)]
+        queries: Vec<String>,
 
         /// Restrict to entities defined in this file
         #[arg(long)]
@@ -199,12 +204,17 @@ enum Commands {
     /// Show direct callers of an entity (who calls/references it) — the
     /// index's reverse postings, same freshness/fallback discipline as `find`.
     Callers {
-        /// Entity name or id
+        /// Entity name or id. Must resolve to exactly one definition —
+        /// an ambiguous name is refused with the candidate list.
         query: String,
 
         /// Disambiguate by defining file
         #[arg(long)]
         file: Option<String>,
+
+        /// Show at most this many callers (all by default)
+        #[arg(long)]
+        limit: Option<usize>,
 
         /// Output as JSON
         #[arg(long)]
@@ -233,7 +243,13 @@ enum Commands {
     /// a wrong answer.
     Grep {
         /// Regex or literal pattern
-        pattern: String,
+        #[arg(required_unless_present = "patterns")]
+        pattern: Option<String>,
+
+        /// Pattern to search for, repeatable (rg-style `-e p1 -e p2`); each
+        /// pattern's hits are reported separately rather than merged
+        #[arg(long = "regexp", short = 'e', conflicts_with = "pattern")]
+        patterns: Vec<String>,
 
         /// Case-insensitive match (disables the trigram prefilter)
         #[arg(long, short = 'i')]
@@ -353,12 +369,25 @@ enum Commands {
         /// matched text). Use instead of grep for strings in code.
         #[arg(long, value_name = "SUBSTRING")]
         text: Option<String>,
+
+        /// Show each entity's header under its row: the signature up to the
+        /// body plus the first doc-comment line — more than a name, far less
+        /// than a body
+        #[arg(long)]
+        signatures: bool,
     },
     /// Show token-budgeted context for an entity
     Context {
         /// Name of the entity, optionally as "type name"
-        #[arg(required_unless_present = "entity_id")]
+        #[arg(required_unless_present_any = ["entity_id", "entities"], conflicts_with = "entities")]
         entity: Option<String>,
+
+        /// Entity name, repeatable (--entity A --entity B) to pack context
+        /// for several entities in one invocation under one --budget; each
+        /// name resolves (and refuses on ambiguity) exactly like the
+        /// single-entity form
+        #[arg(long = "entity", conflicts_with = "entity_id")]
+        entities: Vec<String>,
 
         /// Look up entity by its ID (from sem diff --format json output)
         #[arg(long)]
@@ -395,6 +424,12 @@ enum Commands {
         /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
+
+        /// Render each packed entity as its header (signature plus first
+        /// doc-comment line) instead of its body — the same budget buys a
+        /// much wider map
+        #[arg(long)]
+        headers: bool,
     },
     /// Show lifetime diff statistics
     Stats,
@@ -492,7 +527,8 @@ enum CloudAction {
 #[derive(Subcommand)]
 enum ReviewAction {
     /// Join a sem-cloud code review as a live listener (the one-command agent attach)
-    #[command(long_about = "Join a sem-cloud code review as a live listener: resolves credentials, \
+    #[command(
+        long_about = "Join a sem-cloud code review as a live listener: resolves credentials, \
         validates the diff exists, and execs `claude` pre-configured with the sem-review-listener \
         plugin so the session joins the review and answers reviewer questions in a loop for as long \
         as it runs.\n\n\
@@ -503,7 +539,8 @@ enum ReviewAction {
                                      other cloud command).\n  \
         SEM_LISTENER_MODEL          Model for the listener session (default: claude-opus-5).\n  \
         SEM_LISTENER_PLUGIN_DIR     Override the claude-review-listener plugin directory \
-                                     (auto-detected relative to the sem binary otherwise).")]
+                                     (auto-detected relative to the sem binary otherwise)."
+    )]
     Listen {
         /// Diff id, or a hosted review URL (…/diffs/{id}, optionally /canvas)
         diff_id_or_url: String,
@@ -718,27 +755,44 @@ fn main() {
                 no_default_excludes,
             });
         }
-        Some(Commands::Find { query, file, json }) => {
-            commands::query::find_command(commands::query::QueryOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                query,
-                file,
-                json,
-            });
+        Some(Commands::Find {
+            queries,
+            file,
+            json,
+        }) => {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if queries.len() == 1 {
+                commands::query::find_command(commands::query::QueryOptions {
+                    cwd,
+                    query: queries.into_iter().next().unwrap_or_default(),
+                    file,
+                    json,
+                });
+            } else {
+                commands::query::find_multi_command(cwd, queries, file, json);
+            }
         }
-        Some(Commands::Callers { query, file, json }) => {
-            commands::query::callers_command(commands::query::QueryOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                query,
-                file,
-                json,
-            });
+        Some(Commands::Callers {
+            query,
+            file,
+            limit,
+            json,
+        }) => {
+            commands::query::callers_command(
+                commands::query::QueryOptions {
+                    cwd: std::env::current_dir()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    query,
+                    file,
+                    json,
+                },
+                limit,
+            );
         }
         Some(Commands::Refs { query, file, json }) => {
             commands::query::refs_command(commands::query::QueryOptions {
@@ -753,18 +807,29 @@ fn main() {
         }
         Some(Commands::Grep {
             pattern,
+            patterns,
             ignore_case,
             json,
         }) => {
-            commands::grep::grep_command(commands::grep::GrepOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                pattern,
-                case_insensitive: ignore_case,
-                json,
-            });
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if patterns.len() > 1 {
+                commands::grep::grep_multi_command(cwd, patterns, ignore_case, json);
+            } else {
+                // Positional pattern, or exactly one -e: the single form,
+                // byte-identical to what it always produced.
+                let single = pattern
+                    .or_else(|| patterns.into_iter().next())
+                    .unwrap_or_default();
+                commands::grep::grep_command(commands::grep::GrepOptions {
+                    cwd,
+                    pattern: single,
+                    case_insensitive: ignore_case,
+                    json,
+                });
+            }
         }
         Some(Commands::Hook { kind }) => {
             if kind == "prompt-submit" {
@@ -810,6 +875,7 @@ fn main() {
             only_kinds,
             except_kinds,
             text,
+            signatures,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -823,10 +889,12 @@ fn main() {
                 only_kinds,
                 except_kinds,
                 text,
+                signatures,
             });
         }
         Some(Commands::Context {
             entity,
+            entities,
             entity_id,
             file,
             budget,
@@ -836,22 +904,47 @@ fn main() {
             file_exts,
             no_cache,
             no_default_excludes,
+            headers,
         }) => {
-            context_command(ContextOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                entity_name: entity,
-                entity_id,
-                file_path: file,
-                budget,
-                hops,
-                json: resolve_json(format, json),
-                file_exts,
-                no_cache,
-                no_default_excludes,
-            });
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let json = resolve_json(format, json);
+            if entities.is_empty() {
+                context_command(ContextOptions {
+                    cwd,
+                    entity_name: entity,
+                    entity_id,
+                    file_path: file,
+                    budget,
+                    hops,
+                    json,
+                    file_exts,
+                    no_cache,
+                    no_default_excludes,
+                    headers,
+                });
+            } else {
+                // Batch form: one packed context per named entity, every
+                // other flag (budget included) applying to each. Resolution
+                // failures refuse exactly like the single-entity form.
+                for entity_name in entities {
+                    context_command(ContextOptions {
+                        cwd: cwd.clone(),
+                        entity_name: Some(entity_name),
+                        entity_id: None,
+                        file_path: file.clone(),
+                        budget,
+                        hops,
+                        json,
+                        file_exts: file_exts.clone(),
+                        no_cache,
+                        no_default_excludes,
+                        headers,
+                    });
+                }
+            }
         }
         Some(Commands::Stats) => {
             commands::stats::run();
@@ -914,7 +1007,10 @@ fn main() {
             }
         }
         Some(Commands::Review { action }) => match action {
-            ReviewAction::Listen { diff_id_or_url, dry_run } => {
+            ReviewAction::Listen {
+                diff_id_or_url,
+                dry_run,
+            } => {
                 if let Err(e) = commands::review::listen(&diff_id_or_url, dry_run) {
                     eprintln!("{} {}", "error:".red().bold(), e);
                     std::process::exit(1);

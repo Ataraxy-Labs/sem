@@ -22,6 +22,9 @@ pub struct EntitiesOptions {
     /// Exact substring to search for inside entity bodies (entity-addressed
     /// grep replacement). When set, listing flags are ignored.
     pub text: Option<String>,
+    /// Show each entity's header (signature plus first doc-comment line)
+    /// under its row.
+    pub signatures: bool,
 }
 
 pub fn entities_command(opts: EntitiesOptions) {
@@ -228,16 +231,37 @@ pub fn entities_command(opts: EntitiesOptions) {
     timings.counter("distinct_files", distinct_files as u64);
     timings.counter("entities", entities.len() as u64);
 
+    // One header per entity id (`sem_core::parser::header`), computed only
+    // under --signatures. `entity.file_path` here is relative to `opts.cwd`
+    // (see `resolve_path`/`file_path_for_entity`), so `root` is the join
+    // base. A file that can't be read just leaves its entities without a
+    // header; the listing itself never fails over the zoom detail.
+    let headers = opts.signatures.then(|| {
+        sem_core::parser::header::headers_by_id(
+            root,
+            entities.iter().map(|e| {
+                (
+                    e.id.as_str(),
+                    e.file_path.as_str(),
+                    e.start_line,
+                    e.end_line,
+                )
+            }),
+        )
+    });
+    let headers = headers.as_ref();
+
     if opts.json {
-        let json_bytes = write_entities_json(&entities, include_file).unwrap_or_else(|e| {
-            eprintln!("{} Cannot write JSON output: {}", "error:".red().bold(), e);
-            std::process::exit(1);
-        });
+        let json_bytes =
+            write_entities_json(&entities, include_file, headers).unwrap_or_else(|e| {
+                eprintln!("{} Cannot write JSON output: {}", "error:".red().bold(), e);
+                std::process::exit(1);
+            });
         timings.counter("json_bytes", json_bytes);
     } else if should_group_by_file(&entities) {
-        print_grouped_entities(&display_label, &entities);
+        print_grouped_entities(&display_label, &entities, headers);
     } else if let Some(file_path) = entities.first().map(|e| e.file_path.as_str()) {
-        print_file_entities(file_path, &entities);
+        print_file_entities(file_path, &entities, headers);
     } else {
         println!("{} {}\n", "entities:".green().bold(), display_label.bold());
     }
@@ -510,9 +534,15 @@ struct EntityJsonRow<'a> {
     parent_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    header: Option<&'a [String]>,
 }
 
-fn write_entities_json(entities: &[SemanticEntity], include_file: bool) -> io::Result<u64> {
+fn write_entities_json(
+    entities: &[SemanticEntity],
+    include_file: bool,
+    headers: Option<&HashMap<String, Vec<String>>>,
+) -> io::Result<u64> {
     let stdout = io::stdout();
     let mut writer = CountingWriter::new(stdout.lock());
     writer.write_all(b"[")?;
@@ -529,6 +559,9 @@ fn write_entities_json(entities: &[SemanticEntity], include_file: bool) -> io::R
             end_byte: entity.end_byte,
             parent_id: entity.parent_id.as_deref(),
             file: include_file.then_some(entity.file_path.as_str()),
+            header: headers
+                .and_then(|h| h.get(entity.id.as_str()))
+                .map(Vec::as_slice),
         };
         serde_json::to_writer(&mut writer, &row)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
@@ -564,9 +597,13 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
-fn print_file_entities(file_path: &str, entities: &[SemanticEntity]) {
+fn print_file_entities(
+    file_path: &str,
+    entities: &[SemanticEntity],
+    headers: Option<&HashMap<String, Vec<String>>>,
+) {
     println!("{} {}\n", "entities:".green().bold(), file_path.bold());
-    print_entity_rows(entities, "  ");
+    print_entity_rows(entities, "  ", headers);
 }
 
 fn should_group_by_file(entities: &[SemanticEntity]) -> bool {
@@ -574,7 +611,11 @@ fn should_group_by_file(entities: &[SemanticEntity]) -> bool {
     files.len() > 1
 }
 
-fn print_grouped_entities(path_label: &str, entities: &[SemanticEntity]) {
+fn print_grouped_entities(
+    path_label: &str,
+    entities: &[SemanticEntity],
+    headers: Option<&HashMap<String, Vec<String>>>,
+) {
     println!("{} {}\n", "entities:".green().bold(), path_label.bold());
 
     let mut current_file: Option<&str> = None;
@@ -586,15 +627,19 @@ fn print_grouped_entities(path_label: &str, entities: &[SemanticEntity]) {
         }
 
         let indent = entity_indent(entity, &entities_by_id, "    ");
-        print_entity_row(entity, &indent);
+        print_entity_row(entity, &indent, headers);
     }
 }
 
-fn print_entity_rows(entities: &[SemanticEntity], base_indent: &str) {
+fn print_entity_rows(
+    entities: &[SemanticEntity],
+    base_indent: &str,
+    headers: Option<&HashMap<String, Vec<String>>>,
+) {
     let entities_by_id = entities_by_id(entities);
     for entity in entities {
         let indent = entity_indent(entity, &entities_by_id, base_indent);
-        print_entity_row(entity, &indent);
+        print_entity_row(entity, &indent, headers);
     }
 }
 
@@ -634,7 +679,11 @@ fn entity_depth(entity: &SemanticEntity, entities_by_id: &HashMap<&str, &Semanti
     depth
 }
 
-fn print_entity_row(entity: &SemanticEntity, indent: &str) {
+fn print_entity_row(
+    entity: &SemanticEntity,
+    indent: &str,
+    headers: Option<&HashMap<String, Vec<String>>>,
+) {
     println!(
         "{}{} {} (L{}:{})",
         indent,
@@ -643,6 +692,11 @@ fn print_entity_row(entity: &SemanticEntity, indent: &str) {
         entity.start_line,
         entity.end_line,
     );
+    if let Some(header) = headers.and_then(|h| h.get(entity.id.as_str())) {
+        for line in header {
+            println!("{indent}  {}", line.dimmed());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -759,6 +813,7 @@ mod tests {
             only_kinds: vec![],
             except_kinds: vec![],
             text: None,
+            signatures: false,
         });
 
         assert_eq!(

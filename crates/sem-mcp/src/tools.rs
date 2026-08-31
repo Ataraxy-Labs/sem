@@ -21,6 +21,10 @@ pub struct EntitiesParams {
         description = "Exact substring to search for inside entity bodies across the whole repo (use instead of grep for strings, error messages, config keys). Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text."
     )]
     pub text: Option<String>,
+    #[schemars(
+        description = "Show each listed entity's header: its signature up to the body plus the first doc-comment line — more than a name, far less than a body."
+    )]
+    pub signatures: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }
@@ -50,6 +54,10 @@ impl EntitiesParams {
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
+    }
+
+    pub fn signatures(&self) -> bool {
+        self.signatures.unwrap_or(false)
     }
 
     pub fn format(&self) -> &str {
@@ -115,7 +123,11 @@ pub struct ContextParams {
     )]
     pub file_path: Option<String>,
     #[schemars(description = "Name of the target entity")]
-    pub entity_name: String,
+    pub entity_name: Option<String>,
+    #[schemars(
+        description = "Several target entities to pack in one call (batch form of `entity_name`), each packed under the same token_budget. Text output concatenates the per-entity blocks; json output is newline-delimited, one object per entity."
+    )]
+    pub entities: Option<Vec<String>>,
     #[schemars(description = "Maximum token budget. Defaults to 8000.")]
     pub token_budget: Option<usize>,
     #[schemars(
@@ -132,11 +144,24 @@ pub struct ContextParams {
     pub fresh: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
+    #[schemars(
+        description = "Set to \"headers\" to render each packed entity as its header (signature plus first doc-comment line) instead of its body — the same token_budget buys a much wider map."
+    )]
+    pub mode: Option<String>,
 }
 
 impl ContextParams {
     pub fn format(&self) -> &str {
         self.format.as_deref().unwrap_or("text")
+    }
+
+    /// Batch entries, when the batch form is in use (non-empty `entities`).
+    pub fn entities(&self) -> Option<&[String]> {
+        self.entities.as_deref().filter(|e| !e.is_empty())
+    }
+
+    pub fn wants_headers(&self) -> bool {
+        self.mode.as_deref() == Some("headers")
     }
 }
 
@@ -148,7 +173,11 @@ pub struct FindParams {
     #[schemars(
         description = "Entity name to look up, optionally as \"type name\" (e.g. \"function createProgram\") to disambiguate by kind."
     )]
-    pub query: String,
+    pub query: Option<String>,
+    #[schemars(
+        description = "Several names to look up in one call (batch form of `query`). Each resolves independently; a miss on one never affects the others."
+    )]
+    pub queries: Option<Vec<String>>,
     #[schemars(description = "Restrict to entities defined in this file.")]
     pub file: Option<String>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
@@ -163,6 +192,11 @@ impl FindParams {
     pub fn format(&self) -> &str {
         self.format.as_deref().unwrap_or("text")
     }
+
+    /// Batch entries, when the batch form is in use (non-empty `queries`).
+    pub fn queries(&self) -> Option<&[String]> {
+        self.queries.as_deref().filter(|q| !q.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -171,7 +205,11 @@ pub struct GrepParams {
     #[schemars(
         description = "Regex or literal pattern to search file contents for (rg-compatible)."
     )]
-    pub pattern: String,
+    pub pattern: Option<String>,
+    #[schemars(
+        description = "Several patterns to search in one call (batch form of `pattern`). Each pattern's hits are reported separately, never merged."
+    )]
+    pub patterns: Option<Vec<String>>,
     #[schemars(description = "Case-insensitive match.")]
     pub case_insensitive: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
@@ -181,6 +219,36 @@ pub struct GrepParams {
 impl GrepParams {
     pub fn case_insensitive(&self) -> bool {
         self.case_insensitive.unwrap_or(false)
+    }
+
+    pub fn format(&self) -> &str {
+        self.format.as_deref().unwrap_or("text")
+    }
+
+    /// Batch entries, when the batch form is in use (non-empty `patterns`).
+    pub fn patterns(&self) -> Option<&[String]> {
+        self.patterns.as_deref().filter(|p| !p.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CallersParams {
+    #[schemars(
+        description = "Entity whose callers to list, optionally as \"type name\" (e.g. \"function createProgram\") to disambiguate by kind. Must resolve to exactly one definition; an ambiguous name is refused with the full candidate list."
+    )]
+    pub query: String,
+    #[schemars(description = "Restrict to the definition in this file (disambiguates).")]
+    pub file: Option<String>,
+    #[schemars(description = "Return at most this many callers (all by default).")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
+    pub format: Option<String>,
+}
+
+impl CallersParams {
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_deref().filter(|f| !f.is_empty())
     }
 
     pub fn format(&self) -> &str {
@@ -303,6 +371,7 @@ mod tests {
         assert_unknown_fields_return_invalid_params::<ContextParams>();
         assert_unknown_fields_return_invalid_params::<FindParams>();
         assert_unknown_fields_return_invalid_params::<GrepParams>();
+        assert_unknown_fields_return_invalid_params::<CallersParams>();
         assert_unknown_fields_return_invalid_params::<JoinReviewParams>();
         assert_unknown_fields_return_invalid_params::<WaitForBranchParams>();
         assert_unknown_fields_return_invalid_params::<ReplyToBranchParams>();

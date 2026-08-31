@@ -4,6 +4,7 @@ pub mod diff_oracle;
 pub mod differ;
 pub mod fast_extractor;
 pub mod graph;
+pub mod header;
 #[cfg(feature = "git")]
 pub mod hotspot;
 mod import_resolution;

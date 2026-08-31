@@ -418,3 +418,216 @@ fn entities_and_context_support_format_json_with_cli_fields() {
     assert!(entry.get("name").is_some(), "entry: {entry}");
     assert!(entry.get("content").is_some(), "entry: {entry}");
 }
+
+// ── Batch (multi-query) forms ──
+
+#[test]
+fn find_batch_queries_resolve_independently() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_find",
+        json!({"queries": ["needle_target_fn", "does_not_exist_zzz"], "format": "json"}),
+    );
+    let rows: Value = serde_json::from_str(&tool_text(&resp)).expect("batch find json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 2, "one entry per query, in order: {rows:?}");
+    assert_eq!(rows[0]["query"], "needle_target_fn");
+    assert_eq!(rows[0]["matches"][0]["file"], "src/needle.py");
+    assert_eq!(rows[1]["query"], "does_not_exist_zzz");
+    assert_eq!(
+        rows[1]["matches"].as_array().unwrap().len(),
+        0,
+        "a miss is an empty entry, never an error for the batch"
+    );
+}
+
+#[test]
+fn grep_batch_patterns_report_separately() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_grep",
+        json!({"patterns": ["NEEDLE_GREP_MARKER_XYZ", "no_such_text_zzz"], "format": "json"}),
+    );
+    let results: Value = serde_json::from_str(&tool_text(&resp)).expect("batch grep json");
+    let results = results.as_array().expect("array");
+    assert_eq!(results.len(), 2, "one entry per pattern: {results:?}");
+    assert_eq!(results[0]["pattern"], "NEEDLE_GREP_MARKER_XYZ");
+    assert_eq!(results[0]["hits"][0]["file"], "src/marker.py");
+    assert_eq!(results[1]["pattern"], "no_such_text_zzz");
+    assert_eq!(results[1]["hits"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn context_batch_entities_pack_one_block_each() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_context",
+        json!({"entities": ["needle_target_fn", "unrelated_other"], "format": "json"}),
+    );
+    let text = tool_text(&resp);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "json batch is newline-delimited, one object per entity:\n{text}"
+    );
+    let first: Value = serde_json::from_str(lines[0]).expect("first entity json");
+    let second: Value = serde_json::from_str(lines[1]).expect("second entity json");
+    assert_eq!(first["entity"], "needle_target_fn");
+    assert_eq!(second["entity"], "unrelated_other");
+}
+
+// ── sem_callers ──
+
+/// Extract the text of a tool-level *error* response — the inverse of
+/// `tool_text`: panics unless the tool reported `isError`.
+fn tool_error_text(resp: &Value) -> String {
+    if let Some(err) = resp.get("error") {
+        panic!("tools/call returned a JSON-RPC error: {err}");
+    }
+    let result = &resp["result"];
+    assert_eq!(
+        result.get("isError"),
+        Some(&Value::Bool(true)),
+        "expected a tool-level error: {result}"
+    );
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool result content[0] is not text: {result}"))
+        .to_string()
+}
+
+/// A repo where `target_fn` has exactly two same-file callers and
+/// `dup_name` is defined in two different files — the two shapes
+/// `sem_callers` has to get right (limit, and the ambiguity refusal).
+fn callers_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@t.com"]);
+    git(root, &["config", "user.name", "test"]);
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/app.py"),
+        "def target_fn():\n    return 0\n\n\ndef caller_a():\n    return target_fn()\n\n\ndef caller_b():\n    return target_fn() + caller_a()\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/dup.py"), "def dup_name():\n    return 1\n").unwrap();
+    std::fs::write(root.join("src/dup2.py"), "def dup_name():\n    return 2\n").unwrap();
+
+    git(root, &["add", "-A"]);
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(["commit", "-q", "-m", "fixture"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    dir
+}
+
+#[test]
+fn callers_lists_direct_callers_and_honors_limit() {
+    let repo = callers_fixture();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_callers",
+        json!({"query": "target_fn", "format": "json"}),
+    );
+    let out: Value = serde_json::from_str(&tool_text(&resp)).expect("callers json");
+    assert_eq!(out["entity"]["name"], "target_fn");
+    assert_eq!(
+        out["callers"].as_array().unwrap().len(),
+        2,
+        "both direct callers listed: {out}"
+    );
+
+    let resp = client.call_tool(
+        "sem_callers",
+        json!({"query": "target_fn", "format": "json", "limit": 1}),
+    );
+    let out: Value = serde_json::from_str(&tool_text(&resp)).expect("capped callers json");
+    assert_eq!(
+        out["callers"].as_array().unwrap().len(),
+        1,
+        "limit caps the caller rows: {out}"
+    );
+}
+
+#[test]
+fn callers_refuses_ambiguous_names_with_the_candidate_list() {
+    let repo = callers_fixture();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool("sem_callers", json!({"query": "dup_name"}));
+    let text = tool_error_text(&resp);
+    assert!(
+        text.contains("src/dup.py") && text.contains("src/dup2.py"),
+        "refusal lists every candidate definition: {text}"
+    );
+
+    // The file param picks one and the same query then answers.
+    let resp = client.call_tool(
+        "sem_callers",
+        json!({"query": "dup_name", "file": "src/dup.py", "format": "json"}),
+    );
+    let out: Value = serde_json::from_str(&tool_text(&resp)).expect("disambiguated json");
+    assert_eq!(out["entity"]["file"], "src/dup.py");
+}
+
+// ── format:"json" on the entities text-search and query-ranking shapes ──
+
+#[test]
+fn entities_text_search_supports_format_json() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_entities",
+        json!({"text": "needle_target_fn_helper_a():", "format": "json"}),
+    );
+    let rows: Value = serde_json::from_str(&tool_text(&resp)).expect("text-search json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "one hit for a unique needle: {rows:?}");
+    assert_eq!(rows[0]["file"], "src/needle.py");
+    assert_eq!(rows[0]["entity"], "needle_target_fn_helper_a");
+    assert_eq!(rows[0]["type"], "function");
+    assert!(
+        rows[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("needle_target_fn_helper_a"),
+        "the full matched line, not a clipped preview: {rows:?}"
+    );
+    assert!(rows[0]["line"].is_u64());
+}
+
+#[test]
+fn entities_query_mode_supports_format_json() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn(repo.path());
+
+    let resp = client.call_tool(
+        "sem_entities",
+        json!({"query": "needle_target_fn", "format": "json", "limit": 3}),
+    );
+    let rows: Value = serde_json::from_str(&tool_text(&resp)).expect("query-mode json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 3, "limit honored: {rows:?}");
+    assert_eq!(
+        rows[0]["name"], "needle_target_fn",
+        "exact-name relevance still ranks first in json: {rows:?}"
+    );
+    for row in rows {
+        assert!(row["dependents"].is_u64(), "dependent count carried: {row}");
+        assert!(row["file"].is_string() && row["start_line"].is_u64());
+    }
+}

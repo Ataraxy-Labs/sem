@@ -46,6 +46,58 @@ pub struct QueryOptions {
     pub json: bool,
 }
 
+/// `sem find name1 name2 …` — several lookups in one invocation. Each name
+/// resolves independently through the exact same index/fallback machinery as
+/// a single `sem find`; a miss on one name never affects the others. Exit
+/// code is 1 only when *every* name missed (a batch where anything resolved
+/// is a success, matching the per-name independence contract).
+pub fn find_multi_command(cwd: String, queries: Vec<String>, file: Option<String>, json: bool) {
+    let mut answers: Vec<(String, Answer)> = Vec::with_capacity(queries.len());
+    for query in queries {
+        let opts = QueryOptions {
+            cwd: cwd.clone(),
+            query: query.clone(),
+            file: file.clone(),
+            json,
+        };
+        let answer = resolve(&opts, Verb::Find);
+        answers.push((query, answer));
+    }
+
+    let any_hit = answers.iter().any(|(_, a)| !a.defs.is_empty());
+    if json {
+        let rows: Vec<serde_json::Value> = answers
+            .iter()
+            .map(|(query, answer)| {
+                serde_json::json!({
+                    "query": query,
+                    "matches": answer.defs.iter().map(to_row).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows).unwrap_or_default());
+    } else {
+        for (query, answer) in &answers {
+            if answer.defs.is_empty() {
+                eprintln!("{} no entity named '{}'", "error:".red().bold(), query);
+                continue;
+            }
+            for def in &answer.defs {
+                println!(
+                    "{} {} {}:{}",
+                    def.entity_type.dimmed(),
+                    def.name.bold(),
+                    def.file_path,
+                    def.start_line
+                );
+            }
+        }
+    }
+    if !any_hit {
+        std::process::exit(1);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Verb {
     Find,
@@ -57,8 +109,62 @@ pub fn find_command(opts: QueryOptions) {
     run(opts, Verb::Find);
 }
 
-pub fn callers_command(opts: QueryOptions) {
-    run(opts, Verb::Callers);
+/// `sem callers` answers about exactly one entity, so an ambiguous name is
+/// refused with the full candidate list rather than answered many times over
+/// (`refs` keeps the old show-everything behavior — its answer reads fine
+/// per-def; a caller list only means something once you know *whose* callers
+/// it is). `limit` caps the caller rows shown; text mode says how many were
+/// held back, json is just the capped list the caller asked for.
+pub fn callers_command(opts: QueryOptions, limit: Option<usize>) {
+    let mut answer = resolve(&opts, Verb::Callers);
+    if answer.defs.len() > 1 {
+        refuse_ambiguous(&answer.defs, &opts);
+    }
+
+    let mut hidden = 0;
+    if let Some(cap) = limit {
+        for related in &mut answer.related {
+            if related.len() > cap {
+                hidden += related.len() - cap;
+                related.truncate(cap);
+            }
+        }
+    }
+    render(&answer, Verb::Callers, opts.json, &opts.query);
+    if hidden > 0 && !opts.json {
+        println!("{}", format!("  … {hidden} more (raise --limit)").dimmed());
+    }
+}
+
+/// The callers-verb refusal: every candidate definition listed, exit 1.
+/// Text mode reports on stderr like the no-match case; json emits
+/// `{"resolved": false, "candidates": [...]}` so an agent can pick a file
+/// and retry without re-running discovery.
+fn refuse_ambiguous(defs: &[EntityInfo], opts: &QueryOptions) -> ! {
+    if opts.json {
+        let out = serde_json::json!({
+            "resolved": false,
+            "candidates": defs.iter().map(to_row).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&out).unwrap_or_default());
+    } else {
+        eprintln!(
+            "{} '{}' matches {} definitions; pass --file (or a \"type name\" query) to pick one:",
+            "error:".red().bold(),
+            opts.query,
+            defs.len()
+        );
+        for def in defs {
+            eprintln!(
+                "  {} {} {}:{}",
+                def.entity_type.dimmed(),
+                def.name.bold(),
+                def.file_path,
+                def.start_line
+            );
+        }
+    }
+    std::process::exit(1);
 }
 
 pub fn refs_command(opts: QueryOptions) {
@@ -94,21 +200,27 @@ fn to_row(e: &EntityInfo) -> DefRow {
 }
 
 fn run(opts: QueryOptions, verb: Verb) {
+    let answer = resolve(&opts, verb);
+    render(&answer, verb, opts.json, &opts.query);
+}
+
+/// Resolution half of `run`, shared with the multi-query form: index answer
+/// when fresh, cold build otherwise — byte-identical behavior to what `run`
+/// always did, just separated from rendering.
+fn resolve(opts: &QueryOptions, verb: Verb) -> Answer {
     let root = super::repo_root_or_cwd(&opts.cwd);
 
-    let answer = if std::env::var_os("SEM_NO_INDEX").is_some() {
-        cold_build_answer(&root, &opts, verb)
+    if std::env::var_os("SEM_NO_INDEX").is_some() {
+        cold_build_answer(&root, opts, verb)
     } else {
         match index::QueryIndex::open(&index_path(&root)) {
-            Some(idx) => match index_answer(&idx, &root, &opts, verb) {
+            Some(idx) => match index_answer(&idx, &root, opts, verb) {
                 Some(answer) => answer,
-                None => cold_build_answer(&root, &opts, verb),
+                None => cold_build_answer(&root, opts, verb),
             },
-            None => cold_build_answer(&root, &opts, verb),
+            None => cold_build_answer(&root, opts, verb),
         }
-    };
-
-    render(&answer, verb, opts.json, &opts.query);
+    }
 }
 
 fn index_path(root: &Path) -> PathBuf {
