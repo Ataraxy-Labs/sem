@@ -8,10 +8,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(__dirname, "fixtures");
 
 /**
- * OX-REVIEW-2 FINDING (confirmed independently before driving Ox's
- * supplementary native-tools pass, category b: "sem_read's budget path —
+ * A category b finding: "sem_read's budget path —
  * for hops=0, does the character-based slice risk cutting a UTF-16
- * surrogate pair in half, producing a malformed string?").
+ * surrogate pair in half, producing a malformed string?".
  *
  * src/tools/sem-read.ts's enforceBudget() (line ~170):
  *

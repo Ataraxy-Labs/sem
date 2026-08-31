@@ -21,7 +21,7 @@ function readCalls(callLog: string): string[] {
 }
 
 /**
- * Ox-review finding #11/#12/#13 (critical): performWeaveEdit calls
+ * Critical finding: performWeaveEdit calls
  * coordinator.claim() before withFileMutationQueue, but readFile/
  * extractEntities/the rollback writeFile all run inside the queue callback
  * with no try/catch, and coordinator.updateAndRelease only runs after the

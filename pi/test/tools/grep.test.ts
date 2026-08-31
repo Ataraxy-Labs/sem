@@ -104,7 +104,7 @@ test("patterns= applies the same path=/glob=/limit= to every pattern in the batc
   });
 });
 
-// Ox-review pass 3 finding: patterns= ran through Promise.all with no cap
+// patterns= ran through Promise.all with no cap
 // at all -- a caller passing an arbitrarily large array fired that many
 // `sem grep` child processes in one call. 30 patterns against a
 // 25-per-call cap must run exactly the first 25 and honestly report the

@@ -8,7 +8,7 @@ import type { PiSemConfig, ServerConfig } from "../../src/config/types.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /**
- * team-lead's "authority on failure" audit (follow-up to 83ea54f and
+ * The "authority on failure" audit (follow-up to 83ea54f and
  * f59b60a): for every failure mode along the bridge/extension startup and
  * runtime path, does the session end up with authority <= a healthy
  * session, or > (a bug of the same family as the last two fixes)? This
@@ -50,8 +50,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
  *  - a dead allowlist entry (a config key naming a tool the server never
  *    actually exposes)
  *  - a server's real tool that is NOT allowlisted, confirmed through the
- *    FULL startServersAndRegisterTools path (team-lead's explicit ask --
- *    register.test.ts only proved this at the registerServerTools-unit
+ *    FULL startServersAndRegisterTools path (going beyond what
+ *    register.test.ts only proved at the registerServerTools-unit
  *    level)
  *  - tools/list hanging/timing out (as opposed to crashing) -- a new fixture
  *    mode (FAKE_MCP_HANG_TOOLS_LIST), proving registerServerTools's
@@ -141,9 +141,9 @@ test("authority-on-failure: a healthy server's real tool that is NOT allowlisted
     // The fake server DOES expose "echo" -- but this config's allowlist is
     // empty, so it must never surface. This is the negative counterpart of
     // extension-fail-closed.test.ts's success-path sibling (which proves
-    // an ALLOWLISTED tool DOES register) -- team-lead's explicit ask was to
-    // confirm the exclusion side holds at this same integration level too,
-    // not just at register.test.ts's registerServerTools-unit level.
+    // an ALLOWLISTED tool DOES register) -- confirming the exclusion side
+    // holds at this same integration level too, not just at
+    // register.test.ts's registerServerTools-unit level.
     servers: [{ id: "weave", command: process.execPath, args: [FAKE_MCP_SERVER], tools: {} }],
     sessionPolicy: { activeBuiltins: ["bash", "write"] },
   };

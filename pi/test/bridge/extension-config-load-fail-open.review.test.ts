@@ -7,9 +7,8 @@ import piSemExtension from "../../extensions/pi-sem.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /**
- * OX-REVIEW-2 FINDING (Ox's own supplementary category-a pass, finding #1,
- * graded CONFIRMED — a real gap this reviewer's own reading missed; Ox
- * caught it independently).
+ * A supplementary category-a finding, graded CONFIRMED — a real gap
+ * missed on first pass, caught independently on a follow-up read.
  *
  * extensions/pi-sem.ts's session_start handler (default export):
  *
@@ -121,7 +120,7 @@ test("a PI_SEM_CONFIG that fails to load still leaves the session fail-closed, n
         `so the session is left on pi's full, unrestricted default toolset. Notices seen: ${JSON.stringify(notices)}`,
     );
 
-    // FOLLOW-UP (team-lead, after the vacuous-fixture audit / b21eae7): this
+    // FOLLOW-UP (after the vacuous-fixture audit / b21eae7): this
     // assertion used to stop at "setActiveTools was called at all" -- it
     // never checked what was actually IN that call. The fallback at the
     // time was DEFAULT_CONFIG, which spawns the real sem/weave-mcp

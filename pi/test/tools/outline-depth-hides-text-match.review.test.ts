@@ -9,10 +9,9 @@ import { performSemOutline } from "../../src/tools/sem-outline.ts";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
- * OX-REVIEW-2 FINDING (confirmed independently before driving Ox's
- * supplementary native-tools pass, category b: "does requesting depth=N
+ * A category b finding: "does requesting depth=N
  * together with text= interact correctly, or does the depth ceiling get
- * applied ... in a way that could hide a real match?").
+ * applied ... in a way that could hide a real match?".
  *
  * src/tools/sem-outline.ts's performSemOutline():
  *

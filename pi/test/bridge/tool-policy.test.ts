@@ -4,7 +4,7 @@ import { computeActiveTools } from "../../src/bridge/tool-policy.ts";
 import type { RegisterServerResult } from "../../src/bridge/register.ts";
 import type { SessionPolicy } from "../../src/config/types.ts";
 
-// Pins the fail-closed invariant from the ox review (finding #21/#22, "fix
+// Pins the fail-closed invariant (finding #21/#22, "fix
 // now" item 1): the active tool set is ALWAYS computed from
 // sessionPolicy.activeBuiltins + whatever actually registered, even when
 // every server failed -- never a silent fall-through to pi's full default

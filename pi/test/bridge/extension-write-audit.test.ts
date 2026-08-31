@@ -254,7 +254,7 @@ test("/pi-sem status counts write audit events for the session", async () => {
   }
 });
 
-// --- ox-review-3 finding #19: bash-side writes bypassed PI_SEM_STRICT's
+// --- bash-side writes bypassed PI_SEM_STRICT's
 // write protection entirely. src/bridge/bash-audit.ts's own unit tests
 // (bash-audit.test.ts) cover the pure classifier + resolver wiring with a
 // FAKE resolveTargetExists; this proves the real wiring end to end -- the

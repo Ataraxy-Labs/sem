@@ -93,7 +93,7 @@ test("sem.log is exempt from the call-count cap -- progress reporting must not i
   assert.equal(result.value, "done");
 });
 
-// The basis for tool.ts's apiCalls/edits reporting (team-lead: score how
+// The basis for tool.ts's apiCalls/edits reporting (scoring how
 // much work went through us vs. a provider-native bypass). Sandbox.ts stays
 // generic here -- it doesn't know "edit" is semantically special, it just
 // records every call that reached the host function, per function name.
@@ -162,7 +162,7 @@ test("calls[] never includes sem.log, and a call-cap-rejected attempt (never rea
   );
 });
 
-// --- review pass 3 (Ox's late report): (a) logged-value host-thread escape ---
+// --- logged-value host-thread escape ---
 //
 // Same class of vector as sandbox-return-value-toJSON-escape.review.test.ts,
 // reached via a LOGGED value's toJSON()/toString() instead of the script's
@@ -206,7 +206,7 @@ test("logged values still capture normally -- the context-native stringification
   assert.match(result.output, /progress \{"done":true\}/);
 });
 
-// --- review pass 3 (Ox's late report): (b) timeout must REVOKE the API ---
+// --- timeout must REVOKE the API ---
 //
 // Proven empirically before fixing: a script that awaits something slower
 // than the declared timeout, then calls a mutating sem.* function, lands

@@ -130,7 +130,7 @@ export interface SandboxResult {
    * had already RESOLVED (revoked) by the time they reached the
    * trampoline's cancellation check -- see createRunCancellation.
    * `cancellation.revoke()` now fires on EVERY exit path (success, error,
-   * AND timeout, not just timeout -- team-lead's fix-shape correction to
+   * AND timeout, not just timeout -- a fix-shape correction to
    * the authority-on-failure audit), so this counts a call refused for
    * ANY of those reasons, not only "refused after cancel due to timeout"
    * (its narrower, pre-fix meaning; renamed from `revokedCalls` to match).
@@ -150,13 +150,13 @@ export interface SandboxResult {
    * call-cap checks, into the real host function) but had not yet settled
    * at the moment this run finished returning -- i.e. a script that never
    * awaited them (fire-and-forget: `sem.write(...).then(...)`) and itself
-   * returned/resolved first. Authority-on-failure finding (pisem-l1-bridge,
+   * returned/resolved first. Authority-on-failure finding (see
    * test/codemode/authority-on-failure.test.ts): revoking on resolution
    * (see `refusedAfterResolve`) does NOT retroactively stop a call that
    * already passed the trampoline's check before revoke() fired -- that
    * call keeps running and its mutation lands for real, invisibly, after
    * "done" was already reported. This field (renamed from
-   * `outstandingCalls` to match team-lead's fix-shape naming) is the
+   * `outstandingCalls` to match the fix-shape naming) is the
    * honest signal for exactly that case: a nonzero count means the
    * model's own report of success may still have real, unconfirmed side
    * effects landing after the fact. Best-effort like `refusedAfterResolve`:
@@ -193,7 +193,7 @@ function readSubCalls(value: unknown): CallRecord[] | undefined {
 }
 
 /**
- * Closes the "zombie script" hole (review pass 3, Ox's finding): when the
+ * Closes the "zombie script" hole: when the
  * wall-clock timeout race wins, `runInSandbox` returns `{ok:false, timed
  * out}` immediately -- but the sandboxed script's OWN promise chain is
  * still pending and keeps running in the background (JS promises can't be
@@ -560,7 +560,7 @@ export async function runInSandbox(code: string, options: SandboxOptions): Promi
     });
     const value = await Promise.race([scriptResultPromise, timeoutPromise]);
     outcome = { ok: true, value };
-    // Authority-on-failure fix (team-lead's fix-shape correction): revoke
+    // Authority-on-failure fix: revoke
     // on EVERY resolution, not just timeout -- a normal, on-time return is
     // still a resolution. This can't retroactively stop a call already
     // past the trampoline's check (pendingAtResolve covers that), but it

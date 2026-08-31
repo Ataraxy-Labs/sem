@@ -234,8 +234,8 @@ export async function startServersAndRegisterTools(
  * active set (confirmed empirically: openai-codex/gpt-5.6-sol calling
  * exec_command with pi-sem's lockdown active and `--no-builtin-tools` set).
  *
- * Originally (wrongly) keyed on model PROVIDER ("openai-codex"). ox-review-3
- * corrected this: probing a real session's pi.getAllTools() showed these
+ * Originally (wrongly) keyed on model PROVIDER ("openai-codex"). A later
+ * review corrected this: probing a real session's pi.getAllTools() showed these
  * tools' sourceInfo naming the actual cause -- `source: "npm:@howaboua/
  * pi-codex-conversion"`, `origin: "package"` (from ~/.pi/agent/settings.json's
  * `packages` list) -- present or absent based on whether that PACKAGE is

@@ -16,7 +16,7 @@ const FAKE_MCP_SERVER = join(__dirname, "fixtures", "fake-mcp-server.mjs");
  * (3673f59): when set, `startServersAndRegisterTools` registers ONE tool
  * (`sem_code`) instead of the usual six natives, and the `setActiveTools`
  * extras array becomes `[SEM_CODE_TOOL_NAME]` instead of the six tool-name
- * constants. Team-lead's ask: prove the fail-closed invariant this whole
+ * constants. This proves the fail-closed invariant this whole
  * file exists to protect -- pi.setActiveTools always gets called, exactly
  * once, with a closed (non-empty, bounded) set -- still holds in code mode,
  * not just the default mode extension-fail-closed.test.ts already covers.
@@ -210,7 +210,7 @@ test("code mode: a bridged MCP server's allowlisted tool is never registered at 
 
 // --- Full-lifecycle harness (through the default piSemExtension export,
 // not just startServersAndRegisterTools) for the three remaining review
-// checkpoints team-lead asked to verify in code mode: the bash/write audit
+// checkpoints to verify in code mode: the bash/write audit
 // wrappers, before_agent_start's addendum exclusivity, and /pi-sem's mode
 // line. Mirrors extension-write-audit.test.ts's harness shape (multi-
 // handler-per-event Map -- see extension-config-load-fail-open.review.test.ts

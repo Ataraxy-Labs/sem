@@ -8,7 +8,7 @@ import type { PiSemConfig } from "../../src/config/types.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /**
- * Pass-3 review (ox-review-3): the old bypass warning was keyed on model
+ * A later review round found the old bypass warning was keyed on model
  * PROVIDER ("openai-codex"), asserted these tools were "invisible to
  * pi.registerTool/setActiveTools". Both were wrong. Verified against a real
  * pi session (probe extension + `pi -e ... --mode json -p "..."`, `~/.pi/

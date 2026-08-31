@@ -22,7 +22,7 @@ test("classifyBashCommand: matches any plain sed (no -i) as a read -- without -i
   assert.equal(classifyBashCommand("sed 's/a/b/' foo.ts")[0]?.ruleId, "read", "sed without -i only prints the transform to stdout; the file on disk is untouched, so this is a read");
 });
 
-test("classifyBashCommand: sed WITH -i is a genuine in-place edit -- classified write, not read (ox-review-3 finding #19)", () => {
+test("classifyBashCommand: sed WITH -i is a genuine in-place edit -- classified write, not read", () => {
   const matches1 = classifyBashCommand("sed -i 's/a/b/' foo.ts");
   assert.equal(matches1.length, 1);
   assert.equal(matches1[0]?.ruleId, "write");
@@ -72,7 +72,7 @@ test("classifyBashCommand: matches leading ls/tree as a list", () => {
   assert.equal(classifyBashCommand("tree src/")[0]?.ruleId, "list");
 });
 
-test("classifyBashCommand: a cat heredoc WRITE is classified write (its redirect target), never read -- the heredoc body is stripped first, not just excluded from the read rule (ox-review-3 finding #18 item 7)", () => {
+test("classifyBashCommand: a cat heredoc WRITE is classified write (its redirect target), never read -- the heredoc body is stripped first, not just excluded from the read rule", () => {
   const matches = classifyBashCommand("cat <<EOF > out.txt\nhello\nEOF");
   assert.equal(matches.length, 1);
   assert.equal(matches[0]?.ruleId, "write");
@@ -169,7 +169,7 @@ test("classifyBashCommand: node without -e (a normal script invocation) is not c
   assert.equal(classifyBashCommand("node script.js").length, 0);
 });
 
-test("classifyBashCommand: combined short-flag clusters containing the trigger letter are classified as indirect, same as bare -c/-e (ox-review-3)", () => {
+test("classifyBashCommand: combined short-flag clusters containing the trigger letter are classified as indirect, same as bare -c/-e", () => {
   for (const cmd of [
     'bash -lc "cat secret.env"', // login shell + command -- the most common real-world -c form
     'sh -lc "cat secret.env"',
@@ -222,7 +222,7 @@ test("classifyBashCommand: leading-command classification takes priority over a 
   assert.equal(matches[0]?.ruleId, "read");
 });
 
-// --- ox-review-3 finding #18 item 7: heredoc/here-string stripping
+// --- heredoc/here-string stripping
 // (previously a blanket "skip the whole rule if this statement contains
 // <<" guard turned appending `<<< x` into a universal evasion suffix for
 // the read rule specifically) ---
@@ -270,7 +270,7 @@ test("classifyBashCommand: a quoted heredoc delimiter ('EOF' or \"EOF\") is reco
   }
 });
 
-// --- ox-review-3 finding #19: bash-side writes were never classified at
+// --- bash-side writes were never classified at
 // all, so PI_SEM_STRICT's write protection was fully bypassable through
 // bash (sed -i, echo/redirect, tee, cp, mv, truncate) ---
 
@@ -358,7 +358,7 @@ test("auditBashCommand: a write match with no extractable path is audit-only, ne
   }
 });
 
-// --- Full evasion matrix, passes 2-3 combined: every case ox's reviews
+// --- Full evasion matrix, passes 2-3 combined: every case earlier reviews
 // raised, re-verified together in one table so "what's caught" and "what's
 // documented-uncaught" can't silently drift apart from each other or from
 // the module header's own gap list. ---

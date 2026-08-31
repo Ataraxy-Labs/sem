@@ -42,7 +42,7 @@ function withGitDiffFixture<T>(run: (dir: string) => Promise<T>): Promise<T> {
 }
 
 /**
- * Team-lead's exact live repro: a live model's chained
+ * An exact live repro: a live model's chained
  * `sem.callers("add")` -> `sem.headers(callers.callers.map(...))` came back
  * with rows holding ONLY `file` -- the sem-api.d.ts's HeaderLine promises
  * name/type/parent_name/signature/doc too, and api.ts silently didn't
@@ -52,7 +52,7 @@ function withGitDiffFixture<T>(run: (dir: string) => Promise<T>): Promise<T> {
  * spreading that raw shape instead of reshaping it to what the d.ts
  * promises. Fixed in api.ts's headerLine().
  */
-test("callers()->headers() chain returns fully-populated rows on both ends (team-lead's exact repro)", async () => {
+test("callers()->headers() chain returns fully-populated rows on both ends (exact live repro)", async () => {
   await withTempCopy(["calls.ts"], async (dir) => {
     const api = buildSemApi({ cwd: dir, semBin: "sem" });
 

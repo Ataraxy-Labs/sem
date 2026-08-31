@@ -139,7 +139,7 @@ test("path() respects max_hops, returning null when the real path is longer than
  * relying on the live-repo test below to catch it again by chance.
  */
 /**
- * team-lead independently reproduced this repo's own ambiguous-entity bug
+ * This independently reproduces this repo's own ambiguous-entity bug
  * against a DIFFERENT sem build that signals the refusal via exit 0 with
  * the human-readable candidate list on STDOUT -- not the exit-1 + STDERR
  * shape this machine's installed sem 0.23.1 actually produces (confirmed

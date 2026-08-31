@@ -9,7 +9,7 @@ test("deriveVisibility reads TS/JS export prefixes", () => {
   assert.equal(deriveVisibility("math.js", "add", "  export function add() {"), "exported");
 });
 
-// Ox-review pass 4 finding: a genuine regex literal containing an
+// A genuine regex literal containing an
 // unescaped apostrophe used to be read as opening a plain string, which
 // then ran to EOF (no other apostrophe to close it) and blanked a real,
 // untouched `export { add };` further down -- a false negative with an

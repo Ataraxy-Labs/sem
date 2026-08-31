@@ -112,7 +112,7 @@ test("the single query= form is unaffected by batching — its details keep the 
   });
 });
 
-// Ox-review pass 3 finding: queries= ran through Promise.all with no cap at
+// queries= ran through Promise.all with no cap at
 // all -- a caller passing an arbitrarily large array fired that many `sem
 // find` child processes in one call. 30 queries against a 25-per-call cap
 // must run exactly the first 25 and honestly report the other 5 as not run

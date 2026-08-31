@@ -27,8 +27,7 @@ function countCalls(calls: string[], method: string): number {
 }
 
 /**
- * OX-REVIEW-3 FINDING (category: "does atomic rollback leave weave-mcp
- * coordination behind after undoing the disk edit?"): performWeaveEditBatch's
+ * performWeaveEditBatch's
  * atomic=true restores every touched file to its pre-batch snapshot when a
  * later edit fails, but an EARLIER edit in the same batch that had already
  * succeeded already ran its own full claim/update/release cycle against

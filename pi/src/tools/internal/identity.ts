@@ -22,7 +22,7 @@ import { extname } from "node:path";
 export type Visibility = "exported" | "not-exported" | "unknown";
 
 /**
- * OX-REVIEW-3 FINDING: hasNamedExport used to regex-scan the file's raw
+ * hasNamedExport used to regex-scan the file's raw
  * text with no comment/string stripping, so a comment or string literal
  * merely MENTIONING `export { name }` (a migration note, a code example in
  * a doc comment, ...) counted as proof the entity is genuinely exported —
@@ -36,7 +36,7 @@ export type Visibility = "exported" | "not-exported" | "unknown";
  * a real lexer — same "honest heuristic, not a parser" spirit as
  * deriveVisibility itself.
  *
- * OX-REVIEW-4 FINDING: the pass-3 version had zero regex-literal
+ * The pass-3 version had zero regex-literal
  * awareness — a genuine regex like `/don't match/` was copied character by
  * character, and when the scan reached the apostrophe INSIDE it, the
  * quote-matching branch below mistook it for the start of a NEW

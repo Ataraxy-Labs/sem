@@ -11,9 +11,9 @@ function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
 }
 
 /**
- * OX-REVIEW-3 FINDING (found independently, category (g): "what would make
+ * A category (g) finding: "what would make
  * the model escape to native apply_patch or another disabled built-in? --
- * any refusal path that is wrong").
+ * any refusal path that is wrong".
  *
  * This isn't an escape to a DIFFERENT tool -- it's worse: an entirely
  * ungated escape hatch on the SAME sanctioned tool. `sem.edit()` (api.ts's

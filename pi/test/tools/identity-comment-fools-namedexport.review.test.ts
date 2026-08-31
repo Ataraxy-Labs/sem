@@ -13,7 +13,7 @@ function run(params: WeaveEditParams, cwd: string) {
 }
 
 /**
- * OX-REVIEW-3 FINDING (found independently, category: "does the identity
+ * A finding (category: "does the identity
  * check now have false NEGATIVES after the pass-2 fix?" — explicitly asked
  * for in this round's brief).
  *

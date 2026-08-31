@@ -4,7 +4,7 @@ import { registerSemCode, buildSystemPromptAddendum, resolvePromptShape, CODE_MO
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * PI_SEM_PROMPT dimension (team-lead's ask): three env-selectable system-
+ * PI_SEM_PROMPT dimension: three env-selectable system-
  * prompt shapes so a gate can MEASURE which one wins on tokens and
  * correctness, rather than guess. This file exercises the shape-building
  * logic in isolation (buildSystemPromptAddendum(shape) takes an explicit

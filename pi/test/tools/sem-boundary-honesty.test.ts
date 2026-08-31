@@ -12,7 +12,7 @@ import { performSemCallers } from "../../src/tools/sem-callers.ts";
 import { performSemGrep } from "../../src/tools/sem-grep.ts";
 
 /**
- * team-lead's third "authority on failure" audit: the `sem` CLI/MCP
+ * The third "authority on failure" audit: the `sem` CLI/MCP
  * boundary as pi-sem consumes it. Found by accident this round:
  * `sem log <ambiguous> --json` -- misdiagnosed as environmental for three
  * sessions before someone noticed the CLI's refusal text was being thrown

@@ -3,10 +3,9 @@ import assert from "node:assert/strict";
 import { splice } from "../../src/tools/internal/text.ts";
 
 /**
- * OX-REVIEW-2 FINDING (confirmed independently before driving Ox, category
- * c: "the new splice() padding logic in text.ts — check whether the
- * reported newRange and insertedText actually match what was written to
- * disk when padding was added").
+ * A category c finding: "the new splice() padding logic in text.ts — check
+ * whether the reported newRange and insertedText actually match what was
+ * written to disk when padding was added".
  *
  * src/tools/internal/text.ts's splice(), op === "replace" branch
  * (introduced by commit 9f6f721, "splice replace preserves a trailing

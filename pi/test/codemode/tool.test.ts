@@ -122,7 +122,7 @@ test("the addendum points at sem.more(handle) for a truncated result", () => {
   assert.match(CODE_MODE_ADDENDUM, /sem\.more\(handle\)/);
 });
 
-// Authority-on-failure finding (pisem-l1-bridge, team-lead's fix shape
+// Authority-on-failure finding (fix shape
 // item 4): the model needs to be told plainly that an unawaited sem.*
 // call is not confirmed by the time the script returns.
 test("the addendum tells the model to await every sem.* call, since an unawaited one isn't confirmed", () => {
@@ -149,16 +149,15 @@ test("deriveApiCallStats builds a per-function histogram and edit-specific refus
 });
 
 /**
- * team-lead: "primitives before the first v2 verb" needs to be exact
+ * "primitives before the first v2 verb" needs to be exact
  * WITHIN a single sem_code script, not just across separate sem_code
  * calls -- the histogram alone throws away order (three `grep` calls
  * and one before a `blast` collapse into the same {grep: 3, blast: 1}
  * whether the blast happened first, last, or in the middle). sandbox.ts's
  * CallRecord[] is already ordered; this only had to be surfaced.
  *
- * Settled cross-lane contract (team-lead + pisem-l2-inventory's
- * independent verifier, which had guessed this shape ahead of any real
- * emission): top-level `apiCallSequence` (sibling to `apiCalls`, NOT
+ * Settled contract (an independent verifier, which had guessed this
+ * shape ahead of any real emission): top-level `apiCallSequence` (sibling to `apiCalls`, NOT
  * nested under it), plain lowercase strings, `:refused` suffix on a
  * failed call rather than upgrading every entry to an object shape.
  */
@@ -184,7 +183,7 @@ test("deriveApiCallStats reports zero edits, not undefined, when the script neve
 
 // End-to-end: prove the wiring (execute -> runInSandbox -> deriveApiCallStats
 // -> details), not just the pure derivation function in isolation.
-// Authority-on-failure finding (pisem-l1-bridge, test/codemode/
+// Authority-on-failure finding (see test/codemode/
 // authority-on-failure.test.ts): a script that never awaits a sem.* call
 // (fire-and-forget) can return before that call settles -- the mutation
 // still lands, invisibly, unless execute() surfaces it. This proves the
@@ -251,7 +250,7 @@ test("sem_code's execute result carries apiCalls and edits in details, derived f
   });
 });
 
-// v2 item 5/6: the gap team-lead's slice-2 review caught -- a PER-RUN
+// v2 item 5/6: the gap a slice-2 review caught -- a PER-RUN
 // budget alone doesn't bind across separate sem_code calls, since a fresh
 // budget is available again on the very next invocation. registerSemCode
 // constructs ONE SessionBudget in its own outer closure (same pattern as

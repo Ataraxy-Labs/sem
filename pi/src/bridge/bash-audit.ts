@@ -51,7 +51,7 @@ import { isCodeFilePath, auditWriteCommand } from "./write-audit.ts";
  *    disclosed, not yet fixed)
  *  - `base64 -d | sh`-style decode-then-execute chains -- no verb rule for
  *    decode utilities, and only one level of substitution is inspected
- *    (ox-review-3 item 8 -- disclosed, not yet fixed)
+ *    (disclosed, not yet fixed)
  *  - a write's TARGET PATH extraction (below) is best-effort: quoted paths
  *    with embedded spaces, `2>&1`-style fd duplication (deliberately
  *    excluded, see REDIRECT_PATTERN), and multi-redirect statements only
@@ -99,7 +99,7 @@ const REDIRECT_PATTERN = /(?<!-)>{1,2}(?!=)(?!&)\s*(['"]?)([^\s'"]+)\1/g;
  * the next line through the terminator line (a line consisting of just the
  * delimiter, optionally indented for `<<-`).
  *
- * This closes ox-review-3 finding #18 item 7: the previous approach (skip
+ * This closes a real gap: the previous approach (skip
  * the WHOLE statement if it merely contained the substring "<<") meant
  * appending `<<< x` to ANY statement -- `head -100 file <<< x`, `cat foo.ts
  * <<< x` -- evaded classification entirely, a universal evasion suffix
@@ -136,7 +136,7 @@ function normalizeForMatch(statement: string): string {
  * recognized, which meant `sed --in-place ...` fell through to the plain-
  * sed READ rule -- a MISCLASSIFICATION (reported as a read) rather than
  * merely uncaught, since neither the write rule's guard nor the read
- * rule's negated guard recognized the long form (ox-review-3 follow-up).
+ * rule's negated guard recognized the long form.
  */
 function hasSedInPlaceFlag(statement: string): boolean {
   return /(^|\s)-i\b/.test(statement) || /(^|\s)--in-place(\b|=)/.test(statement);
@@ -164,7 +164,7 @@ function hasIndirectTriggerFlag(rest: string, triggerLetter: string): boolean {
  * `sh|bash|zsh|dash|python(3)|node` followed by a leading run of flag
  * tokens carrying the trigger letter -- combined cluster (`bash -lc "..."`)
  * or split across separate tokens (`bash -l -c "..."`, `sh -e -c "..."`).
- * The split form was previously a documented gap (ox-review-3 follow-up):
+ * The split form was previously a documented gap:
  * `bash -lc` was caught but `bash -l -c` was not, even though both invoke
  * an opaque interpreted string identically.
  */
@@ -227,8 +227,8 @@ interface ClassificationRule {
 const RULES: ClassificationRule[] = [
   {
     ruleId: "write",
-    // `cmd > file` / `cmd >> file`, any leading command -- ox-review-3
-    // finding #19: bash-side writes (redirection, sed -i, tee, cp, mv,
+    // `cmd > file` / `cmd >> file`, any leading command --
+    // bash-side writes (redirection, sed -i, tee, cp, mv,
     // truncate) were never classified at all, so PI_SEM_STRICT's write
     // protection was fully bypassable through bash.
     pattern: REDIRECT_PATTERN,
@@ -296,8 +296,8 @@ const RULES: ClassificationRule[] = [
     // sh/bash/zsh/dash/python, `e` for node) is matched whether it appears
     // in a combined CLUSTER (`bash -lc "..."`, `sh -ic "..."`, `bash -xc
     // "..."`) or split across separate leading flag tokens (`bash -l -c
-    // "..."`, `sh -e -c "..."` -- previously a documented gap, ox-review-3
-    // follow-up), so `bash -lc` and `bash -l -c` are treated identically.
+    // "..."`, `sh -e -c "..."` -- previously a documented gap), so
+    // `bash -lc` and `bash -l -c` are treated identically.
     // A false positive here only ever costs one audit-log entry, so
     // matching any leading flag run CONTAINING the trigger letter is the
     // conservative direction, even though a cluster like `-norc` (not a
@@ -372,8 +372,8 @@ export interface BashAuditDecision {
  * as a match with no extractable path at all. When provided and the write
  * targets an existing code file, the refusal is delegated to
  * write-audit.ts's own `auditWriteCommand` so the message is the SAME text
- * the builtin `write` tool wrapper already gives (ox-review-3 finding #19's
- * explicit ask), not a separately-maintained copy that can drift.
+ * the builtin `write` tool wrapper already gives, not a separately-maintained
+ * copy that can drift.
  */
 export function auditBashCommand(
   command: string,
@@ -394,9 +394,9 @@ export function auditBashCommand(
     // Prefix with the offending bash statement for context, then reuse the
     // builtin write wrapper's own refusalMessage's core guidance text
     // verbatim (its own leading "pi-sem: " is stripped so the two prefixes
-    // don't double up) -- this is the "same message as the write wrapper"
-    // ox-review-3 asked for, guaranteed by sharing the string, not by
-    // separately maintaining matching prose.
+    // don't double up) -- this is the "same message as the write wrapper",
+    // guaranteed by sharing the string, not by separately maintaining
+    // matching prose.
     return {
       matches,
       refuse: true,

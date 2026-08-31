@@ -16,7 +16,7 @@ function withTempCopy<T>(fixtureNames: string[], run: (dir: string) => Promise<T
 }
 
 /**
- * Review pass 3 (Ox's late report), item 3: every native tool api.ts wraps
+ * A later review finding, item 3: every native tool api.ts wraps
  * (performSemRead/Find/Grep/Outline/Callers/WeaveEdit) prefixes its own
  * error text with its OWN tool name -- correct in tools-mode, where that's
  * the registered tool name, but api.ts ONLY EVER runs in code mode, which

@@ -11,7 +11,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_SERVER = join(__dirname, "fixtures", "fake-mcp-server.mjs");
 
 /**
- * Vacuous-fixture audit follow-up (team-lead, after 83ea54f's code-mode
+ * Vacuous-fixture audit follow-up (after 83ea54f's code-mode
  * fail-open fix): before this file, `registerServerTools` -- the function
  * whose entire job is "filter an MCP server's tools/list result through
  * this server's allowlist, applying name/description/prompt overrides" --

@@ -17,9 +17,9 @@ const FAKE_SERVER = join(__dirname, "fixtures", "fake-mcp-server-crash-on-tools-
 const fakePi = { registerTool: () => {} } as unknown as Parameters<typeof registerServerTools>[0];
 
 /**
- * OX-REVIEW FINDING (confirmed independently, category b: tool
+ * A category b finding: tool
  * registration / "does a client.listTools() failure get captured into
- * RegisterServerResult.startError, or does it escape uncaught") — Ox's
+ * RegisterServerResult.startError, or does it escape uncaught" —
  * finding #7, graded CONFIRMED, plus a second defect this test's own
  * failure mode exposed (below).
  *

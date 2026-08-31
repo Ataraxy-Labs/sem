@@ -1174,8 +1174,7 @@ function sliceRestoredEntityText(content: string, startLine: number, endLine: nu
 }
 
 /**
- * OX-REVIEW-3 FINDING (category: "does atomic rollback leave weave-mcp
- * coordination behind after undoing the disk edit?"): performWeaveEditBatch's
+ * performWeaveEditBatch's
  * atomic=true restores every touched FILE to its pre-batch snapshot when a
  * later edit fails, but any EARLIER edit in the same batch that had already
  * succeeded already ran its own full claim/update/release cycle against

@@ -2,7 +2,7 @@
 //
 // STRUCTURE: an untrusted routine replay receives an ATTENUATED CAPABILITY
 // (Miller 2006, "Robust Composition", ch. 9 -- the caretaker/membrane
-// pattern; POLA): restrictedApiForReplay is a facet of the full SemApi in
+// pattern; least-authority): restrictedApiForReplay is a facet of the full SemApi in
 // which every INTENT verb is replaced by a refusal and every QUESTION verb
 // passes through unchanged. The laws witnessed at the public boundary
 // (sem.routine() replaying a planted, never-trusted routine -- internals

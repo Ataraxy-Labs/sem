@@ -13,10 +13,10 @@ function run(params: WeaveEditParams, cwd: string) {
 }
 
 /**
- * OX-REVIEW-2 FINDING (confirmed independently before driving Ox, category
- * c: "identity-check false positives that would block a legitimate edit —
- * look for a change that ISN'T really an identity/visibility change but
- * the heuristic in identity.ts flags as one anyway").
+ * A category c finding: "identity-check false positives that would block
+ * a legitimate edit — look for a change that ISN'T really an
+ * identity/visibility change but the heuristic in identity.ts flags as
+ * one anyway".
  *
  * src/tools/internal/identity.ts's deriveVisibility() for TS/JS (line ~46):
  *

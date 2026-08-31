@@ -11,10 +11,10 @@ function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
 }
 
 /**
- * OX-REVIEW-3 FINDING (this round's brief flagged this exact question:
+ * This round's brief flagged this exact question:
  * "we already independently found that headers() was missing name/type/
  * signature in an earlier check -- verify whether that's actually still
- * true"). Confirmed: still true, and worse than "missing a few fields" —
+ * true". Confirmed: still true, and worse than "missing a few fields" —
  * the actual shape doesn't resemble the declared one at all.
  *
  * src/codemode/sem-api.d.ts declares `sem.headers()` returns `HeaderLine[]`:

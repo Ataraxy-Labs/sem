@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { classifyBashCommand } from "../../src/bridge/bash-audit.ts";
 
 /**
- * OX-REVIEW-3 FINDING (found independently, category "write audit + bash
+ * A finding (category "write audit + bash
  * classifier: which NEW evasions remain even after this round's
  * broadening").
  *

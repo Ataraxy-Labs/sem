@@ -46,8 +46,8 @@ function assertNotRevoked(deps: SemApiDeps): void {
  * has no other caller) -- code mode registers exactly one tool, sem_code,
  * and none of sem_read/sem_find/sem_grep/sem_outline/sem_callers/
  * weave_edit are registered tools there at all; a script calls
- * sem.read/find/grep/outline/callers/edit() instead. Confirmed live
- * (review pass 3, Ox's finding): `api.edit({entity:{name:"doesNotExist"}})`
+ * sem.read/find/grep/outline/callers/edit() instead. Confirmed live:
+ * `api.edit({entity:{name:"doesNotExist"}})`
  * threw `"weave_edit: no entity named..."` verbatim, telling the model to
  * reach for a tool it doesn't have. Rewritten at this boundary -- the ONE
  * place every one of these results gets surfaced to a code-mode caller --
@@ -347,7 +347,7 @@ export function createRunBudget(total: number = DEFAULT_RUN_BUDGET_TOKENS): RunB
 }
 
 /**
- * v2 item 5/6: the gap team-lead's slice-2 review caught -- a PER-RUN
+ * v2 item 5/6: the gap a slice-2 review caught -- a PER-RUN
  * budget alone doesn't bind, since a script that exhausts 6k can just be
  * followed by another `sem_code` call with a fresh 6k, indefinitely.
  * SessionBudget tracks CUMULATIVE spend across every `sem_code`
@@ -423,7 +423,7 @@ function isPaginationContinuation(value: unknown): value is PaginationContinuati
   return value !== null && typeof value === "object" && (value as Record<string, unknown>).__pagination === true;
 }
 
-/** Once `sessionBudget` is over its soft ceiling, row results cap at this many regardless of what the per-run budget alone would still allow -- team-lead's slice-2 correction: the per-run cap alone just paces the re-query habit, this is what actually caps it once the SESSION has gotten expensive. */
+/** Once `sessionBudget` is over its soft ceiling, row results cap at this many regardless of what the per-run budget alone would still allow -- the per-run cap alone just paces the re-query habit, this is what actually caps it once the SESSION has gotten expensive. */
 const SESSION_OVER_CEILING_ROW_CAP = 5;
 
 const SESSION_OVER_CEILING_NOTE = "session budget high -- use handles/more() rather than re-querying.";
@@ -778,7 +778,7 @@ export interface SemApiDeps {
    * constructed once in `registerSemCode`'s outer closure, threaded into
    * every `buildSemApi({..., sessionBudget})` call, so a soft ceiling on
    * TOTAL spend across every `sem_code` call this session can actually
-   * bind (team-lead's slice-2 correction: the per-run `budget` alone just
+   * bind (the per-run `budget` alone just
    * paces spend, since a fresh 6k budget is available again on the very
    * next call). Optional: falls back to a fresh, call-local session
    * budget when none is given (isolated by default, same as the other
@@ -1443,8 +1443,8 @@ function assertValidLocator(locator: EntityLocator, callerLabel: string): Entity
  * back into full bodies for every entity in the array. A single entity
  * (array of 1, or a bare locator/handle) always gets its full body --
  * that's an explicit, targeted request, not a broad one --
- * UNLESS the SESSION's cumulative spend is over its soft ceiling
- * (team-lead's slice-2 correction): past that point even a single-entity
+ * UNLESS the SESSION's cumulative spend is over its soft ceiling:
+ * past that point even a single-entity
  * read defaults to headers-only too, since a per-run cap alone doesn't
  * bind across separate sem_code calls the way the session ceiling does.
  * `{ full: true }` still overrides this.

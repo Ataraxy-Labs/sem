@@ -223,12 +223,11 @@ export interface ApiCallStats {
   edits: { count: number; refused: number; merged: number; reasons: string[] };
   /**
    * The call ORDER the histogram throws away -- needed for eval telemetry
-   * (team-lead's ask: "primitives before the first v2 verb" has to be
+   * ("primitives before the first v2 verb" has to be
    * exact within a single sem_code script, not just across scripts).
    *
-   * Settled cross-lane contract (team-lead + pisem-l2-inventory's
-   * independent verifier, which had guessed this shape ahead of any real
-   * emission and is now built against it):
+   * Settled contract (an independent verifier, which had guessed this
+   * shape ahead of any real emission and is now built against it):
    * - field location: top-level `details.apiCallSequence` (spread here
    *   from ApiCallStats, sibling to `apiCalls`/`edits` -- NOT nested
    *   under `apiCalls`).
@@ -249,7 +248,7 @@ export interface ApiCallStats {
 
 /**
  * Derives the "how much work went through us" telemetry the eval needs
- * (team-lead: score sem_code usage vs. a provider-native apply_patch/
+ * (scoring sem_code usage vs. a provider-native apply_patch/
  * exec_command bypass) from sandbox.ts's generic, per-function call log --
  * sandbox.ts itself stays domain-agnostic (it doesn't know "edit" is
  * special), this is where the "edit" name gets semantic meaning.
@@ -348,7 +347,7 @@ export function registerSemCode(pi: ExtensionAPI, opts: RegisterSemCodeOptions =
   // re-grepping the same thing in a LATER call.
   const dedup: DedupStore = createDedupStore();
 
-  // SESSION-scoped cumulative budget: the gap team-lead's slice-2 review
+  // SESSION-scoped cumulative budget: the gap a slice-2 review
   // caught -- the per-run `budget` above resets fresh on every sem_code
   // call, so it only PACES spend within one script, not across the whole
   // session. This tracks TOTAL spend across every sem_code invocation
@@ -427,8 +426,8 @@ export function registerSemCode(pi: ExtensionAPI, opts: RegisterSemCodeOptions =
       // line is the one piece of "am I about to run out of budget"
       // signal the model gets without calling anything itself.
       const sessionLine = `session: ${Math.round(sessionBudget.used() / 1000)}k across ${sessionBudget.runs()} run${sessionBudget.runs() === 1 ? "" : "s"}${sessionBudget.overCeiling() ? " (over ceiling -- reads/rows are now conservative by default)" : ""}`;
-      // Authority-on-failure finding (pisem-l1-bridge, team-lead's fix
-      // shape): a script that never awaits a sem.* call (fire-and-forget)
+      // Authority-on-failure finding: a script that never awaits a sem.*
+      // call (fire-and-forget)
       // can return/resolve BEFORE that call settles -- the mutation still
       // lands, invisibly, after this "done" response is already on its
       // way back (pendingAtResolve). Revoking on every resolution (not

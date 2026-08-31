@@ -7,7 +7,7 @@ import { runInSandbox, createRunCancellation } from "../../src/codemode/sandbox.
 import { buildSemApi, createChangeLog } from "../../src/codemode/api.ts";
 
 /**
- * team-lead's "authority on failure" audit, extended to the code-mode
+ * The "authority on failure" audit, extended to the code-mode
  * sandbox (follow-up to the bridge-side audit, 50b4374). READ-ONLY with
  * respect to src/codemode/** -- pisem-codemode owns those files and is
  * mid-matrix; this file is findings + RED tests only, handed off for
@@ -75,13 +75,13 @@ function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
 // wrong is REPORTING: a "successful, complete" tool response could have a
 // real mutation still pending behind it, invisible to callCount/calls/
 // edits telemetry and therefore to the model, with no way for the model to
-// know a write it never confirmed might still land. This is exactly team-
-// lead's "a silent partial write is as bad as an over-grant" framing --
+// know a write it never confirmed might still land. This is exactly the
+// "a silent partial write is as bad as an over-grant" framing --
 // here it's not partial (writeFile is atomic at the Node API level, proven
 // unreachable to interrupt from JS), it's a SILENT FULL write with a
 // falsely-clean "done" already reported.
 //
-// FIXED (team-lead's fix-shape correction, two parts): the FIRST,
+// FIXED (a fix-shape correction, two parts): the FIRST,
 // already-in-flight call's mutation is UNCHANGED by design (this file
 // stays a domain-agnostic sandbox; it correctly doesn't block a normal
 // return waiting on a call the script itself never awaited) -- what
@@ -251,8 +251,8 @@ test("PI_SEM_STRICT=1's code-file overwrite refusal is evaluated before any awai
 });
 
 // ============================================================================
-// Mode: sem binary missing/erroring mid-script (team-lead: "post the
-// runSemJson fix"). Confirms the fix holds for a verb ROUTED THROUGH
+// Mode: sem binary missing/erroring mid-script (post the
+// runSemJson fix). Confirms the fix holds for a verb ROUTED THROUGH
 // runSemJson (impact) reaching the script as a normal, catchable error --
 // not a silent failure, not a hang, not a crash. One message-quality
 // observation (not a "silently wrong" finding): a MISSING binary (ENOENT)

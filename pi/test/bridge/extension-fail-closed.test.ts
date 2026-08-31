@@ -6,7 +6,7 @@ import { startServersAndRegisterTools } from "../../extensions/pi-sem.ts";
 import type { PiSemConfig } from "../../src/config/types.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// Ox review finding #21/#22 ("fix now" item 1, folded into the same fix as
+// Finding #21/#22 ("fix now" item 1, folded into the same fix as
 // #7): the tool lockdown must be fail-CLOSED. Even when every configured
 // MCP server fails -- including a defect that makes registerServerTools
 // itself throw, simulating a FUTURE regression of the #7 fix -- pi.setActiveTools

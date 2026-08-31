@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { runInSandbox } from "../../src/codemode/sandbox.ts";
 
 /**
- * OX-REVIEW-3 FINDING (found independently, category "sandbox contract" —
+ * A category "sandbox contract" finding —
  * a NEW, easier-to-trigger relative of the busy-loop-after-await gap
- * DESIGN.md already discloses).
+ * DESIGN.md already discloses.
  *
  * src/codemode/sandbox.ts's runInSandbox() (lines ~256-291):
  *

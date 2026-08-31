@@ -16,7 +16,7 @@ function withTempCopy<T>(fixtureNames: string[], run: (dir: string) => Promise<T
 }
 
 /**
- * v2 item 5/6: the gap team-lead's slice-2 review caught -- a PER-RUN
+ * v2 item 5/6: the gap a slice-2 review caught -- a PER-RUN
  * budget alone doesn't bind, since a script that exhausts 6k can just be
  * followed by another sem_code call with a fresh 6k, indefinitely.
  * SessionBudget tracks CUMULATIVE spend across every buildSemApi() call

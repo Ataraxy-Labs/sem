@@ -1,5 +1,5 @@
 /**
- * OX-REVIEW-3 FINDING: sem_find's queries= and sem_grep's patterns= ran
+ * sem_find's queries= and sem_grep's patterns= ran
  * every item through `Promise.all` unbounded — a caller passing a large
  * array fires that many `sem` child processes at once, with no ceiling on
  * either how many run or how many get accepted at all. Two independent
