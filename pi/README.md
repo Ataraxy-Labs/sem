@@ -14,6 +14,24 @@ multi-tool surface (**tools mode**, the default), or a single sandboxed
 `sem_code` tool that runs a short script against a typed `sem` API
 (**code mode**). See [Running modes](#running-modes) below.
 
+## Does it hold up?
+
+Two results, each stated with its conditions:
+
+- **Pure code mode solves real tasks without a shell.** On a 10-task
+  SWE-bench Verified slice — hermetic environment (network-shimmed,
+  ancestors-only checkouts), graded by SWE-bench's official harness — an
+  agent running pure code mode resolved **9/10**, identical to the same
+  agent with full bash access. Every one of its 87 tool calls across the
+  slice was a `sem_code` entity operation: no shell, no direct file
+  writes. One run, ten tasks; the claim is that the codespace is
+  *sufficient*, not that it is smarter.
+- **Concurrent edits don't lose work.** Two agent processes free-running
+  edits against disjoint functions in the same file lose **zero edits in
+  1,000 raced attempts** (plain last-writer-wins file writes lose one in
+  80–100% of runs on the same harness). This test ships in this repo —
+  `test/tools/weave-write-window-race-live.test.ts` — run it yourself.
+
 ## Requirements
 
 - **`sem` on `PATH`**, speaking MCP protocol 2024-11-05 over stdio (`sem mcp`).
