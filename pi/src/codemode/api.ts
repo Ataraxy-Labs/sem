@@ -482,7 +482,7 @@ function withRowBudget(result: Record<string, unknown>, rowsKey: string, budget:
   return {
     ...result,
     [rowsKey]: truncatedRows,
-    budget_note: reason + (moreHandle ? ` sem.more('${moreHandle}') pages into what was omitted.` : ""),
+    budget_note: reason + (moreHandle ? ` await sem.more('${moreHandle}') pages into what was omitted.` : ""),
     more_handle: moreHandle,
   };
 }

@@ -603,13 +603,13 @@ declare const sem: {
   explain(target: EntityLocator | string): Promise<ExplainResult>;
 
   /** Every sem.edit()/sem.write() call THIS PI SESSION has made so far -- across all sem_code calls, not just the current one -- grouped by file. Check this instead of re-deriving what you've touched. */
-  changed(): ChangedResult;
+  changed(): Promise<ChangedResult>;
 
   /** "Am I still green" without leaving the sandbox for bash. Detects the project's own typecheck/test command (cargo/npm/pytest/go) -- never invents one -- and runs typecheck first when both exist, so a cheap typecheck failure surfaces before the (usually slower) test run even starts. No runner found: { pass: null, reason: "no cargo/npm/pytest/go runner found", try: "sem.check({cmd:'make test'})" }. Pass { cmd } to override detection with a specific command, but this is not a general shell: `cmd` must match a detected runner (npm/yarn/pnpm/bun, cargo test/build/check/clippy, pytest, go test/build/vet, `make <target>`) or a prefix listed in the PI_SEM_CHECK_ALLOW env var -- anything else is refused, naming the allowed set. Cached within this session by the actual tree state, so asking again after nothing changed is instant. */
   check(opts?: { cmd?: string }): Promise<CheckResult>;
 
   /** Pages into a result a verb already truncated for the token budget -- pass the `more_handle` named in that result's `budget_note`. Free (the rows were already computed, no re-query); works across sem_code calls in the same session, same as any other handle. Throws if `handle` isn't a known pagination handle (e.g. it was already fully paged through, or it's some OTHER kind of handle). */
-  more(handle: string): MoreResult;
+  more(handle: string): Promise<MoreResult>;
 
   /** sem.routine(name, params) replays a routine this repo already saved (sem.routines() lists them), `params` merged over its saved examples -- same sandbox, budgets, and verification as any script, so replay costs the script, not the reasoning. If the repo has drifted it fails with the normal honest refusal: re-explore, then re-save with { update: true }. sem.routine.save(name, {params, description}) at the END of a script that just solved something reusable saves THIS script as .sem/routines/<name>.mjs with each params value lifted to a params.<key> reference. */
   routine: { (name: string, params?: Record<string, unknown>): Promise<unknown>; save(name: string, opts?: { params?: Record<string, unknown>; description?: string; update?: boolean }): Promise<unknown> };
