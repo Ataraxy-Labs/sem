@@ -43,8 +43,33 @@ export interface EntityQuery {
 
 export type ResolveResult =
   | { kind: "found"; entity: Entity }
-  | { kind: "not-found"; nearest: string[] }
-  | { kind: "ambiguous"; candidates: Entity[] };
+  | {
+      kind: "not-found";
+      nearest: string[];
+      /**
+       * The entities that DID match the name, when an entity_type/parent_name
+       * filter is what emptied the set -- absent only when the name genuinely
+       * matches nothing. Carries the answer the caller was actually looking
+       * for, so the refusal can name the real type/parent instead of
+       * reporting "no entity named X" and then offering X as the closest
+       * name (43 such self-contradictions across 39 runs in the 2026-09-02
+       * transcript study).
+       */
+      filteredOut?: Entity[];
+      /** The filter values that emptied it, echoed back so the message can name them. */
+      filters?: { entity_type?: string; parent_name?: string };
+    }
+  | {
+      kind: "ambiguous";
+      candidates: Entity[];
+      /**
+       * True when an `ordinal` was supplied and DELIBERATELY not honoured
+       * because `parent_name` separates these candidates one-to-one -- see
+       * resolveEntity. The caller renders a different refusal for this: the
+       * fix is a parent_name, not a better index.
+       */
+      ordinalRefused?: boolean;
+    };
 
 function parentNameOf(parentId: string | null): string | null {
   if (!parentId) return null;
@@ -173,17 +198,68 @@ export function nearestNames(entities: Entity[], name: string, limit = 5): strin
 }
 
 /**
+ * Renders the filter values that emptied a name match, for the P4b refusal
+ * ("... but none match {entity_type:\"method\"}"). Shared by sem_read and
+ * weave_edit so the two tools cannot drift into describing the same refusal
+ * differently.
+ */
+export function describeEntityFilters(filters?: { entity_type?: string; parent_name?: string }): string {
+  const parts: string[] = [];
+  if (filters?.entity_type !== undefined) parts.push(`entity_type:"${filters.entity_type}"`);
+  if (filters?.parent_name !== undefined) parts.push(`parent_name:"${filters.parent_name}"`);
+  return `{${parts.join(", ")}}`;
+}
+
+/** "1 entity named \"x\" exists" / "3 entities named \"x\" exist" -- the subject of the P4b refusal sentence. */
+export function describeNameMatchCount(name: string, count: number): string {
+  return count === 1 ? `1 entity named "${name}" exists` : `${count} entities named "${name}" exist`;
+}
+
+/**
+ * True when every candidate carries a DISTINCT parent name -- i.e. a
+ * `parent_name` would have selected exactly one of them. That is the
+ * precondition for refusing a bare `ordinal` (P4a): an ordinal indexes a
+ * start-line-sorted list, so it silently re-points at a different entity
+ * whenever the file grows a definition above the one that was meant, and
+ * django__django-13128 shows what that costs -- `ordinal:1` overwrote
+ * `ResolvedOuterRef.resolve_expression` with `CombinedExpression` logic and
+ * never erred. When parents do NOT separate the candidates (two overloads
+ * under the same parent, two module-level definitions), an ordinal is
+ * genuinely the last resort it is documented to be, and is still honoured.
+ */
+function parentNameWouldDisambiguate(candidates: Entity[]): boolean {
+  const parents = new Set(candidates.map((e) => e.parentName ?? ""));
+  return parents.size === candidates.length && !parents.has("");
+}
+
+/**
  * Applies the same disambiguation rule weave-mcp's own entity resolution
  * uses: filter by name, then type, then parent, then ordinal. Zero matches
  * is reported with the nearest names in the file; more than one is refused
  * with the full candidate list — this never guesses by picking the first.
+ *
+ * Two honesty guarantees on top of that (P4, 2026-09-02 transcript study):
+ * a `not-found` produced by the type/parent FILTER carries the name matches
+ * it discarded, so the caller never says "no entity named X" and then
+ * offers X as the nearest name; and a bare `ordinal` is refused rather than
+ * honoured when `parent_name` would have separated the candidates
+ * one-to-one.
  */
 export function resolveEntity(entities: Entity[], query: EntityQuery): ResolveResult {
-  let candidates = entities.filter((e) => e.name === query.name);
+  const byName = entities.filter((e) => e.name === query.name);
+  let candidates = byName;
   if (query.entity_type) candidates = candidates.filter((e) => e.type === query.entity_type);
   if (query.parent_name) candidates = candidates.filter((e) => e.parentName === query.parent_name);
 
   if (candidates.length === 0) {
+    if (byName.length > 0) {
+      return {
+        kind: "not-found",
+        nearest: [],
+        filteredOut: [...byName].sort((a, b) => a.start_line - b.start_line),
+        filters: { entity_type: query.entity_type, parent_name: query.parent_name },
+      };
+    }
     return { kind: "not-found", nearest: nearestNames(entities, query.name) };
   }
 
@@ -194,6 +270,9 @@ export function resolveEntity(entities: Entity[], query: EntityQuery): ResolveRe
   }
 
   if (query.ordinal !== undefined) {
+    if (query.parent_name === undefined && parentNameWouldDisambiguate(sorted)) {
+      return { kind: "ambiguous", candidates: sorted, ordinalRefused: true };
+    }
     const picked = sorted[query.ordinal];
     if (picked) return { kind: "found", entity: picked };
   }

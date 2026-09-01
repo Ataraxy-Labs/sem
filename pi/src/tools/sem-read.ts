@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { Type } from "typebox";
-import { extractEntities, resolveEntity, type Entity, type ResolveResult } from "./internal/entities.ts";
+import { describeEntityFilters, describeNameMatchCount, extractEntities, resolveEntity, type Entity, type ResolveResult } from "./internal/entities.ts";
 import { runCommand } from "./internal/proc.ts";
 
 /**
@@ -83,7 +83,8 @@ const SemReadEntityRefSchema = Type.Object({
   ordinal: Type.Optional(
     Type.Integer({
       minimum: 0,
-      description: "0-based occurrence index, in file order, among matches still ambiguous after entity_type/parent_name. Last resort — prefer entity_type/parent_name.",
+      description:
+        "0-based occurrence index, in file order, among matches still ambiguous after entity_type/parent_name. Genuine last resort: REFUSED (with the candidate list) when the candidates each sit under a different parent, since parent_name addresses them stably and an ordinal silently re-points when the file changes.",
     }),
   ),
 });
@@ -147,8 +148,33 @@ function formatCandidate(e: Entity): string {
   return `  - ${e.name} (${e.type}${parent}), lines ${e.start_line}-${e.end_line}`;
 }
 
+/** The machine-readable twin of formatCandidate, for `details.candidates`. */
+function candidateSummary(e: Entity): { name: string; type: string; parent_name: string | null; start_line: number; end_line: number } {
+  return { name: e.name, type: e.type, parent_name: e.parentName, start_line: e.start_line, end_line: e.end_line };
+}
+
 function formatResolutionFailure(req: SemReadEntityRequest, result: Extract<ResolveResult, { kind: "not-found" | "ambiguous" }>): SemReadOutcome {
   if (result.kind === "not-found") {
+    // P4b: the name DID match -- an entity_type/parent_name filter is what
+    // emptied it. Saying "no entity named X" here and then offering X back
+    // as the closest name is the self-contradiction 39 runs hit; name the
+    // filter and show what actually exists instead.
+    if (result.filteredOut !== undefined && result.filteredOut.length > 0) {
+      const filters = describeEntityFilters(result.filters);
+      const shown = result.filteredOut.map(formatCandidate).join("\n");
+      return {
+        isError: true,
+        text: `sem_read: ${describeNameMatchCount(req.name, result.filteredOut.length)} in ${req.file}, but none match ${filters} — drop the filter, or use one of these:\n${shown}`,
+        details: {
+          file: req.file,
+          entity: req,
+          resolved: false,
+          nearest: [],
+          filters: result.filters ?? {},
+          candidates: result.filteredOut.map(candidateSummary),
+        },
+      };
+    }
     const nearest = result.nearest.length > 0 ? ` Closest names in ${req.file}: ${result.nearest.join(", ")}.` : "";
     return {
       isError: true,
@@ -158,6 +184,23 @@ function formatResolutionFailure(req: SemReadEntityRequest, result: Extract<Reso
   }
 
   const list = result.candidates.map(formatCandidate).join("\n");
+  // P4a: an ordinal was offered and deliberately NOT honoured -- see
+  // resolveEntity's parentNameWouldDisambiguate.
+  if (result.ordinalRefused === true) {
+    return {
+      isError: true,
+      text:
+        `sem_read: ordinal:${req.ordinal} refused for "${req.name}" in ${req.file} — these ${result.candidates.length} same-named entities each sit under a DIFFERENT parent, ` +
+        `and an ordinal indexes a start-line-sorted list that silently re-points at another entity when the file changes. Pass parent_name instead:\n${list}`,
+      details: {
+        file: req.file,
+        entity: req,
+        resolved: false,
+        ordinal_refused: true,
+        candidates: result.candidates.map(candidateSummary),
+      },
+    };
+  }
   return {
     isError: true,
     text: `sem_read: "${req.name}" is ambiguous in ${req.file} — ${result.candidates.length} matches. Add entity_type, parent_name, or ordinal to disambiguate:\n${list}`,

@@ -15,7 +15,7 @@ declare interface EntityLocator {
   entity_type?: string;
   /** Disambiguates when the name exists under more than one parent. */
   parent_name?: string;
-  /** 0-based occurrence index, last resort after entity_type/parent_name. */
+  /** 0-based occurrence index, genuine last resort after entity_type/parent_name. REFUSED, with the candidate list, when the same-named candidates each sit under a DIFFERENT parent -- pass `parent_name` there instead: an ordinal indexes a start-line-sorted list and silently re-points at another entity as the file changes. */
   ordinal?: number;
 }
 
