@@ -16,9 +16,19 @@ export function runCommand(
   args: string[],
   cwd: string,
   signal?: AbortSignal,
+  /**
+   * Extra variables MERGED OVER the ambient environment (never replacing
+   * it -- PATH, HOME and the rest still apply). Added for sem.check({env}):
+   * Django's suite needs DJANGO_SETTINGS_MODULE, matplotlib needs
+   * MPLBACKEND=Agg, and countless projects need PYTHONPATH, so a verify
+   * verb that cannot set one variable cannot verify those projects at all
+   * (153 ImproperlyConfigured failures across 123 runs of the 2026-09-02
+   * drive). A value of undefined UNSETS an inherited variable.
+   */
+  env?: Record<string, string | undefined>,
 ): Promise<RunResult> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, { cwd, signal });
+    const child = spawn(command, args, { cwd, signal, ...(env ? { env: { ...process.env, ...env } } : {}) });
     let stdout = "";
     let stderr = "";
 

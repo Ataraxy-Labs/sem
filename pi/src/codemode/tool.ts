@@ -24,7 +24,7 @@ import {
   type HandleStore,
 } from "./api.ts";
 import { Coordinator } from "../tools/internal/weave-coordination.ts";
-import { runInSandbox, createRunCancellation, type CallRecord } from "./sandbox.ts";
+import { runInSandbox, createRunCancellation, type CallRecord, type SandboxResult } from "./sandbox.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -273,6 +273,61 @@ export interface ApiCallStats {
  * `edits.refused`/`reasons` are precise for both the single-request and
  * batch forms (see test/codemode/tool.test.ts's batch-telemetry test).
  */
+/**
+ * Char cap on the salvaged results appended to a failed run's error, ~2k
+ * tokens: enough for the searches and outlines a script typically finishes
+ * before it trips, small enough that a failure can never cost more context
+ * than a success (which is capped at ~8k tokens of output).
+ */
+const SALVAGE_CHAR_CAP = 8_000;
+
+/**
+ * P6 -- what a failed run gives back instead of nothing.
+ *
+ * The 2026-09-02 transcript study found 206 scripts across 147 of 327 runs
+ * (45%) dying on an uncaught throw and taking ~518 already-completed sem.*
+ * calls with them; astropy__astropy-13398 lost a successful grep AND a
+ * successful outline to a third-call read that missed a name. The runtime
+ * already had every one of those results in hand -- it simply threw them
+ * away. This renders them, in order, alongside the error that ended the
+ * run, so the next turn re-runs only what is actually missing.
+ *
+ * Deliberately part of the ERROR: the run still failed, the model must
+ * still see it as a failure, and a successful run's output is untouched.
+ */
+function renderSalvage(result: SandboxResult): string {
+  const sections: string[] = [];
+  const logged = result.output.trim();
+  if (logged.length > 0) sections.push(`output logged before the throw:\n${logged}`);
+
+  if (result.completed.length > 0) {
+    const rendered: string[] = [];
+    let used = 0;
+    let omitted = 0;
+    for (const call of result.completed) {
+      let line: string;
+      try {
+        line = JSON.stringify({ call: call.fn, result: call.value });
+      } catch {
+        line = JSON.stringify({ call: call.fn, result: "(unserializable)" });
+      }
+      if (omitted > 0 || used + line.length > SALVAGE_CHAR_CAP) {
+        omitted++;
+        continue;
+      }
+      used += line.length;
+      rendered.push(line);
+    }
+    const omittedNote = omitted > 0 ? `\n(+${omitted} more result(s) omitted for size -- re-run those calls if you need them)` : "";
+    sections.push(
+      `${result.completed.length} sem.* call(s) completed before this error; their results follow, so this turn's work is not lost -- re-run only what is missing.\n` +
+        `partial results:\n[\n${rendered.join(",\n")}\n]${omittedNote}`,
+    );
+  }
+
+  return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
+}
+
 export function deriveApiCallStats(calls: CallRecord[]): ApiCallStats {
   const histogram: Record<string, number> = {};
   for (const call of calls) histogram[call.fn] = (histogram[call.fn] ?? 0) + 1;
@@ -428,7 +483,10 @@ export function registerSemCode(pi: ExtensionAPI, opts: RegisterSemCodeOptions =
 
       if (!result.ok) {
         const location = result.error?.line !== undefined ? ` (line ${result.error.line})` : "";
-        throw new Error(`sem_code: ${result.error?.message ?? "run failed"}${location}`);
+        // P6: a throw in step 3 must not discard steps 1 and 2. Everything
+        // that already ran -- each completed call's own result, plus
+        // anything logged before the throw -- rides back WITH the error.
+        throw new Error(`sem_code: ${result.error?.message ?? "run failed"}${location}${renderSalvage(result)}`);
       }
 
       const valueText = result.value !== undefined ? JSON.stringify(result.value, null, 2) : "";

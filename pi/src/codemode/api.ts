@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { runInSandbox } from "./sandbox.ts";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { performSemOutline } from "../tools/sem-outline.ts";
 import { performSemRead, type SemReadEntityRequest, type SemReadParams } from "../tools/sem-read.ts";
 import { performSemFind } from "../tools/sem-find.ts";
@@ -482,7 +482,7 @@ function withRowBudget(result: Record<string, unknown>, rowsKey: string, budget:
   return {
     ...result,
     [rowsKey]: truncatedRows,
-    budget_note: reason + (moreHandle ? ` sem.more('${moreHandle}') pages into what was omitted.` : ""),
+    budget_note: reason + (moreHandle ? ` await sem.more('${moreHandle}') pages into what was omitted.` : ""),
     more_handle: moreHandle,
   };
 }
@@ -1578,6 +1578,8 @@ interface GrepOpts {
   glob?: string;
   context?: number;
   limit?: number;
+  /** Search the pattern as literal text instead of a regex -- see sem-grep.ts's escapeRegexLiteral (P7). */
+  literal?: boolean;
 }
 
 /**
@@ -2089,9 +2091,113 @@ async function history(entityName: string, opts: { limit?: number }, deps: SemAp
 // report only the failure -- not the full scrollback.
 
 export interface CheckRunner {
-  kind: "cargo" | "npm" | "pytest" | "go";
+  kind: "declared" | "cargo" | "npm" | "pytest" | "go";
   typecheckCmd?: string[];
   testCmd?: string[];
+}
+
+/**
+ * P2d of the 2026-09-02 transcript study: the allowlist was LANGUAGE-shaped
+ * and matched on argv[0], so for any Python repo it produced exactly
+ * [{tokens:["pytest"]}] -- and 69 refusals across 69 runs followed, every
+ * one of them a project asking to run its own documented test command. The
+ * general fix is not a bigger built-in table (that is per-repo special
+ * casing wearing a hat); it is to let the REPO say what its runner is, and
+ * keep manifest detection as the fallback for a repo that says nothing.
+ *
+ * Minimal by design -- two strings and an optional extra-allow list:
+ *
+ *   .sem/check.json
+ *   { "typecheck": "mypy src", "test": "python -m pytest -q", "allow": ["tox"] }
+ *
+ * Lives beside .sem/routines/ and .sem/notes.jsonl, the repo-local state
+ * this tool already keeps.
+ */
+export interface RepoCheckConfig {
+  /** Run first when both are present -- a cheap failure surfaces before the slow one. */
+  typecheck?: string;
+  test?: string;
+  /** Extra command prefixes check({cmd}) may use, for a repo with more than one verification entry point. */
+  allow?: string[];
+}
+
+const REPO_CHECK_CONFIG_FILE = join(".sem", "check.json");
+
+/** Reads `.sem/check.json`, degrading to undefined on anything unreadable or malformed -- check() must never be BLOCKED by a bad config file, only un-helped by one. */
+function readRepoCheckConfig(cwd: string): RepoCheckConfig | undefined {
+  const path = resolve(cwd, REPO_CHECK_CONFIG_FILE);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as RepoCheckConfig;
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * POSIX-ish word split for {cmd}: honours single quotes, double quotes and
+ * backslash escapes, and nothing else -- no globbing, no variable
+ * expansion, no operators, so this stays a tokenizer and never becomes a
+ * shell.
+ *
+ * P2b: {cmd} used to be `opts.cmd.split(/\s+/)`, so psf__requests-2931's
+ * `-k 'test_basic_building or test_params_bytes_are_encoded'` arrived as
+ * four argv entries and pytest answered "file or directory not found: or".
+ * An unbalanced quote comes back as a REFUSAL rather than a guess about
+ * where the word ended -- a result, not a throw, so this stays a pure
+ * tokenizer every caller can branch on (api-error-phrasing pins that every
+ * user-facing refusal in this file routes through toCodeModeError).
+ */
+export type ShellWordsResult = { ok: true; parts: string[] } | { ok: false; reason: string };
+
+export function splitShellWords(cmd: string): ShellWordsResult {
+  const parts: string[] = [];
+  let current = "";
+  let started = false;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+      } else if (ch === "\\" && i + 1 < cmd.length && ['"', "\\", "$", "`"].includes(cmd[i + 1]!)) {
+        current += cmd[++i]!;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < cmd.length) {
+      current += cmd[++i]!;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (started) {
+        parts.push(current);
+        current = "";
+        started = false;
+      }
+      continue;
+    }
+    current += ch;
+    started = true;
+  }
+  if (quote !== null) return { ok: false, reason: `unbalanced ${quote === '"' ? "double" : "single"} quote` };
+  if (started) parts.push(current);
+  return { ok: true, parts };
 }
 
 /**
@@ -2104,6 +2210,14 @@ export interface CheckRunner {
  * script".
  */
 export async function detectRunner(cwd: string): Promise<CheckRunner | null> {
+  // Repo-declared FIRST (P2d) -- detection is the fallback for a repo that
+  // hasn't said what its runner is, not the only source of truth.
+  const declared = readRepoCheckConfig(cwd);
+  if (declared) {
+    const typecheckCmd = parseDeclaredCommand(declared.typecheck);
+    const testCmd = parseDeclaredCommand(declared.test);
+    if (typecheckCmd || testCmd) return { kind: "declared", typecheckCmd, testCmd };
+  }
   if (existsSync(resolve(cwd, "Cargo.toml"))) {
     return { kind: "cargo", typecheckCmd: ["cargo", "check", "--quiet"], testCmd: ["cargo", "test", "--quiet"] };
   }
@@ -2127,6 +2241,14 @@ export async function detectRunner(cwd: string): Promise<CheckRunner | null> {
     return { kind: "pytest", testCmd: ["pytest", "-q"] };
   }
   return null;
+}
+
+/** One declared command string to argv, or undefined when absent/blank/unparseable (a malformed entry degrades to "not declared", never to a throw). */
+function parseDeclaredCommand(cmd: string | undefined): string[] | undefined {
+  if (typeof cmd !== "string" || cmd.trim().length === 0) return undefined;
+  const split = splitShellWords(cmd);
+  if (!split.ok || split.parts.length === 0) return undefined;
+  return split.parts;
 }
 
 /** Combined stdout+stderr, tailed to the last N lines -- test/build runners across cargo/npm/pytest/go all print their failure summary at the END of output, so a tail is the one heuristic that works uniformly without per-tool output parsing. */
@@ -2160,6 +2282,24 @@ interface CheckAllowEntry {
   tokens: string[];
   /** Minimum leading-token count required to match (default: tokens.length). Used by `make`, which additionally requires a named target beyond the bare command word. */
   minLength?: number;
+  /** An EXTRA condition on the whole argv beyond the token prefix -- used by `<python> <script>`, which additionally requires the script to be a file inside this repo. */
+  match?: (parts: string[]) => boolean;
+}
+
+/**
+ * "Run the interpreter on a file the repo itself ships" is not arbitrary
+ * shell -- it is how a large share of projects document their own test
+ * entry point, and refusing it is what left an agent with no way to verify
+ * anything at all. Bounded by construction: the argument must resolve to an
+ * EXISTING file strictly inside the repo, so neither an absolute path nor a
+ * `../` escape qualifies.
+ */
+function isRepoScript(cwd: string, arg: string | undefined): boolean {
+  if (arg === undefined || arg.length === 0 || arg.startsWith("-")) return false;
+  const root = resolve(cwd);
+  const target = resolve(root, arg);
+  if (target === root || !target.startsWith(root + sep)) return false;
+  return existsSync(target);
 }
 
 const checkAllowlistDetectionCache = new Map<string, CheckAllowEntry[]>();
@@ -2169,6 +2309,15 @@ function detectCheckAllowlist(cwd: string): CheckAllowEntry[] {
   if (cached) return cached;
 
   const entries: CheckAllowEntry[] = [];
+  // Repo-declared commands are allowlist prefixes too (P2d), so a script can
+  // pass the declared command back as an explicit {cmd} with extra flags.
+  const declared = readRepoCheckConfig(cwd);
+  if (declared) {
+    for (const cmd of [declared.typecheck, declared.test, ...(Array.isArray(declared.allow) ? declared.allow : [])]) {
+      const tokens = parseDeclaredCommand(cmd);
+      if (tokens) entries.push({ tokens });
+    }
+  }
   if (existsSync(resolve(cwd, "package.json"))) {
     for (const runner of ["npm", "yarn", "pnpm", "bun"]) entries.push({ tokens: [runner] });
   }
@@ -2177,6 +2326,16 @@ function detectCheckAllowlist(cwd: string): CheckAllowEntry[] {
   }
   if (existsSync(resolve(cwd, "pytest.ini")) || existsSync(resolve(cwd, "pyproject.toml")) || existsSync(resolve(cwd, "setup.cfg"))) {
     entries.push({ tokens: ["pytest"] });
+    // P2d: `pytest` alone is the console script, which is exactly what is
+    // missing whenever the environment is thin -- and `python -m pytest`,
+    // the documented workaround, used to be REFUSED because parts[0] was
+    // "python". Both interpreter forms are allowed now: `-m pytest`, and
+    // running a test script the repo itself ships (bounded by isRepoScript,
+    // so this stays "the project's own entry point", not a shell).
+    for (const interpreter of ["python", "python3"]) {
+      entries.push({ tokens: [interpreter, "-m", "pytest"] });
+      entries.push({ tokens: [interpreter], minLength: 2, match: (parts) => isRepoScript(cwd, parts[1]) });
+    }
   }
   if (existsSync(resolve(cwd, "go.mod"))) {
     for (const sub of ["test", "build", "vet"]) entries.push({ tokens: ["go", sub] });
@@ -2202,9 +2361,10 @@ function userCheckAllowlist(): CheckAllowEntry[] {
 }
 
 function isCheckCommandAllowed(parts: string[], allowlist: CheckAllowEntry[]): boolean {
-  return allowlist.some(({ tokens, minLength }) => {
+  return allowlist.some(({ tokens, minLength, match }) => {
     if (parts.length < (minLength ?? tokens.length)) return false;
-    return tokens.every((t, i) => parts[i] === t);
+    if (!tokens.every((t, i) => parts[i] === t)) return false;
+    return match === undefined || match(parts);
   });
 }
 
@@ -2214,18 +2374,46 @@ function checkCmdRefusal(cmd: string, allowlist: CheckAllowEntry[]): string {
     `sem.check: {cmd:"${cmd}"} is not a detected project runner or an explicitly allowed command -- ` +
     `pure mode's check() only runs verification, never an arbitrary shell command. ` +
     `Currently allowed: ${allowedList}. ` +
-    `To allow another command (e.g. a runner this project uses that isn't auto-detected), set PI_SEM_CHECK_ALLOW ` +
-    `to a colon- or comma-separated list of command prefixes, e.g. PI_SEM_CHECK_ALLOW="just test:tox -e py311".`
+    `To teach it this project's real verification command, add ${REPO_CHECK_CONFIG_FILE} to the repo: ` +
+    `{"typecheck": "...", "test": "...", "allow": ["..."]} -- that is the repo-declared runner, and it wins over detection. ` +
+    `(A human outside the sandbox can also set PI_SEM_CHECK_ALLOW to a colon- or comma-separated list of command prefixes, ` +
+    `e.g. PI_SEM_CHECK_ALLOW="just test:tox -e py311".)`
   );
 }
 
-async function runOneCheckCommand(cmd: string[], cwd: string): Promise<{ ok: boolean; output: string }> {
+/**
+ * P2c: a command that never STARTED is not a failing test.
+ * runOneCheckCommand used to fold the spawn error into {ok:false}, which
+ * runCheckUncached rendered as {pass:false, stage:"test", failed:["spawn
+ * pytest ENOENT"]} -- telling the model its code was red when the truth was
+ * "there is no pytest here". 14 occurrences across 12 instances. The two
+ * outcomes are now distinct constructors and can no longer be conflated.
+ */
+type CheckRunOutcome = { kind: "ran"; ok: boolean; output: string } | { kind: "spawn-failed"; message: string };
+
+async function runOneCheckCommand(cmd: string[], cwd: string, env?: Record<string, string | undefined>): Promise<CheckRunOutcome> {
   try {
-    const result = await runCommand(cmd[0]!, cmd.slice(1), cwd);
-    return { ok: result.exitCode === 0, output: `${result.stdout}\n${result.stderr}` };
+    const result = await runCommand(cmd[0]!, cmd.slice(1), cwd, undefined, env);
+    return { kind: "ran", ok: result.exitCode === 0, output: `${result.stdout}\n${result.stderr}` };
   } catch (err) {
-    return { ok: false, output: err instanceof Error ? err.message : String(err) };
+    return { kind: "spawn-failed", message: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/** The pass:null receipt for a command that never ran -- "could not verify", never "your code is red". */
+function spawnFailureResult(cmd: string[], message: string): CheckResult {
+  return {
+    pass: null,
+    reason: `could not run "${cmd.join(" ")}": ${message} -- the command never started, so NOTHING was verified (this is not a test failure)`,
+    try: `install the runner, pass the environment it needs via sem.check({env:{...}}), or declare this repo's real command in ${REPO_CHECK_CONFIG_FILE} ({"test": "..."})`,
+  };
+}
+
+export interface CheckOpts {
+  /** Override detection with a specific command -- still allowlisted (repo-declared, detected runner, or PI_SEM_CHECK_ALLOW), never an arbitrary shell command. Quoted arguments survive: see splitShellWords. */
+  cmd?: string;
+  /** Extra environment variables, MERGED OVER the ambient environment -- DJANGO_SETTINGS_MODULE, MPLBACKEND, PYTHONPATH, DATABASE_URL. Part of the cache key, so two different environments never share one verdict. */
+  env?: Record<string, string>;
 }
 
 export interface CheckResult {
@@ -2276,9 +2464,15 @@ async function computeTreeFingerprint(cwd: string): Promise<string | undefined> 
   return `${head.stdout.trim()}:${status?.stdout ?? ""}`;
 }
 
-async function check(opts: { cmd?: string } = {}, deps: SemApiDeps, checkCache: CheckCache): Promise<CheckResult> {
+async function check(opts: CheckOpts = {}, deps: SemApiDeps, checkCache: CheckCache): Promise<CheckResult> {
   const fingerprint = await computeTreeFingerprint(deps.cwd);
-  const cacheKey = opts.cmd ? `cmd:${opts.cmd}:${fingerprint ?? ""}` : `auto:${fingerprint ?? ""}`;
+  // The environment is part of what was checked: a red produced WITHOUT
+  // DJANGO_SETTINGS_MODULE must never be replayed as the answer for a run
+  // that supplies it (P2a).
+  const envKey = opts.env
+    ? JSON.stringify(Object.entries(opts.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+    : "";
+  const cacheKey = `${opts.cmd ? `cmd:${opts.cmd}` : "auto"}:${envKey}:${fingerprint ?? ""}`;
   if (fingerprint !== undefined) {
     const cached = checkCache.get(cacheKey);
     if (cached) return { ...cached, cached: true };
@@ -2289,30 +2483,44 @@ async function check(opts: { cmd?: string } = {}, deps: SemApiDeps, checkCache: 
   return result;
 }
 
-async function runCheckUncached(opts: { cmd?: string }, deps: SemApiDeps): Promise<CheckResult> {
+async function runCheckUncached(opts: CheckOpts, deps: SemApiDeps): Promise<CheckResult> {
+  const env = opts.env;
   if (opts.cmd) {
-    const parts = opts.cmd.split(/\s+/).filter((p) => p.length > 0);
+    const split = splitShellWords(opts.cmd);
+    if (!split.ok) {
+      throw toCodeModeError(`sem.check: {cmd:"${opts.cmd}"} has an ${split.reason} -- close it, or drop the quotes if the argument has no spaces.`);
+    }
+    const parts = split.parts;
     if (parts.length === 0) throw toCodeModeError(`sem.check: { cmd } was empty.`);
     const allowlist = [...detectCheckAllowlist(deps.cwd), ...userCheckAllowlist()];
     if (!isCheckCommandAllowed(parts, allowlist)) throw toCodeModeError(checkCmdRefusal(opts.cmd, allowlist));
-    const { ok, output } = await runOneCheckCommand(parts, deps.cwd);
-    return ok ? { pass: true, stage: "test" } : { pass: false, stage: "test", failed: tailLines(output, 20) };
+    const outcome = await runOneCheckCommand(parts, deps.cwd, env);
+    if (outcome.kind === "spawn-failed") return spawnFailureResult(parts, outcome.message);
+    return outcome.ok ? { pass: true, stage: "test" } : { pass: false, stage: "test", failed: tailLines(outcome.output, 20) };
   }
 
   const runner = await detectRunner(deps.cwd);
   if (!runner) {
-    return { pass: null, reason: "no cargo/npm/pytest/go runner found", try: "sem.check({cmd:'make test'})" };
+    return {
+      pass: null,
+      reason: "no cargo/npm/pytest/go runner found",
+      try: `declare this repo's own commands in ${REPO_CHECK_CONFIG_FILE} ({"typecheck": "...", "test": "..."}), or sem.check({cmd:'make test'})`,
+    };
   }
 
   // Typecheck first when both exist -- the cheap failure surfaces before
   // the (usually much slower) test run even starts.
   if (runner.typecheckCmd) {
-    const { ok, output } = await runOneCheckCommand(runner.typecheckCmd, deps.cwd);
-    if (!ok) return { pass: false, runner: runner.kind, stage: "typecheck", failed: tailLines(output, 20) };
+    const outcome = await runOneCheckCommand(runner.typecheckCmd, deps.cwd, env);
+    if (outcome.kind === "spawn-failed") return { ...spawnFailureResult(runner.typecheckCmd, outcome.message), runner: runner.kind };
+    if (!outcome.ok) return { pass: false, runner: runner.kind, stage: "typecheck", failed: tailLines(outcome.output, 20) };
   }
   if (runner.testCmd) {
-    const { ok, output } = await runOneCheckCommand(runner.testCmd, deps.cwd);
-    return ok ? { pass: true, runner: runner.kind, stage: "test" } : { pass: false, runner: runner.kind, stage: "test", failed: tailLines(output, 20) };
+    const outcome = await runOneCheckCommand(runner.testCmd, deps.cwd, env);
+    if (outcome.kind === "spawn-failed") return { ...spawnFailureResult(runner.testCmd, outcome.message), runner: runner.kind };
+    return outcome.ok
+      ? { pass: true, runner: runner.kind, stage: "test" }
+      : { pass: false, runner: runner.kind, stage: "test", failed: tailLines(outcome.output, 20) };
   }
   // A runner was detected (e.g. npm with only a typecheck script) but it
   // had no test command, and typecheck (if any) already passed above.
@@ -3159,7 +3367,7 @@ export interface SemApi {
   /** Every edit()/write() this pi SESSION has made (across all sem_code calls, not just this one), grouped by file. */
   changed(): unknown;
   /** "Am I still green" -- detects the project's own typecheck/test command (cargo/npm/pytest/go) and returns only the failure. Runs typecheck before test so the cheap failure surfaces first. Pass { cmd } to override detection with a runner-allowlisted or PI_SEM_CHECK_ALLOW-listed command (never an arbitrary one). Cached by tree state within this session. */
-  check(opts?: { cmd?: string }): Promise<CheckResult>;
+  check(opts?: CheckOpts): Promise<CheckResult>;
   /** Pages into a result a verb already truncated for the token budget -- the handle named in that result's `more_handle`/`budget_note`. Free (already-computed rows, no re-query); works across sem_code calls in the same session, same as any other handle. */
   more(handle: string): unknown;
   /** Replays a saved routine (a script this repo already reasoned through once) in the same sandbox with `params` merged over the saved examples -- same budgets, revocation, receipts; no new authority. Returns the routine's own return value. `routine.save(name, {params, description, update?})` at the END of a script that just worked saves that script, params lifted. */

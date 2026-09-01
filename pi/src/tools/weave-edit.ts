@@ -5,10 +5,10 @@ import { readFile } from "node:fs/promises";
 // comment there for why the async pair is measurably not narrow enough.
 import { readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { Type, type Static } from "typebox";
 import { currentBranch, repoRelativePath, type RepoLocation } from "./internal/git.ts";
-import { extractEntities, extractEntitiesFromText, resolveEntity, type Entity, type ResolveResult } from "./internal/entities.ts";
+import { describeEntityFilters, describeNameMatchCount, extractEntities, extractEntitiesFromText, resolveEntity, type Entity, type ResolveResult } from "./internal/entities.ts";
 import { splice, parseLines, renderLines, type Op } from "./internal/text.ts";
 import { verifyEdit } from "./internal/verify.ts";
 import { compareIdentity, deriveVisibility, type IdentityChange, type IdentityFacts } from "./internal/identity.ts";
@@ -31,7 +31,8 @@ const EntityRefSchema = Type.Object({
   ordinal: Type.Optional(
     Type.Integer({
       minimum: 0,
-      description: "0-based occurrence index, in file order, among matches still ambiguous after entity_type/parent_name. Last resort — prefer entity_type/parent_name.",
+      description:
+        "0-based occurrence index, in file order, among matches still ambiguous after entity_type/parent_name. Genuine last resort: REFUSED (with the candidate list) when the candidates each sit under a different parent, since parent_name addresses them stably and an ordinal silently re-points when the file changes.",
     }),
   ),
 });
@@ -224,9 +225,41 @@ function summarizeImage(text: string): ImageSummary {
   return { bytes: Buffer.byteLength(text, "utf8"), sha1: createHash("sha1").update(text, "utf8").digest("hex") };
 }
 
+/** Header + this many candidates + one trailing count line keeps every resolution refusal within ~6 lines no matter how ambiguous the name is; the complete list stays in details.candidates. */
+const MAX_INLINE_CANDIDATES = 4;
+
+/**
+ * The entity's own stable sem id, built from what extractEntities already
+ * returned -- zero extra lookups. `parent_id` IS the parent's own id (sem
+ * gives it directly, always repo-relative), so a nested entity only appends
+ * its own name; a module-level one is keyed by its file, type and name. Same
+ * construction sem-read.ts's ownEntityId uses. Threaded into checkDependents
+ * so the post-edit impact question is asked about the entity that was
+ * ACTUALLY resolved rather than re-resolved from a bare name -- see P4c in
+ * internal/impact.ts.
+ */
+function ownEntityId(entity: Entity, cwd: string, absPath: string): string {
+  const relPath = isAbsolute(absPath) ? relative(cwd, absPath) : absPath;
+  const parentId = entity.parent_id;
+  if (!parentId) return `${relPath}::${entity.type}::${entity.name}`;
+  // `sem entities` echoes back whatever path it was HANDED as the id's file
+  // prefix (this file always hands it an absolute one), while `sem impact
+  // --entity-id` keys its index by the repo-relative path. Re-prefix rather
+  // than trusting the echo, or every nested entity's id misses.
+  for (const prefix of [absPath, relPath]) {
+    if (parentId.startsWith(`${prefix}::`)) return `${relPath}${parentId.slice(prefix.length)}::${entity.name}`;
+  }
+  return `${parentId}::${entity.name}`;
+}
+
 function formatCandidate(e: Entity): string {
   const parent = e.parentName ? ` in ${e.parentName}` : "";
   return `  - ${e.name} (${e.type}${parent}), lines ${e.start_line}-${e.end_line}`;
+}
+
+/** The machine-readable twin of formatCandidate, for `details.candidates`. */
+function candidateSummary(e: Entity): { name: string; type: string; parent_name: string | null; start_line: number; end_line: number } {
+  return { name: e.name, type: e.type, parent_name: e.parentName, start_line: e.start_line, end_line: e.end_line };
 }
 
 function formatResolutionFailure(
@@ -236,6 +269,31 @@ function formatResolutionFailure(
   merge: MergeStatus,
 ): WeaveEditOutcome {
   if (result.kind === "not-found") {
+    // P4b: an entity_type/parent_name filter emptied a NON-empty name match.
+    // Reporting "no entity named X" and then listing X as the closest name
+    // is the self-contradiction 39 of 327 drive runs hit; name the filter
+    // and show what the file really holds under that name.
+    if (result.filteredOut !== undefined && result.filteredOut.length > 0) {
+      const filters = describeEntityFilters(result.filters);
+      const shownMatches = result.filteredOut.slice(0, MAX_INLINE_CANDIDATES);
+      const omittedMatches = result.filteredOut.length - shownMatches.length;
+      const matchList = shownMatches.map(formatCandidate).join("\n");
+      const matchMore = omittedMatches > 0 ? `\n…${omittedMatches} more — full list in details.candidates` : "";
+      return {
+        isError: true,
+        text: `weave_edit: ${describeNameMatchCount(params.entity.name, result.filteredOut.length)} in ${params.file}, but none match ${filters} — drop the filter, or use one of these:\n${matchList}${matchMore}`,
+        details: {
+          file: params.file,
+          entity: params.entity,
+          resolved: false,
+          nearest: [],
+          filters: result.filters ?? {},
+          candidates: result.filteredOut.map(candidateSummary),
+          coordination,
+          merge,
+        },
+      };
+    }
     const nearest = result.nearest.length > 0 ? ` Closest names in ${params.file}: ${result.nearest.join(", ")}.` : "";
     return {
       isError: true,
@@ -249,10 +307,31 @@ function formatResolutionFailure(
   // tokens per turn than vanilla pi). Header + 4 candidates + one trailing
   // count line stays within 6 lines no matter how many matches exist; the
   // complete list remains in details.candidates below.
-  const shown = result.candidates.slice(0, 4);
+  const shown = result.candidates.slice(0, MAX_INLINE_CANDIDATES);
   const omitted = result.candidates.length - shown.length;
   const list = shown.map(formatCandidate).join("\n");
   const moreLine = omitted > 0 ? `\n…${omitted} more — full list in details.candidates` : "";
+  // P4a: the ordinal was offered and deliberately NOT honoured. This is the
+  // django__django-13128 refusal -- ordinal:1 there indexed
+  // ResolvedOuterRef.resolve_expression and overwrote it with
+  // CombinedExpression logic, silently. See parentNameWouldDisambiguate.
+  if (result.ordinalRefused === true) {
+    return {
+      isError: true,
+      text:
+        `weave_edit: ordinal:${params.entity.ordinal} refused for "${params.entity.name}" in ${params.file} — these ${result.candidates.length} same-named entities each sit under a DIFFERENT parent, ` +
+        `and an ordinal indexes a start-line-sorted list that silently re-points at another entity when the file changes. Pass parent_name instead:\n${list}${moreLine}`,
+      details: {
+        file: params.file,
+        entity: params.entity,
+        resolved: false,
+        ordinal_refused: true,
+        candidates: result.candidates.map(candidateSummary),
+        coordination,
+        merge,
+      },
+    };
+  }
   return {
     isError: true,
     text: `weave_edit: "${params.entity.name}" is ambiguous in ${params.file} — ${result.candidates.length} matches. Add entity_type, parent_name, or ordinal to disambiguate:\n${list}${moreLine}`,
@@ -761,7 +840,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
       // be captured now or not at all.
       const dependentsBefore =
         params.op === "replace" || params.op === "delete"
-          ? await checkDependents(semBin, cwd, absPath, resolved.entity.name, signal)
+          ? await checkDependents(semBin, cwd, absPath, resolved.entity.name, signal, ownEntityId(resolved.entity, cwd, absPath))
           : undefined;
 
       const spliced = splice(currentContent, resolved.entity, params.op as Op, params.content);
@@ -1022,6 +1101,11 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
       }
 
       let afterEntityName = resolved.entity.name;
+      // The post-edit twin of the pre-edit id above: re-derived from the
+      // entity as re-extracted after the write (its parent/type may have
+      // moved), so the "after" half of the dependents report is addressed
+      // just as precisely as the "before" half.
+      let afterEntityId = ownEntityId(resolved.entity, cwd, absPath);
 
       if (params.op === "replace") {
         const beforeFacts: IdentityFacts = {
@@ -1064,7 +1148,10 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
 
         // allow_signature_change may have let a rename through — look the new
         // name up under its post-edit identity, not the one it no longer has.
-        if (afterEntity) afterEntityName = afterEntity.name;
+        if (afterEntity) {
+          afterEntityName = afterEntity.name;
+          afterEntityId = ownEntityId(afterEntity, cwd, absPath);
+        }
       }
 
       // The uncoordinated commit's deferred post-write confirmation -- the
@@ -1088,7 +1175,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
       } else if (params.op === "delete") {
         dependents = { checked: true, before: dependentsBefore.dependents };
       } else {
-        const dependentsAfter = await checkDependents(semBin, cwd, absPath, afterEntityName, signal);
+        const dependentsAfter = await checkDependents(semBin, cwd, absPath, afterEntityName, signal, afterEntityId);
         dependents = dependentsAfter.ok
           ? { checked: true, before: dependentsBefore.dependents, after: dependentsAfter.dependents }
           : { checked: true, before: dependentsBefore.dependents, afterCheckFailed: true, reason: dependentsAfter.reason };

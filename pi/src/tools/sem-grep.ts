@@ -14,6 +14,8 @@ export interface SemGrepParams {
   glob?: string;
   context?: number;
   limit?: number;
+  /** Treat every pattern as literal text rather than a regex -- see escapeRegexLiteral. */
+  literal?: boolean;
 }
 
 export interface SemGrepDeps {
@@ -72,7 +74,34 @@ const SemGrepParamsSchema = Type.Object({
       description: "Max hits to show (default 20). More matches are summarized as a trailing '…N more' count.",
     }),
   ),
+  literal: Type.Optional(
+    Type.Boolean({
+      description:
+        "Search for the pattern as LITERAL TEXT instead of a regex. Use it whenever the pattern is code -- \"is_fits(\", \"only(\", \"col_suffixes=['\" -- since parens and brackets are regex syntax and an unbalanced one is a parse error, not a search.",
+    }),
+  ),
 });
+
+/**
+ * P7 of the 2026-09-02 transcript study: 170 regex parse errors across 117
+ * of 327 runs (36%), 25 of them fatal to the whole script, all from agents
+ * typing CODE into a regex-only search -- `is_fits(`, `only(`, `Prefetch(`,
+ * `col_suffixes=['`.
+ *
+ * Escapes exactly the characters Rust's own `regex::escape` treats as meta
+ * (`\ . + * ? ( ) | [ ] { } ^ $ # & - ~`) and nothing else, because sem's
+ * pattern is a Rust regex. Escaping MORE would be actively wrong: `\<` and
+ * `\>` are word-boundary assertions in that dialect, so backslashing every
+ * punctuation character would silently change what a literal `<` matches.
+ */
+export function escapeRegexLiteral(pattern: string): string {
+  return pattern.replace(/[\\.+*?()|[\]{}^$#&~-]/g, (c) => `\\${c}`);
+}
+
+/** The one place a pattern is chosen: what actually goes to `sem grep`. `details.pattern` always echoes what the CALLER typed, never this. */
+function searchPattern(pattern: string, literal: boolean | undefined): string {
+  return literal === true ? escapeRegexLiteral(pattern) : pattern;
+}
 
 /** Default cap on rendered hits, enforced client-side (the CLI has no --limit). */
 const DEFAULT_LIMIT = 20;
@@ -173,8 +202,10 @@ async function contextHitBlock(hit: RawGrepHit, context: number, readCached: (fi
  * only a genuine execution error comes back isError=true.
  */
 async function runOnePattern(pattern: string, params: SemGrepParams, deps: SemGrepDeps): Promise<SemGrepOutcome> {
+  const literal = params.literal === true;
   const baseDetails = {
     pattern,
+    literal,
     path: params.path ?? null,
     glob: params.glob ?? null,
     context: params.context ?? 0,
@@ -182,12 +213,20 @@ async function runOnePattern(pattern: string, params: SemGrepParams, deps: SemGr
 
   let rawHits: RawGrepHit[];
   try {
-    rawHits = await runSemGrepJson(pattern, deps);
+    rawHits = await runSemGrepJson(searchPattern(pattern, params.literal), deps);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // P7: the fix for a parse error is almost always "I meant that as
+    // text" -- say so IN the error, so one wall-hit teaches the way over
+    // it instead of costing a retry (or, 25 times in the drive, the whole
+    // script).
+    const hint =
+      !literal && /regex parse error|unclosed|unrecognized|repetition|unmatched|invalid pattern/i.test(message)
+        ? ` If you meant this as literal text (identifiers and call sites contain ( [ { and other regex syntax), pass { literal: true }.`
+        : "";
     return {
       isError: true,
-      text: `sem_grep: ${message}`,
+      text: `sem_grep: ${message}${hint}`,
       details: { ...baseDetails, error: message },
     };
   }
@@ -299,12 +338,13 @@ export function registerSemGrep(pi: ExtensionAPI, opts: RegisterSemGrepOptions =
     name: "sem_grep",
     label: "Sem Grep",
     description:
-      "Regex-search repo text (trigram-indexed): file:line hits for call sites, string literals, log/error messages. Pass patterns=[...] to batch several searches.",
+      "Search repo text (trigram-indexed): file:line hits for call sites, string literals, log/error messages. Regex, or literal=true for code. patterns=[...] batches.",
     promptSnippet: "Regex-search repo text for a pattern, getting file:line hits across all files",
     promptGuidelines: [
       "Reach for sem_grep FIRST when you don't know where something lives in the repo and there isn't a precise name to hand sem_find — e.g. call sites, string literals, log/error messages.",
       "Narrow big searches with path= (file or directory prefix) or glob= (e.g. \"*.ts\", \"subdir/**\") instead of paging through capped results.",
       "Pass context= (a few lines) to see each hit's surroundings before deciding what to open; raise limit= above the default 20 only when you truly need more.",
+      "Searching for a snippet of code rather than a pattern? Pass literal=true -- \"is_fits(\" or \"col_suffixes=['\" is a regex parse error otherwise, not a search.",
     ],
     parameters: SemGrepParamsSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
