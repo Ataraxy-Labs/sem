@@ -1578,6 +1578,8 @@ interface GrepOpts {
   glob?: string;
   context?: number;
   limit?: number;
+  /** Search the pattern as literal text instead of a regex -- see sem-grep.ts's escapeRegexLiteral (P7). */
+  literal?: boolean;
 }
 
 /**

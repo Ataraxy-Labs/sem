@@ -545,8 +545,9 @@ declare const sem: {
 
   /** Regex search over repo text, trigram-indexed. */
   /** Text search via sem's own grep. Pass an array to search several patterns in one call -- like find(names[]), that returns a single GrepBatchResult object, NOT an array, with one entry per pattern under `results`. An IDENTICAL single-pattern call already answered earlier THIS SESSION, unchanged since, comes back as UnchangedResult instead of re-running. */
-  grep(patterns: string, opts?: { path?: string; glob?: string; context?: number; limit?: number }): Promise<GrepResult | UnchangedResult>;
-  grep(patterns: string[], opts?: { path?: string; glob?: string; context?: number; limit?: number }): Promise<GrepBatchResult>;
+  /** `literal: true` searches the pattern as PLAIN TEXT instead of a regex -- reach for it whenever the pattern is code, since "is_fits(", "only(" or "col_suffixes=['" is an unclosed-group parse error as a regex, not a search. */
+  grep(patterns: string, opts?: { path?: string; glob?: string; context?: number; limit?: number; literal?: boolean }): Promise<GrepResult | UnchangedResult>;
+  grep(patterns: string[], opts?: { path?: string; glob?: string; context?: number; limit?: number; literal?: boolean }): Promise<GrepBatchResult>;
 
   /** Direct callers of one entity (index-backed reverse postings). Throws if the name is ambiguous or not found. An IDENTICAL call already answered earlier THIS SESSION, unchanged since, comes back as UnchangedResult instead of re-running. */
   callers(name: string): Promise<CallersResult | UnchangedResult>;
