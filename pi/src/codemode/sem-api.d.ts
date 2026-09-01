@@ -503,17 +503,17 @@ declare interface ChangedResult {
 }
 
 declare interface CheckResult {
-  /** true = green, false = red, null = no runner could be detected at all (see `reason`/`try`). */
+  /** true = green, false = red, null = COULD NOT VERIFY -- no runner detected, or the command could not be started (missing binary, ENOENT). null is never a statement about your code; see `reason`/`try`. */
   pass: boolean | null;
-  /** "cargo" | "npm" | "pytest" | "go" -- absent when `cmd` was passed explicitly, or when pass is null. */
+  /** "declared" (from .sem/check.json) | "cargo" | "npm" | "pytest" | "go" -- absent when `cmd` was passed explicitly. */
   runner?: string;
   /** Which stage the reported pass/fail is FROM -- typecheck runs before test, so a typecheck failure never reaches (and never runs) the usually-slower test stage. */
   stage?: "typecheck" | "test";
   /** Up to 20 lines, tailed from the failing command's own output. Present only when pass is false. */
   failed?: string[];
-  /** Present only when pass is null. */
+  /** Present only when pass is null -- why nothing could be verified (no runner, or the exact spawn failure). */
   reason?: string;
-  /** Present only when pass is null -- the literal next call to make. */
+  /** Present only when pass is null -- what to do about it. */
   try?: string;
   /** True when this result was served from cache (the tree hasn't changed since the last check() this session) instead of actually re-running a command. */
   cached?: boolean;
@@ -605,8 +605,8 @@ declare const sem: {
   /** Every sem.edit()/sem.write() call THIS PI SESSION has made so far -- across all sem_code calls, not just the current one -- grouped by file. Check this instead of re-deriving what you've touched. */
   changed(): Promise<ChangedResult>;
 
-  /** "Am I still green" without leaving the sandbox for bash. Detects the project's own typecheck/test command (cargo/npm/pytest/go) -- never invents one -- and runs typecheck first when both exist, so a cheap typecheck failure surfaces before the (usually slower) test run even starts. No runner found: { pass: null, reason: "no cargo/npm/pytest/go runner found", try: "sem.check({cmd:'make test'})" }. Pass { cmd } to override detection with a specific command, but this is not a general shell: `cmd` must match a detected runner (npm/yarn/pnpm/bun, cargo test/build/check/clippy, pytest, go test/build/vet, `make <target>`) or a prefix listed in the PI_SEM_CHECK_ALLOW env var -- anything else is refused, naming the allowed set. Cached within this session by the actual tree state, so asking again after nothing changed is instant. */
-  check(opts?: { cmd?: string }): Promise<CheckResult>;
+  /** "Am I still green" without leaving the sandbox for bash. Runs the command the REPO declares in `.sem/check.json` ({"typecheck": "...", "test": "...", "allow": ["..."]}) if there is one, else detects the project's own typecheck/test command (cargo/npm/pytest/go) -- never invents one -- and runs typecheck first when both exist, so a cheap typecheck failure surfaces before the (usually slower) test run even starts. `pass: null` ALWAYS means "could not verify", never "your code is red": no runner found, or the command could not be started at all (a missing binary is a pass:null with a `reason` and a `try`, not a failing test). Pass { env } to hand the runner the variables it needs -- DJANGO_SETTINGS_MODULE, MPLBACKEND, PYTHONPATH -- merged over the ambient environment. Pass { cmd } to override detection; quoted arguments survive intact (`-k 'a or b'` is ONE argument), but this is not a general shell: `cmd` must match the repo-declared command, a detected runner (npm/yarn/pnpm/bun, cargo test/build/check/clippy, pytest, `python -m pytest`, `python <a test script this repo ships>`, go test/build/vet, `make <target>`), or a prefix listed in the PI_SEM_CHECK_ALLOW env var -- anything else is refused, naming the allowed set. Cached within this session by the actual tree state AND the env passed, so asking again after nothing changed is instant. */
+  check(opts?: { cmd?: string; env?: Record<string, string> }): Promise<CheckResult>;
 
   /** Pages into a result a verb already truncated for the token budget -- pass the `more_handle` named in that result's `budget_note`. Free (the rows were already computed, no re-query); works across sem_code calls in the same session, same as any other handle. Throws if `handle` isn't a known pagination handle (e.g. it was already fully paged through, or it's some OTHER kind of handle). */
   more(handle: string): Promise<MoreResult>;

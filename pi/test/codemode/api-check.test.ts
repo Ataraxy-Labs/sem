@@ -33,7 +33,10 @@ test("check(): no runner detected in an empty directory returns pass:null with r
     const result = await api.check();
     assert.equal(result.pass, null);
     assert.equal(result.reason, "no cargo/npm/pytest/go runner found");
-    assert.equal(result.try, "sem.check({cmd:'make test'})");
+    // P2d: the no-runner advice now leads with the repo-declared runner
+    // (.sem/check.json), the general answer to "this project's verification
+    // command isn't one of the four this detector knows".
+    assert.equal(result.try, `declare this repo's own commands in .sem/check.json ({"typecheck": "...", "test": "..."}), or sem.check({cmd:'make test'})`);
   });
 });
 
