@@ -94,8 +94,15 @@ pi -e /path/to/sem/pi
     `sem.write` is refused (`sem.add` is the one creation door); `sem.check`
     only runs a detected project runner or a command explicitly allowlisted via
     `PI_SEM_CHECK_ALLOW`.
-  - **`PI_SEM_PURE=0`** restores `bash`/`write` next to `sem_code` -- for
-    benchmark-comparability runs or workflows that still want a general shell.
+  - **`PI_SEM_PURE=0`** ("mixed mode") restores `bash`/`write` next to
+    `sem_code` -- for benchmark-comparability runs or workflows that still want
+    a general shell. The system prompt then carries an extra block
+    (`CODE_MODE_MIXED_ADDENDUM`, rendered only in this mode) stating the
+    division of labor: every code-content operation -- finding, grepping,
+    reading, and *every* edit -- still goes through `sem`, and `bash` is for
+    execution only (reproduce, run a snippet, run the real tests, provision what
+    running needs, read-only `git log -S`/`git blame`). Pure mode's own block is
+    unchanged.
 
 Add `--no-extensions` to any of the above if you also want to exclude any other
 installed pi package's own tools for a fully locked-down session.

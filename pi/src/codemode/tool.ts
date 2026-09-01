@@ -75,6 +75,80 @@ concluded something worth keeping? sem.note(entity, text) pins it to that entity
 Await every sem.* call before returning -- an unawaited one may still be running (or fail) after the script returns, unconfirmed.
 Wall-clock timeout 60s (timeout_ms), max 200 sem.* calls, ~6k token budget per run -- write efficient scripts, not exploration loops.`;
 
+/**
+ * MIXED MODE only (PI_SEM_PURE=0): appended right after CODE_MODE_ADDENDUM,
+ * never rendered in pure mode. CODE_MODE_ADDENDUM is written for a session
+ * whose ONLY tool is sem_code ("only `sem` is exposed", "never ...
+ * exec_command/bash redirection"); when the native tools are restored
+ * alongside sem_code that text is describing a world the model can see is
+ * not the one it is in, and nothing anywhere states the division of labor.
+ * This block states it, as a strict default.
+ *
+ * Every line is grounded in the 327-run / 2,541-script transcript study
+ * (thinking/design/transcript-study-2026-09-02.md) plus the 12-transcript
+ * bash-capability inventory of the vanilla arm. Deliberately NOT grounded
+ * in any task shape -- the study's own P8 finding is that ~4 of the 10
+ * pinned lines produced zero observed behaviour across 327 runs, so a line
+ * that only pays off on one kind of repo or one kind of bug is dead weight
+ * that costs tokens every single turn. Line by line:
+ *
+ * 1. Frame. §6: the addendum "says nothing about" the two things every run
+ *    needed. In mixed mode the unstated thing is which surface owns what,
+ *    and line 1 of the pure block actively misdescribes the tool set.
+ * 2. sem owns code content. The paired eval behind the pure block's
+ *    edit-bypass line found provider-native apply_patch/exec_command firing
+ *    next to sem_code for the actual edit; restoring bash + native edit
+ *    restores exactly that pull. The reasons given are the study's own
+ *    observed wins (§5): entity addressing survives its own edits, edits
+ *    merge at the entity level, the parse-verify-and-roll-back guard
+ *    refused 15 malformed edits in django-15161 rather than leave a broken
+ *    file, and edit().impact arrives unbidden. A native edit gets none of it.
+ * 3. Fix the call, don't defect to bash. §2.5 (170 regex parse errors in
+ *    36% of runs, now answered by literal), §2.2 (43 self-contradictory
+ *    not-founds -- the disambiguator, not the tool, was wrong), §2.1
+ *    (check() refusals now answered by {env} and .sem/check.json). Every
+ *    one of those is a fixable CALL; in mixed mode the cheap escape is to
+ *    grep in bash instead and lose entity addressing for the rest of the
+ *    task. The escape hatch stays open for what sem genuinely cannot
+ *    address (§2.3: non-code files, generated artifacts) -- with a
+ *    say-so, so the bypass is visible rather than silent.
+ * 4. bash is execution. The V-arm inventory: repro-before-edit 9/12, real
+ *    test runs 6/12, env provisioning 12/12, local git archaeology 10/12
+ *    (decisive 2/12, and in psf-requests-2931 the pickaxe REFUTED the
+ *    agent's hypothesis -- forensics, not answer-fetching). These are the
+ *    capabilities P1's scoped verbs were designed to buy back; in mixed
+ *    mode they are already present and just need pointing at.
+ * 5. Reproduce -> edit -> verify by running. The study's costliest finding
+ *    (§0.4, P1): 296/327 runs never got a green signal, and django-15368
+ *    produced the gold line and then OVERWROTE IT for want of one. The
+ *    counterweight (§4, matplotlib-24970 / astropy-14365) is that the
+ *    vanilla arm's "verified" claims were frequently partial -- hence the
+ *    second clause: say you could not run it rather than implying you did.
+ * 6. Solve from the repo. 210/325 vanilla runs were gate-labelled
+ *    answer_adjacent; in django-15252 the agent fetched the upstream diff
+ *    and THREW AWAY its own already-passing fix. Pure mode prevents this
+ *    by construction; mixed mode can only ask. Stated as a general
+ *    property (don't import an outside answer for the code you are
+ *    fixing), never as a benchmark rule.
+ * 7. The one-script idiom survives. §6: it is the one addendum line
+ *    measured as working (77% of calls combine 2+ verbs), and the cheapest
+ *    way to lose it is to start interleaving single bash round trips
+ *    between single sem verbs. The same-file concurrency affordance needs
+ *    no restatement -- the pure block's line 3 carries it unchanged and is
+ *    rendered in both modes.
+ *
+ * The block is 7 lines against a <=8 budget, and it never contradicts the
+ * pure block: both route EVERY edit through sem, which is the one rule the
+ * two halves of the prompt must agree on (pinned by test).
+ */
+export const CODE_MODE_MIXED_ADDENDUM = `Mixed mode: bash and the native read/edit/write tools are live alongside sem_code. The division of labor is strict -- sem owns the code, bash runs it.
+EVERY code-content operation goes through sem: finding, grepping, reading, understanding, and every edit (sem.edit / sem.add / sem.rename). Never cat/sed/grep/echo>/apply_patch or the native edit tool on a source file -- sem edits are entity-addressed, merge-safe, re-parsed and verified, and receipted with their blast radius; a native edit silently bypasses all of it.
+When a sem verb fails, fix the CALL -- do not retry the same operation in bash. The error names the fix: {literal:true} for a pattern with parens, parent_name/entity_type to disambiguate a name, .sem/check.json or check({env}) for a runner. Fall back only for what is genuinely outside sem's domain -- non-code files, generated artifacts -- and say which.
+bash is for EXECUTION, not for reading or editing code: reproduce the bug before you edit it, run a snippet to test a hypothesis, run the project's real tests after you edit, install or provision whatever running requires, and read-only git forensics (git log -S, git blame).
+Reproduce -> edit via sem -> verify by running. Never trust a change you have not executed; if you could not execute it, say so plainly instead of implying it was verified.
+Never fetch an answer from outside the repo -- no upstream patch, issue thread, or newer release of the code you are fixing. Solve it from this repo: its source, its history, its tests.
+Keep the one-script idiom for sem work -- batch a turn's reads, edits and checks into one sem_code script -- and spend bash turns on running, not on looking.`;
+
 const SEM_API_DTS = readFileSync(join(__dirname, "sem-api.d.ts"), "utf8");
 
 /**
@@ -203,16 +277,28 @@ export function resolvePromptShape(): PromptShape {
  * (C) "recipes" -- (B) plus CODE_MODE_RECIPES's five worked examples (default; see resolvePromptShape).
  * Defaults to resolvePromptShape() (PI_SEM_PROMPT env var); accepts an
  * explicit shape for tests so they don't have to mutate process.env.
+ *
+ * Orthogonal to shape: `pure`. In MIXED mode (PI_SEM_PURE=0, native tools
+ * restored alongside sem_code) CODE_MODE_MIXED_ADDENDUM is appended right
+ * after CODE_MODE_ADDENDUM, stating the sem/bash division of labor the
+ * pure-shaped text cannot. Pure mode renders exactly what it rendered
+ * before -- the 10-line block, untouched.
  */
 export function buildSystemPromptAddendum(
   shape: PromptShape = resolvePromptShape(),
   cwd: string = process.cwd(),
   sessionSavedRoutines?: ReadonlySet<string>,
+  pure: boolean = process.env.PI_SEM_PURE !== "0",
 ): string {
   // `cwd` defaults to process.cwd() because before_agent_start fires with
   // no tool ctx -- pi runs in the project root, which is also what every
   // execute()-time ctx.cwd resolves to for this session.
-  const base = [CODE_MODE_ADDENDUM, buildRoutinesPromptSection(cwd, sessionSavedRoutines), buildNotesPromptSection(cwd)]
+  const base = [
+    CODE_MODE_ADDENDUM,
+    pure ? "" : CODE_MODE_MIXED_ADDENDUM,
+    buildRoutinesPromptSection(cwd, sessionSavedRoutines),
+    buildNotesPromptSection(cwd),
+  ]
     .filter((s) => s.length > 0)
     .join("\n");
   if (shape === "table") return base;
@@ -543,7 +629,11 @@ export function registerSemCode(pi: ExtensionAPI, opts: RegisterSemCodeOptions =
   });
 
   pi.on("before_agent_start", (event) => {
-    return { systemPrompt: `${event.systemPrompt}\n\n${buildSystemPromptAddendum(undefined, undefined, sessionSavedRoutines)}` };
+    // `pure` is the REGISTRATION-time value (opts.pure, else PI_SEM_PURE),
+    // not re-read here: the tool surface this session was registered with
+    // is what the prompt has to describe, and the env is only read once at
+    // extension load (see pi-sem.ts's PURE_MODE).
+    return { systemPrompt: `${event.systemPrompt}\n\n${buildSystemPromptAddendum(undefined, undefined, sessionSavedRoutines, pure)}` };
   });
 
   pi.on("session_shutdown", async () => {
