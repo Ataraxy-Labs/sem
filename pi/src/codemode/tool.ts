@@ -51,10 +51,22 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * skipping verification and weave-mcp coordination entirely. Dropping it
  * to hit the line budget would silently reopen a measured regression, so
  * it stays as its own line even though it isn't a verb mapping.
+ *
+ * Pre-SWE-bench-drive tuning pass (2026-09): the 10-line cap held --
+ * both additions were folded into their nearest existing line rather than
+ * appended as new ones. Line 2 (batching) now names the winning shape
+ * explicitly (one script: read -> decide -> edit -> check(), not
+ * single-verb round trips; entity verbs over re-reading whole files) --
+ * sharpening the existing directive, not new capability, since recipes
+ * 4/5 already modeled that shape. Line 3 (edit-bypass) gained one new
+ * sentence: same-file concurrent edits are safe (entity-level merge,
+ * structured conflicts, nothing silently lost) -- this IS new capability
+ * information, added here because the model has no other way to learn
+ * that parallel subagents can safely fan out onto one file.
  */
 export const CODE_MODE_ADDENDUM = `Code mode: call sem_code with a short async JS program instead of many small tool calls. Sandboxed: only \`sem\` is exposed, no require/process/fetch/filesystem.
-Batch everything one turn needs in a single script; return only the final answer via console.log or a return value. sem.log(...) streams progress; console.log output is capped ~8k tokens.
-All edits go through sem.edit/sem.add inside sem_code -- never apply_patch/patch/exec_command/bash redirection, which bypass verification and coordination.
+One script per turn, not many single-verb round trips: read, decide, edit, and check() together; prefer entity verbs over re-reading whole files. Return only the final answer via console.log or a return value; sem.log(...) streams progress, console.log capped ~8k tokens.
+All edits go through sem.edit/sem.add inside sem_code -- never apply_patch/patch/exec_command/bash redirection, which bypass verification and coordination. Concurrent edits to the SAME file are safe -- writes merge at the entity level, real conflicts return as a structured result, nothing is silently lost; fan parallel subagents onto one file without fear.
 "who's affected?" -> sem.blast, "how are these connected?" -> sem.why, "where does this live?" -> sem.where, "what is this?" -> sem.explain
 "am I still green?" -> sem.check, "what have I changed?" -> sem.changed, "definition / callers" -> sem.find / sem.callers
 "rename this, everywhere" -> sem.rename, "edit an entity" -> sem.edit, "new file/module, wired in" -> sem.add, "add an import/mod line" -> sem.addImport, "too much back?" -> sem.more(handle)
