@@ -118,6 +118,23 @@ export interface CallRecord {
   merged?: boolean;
 }
 
+/**
+ * One sem.* call that RAN TO COMPLETION, with the value it produced.
+ *
+ * P6 (2026-09-02 transcript study): every verb throws on a soft failure and
+ * an uncaught throw used to discard the entire script's output, so 206
+ * scripts across 147 of 327 runs (45%) lost ~518 already-completed calls to
+ * one bad guess later in the script -- a tax that scaled with how well the
+ * agent followed this tool's own "one script per turn" advice. Retaining
+ * each completed call's value costs nothing (the value is already in memory,
+ * already JSON-round-tripped by the trampoline) and makes every remaining
+ * throw survivable.
+ */
+export interface CompletedCall {
+  fn: string;
+  value: unknown;
+}
+
 export interface SandboxResult {
   ok: boolean;
   output: string;
@@ -164,6 +181,8 @@ export interface SandboxResult {
    * change by a microtask in either direction.
    */
   pendingAtResolve: number;
+  /** Every sem.* call that COMPLETED, in order, with its own result -- see CompletedCall. Present on every exit path; the error paths are what it exists for. */
+  completed: CompletedCall[];
   error?: SandboxError;
   value?: unknown;
 }
@@ -432,6 +451,7 @@ export async function runInSandbox(code: string, options: SandboxOptions): Promi
   let refusedAfterResolve = 0;
   let pendingAtResolve = 0;
   const calls: CallRecord[] = [];
+  const completed: CompletedCall[] = [];
   const cancellation = options.cancellation ?? createRunCancellation();
 
   // Build the context with a throwaway placeholder global object first --
@@ -480,6 +500,9 @@ export async function runInSandbox(code: string, options: SandboxOptions): Promi
       pendingAtResolve++;
       try {
         const result = await target(...args);
+        // Retained BEFORE the sub-call bookkeeping below, so a batch verb's
+        // one return value is kept whole rather than once per sub-outcome.
+        if (result !== undefined) completed.push({ fn: fnName, value: result });
         const subCalls = readSubCalls(result);
         if (subCalls !== undefined) {
           for (const sub of subCalls) calls.push(sub);
@@ -543,7 +566,7 @@ export async function runInSandbox(code: string, options: SandboxOptions): Promi
     // Nothing could have started (the script never ran), but revoke
     // anyway for consistency with every other exit path below.
     cancellation.revoke();
-    return { ok: false, output: sink.text, truncated: sink.truncated, callCount, calls, refusedAfterResolve, pendingAtResolve, error: toSandboxError(err) };
+    return { ok: false, output: sink.text, truncated: sink.truncated, callCount, calls, completed, refusedAfterResolve, pendingAtResolve, error: toSandboxError(err) };
   }
 
   let outcome: { ok: true; value: unknown } | { ok: false; error: unknown; timedOut: boolean };
@@ -594,6 +617,7 @@ export async function runInSandbox(code: string, options: SandboxOptions): Promi
       truncated: sink.truncated,
       callCount,
       calls,
+      completed,
       refusedAfterResolve,
       pendingAtResolve,
       error: timeoutSuffix ? { ...sandboxError, message: sandboxError.message + timeoutSuffix } : sandboxError,
@@ -612,8 +636,8 @@ export async function runInSandbox(code: string, options: SandboxOptions): Promi
     // sanitization was even attempted) -- no-op call, kept for clarity
     // that this exit path is also covered, not an oversight.
     cancellation.revoke();
-    return { ok: false, output: sink.text, truncated: sink.truncated, callCount, calls, refusedAfterResolve, pendingAtResolve, error: toSandboxError(sanitized.error) };
+    return { ok: false, output: sink.text, truncated: sink.truncated, callCount, calls, completed, refusedAfterResolve, pendingAtResolve, error: toSandboxError(sanitized.error) };
   }
 
-  return { ok: true, output: sink.text, truncated: sink.truncated, callCount, calls, refusedAfterResolve, pendingAtResolve, value: sanitized.value };
+  return { ok: true, output: sink.text, truncated: sink.truncated, callCount, calls, completed, refusedAfterResolve, pendingAtResolve, value: sanitized.value };
 }
