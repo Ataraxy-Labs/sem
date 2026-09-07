@@ -268,6 +268,8 @@ interface DedupEntry {
   cachedAt: number;
   /** The FIRST row's own `h<n>` handle from the cached result, when it had one -- reused as "unchanged since h_"'s reference so the model gets something it can actually pass to read()/etc, rather than a second, unresolvable handle namespace. */
   sinceHandle: string | undefined;
+  /** The already-budgeted answer. A cache hit must preserve the verb's result shape so callers can safely keep using `.hits`, `.results`, `.rows`, etc. */
+  result: unknown;
 }
 
 /**
@@ -596,10 +598,12 @@ function firstRowHandle(result: unknown): string | undefined {
 /**
  * Wraps a row-shaped question verb (find/grep/callers/blast/where) with
  * session-wide dedup: an IDENTICAL (verb, args) call, when nothing the
- * cached result depended on has changed since, returns `{unchanged: true,
- * since, message: "unchanged since h_"}` WITHOUT re-running the underlying
- * call at all -- the real savings this exists for (a re-grep in a later
- * sem_code call costs nothing, not "costs less").
+ * cached result depended on has changed since, returns the cached result in
+ * its ORIGINAL SHAPE with `{unchanged: true, since, message}` added. It does
+ * not re-run the underlying call. Shape preservation matters because a model
+ * naturally repeats a query and then keeps using `.hits`/`.results`/`.rows`;
+ * replacing that result with a marker turns a cache hit into a script crash
+ * and costs an entire extra outer model turn.
  */
 async function withDedup(verbName: string, args: unknown, run: () => Promise<unknown>, dedup: DedupStore, changes: ChangeLog, budget: RunBudget, sessionBudget: SessionBudget, cwd: string): Promise<unknown> {
   const key = `${verbName}:${JSON.stringify(args)}`;
@@ -627,19 +631,35 @@ async function withDedup(verbName: string, args: unknown, run: () => Promise<unk
     // depended on against the bytes that are there NOW (stat first, hash
     // only on a stat difference -- see stampsStale).
     if (!changedSince && !stampsStale(cached.stamps, cwd)) {
-      const stub = {
-        unchanged: true,
-        since: cached.sinceHandle,
-        message: cached.sinceHandle ? `unchanged since ${cached.sinceHandle}` : "unchanged since the last identical call this session",
-      };
-      const cost = estimateTokens(stub);
+      const result = cached.result !== null && typeof cached.result === "object"
+        ? {
+            ...(cached.result as Record<string, unknown>),
+            unchanged: true,
+            since: cached.sinceHandle,
+            message: cached.sinceHandle ? `unchanged since ${cached.sinceHandle}` : "unchanged since the last identical call this session",
+          }
+        : {
+            result: cached.result,
+            unchanged: true,
+            since: cached.sinceHandle,
+            message: cached.sinceHandle ? `unchanged since ${cached.sinceHandle}` : "unchanged since the last identical call this session",
+          };
+      const cost = estimateTokens(result);
       budget.spend(cost);
       sessionBudget.spend(cost);
-      return stub;
+      return result;
     }
   }
   const result = await run();
-  dedup.record(key, { stamps: stampFiles(filesTouchedIn(result), cwd), cachedAt: Date.now(), sinceHandle: firstRowHandle(result) });
+  dedup.record(key, {
+    stamps: stampFiles(filesTouchedIn(result), cwd),
+    cachedAt: Date.now(),
+    sinceHandle: firstRowHandle(result),
+    // Do not let a direct API caller mutating the first returned object
+    // corrupt later cache hits. Results are plain structured data by the
+    // time they reach this boundary.
+    result: structuredClone(result),
+  });
   return result;
 }
 

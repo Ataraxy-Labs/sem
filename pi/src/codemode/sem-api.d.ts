@@ -452,9 +452,10 @@ declare interface WhereResult {
 }
 
 /**
- * A verb's response when session-wide dedup (v2 item 5) recognized an
- * IDENTICAL (verb, args) call whose result hasn't changed since -- see
- * find()/grep()/callers()/blast()/where() below. `since` is a REAL handle
+ * Metadata added to a verb's normal response when session-wide dedup
+ * recognized an IDENTICAL (verb, args) call whose result hasn't changed.
+ * The normal result fields remain present, so `.hits`/`.results`/`.rows`
+ * continue to work. `since` is a REAL handle
  * from the original call's first row (not a fresh, second handle
  * namespace) -- pass it to read()/etc the same way you would any other
  * handle.
@@ -548,18 +549,18 @@ declare const sem: {
   /** A single entity (bare locator/handle, or a 1-element array) gets its full body -- UNLESS this session's cumulative token spend is over its soft ceiling, in which case even a single entity defaults to headers-only too (see HeadersOnlyResult.note). 2+ entities in ONE call always default to headers-only. `{ full: true }` overrides both cases, getting ReadResult/ReadResult[] regardless. A locator with no `name` is refused -- there's no whole-file read here, use sem.outline(file). */
   read(entity: EntityLocator | string | Array<EntityLocator | string>, opts?: { budget?: number; hops?: number; full?: boolean }): Promise<ReadResult | ReadResult[] | HeadersOnlyResult>;
 
-  /** Exact, case-sensitive name lookup via sem's index. Pass an array to look up several names in one call -- that returns a single FindBatchResult, NOT an array, with one entry per name under `results`. An IDENTICAL query already answered earlier THIS SESSION, with nothing it depends on changed since, comes back as UnchangedResult instead of re-running -- see `since`. */
-  find(names: string): Promise<FindResult | UnchangedResult>;
+  /** Exact, case-sensitive name lookup via sem's index. Pass an array to look up several names in one call -- that returns a single FindBatchResult, NOT an array, with one entry per name under `results`. An IDENTICAL query already answered earlier THIS SESSION keeps this same shape and adds UnchangedResult metadata instead of re-running. */
+  find(names: string): Promise<FindResult & Partial<UnchangedResult>>;
   find(names: string[]): Promise<FindBatchResult>;
 
   /** Regex search over repo text, trigram-indexed. */
-  /** Text search via sem's own grep. Pass an array to search several patterns in one call -- like find(names[]), that returns a single GrepBatchResult object, NOT an array, with one entry per pattern under `results`. An IDENTICAL single-pattern call already answered earlier THIS SESSION, unchanged since, comes back as UnchangedResult instead of re-running. */
+  /** Text search via sem's own grep. Pass an array to search several patterns in one call -- like find(names[]), that returns a single GrepBatchResult object, NOT an array, with one entry per pattern under `results`. An IDENTICAL call already answered earlier THIS SESSION keeps this same shape and adds UnchangedResult metadata instead of re-running. */
   /** `literal: true` searches the pattern as PLAIN TEXT instead of a regex -- reach for it whenever the pattern is code, since "is_fits(", "only(" or "col_suffixes=['" is an unclosed-group parse error as a regex, not a search. */
-  grep(patterns: string, opts?: { path?: string; glob?: string; context?: number; limit?: number; literal?: boolean }): Promise<GrepResult | UnchangedResult>;
+  grep(patterns: string, opts?: { path?: string; glob?: string; context?: number; limit?: number; literal?: boolean }): Promise<GrepResult & Partial<UnchangedResult>>;
   grep(patterns: string[], opts?: { path?: string; glob?: string; context?: number; limit?: number; literal?: boolean }): Promise<GrepBatchResult>;
 
-  /** Direct callers of one entity (index-backed reverse postings). Throws if the name is ambiguous or not found. An IDENTICAL call already answered earlier THIS SESSION, unchanged since, comes back as UnchangedResult instead of re-running. */
-  callers(name: string): Promise<CallersResult | UnchangedResult>;
+  /** Direct callers of one entity (index-backed reverse postings). Throws if the name is ambiguous or not found. An IDENTICAL call already answered earlier THIS SESSION keeps this same shape and adds UnchangedResult metadata instead of re-running. */
+  callers(name: string): Promise<CallersResult & Partial<UnchangedResult>>;
 
   /** Full blast radius of changing one entity: deps, dependents, transitive impact, affected tests. */
   impact(name: string): Promise<ImpactResult>;
@@ -601,13 +602,13 @@ declare const sem: {
   history(entity: string, opts?: { limit?: number }): Promise<EntityHistory>;
 
   /** "Who's affected if I change this" in ONE call: callers ∪ transitive dependents ∪ affected tests, deduped, with a per-row hop count -- replaces composing sem.callers()+sem.impact() yourself. depth default 2. An IDENTICAL call already answered earlier THIS SESSION, unchanged since, comes back as UnchangedResult instead of re-running. */
-  blast(seed: Ref, opts?: { depth?: number }): Promise<BlastResult | UnchangedResult>;
+  blast(seed: Ref, opts?: { depth?: number }): Promise<BlastResult & Partial<UnchangedResult>>;
 
   /** "How are A and B connected" -- the shortest chain plus a one-line summary, e.g. "tokenize -> Lexer::next -> Parser::new (2 hops)". Same direction semantics as sem.path() (default "out": a real directed call chain from a to b; "any" is the old undirected opt-in). */
   why(a: Ref, b: Ref, opts?: { direction?: "out" | "in" | "any" }): Promise<WhyResult>;
 
   /** Broad/fuzzy discovery for a concept you can't spell exactly: exact-name definitions (find) ∪ full-text mentions (grep), ranked (definitions first) and deduped. Use this before sem.find() when you're not sure of the exact name. An IDENTICAL call already answered earlier THIS SESSION, unchanged since, comes back as UnchangedResult instead of re-running. */
-  where(concept: string): Promise<WhereResult | UnchangedResult>;
+  where(concept: string): Promise<WhereResult & Partial<UnchangedResult>>;
 
   /** Everything about one entity in one call: signature, doc, up to 5 callers, and a short deterministic summary paragraph. `target` also accepts an `h<n>` handle from an earlier row. */
   explain(target: EntityLocator | string): Promise<ExplainResult>;

@@ -32,9 +32,10 @@ test("find(): an identical query in the SAME buildSemApi() call is deduped on th
     const first = (await api.find("add")) as { hits: unknown[] };
     assert.ok(Array.isArray(first.hits) && first.hits.length > 0);
 
-    const second = (await api.find("add")) as { unchanged?: boolean; since?: string; message?: string };
+    const second = (await api.find("add")) as { hits?: unknown[]; unchanged?: boolean; since?: string; message?: string };
     assert.equal(second.unchanged, true);
     assert.match(second.message ?? "", /unchanged since/i);
+    assert.ok(Array.isArray(second.hits) && second.hits.length > 0, "a cache hit preserves find()'s result shape");
   });
 });
 
@@ -53,12 +54,14 @@ test("grep()/callers()/blast()/where() are each independently deduped by their o
     const api = buildSemApi({ cwd: dir, semBin: "sem" });
 
     await api.grep("add");
-    const grepSecond = (await api.grep("add")) as { unchanged?: boolean };
+    const grepSecond = (await api.grep("add")) as { hits?: unknown[]; unchanged?: boolean };
     assert.equal(grepSecond.unchanged, true);
+    assert.ok(Array.isArray(grepSecond.hits), "a cache hit preserves grep()'s result shape");
 
     await api.callers("add");
-    const callersSecond = (await api.callers("add")) as { unchanged?: boolean };
+    const callersSecond = (await api.callers("add")) as { callers?: unknown[]; unchanged?: boolean };
     assert.equal(callersSecond.unchanged, true);
+    assert.ok(Array.isArray(callersSecond.callers), "a cache hit preserves callers()'s result shape");
   });
 });
 
