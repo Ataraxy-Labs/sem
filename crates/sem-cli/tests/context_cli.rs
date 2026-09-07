@@ -204,15 +204,20 @@ fn context_declines_the_index_for_an_ambiguous_name() {
     assert_success(run_context(&repo, &cache, &["top", "--json"]), "warm cache");
 
     // `mid` now names two entities: the index fast path (single-match only)
-    // must decline and let the legacy path report the ambiguity.
+    // must decline and let the legacy path report the ambiguity. Agent-native
+    // contract: an ambiguous name never yields empty stdout (which reads as
+    // "does not exist" and makes agents thrash) — the candidate list is written
+    // to STDOUT and the process exits 0 so a single call returns actionable info.
     let output = run_context(&repo, &cache, &["mid", "--json"]);
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let phases = phase_names_from_dry(&output);
     assert!(
         !phases.iter().any(|p| p.starts_with("index_context")),
         "ambiguous name must not be answered from the index, got {phases:?}"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("ambiguous"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ambiguous"), "candidates must be on stdout: {stdout}");
+    assert!(stdout.contains("mid"), "candidate list must name the entity: {stdout}");
 }
 
 /// `phase_names` expects the timings JSON to be the *only* thing on stderr;
