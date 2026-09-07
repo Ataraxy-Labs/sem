@@ -1744,8 +1744,21 @@ async function resolveAbsoluteRepoFile(deps: SemApiDeps, file: string): Promise<
 }
 
 /** Reuses the native sem_callers tool's own orchestration (ambiguity refusal, limit=, not-found wording) rather than re-shelling `sem callers` directly. */
-async function callers(name: string, deps: SemApiDeps, handles: HandleStore): Promise<unknown> {
-  const outcome = await performSemCallers({ name }, { cwd: deps.cwd, semBin: deps.semBin ?? "sem" });
+async function callers(target: EntityLocator | string, deps: SemApiDeps, handles: HandleStore): Promise<unknown> {
+  let locator: EntityLocator;
+  if (typeof target === "string" && !HANDLE_PATTERN.test(target)) {
+    locator = { name: target };
+  } else {
+    const resolved = typeof target === "string" ? handles.resolve(target) : target;
+    if (resolved === undefined) {
+      throw toCodeModeError(`sem.callers: "${target}" is not a known handle from this session -- pass an exact entity name, locator, or find() hit handle.`);
+    }
+    locator = resolved as EntityLocator;
+  }
+  const outcome = await performSemCallers(
+    { name: locator.name, entity_type: locator.entity_type, file: locator.file },
+    { cwd: deps.cwd, semBin: deps.semBin ?? "sem" },
+  );
   if (outcome.isError) throw toCodeModeError(outcome.text);
   const details = outcome.details as { callers?: FindHitLike[] };
   if (!Array.isArray(details.callers)) return details;

@@ -560,7 +560,7 @@ declare const sem: {
   grep(patterns: string[], opts?: { path?: string; glob?: string; context?: number; limit?: number; literal?: boolean }): Promise<GrepBatchResult>;
 
   /** Direct callers of one entity (index-backed reverse postings). Throws if the name is ambiguous or not found. An IDENTICAL call already answered earlier THIS SESSION keeps this same shape and adds UnchangedResult metadata instead of re-running. */
-  callers(name: string): Promise<CallersResult & Partial<UnchangedResult>>;
+  callers(target: Ref): Promise<CallersResult & Partial<UnchangedResult>>;
 
   /** Full blast radius of changing one entity: deps, dependents, transitive impact, affected tests. */
   impact(name: string): Promise<ImpactResult>;

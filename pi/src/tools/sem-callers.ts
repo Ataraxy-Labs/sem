@@ -19,6 +19,8 @@ import { runCommand } from "./internal/proc.ts";
 export interface SemCallersParams {
   name: string;
   entity_type?: string;
+  /** Optional exact file filter, used by code-mode handles to preserve the identity selected by find(). */
+  file?: string;
   limit?: number;
 }
 
@@ -56,6 +58,9 @@ const SemCallersParamsSchema = Type.Object({
     Type.String({
       description: "Entity kind to narrow by, e.g. 'function', 'class', 'method' (language-dependent; matches sem's `type` field).",
     }),
+  ),
+  file: Type.Optional(
+    Type.String({ description: "Exact repo-relative file to disambiguate duplicate entity names." }),
   ),
   limit: Type.Optional(
     Type.Integer({
@@ -110,12 +115,19 @@ function formatCandidate(entity: RawEntityRef): string {
  * isError=true.
  */
 export async function performSemCallers(params: SemCallersParams, deps: SemCallersDeps): Promise<SemCallersOutcome> {
-  const baseDetails = { name: params.name, entity_type: params.entity_type ?? null };
+  const baseDetails = { name: params.name, entity_type: params.entity_type ?? null, file: params.file ?? null };
   const query = params.entity_type !== undefined ? `${params.entity_type} ${params.name}` : params.name;
 
   let groups: RawCallersGroup[];
   try {
     groups = await runSemCallersJson(query, deps);
+    if (params.file !== undefined) {
+      const wanted = params.file.startsWith("@") ? params.file.slice(1) : params.file;
+      groups = groups.filter((g) => {
+        const actual = g.entity.file.startsWith("@") ? g.entity.file.slice(1) : g.entity.file;
+        return actual === wanted;
+      });
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return {
@@ -137,7 +149,7 @@ export async function performSemCallers(params: SemCallersParams, deps: SemCalle
     const list = groups.map((g) => formatCandidate(g.entity)).join("\n");
     return {
       isError: true,
-      text: `sem_callers: "${params.name}" is ambiguous — ${groups.length} matches. Add entity_type to narrow it:\n${list}`,
+      text: `sem_callers: "${params.name}" is ambiguous — ${groups.length} matches. Add entity_type or file to narrow it:\n${list}`,
       details: {
         ...baseDetails,
         resolved: false,

@@ -54,6 +54,20 @@ test("callers()'s rows each carry a unique h<n> handle, distinct from find()'s i
   });
 });
 
+test("callers() accepts a find() hit handle and preserves its exact identity", async () => {
+  await withTempCopy(["calls.ts"], async (dir) => {
+    const api = buildSemApi({ cwd: dir, semBin: "sem" });
+    const found = (await api.find("add")) as { hits: Array<{ h: string }> };
+    const called = (await api.callers(found.hits[0]!.h)) as { callers: Array<{ name: string }> };
+    assert.deepEqual(called.callers.map((c) => c.name).sort(), ["thrice", "twice"]);
+  });
+});
+
+test("callers() rejects an unknown handle clearly instead of searching for its literal text", async () => {
+  const api = buildSemApi({ cwd: process.cwd(), semBin: "sem" });
+  await assert.rejects(() => api.callers("h999"), /not a known handle/i);
+});
+
 test("read() accepts a handle from an earlier find() result and reads the SAME entity", async () => {
   await withTempCopy(["calls.ts"], async (dir) => {
     const api = buildSemApi({ cwd: dir, semBin: "sem" });
