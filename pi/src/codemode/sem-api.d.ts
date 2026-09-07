@@ -246,6 +246,14 @@ declare interface MergeStatus {
   mergedOver?: string[];
 }
 
+declare interface EditVerification {
+  /** True only when extraction conclusively verified the edit. */
+  ok: boolean;
+  /** False means the edit landed, but parser/extractor drift requires sem.check. */
+  conclusive: boolean;
+  reason?: string;
+}
+
 declare interface EditResult {
   file: string;
   op: EditOp;
@@ -257,6 +265,7 @@ declare interface EditResult {
   impact: string;
   /** Non-empty only after a RENAME (a replace whose entity name actually changed) -- every other file still mentioning the OLD name (e.g. a now-dangling import), swept via a word-boundary-safe grep. Always [] for a same-name content edit. Follow up by editing each one before considering the rename done. */
   leftover_references: LeftoverReference[];
+  verification: EditVerification;
   merge: MergeStatus;
 }
 

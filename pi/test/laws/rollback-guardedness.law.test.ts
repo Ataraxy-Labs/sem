@@ -30,7 +30,7 @@
 //
 //   (ii) GUARDEDNESS OF COMPENSATION. C(T) may only compensate T's own
 //        write, never a stranger's. Every engine write -- forward commit,
-//        verification rollback, identity-refusal restore, atomic-batch
+//        operation-invariant rollback, identity-refusal restore, atomic-batch
 //        restore -- goes through ONE primitive, guardedWrite(path,
 //        expectedImage, bytes), a synchronous compare-adjacent-write. A
 //        rollback whose guard is lost does NOT retry blindly: it reports
@@ -152,14 +152,13 @@ test("law (i) purity: a torn foreign read during the verification window cannot 
   });
 });
 
-test("law (ii) guardedness, verification rollback: a genuine verification failure over a file that moved underneath reports rollback-window-lost and destroys nothing", async () => {
+test("law (ii) guardedness: an identity refusal over a file that moved underneath reports rollback-window-lost and destroys nothing", async () => {
   await withHarness(async ({ dir, signals }) => {
     const file = join(dir, "f.ts");
     writeFileSync(file, ORIGINAL);
-    // STYLE=mid: the verification extraction runs for real (against the
-    // engine's own output, which genuinely fails to parse), and only THEN is
-    // the foreign write landed -- so the failure verdict is real and the
-    // rollback is the thing under test.
+    // STYLE=mid: extraction runs against the engine's own output and only
+    // THEN is the foreign write landed, so the identity refusal's guarded
+    // compensation is the thing under test.
     gate(2, "mid", signals);
 
     const pending = performWeaveEdit(
@@ -181,11 +180,12 @@ test("law (ii) guardedness, verification rollback: a genuine verification failur
     assert.match(outcome.text, /rollback (was )?skipped|file changed underneath/i, "the skipped compensation is reported, never silent");
     const rw = outcome.details.rollbackWindow as { ok?: boolean; cause?: string; expected?: unknown; actual?: unknown } | undefined;
     assert.equal(rw?.ok, false, "the receipt names the new summand");
-    assert.equal(rw?.cause, "verification-failed", "and names which compensation was skipped");
+    assert.equal(rw?.cause, "identity-changed", "and names which compensation was skipped");
     assert.ok(rw?.expected !== undefined && rw?.actual !== undefined, "the receipt carries what it expected vs what it found");
     assert.equal(outcome.details.rolledBack, false, "rolledBack must tell the truth: nothing was restored");
-    // Non-vacuity: the verification failure itself was genuine, not torn-read noise.
-    assert.equal((outcome.details.verification as { ok?: boolean }).ok, false);
+    // Non-vacuity: the edited identity really disappeared; this is not a
+    // heuristic neighbor-loss warning.
+    assert.equal((outcome.details.identityChange as { ok?: boolean }).ok, false);
   });
 });
 
@@ -207,7 +207,7 @@ test("law (ii) guardedness, identity-refusal restore: the same guard covers the 
     const outcome = await pending;
     const disk = readFileSync(file, "utf8");
 
-    assert.equal(disk, FOREIGN_FINAL, "the identity refusal's restore is guarded exactly like the verification rollback");
+    assert.equal(disk, FOREIGN_FINAL, "the identity refusal's restore is guarded like every compensating rollback");
     assert.ok(disk.includes("777"));
     assert.equal(outcome.isError, true);
     assert.match(outcome.text, /rollback (was )?skipped|file changed underneath/i);
@@ -260,7 +260,7 @@ test("law (ii) guardedness, atomic batch restore: the all-or-nothing snapshot re
   });
 });
 
-test("regression guard: in the single-writer frame the guarded rollback is still an EXACT inverse (guardedWrite did not weaken LAW 4's green half)", async () => {
+test("regression guard: losing the edited identity still rolls back exactly", async () => {
   const dir = mkdtempSync(join(tmpdir(), "law-guarded-exact-"));
   try {
     const file = join(dir, "f.ts");
@@ -270,9 +270,9 @@ test("regression guard: in the single-writer frame the guarded rollback is still
       { cwd: dir, semBin: "sem", coordinator: undefined },
     );
     assert.equal(outcome.isError, true);
-    assert.match(outcome.text, /failed verification and was rolled back/);
+    assert.match(outcome.text, /Refused and rolled back/);
     assert.equal(outcome.details.rolledBack, true);
-    assert.equal(readFileSync(file, "utf8"), ORIGINAL, "no foreign writer means the guard holds and the compensation runs to completion");
+    assert.equal(readFileSync(file, "utf8"), ORIGINAL, "no foreign writer means the compensation runs to completion");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

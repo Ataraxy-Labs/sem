@@ -1,8 +1,8 @@
 // LAW 4 (green half) -- ROLLBACK SAFETY: the compensating action restores
 // the pre-edit bytes EXACTLY.
 //
-// STRUCTURE: performOneWeaveEdit's verify-extract failure path and its
-// identity-guard refusal path are COMPENSATING TRANSACTIONS
+// STRUCTURE: performOneWeaveEdit's identity-guard refusal path is a
+// COMPENSATING TRANSACTION
 // (Garcia-Molina & Salem 1987, "Sagas", SIGMOD): the forward action (the
 // splice write) already committed to disk, so the failure path executes
 // C(T) = write(currentContent). The law witnessed here is that C is an
@@ -32,26 +32,6 @@ import { performWeaveEdit } from "../../src/tools/weave-edit.ts";
 function makeDir(): string {
   return mkdtempSync(join(tmpdir(), "law-rollback-"));
 }
-
-test("verify-extract rollback: a replace that breaks the file's parse is rolled back to the exact pre-edit bytes", async () => {
-  const dir = makeDir();
-  try {
-    const original = "export function target(): number {\n  return 1;\n}\n\nexport function other(): number {\n  return 2;\n}\n";
-    writeFileSync(join(dir, "f.ts"), original);
-    const outcome = await performWeaveEdit(
-      // Unbalanced parens/braces: tree-sitter error recovery swallows the
-      // NEIGHBOR entity, which is exactly what verifyEdit detects.
-      { file: "f.ts", entity: { name: "target" }, op: "replace", content: "export function target(): number {\n  return ((1;\n" },
-      { cwd: dir, semBin: "sem", coordinator: undefined },
-    );
-    assert.equal(outcome.isError, true, "non-vacuity: verification must actually have failed");
-    assert.match(outcome.text, /failed verification and was rolled back/);
-    assert.equal(outcome.details.rolledBack, true);
-    assert.equal(readFileSync(join(dir, "f.ts"), "utf8"), original, "byte-for-byte restoration");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
 
 test("identity-guard rollback: a refused rename-by-replace restores CRLF + missing-trailing-newline bytes exactly", async () => {
   const dir = makeDir();

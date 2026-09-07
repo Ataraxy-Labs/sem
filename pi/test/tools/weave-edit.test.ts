@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { performWeaveEdit, type WeaveEditParams } from "../../src/tools/weave-edit.ts";
 
@@ -124,7 +124,7 @@ test("two concurrent edits to different entities in the same file both land", as
   });
 });
 
-test("a rewrite that breaks parsing around the edit fails verification and is rolled back", async () => {
+test("a rewrite that loses the edited identity is refused and rolled back", async () => {
   const dir = mkdtempSync(join(tmpdir(), "weave-edit-test-"));
   try {
     const file = "two.ts";
@@ -137,10 +137,46 @@ test("a rewrite that breaks parsing around the edit fails verification and is ro
     );
     assert.equal(outcome.isError, true);
     assert.match(outcome.text, /rolled back/);
-    assert.match(outcome.text, /verification/i);
+    assert.match(outcome.text, /no entity found at the edited location/);
 
     const finalContent = readFileSync(join(dir, file), "utf8");
     assert.equal(finalContent, original, "file content is restored exactly on rollback");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a vanished neighbor is advisory and the requested edit remains on disk", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "weave-edit-inconclusive-"));
+  try {
+    const file = "two.ts";
+    const semStub = join(dir, "sem-stub.mjs");
+    writeFileSync(join(dir, file), "function target() {\n  return 1;\n}\n\nfunction neighbor() {\n  return 2;\n}\n");
+    writeFileSync(
+      semStub,
+      `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const path = process.argv.at(-1);
+const text = readFileSync(path, "utf8");
+const entity = (name, start, end) => ({ name, type: "function", start_line: start, end_line: end, start_byte: start, end_byte: end, parent_id: null });
+const entities = text.includes("inserted_marker") ? [entity("target", 1, 3), entity("inserted_marker", 5, 7)] : [entity("target", 1, 3), entity("neighbor", 5, 7)];
+process.stdout.write(JSON.stringify(entities));
+`,
+    );
+    chmodSync(semStub, 0o755);
+
+    const outcome = await performWeaveEdit(
+      { file, entity: { name: "target" }, op: "insert_after", content: "function inserted_marker() {\n  return 3;\n}" },
+      { cwd: dir, semBin: semStub, coordinator: undefined },
+    );
+
+    assert.equal(outcome.isError, false, outcome.text);
+    assert.match(outcome.text, /Verification: inconclusive/);
+    assert.match(outcome.text, /sem\.check/);
+    const verification = outcome.details.verification as { ok: boolean; conclusive: boolean; reason?: string };
+    assert.equal(verification.ok, false);
+    assert.equal(verification.conclusive, false);
+    assert.match(readFileSync(join(dir, file), "utf8"), /inserted_marker/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

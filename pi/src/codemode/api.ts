@@ -2725,6 +2725,7 @@ async function editOne(request: EditRequest, deps: SemApiDeps, changes: ChangeLo
     entity: { name: string; type: string; parent_name: string | null; old_start_line: number; old_end_line: number };
     new_range: { start_line: number; end_line: number } | null;
     dependents: DependentsReportLike & { after?: unknown[] };
+    verification: { ok: boolean; conclusive: boolean; reason?: string };
     merge?: MergeStatus;
   };
   const newName = d.op === "replace" ? await detectRenamedTo(request.file, d.entity.name, d.new_range, deps) : d.entity.name;
@@ -2742,6 +2743,7 @@ async function editOne(request: EditRequest, deps: SemApiDeps, changes: ChangeLo
     // already captured above, never a second query. See impactLine().
     impact: impactLine(d.dependents),
     leftover_references: leftoverReferences,
+    verification: d.verification,
     merge,
   };
   // One CallRecord for this single edit, same as the trampoline's generic
@@ -2857,6 +2859,7 @@ async function edit(request: EditRequest | EditRequest[], deps: SemApiDeps, chan
         entity: { name: string; type: string; parent_name: string | null; old_start_line: number; old_end_line: number };
         new_range: { start_line: number; end_line: number } | null;
         dependents: DependentsReportLike & { after?: unknown[] };
+        verification: { ok: boolean; conclusive: boolean; reason?: string };
         merge?: MergeStatus;
       };
       const entryMerge: MergeStatus = rd.merge ?? { attempted: false, performed: false };
@@ -2874,6 +2877,7 @@ async function edit(request: EditRequest | EditRequest[], deps: SemApiDeps, chan
         // Per ENTRY, not per batch -- each entity's own consequence line.
         impact: impactLine(rd.dependents),
         leftover_references: leftoverReferences,
+        verification: rd.verification,
         merge: entryMerge,
       };
     }),

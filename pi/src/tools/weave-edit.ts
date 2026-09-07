@@ -10,7 +10,7 @@ import { Type, type Static } from "typebox";
 import { currentBranch, repoRelativePath, type RepoLocation } from "./internal/git.ts";
 import { describeEntityFilters, describeNameMatchCount, extractEntities, extractEntitiesFromText, resolveEntity, type Entity, type ResolveResult } from "./internal/entities.ts";
 import { splice, parseLines, renderLines, type Op } from "./internal/text.ts";
-import { verifyEdit } from "./internal/verify.ts";
+import { verifyEdit, type VerificationResult } from "./internal/verify.ts";
 import { compareIdentity, deriveVisibility, type IdentityChange, type IdentityFacts } from "./internal/identity.ts";
 import { checkDependents, type DependentInfo } from "./internal/impact.ts";
 import { Coordinator, type MergeConflictSummary } from "./internal/weave-coordination.ts";
@@ -624,6 +624,7 @@ function formatSuccess(
   dependents: DependentsReport,
   coordination: CoordinationStatus,
   merge: MergeStatus,
+  verification: VerificationResult,
 ): WeaveEditOutcome {
   const location = `${entity.name} (${entity.type}${entity.parentName ? ` in ${entity.parentName}` : ""})`;
   const oldRange = `${entity.start_line}-${entity.end_line}`;
@@ -631,7 +632,7 @@ function formatSuccess(
 
   return {
     isError: false,
-    text: `weave_edit: ${params.op} ${location} in ${params.file}, ${rangeText}. Verification: ok.${formatMergeText(merge)}${formatDependentsText(dependents, params.op)} ${formatCoordinationText(coordination)}.`,
+    text: `weave_edit: ${params.op} ${location} in ${params.file}, ${rangeText}. Verification: ${verification.conclusive ? "ok" : `inconclusive — ${verification.reason}`}.${formatMergeText(merge)}${formatDependentsText(dependents, params.op)} ${formatCoordinationText(coordination)}.`,
     details: {
       file: params.file,
       op: params.op,
@@ -647,7 +648,7 @@ function formatSuccess(
         byte_range_reliable: entity.byteRangeReliable,
       },
       new_range: newRange ? { start_line: newRange.start, end_line: newRange.end } : null,
-      verification: { ok: true },
+      verification,
       dependents,
       coordination,
       merge,
@@ -739,6 +740,7 @@ type QueueOutcome =
       dependents: DependentsReport;
       /** The entity's post-edit name, if a replace renamed it (allow_signature_change) — equal to entity.name otherwise. */
       afterEntityName: string;
+      verification: VerificationResult;
     };
 
 /**
@@ -750,8 +752,8 @@ type QueueOutcome =
  * changed it first), run the merge gate, write only against a disk that
  * has not moved since the gate saw it and confirm the edit landed —
  * retrying the gate up to MAX_MERGE_ATTEMPTS times if it did — verify by
- * re-extracting entities and rolling back on failure, then release the
- * claim regardless of outcome.
+ * re-extracting entities (reporting heuristic parser drift as inconclusive,
+ * not destructive), then release the claim regardless of outcome.
  */
 async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDeps): Promise<WeaveEditOutcome> {
   const { cwd, semBin, coordinator, signal } = deps;
@@ -1078,7 +1080,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
       const entitiesAfter = entitiesOfWrittenText ?? (await extractEntitiesFromText(semBin, textToWrite, absPath, cwd, signal));
       const verification = verifyEdit(entitiesBefore, entitiesAfter, resolved.entity, params.op as Op);
 
-      if (!verification.ok) {
+      if (!verification.ok && verification.conclusive) {
         // The compensation is guarded exactly like the commit: restore only
         // over this edit's OWN last write. Foreign bytes mean the frame
         // moved, and the honest outcome is to report it, never to blind-fire
@@ -1126,7 +1128,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
 
         const changes = compareIdentity(beforeFacts, afterFacts);
         if (changes.length > 0 && !allowSignatureChange) {
-          // Same guard as the verification rollback -- an identity refusal is
+          // Same guard as every compensating rollback -- an identity refusal is
           // the same compensating transaction, so it earns the same right to
           // overwrite: only this edit's own bytes.
           const restore = guardedWrite(absPath, textToWrite, currentContent);
@@ -1188,6 +1190,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
         insertedText: spliced.insertedText,
         dependents,
         afterEntityName,
+        verification,
       };
     });
   } catch (err) {
@@ -1243,7 +1246,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
   if (queueOutcome.kind === "write-window-lost")
     return formatWriteWindowLostFailure(params, queueOutcome.entity, queueOutcome.attempts, queueOutcome.phase, coordination, merge);
   if (queueOutcome.kind === "rollback-window-lost") return formatRollbackWindowLostFailure(params, queueOutcome, coordination, merge);
-  return formatSuccess(params, queueOutcome.entity, queueOutcome.newRange, queueOutcome.dependents, coordination, merge);
+  return formatSuccess(params, queueOutcome.entity, queueOutcome.newRange, queueOutcome.dependents, coordination, merge, queueOutcome.verification);
 }
 
 /** One resync attempt's outcome, reported per rolled-back-but-previously-succeeded edit. */
