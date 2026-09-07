@@ -2446,8 +2446,8 @@ export function createCheckCache(): CheckCache {
 }
 
 /**
- * Cache key: `git rev-parse HEAD` + `git status --porcelain`'s own output,
- * hashed. Deliberately a REAL git fingerprint of the working tree, not a
+ * Cache key: `git rev-parse HEAD` + the tracked binary diff + untracked file
+ * names and contents, hashed. Deliberately a REAL git fingerprint of the working tree, not a
  * proxy over `deps.changes`'s own entry count -- code mode's own
  * sem.edit()/sem.write() aren't the only way the tree can change between
  * two check() calls in one session (a human, another process, or a
@@ -2460,8 +2460,23 @@ export function createCheckCache(): CheckCache {
 async function computeTreeFingerprint(cwd: string): Promise<string | undefined> {
   const head = await runCommand("git", ["rev-parse", "HEAD"], cwd).catch(() => undefined);
   if (!head || head.exitCode !== 0) return undefined;
-  const status = await runCommand("git", ["status", "--porcelain"], cwd).catch(() => undefined);
-  return `${head.stdout.trim()}:${status?.stdout ?? ""}`;
+  const diff = await runCommand("git", ["diff", "--no-ext-diff", "--binary", "HEAD", "--"], cwd).catch(() => undefined);
+  if (!diff || diff.exitCode !== 0) return undefined;
+  const untracked = await runCommand("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd).catch(() => undefined);
+  if (!untracked || untracked.exitCode !== 0) return undefined;
+
+  const hash = createHash("sha256").update(head.stdout.trim()).update("\0tracked\0").update(diff.stdout);
+  for (const path of untracked.stdout.split("\0").filter((value) => value.length > 0).sort()) {
+    hash.update("\0untracked\0").update(path).update("\0");
+    try {
+      hash.update(await readFile(resolve(cwd, path)));
+    } catch {
+      // A concurrent writer removed the file between enumeration and read.
+      // Include that fact; the next fingerprint will differ if it reappears.
+      hash.update("<unreadable-or-removed>");
+    }
+  }
+  return hash.digest("hex");
 }
 
 async function check(opts: CheckOpts = {}, deps: SemApiDeps, checkCache: CheckCache): Promise<CheckResult> {

@@ -319,6 +319,26 @@ test("check(): the cache is invalidated once the tree actually changes (a new un
   });
 });
 
+test("check(): editing the same tracked file twice invalidates both cached verdicts", async () => {
+  await withTempDir(async (dir) => {
+    await initGitRepo(dir);
+    writeFileSync(join(dir, "marker.txt"), "base");
+    await runCommand("git", ["add", "marker.txt"], dir);
+    await runCommand("git", ["commit", "-q", "-m", "marker"], dir);
+    const checkCache = createCheckCache();
+    const api = buildSemApi({ cwd: dir, semBin: "sem", checkCache });
+
+    await api.check();
+    writeFileSync(join(dir, "marker.txt"), "first repair");
+    const firstRepair = await api.check();
+    assert.equal(firstRepair.cached, undefined);
+
+    writeFileSync(join(dir, "marker.txt"), "second repair");
+    const secondRepair = await api.check();
+    assert.equal(secondRepair.cached, undefined, "content changes must invalidate even when porcelain status is identical");
+  });
+});
+
 test("check(): caching is SESSION-scoped -- shared across two separate buildSemApi() calls passing the same checkCache", async () => {
   await withTempDir(async (dir) => {
     await initGitRepo(dir);
