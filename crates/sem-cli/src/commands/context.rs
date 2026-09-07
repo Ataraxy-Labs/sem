@@ -600,19 +600,25 @@ fn find_entity<'a>(
     }
 
     matching.sort_by_key(|e| (&e.file_path, e.start_line));
-    eprintln!(
-        "{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:",
-        "error:".red().bold(),
+    // Agent-friendly disambiguation: an ambiguous name must NEVER produce empty
+    // stdout. Empty stdout reads to an agent as "this entity does not exist",
+    // which makes it abandon the structural tool and thrash on grep/read. Emit
+    // the candidate list to STDOUT (not just stderr) and exit cleanly, so a
+    // single `sem context <name>` call always returns actionable information the
+    // agent can act on (re-query with a qualified `Parent::name`, --file, or
+    // --entity-id). This is the "never miss silently" contract.
+    println!(
+        "'{}' is ambiguous ({} matches). Re-run `sem context` on one of these (use a qualified name, --file, or --entity-id):",
         name,
         matching.len()
     );
     for m in &matching {
-        eprintln!(
+        println!(
             "  {} {} ({}:L{})",
             m.entity_type, m.id, m.file_path, m.start_line
         );
     }
-    std::process::exit(1);
+    std::process::exit(0);
 }
 
 /// "direct_dependency" -> "direct dependencies", "direct_dependent" -> "direct dependents".
