@@ -48,6 +48,24 @@ test("adds an ES named import after existing imports", async () => {
   }
 });
 
+test("adds a Python import after __future__ imports", async () => {
+  const dir = makeDir({
+    "a.py": '# Copyright\n\nfrom __future__ import annotations\n\nimport os\n\nVALUE = os.name\n',
+  });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.py", "from .env_utils import is_env_enabled")) as AddImportResult;
+    assert.equal(r.added, true);
+    assert.equal(r.line, 6);
+    assert.match(
+      readFileSync(join(dir, "a.py"), "utf8"),
+      /from __future__ import annotations\n\nimport os\nfrom \.env_utils import is_env_enabled\n/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("idempotent: the same spec again (whitespace/semicolon normalized) reports alreadyPresent", async () => {
   const dir = makeDir({ "a.ts": 'import { one } from "./one.js";\n' });
   try {

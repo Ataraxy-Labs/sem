@@ -3023,7 +3023,7 @@ export interface AddImportResult {
 
 const RUST_MOD_RE = /^(?:pub(?:\(crate\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?$/;
 const ES_IMPORT_RE = /^import\s+(type\s+)?\{([^}]*)\}\s+from\s+["']([^"']+)["']\s*;?$/;
-const IMPORT_LIKE_RE = /^(?:import\s|(?:pub(?:\(crate\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;|use\s)/;
+const IMPORT_LIKE_RE = /^(?:import\s|from\s+\S+\s+import\s|(?:pub(?:\(crate\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;|use\s)/;
 
 const normalizeDecl = (line: string): string => line.trim().replace(/;$/, "").replace(/\s+/g, " ");
 
