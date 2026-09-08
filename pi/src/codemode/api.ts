@@ -3107,6 +3107,26 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
       i++;
       continue;
     }
+    // A Python module docstring is part of the import prologue. Inserting
+    // above it changes __doc__, and stopping here can place a new import
+    // before a following `from __future__ ...`, which is a SyntaxError.
+    const pyDocDelimiter = lastImportIdx === -1
+      ? (t.startsWith('"""') ? '"""' : t.startsWith("'''") ? "'''" : null)
+      : null;
+    if (pyDocDelimiter) {
+      lastImportIdx = i;
+      const closesOnSameLine = t.slice(3).includes(pyDocDelimiter);
+      i++;
+      if (!closesOnSameLine) {
+        while (i < lines.length) {
+          lastImportIdx = i;
+          const closes = lines[i]!.includes(pyDocDelimiter);
+          i++;
+          if (closes) break;
+        }
+      }
+      continue;
+    }
     if (!IMPORT_LIKE_RE.test(lines[i]!)) break;
     let depth = 0;
     do {
