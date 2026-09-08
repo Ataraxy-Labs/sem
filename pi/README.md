@@ -107,6 +107,31 @@ installed pi package's own tools for a fully locked-down session.
 - **`PI_SEM_PURE`** -- code mode's tool-surface switch. Unset or `"1"` is pure
   (`[sem_code]` only); `"0"` restores `bash`/`write`; `"1"` also forces code
   mode on even when `PI_SEM_MODE` is unset.
+
+### Enforced structural transactions
+
+Transaction mode makes the plan/edit/validate protocol an authority boundary,
+not prompt advice. It starts only the MCP servers in the selected config,
+activates only their allowlisted tools, and disables Pi builtins, `sem_code`,
+and all lower-level native SEM/Weave tools. If the server fails, the active
+tool set is empty (fail closed).
+
+Install Pi from a clone of this repository, then launch it from the target
+repository:
+
+```bash
+cd /path/to/sem/pi
+npm install
+cd /path/to/project
+PI_SEM_MODE=transaction \
+PI_SEM_CONFIG="/path/to/sem/pi/config/transaction.mjs" \
+/path/to/sem/pi/node_modules/.bin/pi -e /path/to/sem/pi
+```
+
+The bundled config exposes exactly `sem_plan` and `weave_transaction` through
+`src/transaction/server.mjs`. Run the command from the repository you want the
+agent to edit, changing the extension/config paths to absolute paths when the
+`sem` checkout lives elsewhere.
 - **`PI_SEM_CHECK_ALLOW`** -- extends pure mode's `sem.check({cmd})` allowlist
   beyond the auto-detected runners (`npm`/`yarn`/`pnpm`/`bun`, `cargo
   test`/`build`/`check`/`clippy`, `pytest`, `go test`/`build`/`vet`, `make
