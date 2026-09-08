@@ -41,6 +41,13 @@ const SEM_COCHANGE_TOOL_NAME = "sem_cochange";
 // else keeps today's per-lookup tool set byte-for-byte; bash/write policy
 // is unaffected either way.
 const CODE_MODE = process.env.PI_SEM_MODE === "code" || process.env.PI_SEM_PURE === "1";
+// Transaction mode is the agent-independent, fail-closed interface: the
+// configured MCP server owns discovery, preflight, atomic editing, and
+// validation.  Unlike tools mode, no lower-level native SEM/Weave tools are
+// registered; unlike code mode, the model cannot compose an unconstrained
+// script.  The only active tools are those explicitly allowlisted from the
+// transaction server (normally sem_plan + weave_transaction).
+const TRANSACTION_MODE = process.env.PI_SEM_MODE === "transaction";
 // Pure codespace is code mode's DEFAULT identity: no active builtins at
 // all, [sem_code] is the entire tool set. The agent lives in the code
 // space with one tool: ask (blast/why/where/explain), act
@@ -179,7 +186,7 @@ export async function startServersAndRegisterTools(
     // the tool surface (activeBuiltins above) and sem.write's behavior can
     // never disagree about which mode this session is in.
     registerSemCode(pi, { pure: PURE_MODE, weaveMcpCommand: weaveServer?.command, weaveMcpArgs: weaveServer?.args, onWriteAudit: onCodeModeWriteAudit });
-  } else {
+  } else if (!TRANSACTION_MODE) {
     registerWeaveEdit(pi, {
       weaveMcpCommand: weaveServer?.command,
       weaveMcpArgs: weaveServer?.args,
@@ -199,9 +206,11 @@ export async function startServersAndRegisterTools(
     // Pure mode: the codespace is the whole surface -- activeBuiltins
     // forced empty regardless of config, so the active set is exactly
     // [sem_code].
-    PURE_MODE ? { ...config.sessionPolicy, activeBuiltins: [] } : config.sessionPolicy,
+    PURE_MODE || TRANSACTION_MODE ? { ...config.sessionPolicy, activeBuiltins: [] } : config.sessionPolicy,
     statuses,
-    CODE_MODE
+    TRANSACTION_MODE
+      ? []
+      : CODE_MODE
       ? [SEM_CODE_TOOL_NAME]
       : [
           WEAVE_EDIT_TOOL_NAME,
@@ -466,7 +475,7 @@ export default function piSemExtension(pi: ExtensionAPI) {
     description: "Show pi-sem MCP server status and active tools",
     handler: async (_args, ctx) => {
       const lines: string[] = [];
-      lines.push(`mode: ${CODE_MODE ? "code (PI_SEM_MODE=code)" : "tools (default)"}`);
+      lines.push(`mode: ${TRANSACTION_MODE ? "transaction (PI_SEM_MODE=transaction)" : CODE_MODE ? "code (PI_SEM_MODE=code)" : "tools (default)"}`);
       for (const status of statuses) {
         if (status.startError) {
           lines.push(`${status.serverId}: FAILED (${status.startError.message})`);
