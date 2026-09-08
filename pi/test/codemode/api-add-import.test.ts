@@ -66,6 +66,42 @@ test("adds a Python import after __future__ imports", async () => {
   }
 });
 
+test("adds a Go import inside the package import block", async () => {
+  const dir = makeDir({
+    "a.go": 'package shared\n\nimport (\n\t"fmt"\n)\n\nfunc f() { fmt.Println() }\n',
+  });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.go", 'internalgit "example.com/internal/git"')) as AddImportResult;
+    assert.equal(r.added, true);
+    assert.equal(r.line, 5);
+    assert.match(
+      readFileSync(join(dir, "a.go"), "utf8"),
+      /import \(\n\t"fmt"\n\tinternalgit "example\.com\/internal\/git"\n\)/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("adds a first Go import after the package declaration", async () => {
+  const dir = makeDir({
+    "a.go": "package shared\n\nfunc f() {}\n",
+  });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.go", '"example.com/internal/git"')) as AddImportResult;
+    assert.equal(r.added, true);
+    assert.equal(r.line, 3);
+    assert.equal(
+      readFileSync(join(dir, "a.go"), "utf8"),
+      'package shared\n\nimport "example.com/internal/git"\nfunc f() {}\n',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("idempotent: the same spec again (whitespace/semicolon normalized) reports alreadyPresent", async () => {
   const dir = makeDir({ "a.ts": 'import { one } from "./one.js";\n' });
   try {

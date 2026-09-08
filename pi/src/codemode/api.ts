@@ -3101,6 +3101,25 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
   // `import { ... } from "..."` is consumed to its closing brace so the
   // insert can't land inside the braces.
   let lastImportIdx = -1;
+  let goInsertAt = -1;
+  let goImportBlock = false;
+  let goSpec = spec.trim();
+  if (file.endsWith(".go")) {
+    goSpec = goSpec.replace(/^import\s+/, "");
+    const packageIdx = lines.findIndex((line) => /^package\s+\w+/.test(line.trim()));
+    if (packageIdx >= 0) {
+      let i = packageIdx + 1;
+      while (i < lines.length && lines[i]!.trim() === "") i++;
+      if (lines[i]?.trim() === "import (") {
+        goImportBlock = true;
+        i++;
+        while (i < lines.length && lines[i]!.trim() !== ")") i++;
+        if (i < lines.length) goInsertAt = i;
+      } else {
+        goInsertAt = i;
+      }
+    }
+  }
   for (let i = 0; i < lines.length; ) {
     const t = lines[i]!.trim();
     if (t === "" || t.startsWith("//") || t.startsWith("/*") || t.startsWith("*") || t.startsWith("#")) {
@@ -3138,8 +3157,11 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
       i++;
     } while (i < lines.length && depth > 0);
   }
-  const insertAt = lastImportIdx + 1;
-  lines.splice(insertAt, 0, spec.trim().endsWith(";") || rustMod || esImport ? spec.trim().replace(/;?$/, ";") : spec.trim());
+  const insertAt = goInsertAt >= 0 ? goInsertAt : lastImportIdx + 1;
+  const inserted = goInsertAt >= 0
+    ? (goImportBlock ? `\t${goSpec}` : `import ${goSpec}`)
+    : spec.trim().endsWith(";") || rustMod || esImport ? spec.trim().replace(/;?$/, ";") : spec.trim();
+  lines.splice(insertAt, 0, inserted);
 
   const content = lines.join("\n");
   const contentBytes = Buffer.byteLength(content, "utf8");
