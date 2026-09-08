@@ -16,6 +16,8 @@ const argument = (name) => {
 let hostedState = null;
 let planImportAuthority = new Map();
 let planImportFiles = new Map();
+let planCalls = 0;
+let transactionCalls = 0;
 
 function resolvePythonImportFile(fromFile, moduleName) {
   const match = moduleName.match(/^(\.*)(.*)$/);
@@ -372,6 +374,9 @@ const tools = new Map([
       budget_per_entity: { type: "integer", minimum: 300, maximum: 2500, default: 1800 },
     }),
     async run(params, cwd) {
+      if (planCalls >= 1) throw new Error("transaction protocol permits exactly one sem_plan call per session");
+      if (transactionCalls > 0) throw new Error("sem_plan must run before any weave_transaction call");
+      planCalls++;
       const started = performance.now();
       const api = buildSemApi({ cwd, semBin: "sem" });
       // Enforce bounds here as well as in the advertised schema. Some MCP
@@ -836,6 +841,9 @@ const tools = new Map([
       validation_cmd: { type: "string", description: "Optional focused repository test or typecheck command. Prefer the narrow target covering the edited code over the generic detected runner." },
     }),
     async run(params, cwd) {
+      if (planCalls !== 1) throw new Error("weave_transaction requires one successful sem_plan call first");
+      if (transactionCalls >= 2) throw new Error("transaction protocol permits one implementation and at most one repair");
+      transactionCalls++;
       const started = performance.now();
       const api = buildSemApi({ cwd, semBin: "sem" });
       const normalized = await normalizeEdits(params.edits, cwd, api);
