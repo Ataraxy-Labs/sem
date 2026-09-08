@@ -102,6 +102,24 @@ test("adds a first Go import after the package declaration", async () => {
   }
 });
 
+test("adds a C include after the leading include block", async () => {
+  const dir = makeDir({
+    "a.c": '/** file docs */\n#include "base.h"\n#include <stdint.h>\n\nint main(void) { return 0; }\n',
+  });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.c", '#include "compat.h"')) as AddImportResult;
+    assert.equal(r.added, true);
+    assert.equal(r.line, 4);
+    assert.equal(
+      readFileSync(join(dir, "a.c"), "utf8"),
+      '/** file docs */\n#include "base.h"\n#include <stdint.h>\n#include "compat.h"\n\nint main(void) { return 0; }\n',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("idempotent: the same spec again (whitespace/semicolon normalized) reports alreadyPresent", async () => {
   const dir = makeDir({ "a.ts": 'import { one } from "./one.js";\n' });
   try {

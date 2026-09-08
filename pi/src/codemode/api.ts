@@ -3122,6 +3122,11 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
   }
   for (let i = 0; i < lines.length; ) {
     const t = lines[i]!.trim();
+    if (/^#\s*include\b/.test(t)) {
+      lastImportIdx = i;
+      i++;
+      continue;
+    }
     if (t === "" || t.startsWith("//") || t.startsWith("/*") || t.startsWith("*") || t.startsWith("#")) {
       i++;
       continue;
