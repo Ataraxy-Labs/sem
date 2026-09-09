@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { buildSemApi } from "../codemode/api.ts";
 import { performWeaveEdit } from "../tools/weave-edit.ts";
@@ -18,6 +19,16 @@ let planImportAuthority = new Map();
 let planImportFiles = new Map();
 let planCalls = 0;
 let transactionCalls = 0;
+let expectedRevision = null;
+
+async function workspaceRevision(cwd) {
+  const options = { cwd, maxBuffer: 16 * 1024 * 1024 };
+  const head = (await runFile("git", ["rev-parse", "HEAD"], options)).stdout.trim();
+  const status = (await runFile("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], options)).stdout;
+  const diff = (await runFile("git", ["diff", "--no-ext-diff", "--binary", "HEAD"], options)).stdout;
+  const digest = createHash("sha256").update(head).update("\0").update(status).update("\0").update(diff).digest("hex");
+  return { head, digest };
+}
 
 function resolvePythonImportFile(fromFile, moduleName) {
   const match = moduleName.match(/^(\.*)(.*)$/);
@@ -793,7 +804,10 @@ const tools = new Map([
       planImportFiles = new Map([...authorityFileCandidates]
         .filter(([, values]) => values.size === 1)
         .map(([symbol, values]) => [symbol, [...values][0]]));
+      expectedRevision = await workspaceRevision(cwd);
       return {
+        protocol: "sem-transaction/1",
+        revision: expectedRevision,
         definitions,
         resolutions: nameCandidates.map(({ name, expectedParent, ranked, error }) => ({
           requested_name: name,
@@ -843,6 +857,10 @@ const tools = new Map([
     async run(params, cwd) {
       if (planCalls !== 1) throw new Error("weave_transaction requires one successful sem_plan call first");
       if (transactionCalls >= 2) throw new Error("transaction protocol permits one implementation and at most one repair");
+      const observedRevision = await workspaceRevision(cwd);
+      if (!expectedRevision || observedRevision.digest !== expectedRevision.digest) {
+        throw new Error(`workspace changed outside the transaction protocol; re-plan required (expected ${expectedRevision?.digest ?? "none"}, observed ${observedRevision.digest})`);
+      }
       transactionCalls++;
       const started = performance.now();
       const api = buildSemApi({ cwd, semBin: "sem" });
@@ -965,7 +983,16 @@ const tools = new Map([
         }
       }
       const checkedAt = performance.now();
+      const revisionBefore = observedRevision;
+      expectedRevision = await workspaceRevision(cwd);
       return {
+        protocol: "sem-transaction/1",
+        receipt: {
+          revision_before: revisionBefore,
+          revision_after: expectedRevision,
+          committed: check?.pass === true,
+          validation_passed: check?.pass ?? null,
+        },
         created,
         imported: [...importSnapshots.keys()],
         exact_text_edits: normalized.textEdits.length,
