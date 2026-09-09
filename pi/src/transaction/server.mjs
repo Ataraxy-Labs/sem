@@ -220,6 +220,17 @@ function codeWithoutDocumentation(content) {
   return kept.join("\n");
 }
 
+function assertNoInventedPrivateAccess(before, after, label) {
+  const existing = new Set([...String(before ?? "").matchAll(/\b([A-Za-z_]\w*)\s*\.\s*(_[A-Za-z]\w*)/g)]
+    .map((match) => `${match[1]}.${match[2]}`));
+  const introduced = [...String(after ?? "").matchAll(/\b([A-Za-z_]\w*)\s*\.\s*(_[A-Za-z]\w*)/g)]
+    .map((match) => `${match[1]}.${match[2]}`)
+    .filter((access) => !access.startsWith("self.") && !access.startsWith("this.") && !existing.has(access));
+  if (introduced.length > 0) {
+    throw new Error(`replacement invents private collaborator access in ${label}: ${[...new Set(introduced)].join(", ")}; use a public indexed member or forward the existing context object`);
+  }
+}
+
 async function normalizeEdits(rawEdits, cwd, api) {
   const creates = [];
   const edits = [];
@@ -257,6 +268,14 @@ async function normalizeEdits(rawEdits, cwd, api) {
           };
         }
       } catch { /* underlying edit still reports a precise locator error */ }
+      if ((raw.op ?? raw.operation ?? "replace") === "replace") {
+        try {
+          const before = await api.read({ ...normalizedEntity, file }, { full: true, budget: 100_000 });
+          assertNoInventedPrivateAccess(before.content, raw.content, `${file}:${normalizedEntity.name}`);
+        } catch (error) {
+          if (String(error instanceof Error ? error.message : error).includes("invents private collaborator access")) throw error;
+        }
+      }
       edits.push({ ...raw, entity: normalizedEntity, file, op: raw.op ?? raw.operation ?? "replace", claim: false });
       continue;
     }
@@ -264,6 +283,9 @@ async function normalizeEdits(rawEdits, cwd, api) {
     const root = `${path.resolve(cwd)}${path.sep}`;
     if (!absolute.startsWith(root)) throw new Error(`edit path escapes repository: ${file}`);
     let source = await fs.readFile(absolute, "utf8").catch(() => "");
+    if (typeof raw.old === "string" && typeof raw.new === "string") {
+      assertNoInventedPrivateAccess(raw.old, raw.new, `${file}:text edit`);
+    }
     if (typeof raw.old === "string" && !uniqueFlexibleText(source, raw.old)) {
       const needle = raw.old.split("\n").find((line) => line.trim().length >= 8)?.trim();
       if (needle) {

@@ -73,3 +73,20 @@ test("transaction refuses a workspace changed after its pinned plan", async () =
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("transaction rejects newly invented private collaborator access", async () => {
+  const cwd = repository();
+  const rpc = client(cwd);
+  try {
+    await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
+    const edited = await rpc.call("tools/call", {
+      name: "weave_transaction",
+      arguments: { edits: [{ file: "x.txt", old: "one", new: "context._secret" }] },
+    });
+    assert.match(edited.error.message, /invents private collaborator access/);
+    assert.match(edited.error.message, /context\._secret/);
+  } finally {
+    rpc.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
