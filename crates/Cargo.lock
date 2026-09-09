@@ -2342,6 +2342,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-bash",
+ "tree-sitter-bsl",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
  "tree-sitter-clojure-orchard",
@@ -2959,6 +2960,16 @@ name = "tree-sitter-bash"
 version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "329a4d48623ac337d42b1df84e81a1c9dbb2946907c102ca72db158c1964a52e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-bsl"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6a660bcc779bb599dddfc5ce17a120bc82eab86bf849194fec1dfb5d199c7e9"
 dependencies = [
  "cc",
  "tree-sitter-language",

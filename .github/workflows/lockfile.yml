@@ -1,0 +1,37 @@
+name: Lockfile
+
+# A dependency added to a Cargo.toml without regenerating crates/Cargo.lock
+# builds fine here and breaks every consumer that resolves from the committed
+# lock — the Nix flake vendors strictly from it and builds `--offline`, so the
+# failure lands downstream rather than in this repo (issue #485).
+#
+# `cargo metadata --locked` resolves the graph and fails if the lock would have
+# to change, which is exactly that condition and nothing more: it does not
+# re-resolve the world the way `generate-lockfile` does.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lockfile:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo.lock is in sync with the manifests
+        run: |
+          if ! cargo metadata --locked --format-version 1 > /dev/null; then
+            echo "::error::crates/Cargo.lock is out of sync with the Cargo.toml files."
+            echo "Run 'cargo metadata --format-version 1 > /dev/null' in crates/ and commit the updated Cargo.lock."
+            echo "Do not run 'cargo generate-lockfile' — it re-resolves every dependency."
+            exit 1
+          fi
