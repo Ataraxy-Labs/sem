@@ -395,6 +395,11 @@ fn get_lua() -> Option<Language> {
     Some(tree_sitter_lua::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-bsl")]
+fn get_bsl() -> Option<Language> {
+    Some(tree_sitter_bsl::LANGUAGE.into())
+}
+
 #[cfg(feature = "lang-fish")]
 fn get_fish() -> Option<Language> {
     Some(tree_sitter_fish::language())
@@ -1278,6 +1283,29 @@ static LUA_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_lua,
+    scope_resolve: None,
+};
+
+#[cfg(feature = "lang-bsl")]
+static BSL_CONFIG: LanguageConfig = LanguageConfig {
+    id: "bsl",
+    // BSL (1C:Enterprise). `.bsl` is the platform's managed-mode language and
+    // `.osl` its OneScript dialect; alkoleft/tree-sitter-bsl parses both.
+    extensions: &[".bsl", ".osl"],
+    // Procedures (`Процедура … КонецПроцедуры`) and functions
+    // (`Функция … КонецФункции`) are the module-level entities git conflicts
+    // most on, which is what issue #132 asked weave to merge cleanly.
+    entity_node_types: &["procedure_definition", "function_definition"],
+    // A BSL module is a flat list of procedures and functions — there is no
+    // class container, so there are no nested members to descend into.
+    container_node_types: &[],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    // BSL has no nested definitions — a body holds statements, not procedures —
+    // so the general recursion never produces a local as a top-level entity and
+    // there is no boundary to stop it at.
+    scope_boundary_types: &[],
+    get_language: get_bsl,
     scope_resolve: None,
 };
 
@@ -2567,10 +2595,39 @@ static FISH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     external_method: false,
 
     builtins: &[
-        "echo", "printf", "cd", "ls", "cat", "grep", "sed", "awk", "exit", "return", "source",
-        "eval", "set", "test", "string", "math", "status", "read", "argparse", "count", "type",
-        "functions", "abbr", "alias", "complete", "contains", "set_color", "command", "builtin",
-        "emit", "and", "or", "not",
+        "echo",
+        "printf",
+        "cd",
+        "ls",
+        "cat",
+        "grep",
+        "sed",
+        "awk",
+        "exit",
+        "return",
+        "source",
+        "eval",
+        "set",
+        "test",
+        "string",
+        "math",
+        "status",
+        "read",
+        "argparse",
+        "count",
+        "type",
+        "functions",
+        "abbr",
+        "alias",
+        "complete",
+        "contains",
+        "set_color",
+        "command",
+        "builtin",
+        "emit",
+        "and",
+        "or",
+        "not",
     ],
 };
 
@@ -2645,6 +2702,8 @@ macro_rules! all_configs {
             &LUA_CONFIG,
             #[cfg(feature = "lang-fish")]
             &FISH_CONFIG,
+            #[cfg(feature = "lang-bsl")]
+            &BSL_CONFIG,
         ]
     }};
 }

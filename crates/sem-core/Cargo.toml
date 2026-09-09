@@ -57,6 +57,7 @@ grammar-all = [
     "lang-sql",
     "lang-lua",
     "lang-fish",
+    "lang-bsl",
 ]
 
 # Individual grammar features
@@ -94,6 +95,7 @@ lang-d = ["dep:tree-sitter-d"]
 lang-sql = ["dep:tree-sitter-sequel"]
 lang-lua = ["dep:tree-sitter-lua"]
 lang-fish = ["dep:tree-sitter-fish"]
+lang-bsl = ["dep:tree-sitter-bsl"]
 
 [dependencies]
 git2 = { version = "0.20", optional = true }
@@ -142,6 +144,7 @@ tree-sitter-clojure-orchard = { version = "0.2.5", optional = true }
 tree-sitter-d = { version = "0.8.2", optional = true }
 tree-sitter-lua = { version = "0.5.0", optional = true }
 tree-sitter-fish = { version = "3.6", optional = true }
+tree-sitter-bsl = { version = "0.1.7", optional = true }
 rustc-hash = "2"
 # On-disk persistence for the red-green facts layer (parser::facts_store).
 # Pure Rust, no C dependency (keeps the `wasm` feature viable). CBOR, not

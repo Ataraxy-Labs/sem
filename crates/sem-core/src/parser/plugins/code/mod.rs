@@ -1801,6 +1801,31 @@ return M
     }
 
     #[test]
+    #[cfg(feature = "lang-bsl")]
+    fn test_bsl_entity_extraction() {
+        // BSL / 1C:Enterprise (issue #132). Procedures and functions are the
+        // module-level entities; both normalize to the "function" type.
+        let code = "Процедура ВывестиСообщение(Текст) Экспорт\n    Сообщить(Текст);\nКонецПроцедуры\n\nФункция Сложить(А, Б)\n    Возврат А + Б;\nКонецФункции\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "mod.bsl");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"ВывестиСообщение"),
+            "procedure, got: {names:?}"
+        );
+        assert!(names.contains(&"Сложить"), "function, got: {names:?}");
+        assert_eq!(entities.len(), 2, "two top-level entities, got: {names:?}");
+        assert!(
+            entities.iter().all(|e| e.entity_type == "function"),
+            "procedures and functions normalize to `function`, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (e.name.as_str(), e.entity_type.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     #[cfg(feature = "lang-fish")]
     fn test_fish_entity_extraction() {
         let code = r#"function greet

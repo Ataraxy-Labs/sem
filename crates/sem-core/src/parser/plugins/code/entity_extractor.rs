@@ -2390,7 +2390,8 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "function_definition"
         | "function_item"
         | "function_signature"
-        | "subroutine_declaration_statement" => "function",
+        | "subroutine_declaration_statement"
+        | "procedure_definition" => "function",
         "method_declaration"
         | "method_definition"
         | "method"
