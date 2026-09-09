@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,6 +85,71 @@ test("transaction rejects newly invented private collaborator access", async () 
     });
     assert.match(edited.error.message, /invents private collaborator access/);
     assert.match(edited.error.message, /context\._secret/);
+  } finally {
+    rpc.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an explicit structural-kind change uses a revision-pinned exact replacement", async () => {
+  const cwd = repository();
+  writeFileSync(join(cwd, "sample.c"), "int answer(void) { return 42; }\n");
+  execFileSync("git", ["add", "sample.c"], { cwd });
+  execFileSync("git", ["commit", "-qm", "add sample"], { cwd });
+  const rpc = client(cwd);
+  try {
+    await rpc.call("tools/call", { name: "sem_plan", arguments: { entity_names: ["answer"] } });
+    const edited = await rpc.call("tools/call", {
+      name: "weave_transaction",
+      arguments: {
+        edits: [{
+          file: "sample.c",
+          entity: { name: "answer", entity_type: "function" },
+          op: "replace",
+          content: "#define answer() 42",
+          allow_signature_change: true,
+        }],
+      },
+    });
+    assert.equal(edited.result.structuredContent.exact_text_edits, 1);
+    assert.equal(edited.result.structuredContent.edit.applied, 0);
+    assert.match(readFileSync(join(cwd, "sample.c"), "utf8"), /#define answer\(\) 42/);
+  } finally {
+    rpc.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a mixed transaction never reports committed when one structural edit rolls back", async () => {
+  const cwd = repository();
+  writeFileSync(join(cwd, "sample.c"), "int answer(void) { return 42; }\n");
+  execFileSync("git", ["add", "sample.c"], { cwd });
+  execFileSync("git", ["commit", "-qm", "add sample"], { cwd });
+  const rpc = client(cwd);
+  try {
+    await rpc.call("tools/call", { name: "sem_plan", arguments: { entity_names: ["answer"] } });
+    const edited = await rpc.call("tools/call", {
+      name: "weave_transaction",
+      arguments: {
+        edits: [
+          {
+            file: "sample.c",
+            entity: { name: "answer", entity_type: "function" },
+            op: "replace",
+            content: "#define answer() 42",
+            allow_signature_change: true,
+          },
+          {
+            file: "sample.c",
+            entity: { name: "missing", entity_type: "function" },
+            op: "replace",
+            content: "int missing(void) { return 0; }",
+          },
+        ],
+      },
+    });
+    assert.equal(edited.result.structuredContent.receipt.committed, false);
+    assert.equal(edited.result.structuredContent.receipt.edits_applied, false);
   } finally {
     rpc.close();
     rmSync(cwd, { recursive: true, force: true });

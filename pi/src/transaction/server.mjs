@@ -140,7 +140,7 @@ const flexibleEdit = object({
   range: object({ start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 } }, ["start_line", "end_line"]),
   old: { type: "string", description: "Exact text to replace inside one entity." },
   new: { type: "string", description: "Replacement for old." },
-  allow_signature_change: { type: "boolean" },
+  allow_signature_change: { type: "boolean", description: "Set true only when a replacement intentionally renames an entity or changes its structural kind, such as replacing a declaration with a compatibility macro." },
 });
 
 function uniqueFlexibleText(source, requested) {
@@ -272,6 +272,10 @@ async function normalizeEdits(rawEdits, cwd, api) {
         try {
           const before = await api.read({ ...normalizedEntity, file }, { full: true, budget: 100_000 });
           assertNoInventedPrivateAccess(before.content, raw.content, `${file}:${normalizedEntity.name}`);
+          if (raw.allow_signature_change === true) {
+            textEdits.push({ file, old: before.content, new: raw.content });
+            continue;
+          }
         } catch (error) {
           if (String(error instanceof Error ? error.message : error).includes("invents private collaborator access")) throw error;
         }
@@ -975,6 +979,12 @@ const tools = new Map([
         }
       }
       const editedAt = performance.now();
+      const editDetails = outcome.details ?? {};
+      const editsApplied = normalized.edits.length === 0 || (
+        editDetails.rolledBack !== true &&
+        (editDetails.failed ?? 0) === 0 &&
+        (editDetails.succeeded ?? editDetails.applied ?? 0) > 0
+      );
       let check = await hostedValidation(cwd);
       if (!check) {
         const validationCmd = params.validation_cmd
@@ -1012,8 +1022,9 @@ const tools = new Map([
         receipt: {
           revision_before: revisionBefore,
           revision_after: expectedRevision,
-          committed: check?.pass === true,
+          committed: editsApplied && check?.pass === true,
           validation_passed: check?.pass ?? null,
+          edits_applied: editsApplied,
         },
         created,
         imported: [...importSnapshots.keys()],
