@@ -1551,21 +1551,20 @@ impl PrecomputedFileFacts {
                 .scopes
                 .iter()
                 .map(|scope| {
-                    let string_to_string =
-                        |m: &HashMap<String, String>| -> usize {
-                            m.iter()
-                                .map(|(k, v)| k.capacity() + v.capacity())
-                                .sum::<usize>()
-                        };
+                    let string_to_string = |m: &HashMap<String, String>| -> usize {
+                        m.iter()
+                            .map(|(k, v)| k.capacity() + v.capacity())
+                            .sum::<usize>()
+                    };
                     string_to_string(&scope.defs)
                         + string_to_string(&scope.types)
                         + string_to_string(&scope.pending_call_types)
+                        + scope.bindings.iter().map(String::capacity).sum::<usize>()
                         + scope
-                            .bindings
-                            .iter()
+                            .binding_rows
+                            .keys()
                             .map(String::capacity)
                             .sum::<usize>()
-                        + scope.binding_rows.keys().map(String::capacity).sum::<usize>()
                         + scope
                             .pending_field_types
                             .iter()
@@ -6301,6 +6300,15 @@ fn scan_class_for_init(
         scan_kotlin_primary_constructor(root, class_name, source, instance_attr_types);
     }
 
+    // TypeScript: field declarations and constructor parameter properties. The
+    // constructor-body scan below only sees fields written as an explicit
+    // `this.x = ...` statement, which is the least common of the three ways to
+    // declare one (issue #474). Runs first so an explicit assignment in the
+    // constructor still wins.
+    if lang == "typescript" {
+        scan_ts_class_fields(root, class_name, source, instance_attr_types);
+    }
+
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
@@ -6761,6 +6769,109 @@ fn scan_kotlin_init_body(
 }
 
 /// TS: scan constructor body for `this.attr = param` patterns
+/// The bare type name out of a node's `type` annotation, so `: Foo` reads as
+/// `Foo`. Anything that is not a plain or generic named type (a union, a literal,
+/// a function type) has no single entity to point at and is skipped rather than
+/// guessed at.
+fn ts_annotation_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let inner = node.child_by_field_name("type")?.named_child(0)?;
+    match inner.kind() {
+        "type_identifier" => inner.utf8_text(source).ok().map(str::to_string),
+        "generic_type" => inner
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Does this constructor parameter *declare a field*? `private foo: Foo` and
+/// `readonly foo: Foo` do; a bare `foo: Foo` is local to the constructor.
+fn is_ts_parameter_property(param: tree_sitter::Node) -> bool {
+    let mut cursor = param.walk();
+    let is_property = param
+        .children(&mut cursor)
+        .any(|c| matches!(c.kind(), "accessibility_modifier" | "readonly"));
+    is_property
+}
+
+/// TypeScript instance fields declared outside the constructor body.
+///
+/// `scan_ts_constructor_body` learns a field's type only from an explicit
+/// `this.x = ...` statement. TypeScript has two other, far more common ways to
+/// declare an instance field, and neither writes such a statement, so
+/// `this.x.method()` resolved to nothing for either one (issue #474):
+///
+///   * a class field carrying an initializer or an annotation
+///     (`foo = new Foo()`, `bar: Bar`);
+///   * a constructor **parameter property** (`constructor(private foo: Foo) {}`),
+///     which is the shape most dependency-injection code is written in.
+fn scan_ts_class_fields(
+    class_node: tree_sitter::Node,
+    class_name: &str,
+    source: &[u8],
+    instance_attr_types: &mut HashMap<(String, String), String>,
+) {
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        match member.kind() {
+            "public_field_definition" => {
+                let Some(name) = member
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                else {
+                    continue;
+                };
+                // `foo = new Foo()` names the type in its initializer;
+                // `bar: Bar` names it in the annotation.
+                let ty = member
+                    .child_by_field_name("value")
+                    .filter(|v| v.kind() == "new_expression")
+                    .and_then(|v| v.child_by_field_name("constructor"))
+                    .and_then(|c| c.utf8_text(source).ok())
+                    .map(str::to_string)
+                    .or_else(|| ts_annotation_type_name(member, source));
+                if let Some(ty) = ty {
+                    instance_attr_types.insert((class_name.to_string(), name.to_string()), ty);
+                }
+            }
+            "method_definition" => {
+                if member
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    != Some("constructor")
+                {
+                    continue;
+                }
+                let Some(params) = member.child_by_field_name("parameters") else {
+                    continue;
+                };
+                let mut param_cursor = params.walk();
+                for param in params.named_children(&mut param_cursor) {
+                    if !matches!(param.kind(), "required_parameter" | "optional_parameter")
+                        || !is_ts_parameter_property(param)
+                    {
+                        continue;
+                    }
+                    let Some(name) = param
+                        .child_by_field_name("pattern")
+                        .and_then(|n| n.utf8_text(source).ok())
+                    else {
+                        continue;
+                    };
+                    if let Some(ty) = ts_annotation_type_name(param, source) {
+                        instance_attr_types.insert((class_name.to_string(), name.to_string()), ty);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn scan_ts_constructor_body(
     node: tree_sitter::Node,
     class_name: &str,
@@ -10427,17 +10538,13 @@ fn resolve_ref(
                         && info.name == receiver
                     {
                         rec.one(Table::OwnerMembers, &class_id);
-                        if let Some(mid) =
-                            lookup_entity_member(owner_members, &class_id, method).or_else(|| {
-                                lookup_owned_scope_member(scopes, &class_id, method)
-                            })
+                        if let Some(mid) = lookup_entity_member(owner_members, &class_id, method)
+                            .or_else(|| lookup_owned_scope_member(scopes, &class_id, method))
                         {
                             return Some((mid, RefType::Calls, "scope_chain"));
                         }
-                    } else if matches!(
-                        info.entity_type.as_str(),
-                        "class" | "struct" | "interface"
-                    ) && info.name == receiver
+                    } else if matches!(info.entity_type.as_str(), "class" | "struct" | "interface")
+                        && info.name == receiver
                     {
                         rec.one(Table::ClassMembers, &info.name);
                         if let Some(members) = class_members.get(&info.name) {
@@ -12589,10 +12696,7 @@ mod tests {
         let stdlib_shadow_id = "pkg/quux/os.go::function::Stat".to_string();
 
         let mut symbol_table = HashMap::default();
-        symbol_table.insert(
-            "Run".to_string(),
-            vec![go_id.clone(), py_twin_id.clone()],
-        );
+        symbol_table.insert("Run".to_string(), vec![go_id.clone(), py_twin_id.clone()]);
         symbol_table.insert("UtilFn".to_string(), vec![py_util_id.clone()]);
         symbol_table.insert("Stat".to_string(), vec![stdlib_shadow_id.clone()]);
 
@@ -12653,7 +12757,11 @@ mod tests {
         assert!(!index.contains_key("zeta"));
         assert_eq!(
             index.get("foo"),
-            Some(&vec![("Run".to_string(), go_id.clone(), "pkg/foo".to_string())])
+            Some(&vec![(
+                "Run".to_string(),
+                go_id.clone(),
+                "pkg/foo".to_string()
+            )])
         );
 
         // The stdlib-name-colliding file creates no "os" bucket — the exact
@@ -14084,31 +14192,20 @@ mod tests {
         };
         let scopes = vec![module_scope, create_scope];
 
-        let direct =
-            lookup_scope_chain_respecting_shadows(1, &scopes, "checkElements");
+        let direct = lookup_scope_chain_respecting_shadows(1, &scopes, "checkElements");
         assert_eq!(
             direct,
-            ScopeChainLookup::Defined(
-                "no-keywords.cjs::method::create::checkElements".to_string()
-            ),
+            ScopeChainLookup::Defined("no-keywords.cjs::method::create::checkElements".to_string()),
             "same-scope .defs+.bindings co-population must resolve as Defined"
         );
 
         // Cached wrapper: fresh cache computes the same answer, and the
         // second call serves it from the cache entry.
         let mut cache = ScopeLookupCache::default();
-        let first = lookup_scope_chain_respecting_shadows_cached(
-            1,
-            &scopes,
-            "checkElements",
-            &mut cache,
-        );
-        let second = lookup_scope_chain_respecting_shadows_cached(
-            1,
-            &scopes,
-            "checkElements",
-            &mut cache,
-        );
+        let first =
+            lookup_scope_chain_respecting_shadows_cached(1, &scopes, "checkElements", &mut cache);
+        let second =
+            lookup_scope_chain_respecting_shadows_cached(1, &scopes, "checkElements", &mut cache);
         assert_eq!(first, direct);
         assert_eq!(second, direct);
     }
@@ -14185,9 +14282,7 @@ mod tests {
         // resolves normally.
         assert_eq!(
             lookup_scope_chain_respecting_shadows(0, &scopes, "isKeyword"),
-            ScopeChainLookup::Defined(
-                "no-keywords.cjs::method::create::isKeyword".to_string()
-            ),
+            ScopeChainLookup::Defined("no-keywords.cjs::method::create::isKeyword".to_string()),
         );
         // Unknown names stay NotFound so callers fall through to import /
         // global fallbacks unchanged.
@@ -14195,5 +14290,61 @@ mod tests {
             lookup_scope_chain_respecting_shadows(2, &scopes, "nope"),
             ScopeChainLookup::NotFound,
         );
+    }
+
+    /// Issue #474. TypeScript declares an instance field three ways, and the
+    /// constructor-body scan only ever saw the least common of them. A field
+    /// with an initializer or an annotation, and a constructor parameter
+    /// property (the shape most dependency-injection code uses), both bind a
+    /// field without writing `this.x = ...`, so `this.foo.doFoo()` resolved to
+    /// nothing and method-level impact came back empty.
+    #[test]
+    fn ts_instance_fields_are_typed_from_all_three_declaration_forms() {
+        let source = br#"class ViaCtorBody {
+    private foo: Foo
+    constructor() { this.foo = new Foo() }
+}
+class ViaFieldInit {
+    foo = new Foo()
+}
+class ViaAnnotation {
+    bar: Bar
+}
+class ViaParamProp {
+    constructor(private foo: Foo, readonly baz: Baz, plain: Plain) {}
+}
+"#;
+        let config = get_language_config(".ts").expect("ts config");
+        let scope_config = config.scope_resolve.expect("ts scope config");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&(config.get_language)().expect("ts grammar"))
+            .expect("set language");
+        let tree = parser.parse(&source[..], None).expect("parse");
+
+        let mut instance_attr_types = HashMap::default();
+        let mut init_params_map = HashMap::default();
+        let mut attr_to_param_map = HashMap::default();
+        scan_init_self_attrs(
+            tree.root_node(),
+            &source[..],
+            &mut instance_attr_types,
+            &mut init_params_map,
+            &mut attr_to_param_map,
+            scope_config,
+        );
+
+        let typed = |class: &str, attr: &str| -> Option<String> {
+            instance_attr_types
+                .get(&(class.to_string(), attr.to_string()))
+                .cloned()
+        };
+        assert_eq!(typed("ViaCtorBody", "foo").as_deref(), Some("Foo"));
+        assert_eq!(typed("ViaFieldInit", "foo").as_deref(), Some("Foo"));
+        assert_eq!(typed("ViaAnnotation", "bar").as_deref(), Some("Bar"));
+        assert_eq!(typed("ViaParamProp", "foo").as_deref(), Some("Foo"));
+        assert_eq!(typed("ViaParamProp", "baz").as_deref(), Some("Baz"));
+        // A bare constructor parameter declares no field, so it must not bind.
+        assert_eq!(typed("ViaParamProp", "plain"), None);
     }
 }
