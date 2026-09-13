@@ -127,10 +127,6 @@ impl EntityId {
     pub fn as_str(&self) -> &str {
         self.0.text.as_str()
     }
-    pub(crate) fn as_string(&self) -> &String {
-        &self.0.text
-    }
-
     /// Ephemeral identity for operations that retain the corresponding handles.
     /// Never serialize this address or use it once its owning handle is gone.
     /// Ordinary Hash still hashes text to preserve borrowed-string lookups.
