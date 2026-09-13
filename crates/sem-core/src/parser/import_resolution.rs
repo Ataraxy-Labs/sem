@@ -569,8 +569,8 @@ pub(crate) fn resolve_js_ts_named_import_target<S: BuildHasher>(
     original_name: &str,
     module_path: &str,
     file_path: &str,
-    symbol_table: &HashMap<String, Vec<String>, S>,
-    entity_map: &HashMap<String, EntityInfo, S>,
+    symbol_table: &HashMap<String, Vec<crate::model::entity_id::EntityId>, S>,
+    entity_map: &HashMap<crate::model::entity_id::EntityId, EntityInfo, S>,
     named_export_sources_by_file: &HashMapFx<String, HashMapFx<String, String>>,
     candidate_files: &[String],
 ) -> Option<String> {
@@ -600,7 +600,7 @@ pub(crate) fn resolve_js_ts_named_import_target<S: BuildHasher>(
                     .get(id.as_str())
                     .is_some_and(|entity| entity.file_path == *source_file && entity.parent_id.is_none())
             })
-            .cloned()
+            .map(ToString::to_string)
     })
 }
 
@@ -616,8 +616,8 @@ pub(crate) fn resolve_js_ts_namespace_member_target<S: BuildHasher>(
     name: &str,
     barrel_file: &str,
     source_file: &str,
-    symbol_table: &HashMap<String, Vec<String>, S>,
-    entity_map: &HashMap<String, EntityInfo, S>,
+    symbol_table: &HashMap<String, Vec<crate::model::entity_id::EntityId>, S>,
+    entity_map: &HashMap<crate::model::entity_id::EntityId, EntityInfo, S>,
 ) -> Option<String> {
     let find_in = |file: &str| {
         symbol_table.get(name).and_then(|target_ids| {
@@ -630,7 +630,7 @@ pub(crate) fn resolve_js_ts_namespace_member_target<S: BuildHasher>(
             })
         })
     };
-    find_in(barrel_file).or_else(|| find_in(source_file)).cloned()
+    find_in(barrel_file).or_else(|| find_in(source_file)).map(ToString::to_string)
 }
 
 fn split_js_ts_var_declarators(input: &str) -> Vec<&str> {
@@ -708,27 +708,27 @@ fn extension_priority(file_path: &str, extensions: &[&str]) -> usize {
         .unwrap_or(extensions.len())
 }
 
-pub(crate) fn find_import_target<'a, S>(
-    target_ids: &'a [String],
+pub(crate) fn find_import_target<'a, S, I: std::borrow::Borrow<String>>(
+    target_ids: &'a [I],
     source_path: &str,
     file_path: &str,
     extensions: &[&str],
-    entity_map: &HashMap<String, EntityInfo, S>,
+    entity_map: &HashMap<crate::model::entity_id::EntityId, EntityInfo, S>,
 ) -> Option<&'a String>
 where
     S: BuildHasher,
 {
     let target_files: Vec<&str> = target_ids
         .iter()
-        .filter_map(|id| entity_map.get(id).map(|entity| entity.file_path.as_str()))
+        .filter_map(|id| entity_map.get(id.borrow()).map(|entity| entity.file_path.as_str()))
         .collect();
     let target_file = find_import_file(&target_files, source_path, file_path, extensions)?;
 
     target_ids.iter().find(|id| {
         entity_map
-            .get(*id)
+            .get((*id).borrow())
             .map_or(false, |entity| entity.file_path == target_file)
-    })
+    }).map(|id| id.borrow())
 }
 
 pub(crate) fn find_import_file<'a, P: AsRef<str>>(
@@ -991,7 +991,7 @@ mod tests {
 
     fn entity(file_path: &str) -> EntityInfo {
         EntityInfo {
-            id: format!("{file_path}::function::helper"),
+            id: (format!("{file_path}::function::helper")).into(),
             name: "helper".to_string(),
             entity_type: "function".to_string(),
             file_path: file_path.to_string(),
@@ -1008,8 +1008,8 @@ mod tests {
             "src/util.ts::function::helper".to_string(),
         ];
         let entity_map = HashMap::from([
-            (ids[0].clone(), entity("src/util.js")),
-            (ids[1].clone(), entity("src/util.ts")),
+            (ids[0].clone().into(), entity("src/util.js")),
+            (ids[1].clone().into(), entity("src/util.ts")),
         ]);
 
         let target = find_import_target(
@@ -1026,7 +1026,7 @@ mod tests {
     #[test]
     fn explicit_relative_import_requires_exact_extension() {
         let ids = vec!["src/util.js::function::helper".to_string()];
-        let entity_map = HashMap::from([(ids[0].clone(), entity("src/util.js"))]);
+        let entity_map = HashMap::from([(ids[0].clone().into(), entity("src/util.js"))]);
 
         let target = find_import_target(
             &ids,
@@ -1118,8 +1118,8 @@ import './missing';
             "src/b/util.py::function::helper".to_string(),
         ];
         let entity_map = HashMap::from([
-            (ids[0].clone(), entity("src/a/util.py")),
-            (ids[1].clone(), entity("src/b/util.py")),
+            (ids[0].clone().into(), entity("src/a/util.py")),
+            (ids[1].clone().into(), entity("src/b/util.py")),
         ]);
 
         let target = find_import_target(&ids, "src.b.util", "src/main.py", &[".py"], &entity_map);
@@ -1130,7 +1130,7 @@ import './missing';
     #[test]
     fn bare_import_with_extension_uses_file_stem() {
         let ids = vec!["src/util.ts::function::helper".to_string()];
-        let entity_map = HashMap::from([(ids[0].clone(), entity("src/util.ts"))]);
+        let entity_map = HashMap::from([(ids[0].clone().into(), entity("src/util.ts"))]);
 
         let target = find_import_target(
             &ids,
@@ -1150,8 +1150,8 @@ import './missing';
             "lib.ts::function::helper".to_string(),
         ];
         let entity_map = HashMap::from([
-            (ids[0].clone(), entity("lib.js")),
-            (ids[1].clone(), entity("lib.ts")),
+            (ids[0].clone().into(), entity("lib.js")),
+            (ids[1].clone().into(), entity("lib.ts")),
         ]);
 
         let target = find_import_target(&ids, "lib", "consumer.ts", JS_TS_EXTENSIONS, &entity_map);
@@ -1167,9 +1167,9 @@ import './missing';
                 format!("src/deep/config{extension}::function::helper"),
             ];
             let entity_map = HashMap::from([
-                (ids[0].clone(), entity("src/config.ts")),
+                (ids[0].clone().into(), entity("src/config.ts")),
                 (
-                    ids[1].clone(),
+                    ids[1].clone().into(),
                     entity(&format!("src/deep/config{extension}")),
                 ),
             ]);

@@ -1274,11 +1274,11 @@ fn print_tests(
         .iter()
         .filter(|e| test_ids.contains(e.id.as_str()) && word_hit(&e.content, &entity.name))
         .map(|e| EntityInfo {
-            id: e.id.clone(),
+            id: (e.id.clone()).into(),
             name: e.name.clone(),
             entity_type: e.entity_type.clone(),
             file_path: e.file_path.clone(),
-            parent_id: e.parent_id.clone(),
+            parent_id: e.parent_id.as_ref().map(Into::into),
             start_line: e.start_line,
             end_line: e.end_line,
         })
@@ -1403,7 +1403,7 @@ fn test_impact_from_ids<'a>(
     graph
         .impact_analysis(entity_id)
         .into_iter()
-        .filter(|info| test_entity_ids.contains(&info.id))
+        .filter(|info| test_entity_ids.contains(info.id.as_str()))
         .collect()
 }
 
@@ -1555,7 +1555,7 @@ mod tests {
 
     fn entity(id: &str, file: &str, name: &str) -> EntityInfo {
         EntityInfo {
-            id: id.to_string(),
+            id: (id.to_string()).into(),
             name: name.to_string(),
             entity_type: "function".to_string(),
             file_path: file.to_string(),
@@ -1567,8 +1567,8 @@ mod tests {
 
     fn edge(from: &str, to: &str) -> EntityRef {
         EntityRef {
-            from_entity: from.to_string(),
-            to_entity: to.to_string(),
+            from_entity: (from.to_string()).into(),
+            to_entity: (to.to_string()).into(),
             ref_type: RefType::Calls,
         }
     }

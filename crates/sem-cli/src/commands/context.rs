@@ -469,8 +469,8 @@ fn collect_subgraph(idx: &QueryIndex, at: usize) -> Option<(Vec<usize>, Vec<Enti
                 };
                 if seen_edges.insert((from_id.clone(), to_id.clone(), ref_type_key(&ref_type))) {
                     edges.push(EntityRef {
-                        from_entity: from_id,
-                        to_entity: to_id,
+                        from_entity: (from_id).into(),
+                        to_entity: (to_id).into(),
                         ref_type,
                     });
                 }
@@ -520,11 +520,11 @@ fn hydrate_contents(
             let content = std::str::from_utf8(slice).ok()?.to_string();
             let info = e.to_entity_info();
             out.push(SemanticEntity {
-                id: info.id,
+                id: info.id.into(),
                 file_path: info.file_path,
                 entity_type: info.entity_type,
                 name: info.name,
-                parent_id: info.parent_id,
+                parent_id: info.parent_id.map(Into::into),
                 content,
                 content_hash: String::new(),
                 structural_hash: None,

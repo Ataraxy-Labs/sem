@@ -241,8 +241,8 @@ fn write_graph_json_index(idx: &sem_core::index::QueryIndex) -> std::io::Result<
                 writer.write_all(b",")?;
             }
             let edge = EntityRef {
-                from_entity: id.clone(),
-                to_entity: target.id(),
+                from_entity: (id.clone()).into(),
+                to_entity: (target.id()).into(),
                 ref_type,
             };
             serde_json::to_writer(&mut writer, &edge).map_err(std::io::Error::other)?;

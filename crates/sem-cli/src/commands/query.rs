@@ -190,7 +190,7 @@ struct RelatedRow {
 
 fn to_row(e: &EntityInfo) -> DefRow {
     DefRow {
-        id: e.id.clone(),
+        id: e.id.to_string(),
         name: e.name.clone(),
         entity_type: e.entity_type.clone(),
         file: e.file_path.clone(),
@@ -567,11 +567,11 @@ fn reextract_file(registry: &ParserRegistry, root: &Path, path: &str) -> Vec<Ent
         .extract_entities_brief(path, &content)
         .into_iter()
         .map(|e| EntityInfo {
-            id: e.id,
+            id: (e.id).into(),
             name: e.name,
             entity_type: e.entity_type,
             file_path: e.file_path,
-            parent_id: e.parent_id,
+            parent_id: e.parent_id.map(Into::into),
             start_line: e.start_line,
             end_line: e.end_line,
         })

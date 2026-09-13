@@ -61,7 +61,7 @@ macro_rules! maybe_par_iter {
         }
     }};
 }
-use crate::parser::graph::{EntityInfo, RefType};
+use crate::parser::graph::{EntityInfo, EntityInfoMap, RefType, SymbolTable};
 use crate::parser::import_resolution::{
     build_owned_stem_index, find_import_file, find_import_target, import_file_candidates,
     is_js_ts_file, js_ts_named_exports_from_content, match_bare_import_stem,
@@ -592,7 +592,7 @@ pub struct ResolutionEntry {
 /// Pre-built lookup tables that can be shared between `EntityGraph::build()` and
 /// `resolve_with_scopes()` to avoid redundant O(E) passes.
 pub(crate) struct PreBuiltLookups {
-    pub(crate) symbol_table: Arc<HashMap<String, Vec<String>>>,
+    pub(crate) symbol_table: Arc<SymbolTable>,
     pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
     pub(crate) owner_members: HashMap<String, Vec<(String, String)>>,
     pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
@@ -975,8 +975,8 @@ pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
 }
 
 fn sort_symbol_table_targets_by_source(
-    symbol_table: &mut HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &mut SymbolTable,
+    entity_map: &EntityInfoMap,
 ) {
     for target_ids in symbol_table.values_mut() {
         if target_ids.len() > 1 {
@@ -990,7 +990,7 @@ fn sort_symbol_table_targets_by_source(
 fn compare_entity_ids_by_source(
     left: &str,
     right: &str,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
 ) -> Ordering {
     match (entity_map.get(left), entity_map.get(right)) {
         (Some(left), Some(right)) => (
@@ -1016,10 +1016,10 @@ pub fn resolve_with_scopes(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &std::collections::HashMap<String, EntityInfo, impl BuildHasher>,
+    entity_map: &std::collections::HashMap<crate::model::entity_id::EntityId, EntityInfo, impl BuildHasher>,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
 ) -> ScopeResult {
-    let entity_map: HashMap<String, EntityInfo> = entity_map
+    let entity_map: EntityInfoMap = entity_map
         .iter()
         .map(|(id, entity)| (id.clone(), entity.clone()))
         .collect();
@@ -1042,7 +1042,7 @@ pub fn resolve_with_scopes_fast(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
 ) -> ScopeResult {
     let result = resolve_with_scopes_full(
@@ -1071,7 +1071,7 @@ pub(crate) fn resolve_with_scopes_full(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
     pre_built: Option<&PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
@@ -1097,7 +1097,7 @@ pub(crate) fn resolve_with_scopes_full_for_entities(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
     pre_built: Option<&PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
@@ -1224,7 +1224,7 @@ pub(crate) fn resolve_with_scopes_full_chunked(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     pre_built: Option<&PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
     chunked: &ChunkedResolveInputs<'_>,
@@ -1898,17 +1898,17 @@ pub(crate) fn precompute_js_ts_file_facts(
     let source = content.as_bytes();
 
     let file_entities: Vec<&SemanticEntity> = entities.iter().collect();
-    let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
+    let mut entity_map: EntityInfoMap = HashMap::default();
     let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in &file_entities {
         entity_map.insert(
-            entity.id.clone(),
+            (&entity.id).into(),
             EntityInfo {
-                id: entity.id.clone(),
+                id: (&entity.id).into(),
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
                 file_path: entity.file_path.clone(),
-                parent_id: entity.parent_id.clone(),
+                parent_id: entity.parent_id.as_ref().map(Into::into),
                 start_line: entity.start_line,
                 end_line: entity.end_line,
             },
@@ -2628,17 +2628,17 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     let source = content.as_bytes();
 
     let file_entities: Vec<&SemanticEntity> = entities.iter().collect();
-    let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
+    let mut entity_map: EntityInfoMap = HashMap::default();
     let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in &file_entities {
         entity_map.insert(
-            entity.id.clone(),
+            (&entity.id).into(),
             EntityInfo {
-                id: entity.id.clone(),
+                id: (&entity.id).into(),
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
                 file_path: entity.file_path.clone(),
-                parent_id: entity.parent_id.clone(),
+                parent_id: entity.parent_id.as_ref().map(Into::into),
                 start_line: entity.start_line,
                 end_line: entity.end_line,
             },
@@ -2795,7 +2795,7 @@ fn resolve_with_scopes_full_inner(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
     pre_built: Option<&PreBuiltLookups>,
     pre_built_import_table: Option<&HashMap<(String, String), String>>,
@@ -2815,7 +2815,7 @@ fn resolve_with_scopes_full_inner(
     let lookups = if let Some(pb) = pre_built {
         pb
     } else {
-        let mut symbol_table: HashMap<String, Vec<String>> = HashMap::default();
+        let mut symbol_table: SymbolTable = HashMap::default();
         let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
         let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
         let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::default();
@@ -2824,7 +2824,7 @@ fn resolve_with_scopes_full_inner(
             symbol_table
                 .entry(entity.name.clone())
                 .or_default()
-                .push(entity.id.clone());
+                .push((&entity.id).into());
 
             if let Some(ref pid) = entity.parent_id {
                 owner_members
@@ -3881,7 +3881,7 @@ fn resolve_with_scopes_full_inner(
                                     entity.parent_id.as_ref().map_or(false, |pid| {
                                         pid == &target_id
                                             || entity_map.get(&target_id).map_or(false, |t| {
-                                                t.parent_id.as_ref() == Some(&entity.id)
+                                                t.parent_id.as_deref() == Some(entity.id.as_str())
                                             })
                                     });
 
@@ -4094,7 +4094,7 @@ fn hash_swift_signatures(sigs: &HashMap<String, SwiftCallSignature>) -> u64 {
 /// corpus (see [`fingerprint_corpus_tables_incremental`]).
 pub(crate) fn fingerprint_corpus_tables(
     lookups: &PreBuiltLookups,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     fp: &mut TableFingerprints,
 ) -> u64 {
     let mut sink = FingerprintSink::new(fp, 0);
@@ -4206,7 +4206,7 @@ pub(crate) fn wildcard_guard_contribution(name: &str, file_path: &str) -> u64 {
 pub(crate) fn fingerprint_corpus_tables_incremental(
     touched: &TouchedCorpusKeys,
     lookups: &PreBuiltLookups,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     fp: &mut TableFingerprints,
     wildcard_import_guard: &mut u64,
 ) {
@@ -4395,7 +4395,7 @@ fn log_scope_bindings(
 
 fn build_descendant_ranges_by_entity(
     file_entities: &[&SemanticEntity],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
 ) -> HashMap<String, Vec<(usize, usize)>> {
     let mut ranges_by_entity: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
     let mut sorted_entities = file_entities.to_vec();
@@ -4521,7 +4521,7 @@ fn build_scopes_from_ast(
     entity_inner_scope: &mut HashMap<String, usize>,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) {
@@ -4560,7 +4560,7 @@ fn scope_visit_node(
     entity_inner_scope: &mut HashMap<String, usize>,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) -> usize {
@@ -4888,7 +4888,7 @@ fn fused_scope_refs_import_walk(
     entity_inner_scope: &mut HashMap<String, usize>,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) -> (Vec<AstRef>, Vec<usize>, bool) {
@@ -5868,8 +5868,8 @@ pub(crate) type GoPkgIndex = HashMap<String, Vec<(String, String, String)>>;
 /// route below is the Go-correct heuristic and is unaffected by this
 /// deletion.
 pub(crate) fn build_go_pkg_index(
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
 ) -> GoPkgIndex {
     let mut idx: GoPkgIndex = HashMap::default();
     for (name, target_ids) in symbol_table.iter() {
@@ -5885,7 +5885,7 @@ pub(crate) fn build_go_pkg_index(
                     if !dir_name.is_empty() {
                         idx.entry(dir_name.to_string()).or_default().push((
                             name.clone(),
-                            target_id.clone(),
+                            target_id.to_string(),
                             decl_dir.to_string(),
                         ));
                     }
@@ -7140,8 +7140,8 @@ fn infer_constructor_param_types(
     return_type_map: &HashMap<String, String>,
     init_params: &HashMap<String, Vec<String>>,
     attr_to_param: &HashMap<(String, String), String>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     instance_attr_types: &mut HashMap<(String, String), String>,
 ) {
     // the scan writes to `instance_attr_types` only from inside
@@ -7234,8 +7234,8 @@ fn infer_constructor_param_types(
 /// can produce a hit.
 fn deterministic_return_types_by_name(
     return_type_map: &HashMap<String, String>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
 ) -> HashMap<String, String> {
     let mut by_name: HashMap<String, String> =
         HashMap::with_capacity_and_hasher(return_type_map.len(), Default::default());
@@ -7251,7 +7251,7 @@ fn deterministic_return_types_by_name(
         };
         if let Some(return_type) = target_ids
             .iter()
-            .find_map(|target_id| return_type_map.get(target_id))
+            .find_map(|target_id| return_type_map.get(target_id.as_str()))
         {
             by_name.insert(name.to_string(), return_type.clone());
         }
@@ -7481,8 +7481,8 @@ fn inject_field_type_bindings(
 
 fn build_ts_default_export_table(
     parsed_files: &[(String, String, tree_sitter::Tree)],
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
 ) -> TsDefaultExportTable {
     // Per-file AST extraction is independent, so run it in parallel and merge.
     // Collecting preserves file order, so the merged result matches a sequential scan.
@@ -7505,7 +7505,7 @@ fn build_ts_default_export_table(
                         })
                     });
                     if let Some(target_id) = target {
-                        default_export = Some((file_path.clone(), target_id.clone()));
+                        default_export = Some((file_path.clone(), target_id.to_string()));
                     }
                 }
 
@@ -7550,8 +7550,8 @@ fn sorted_default_export_files(default_exports: &HashMap<String, String>) -> Vec
 fn resolve_ts_default_re_exports(
     default_exports: &mut HashMap<String, String>,
     pending: Vec<TsDefaultReExport>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
 ) {
     let mut pending = pending;
     while !pending.is_empty() {
@@ -7609,8 +7609,8 @@ fn resolve_ts_default_re_exports(
 /// index, scanning the whole corpus per bare `import module` statement, see
 /// its doc comment — can share the same structure and the same fix shape.
 fn build_top_level_entity_index(
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     extensions: &[&str],
 ) -> TopLevelEntityIndex {
     let mut entities_by_file: HashMap<String, Vec<(String, String)>> = HashMap::default();
@@ -7627,7 +7627,7 @@ fn build_top_level_entity_index(
             entities_by_file
                 .entry(info.file_path.clone())
                 .or_default()
-                .push((name.clone(), target_id.clone()));
+                .push((name.clone(), target_id.to_string()));
         }
     }
 
@@ -7856,8 +7856,8 @@ fn extract_imports_from_ast<'a>(
     root: tree_sitter::Node,
     file_path: &str,
     source: &[u8],
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     config: &ScopeResolveConfig,
@@ -8331,8 +8331,8 @@ fn collect_go_import_pkg_names(root: tree_sitter::Node, source: &[u8], out: &mut
 fn dispatch_import_stmt<'a>(
     descriptor: &ImportStmtFacts,
     file_path: &str,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     go_pkg_index: &GoPkgIndex,
@@ -8665,8 +8665,8 @@ fn record_import_stmts_pruned(
 fn dispatch_import_stmts_from_facts<'a>(
     descriptors: &[ImportStmtFacts],
     file_path: &str,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     go_pkg_index: &GoPkgIndex,
@@ -8830,8 +8830,8 @@ fn resolve_import_name(
     source_path: &str,
     file_path: &str,
     extensions: &[&str],
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
     rec: &mut Recorder,
@@ -8895,8 +8895,8 @@ fn register_ts_namespace_import<'a>(
     file_path: &str,
     extensions: &[&str],
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     parsed_files: &'a [(String, String, tree_sitter::Tree)],
     content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
     exported_names_by_file: &Mutex<HashMap<String, Arc<HashSet<String>>>>,
@@ -9039,8 +9039,8 @@ fn register_namespace_import(
     file_path: &str,
     extensions: &[&str],
     py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     rec: &mut Recorder,
 ) {
@@ -9139,8 +9139,8 @@ fn register_rust_module_import(
     qualifying_path: &str,
     file_path: &str,
     rust_top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     rec: &mut Recorder,
 ) {
@@ -9303,7 +9303,7 @@ fn build_swift_call_signatures(
     parsed_files: &[(String, String, tree_sitter::Tree)],
     all_entities: &[SemanticEntity],
     entity_ranges: &HashMap<String, Vec<(usize, usize, String)>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
 ) -> HashMap<String, SwiftCallSignature> {
     let mut signatures = HashMap::default();
 
@@ -9356,7 +9356,7 @@ fn build_swift_call_signatures(
 fn find_entity_id_for_swift_declaration(
     node: tree_sitter::Node,
     ranges: &[(usize, usize, String)],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
 ) -> Option<String> {
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
@@ -9980,7 +9980,7 @@ fn resolve_qualified_callee_name(
     name: &str,
     import_table_by_name: &HashMap<&str, &str>,
     file_lookup: &FileEntityLookup<'_>,
-    symbol_table: &HashMap<String, Vec<String>>,
+    symbol_table: &SymbolTable,
     from_entity_id: &str,
     allow_same_file: bool,
     rec: &mut Recorder,
@@ -10000,7 +10000,7 @@ fn resolve_qualified_callee_name(
     rec.one(Table::SymbolTable, name);
     if let Some(ids) = symbol_table.get(name) {
         if ids.len() == 1 && ids[0] != from_entity_id {
-            return Some(ids[0].clone());
+            return Some(ids[0].to_string());
         }
     }
     None
@@ -10020,12 +10020,12 @@ fn resolve_ref(
     // fallback fully active.
     scope_lookup_missed: bool,
     scopes: &[Scope],
-    symbol_table: &HashMap<String, Vec<String>>,
+    symbol_table: &SymbolTable,
     class_members: &HashMap<String, Vec<(String, String)>>,
     owner_members: &HashMap<String, Vec<(String, String)>>,
     import_table_by_name: &HashMap<&str, &str>,
     instance_attr_types: &HashMap<(String, String), String>,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
     file_path: &str,
     from_entity_id: &str,
@@ -10072,7 +10072,7 @@ fn resolve_ref(
                 if argument_labels.is_some() {
                     if let Some(target_ids) = symbol_table.get(name.as_ref()) {
                         let same_file_targets: Vec<&String> = target_ids
-                            .iter()
+                            .iter().map(crate::model::entity_id::EntityId::as_string)
                             .filter(|id| {
                                 entity_map
                                     .get(*id)
@@ -10082,7 +10082,7 @@ fn resolve_ref(
                         let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
                             same_file_targets
                         } else if allow_cross_file_calls {
-                            target_ids.iter().collect()
+                            target_ids.iter().map(crate::model::entity_id::EntityId::as_string).collect()
                         } else {
                             Vec::new()
                         };
@@ -10107,7 +10107,7 @@ fn resolve_ref(
                     }
                 } else if let Some(target_ids) = symbol_table.get(name.as_ref()) {
                     let same_file_targets: Vec<&String> = target_ids
-                        .iter()
+                        .iter().map(crate::model::entity_id::EntityId::as_string)
                         .filter(|id| {
                             entity_map
                                 .get(*id)
@@ -10117,7 +10117,7 @@ fn resolve_ref(
                     let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
                         same_file_targets
                     } else if allow_cross_file_calls {
-                        target_ids.iter().collect()
+                        target_ids.iter().map(crate::model::entity_id::EntityId::as_string).collect()
                     } else {
                         Vec::new()
                     };
@@ -10168,7 +10168,7 @@ fn resolve_ref(
                         .map(str::to_string)
                         .or_else(|| {
                             if is_constructor || allow_cross_file_calls {
-                                target_ids.first().cloned()
+                                target_ids.first().map(ToString::to_string)
                             } else {
                                 None
                             }
@@ -10180,7 +10180,7 @@ fn resolve_ref(
                 }
 
                 let same_file_targets: Vec<&String> = target_ids
-                    .iter()
+                    .iter().map(crate::model::entity_id::EntityId::as_string)
                     .filter(|id| {
                         entity_map
                             .get(*id)
@@ -10190,7 +10190,7 @@ fn resolve_ref(
                 let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
                     same_file_targets
                 } else if is_constructor || allow_cross_file_calls {
-                    target_ids.iter().collect()
+                    target_ids.iter().map(crate::model::entity_id::EntityId::as_string).collect()
                 } else {
                     Vec::new()
                 };
@@ -10637,7 +10637,7 @@ fn resolve_ref(
                                     && matches!(e.entity_type.as_str(), "method" | "function")
                             })
                         {
-                            return Some((tid.clone(), RefType::Calls, "unique_method_name"));
+                            return Some((tid.to_string(), RefType::Calls, "unique_method_name"));
                         }
                     }
                 }
@@ -10774,7 +10774,7 @@ fn lookup_entity_member(
 fn find_enclosing_class(
     start_scope: usize,
     scopes: &[Scope],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     rec: &mut Recorder,
 ) -> Option<String> {
     let mut idx = start_scope;
@@ -10800,7 +10800,7 @@ fn find_enclosing_class(
 fn find_enclosing_class_cached(
     start_scope: usize,
     scopes: &[Scope],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &EntityInfoMap,
     cache: &mut ScopeLookupCache,
     rec: &mut Recorder,
 ) -> Option<String> {
@@ -12587,21 +12587,21 @@ mod tests {
             vec![
                 "a_primary.py::function::make_conn".to_string(),
                 "z_backup.py::function::make_conn".to_string(),
-            ],
+            ].into_iter().map(Into::into).collect(),
         );
 
         // `deterministic_return_types_by_name` reaches a name through
         // `entity_map`, so both candidates must be present here for the test to
         // exercise the tie-break it is about.
-        let mut entity_map: HashMap<String, EntityInfo> = HashMap::default();
+        let mut entity_map: EntityInfoMap = HashMap::default();
         for (id, file) in [
             ("z_backup.py::function::make_conn", "z_backup.py"),
             ("a_primary.py::function::make_conn", "a_primary.py"),
         ] {
             entity_map.insert(
-                id.to_string(),
+                (id.to_string()).into(),
                 EntityInfo {
-                    id: id.to_string(),
+                    id: (id.to_string()).into(),
                     name: "make_conn".to_string(),
                     entity_type: "function".to_string(),
                     file_path: file.to_string(),
@@ -12627,14 +12627,14 @@ mod tests {
         let second_id = "pkg/foo/b.go::function::alpha".to_string();
 
         let mut symbol_table = HashMap::default();
-        symbol_table.insert("zeta".to_string(), vec![first_id.clone()]);
-        symbol_table.insert("alpha".to_string(), vec![second_id.clone()]);
+        symbol_table.insert("zeta".to_string(), vec![first_id.clone()].into_iter().map(Into::into).collect());
+        symbol_table.insert("alpha".to_string(), vec![second_id.clone()].into_iter().map(Into::into).collect());
 
         let mut entity_map = HashMap::default();
         entity_map.insert(
-            first_id.clone(),
+            (first_id.clone()).into(),
             EntityInfo {
-                id: first_id.clone(),
+                id: (first_id.clone()).into(),
                 name: "zeta".to_string(),
                 entity_type: "function".to_string(),
                 file_path: "pkg/foo/a.go".to_string(),
@@ -12644,9 +12644,9 @@ mod tests {
             },
         );
         entity_map.insert(
-            second_id.clone(),
+            (second_id.clone()).into(),
             EntityInfo {
-                id: second_id.clone(),
+                id: (second_id.clone()).into(),
                 name: "alpha".to_string(),
                 entity_type: "function".to_string(),
                 file_path: "pkg/foo/b.go".to_string(),
@@ -12696,15 +12696,15 @@ mod tests {
         let stdlib_shadow_id = "pkg/quux/os.go::function::Stat".to_string();
 
         let mut symbol_table = HashMap::default();
-        symbol_table.insert("Run".to_string(), vec![go_id.clone(), py_twin_id.clone()]);
-        symbol_table.insert("UtilFn".to_string(), vec![py_util_id.clone()]);
-        symbol_table.insert("Stat".to_string(), vec![stdlib_shadow_id.clone()]);
+        symbol_table.insert("Run".to_string(), vec![go_id.clone(), py_twin_id.clone()].into_iter().map(Into::into).collect());
+        symbol_table.insert("UtilFn".to_string(), vec![py_util_id.clone()].into_iter().map(Into::into).collect());
+        symbol_table.insert("Stat".to_string(), vec![stdlib_shadow_id.clone()].into_iter().map(Into::into).collect());
 
         let mut entity_map = HashMap::default();
         entity_map.insert(
-            go_id.clone(),
+            (go_id.clone()).into(),
             EntityInfo {
-                id: go_id.clone(),
+                id: (go_id.clone()).into(),
                 name: "Run".to_string(),
                 entity_type: "function".to_string(),
                 file_path: "pkg/foo/zeta.go".to_string(),
@@ -12714,9 +12714,9 @@ mod tests {
             },
         );
         entity_map.insert(
-            py_twin_id.clone(),
+            (py_twin_id.clone()).into(),
             EntityInfo {
-                id: py_twin_id.clone(),
+                id: (py_twin_id.clone()).into(),
                 name: "Run".to_string(),
                 entity_type: "function".to_string(),
                 file_path: "pkg/foo/zeta.py".to_string(),
@@ -12726,9 +12726,9 @@ mod tests {
             },
         );
         entity_map.insert(
-            py_util_id.clone(),
+            (py_util_id.clone()).into(),
             EntityInfo {
-                id: py_util_id.clone(),
+                id: (py_util_id.clone()).into(),
                 name: "UtilFn".to_string(),
                 entity_type: "function".to_string(),
                 file_path: "pkg/bar/helpers.py".to_string(),
@@ -12738,9 +12738,9 @@ mod tests {
             },
         );
         entity_map.insert(
-            stdlib_shadow_id.clone(),
+            (stdlib_shadow_id.clone()).into(),
             EntityInfo {
-                id: stdlib_shadow_id.clone(),
+                id: (stdlib_shadow_id.clone()).into(),
                 name: "Stat".to_string(),
                 entity_type: "function".to_string(),
                 file_path: "pkg/quux/os.go".to_string(),
@@ -12810,14 +12810,14 @@ mod tests {
         let mut symbol_table = HashMap::default();
         symbol_table.insert(
             "DeepCopyInto".to_string(),
-            vec![kubeadm_id.clone(), podsec_id.clone()],
+            vec![kubeadm_id.clone(), podsec_id.clone()].into_iter().map(Into::into).collect(),
         );
 
         let mut entity_map = HashMap::default();
         entity_map.insert(
-            kubeadm_id.clone(),
+            (kubeadm_id.clone()).into(),
             EntityInfo {
-                id: kubeadm_id.clone(),
+                id: (kubeadm_id.clone()).into(),
                 name: "DeepCopyInto".to_string(),
                 entity_type: "method".to_string(),
                 file_path: "cmd/kubeadm/app/apis/kubeadm/v1/types.go".to_string(),
@@ -12827,9 +12827,9 @@ mod tests {
             },
         );
         entity_map.insert(
-            podsec_id.clone(),
+            (podsec_id.clone()).into(),
             EntityInfo {
-                id: podsec_id.clone(),
+                id: (podsec_id.clone()).into(),
                 name: "DeepCopyInto".to_string(),
                 entity_type: "method".to_string(),
                 file_path: "staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go"
@@ -12886,14 +12886,14 @@ mod tests {
         let mut symbol_table = HashMap::default();
         symbol_table.insert(
             "DeepCopyInto".to_string(),
-            vec![kubeadm_id.clone(), podsec_id.clone()],
+            vec![kubeadm_id.clone(), podsec_id.clone()].into_iter().map(Into::into).collect(),
         );
 
         let mut entity_map = HashMap::default();
         entity_map.insert(
-            kubeadm_id.clone(),
+            (kubeadm_id.clone()).into(),
             EntityInfo {
-                id: kubeadm_id.clone(),
+                id: (kubeadm_id.clone()).into(),
                 name: "DeepCopyInto".to_string(),
                 entity_type: "method".to_string(),
                 file_path: "cmd/kubeadm/app/apis/kubeadm/v1/types.go".to_string(),
@@ -12903,9 +12903,9 @@ mod tests {
             },
         );
         entity_map.insert(
-            podsec_id.clone(),
+            (podsec_id.clone()).into(),
             EntityInfo {
-                id: podsec_id.clone(),
+                id: (podsec_id.clone()).into(),
                 name: "DeepCopyInto".to_string(),
                 entity_type: "method".to_string(),
                 file_path: "staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go"
@@ -13031,8 +13031,8 @@ mod tests {
         ext: &'static str,
         source: String,
         entities: Vec<SemanticEntity>,
-        symbol_table: HashMap<String, Vec<String>>,
-        entity_map: HashMap<String, EntityInfo>,
+        symbol_table: SymbolTable,
+        entity_map: EntityInfoMap,
     }
 
     fn mk_entity(
@@ -13086,8 +13086,8 @@ mod tests {
     }
 
     fn register_target(
-        fx_symbols: &mut HashMap<String, Vec<String>>,
-        fx_entity_map: &mut HashMap<String, EntityInfo>,
+        fx_symbols: &mut SymbolTable,
+        fx_entity_map: &mut EntityInfoMap,
         file: &str,
         name: &str,
     ) -> String {
@@ -13095,11 +13095,11 @@ mod tests {
         fx_symbols
             .entry(name.to_string())
             .or_default()
-            .push(id.clone());
+            .push(id.clone().into());
         fx_entity_map.insert(
-            id.clone(),
+            (id.clone()).into(),
             EntityInfo {
-                id: id.clone(),
+                id: (id.clone()).into(),
                 name: name.to_string(),
                 entity_type: "function".to_string(),
                 file_path: file.to_string(),
@@ -13157,13 +13157,13 @@ mod tests {
         let mut entity_map = fx.entity_map.clone();
         for e in &fx.entities {
             entity_map.insert(
-                e.id.clone(),
+                (&e.id).into(),
                 EntityInfo {
-                    id: e.id.clone(),
+                    id: (&e.id).into(),
                     name: e.name.clone(),
                     entity_type: e.entity_type.clone(),
                     file_path: e.file_path.clone(),
-                    parent_id: e.parent_id.clone(),
+                    parent_id: e.parent_id.as_ref().map(Into::into),
                     start_line: e.start_line,
                     end_line: e.end_line,
                 },
@@ -13887,13 +13887,13 @@ mod tests {
             let mut entity_map = fx.entity_map.clone();
             for e in &fx.entities {
                 entity_map.insert(
-                    e.id.clone(),
+                    (&e.id).into(),
                     EntityInfo {
-                        id: e.id.clone(),
+                        id: (&e.id).into(),
                         name: e.name.clone(),
                         entity_type: e.entity_type.clone(),
                         file_path: e.file_path.clone(),
-                        parent_id: e.parent_id.clone(),
+                        parent_id: e.parent_id.as_ref().map(Into::into),
                         start_line: e.start_line,
                         end_line: e.end_line,
                     },

@@ -42,7 +42,7 @@ mod tests {
 
     fn entity(id: &str, name: &str, kind: &str, file: &str, line: usize) -> EntityInfo {
         EntityInfo {
-            id: id.to_string(),
+            id: (id.to_string()).into(),
             name: name.to_string(),
             entity_type: kind.to_string(),
             file_path: file.to_string(),
@@ -67,8 +67,8 @@ mod tests {
 
     fn typed_edge(from: &str, to: &str, ref_type: RefType) -> EntityRef {
         EntityRef {
-            from_entity: from.to_string(),
-            to_entity: to.to_string(),
+            from_entity: (from.to_string()).into(),
+            to_entity: (to.to_string()).into(),
             ref_type,
         }
     }
@@ -245,7 +245,7 @@ mod tests {
             "a.ts",
             5,
         );
-        child.parent_id = Some("a.ts::class::Outer".to_string());
+        child.parent_id = Some("a.ts::class::Outer".into());
         let graph = graph_of(vec![
             entity("a.ts::class::Outer", "Outer", "class", "a.ts", 1),
             child,

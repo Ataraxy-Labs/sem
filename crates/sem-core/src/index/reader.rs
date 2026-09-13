@@ -604,11 +604,11 @@ impl<'a> Entity<'a> {
     /// speak, so an index answer can be handed to unchanged print code.
     pub fn to_entity_info(&self) -> crate::parser::graph::EntityInfo {
         crate::parser::graph::EntityInfo {
-            id: self.id(),
+            id: self.id().into(),
             name: self.name().to_string(),
             entity_type: self.entity_type().to_string(),
             file_path: self.file_path().to_string(),
-            parent_id: self.parent_id(),
+            parent_id: self.parent_id().map(Into::into),
             start_line: self.start_line(),
             end_line: self.end_line(),
         }

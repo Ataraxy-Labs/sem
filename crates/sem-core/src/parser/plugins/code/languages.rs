@@ -224,7 +224,7 @@ pub type ImportExtractorFn = fn(
     file_path: &str,
     source: &[u8],
     symbol_table: &HashMap<String, Vec<String>>,
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &HashMap<crate::model::entity_id::EntityId, EntityInfo>,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<crate::parser::scope_resolve::Scope>,
 );

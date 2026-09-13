@@ -158,21 +158,18 @@ pub(crate) fn semantic_entities_bytes(
 }
 
 pub(crate) fn entity_map_bytes<S: BuildHasher>(
-    map: &StdHashMap<String, crate::parser::graph::EntityInfo, S>,
+    map: &StdHashMap<crate::model::entity_id::EntityId, crate::parser::graph::EntityInfo, S>,
 ) -> usize {
     let table_overhead = map.capacity()
-        * (std::mem::size_of::<String>()
+        * (std::mem::size_of::<crate::model::entity_id::EntityId>()
             + std::mem::size_of::<crate::parser::graph::EntityInfo>()
             + 1);
     let entries: usize = map
         .iter()
-        .map(|(k, v)| {
-            k.capacity()
-                + v.id.capacity()
-                + v.name.capacity()
+        .map(|(_, v)| {
+            v.name.capacity()
                 + v.entity_type.capacity()
                 + v.file_path.capacity()
-                + v.parent_id.as_ref().map_or(0, String::capacity)
         })
         .sum();
     table_overhead + entries
@@ -196,24 +193,6 @@ pub(crate) fn string_to_string_set_map_bytes<S: BuildHasher, S2: BuildHasher>(
         .map(|(k, v)| {
             let set_overhead = v.capacity() * (std::mem::size_of::<String>() + 1);
             k.capacity() + set_overhead + v.iter().map(String::capacity).sum::<usize>()
-        })
-        .sum();
-    table_overhead + entries
-}
-
-/// `symbol_table` shape: `name -> [entity_id, ...]`. Also used for
-/// `import_scans`/similar `HashMap<String, Vec<String>>` structures.
-pub(crate) fn string_to_string_vec_map_bytes<S: BuildHasher>(
-    map: &StdHashMap<String, Vec<String>, S>,
-) -> usize {
-    let table_overhead =
-        map.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<String>>() + 1);
-    let entries: usize = map
-        .iter()
-        .map(|(k, v)| {
-            k.capacity()
-                + v.capacity() * std::mem::size_of::<String>()
-                + v.iter().map(String::capacity).sum::<usize>()
         })
         .sum();
     table_overhead + entries
@@ -445,14 +424,38 @@ pub(crate) fn precomputed_facts_duplicate_split<S: BuildHasher>(
 /// itself is not walked (tree-sitter doesn't expose it cheaply) — this is
 /// path+content only, which is the dominant, attributable term; the tree is
 /// noted separately as an unattributed residual where this is used.
-/// `graph.edges`: `Vec<EntityRef>` (`from_entity`/`to_entity` Strings + a
+/// `graph.edges`: `Vec<EntityRef>` (interned endpoint handles + a
 /// small enum tag).
 pub(crate) fn entity_refs_bytes(edges: &[crate::parser::graph::EntityRef]) -> usize {
-    edges
-        .iter()
-        .map(|e| e.from_entity.capacity() + e.to_entity.capacity())
-        .sum::<usize>()
-        + std::mem::size_of_val(edges)
+    // Shared canonical allocations are counted once by interned_ids_bytes.
+    std::mem::size_of_val(edges)
+}
+
+pub(crate) fn symbol_table_bytes(map: &crate::parser::graph::SymbolTable) -> usize {
+    map.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<crate::model::entity_id::EntityId>>() + 1)
+        + map.iter().map(|(k, v)| k.capacity() + v.capacity() * std::mem::size_of::<crate::model::entity_id::EntityId>()).sum::<usize>()
+}
+
+pub(crate) fn adjacency_bytes(map: &crate::parser::graph::EntityAdjacencyMap) -> usize {
+    map.capacity() * (std::mem::size_of::<crate::model::entity_id::EntityId>() + std::mem::size_of::<Vec<crate::model::entity_id::EntityId>>() + 1)
+        + map.values().map(|v| v.capacity() * std::mem::size_of::<crate::model::entity_id::EntityId>()).sum::<usize>()
+}
+
+/// Canonical strings reachable from this graph, counted once, plus an estimate
+/// of the interner's per-entry pointer/table/control-byte and refcount overhead.
+/// The measured RSS includes actual table capacity and allocator overhead too.
+pub(crate) fn interned_ids_bytes(graph: &crate::parser::graph::EntityGraph) -> usize {
+    let mut ids = std::collections::HashSet::new();
+    for (id, entity) in &graph.entities {
+        ids.insert(id.as_str());
+        ids.insert(entity.id.as_str());
+        if let Some(parent) = &entity.parent_id { ids.insert(parent.as_str()); }
+    }
+    for edge in &graph.edges {
+        ids.insert(edge.from_entity.as_str());
+        ids.insert(edge.to_entity.as_str());
+    }
+    ids.into_iter().map(|id| id.len() + std::mem::size_of::<String>() + 5 * std::mem::size_of::<usize>() + 1).sum()
 }
 
 pub(crate) fn parsed_files_content_bytes(parsed: &[(String, String, tree_sitter::Tree)]) -> usize {

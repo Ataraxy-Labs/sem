@@ -678,8 +678,8 @@ mod tests {
 
     fn edge(from_entity: &str, to_entity: &str) -> EntityRef {
         EntityRef {
-            from_entity: from_entity.to_string(),
-            to_entity: to_entity.to_string(),
+            from_entity: (from_entity.to_string()).into(),
+            to_entity: (to_entity.to_string()).into(),
             ref_type: RefType::Calls,
         }
     }
@@ -689,13 +689,13 @@ mod tests {
             .iter()
             .map(|entity| {
                 (
-                    entity.id.clone(),
+                    entity.id.clone().into(),
                     EntityInfo {
-                        id: entity.id.clone(),
+                        id: (entity.id.clone()).into(),
                         name: entity.name.clone(),
                         entity_type: entity.entity_type.clone(),
                         file_path: entity.file_path.clone(),
-                        parent_id: entity.parent_id.clone(),
+                        parent_id: entity.parent_id.as_ref().map(Into::into),
                         start_line: entity.start_line,
                         end_line: entity.end_line,
                     },

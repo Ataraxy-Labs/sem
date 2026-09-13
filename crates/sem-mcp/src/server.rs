@@ -2270,7 +2270,7 @@ impl SemServer {
                 Err(err) => return Ok(tool_error(err)),
             },
             None => match Self::find_entity_repo_wide(&graph, entity_name) {
-                Ok(entity) => (entity.id.clone(), entity.file_path.clone()),
+                Ok(entity) => (entity.id.to_string(), entity.file_path.clone()),
                 Err(err) => return Ok(tool_error(err)),
             },
         };
@@ -4610,11 +4610,11 @@ fn index_file_is_stale(index: &sem_core::index::QueryIndex, root: &Path, path: &
 /// listing does not print them — `entity_line` uses name/type/lines only.
 fn entity_info_to_entity(entity: sem_core::parser::graph::EntityInfo) -> SemanticEntity {
     SemanticEntity {
-        id: entity.id,
+        id: entity.id.into(),
         file_path: entity.file_path,
         entity_type: entity.entity_type,
         name: entity.name,
-        parent_id: entity.parent_id,
+        parent_id: entity.parent_id.map(Into::into),
         content: String::new(),
         content_hash: String::new(),
         structural_hash: None,

@@ -251,7 +251,7 @@ mod tests {
 
     fn entity_info(id: &str, file_path: &str, name: &str) -> EntityInfo {
         EntityInfo {
-            id: id.to_string(),
+            id: (id.to_string()).into(),
             file_path: file_path.to_string(),
             entity_type: "function".to_string(),
             name: name.to_string(),
@@ -266,7 +266,7 @@ mod tests {
             .iter()
             .map(|entity| {
                 (
-                    entity.id.clone(),
+                    entity.id.clone().into(),
                     entity_info(&entity.id, &entity.file_path, &entity.name),
                 )
             })
@@ -276,8 +276,8 @@ mod tests {
 
     fn edge(from_entity: &str, to_entity: &str) -> EntityRef {
         EntityRef {
-            from_entity: from_entity.to_string(),
-            to_entity: to_entity.to_string(),
+            from_entity: (from_entity.to_string()).into(),
+            to_entity: (to_entity.to_string()).into(),
             ref_type: RefType::Calls,
         }
     }

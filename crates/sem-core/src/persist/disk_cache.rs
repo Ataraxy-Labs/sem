@@ -1641,15 +1641,15 @@ impl DiskCache {
             .iter()
             .map(|e| {
                 (
-                    e.id.clone(),
+                    (&e.id).into(),
                     EntityInfo {
-                        id: e.id.clone(),
+                        id: (&e.id).into(),
                         name: e.name.clone(),
                         entity_type: e.entity_type.clone(),
                         file_path: e.file_path.clone(),
                         start_line: e.start_line,
                         end_line: e.end_line,
-                        parent_id: e.parent_id.clone(),
+                        parent_id: e.parent_id.as_ref().map(Into::into),
                     },
                 )
             })
@@ -1715,7 +1715,7 @@ impl DiskCache {
             .ok()?;
         let entity_map: EntityInfoMap = entity_stmt
             .query_map([], |row| {
-                let id: String = row.get(0)?;
+                let id: crate::model::entity_id::EntityId = row.get(0)?;
                 Ok((
                     id.clone(),
                     EntityInfo {
@@ -2267,9 +2267,9 @@ impl DiskCache {
                 "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
             )?;
             for edge in &graph.edges {
-                if !affected_sources.contains(&edge.from_entity)
-                    || deleted_ids.contains(&edge.from_entity)
-                    || deleted_ids.contains(&edge.to_entity)
+                if !affected_sources.contains(edge.from_entity.as_str())
+                    || deleted_ids.contains(edge.from_entity.as_str())
+                    || deleted_ids.contains(edge.to_entity.as_str())
                 {
                     continue;
                 }

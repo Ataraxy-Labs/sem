@@ -112,7 +112,7 @@ pub struct GraphSession {
     /// no field of its own here: it round-trips through `graph.entities`
     /// instead (see `run()`), since that is already the field's permanent,
     /// public home.
-    symbol_table: HashMap<String, Vec<String>>,
+    symbol_table: crate::parser::graph::SymbolTable,
     class_members: HashMap<String, Vec<(String, String)>>,
     owner_members: HashMap<String, Vec<(String, String)>>,
     entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
@@ -2917,7 +2917,7 @@ mod tests {
             !entities.is_empty(),
             "the fixture must extract entities before it can prove anything about edges"
         );
-        let edges: Vec<(&String, &String, RefType)> = graph
+        let edges: Vec<(&crate::model::entity_id::EntityId, &crate::model::entity_id::EntityId, RefType)> = graph
             .edges
             .iter()
             .map(|e| (&e.from_entity, &e.to_entity, e.ref_type.clone()))
@@ -2946,7 +2946,7 @@ mod tests {
             !entities.is_empty(),
             "the fixture must extract entities before it can prove anything about edges"
         );
-        let edges: Vec<(&String, &String, RefType)> = graph
+        let edges: Vec<(&crate::model::entity_id::EntityId, &crate::model::entity_id::EntityId, RefType)> = graph
             .edges
             .iter()
             .map(|e| (&e.from_entity, &e.to_entity, e.ref_type.clone()))
@@ -2990,7 +2990,7 @@ mod tests {
             !entities.is_empty(),
             "the fixture must extract entities before it can prove anything about edges"
         );
-        let edges: Vec<(&String, &String, RefType)> = graph
+        let edges: Vec<(&crate::model::entity_id::EntityId, &crate::model::entity_id::EntityId, RefType)> = graph
             .edges
             .iter()
             .map(|e| (&e.from_entity, &e.to_entity, e.ref_type.clone()))

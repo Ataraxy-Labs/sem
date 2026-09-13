@@ -94,7 +94,7 @@ fn build_snapshot(root: &Path, files: &[String], num_threads: usize) -> GraphSna
                     RefType::TypeRef => "typeref",
                     RefType::Imports => "imports",
                 };
-                (e.from_entity.clone(), e.to_entity.clone(), kind)
+                (e.from_entity.to_string(), e.to_entity.to_string(), kind)
             })
             .collect();
         edges.sort();

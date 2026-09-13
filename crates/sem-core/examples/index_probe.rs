@@ -63,7 +63,7 @@ fn no_walk(_dir: &Path) -> Vec<String> {
 fn main() {
     let entered = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    match args.first().map(|id| id.as_str()) {
         Some("write") if args.len() >= 3 => write_mode(Path::new(&args[1]), Path::new(&args[2])),
         Some("lookup") if args.len() >= 3 => lookup_mode(Path::new(&args[1]), &args[2..], entered),
         Some("refs") if args.len() >= 4 => {
@@ -256,7 +256,7 @@ fn oracle(graph: &EntityGraph, bytes: Vec<u8>) -> QueryIndex {
                 .iter()
                 .map(|e| {
                     (
-                        e.id.clone(),
+                        e.id.to_string(),
                         e.entity_type.clone(),
                         e.file_path.clone(),
                         e.start_line,
@@ -405,7 +405,7 @@ fn refs_check(graph: &EntityGraph, index: &QueryIndex) -> RefsCheckStats {
         let mut want_deps: Vec<&str> = graph
             .dependencies()
             .get(entity.id.as_str())
-            .map(|v| v.iter().map(String::as_str).collect())
+            .map(|v| v.iter().map(|id| id.as_str()).collect())
             .unwrap_or_default();
         want_deps.sort_unstable();
         let mut got_deps: Vec<String> = index.refs_of(at).iter().map(|e| e.id()).collect();
@@ -415,7 +415,7 @@ fn refs_check(graph: &EntityGraph, index: &QueryIndex) -> RefsCheckStats {
         let mut want_callers: Vec<&str> = graph
             .dependents()
             .get(entity.id.as_str())
-            .map(|v| v.iter().map(String::as_str).collect())
+            .map(|v| v.iter().map(|id| id.as_str()).collect())
             .unwrap_or_default();
         want_callers.sort_unstable();
         let mut got_callers: Vec<String> = index.callers_of(at).iter().map(|e| e.id()).collect();
@@ -581,7 +581,7 @@ fn files_oracle(files: &[String], index: &QueryIndex) {
     let started = Instant::now();
     let mut mismatched = 0usize;
 
-    let mut want_all: Vec<&str> = files.iter().map(String::as_str).collect();
+    let mut want_all: Vec<&str> = files.iter().map(|id| id.as_str()).collect();
     want_all.sort_unstable();
     let mut got_all = index.files_under("");
     got_all.sort_unstable();
@@ -606,7 +606,7 @@ fn files_oracle(files: &[String], index: &QueryIndex) {
         let mut want: Vec<&str> = files
             .iter()
             .filter(|f| f.starts_with(prefix.as_str()))
-            .map(String::as_str)
+            .map(|id| id.as_str())
             .collect();
         want.sort_unstable();
         let mut got = index.files_under(prefix);

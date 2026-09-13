@@ -429,11 +429,11 @@ fn try_index_entities_for_dir(
                     .into_iter()
                     .map(|e| {
                         entity_info_to_entity(EntityInfo {
-                            id: e.id,
+                            id: (e.id).into(),
                             name: e.name,
                             entity_type: e.entity_type,
                             file_path: e.file_path,
-                            parent_id: e.parent_id,
+                            parent_id: e.parent_id.map(Into::into),
                             start_line: e.start_line,
                             end_line: e.end_line,
                         })
@@ -452,11 +452,11 @@ fn try_index_entities_for_dir(
 
 fn entity_info_to_entity(entity: EntityInfo) -> SemanticEntity {
     SemanticEntity {
-        id: entity.id,
+        id: entity.id.into(),
         file_path: entity.file_path,
         entity_type: entity.entity_type,
         name: entity.name,
-        parent_id: entity.parent_id,
+        parent_id: entity.parent_id.map(Into::into),
         content: String::new(),
         content_hash: String::new(),
         structural_hash: None,

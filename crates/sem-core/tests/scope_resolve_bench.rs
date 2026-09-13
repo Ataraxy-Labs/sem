@@ -138,7 +138,7 @@ fn get_false_positive_edges() -> Vec<(&'static str, &'static str, &'static str)>
 
 fn edge_matches<S>(
     edges: &[(String, String)],
-    entity_map: &HashMap<String, EntityInfo, S>,
+    entity_map: &HashMap<sem_core::model::entity_id::EntityId, EntityInfo, S>,
     from_pat: &str,
     to_pat: &str,
 ) -> bool
@@ -396,7 +396,7 @@ fn scope_resolve_comparison() {
     let old_edges: Vec<(String, String)> = old_graph
         .edges
         .iter()
-        .map(|e| (e.from_entity.clone(), e.to_entity.clone()))
+        .map(|e| (e.from_entity.to_string(), e.to_entity.to_string()))
         .collect();
 
     // --- Extract entities for scope resolver ---
@@ -411,17 +411,17 @@ fn scope_resolve_comparison() {
         .flatten()
         .collect();
 
-    let entity_map: HashMap<String, EntityInfo> = all_entities
+    let entity_map: HashMap<sem_core::model::entity_id::EntityId, EntityInfo> = all_entities
         .iter()
         .map(|e| {
             (
-                e.id.clone(),
+                e.id.clone().into(),
                 EntityInfo {
-                    id: e.id.clone(),
+                    id: (e.id.clone()).into(),
                     name: e.name.clone(),
                     entity_type: e.entity_type.clone(),
                     file_path: e.file_path.clone(),
-                    parent_id: e.parent_id.clone(),
+                    parent_id: e.parent_id.as_ref().map(Into::into),
                     start_line: e.start_line,
                     end_line: e.end_line,
                 },
@@ -591,7 +591,7 @@ fn generate_html_report(
     new_total: usize,
     old_edges: &[(String, String)],
     new_edges: &[(String, String)],
-    entity_map: &HashMap<String, EntityInfo>,
+    entity_map: &HashMap<sem_core::model::entity_id::EntityId, EntityInfo>,
     resolution_log: &[scope_resolve::ResolutionEntry],
 ) -> String {
     let old_f1 = if old_precision + old_recall > 0.0 {
@@ -1244,7 +1244,7 @@ fn run_scope_resolve_for_lang(
     let old_edges: Vec<(String, String)> = old_graph
         .edges
         .iter()
-        .map(|e| (e.from_entity.clone(), e.to_entity.clone()))
+        .map(|e| (e.from_entity.to_string(), e.to_entity.to_string()))
         .collect();
 
     // Run new scope resolver
@@ -1259,17 +1259,17 @@ fn run_scope_resolve_for_lang(
         .flatten()
         .collect();
 
-    let entity_map: HashMap<String, EntityInfo> = all_entities
+    let entity_map: HashMap<sem_core::model::entity_id::EntityId, EntityInfo> = all_entities
         .iter()
         .map(|e| {
             (
-                e.id.clone(),
+                e.id.clone().into(),
                 EntityInfo {
-                    id: e.id.clone(),
+                    id: (e.id.clone()).into(),
                     name: e.name.clone(),
                     entity_type: e.entity_type.clone(),
                     file_path: e.file_path.clone(),
-                    parent_id: e.parent_id.clone(),
+                    parent_id: e.parent_id.as_ref().map(Into::into),
                     start_line: e.start_line,
                     end_line: e.end_line,
                 },
@@ -1434,7 +1434,7 @@ fn scope_resolve_integrated_graph() {
     let graph_edges: Vec<(String, String)> = graph
         .edges
         .iter()
-        .map(|e| (e.from_entity.clone(), e.to_entity.clone()))
+        .map(|e| (e.from_entity.to_string(), e.to_entity.to_string()))
         .collect();
 
     let entity_map = &graph.entities;

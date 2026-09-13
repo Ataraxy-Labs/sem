@@ -267,7 +267,7 @@ mod tests {
 
     fn entity(entity_type: &str, name: &str) -> EntityInfo {
         EntityInfo {
-            id: format!("a.ts::{entity_type}::{name}"),
+            id: (format!("a.ts::{entity_type}::{name}")).into(),
             name: name.to_string(),
             entity_type: entity_type.to_string(),
             file_path: "a.ts".to_string(),
