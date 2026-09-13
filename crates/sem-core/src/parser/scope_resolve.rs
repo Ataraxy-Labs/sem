@@ -82,6 +82,7 @@ use crate::parser::plugins::code::{is_pathological_large_file, parse_tree};
 
 type AttrToParamIndex<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str, &'a str)>>;
 type EntityScopeMap = HashMap<EntityId, usize>;
+type ResolvedReference = (EntityId, RefType, &'static str);
 
 /// A scope in the scope tree. Scopes are nested: module -> class -> function -> block.
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -303,7 +304,7 @@ struct SwiftCallSignature {
 }
 
 enum SwiftOverloadSelection {
-    Matched(String),
+    Matched(EntityId),
     NoMatch,
     NotApplicable,
 }
@@ -3722,10 +3723,8 @@ fn resolve_with_scopes_full_inner(
                 build_descendant_ranges_by_entity(&file_entities, entity_map);
             let __ref_collect_ns = __ref_collect_t0.map(|t| t.elapsed().as_nanos() as u64);
             let mut lookup_cache = ScopeLookupCache::default();
-            let mut last_resolution: Option<(
-                ResolutionCacheKey<'_>,
-                Option<(String, RefType, &'static str)>,
-            )> = None;
+            let mut last_resolution: Option<(ResolutionCacheKey<'_>, Option<ResolvedReference>)> =
+                None;
             let __ref_loop_t0 = __prof_on.then(Instant::now);
             let mut __resolve_ref_ns: u64 = 0;
             let mut __cache_hit: u64 = 0;
@@ -3933,15 +3932,11 @@ fn resolve_with_scopes_full_inner(
                                         file_log.push(ResolutionEntry {
                                             from_entity: entity.id.clone(),
                                             reference,
-                                            resolved_to: Some(target_id.clone()),
+                                            resolved_to: Some(target_id.to_string()),
                                             method,
                                         });
                                     }
-                                    file_edges.push((
-                                        interned_source.clone(),
-                                        target_id.into(),
-                                        ref_type,
-                                    ));
+                                    file_edges.push((interned_source.clone(), target_id, ref_type));
                                 }
                             }
                         } else {
@@ -9555,9 +9550,9 @@ fn select_member_candidate(
     argument_labels: Option<&[Option<String>]>,
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
 ) -> SwiftOverloadSelection {
-    let candidates: Vec<&String> = members
+    let candidates: Vec<&EntityId> = members
         .iter()
-        .filter_map(|(name, id)| (name == method).then_some(id.as_string()))
+        .filter_map(|(name, id)| (name == method).then_some(id))
         .collect();
 
     if argument_labels.is_none()
@@ -9576,7 +9571,7 @@ fn select_member_candidate(
 }
 
 fn has_ambiguous_swift_signature_candidates(
-    candidates: &[&String],
+    candidates: &[&EntityId],
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
 ) -> bool {
     candidates
@@ -9588,7 +9583,7 @@ fn has_ambiguous_swift_signature_candidates(
 }
 
 fn select_swift_overload_candidate(
-    candidates: &[&String],
+    candidates: &[&EntityId],
     argument_labels: Option<&[Option<String>]>,
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
 ) -> SwiftOverloadSelection {
@@ -9596,7 +9591,7 @@ fn select_swift_overload_candidate(
         return SwiftOverloadSelection::NotApplicable;
     };
 
-    let signature_candidates: Vec<(&String, &SwiftCallSignature)> = candidates
+    let signature_candidates: Vec<(&EntityId, &SwiftCallSignature)> = candidates
         .iter()
         .copied()
         .filter_map(|candidate| {
@@ -9609,7 +9604,7 @@ fn select_swift_overload_candidate(
         return SwiftOverloadSelection::NotApplicable;
     }
 
-    let exact_matches: Vec<&String> = signature_candidates
+    let exact_matches: Vec<&EntityId> = signature_candidates
         .iter()
         .filter_map(|(candidate, signature)| {
             (signature.argument_labels.as_slice() == argument_labels).then_some(*candidate)
@@ -9623,7 +9618,7 @@ fn select_swift_overload_candidate(
     }
 
     if argument_labels.iter().all(Option::is_none) {
-        let same_arity_matches: Vec<&String> = signature_candidates
+        let same_arity_matches: Vec<&EntityId> = signature_candidates
             .iter()
             .filter_map(|(candidate, signature)| {
                 (signature.argument_labels.len() == argument_labels.len()).then_some(*candidate)
@@ -10029,23 +10024,23 @@ fn resolve_qualified_callee_name(
     from_entity_id: &str,
     allow_same_file: bool,
     rec: &mut Recorder,
-) -> Option<String> {
+) -> Option<EntityId> {
     if let Some(target_id) = import_table_by_name.get(name) {
         if *target_id != from_entity_id {
-            return Some((*target_id).to_string());
+            return Some(EntityId::from(*target_id));
         }
     }
     if allow_same_file {
         if let Some(same_file) = file_lookup.first_id_by_name(name) {
             if same_file != from_entity_id {
-                return Some(same_file.to_string());
+                return Some(EntityId::from(same_file));
             }
         }
     }
     rec.one(Table::SymbolTable, name);
     if let Some(ids) = symbol_table.get(name) {
         if ids.len() == 1 && ids[0] != from_entity_id {
-            return Some(ids[0].to_string());
+            return Some(ids[0].clone());
         }
     }
     None
@@ -10084,7 +10079,7 @@ fn resolve_ref(
     // per lookup — it holds only this file's own imports and the caller records
     // the whole slice once as `Table::ImportsForFile`.
     rec: &mut Recorder,
-) -> Option<(String, RefType, &'static str)> {
+) -> Option<ResolvedReference> {
     match &ast_ref.kind {
         AstRefKind::Call {
             name,
@@ -10116,22 +10111,18 @@ fn resolve_ref(
             if !swift_call_signatures.is_empty() {
                 if argument_labels.is_some() {
                     if let Some(target_ids) = symbol_table.get(name.as_ref()) {
-                        let same_file_targets: Vec<&String> = target_ids
+                        let same_file_targets: Vec<&EntityId> = target_ids
                             .iter()
-                            .map(crate::model::entity_id::EntityId::as_string)
                             .filter(|id| {
                                 entity_map
                                     .get(*id)
                                     .map_or(false, |e| e.file_path == file_path)
                             })
                             .collect();
-                        let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
+                        let visible_targets: Vec<&EntityId> = if !same_file_targets.is_empty() {
                             same_file_targets
                         } else if allow_cross_file_calls {
-                            target_ids
-                                .iter()
-                                .map(crate::model::entity_id::EntityId::as_string)
-                                .collect()
+                            target_ids.iter().collect()
                         } else {
                             Vec::new()
                         };
@@ -10155,22 +10146,18 @@ fn resolve_ref(
                         }
                     }
                 } else if let Some(target_ids) = symbol_table.get(name.as_ref()) {
-                    let same_file_targets: Vec<&String> = target_ids
+                    let same_file_targets: Vec<&EntityId> = target_ids
                         .iter()
-                        .map(crate::model::entity_id::EntityId::as_string)
                         .filter(|id| {
                             entity_map
                                 .get(*id)
                                 .map_or(false, |e| e.file_path == file_path)
                         })
                         .collect();
-                    let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
+                    let visible_targets: Vec<&EntityId> = if !same_file_targets.is_empty() {
                         same_file_targets
                     } else if allow_cross_file_calls {
-                        target_ids
-                            .iter()
-                            .map(crate::model::entity_id::EntityId::as_string)
-                            .collect()
+                        target_ids.iter().collect()
                     } else {
                         Vec::new()
                     };
@@ -10194,7 +10181,7 @@ fn resolve_ref(
             // imports, so a name lookup suffices — avoiding a (path, name) key string
             // allocated for every reference (millions on a large repo).
             if let Some(target_id) = import_table_by_name.get(name.as_ref()) {
-                return Some(((*target_id).to_string(), RefType::Calls, "import"));
+                return Some((EntityId::from(*target_id), RefType::Calls, "import"));
             }
 
             // 3. Global symbol table fallback (constructor calls or cross-file functions)
@@ -10218,10 +10205,10 @@ fn resolve_ref(
                     // thousands of same-named entities a monorepo accumulates.
                     let target = file_lookup
                         .first_id_by_name(name)
-                        .map(str::to_string)
+                        .map(EntityId::from)
                         .or_else(|| {
                             if is_constructor || allow_cross_file_calls {
-                                target_ids.first().map(ToString::to_string)
+                                target_ids.first().cloned()
                             } else {
                                 None
                             }
@@ -10232,22 +10219,18 @@ fn resolve_ref(
                     return None;
                 }
 
-                let same_file_targets: Vec<&String> = target_ids
+                let same_file_targets: Vec<&EntityId> = target_ids
                     .iter()
-                    .map(crate::model::entity_id::EntityId::as_string)
                     .filter(|id| {
                         entity_map
                             .get(*id)
                             .map_or(false, |e| e.file_path == file_path)
                     })
                     .collect();
-                let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
+                let visible_targets: Vec<&EntityId> = if !same_file_targets.is_empty() {
                     same_file_targets
                 } else if is_constructor || allow_cross_file_calls {
-                    target_ids
-                        .iter()
-                        .map(crate::model::entity_id::EntityId::as_string)
-                        .collect()
+                    target_ids.iter().collect()
                 } else {
                     Vec::new()
                 };
@@ -10285,13 +10268,13 @@ fn resolve_ref(
                     .find(|(member, _)| member.as_str() == name.as_ref())
                 {
                     if target_id != from_entity_id {
-                        return Some((target_id.to_string(), RefType::Calls, "scoped_call"));
+                        return Some((target_id.clone(), RefType::Calls, "scoped_call"));
                     }
                 }
             }
             if let Some(target_id) = import_table_by_name.get(name.as_ref()) {
                 if *target_id != from_entity_id {
-                    return Some(((*target_id).to_string(), RefType::Calls, "scoped_call"));
+                    return Some((EntityId::from(*target_id), RefType::Calls, "scoped_call"));
                 }
             }
             // Rust module-alias qualified call: `alias::item()` where `alias`
@@ -10302,7 +10285,7 @@ fn resolve_ref(
             let qualified = format!("{path}::{name}");
             if let Some(target_id) = import_table_by_name.get(qualified.as_str()) {
                 if *target_id != from_entity_id {
-                    return Some(((*target_id).to_string(), RefType::Calls, "module_alias"));
+                    return Some((EntityId::from(*target_id), RefType::Calls, "module_alias"));
                 }
             }
             None
@@ -10352,7 +10335,7 @@ fn resolve_ref(
                             }
                         }
                         if let Some(eid) = scopes[idx].defs.get(method.as_ref()) {
-                            return Some((eid.to_string(), RefType::Calls, "scope_chain"));
+                            return Some((eid.clone(), RefType::Calls, "scope_chain"));
                         }
                         break;
                     }
@@ -10654,7 +10637,7 @@ fn resolve_ref(
                 // Namespace import: alias.method()
                 let namespaced = format!("{receiver}.{method}");
                 if let Some(target_id) = import_table_by_name.get(namespaced.as_str()) {
-                    return Some(((*target_id).to_string(), RefType::Calls, "import"));
+                    return Some((EntityId::from(*target_id), RefType::Calls, "import"));
                 }
             }
 
@@ -10668,7 +10651,7 @@ fn resolve_ref(
             // module-level entity keeps the fallback active.
             if !scope_lookup_missed && file_path.ends_with(".go") {
                 if let Some(target_id) = import_table_by_name.get(method.as_ref()) {
-                    return Some(((*target_id).to_string(), RefType::Calls, "import"));
+                    return Some((EntityId::from(*target_id), RefType::Calls, "import"));
                 }
             }
 
@@ -10694,7 +10677,7 @@ fn resolve_ref(
                                     && matches!(e.entity_type.as_str(), "method" | "function")
                             })
                         {
-                            return Some((tid.to_string(), RefType::Calls, "unique_method_name"));
+                            return Some((tid.clone(), RefType::Calls, "unique_method_name"));
                         }
                     }
                 }
@@ -10809,22 +10792,22 @@ fn is_simple_identifier_name(name: &str) -> bool {
     (first == '_' || first.is_alphabetic()) && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
 }
 
-fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> Option<String> {
+fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> Option<EntityId> {
     scopes
         .iter()
         .find(|scope| scope.owner_id.as_deref() == Some(owner_id))
-        .and_then(|scope| scope.defs.get(member).map(ToString::to_string))
+        .and_then(|scope| scope.defs.get(member).cloned())
 }
 
 fn lookup_entity_member(
     owner_members: &OwnerMembers,
     owner_id: &str,
     member: &str,
-) -> Option<String> {
+) -> Option<EntityId> {
     owner_members
         .get(owner_id)
         .and_then(|members| members.iter().find(|(name, _)| name == member))
-        .map(|(_, id)| id.to_string())
+        .map(|(_, id)| id.clone())
 }
 
 /// Find the class name for the enclosing class scope.
@@ -10885,7 +10868,7 @@ fn find_enclosing_class_cached(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScopeChainLookup {
     /// Name resolved to an entity id via a scope's `.defs`.
-    Defined(String),
+    Defined(EntityId),
     /// A `.bindings`-only hit stopped the walk before any `.defs` hit.
     Shadowed,
     /// Neither map knows the name anywhere up the chain.
@@ -10902,7 +10885,7 @@ fn lookup_scope_chain_respecting_shadows(
     let mut idx = start_scope;
     loop {
         if let Some(eid) = scopes[idx].defs.get(name) {
-            return ScopeChainLookup::Defined(eid.to_string());
+            return ScopeChainLookup::Defined(eid.clone());
         }
         if scopes[idx].bindings.contains(name) {
             return ScopeChainLookup::Shadowed;
@@ -11058,6 +11041,18 @@ mod tests {
         let canonical = EntityId::from(text);
         for id in scope.defs.values().chain(scope.owner_id.iter()) {
             assert_eq!(id.as_str().as_ptr(), canonical.as_str().as_ptr());
+        }
+        let mut lookup_cache = ScopeLookupCache::default();
+        for _ in 0..2 {
+            let ScopeChainLookup::Defined(id) = lookup_scope_chain_respecting_shadows_cached(
+                0,
+                std::slice::from_ref(&scope),
+                "callee",
+                &mut lookup_cache,
+            ) else {
+                panic!("the cached scope lookup must preserve the definition");
+            };
+            assert_eq!(id.identity_key(), canonical.identity_key());
         }
         assert_eq!(serde_json::to_value(&scope).unwrap(), legacy);
         let mut encoded = Vec::new();
@@ -11417,7 +11412,7 @@ mod tests {
         );
         assert_eq!(
             resolved_hit,
-            Some(("go-fmt-target".to_string(), RefType::Calls, "import"))
+            Some(("go-fmt-target".into(), RefType::Calls, "import"))
         );
 
         // Lookup MISS (true): identical inputs except the flag — the
@@ -14318,7 +14313,7 @@ mod tests {
         let direct = lookup_scope_chain_respecting_shadows(1, &scopes, "checkElements");
         assert_eq!(
             direct,
-            ScopeChainLookup::Defined("no-keywords.cjs::method::create::checkElements".to_string()),
+            ScopeChainLookup::Defined("no-keywords.cjs::method::create::checkElements".into()),
             "same-scope .defs+.bindings co-population must resolve as Defined"
         );
 
@@ -14405,7 +14400,7 @@ mod tests {
         // resolves normally.
         assert_eq!(
             lookup_scope_chain_respecting_shadows(0, &scopes, "isKeyword"),
-            ScopeChainLookup::Defined("no-keywords.cjs::method::create::isKeyword".to_string()),
+            ScopeChainLookup::Defined("no-keywords.cjs::method::create::isKeyword".into()),
         );
         // Unknown names stay NotFound so callers fall through to import /
         // global fallbacks unchanged.

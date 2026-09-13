@@ -131,6 +131,13 @@ impl EntityId {
         &self.0.text
     }
 
+    /// Ephemeral identity for operations that retain the corresponding handles.
+    /// Never serialize this address or use it once its owning handle is gone.
+    /// Ordinary Hash still hashes text to preserve borrowed-string lookups.
+    pub(crate) fn identity_key(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     /// Number of canonical IDs currently retained across all live graphs and
     /// sessions in this process. Useful for profiling/reclamation diagnostics.
     pub fn live_count() -> usize {

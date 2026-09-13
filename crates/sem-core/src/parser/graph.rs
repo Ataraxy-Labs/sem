@@ -875,17 +875,20 @@ fn sort_all_entity_ranges_by_source(ranges_by_file: &mut EntityRanges) {
 
 fn dedupe_resolved_edges(mut combined: Vec<ResolvedEdge>) -> Vec<ResolvedEdge> {
     let mut keep = vec![false; combined.len()];
-    let mut seen_edges: HashSet<(&str, &str)> =
+    let mut seen_edges: HashSet<(usize, usize)> =
         HashSet::with_capacity_and_hasher(combined.len(), Default::default());
     for (index, (from_entity, to_entity, _)) in combined.iter().enumerate() {
-        if seen_edges.insert((from_entity.as_str(), to_entity.as_str())) {
+        // All handles remain owned by `combined` until this set is dropped.
+        // Canonical identity avoids re-hashing two long ID strings per edge;
+        // these addresses never escape to output, ordering, or persistence.
+        if seen_edges.insert((from_entity.identity_key(), to_entity.identity_key())) {
             keep[index] = true;
         }
     }
     drop(seen_edges);
 
     // In-place survivor compaction: the `drop` above
-    // already released the `&str` borrows, so `combined` can be mutated —
+    // already released the ephemeral identity keys before any handle drops —
     // the old `into_iter().filter_map().collect()` built a whole second
     // edge vector (both live at the `collect`, a transient ~150-200 MB at
     // linux scale) to drop a handful of elements. `Vec::retain` preserves
@@ -8207,6 +8210,34 @@ mod tests {
         assert_eq!(edges[1], (to.clone(), from.clone(), RefType::TypeRef));
         assert_eq!(edges[0].0.as_str().as_ptr(), from.as_str().as_ptr());
         assert_eq!(edges[0].1.as_str().as_ptr(), to.as_str().as_ptr());
+    }
+
+    #[test]
+    fn interned_edge_deduplication_matches_text_identity() {
+        let names = [
+            "",
+            "über.py::function::caller",
+            "über.py::function::callee",
+            "deeply/nested/module/services/users.ts::class::Users::method::find",
+        ];
+        let mut input = Vec::new();
+        let mut expected = Vec::new();
+        let mut seen_text = HashSet::default();
+        for index in 0..512 {
+            let from = names[index % names.len()];
+            let to = names[(index / names.len()) % names.len()];
+            let kind = match index % 3 {
+                0 => RefType::Calls,
+                1 => RefType::Imports,
+                _ => RefType::TypeRef,
+            };
+            let edge = (EntityId::from(from.to_owned()), EntityId::from(to), kind);
+            if seen_text.insert((from.to_owned(), to.to_owned())) {
+                expected.push(edge.clone());
+            }
+            input.push(edge);
+        }
+        assert_eq!(dedupe_resolved_edges(input), expected);
     }
     use crate::git::types::{FileChange, FileStatus};
     use crate::parser::plugins::code::languages::StripStrategy;
