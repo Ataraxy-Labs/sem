@@ -622,6 +622,16 @@ pub(crate) type MemberTarget = (String, EntityId);
 pub(crate) type ClassMembers = HashMap<String, Vec<MemberTarget>>;
 pub(crate) type OwnerMembers = HashMap<EntityId, Vec<MemberTarget>>;
 
+/// Reuse a graph-owned canonical handle without acquiring an interner shard
+/// lock. Resolution already has this immutable map; absent (e.g. synthetic)
+/// IDs still take the normal interning path, preserving their text identity.
+pub(crate) fn canonical_entity_id(entities: &EntityInfoMap, id: &str) -> EntityId {
+    entities
+        .get_key_value(id)
+        .map(|(key, _)| key.clone())
+        .unwrap_or_else(|| EntityId::from(id))
+}
+
 /// Type of reference between entities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1313,6 +1323,7 @@ fn build_symbol_table_by_file<'a>(
 }
 
 struct ReferenceResolutionContext<'a> {
+    entity_map: &'a EntityInfoMap,
     // `symbol_table`'s per-name candidate list, pre-bucketed by
     // file path (see `build_symbol_table_by_file`) so the bag-of-words
     // global-ref match in `resolve_entity_references` is O(candidates in
@@ -1720,7 +1731,7 @@ fn resolve_entity_references(
         direct_reference_line_ranges(entity, fallback_end_line, context.child_line_ranges);
 
     let mut entity_edges = Vec::new();
-    let source_id = EntityId::from(entity.id.as_str());
+    let source_id = canonical_entity_id(context.entity_map, entity.id.as_str());
 
     let reference_index =
         if entity_requires_content_span_filter(entity, context.child_ranges_by_parent) {
@@ -1911,7 +1922,7 @@ fn resolve_entity_references(
             {
                 entity_edges.push((
                     source_id.clone(),
-                    EntityId::from(import_target_id),
+                    canonical_entity_id(context.entity_map, import_target_id),
                     ref_type,
                 ));
             }
@@ -1947,7 +1958,11 @@ fn resolve_entity_references(
                 {
                     continue;
                 }
-                entity_edges.push((source_id.clone(), EntityId::from(target_id), ref_type));
+                entity_edges.push((
+                    source_id.clone(),
+                    canonical_entity_id(context.entity_map, target_id),
+                    ref_type,
+                ));
             }
         }
     }
@@ -1978,7 +1993,7 @@ fn resolve_entity_references(
                 {
                     entity_edges.push((
                         source_id.clone(),
-                        EntityId::from(import_target_id),
+                        canonical_entity_id(context.entity_map, import_target_id),
                         RefType::Calls,
                     ));
                 }
@@ -3109,6 +3124,7 @@ impl EntityGraph {
         let symbol_table_by_file = build_symbol_table_by_file(symbol_table.as_ref(), &entity_map);
         resolve_profile::add_symbol_table_by_file_ns(__symbol_table_by_file_t0.elapsed());
         let reference_context = ReferenceResolutionContext {
+            entity_map: &entity_map,
             symbol_table_by_file: &symbol_table_by_file,
             imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
@@ -3534,6 +3550,7 @@ impl EntityGraph {
         let imports_by_file = build_imports_by_file(&import_table);
         let symbol_table_by_file = build_symbol_table_by_file(symbol_table.as_ref(), &entity_map);
         let reference_context = ReferenceResolutionContext {
+            entity_map: &entity_map,
             symbol_table_by_file: &symbol_table_by_file,
             imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,
@@ -4301,6 +4318,7 @@ impl EntityGraph {
         let imports_by_file = build_imports_by_file(&import_table);
         let symbol_table_by_file = build_symbol_table_by_file(symbol_table.as_ref(), &entity_map);
         let reference_context = ReferenceResolutionContext {
+            entity_map: &entity_map,
             symbol_table_by_file: &symbol_table_by_file,
             imports_by_file: &imports_by_file,
             scope_consumed_words: &scope_consumed_words,

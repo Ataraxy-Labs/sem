@@ -62,8 +62,8 @@ macro_rules! maybe_par_iter {
     }};
 }
 use crate::parser::graph::{
-    ClassMembers, ConsumedWords, EntityId, EntityInfo, EntityInfoMap, EntityRanges, MemberTarget,
-    OwnerMembers, RefType, ResolvedEdge, SymbolTable,
+    canonical_entity_id, ClassMembers, ConsumedWords, EntityId, EntityInfo, EntityInfoMap,
+    EntityRanges, MemberTarget, OwnerMembers, RefType, ResolvedEdge, SymbolTable,
 };
 use crate::parser::import_resolution::{
     build_owned_stem_index, find_import_file, find_import_target, import_file_candidates,
@@ -3771,7 +3771,7 @@ fn resolve_with_scopes_full_inner(
                 // previously re-hashed the entity id against several maps (and every
                 // child id, once per ref); on dense, deeply nested files that hashing
                 // dominated resolution. Fetch them once per entity instead.
-                let interned_source = EntityId::from(&entity.id);
+                let interned_source = canonical_entity_id(entity_map, &entity.id);
                 let entity_consumed = file_consumed_words
                     .entry(interned_source.clone())
                     .or_default();
@@ -4173,8 +4173,8 @@ pub(crate) fn fingerprint_corpus_tables(
             .u(info.end_line);
         sink.one(Table::EntityMap, id, h.finish());
     }
-    for (pkg, entries) in &lookups.go_pkg_index {
-        sink.one(Table::GoPkgIndex, pkg, hash_go_pkg_entries(entries));
+    for (pkg, bucket) in &lookups.go_pkg_index {
+        sink.one(Table::GoPkgIndex, pkg, hash_go_pkg_entries(&bucket.entries));
     }
     sink.whole(Table::GuardPyWildcardImport, wildcard_import_guard);
     // Same fold, second tag: `register_rust_module_import` (Rust's relative
@@ -4318,7 +4318,7 @@ fn hash_member_list(members: &[MemberTarget]) -> u64 {
 /// fingerprint keeps `Table::GoPkgIndex`'s invalidation correct rather than
 /// silently truncating the read-set to `(name, id)` and missing a change
 /// that only moves an entity's declaring directory.
-fn hash_go_pkg_entries(entries: &[(String, String, String)]) -> u64 {
+fn hash_go_pkg_entries(entries: &[GoPkgEntry]) -> u64 {
     let mut h = ValueHasher::new();
     for (name, id, decl_dir) in entries {
         h.s(name).s(id).s(decl_dir);
@@ -5884,7 +5884,34 @@ pub fn extract_go_receiver_type(content: &str) -> Option<String> {
 /// declaring-directory field is what lets [`register_go_package_imports`]
 /// pick the one candidate a specific import actually means, instead of
 /// inserting the whole polluted union into a file's `import_table`.
-pub(crate) type GoPkgIndex = HashMap<String, Vec<(String, String, String)>>;
+type GoPkgEntry = (String, EntityId, String);
+pub(crate) type GoPkgIndex = HashMap<String, GoPkgBucket>;
+
+#[derive(Default)]
+pub(crate) struct GoPkgBucket {
+    // Keep the original (name, id, directory) order for fingerprint parity
+    // and last-write-wins behavior when a package repeats a symbol name.
+    entries: Vec<GoPkgEntry>,
+    directories: Vec<(String, Vec<usize>)>,
+}
+
+impl GoPkgBucket {
+    fn index_directories(&mut self) {
+        self.entries.sort_unstable();
+        let mut by_directory: HashMap<&str, Vec<usize>> = HashMap::default();
+        for (index, (_, _, directory)) in self.entries.iter().enumerate() {
+            by_directory
+                .entry(directory.as_str())
+                .or_default()
+                .push(index);
+        }
+        self.directories = by_directory
+            .into_iter()
+            .map(|(directory, indices)| (directory.to_owned(), indices))
+            .collect();
+        self.directories.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+}
 
 /// Build Go package index: pkg_name → [(entity_name, entity_id, declaring_dir)].
 /// Maps each entity's containing directory name to itself — Go import paths
@@ -5919,9 +5946,9 @@ pub(crate) fn build_go_pkg_index(
                     let parent_path = &entity.file_path[..parent_start];
                     let dir_name = parent_path.rsplit('/').next().unwrap_or(parent_path);
                     if !dir_name.is_empty() {
-                        idx.entry(dir_name.to_string()).or_default().push((
+                        idx.entry(dir_name.to_string()).or_default().entries.push((
                             name.clone(),
-                            target_id.to_string(),
+                            target_id.clone(),
                             decl_dir.to_string(),
                         ));
                     }
@@ -5929,8 +5956,8 @@ pub(crate) fn build_go_pkg_index(
             }
         }
     }
-    for entries in idx.values_mut() {
-        entries.sort_unstable();
+    for bucket in idx.values_mut() {
+        bucket.index_directories();
     }
     idx
 }
@@ -8783,7 +8810,7 @@ fn register_go_package_imports(
     // *any* same-named package must invalidate this file's resolution,
     // since it was consulted to pick the winner.
     rec.one(Table::GoPkgIndex, pkg_name);
-    let Some(entries) = go_pkg_index.get(pkg_name) else {
+    let Some(bucket) = go_pkg_index.get(pkg_name) else {
         return;
     };
     // a bucket keyed by bare last segment can hold entries from
@@ -8796,16 +8823,14 @@ fn register_go_package_imports(
     // one distinct directory (the overwhelming common case) short-circuits
     // without comparing anything, so this costs nothing extra when there is
     // nothing to disambiguate.
-    let winner = select_go_pkg_candidate(entries, import_path);
-    for (name, target_id, decl_dir) in entries {
-        if decl_dir != winner {
-            continue;
-        }
-        import_table.insert((file_path.to_string(), name.clone()), target_id.clone());
+    let Some((_, indices)) = select_go_pkg_candidate(bucket, import_path) else {
+        return;
+    };
+    for &index in indices {
+        let (name, target_id, _) = &bucket.entries[index];
+        import_table.insert((file_path.to_string(), name.clone()), target_id.to_string());
         if !scopes.is_empty() {
-            scopes[0]
-                .defs
-                .insert(name.clone(), EntityId::from(target_id));
+            scopes[0].defs.insert(name.clone(), target_id.clone());
         }
     }
 }
@@ -8821,25 +8846,23 @@ fn register_go_package_imports(
 /// lexicographically smaller directory — deterministic, matching this
 /// module's other tie-breaks (`find_import_file`'s `min_by`).
 ///
-/// A bucket with exactly one distinct declaring directory (the common,
-/// unambiguous case — most bare names are not repo-wide collisions) never
-/// calls [`trailing_path_overlap`] at all: `Iterator::max_by` does not
-/// invoke its comparator on a single-element iterator, so this is exactly
-/// as cheap as returning the bucket's one directory directly.
+/// The directory list and each directory's ordered entry positions are built
+/// once, not collected/sorted from every exported symbol for every import.
+/// Selection allocates nothing and visits distinct directories only. For a
+/// single-directory bucket, `max_by` never invokes its comparator.
 fn select_go_pkg_candidate<'a>(
-    entries: &'a [(String, String, String)],
+    bucket: &'a GoPkgBucket,
     import_path: &str,
-) -> &'a str {
-    let mut dirs: Vec<&str> = entries.iter().map(|(_, _, dir)| dir.as_str()).collect();
-    dirs.sort_unstable();
-    dirs.dedup();
-    dirs.into_iter()
+) -> Option<(&'a str, &'a [usize])> {
+    bucket
+        .directories
+        .iter()
         .max_by(|a, b| {
-            trailing_path_overlap(import_path, a)
-                .cmp(&trailing_path_overlap(import_path, b))
-                .then_with(|| (*b).cmp(*a))
+            trailing_path_overlap(import_path, &a.0)
+                .cmp(&trailing_path_overlap(import_path, &b.0))
+                .then_with(|| b.0.cmp(&a.0))
         })
-        .unwrap_or("")
+        .map(|(directory, indices)| (directory.as_str(), indices.as_slice()))
 }
 
 /// How many trailing `/`-separated segments two paths share, scanning from
@@ -10021,19 +10044,20 @@ fn resolve_qualified_callee_name(
     import_table_by_name: &HashMap<&str, &str>,
     file_lookup: &FileEntityLookup<'_>,
     symbol_table: &SymbolTable,
+    entity_map: &EntityInfoMap,
     from_entity_id: &str,
     allow_same_file: bool,
     rec: &mut Recorder,
 ) -> Option<EntityId> {
     if let Some(target_id) = import_table_by_name.get(name) {
         if *target_id != from_entity_id {
-            return Some(EntityId::from(*target_id));
+            return Some(canonical_entity_id(entity_map, *target_id));
         }
     }
     if allow_same_file {
         if let Some(same_file) = file_lookup.first_id_by_name(name) {
             if same_file != from_entity_id {
-                return Some(EntityId::from(same_file));
+                return Some(canonical_entity_id(entity_map, same_file));
             }
         }
     }
@@ -10181,7 +10205,11 @@ fn resolve_ref(
             // imports, so a name lookup suffices — avoiding a (path, name) key string
             // allocated for every reference (millions on a large repo).
             if let Some(target_id) = import_table_by_name.get(name.as_ref()) {
-                return Some((EntityId::from(*target_id), RefType::Calls, "import"));
+                return Some((
+                    canonical_entity_id(entity_map, *target_id),
+                    RefType::Calls,
+                    "import",
+                ));
             }
 
             // 3. Global symbol table fallback (constructor calls or cross-file functions)
@@ -10205,7 +10233,7 @@ fn resolve_ref(
                     // thousands of same-named entities a monorepo accumulates.
                     let target = file_lookup
                         .first_id_by_name(name)
-                        .map(EntityId::from)
+                        .map(|id| canonical_entity_id(entity_map, id))
                         .or_else(|| {
                             if is_constructor || allow_cross_file_calls {
                                 target_ids.first().cloned()
@@ -10274,7 +10302,11 @@ fn resolve_ref(
             }
             if let Some(target_id) = import_table_by_name.get(name.as_ref()) {
                 if *target_id != from_entity_id {
-                    return Some((EntityId::from(*target_id), RefType::Calls, "scoped_call"));
+                    return Some((
+                        canonical_entity_id(entity_map, *target_id),
+                        RefType::Calls,
+                        "scoped_call",
+                    ));
                 }
             }
             // Rust module-alias qualified call: `alias::item()` where `alias`
@@ -10285,7 +10317,11 @@ fn resolve_ref(
             let qualified = format!("{path}::{name}");
             if let Some(target_id) = import_table_by_name.get(qualified.as_str()) {
                 if *target_id != from_entity_id {
-                    return Some((EntityId::from(*target_id), RefType::Calls, "module_alias"));
+                    return Some((
+                        canonical_entity_id(entity_map, *target_id),
+                        RefType::Calls,
+                        "module_alias",
+                    ));
                 }
             }
             None
@@ -10502,6 +10538,7 @@ fn resolve_ref(
                         import_table_by_name,
                         file_lookup,
                         symbol_table,
+                        entity_map,
                         from_entity_id,
                         true,
                         rec,
@@ -10637,7 +10674,11 @@ fn resolve_ref(
                 // Namespace import: alias.method()
                 let namespaced = format!("{receiver}.{method}");
                 if let Some(target_id) = import_table_by_name.get(namespaced.as_str()) {
-                    return Some((EntityId::from(*target_id), RefType::Calls, "import"));
+                    return Some((
+                        canonical_entity_id(entity_map, *target_id),
+                        RefType::Calls,
+                        "import",
+                    ));
                 }
             }
 
@@ -10651,7 +10692,11 @@ fn resolve_ref(
             // module-level entity keeps the fallback active.
             if !scope_lookup_missed && file_path.ends_with(".go") {
                 if let Some(target_id) = import_table_by_name.get(method.as_ref()) {
-                    return Some((EntityId::from(*target_id), RefType::Calls, "import"));
+                    return Some((
+                        canonical_entity_id(entity_map, *target_id),
+                        RefType::Calls,
+                        "import",
+                    ));
                 }
             }
 
@@ -11025,6 +11070,63 @@ fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn go_directory_index_preserves_flat_selection_order_and_fingerprints() {
+        let mut bucket = GoPkgBucket::default();
+        for directory in ["b/v1", "x/a/v1", "a/v1", "über/v1"] {
+            for ordinal in (0..8).rev() {
+                bucket.entries.push((
+                    format!("Method{}", ordinal % 2),
+                    EntityId::from(format!("{directory}/types.go::method::M{ordinal}")),
+                    directory.to_owned(),
+                ));
+            }
+        }
+        let mut flat = bucket.entries.clone();
+        flat.sort_unstable();
+        let fingerprint = hash_go_pkg_entries(&flat);
+        bucket.index_directories();
+        assert_eq!(bucket.entries, flat);
+        assert_eq!(hash_go_pkg_entries(&bucket.entries), fingerprint);
+        assert_eq!(bucket.directories.len(), 4);
+
+        for import_path in [
+            "example.com/b/v1",
+            "example.com/x/a/v1",
+            "example.com/a/v1",
+            "example.com/über/v1",
+            "unknown/v1",
+            "v1",
+            "",
+        ] {
+            // Original selector: sort all per-entity directories on every call.
+            let mut directories: Vec<&str> = flat.iter().map(|(_, _, dir)| dir.as_str()).collect();
+            directories.sort_unstable();
+            directories.dedup();
+            let expected_dir = directories
+                .into_iter()
+                .max_by(|a, b| {
+                    trailing_path_overlap(import_path, a)
+                        .cmp(&trailing_path_overlap(import_path, b))
+                        .then_with(|| b.cmp(a))
+                })
+                .unwrap();
+            let expected: Vec<_> = flat
+                .iter()
+                .filter(|(_, _, dir)| dir == expected_dir)
+                .collect();
+            let (selected_dir, indices) = select_go_pkg_candidate(&bucket, import_path).unwrap();
+            assert_eq!(selected_dir, expected_dir);
+            assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+            let selected: Vec<_> = indices
+                .iter()
+                .map(|&index| &bucket.entries[index])
+                .collect();
+            assert_eq!(selected, expected);
+        }
+        assert!(select_go_pkg_candidate(&GoPkgBucket::default(), "v1").is_none());
+    }
 
     #[test]
     fn scope_ids_share_canonical_storage_and_decode_legacy_text() {
@@ -12753,10 +12855,10 @@ mod tests {
         let index = build_go_pkg_index(&symbol_table, &entity_map);
 
         assert_eq!(
-            index.get("foo"),
+            index.get("foo").map(|bucket| &bucket.entries),
             Some(&vec![
-                ("alpha".to_string(), second_id, "pkg/foo".to_string()),
-                ("zeta".to_string(), first_id, "pkg/foo".to_string()),
+                ("alpha".to_string(), second_id.into(), "pkg/foo".to_string()),
+                ("zeta".to_string(), first_id.into(), "pkg/foo".to_string()),
             ])
         );
     }
@@ -12868,10 +12970,10 @@ mod tests {
         // only its directory ("foo") does.
         assert!(!index.contains_key("zeta"));
         assert_eq!(
-            index.get("foo"),
+            index.get("foo").map(|bucket| &bucket.entries),
             Some(&vec![(
                 "Run".to_string(),
-                go_id.clone(),
+                go_id.clone().into(),
                 "pkg/foo".to_string()
             )])
         );
@@ -12881,10 +12983,10 @@ mod tests {
         // only via its own directory, "quux".
         assert!(!index.contains_key("os"));
         assert_eq!(
-            index.get("quux"),
+            index.get("quux").map(|bucket| &bucket.entries),
             Some(&vec![(
                 "Stat".to_string(),
-                stdlib_shadow_id.clone(),
+                stdlib_shadow_id.clone().into(),
                 "pkg/quux".to_string()
             )])
         );
@@ -12893,8 +12995,8 @@ mod tests {
         // stem, not under their directory, not into any other bucket.
         assert!(!index.contains_key("helpers"));
         assert!(!index.contains_key("bar"));
-        for entries in index.values() {
-            for (_name, id, _dir) in entries {
+        for bucket in index.values() {
+            for (_name, id, _dir) in &bucket.entries {
                 assert_ne!(id, &py_twin_id);
                 assert_ne!(id, &py_util_id);
             }
@@ -12960,15 +13062,18 @@ mod tests {
             .get("v1")
             .expect("both packages share the bare \"v1\" bucket — the collision is real");
         assert_eq!(
-            bucket.len(),
+            bucket.entries.len(),
             2,
             "the index itself does not distinguish the two \"v1\" packages \
              by bare name alone — disambiguation happens downstream, in \
              register_go_package_imports, using each entry's own declaring \
              directory (the third tuple element)"
         );
-        let dirs: std::collections::BTreeSet<&str> =
-            bucket.iter().map(|(_, _, dir)| dir.as_str()).collect();
+        let dirs: std::collections::BTreeSet<&str> = bucket
+            .entries
+            .iter()
+            .map(|(_, _, dir)| dir.as_str())
+            .collect();
         assert_eq!(
             dirs,
             std::collections::BTreeSet::from([
