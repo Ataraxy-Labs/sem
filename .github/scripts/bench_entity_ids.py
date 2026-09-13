@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+from check_entity_id_binaries import check_binaries
+
 
 def command(*args):
     return subprocess.check_output(list(map(str, args)), text=True).strip()
@@ -99,7 +101,9 @@ def main():
     parser.add_argument('--memory-pairs', type=int, default=5)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    provenance = check_binaries(args.before, args.after)
     report = {
+        'runtime_core_provenance': provenance,
         'baseline_commit': '4cfe1374f79631b01aca5746441d826738a15448',
         'candidate_commit': command('git', 'rev-parse', 'HEAD'),
         'rustc': command('rustc', '-Vv'), 'platform': command('uname', '-a'),

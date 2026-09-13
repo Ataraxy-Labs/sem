@@ -32,15 +32,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-target"
           rustc -Vv
           free -h
           df -h .
           git -C baseline apply "$GITHUB_WORKSPACE/.github/scripts/graph-return-marker.patch"
-          cargo build --manifest-path baseline/crates/Cargo.toml --release --locked -p sem-cli -j 4
-          cp "$CARGO_TARGET_DIR/release/sem" "$RUNNER_TEMP/sem320-before"
-          cargo build --manifest-path crates/Cargo.toml --release --locked -p sem-cli -j 4
-          cp "$CARGO_TARGET_DIR/release/sem" "$RUNNER_TEMP/sem320-after"
+          # Do not share path-dependency artifacts across same-version worktrees:
+          # https://github.com/rust-lang/cargo/issues/12516
+          CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-baseline-target" \
+            cargo build --manifest-path baseline/crates/Cargo.toml --release --locked -p sem-cli -j 4
+          cp "$RUNNER_TEMP/sem320-baseline-target/release/sem" "$RUNNER_TEMP/sem320-before"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-candidate-target" \
+            cargo build --manifest-path crates/Cargo.toml --release --locked -p sem-cli -j 4
+          cp "$RUNNER_TEMP/sem320-candidate-target/release/sem" "$RUNNER_TEMP/sem320-after"
+      - name: Reject stale or identical core artifacts before benchmarking
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check_entity_id_binaries.py \
+            --before "$RUNNER_TEMP/sem320-before" --after "$RUNNER_TEMP/sem320-after"
       - name: Full candidate workspace tests
         shell: bash
         env:
@@ -48,7 +57,7 @@ jobs:
           GIT_CONFIG_SYSTEM: /dev/null
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-target"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-candidate-target"
           cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-fail-fast -j 4
       - uses: actions/checkout@v4
         with:
