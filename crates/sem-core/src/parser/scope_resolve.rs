@@ -61,7 +61,7 @@ macro_rules! maybe_par_iter {
         }
     }};
 }
-use crate::parser::graph::{EntityInfo, EntityInfoMap, RefType, SymbolTable};
+use crate::parser::graph::{EntityId, EntityInfo, EntityInfoMap, RefType, ResolvedEdge, SymbolTable};
 use crate::parser::import_resolution::{
     build_owned_stem_index, find_import_file, find_import_target, import_file_candidates,
     is_js_ts_file, js_ts_named_exports_from_content, match_bare_import_stem,
@@ -85,7 +85,7 @@ type AttrToParamIndex<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str, &'a str)>>
 pub struct Scope {
     parent: Option<usize>,
     /// Definitions visible in this scope: name -> entity_id
-    defs: HashMap<String, String>,
+    defs: HashMap<String, EntityId>,
     /// Local bindings that shadow outer names but are not graph entities.
     bindings: HashSet<String>,
     /// Binding declaration rows keyed by name.
@@ -100,7 +100,7 @@ pub struct Scope {
     /// class field-type map are both available.
     pending_field_types: HashMap<String, (String, String)>,
     /// Which entity owns this scope (if any)
-    owner_id: Option<String>,
+    owner_id: Option<EntityId>,
     /// What kind of scope: "module", "class", "function"
     kind: &'static str,
 }
@@ -121,13 +121,13 @@ impl<'de> serde::Deserialize<'de> for Scope {
         #[derive(serde::Deserialize)]
         struct ScopeShadow {
             parent: Option<usize>,
-            defs: HashMap<String, String>,
+            defs: HashMap<String, EntityId>,
             bindings: HashSet<String>,
             binding_rows: HashMap<String, Vec<usize>>,
             types: HashMap<String, String>,
             pending_call_types: HashMap<String, String>,
             pending_field_types: HashMap<String, (String, String)>,
-            owner_id: Option<String>,
+            owner_id: Option<EntityId>,
             kind: String,
         }
         let s = ScopeShadow::deserialize(deserializer)?;
@@ -569,7 +569,7 @@ pub struct ScopeResult {
 }
 
 pub(crate) struct ScopeResultFull {
-    pub(crate) edges: Vec<(String, String, RefType)>,
+    pub(crate) edges: Vec<ResolvedEdge>,
     pub(crate) resolution_log: Vec<ResolutionEntry>,
     pub(crate) consumed_words: HashMap<String, HashSet<String>>,
 }
@@ -1061,7 +1061,7 @@ pub fn resolve_with_scopes_fast(
 
 fn scope_result_from_full(result: ScopeResultFull) -> ScopeResult {
     ScopeResult {
-        edges: result.edges,
+        edges: result.edges.into_iter().map(|(from, to, kind)| (from.to_string(), to.to_string(), kind)).collect(),
         resolution_log: result.resolution_log,
     }
 }
@@ -1409,7 +1409,7 @@ impl PrecomputedFileFacts {
         for scope in &mut self.scopes {
             for value in scope.defs.values_mut() {
                 if let Some(new_id) = rekey.get(value.as_str()) {
-                    *value = new_id.clone();
+                    *value = EntityId::from(new_id);
                 }
             }
             if let Some(new_id) = scope
@@ -1417,7 +1417,7 @@ impl PrecomputedFileFacts {
                 .as_deref()
                 .and_then(|old_id| rekey.get(old_id))
             {
-                scope.owner_id = Some(new_id.clone());
+                scope.owner_id = Some(EntityId::from(new_id));
             }
         }
     }
@@ -1546,7 +1546,14 @@ impl PrecomputedFileFacts {
                     .sum::<usize>()
         }
 
-        let scopes = self.scopes.capacity() * std::mem::size_of::<Scope>()
+        // Count canonical payloads once within these facts. Canonical IDs can
+        // also be shared across files/the graph, so this per-file estimate is
+        // not additive across the whole corpus; process RSS remains authoritative.
+        let scope_ids: HashSet<&str> = self.scopes.iter().flat_map(|scope| {
+            scope.defs.values().chain(scope.owner_id.iter()).map(EntityId::as_str)
+        }).collect();
+        let scope_id_bytes: usize = scope_ids.iter().map(|id| id.len() + 6 * std::mem::size_of::<usize>()).sum();
+        let scopes = scope_id_bytes + self.scopes.capacity() * std::mem::size_of::<Scope>()
             + self
                 .scopes
                 .iter()
@@ -1556,7 +1563,8 @@ impl PrecomputedFileFacts {
                             .map(|(k, v)| k.capacity() + v.capacity())
                             .sum::<usize>()
                     };
-                    string_to_string(&scope.defs)
+                    scope.defs.keys().map(String::capacity).sum::<usize>()
+                        + scope.defs.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<EntityId>() + 1)
                         + string_to_string(&scope.types)
                         + string_to_string(&scope.pending_call_types)
                         + scope.bindings.iter().map(String::capacity).sum::<usize>()
@@ -1959,7 +1967,7 @@ pub(crate) fn precompute_js_ts_file_facts(
     for entity in &top_level_by_range {
         scopes[0]
             .defs
-            .insert(entity.name.clone(), entity.id.clone());
+            .insert(entity.name.clone(), EntityId::from(&entity.id));
         entity_scope_map.insert(entity.id.clone(), 0);
     }
 
@@ -2682,7 +2690,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     for entity in &top_level_by_range {
         scopes[0]
             .defs
-            .insert(entity.name.clone(), entity.id.clone());
+            .insert(entity.name.clone(), EntityId::from(&entity.id));
         entity_scope_map.insert(entity.id.clone(), 0);
     }
 
@@ -2806,7 +2814,7 @@ fn resolve_with_scopes_full_inner(
 ) -> ScopeResultFull {
     let precomputed_facts = chunked.map(|c| c.facts);
     let entity_index = chunked.map(|c| c.entity_index);
-    let mut all_edges: Vec<(String, String, RefType)> = Vec::new();
+    let mut all_edges: Vec<ResolvedEdge> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
     let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
@@ -3494,7 +3502,7 @@ fn resolve_with_scopes_full_inner(
                     for (_start, _end, eid) in ranges {
                         if let Some(info) = entity_map.get(eid) {
                             if info.parent_id.is_none() {
-                                scopes[0].defs.insert(info.name.clone(), eid.clone());
+                                scopes[0].defs.insert(info.name.clone(), EntityId::from(&info.id));
                                 entity_scope_map.insert(eid.clone(), 0);
                             }
                         }
@@ -3552,7 +3560,7 @@ fn resolve_with_scopes_full_inner(
                         );
                         scopes[0]
                             .defs
-                            .insert((*local_name).to_string(), (*target_id).to_string());
+                            .insert((*local_name).to_string(), EntityId::from(*target_id));
                     }
                 }
             }
@@ -3678,7 +3686,7 @@ fn resolve_with_scopes_full_inner(
                 prof::merge_scope_build(__sb);
             }
 
-            let mut file_edges: Vec<(String, String, RefType)> = Vec::new();
+            let mut file_edges: Vec<ResolvedEdge> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
             let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
 
@@ -3900,7 +3908,7 @@ fn resolve_with_scopes_full_inner(
                                             method,
                                         });
                                     }
-                                    file_edges.push((entity.id.clone(), target_id, ref_type));
+                                    file_edges.push((EntityId::from(&entity.id), target_id.into(), ref_type));
                                 }
                             }
                         } else {
@@ -4038,7 +4046,7 @@ fn resolve_with_scopes_full_inner(
 /// `incremental`), and the read set that authorizes reusing them next time.
 struct PerFileScopeResult<'a> {
     file_path: &'a str,
-    edges: Vec<(String, String, RefType)>,
+    edges: Vec<ResolvedEdge>,
     log: Vec<ResolutionEntry>,
     consumed_words: HashMap<String, HashSet<String>>,
     /// `None` when not recording (the cold, non-session path).
@@ -4635,7 +4643,7 @@ fn scope_visit_node(
                         types: HashMap::default(),
                         pending_call_types: HashMap::default(),
                         pending_field_types: HashMap::default(),
-                        owner_id: Some(ce.id.clone()),
+                        owner_id: Some(EntityId::from(&ce.id)),
                         kind: "class",
                     });
                     entity_scope_map.insert(ce.id.clone(), current_scope);
@@ -4647,7 +4655,7 @@ fn scope_visit_node(
                     for entity in children {
                         scopes[class_scope_idx]
                             .defs
-                            .insert(entity.name.clone(), entity.id.clone());
+                            .insert(entity.name.clone(), EntityId::from(&entity.id));
                         entity_scope_map.insert(entity.id.clone(), class_scope_idx);
                     }
                 }
@@ -4671,7 +4679,7 @@ fn scope_visit_node(
                     types: HashMap::default(),
                     pending_call_types: HashMap::default(),
                     pending_field_types: HashMap::default(),
-                    owner_id: impl_entity.map(|ie| ie.id.clone()),
+                    owner_id: impl_entity.map(|ie| EntityId::from(&ie.id)),
                     kind: "class",
                 });
                 if let Some(ie) = impl_entity {
@@ -4681,7 +4689,7 @@ fn scope_visit_node(
                         for entity in children {
                             scopes[class_scope_idx]
                                 .defs
-                                .insert(entity.name.clone(), entity.id.clone());
+                                .insert(entity.name.clone(), EntityId::from(&entity.id));
                             entity_scope_map.insert(entity.id.clone(), class_scope_idx);
                         }
                     }
@@ -4730,7 +4738,7 @@ fn scope_visit_node(
                 file_lookup.find_at_line(mod_name, line, |entity| entity.entity_type == "module");
 
             if let Some(me) = mod_entity {
-                scopes[mod_scope_idx].owner_id = Some(me.id.clone());
+                scopes[mod_scope_idx].owner_id = Some(EntityId::from(&me.id));
                 entity_scope_map
                     .entry(me.id.clone())
                     .or_insert(current_scope);
@@ -4741,7 +4749,7 @@ fn scope_visit_node(
                     for child_entity in children {
                         scopes[mod_scope_idx]
                             .defs
-                            .insert(child_entity.name.clone(), child_entity.id.clone());
+                            .insert(child_entity.name.clone(), EntityId::from(&child_entity.id));
                         entity_scope_map.insert(child_entity.id.clone(), mod_scope_idx);
                     }
                 }
@@ -4798,7 +4806,7 @@ fn scope_visit_node(
             let func_entity = file_lookup.find_at_line(func_name, line, |_| true);
 
             if let Some(fe) = func_entity {
-                scopes[func_scope_idx].owner_id = Some(fe.id.clone());
+                scopes[func_scope_idx].owner_id = Some(EntityId::from(&fe.id));
                 entity_scope_map
                     .entry(fe.id.clone())
                     .or_insert(parent_scope);
@@ -4812,7 +4820,7 @@ fn scope_visit_node(
                     for entity in children {
                         scopes[func_scope_idx]
                             .defs
-                            .insert(entity.name.clone(), entity.id.clone());
+                            .insert(entity.name.clone(), EntityId::from(&entity.id));
                         entity_scope_map.insert(entity.id.clone(), func_scope_idx);
                     }
                 }
@@ -4822,7 +4830,7 @@ fn scope_visit_node(
                 {
                     scopes[parent_scope]
                         .defs
-                        .insert(fe.name.clone(), fe.id.clone());
+                        .insert(fe.name.clone(), EntityId::from(&fe.id));
                 }
             }
 
@@ -8767,7 +8775,7 @@ fn register_go_package_imports(
         }
         import_table.insert((file_path.to_string(), name.clone()), target_id.clone());
         if !scopes.is_empty() {
-            scopes[0].defs.insert(name.clone(), target_id.clone());
+            scopes[0].defs.insert(name.clone(), EntityId::from(target_id));
         }
     }
 }
@@ -8851,7 +8859,7 @@ fn resolve_import_name(
             if !scopes.is_empty() {
                 scopes[0]
                     .defs
-                    .insert(local_name.to_string(), target_id.clone());
+                    .insert(local_name.to_string(), EntityId::from(target_id));
             }
         }
     }
@@ -8881,7 +8889,7 @@ fn resolve_default_import(
             target_id.clone(),
         );
         if !scopes.is_empty() {
-            scopes[0].defs.insert(local_name.to_string(), target_id);
+            scopes[0].defs.insert(local_name.to_string(), target_id.into());
         }
     }
 }
@@ -10295,7 +10303,7 @@ fn resolve_ref(
                             }
                         }
                         if let Some(eid) = scopes[idx].defs.get(method.as_ref()) {
-                            return Some((eid.clone(), RefType::Calls, "scope_chain"));
+                            return Some((eid.to_string(), RefType::Calls, "scope_chain"));
                         }
                         break;
                     }
@@ -10756,7 +10764,7 @@ fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> 
     scopes
         .iter()
         .find(|scope| scope.owner_id.as_deref() == Some(owner_id))
-        .and_then(|scope| scope.defs.get(member).cloned())
+        .and_then(|scope| scope.defs.get(member).map(ToString::to_string))
 }
 
 fn lookup_entity_member(
@@ -10845,7 +10853,7 @@ fn lookup_scope_chain_respecting_shadows(
     let mut idx = start_scope;
     loop {
         if let Some(eid) = scopes[idx].defs.get(name) {
-            return ScopeChainLookup::Defined(eid.clone());
+            return ScopeChainLookup::Defined(eid.to_string());
         }
         if scopes[idx].bindings.contains(name) {
             return ScopeChainLookup::Shadowed;
@@ -10986,6 +10994,29 @@ fn is_builtin(name: &str, config: &ScopeResolveConfig) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scope_ids_share_canonical_storage_and_decode_legacy_text() {
+        let text = "über.py::function::callee";
+        let legacy = serde_json::json!({
+            "parent": null, "defs": {"callee": text, "alias": text},
+            "bindings": [], "binding_rows": {}, "types": {},
+            "pending_call_types": {}, "pending_field_types": {},
+            "owner_id": text, "kind": "function"
+        });
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&legacy, &mut cbor).unwrap();
+        let scope: Scope = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let canonical = EntityId::from(text);
+        for id in scope.defs.values().chain(scope.owner_id.iter()) {
+            assert_eq!(id.as_str().as_ptr(), canonical.as_str().as_ptr());
+        }
+        assert_eq!(serde_json::to_value(&scope).unwrap(), legacy);
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&scope, &mut encoded).unwrap();
+        let decoded: serde_json::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, legacy);
+    }
+
     /// follow-up: `approx_heap_bytes` must walk the nested heap
     /// content the container-capacity terms skip — each [`Scope`]'s six
     /// internal collections' String contents, every [`AstRefKind`] variant's
@@ -11008,7 +11039,7 @@ mod tests {
         let (pf_key, pf_a, pf_b) = ("f".repeat(20), "F".repeat(25), "G".repeat(26));
 
         let mut defs = HashMap::default();
-        defs.insert(def_key.clone(), def_val.clone());
+        defs.insert(def_key.clone(), EntityId::from(&def_val));
         let mut bindings = HashSet::default();
         bindings.insert(binding.clone());
         let mut binding_rows = HashMap::default();
@@ -11118,9 +11149,9 @@ mod tests {
 
         let mut defs = HashMap::default();
         for i in 0..64 {
-            defs.insert(format!("k{i}"), format!("v{i}"));
+            defs.insert(format!("k{i}"), EntityId::from(format!("v{i}")));
         }
-        defs.insert("kept".to_string(), "value".to_string());
+        defs.insert("kept".to_string(), EntityId::from("value"));
         defs.retain(|k, _| k == "kept");
 
         let mut bindings = HashSet::default();
@@ -11227,7 +11258,7 @@ mod tests {
         );
 
         // Values are untouched — shrink_to_fit is a pure capacity operation.
-        assert_eq!(facts.scopes[0].defs.get("kept"), Some(&"value".to_string()));
+        assert_eq!(facts.scopes[0].defs.get("kept").map(EntityId::as_str), Some("value"));
         assert!(facts.scopes[0].bindings.contains("kept-binding"));
         match &facts.ast_refs[0].kind {
             AstRefKind::MethodCall {
@@ -13189,7 +13220,7 @@ mod tests {
         // The closure's own top-level seed, replicated.
         for e in &fx.entities {
             if e.parent_id.is_none() {
-                scopes[0].defs.insert(e.name.clone(), e.id.clone());
+                scopes[0].defs.insert(e.name.clone(), EntityId::from(&e.id));
                 entity_scope_map.insert(e.id.clone(), 0);
             }
         }
@@ -14159,7 +14190,7 @@ mod tests {
         let mut module_defs = HashMap::default();
         module_defs.insert(
             "create".to_string(),
-            "no-keywords.cjs::method::create".to_string(),
+            EntityId::from("no-keywords.cjs::method::create"),
         );
         let module_scope = Scope {
             parent: None,
@@ -14175,7 +14206,7 @@ mod tests {
         let mut create_defs = HashMap::default();
         create_defs.insert(
             "checkElements".to_string(),
-            "no-keywords.cjs::method::create::checkElements".to_string(),
+            EntityId::from("no-keywords.cjs::method::create::checkElements"),
         );
         let mut create_bindings = HashSet::default();
         create_bindings.insert("checkElements".to_string());
@@ -14187,7 +14218,7 @@ mod tests {
             types: HashMap::default(),
             pending_call_types: HashMap::default(),
             pending_field_types: HashMap::default(),
-            owner_id: Some("no-keywords.cjs::method::create".to_string()),
+            owner_id: Some(EntityId::from("no-keywords.cjs::method::create")),
             kind: "function",
         };
         let scopes = vec![module_scope, create_scope];
@@ -14222,7 +14253,7 @@ mod tests {
         let mut module_defs = HashMap::default();
         module_defs.insert(
             "isKeyword".to_string(),
-            "no-keywords.cjs::method::create::isKeyword".to_string(),
+            EntityId::from("no-keywords.cjs::method::create::isKeyword"),
         );
         let module_scope = Scope {
             parent: None,

@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::model::entity::SemanticEntity;
-use crate::parser::graph::RefType;
+use crate::parser::graph::ResolvedEdge;
 
 // ---------------------------------------------------------------------------
 // Tables
@@ -528,7 +528,7 @@ pub struct FileFacts {
 /// per-file resolution outputs across a process restart, not just within one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CachedScopeResult {
-    pub(crate) edges: Vec<(String, String, RefType)>,
+    pub(crate) edges: Vec<ResolvedEdge>,
     pub(crate) consumed_words: HashMap<String, HashSet<String>>,
     pub(crate) read_set: ReadSet,
 }
@@ -536,7 +536,7 @@ pub(crate) struct CachedScopeResult {
 /// One file's bag-of-words resolution output.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CachedBowResult {
-    pub(crate) edges: Vec<(String, String, RefType)>,
+    pub(crate) edges: Vec<ResolvedEdge>,
     pub(crate) read_set: ReadSet,
 }
 

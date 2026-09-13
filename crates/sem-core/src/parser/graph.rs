@@ -614,6 +614,10 @@ pub struct EntityRef {
     pub ref_type: RefType,
 }
 
+/// Resolver and incremental-cache edges share canonical IDs from the moment
+/// they are discovered, rather than allocating endpoint strings until assembly.
+pub(crate) type ResolvedEdge = (EntityId, EntityId, RefType);
+
 /// Type of reference between entities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -877,8 +881,8 @@ fn sort_all_entity_ranges_by_source(
 }
 
 fn dedupe_resolved_edges(
-    mut combined: Vec<(String, String, RefType)>,
-) -> Vec<(String, String, RefType)> {
+    mut combined: Vec<ResolvedEdge>,
+) -> Vec<ResolvedEdge> {
     let mut keep = vec![false; combined.len()];
     let mut seen_edges: HashSet<(&str, &str)> =
         HashSet::with_capacity_and_hasher(combined.len(), Default::default());
@@ -904,7 +908,7 @@ fn dedupe_resolved_edges(
     combined
 }
 
-fn sort_resolved_refs(refs: &mut [(String, String, RefType)]) {
+fn sort_resolved_refs(refs: &mut [ResolvedEdge]) {
     // `par_sort_by`, not `par_sort_unstable_by`: rayon's stable parallel sort
     // has the same order semantics as the `sort_by` this replaces, element for
     // element, so nothing downstream can tell the difference — only the wall
@@ -1339,7 +1343,7 @@ struct ReferenceResolutionContext<'a> {
 /// invariant in `incremental`).
 struct PerFileBowResult<'a> {
     file_path: &'a str,
-    edges: Vec<(String, String, RefType)>,
+    edges: Vec<ResolvedEdge>,
     read_set: Option<ReadSet>,
     reused: bool,
 }
@@ -1362,7 +1366,7 @@ fn resolve_references_with_file_indexes<'a>(
     // the second disk read is gone, not the fusion. See
     // `snapshot_bow_content`'s doc comment for why the fusion matters.
     pre_parsed_content: &HashMap<&str, Cow<'_, str>>,
-) -> Vec<(String, String, RefType)> {
+) -> Vec<ResolvedEdge> {
     let __bow_wall_t0 = std::time::Instant::now();
     let mut entities_by_file: HashMap<&'a str, Vec<&'a SemanticEntity>> = HashMap::default();
     for entity in all_entities {
@@ -1478,7 +1482,7 @@ fn resolve_references_with_file_indexes<'a>(
         })
         .collect();
 
-    let mut result: Vec<(String, String, RefType)> = Vec::new();
+    let mut result: Vec<ResolvedEdge> = Vec::new();
     for entry in per_file {
         if let Some(state) = incremental.as_deref_mut() {
             if entry.reused {
@@ -1595,7 +1599,7 @@ fn resolve_scopes_in_file_chunks(
     mut incremental: Option<&mut Incremental<'_>>,
     eligible: &HashSet<String>,
 ) -> (
-    Vec<(String, String, RefType)>,
+    Vec<ResolvedEdge>,
     HashMap<String, HashSet<String>>,
 ) {
     let mut all_edges = Vec::new();
@@ -1709,7 +1713,7 @@ fn resolve_entity_references(
     // extra `Instant::now()` calls happen unless `SEM_PROFILE_RESOLVE=1`).
     // See `resolve_profile::BowFileAccum`.
     mut bow_acc: Option<&mut resolve_profile::BowFileAccum>,
-) -> Vec<(String, String, RefType)> {
+) -> Vec<ResolvedEdge> {
     let ext = entity
         .file_path
         .rfind('.')
@@ -1725,6 +1729,7 @@ fn resolve_entity_references(
         direct_reference_line_ranges(entity, fallback_end_line, context.child_line_ranges);
 
     let mut entity_edges = Vec::new();
+    let source_id = EntityId::from(entity.id.as_str());
 
     let reference_index =
         if entity_requires_content_span_filter(entity, context.child_ranges_by_parent) {
@@ -1804,8 +1809,8 @@ fn resolve_entity_references(
                     for (name, target_id) in members {
                         if *name == *member && *target_id != entity.id.as_str() {
                             entity_edges.push((
-                                entity.id.clone(),
-                                target_id.to_string(),
+                                source_id.clone(),
+                                EntityId::from(*target_id),
                                 RefType::Calls,
                             ));
                             consumed_words.insert(*member);
@@ -1833,8 +1838,8 @@ fn resolve_entity_references(
                 for (name, target_id) in members {
                     if *name == *member {
                         entity_edges.push((
-                            entity.id.clone(),
-                            target_id.to_string(),
+                            source_id.clone(),
+                            EntityId::from(*target_id),
                             RefType::Calls,
                         ));
                         consumed_words.insert(*member);
@@ -1913,7 +1918,7 @@ fn resolve_entity_references(
                     .parent_child_pairs
                     .contains(&(import_target_id, entity_id))
             {
-                entity_edges.push((entity.id.clone(), import_target_id.to_string(), ref_type));
+                entity_edges.push((source_id.clone(), EntityId::from(import_target_id), ref_type));
             }
             continue;
         }
@@ -1947,7 +1952,7 @@ fn resolve_entity_references(
                 {
                     continue;
                 }
-                entity_edges.push((entity.id.clone(), target_id.to_string(), ref_type));
+                entity_edges.push((source_id.clone(), EntityId::from(target_id), ref_type));
             }
         }
     }
@@ -1977,8 +1982,8 @@ fn resolve_entity_references(
                         .contains(&(import_target_id, entity_id))
                 {
                     entity_edges.push((
-                        entity.id.clone(),
-                        import_target_id.to_string(),
+                        source_id.clone(),
+                        EntityId::from(import_target_id),
                         RefType::Calls,
                     ));
                 }
@@ -3076,11 +3081,7 @@ impl EntityGraph {
                 &[
                     mem_profile::entry(
                         "scope_edges",
-                        scope_edges.len() * std::mem::size_of::<(String, String, RefType)>()
-                            + scope_edges
-                                .iter()
-                                .map(|(a, b, _)| a.capacity() + b.capacity())
-                                .sum::<usize>(),
+                        scope_edges.capacity() * std::mem::size_of::<ResolvedEdge>(),
                     ),
                     mem_profile::entry(
                         "scope_consumed_words",
@@ -3178,7 +3179,7 @@ impl EntityGraph {
         resolve_profile::add_export_edges_ns(__export_edges_t0.elapsed());
 
         // Merge scope edges with bag-of-words edges, deduplicating
-        let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        let mut combined: Vec<ResolvedEdge> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
         let __dedupe_t0 = std::time::Instant::now();
@@ -3558,12 +3559,12 @@ impl EntityGraph {
 
         let export_edges = build_export_alias_edges(&all_entities, &import_table)
             .into_iter()
-            .filter(|(from_entity, _, _)| needs_resolution.contains(from_entity))
+            .filter(|(from_entity, _, _)| needs_resolution.contains(from_entity.as_str()))
             .collect::<Vec<_>>();
 
-        let mut combined: Vec<(String, String, RefType)> = scope_edges
+        let mut combined: Vec<ResolvedEdge> = scope_edges
             .into_iter()
-            .filter(|(from_entity, _, _)| needs_resolution.contains(from_entity))
+            .filter(|(from_entity, _, _)| needs_resolution.contains(from_entity.as_str()))
             .collect();
         combined.extend(export_edges);
         combined.extend(resolved_refs);
@@ -4322,7 +4323,7 @@ impl EntityGraph {
         let export_edges = build_export_alias_edges(&all_entities, &import_table);
 
         // Merge scope edges + bag-of-words edges + kept cached edges
-        let mut combined: Vec<(String, String, RefType)> = scope_edges;
+        let mut combined: Vec<ResolvedEdge> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
         let mut all_resolved = dedupe_resolved_edges(combined);
@@ -4337,7 +4338,7 @@ impl EntityGraph {
             kept_edge_pairs.insert((edge.from_entity.as_str(), edge.to_entity.as_str()));
         }
 
-        let mut new_edges: Vec<(String, String, RefType)> = Vec::with_capacity(all_resolved.len());
+        let mut new_edges: Vec<ResolvedEdge> = Vec::with_capacity(all_resolved.len());
         for (from_entity, to_entity, ref_type) in all_resolved {
             if kept_edge_pairs.contains(&(from_entity.as_str(), to_entity.as_str())) {
                 continue;
@@ -4964,7 +4965,7 @@ fn fingerprint_bow_tables(
 fn build_export_alias_edges(
     all_entities: &[SemanticEntity],
     import_table: &HashMap<(String, String), String>,
-) -> Vec<(String, String, RefType)> {
+) -> Vec<ResolvedEdge> {
     all_entities
         .iter()
         .filter(|entity| entity.entity_type == "export")
@@ -4974,7 +4975,7 @@ fn build_export_alias_edges(
             if target_id == &entity.id {
                 return None;
             }
-            Some((entity.id.clone(), target_id.clone(), RefType::Imports))
+            Some((EntityId::from(&entity.id), EntityId::from(target_id), RefType::Imports))
         })
         .collect()
 }
@@ -8182,6 +8183,22 @@ fn is_keyword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interned_resolution_edges_keep_first_kind_and_canonical_identity() {
+        let from = EntityId::from("a.py::function::caller");
+        let to = EntityId::from("a.py::function::callee");
+        let edges = dedupe_resolved_edges(vec![
+            (from.clone(), to.clone(), RefType::Calls),
+            (EntityId::from(from.as_str()), EntityId::from(to.as_str()), RefType::Imports),
+            (to.clone(), from.clone(), RefType::TypeRef),
+        ]);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0], (from.clone(), to.clone(), RefType::Calls));
+        assert_eq!(edges[1], (to.clone(), from.clone(), RefType::TypeRef));
+        assert_eq!(edges[0].0.as_str().as_ptr(), from.as_str().as_ptr());
+        assert_eq!(edges[0].1.as_str().as_ptr(), to.as_str().as_ptr());
+    }
     use crate::git::types::{FileChange, FileStatus};
     use crate::parser::plugins::code::languages::StripStrategy;
     use std::io::Write;

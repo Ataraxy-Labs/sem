@@ -62,6 +62,15 @@ pub fn graph_command(opts: GraphOptions) {
         source_scope,
         &mut timings,
     );
+    // Measure the actual returned topology, after transient source entities
+    // have been dropped, and with the CLI's allocator/interner still live.
+    // Keep this opt-in and separate from normal timing measurements.
+    if std::env::var("SEM_PROFILE_MEM").as_deref() == Ok("1") {
+        match sem_core::parser::mem_profile::current_rss_bytes() {
+            Some(bytes) => eprintln!("SEM_PROFILE_MEM[graph-return] process_rss_bytes={bytes}"),
+            None => eprintln!("SEM_PROFILE_MEM[graph-return] process_rss_bytes=unavailable"),
+        }
+    }
     prog.done(&format!(
         "{} entities, {} files",
         fmt_count(graph.entities.len()),
