@@ -355,13 +355,15 @@ fn suppress_redundant_parents(
             continue;
         }
 
-        // Added/Deleted: suppress unconditionally; the children carry the detail.
-        // Modified: only suppress if the container's own declaration is unchanged
-        // and the value type didn't transition.
+        // Modified containers are redundant when only their children changed.
+        // Added/Deleted containers carry structural information of their own —
+        // a whole section appearing or disappearing is not restated by its
+        // leaves, and a rename the matcher missed shows up only as the
+        // Deleted/Added pair — so they are retained alongside their children.
         let should_suppress = if change.change_type == ChangeType::Modified {
             own_declaration_changed(eid) == Some(false)
         } else {
-            true
+            false
         };
 
         if should_suppress {
@@ -381,10 +383,21 @@ fn suppress_redundant_parents(
     // extends Base` losing its `extends Base` from the change record
     // entirely. `None` (not comparable) keeps the old unconditional
     // behaviour, which is what the parent-rename case above relies on.
+    let modified_ids: HashSet<&str> = changes
+        .iter()
+        .filter(|c| c.change_type == ChangeType::Modified)
+        .map(|c| c.entity_id.as_str())
+        .collect();
     for change in changes.iter() {
         if change.change_type == ChangeType::Moved {
             if let Some(ref old_pid) = change.old_parent_id {
-                if changed_ids.contains(old_pid.as_str())
+                // Both conditions, not either. `modified_ids` (not
+                // `changed_ids`) keeps an Added or Deleted old parent, which
+                // describes a structural replacement the move does not restate.
+                // The declaration guard stays because a Moved child never
+                // explains an edit to its former container's own declaration,
+                // and a Moved pairing can be a false positive.
+                if modified_ids.contains(old_pid.as_str())
                     && own_declaration_changed(old_pid) != Some(true)
                 {
                     suppress.insert(old_pid.clone());

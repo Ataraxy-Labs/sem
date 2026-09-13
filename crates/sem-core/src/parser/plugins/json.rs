@@ -860,25 +860,19 @@ mod tests {
     }
 
     #[test]
-    fn whole_object_added_only_leaf_children_reported() {
+    fn whole_new_container_surfaces_as_added() {
         let changes = json_diff("{}", "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}");
-        assert!(
-            !changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts (container) should be suppressed; got: {:?}",
-            names(&changes)
-        );
+        // A whole section appearing is structural information its leaves do
+        // not restate, so the container is retained alongside them.
+        find_change(&changes, "scripts", ChangeType::Added);
         let build = find_change(&changes, "build", ChangeType::Added);
         assert_eq!(build.parent_name.as_deref(), Some("scripts"));
     }
 
     #[test]
-    fn whole_object_deleted_only_leaf_children_reported() {
+    fn whole_deleted_container_surfaces_as_deleted() {
         let changes = json_diff("{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}", "{}");
-        assert!(
-            !changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts (container) should be suppressed; got: {:?}",
-            names(&changes)
-        );
+        find_change(&changes, "scripts", ChangeType::Deleted);
         find_change(&changes, "build", ChangeType::Deleted);
     }
 
@@ -985,16 +979,17 @@ mod tests {
     }
 
     #[test]
-    fn parent_object_renamed_and_child_renamed_only_child_surfaces() {
-        // scripts → tasks AND dev → develop. Parent rename cannot be detected
-        // because the renamed child key changes the parent's structural_hash.
-        // The child move alone conveys the move + rename via:
-        //   parent_name="tasks", old_entity_name="dev", old_parent_id=<scripts>
+    fn parent_object_and_child_renamed_surfaces_container_swap_and_move() {
+        // scripts → tasks AND dev → develop. The renamed child changes the
+        // parent's structural_hash, so the parent rename cannot be matched and
+        // surfaces as a Deleted/Added pair, which is retained because it is the
+        // only record of the structural replacement.
         let before = "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n";
         let after = "{\n  \"tasks\": {\n    \"develop\": \"vite\"\n  }\n}\n";
         let changes = json_diff(before, after);
-        assert_eq!(names(&changes), vec![("develop".into(), ChangeType::Moved)]);
-        let develop = &changes[0];
+        find_change(&changes, "scripts", ChangeType::Deleted);
+        find_change(&changes, "tasks", ChangeType::Added);
+        let develop = find_change(&changes, "develop", ChangeType::Moved);
         assert_eq!(develop.old_entity_name.as_deref(), Some("dev"));
         assert_eq!(develop.parent_name.as_deref(), Some("tasks"));
         assert!(
@@ -1322,13 +1317,8 @@ mod tests {
         assert_eq!(build.parent_name.as_deref(), Some("tasks"));
         assert!(build.old_parent_id.is_some());
         find_change(&changes, "test", ChangeType::Added);
-        assert!(
-            !changes
-                .iter()
-                .any(|c| c.entity_name == "scripts" || c.entity_name == "tasks"),
-            "parent Deleted/Added should be suppressed; got: {:?}",
-            names(&changes)
-        );
+        find_change(&changes, "scripts", ChangeType::Deleted);
+        find_change(&changes, "tasks", ChangeType::Added);
     }
 
     #[test]
@@ -1378,20 +1368,15 @@ mod tests {
     }
 
     #[test]
-    fn deep_whole_section_deleted_only_leaf_reported() {
+    fn deep_whole_section_deleted_surfaces_intermediate_containers() {
         let changes = json_diff(
             "{\n  \"jest\": {\n    \"config\": {\n      \"testTimeout\": 5000\n    }\n  }\n}",
             "{}",
         );
         let timeout = find_change(&changes, "testTimeout", ChangeType::Deleted);
         assert_eq!(timeout.parent_name.as_deref(), Some("jest::config"));
-        assert!(
-            !changes
-                .iter()
-                .any(|c| c.entity_name == "jest" || c.entity_name == "config"),
-            "intermediate containers should be suppressed; got: {:?}",
-            names(&changes)
-        );
+        find_change(&changes, "jest", ChangeType::Deleted);
+        find_change(&changes, "config", ChangeType::Deleted);
     }
 
     #[test]
