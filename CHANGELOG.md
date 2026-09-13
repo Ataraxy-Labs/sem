@@ -4,6 +4,21 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-13
+
+### Added
+
+- **BSL (1C:Enterprise) language support.** Procedures and functions are extracted as entities from `.bsl` and `.osl` files via the alkoleft/tree-sitter-bsl grammar, behind a `lang-bsl` feature included in `grammar-all`. Requested in Ataraxy-Labs/weave#132.
+
+### Fixed
+
+- **TypeScript instance fields are typed from all three declaration forms.** Field types were learned only from an explicit `this.x = ...` in the constructor body, so a field with an initializer or annotation, and a constructor parameter property (the shape most dependency-injection code uses), were never typed and calls through them resolved to nothing. Method-level impact came back empty for DI code (#474).
+
+### Changed
+
+- **Semantic diffs retain added and deleted containers alongside their changed children.** A whole section appearing or disappearing is structural information its leaves do not restate, and a parent rename the matcher cannot confirm is now visible as the Deleted/Added pair rather than only a child move. Modified containers whose own declaration did not change are still suppressed. Based on work in #481.
+
+
 ## [0.24.0] - 2026-08-23
 
 ### Added
