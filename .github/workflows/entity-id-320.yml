@@ -1,0 +1,86 @@
+name: Entity ID acceptance (320)
+
+on:
+  push:
+    branches: [bench/entity-id-320-linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      SEM_CLOUD: '0'
+      SEM_TELEMETRY: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 4cfe1374f79631b01aca5746441d826738a15448
+          path: baseline
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build baseline and candidate with the same release profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-target"
+          rustc -Vv
+          free -h
+          df -h .
+          git -C baseline apply "$GITHUB_WORKSPACE/.github/scripts/graph-return-marker.patch"
+          cargo build --manifest-path baseline/crates/Cargo.toml --release --locked -p sem-cli -j 4
+          cp "$CARGO_TARGET_DIR/release/sem" "$RUNNER_TEMP/sem320-before"
+          cargo build --manifest-path crates/Cargo.toml --release --locked -p sem-cli -j 4
+          cp "$CARGO_TARGET_DIR/release/sem" "$RUNNER_TEMP/sem320-after"
+      - name: Full candidate workspace tests
+        shell: bash
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_SYSTEM: /dev/null
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/sem320-target"
+          cargo test --manifest-path crates/Cargo.toml --workspace --locked --no-fail-fast -j 4
+      - uses: actions/checkout@v4
+        with:
+          repository: kubernetes/kubernetes
+          ref: 688614f24c44fe55eb5368171f8b669b9a7928f6
+          path: corpora/kubernetes
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: django/django
+          ref: 318a316a4c86a65bede68144f9546a6056d91379
+          path: corpora/django
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: tokio-rs/tokio
+          ref: c637f6e73d06f36d933cc3edaf45111c06b79c18
+          path: corpora/tokio
+          persist-credentials: false
+      - name: Paired cold builds, exact JSON parity, and returned RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/bench_entity_ids.py \
+            --before "$RUNNER_TEMP/sem320-before" \
+            --after "$RUNNER_TEMP/sem320-after" \
+            --corpora corpora --output acceptance-results \
+            --pairs 9 --memory-pairs 5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: entity-id-320-linux
+          path: acceptance-results
+          if-no-files-found: warn
+          retention-days: 30
