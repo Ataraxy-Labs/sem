@@ -2303,11 +2303,20 @@ mod tests {
     use super::*;
 
     fn temp_repo_root(test_name: &str) -> PathBuf {
-        let root = env::temp_dir().join(format!("sem-disk-cache-test-{test_name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        env::set_var("SEM_CACHE_DIR", root.join(".cache"));
-        root
+        tempfile::Builder::new()
+            .prefix(&format!("sem-disk-cache-test-{test_name}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
+    }
+
+    fn open_test_cache(root: &Path) -> DiskCache {
+        // These save/load tests need isolated databases, not process-global
+        // cache discovery. Mutating SEM_CACHE_DIR let parallel tests open a
+        // database below another test's root just before it was cleaned up.
+        let conn = Connection::open(root.join("cache.db")).unwrap();
+        initialize_schema(&conn).unwrap();
+        DiskCache { conn }
     }
 
     fn write_file(path: &Path, content: &str) {
@@ -2358,7 +2367,7 @@ mod tests {
         let files = vec!["src/a.rs".to_string()];
         write_file(&root.join("src/a.rs"), "fn f() {}\n");
 
-        let cache = DiskCache::open(&root).unwrap();
+        let cache = open_test_cache(&root);
         cache
             .save(&root, &files, &empty_graph(), &[entity("a", "src/a.rs", "f")], CacheSourceScope::Default)
             .unwrap();
@@ -2394,7 +2403,7 @@ mod tests {
             entity("b-id", "src/b.ts", "b"),
         ];
 
-        let cache_a = DiskCache::open(&root_a).unwrap();
+        let cache_a = open_test_cache(&root_a);
         cache_a
             .save_with_test_dirs_precomputed(
                 &root_a,
@@ -2408,7 +2417,7 @@ mod tests {
             .unwrap();
 
         let precomputed = read_file_cache_columns(&root_b, &files);
-        let cache_b = DiskCache::open(&root_b).unwrap();
+        let cache_b = open_test_cache(&root_b);
         cache_b
             .save_with_test_dirs_precomputed(
                 &root_b,
@@ -2453,7 +2462,7 @@ mod tests {
         let root = temp_repo_root("repo-root-best-effort");
         let files = vec!["src/a.rs".to_string()];
         write_file(&root.join("src/a.rs"), "fn f() {}\n");
-        let cache = DiskCache::open(&root).unwrap();
+        let cache = open_test_cache(&root);
         cache
             .save(&root, &files, &empty_graph(), &[entity("a", "src/a.rs", "f")], CacheSourceScope::Default)
             .unwrap();
