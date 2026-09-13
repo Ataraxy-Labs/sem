@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::model::entity::SemanticEntity;
-use crate::parser::graph::ResolvedEdge;
+use crate::parser::graph::{ConsumedWords, ResolvedEdge};
 
 // ---------------------------------------------------------------------------
 // Tables
@@ -529,7 +529,7 @@ pub struct FileFacts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct CachedScopeResult {
     pub(crate) edges: Vec<ResolvedEdge>,
-    pub(crate) consumed_words: HashMap<String, HashSet<String>>,
+    pub(crate) consumed_words: ConsumedWords,
     pub(crate) read_set: ReadSet,
 }
 
@@ -827,5 +827,48 @@ impl<'a> Incremental<'a> {
         self.reuse
             && !self.forced_red.contains(file_path)
             && read_set.unchanged(self.prev_fp, &self.cur_fp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::entity_id::EntityId;
+
+    #[test]
+    fn cached_resolution_decodes_legacy_ids_and_shares_them_across_maps() {
+        let source = "über.py::function::caller";
+        let target = "über.py::function::callee";
+        let legacy = serde_json::json!({
+            "scope": {
+                "edges": [[source, target, "calls"]],
+                "consumed_words": { (source): ["callee"] },
+                "read_set": { "keys": [42] }
+            },
+            "bow": {
+                "edges": [[source, target, "typeref"]],
+                "read_set": { "keys": [43] }
+            }
+        });
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&legacy, &mut cbor).unwrap();
+        let from_json: CachedFileResolution = serde_json::from_value(legacy.clone()).unwrap();
+        let from_cbor: CachedFileResolution = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let canonical_source = EntityId::from(source);
+        let canonical_target = EntityId::from(target);
+        for cached in [from_json, from_cbor] {
+            for (from, to, _) in cached.scope.edges.iter().chain(&cached.bow.edges) {
+                assert_eq!(from.as_str().as_ptr(), canonical_source.as_str().as_ptr());
+                assert_eq!(to.as_str().as_ptr(), canonical_target.as_str().as_ptr());
+            }
+            let (key, words) = cached.scope.consumed_words.get_key_value(source).unwrap();
+            assert_eq!(key.as_str().as_ptr(), canonical_source.as_str().as_ptr());
+            assert!(words.contains("callee"));
+            assert_eq!(serde_json::to_value(&cached).unwrap(), legacy);
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&cached, &mut encoded).unwrap();
+            let decoded: serde_json::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+            assert_eq!(decoded, legacy);
+        }
     }
 }

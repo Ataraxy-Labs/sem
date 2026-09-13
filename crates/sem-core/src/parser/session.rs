@@ -55,7 +55,10 @@ use crate::model::entity::SemanticEntity;
 use crate::parser::facts_store::{
     FileFactsRef, PersistedFacts, PersistedFactsRef, PersistedFileRef,
 };
-use crate::parser::graph::{BuildCarry, CachedImportScan, EntityGraph, PARSED_FILE_REUSE_LIMIT};
+use crate::parser::graph::{
+    BuildCarry, CachedImportScan, ClassMembers, EntityGraph, EntityRanges, OwnerMembers,
+    PARSED_FILE_REUSE_LIMIT,
+};
 use crate::parser::import_resolution::is_reuse_eligible_file;
 use crate::parser::incremental::{
     content_hash, CachedFileResolution, FileFacts, Incremental, RebuildStats, TableFingerprints,
@@ -113,9 +116,9 @@ pub struct GraphSession {
     /// instead (see `run()`), since that is already the field's permanent,
     /// public home.
     symbol_table: crate::parser::graph::SymbolTable,
-    class_members: HashMap<String, Vec<(String, String)>>,
-    owner_members: HashMap<String, Vec<(String, String)>>,
-    entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
+    class_members: ClassMembers,
+    owner_members: OwnerMembers,
+    entity_ranges: EntityRanges,
     /// Bag-of-words' parent → child-position index, session-owned and
     /// maintained by the same function as the four above. Not
     /// persisted by `FactsStore`: it is derivable from the entities that store
@@ -2917,7 +2920,11 @@ mod tests {
             !entities.is_empty(),
             "the fixture must extract entities before it can prove anything about edges"
         );
-        let edges: Vec<(&crate::model::entity_id::EntityId, &crate::model::entity_id::EntityId, RefType)> = graph
+        let edges: Vec<(
+            &crate::model::entity_id::EntityId,
+            &crate::model::entity_id::EntityId,
+            RefType,
+        )> = graph
             .edges
             .iter()
             .map(|e| (&e.from_entity, &e.to_entity, e.ref_type.clone()))
@@ -2946,7 +2953,11 @@ mod tests {
             !entities.is_empty(),
             "the fixture must extract entities before it can prove anything about edges"
         );
-        let edges: Vec<(&crate::model::entity_id::EntityId, &crate::model::entity_id::EntityId, RefType)> = graph
+        let edges: Vec<(
+            &crate::model::entity_id::EntityId,
+            &crate::model::entity_id::EntityId,
+            RefType,
+        )> = graph
             .edges
             .iter()
             .map(|e| (&e.from_entity, &e.to_entity, e.ref_type.clone()))
@@ -2990,7 +3001,11 @@ mod tests {
             !entities.is_empty(),
             "the fixture must extract entities before it can prove anything about edges"
         );
-        let edges: Vec<(&crate::model::entity_id::EntityId, &crate::model::entity_id::EntityId, RefType)> = graph
+        let edges: Vec<(
+            &crate::model::entity_id::EntityId,
+            &crate::model::entity_id::EntityId,
+            RefType,
+        )> = graph
             .edges
             .iter()
             .map(|e| (&e.from_entity, &e.to_entity, e.ref_type.clone()))

@@ -61,7 +61,10 @@ macro_rules! maybe_par_iter {
         }
     }};
 }
-use crate::parser::graph::{EntityId, EntityInfo, EntityInfoMap, RefType, ResolvedEdge, SymbolTable};
+use crate::parser::graph::{
+    ClassMembers, ConsumedWords, EntityId, EntityInfo, EntityInfoMap, EntityRanges, MemberTarget,
+    OwnerMembers, RefType, ResolvedEdge, SymbolTable,
+};
 use crate::parser::import_resolution::{
     build_owned_stem_index, find_import_file, find_import_target, import_file_candidates,
     is_js_ts_file, js_ts_named_exports_from_content, match_bare_import_stem,
@@ -78,6 +81,7 @@ use crate::parser::plugins::code::languages::{
 use crate::parser::plugins::code::{is_pathological_large_file, parse_tree};
 
 type AttrToParamIndex<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str, &'a str)>>;
+type EntityScopeMap = HashMap<EntityId, usize>;
 
 /// A scope in the scope tree. Scopes are nested: module -> class -> function -> block.
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -571,7 +575,7 @@ pub struct ScopeResult {
 pub(crate) struct ScopeResultFull {
     pub(crate) edges: Vec<ResolvedEdge>,
     pub(crate) resolution_log: Vec<ResolutionEntry>,
-    pub(crate) consumed_words: HashMap<String, HashSet<String>>,
+    pub(crate) consumed_words: ConsumedWords,
 }
 
 #[derive(Clone)]
@@ -593,9 +597,9 @@ pub struct ResolutionEntry {
 /// `resolve_with_scopes()` to avoid redundant O(E) passes.
 pub(crate) struct PreBuiltLookups {
     pub(crate) symbol_table: Arc<SymbolTable>,
-    pub(crate) class_members: HashMap<String, Vec<(String, String)>>,
-    pub(crate) owner_members: HashMap<String, Vec<(String, String)>>,
-    pub(crate) entity_ranges: HashMap<String, Vec<(usize, usize, String)>>,
+    pub(crate) class_members: ClassMembers,
+    pub(crate) owner_members: OwnerMembers,
+    pub(crate) entity_ranges: EntityRanges,
     /// Go package index: pkg_name → [(entity_name, entity_id, declaring_dir)]
     /// Avoids O(symbol_table) scan per Go import.
     pub(crate) go_pkg_index: GoPkgIndex,
@@ -974,10 +978,7 @@ pub(crate) fn class_member_owner_name(parent: &EntityInfo) -> Option<&str> {
     is_class_member_owner_type(&parent.entity_type).then_some(parent.name.as_str())
 }
 
-fn sort_symbol_table_targets_by_source(
-    symbol_table: &mut SymbolTable,
-    entity_map: &EntityInfoMap,
-) {
+fn sort_symbol_table_targets_by_source(symbol_table: &mut SymbolTable, entity_map: &EntityInfoMap) {
     for target_ids in symbol_table.values_mut() {
         if target_ids.len() > 1 {
             target_ids.sort_unstable_by(|left, right| {
@@ -987,11 +988,7 @@ fn sort_symbol_table_targets_by_source(
     }
 }
 
-fn compare_entity_ids_by_source(
-    left: &str,
-    right: &str,
-    entity_map: &EntityInfoMap,
-) -> Ordering {
+fn compare_entity_ids_by_source(left: &str, right: &str, entity_map: &EntityInfoMap) -> Ordering {
     match (entity_map.get(left), entity_map.get(right)) {
         (Some(left), Some(right)) => (
             left.file_path.as_str(),
@@ -1016,7 +1013,11 @@ pub fn resolve_with_scopes(
     root: &Path,
     file_paths: &[String],
     all_entities: &[SemanticEntity],
-    entity_map: &std::collections::HashMap<crate::model::entity_id::EntityId, EntityInfo, impl BuildHasher>,
+    entity_map: &std::collections::HashMap<
+        crate::model::entity_id::EntityId,
+        EntityInfo,
+        impl BuildHasher,
+    >,
     pre_parsed: Option<Vec<(String, String, tree_sitter::Tree)>>,
 ) -> ScopeResult {
     let entity_map: EntityInfoMap = entity_map
@@ -1061,7 +1062,11 @@ pub fn resolve_with_scopes_fast(
 
 fn scope_result_from_full(result: ScopeResultFull) -> ScopeResult {
     ScopeResult {
-        edges: result.edges.into_iter().map(|(from, to, kind)| (from.to_string(), to.to_string(), kind)).collect(),
+        edges: result
+            .edges
+            .into_iter()
+            .map(|(from, to, kind)| (from.to_string(), to.to_string(), kind))
+            .collect(),
         resolution_log: result.resolution_log,
     }
 }
@@ -1270,8 +1275,8 @@ pub struct PrecomputedFileFacts {
     /// raw bytes regardless of whether the tree stuck around).
     content: String,
     scopes: Vec<Scope>,
-    entity_scope_map: HashMap<String, usize>,
-    entity_inner_scope: HashMap<String, usize>,
+    entity_scope_map: EntityScopeMap,
+    entity_inner_scope: EntityScopeMap,
     ast_refs: Vec<AstRef>,
     /// This file's own contribution to the corpus-wide return-type map
     /// (function/method entity id -> declared/inferred return type name).
@@ -1384,14 +1389,14 @@ impl PrecomputedFileFacts {
             return;
         }
         for map in [&mut self.entity_scope_map, &mut self.entity_inner_scope] {
-            let stale: Vec<String> = map
+            let stale: Vec<EntityId> = map
                 .keys()
                 .filter(|id| rekey.contains_key(id.as_str()))
                 .cloned()
                 .collect();
             for old_id in stale {
                 if let Some(value) = map.remove(&old_id) {
-                    map.insert(rekey[&old_id].clone(), value);
+                    map.insert(EntityId::from(&rekey[old_id.as_str()]), value);
                 }
             }
         }
@@ -1549,11 +1554,25 @@ impl PrecomputedFileFacts {
         // Count canonical payloads once within these facts. Canonical IDs can
         // also be shared across files/the graph, so this per-file estimate is
         // not additive across the whole corpus; process RSS remains authoritative.
-        let scope_ids: HashSet<&str> = self.scopes.iter().flat_map(|scope| {
-            scope.defs.values().chain(scope.owner_id.iter()).map(EntityId::as_str)
-        }).collect();
-        let scope_id_bytes: usize = scope_ids.iter().map(|id| id.len() + 6 * std::mem::size_of::<usize>()).sum();
-        let scopes = scope_id_bytes + self.scopes.capacity() * std::mem::size_of::<Scope>()
+        let scope_ids: HashSet<&str> = self
+            .scopes
+            .iter()
+            .flat_map(|scope| {
+                scope
+                    .defs
+                    .values()
+                    .chain(scope.owner_id.iter())
+                    .map(EntityId::as_str)
+            })
+            .chain(self.entity_scope_map.keys().map(EntityId::as_str))
+            .chain(self.entity_inner_scope.keys().map(EntityId::as_str))
+            .collect();
+        let scope_id_bytes: usize = scope_ids
+            .iter()
+            .map(|id| id.len() + 6 * std::mem::size_of::<usize>())
+            .sum();
+        let scopes = scope_id_bytes
+            + self.scopes.capacity() * std::mem::size_of::<Scope>()
             + self
                 .scopes
                 .iter()
@@ -1564,7 +1583,8 @@ impl PrecomputedFileFacts {
                             .sum::<usize>()
                     };
                     scope.defs.keys().map(String::capacity).sum::<usize>()
-                        + scope.defs.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<EntityId>() + 1)
+                        + scope.defs.capacity()
+                            * (std::mem::size_of::<String>() + std::mem::size_of::<EntityId>() + 1)
                         + string_to_string(&scope.types)
                         + string_to_string(&scope.pending_call_types)
                         + scope.bindings.iter().map(String::capacity).sum::<usize>()
@@ -1582,9 +1602,9 @@ impl PrecomputedFileFacts {
                 .sum::<usize>();
 
         let entity_scope_maps = self.entity_scope_map.capacity()
-            * (std::mem::size_of::<String>() + std::mem::size_of::<usize>() + 1)
+            * (std::mem::size_of::<EntityId>() + std::mem::size_of::<usize>() + 1)
             + self.entity_inner_scope.capacity()
-                * (std::mem::size_of::<String>() + std::mem::size_of::<usize>() + 1);
+                * (std::mem::size_of::<EntityId>() + std::mem::size_of::<usize>() + 1);
 
         // `Arc<str>` allocations may be shared (per-file interning,
         // Stage 1) — a pointer already seen in this file's `ast_refs` costs
@@ -1942,8 +1962,8 @@ pub(crate) fn precompute_js_ts_file_facts(
         owner_id: None,
         kind: "module",
     }];
-    let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
-    let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+    let mut entity_scope_map: EntityScopeMap = HashMap::default();
+    let mut entity_inner_scope: EntityScopeMap = HashMap::default();
 
     // Same top-level def registration `resolve_with_scopes_full_inner`'s pass
     // 2 closure does before calling `build_scopes_from_ast` — and in
@@ -1968,7 +1988,7 @@ pub(crate) fn precompute_js_ts_file_facts(
         scopes[0]
             .defs
             .insert(entity.name.clone(), EntityId::from(&entity.id));
-        entity_scope_map.insert(entity.id.clone(), 0);
+        entity_scope_map.insert(EntityId::from(&entity.id), 0);
     }
 
     build_scopes_from_ast(
@@ -2672,8 +2692,8 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         owner_id: None,
         kind: "module",
     }];
-    let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
-    let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+    let mut entity_scope_map: EntityScopeMap = HashMap::default();
+    let mut entity_inner_scope: EntityScopeMap = HashMap::default();
 
     // The seed order: entity_ranges order — `(start_line, end_line, id)`
     // ascending — matching the AST path
@@ -2691,7 +2711,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         scopes[0]
             .defs
             .insert(entity.name.clone(), EntityId::from(&entity.id));
-        entity_scope_map.insert(entity.id.clone(), 0);
+        entity_scope_map.insert(EntityId::from(&entity.id), 0);
     }
 
     // The fused triple walk: scopes/entity_scope_map/
@@ -2816,7 +2836,7 @@ fn resolve_with_scopes_full_inner(
     let entity_index = chunked.map(|c| c.entity_index);
     let mut all_edges: Vec<ResolvedEdge> = Vec::new();
     let mut log: Vec<ResolutionEntry> = Vec::new();
-    let mut consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
+    let mut consumed_words: ConsumedWords = HashMap::default();
 
     // Use pre-built lookups if provided, otherwise build from scratch.
     let owned_lookups;
@@ -2824,9 +2844,9 @@ fn resolve_with_scopes_full_inner(
         pb
     } else {
         let mut symbol_table: SymbolTable = HashMap::default();
-        let mut class_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
-        let mut owner_members: HashMap<String, Vec<(String, String)>> = HashMap::default();
-        let mut entity_ranges: HashMap<String, Vec<(usize, usize, String)>> = HashMap::default();
+        let mut class_members: ClassMembers = HashMap::default();
+        let mut owner_members: OwnerMembers = HashMap::default();
+        let mut entity_ranges: EntityRanges = HashMap::default();
 
         for entity in all_entities {
             symbol_table
@@ -2836,15 +2856,15 @@ fn resolve_with_scopes_full_inner(
 
             if let Some(ref pid) = entity.parent_id {
                 owner_members
-                    .entry(pid.clone())
+                    .entry(EntityId::from(pid))
                     .or_default()
-                    .push((entity.name.clone(), entity.id.clone()));
+                    .push((entity.name.clone(), EntityId::from(&entity.id)));
                 if let Some(parent) = entity_map.get(pid) {
                     if let Some(owner_name) = class_member_owner_name(parent) {
                         class_members
                             .entry(owner_name.to_string())
                             .or_default()
-                            .push((entity.name.clone(), entity.id.clone()));
+                            .push((entity.name.clone(), EntityId::from(&entity.id)));
                     }
                 }
             }
@@ -2854,14 +2874,18 @@ fn resolve_with_scopes_full_inner(
                     class_members
                         .entry(struct_name)
                         .or_default()
-                        .push((entity.name.clone(), entity.id.clone()));
+                        .push((entity.name.clone(), EntityId::from(&entity.id)));
                 }
             }
 
             entity_ranges
                 .entry(entity.file_path.clone())
                 .or_default()
-                .push((entity.start_line, entity.end_line, entity.id.clone()));
+                .push((
+                    entity.start_line,
+                    entity.end_line,
+                    EntityId::from(&entity.id),
+                ));
         }
         sort_symbol_table_targets_by_source(&mut symbol_table, entity_map);
         for members in class_members.values_mut() {
@@ -3495,14 +3519,16 @@ fn resolve_with_scopes_full_inner(
                     owner_id: None,
                     kind: "module",
                 }];
-                let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
-                let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+                let mut entity_scope_map: EntityScopeMap = HashMap::default();
+                let mut entity_inner_scope: EntityScopeMap = HashMap::default();
 
                 if let Some(ranges) = entity_ranges.get(file_path.as_str()) {
                     for (_start, _end, eid) in ranges {
                         if let Some(info) = entity_map.get(eid) {
                             if info.parent_id.is_none() {
-                                scopes[0].defs.insert(info.name.clone(), EntityId::from(&info.id));
+                                scopes[0]
+                                    .defs
+                                    .insert(info.name.clone(), EntityId::from(&info.id));
                                 entity_scope_map.insert(eid.clone(), 0);
                             }
                         }
@@ -3688,7 +3714,7 @@ fn resolve_with_scopes_full_inner(
 
             let mut file_edges: Vec<ResolvedEdge> = Vec::new();
             let mut file_log: Vec<ResolutionEntry> = Vec::new();
-            let mut file_consumed_words: HashMap<String, HashSet<String>> = HashMap::default();
+            let mut file_consumed_words: ConsumedWords = HashMap::default();
 
             let __ref_collect_t0 = __prof_on.then(Instant::now);
             let refs_by_row = build_refs_by_row(&all_file_refs);
@@ -3746,7 +3772,10 @@ fn resolve_with_scopes_full_inner(
                 // previously re-hashed the entity id against several maps (and every
                 // child id, once per ref); on dense, deeply nested files that hashing
                 // dominated resolution. Fetch them once per entity instead.
-                let entity_consumed = file_consumed_words.entry(entity.id.clone()).or_default();
+                let interned_source = EntityId::from(&entity.id);
+                let entity_consumed = file_consumed_words
+                    .entry(interned_source.clone())
+                    .or_default();
                 add_local_bindings_to_consumed_words(entity_consumed, scope_idx, &scopes);
 
                 let entity_span = entity_spans.get(entity.id.as_str()).copied();
@@ -3908,7 +3937,11 @@ fn resolve_with_scopes_full_inner(
                                             method,
                                         });
                                     }
-                                    file_edges.push((EntityId::from(&entity.id), target_id.into(), ref_type));
+                                    file_edges.push((
+                                        interned_source.clone(),
+                                        target_id.into(),
+                                        ref_type,
+                                    ));
                                 }
                             }
                         } else {
@@ -4048,7 +4081,7 @@ struct PerFileScopeResult<'a> {
     file_path: &'a str,
     edges: Vec<ResolvedEdge>,
     log: Vec<ResolutionEntry>,
-    consumed_words: HashMap<String, HashSet<String>>,
+    consumed_words: ConsumedWords,
     /// `None` when not recording (the cold, non-session path).
     read_set: Option<crate::parser::incremental::ReadSet>,
     /// Whether this result came from the cache rather than from resolution.
@@ -4276,7 +4309,7 @@ pub(crate) fn fingerprint_corpus_tables_incremental(
     );
 }
 
-fn hash_member_list(members: &[(String, String)]) -> u64 {
+fn hash_member_list(members: &[MemberTarget]) -> u64 {
     let mut h = ValueHasher::new();
     for (name, id) in members {
         h.s(name).s(id);
@@ -4525,8 +4558,8 @@ fn build_scopes_from_ast(
     root: tree_sitter::Node,
     root_scope: usize,
     scopes: &mut Vec<Scope>,
-    entity_scope_map: &mut HashMap<String, usize>,
-    entity_inner_scope: &mut HashMap<String, usize>,
+    entity_scope_map: &mut EntityScopeMap,
+    entity_inner_scope: &mut EntityScopeMap,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
     entity_map: &EntityInfoMap,
@@ -4564,8 +4597,8 @@ fn scope_visit_node(
     node: tree_sitter::Node,
     current_scope: usize,
     scopes: &mut Vec<Scope>,
-    entity_scope_map: &mut HashMap<String, usize>,
-    entity_inner_scope: &mut HashMap<String, usize>,
+    entity_scope_map: &mut EntityScopeMap,
+    entity_inner_scope: &mut EntityScopeMap,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
     entity_map: &EntityInfoMap,
@@ -4646,8 +4679,8 @@ fn scope_visit_node(
                         owner_id: Some(EntityId::from(&ce.id)),
                         kind: "class",
                     });
-                    entity_scope_map.insert(ce.id.clone(), current_scope);
-                    entity_inner_scope.insert(ce.id.clone(), idx);
+                    entity_scope_map.insert(EntityId::from(&ce.id), current_scope);
+                    entity_inner_scope.insert(EntityId::from(&ce.id), idx);
                     idx
                 };
 
@@ -4656,7 +4689,7 @@ fn scope_visit_node(
                         scopes[class_scope_idx]
                             .defs
                             .insert(entity.name.clone(), EntityId::from(&entity.id));
-                        entity_scope_map.insert(entity.id.clone(), class_scope_idx);
+                        entity_scope_map.insert(EntityId::from(&entity.id), class_scope_idx);
                     }
                 }
 
@@ -4683,14 +4716,14 @@ fn scope_visit_node(
                     kind: "class",
                 });
                 if let Some(ie) = impl_entity {
-                    entity_scope_map.insert(ie.id.clone(), current_scope);
-                    entity_inner_scope.insert(ie.id.clone(), class_scope_idx);
+                    entity_scope_map.insert(EntityId::from(&ie.id), current_scope);
+                    entity_inner_scope.insert(EntityId::from(&ie.id), class_scope_idx);
                     if let Some(children) = children_by_parent.get(ie.id.as_str()) {
                         for entity in children {
                             scopes[class_scope_idx]
                                 .defs
                                 .insert(entity.name.clone(), EntityId::from(&entity.id));
-                            entity_scope_map.insert(entity.id.clone(), class_scope_idx);
+                            entity_scope_map.insert(EntityId::from(&entity.id), class_scope_idx);
                         }
                     }
                 }
@@ -4740,9 +4773,9 @@ fn scope_visit_node(
             if let Some(me) = mod_entity {
                 scopes[mod_scope_idx].owner_id = Some(EntityId::from(&me.id));
                 entity_scope_map
-                    .entry(me.id.clone())
+                    .entry(EntityId::from(&me.id))
                     .or_insert(current_scope);
-                entity_inner_scope.insert(me.id.clone(), mod_scope_idx);
+                entity_inner_scope.insert(EntityId::from(&me.id), mod_scope_idx);
 
                 // Register child entities in the module scope
                 if let Some(children) = children_by_parent.get(me.id.as_str()) {
@@ -4750,7 +4783,7 @@ fn scope_visit_node(
                         scopes[mod_scope_idx]
                             .defs
                             .insert(child_entity.name.clone(), EntityId::from(&child_entity.id));
-                        entity_scope_map.insert(child_entity.id.clone(), mod_scope_idx);
+                        entity_scope_map.insert(EntityId::from(&child_entity.id), mod_scope_idx);
                     }
                 }
             }
@@ -4808,9 +4841,9 @@ fn scope_visit_node(
             if let Some(fe) = func_entity {
                 scopes[func_scope_idx].owner_id = Some(EntityId::from(&fe.id));
                 entity_scope_map
-                    .entry(fe.id.clone())
+                    .entry(EntityId::from(&fe.id))
                     .or_insert(parent_scope);
-                entity_inner_scope.insert(fe.id.clone(), func_scope_idx);
+                entity_inner_scope.insert(EntityId::from(&fe.id), func_scope_idx);
                 // Register this function's nested child entities:
                 // same shape as the class-like branch above. Without it,
                 // entities nested inside a plain function never enter any
@@ -4821,7 +4854,7 @@ fn scope_visit_node(
                         scopes[func_scope_idx]
                             .defs
                             .insert(entity.name.clone(), EntityId::from(&entity.id));
-                        entity_scope_map.insert(entity.id.clone(), func_scope_idx);
+                        entity_scope_map.insert(EntityId::from(&entity.id), func_scope_idx);
                     }
                 }
                 if config.external_method
@@ -4892,8 +4925,8 @@ fn fused_scope_refs_import_walk(
     root: tree_sitter::Node,
     root_scope: usize,
     scopes: &mut Vec<Scope>,
-    entity_scope_map: &mut HashMap<String, usize>,
-    entity_inner_scope: &mut HashMap<String, usize>,
+    entity_scope_map: &mut EntityScopeMap,
+    entity_inner_scope: &mut EntityScopeMap,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
     entity_map: &EntityInfoMap,
@@ -8775,7 +8808,9 @@ fn register_go_package_imports(
         }
         import_table.insert((file_path.to_string(), name.clone()), target_id.clone());
         if !scopes.is_empty() {
-            scopes[0].defs.insert(name.clone(), EntityId::from(target_id));
+            scopes[0]
+                .defs
+                .insert(name.clone(), EntityId::from(target_id));
         }
     }
 }
@@ -8889,7 +8924,9 @@ fn resolve_default_import(
             target_id.clone(),
         );
         if !scopes.is_empty() {
-            scopes[0].defs.insert(local_name.to_string(), target_id.into());
+            scopes[0]
+                .defs
+                .insert(local_name.to_string(), target_id.into());
         }
     }
 }
@@ -9310,7 +9347,7 @@ fn rust_module_path_overlap(qualifying_path: &str, candidate_dir: &str) -> usize
 fn build_swift_call_signatures(
     parsed_files: &[(String, String, tree_sitter::Tree)],
     all_entities: &[SemanticEntity],
-    entity_ranges: &HashMap<String, Vec<(usize, usize, String)>>,
+    entity_ranges: &EntityRanges,
     entity_map: &EntityInfoMap,
 ) -> HashMap<String, SwiftCallSignature> {
     let mut signatures = HashMap::default();
@@ -9363,7 +9400,7 @@ fn build_swift_call_signatures(
 
 fn find_entity_id_for_swift_declaration(
     node: tree_sitter::Node,
-    ranges: &[(usize, usize, String)],
+    ranges: &[(usize, usize, EntityId)],
     entity_map: &EntityInfoMap,
 ) -> Option<String> {
     let start_line = node.start_position().row + 1;
@@ -9377,7 +9414,7 @@ fn find_entity_id_for_swift_declaration(
                 && entity_map.get(id).map_or(false, is_swift_callable_entity)
         })
         .min_by_key(|(start, end, _)| end.saturating_sub(*start))
-        .map(|(_, _, id)| id.clone())
+        .map(|(_, _, id)| id.to_string())
 }
 
 fn is_swift_callable_entity(info: &EntityInfo) -> bool {
@@ -9513,14 +9550,14 @@ fn normalize_swift_label(label: &str) -> Option<String> {
 }
 
 fn select_member_candidate(
-    members: &[(String, String)],
+    members: &[MemberTarget],
     method: &str,
     argument_labels: Option<&[Option<String>]>,
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
 ) -> SwiftOverloadSelection {
     let candidates: Vec<&String> = members
         .iter()
-        .filter_map(|(name, id)| (name == method).then_some(id))
+        .filter_map(|(name, id)| (name == method).then_some(id.as_string()))
         .collect();
 
     if argument_labels.is_none()
@@ -10029,8 +10066,8 @@ fn resolve_ref(
     scope_lookup_missed: bool,
     scopes: &[Scope],
     symbol_table: &SymbolTable,
-    class_members: &HashMap<String, Vec<(String, String)>>,
-    owner_members: &HashMap<String, Vec<(String, String)>>,
+    class_members: &ClassMembers,
+    owner_members: &OwnerMembers,
     import_table_by_name: &HashMap<&str, &str>,
     instance_attr_types: &HashMap<(String, String), String>,
     entity_map: &EntityInfoMap,
@@ -10080,7 +10117,8 @@ fn resolve_ref(
                 if argument_labels.is_some() {
                     if let Some(target_ids) = symbol_table.get(name.as_ref()) {
                         let same_file_targets: Vec<&String> = target_ids
-                            .iter().map(crate::model::entity_id::EntityId::as_string)
+                            .iter()
+                            .map(crate::model::entity_id::EntityId::as_string)
                             .filter(|id| {
                                 entity_map
                                     .get(*id)
@@ -10090,7 +10128,10 @@ fn resolve_ref(
                         let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
                             same_file_targets
                         } else if allow_cross_file_calls {
-                            target_ids.iter().map(crate::model::entity_id::EntityId::as_string).collect()
+                            target_ids
+                                .iter()
+                                .map(crate::model::entity_id::EntityId::as_string)
+                                .collect()
                         } else {
                             Vec::new()
                         };
@@ -10115,7 +10156,8 @@ fn resolve_ref(
                     }
                 } else if let Some(target_ids) = symbol_table.get(name.as_ref()) {
                     let same_file_targets: Vec<&String> = target_ids
-                        .iter().map(crate::model::entity_id::EntityId::as_string)
+                        .iter()
+                        .map(crate::model::entity_id::EntityId::as_string)
                         .filter(|id| {
                             entity_map
                                 .get(*id)
@@ -10125,7 +10167,10 @@ fn resolve_ref(
                     let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
                         same_file_targets
                     } else if allow_cross_file_calls {
-                        target_ids.iter().map(crate::model::entity_id::EntityId::as_string).collect()
+                        target_ids
+                            .iter()
+                            .map(crate::model::entity_id::EntityId::as_string)
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -10188,7 +10233,8 @@ fn resolve_ref(
                 }
 
                 let same_file_targets: Vec<&String> = target_ids
-                    .iter().map(crate::model::entity_id::EntityId::as_string)
+                    .iter()
+                    .map(crate::model::entity_id::EntityId::as_string)
                     .filter(|id| {
                         entity_map
                             .get(*id)
@@ -10198,7 +10244,10 @@ fn resolve_ref(
                 let visible_targets: Vec<&String> = if !same_file_targets.is_empty() {
                     same_file_targets
                 } else if is_constructor || allow_cross_file_calls {
-                    target_ids.iter().map(crate::model::entity_id::EntityId::as_string).collect()
+                    target_ids
+                        .iter()
+                        .map(crate::model::entity_id::EntityId::as_string)
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -10236,7 +10285,7 @@ fn resolve_ref(
                     .find(|(member, _)| member.as_str() == name.as_ref())
                 {
                     if target_id != from_entity_id {
-                        return Some((target_id.clone(), RefType::Calls, "scoped_call"));
+                        return Some((target_id.to_string(), RefType::Calls, "scoped_call"));
                     }
                 }
             }
@@ -10768,14 +10817,14 @@ fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> 
 }
 
 fn lookup_entity_member(
-    owner_members: &HashMap<String, Vec<(String, String)>>,
+    owner_members: &OwnerMembers,
     owner_id: &str,
     member: &str,
 ) -> Option<String> {
     owner_members
         .get(owner_id)
         .and_then(|members| members.iter().find(|(name, _)| name == member))
-        .map(|(_, id)| id.clone())
+        .map(|(_, id)| id.to_string())
 }
 
 /// Find the class name for the enclosing class scope.
@@ -11258,7 +11307,10 @@ mod tests {
         );
 
         // Values are untouched — shrink_to_fit is a pure capacity operation.
-        assert_eq!(facts.scopes[0].defs.get("kept").map(EntityId::as_str), Some("value"));
+        assert_eq!(
+            facts.scopes[0].defs.get("kept").map(EntityId::as_str),
+            Some("value")
+        );
         assert!(facts.scopes[0].bindings.contains("kept-binding"));
         match &facts.ast_refs[0].kind {
             AstRefKind::MethodCall {
@@ -11809,8 +11861,12 @@ mod tests {
         let pre_rewrite_id = ping.id.clone();
 
         let mut facts = dummy_precomputed_facts_for_test("");
-        facts.entity_scope_map.insert(pre_rewrite_id.clone(), 0);
-        facts.entity_inner_scope.insert(pre_rewrite_id.clone(), 0);
+        facts
+            .entity_scope_map
+            .insert(EntityId::from(&pre_rewrite_id), 0);
+        facts
+            .entity_inner_scope
+            .insert(EntityId::from(&pre_rewrite_id), 0);
         facts
             .return_type_map
             .insert(pre_rewrite_id.clone(), "string".to_string());
@@ -12618,7 +12674,10 @@ mod tests {
             vec![
                 "a_primary.py::function::make_conn".to_string(),
                 "z_backup.py::function::make_conn".to_string(),
-            ].into_iter().map(Into::into).collect(),
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         );
 
         // `deterministic_return_types_by_name` reaches a name through
@@ -12658,8 +12717,17 @@ mod tests {
         let second_id = "pkg/foo/b.go::function::alpha".to_string();
 
         let mut symbol_table = HashMap::default();
-        symbol_table.insert("zeta".to_string(), vec![first_id.clone()].into_iter().map(Into::into).collect());
-        symbol_table.insert("alpha".to_string(), vec![second_id.clone()].into_iter().map(Into::into).collect());
+        symbol_table.insert(
+            "zeta".to_string(),
+            vec![first_id.clone()].into_iter().map(Into::into).collect(),
+        );
+        symbol_table.insert(
+            "alpha".to_string(),
+            vec![second_id.clone()]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
 
         let mut entity_map = HashMap::default();
         entity_map.insert(
@@ -12727,9 +12795,27 @@ mod tests {
         let stdlib_shadow_id = "pkg/quux/os.go::function::Stat".to_string();
 
         let mut symbol_table = HashMap::default();
-        symbol_table.insert("Run".to_string(), vec![go_id.clone(), py_twin_id.clone()].into_iter().map(Into::into).collect());
-        symbol_table.insert("UtilFn".to_string(), vec![py_util_id.clone()].into_iter().map(Into::into).collect());
-        symbol_table.insert("Stat".to_string(), vec![stdlib_shadow_id.clone()].into_iter().map(Into::into).collect());
+        symbol_table.insert(
+            "Run".to_string(),
+            vec![go_id.clone(), py_twin_id.clone()]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
+        symbol_table.insert(
+            "UtilFn".to_string(),
+            vec![py_util_id.clone()]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
+        symbol_table.insert(
+            "Stat".to_string(),
+            vec![stdlib_shadow_id.clone()]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
 
         let mut entity_map = HashMap::default();
         entity_map.insert(
@@ -12841,7 +12927,10 @@ mod tests {
         let mut symbol_table = HashMap::default();
         symbol_table.insert(
             "DeepCopyInto".to_string(),
-            vec![kubeadm_id.clone(), podsec_id.clone()].into_iter().map(Into::into).collect(),
+            vec![kubeadm_id.clone(), podsec_id.clone()]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         );
 
         let mut entity_map = HashMap::default();
@@ -12917,7 +13006,10 @@ mod tests {
         let mut symbol_table = HashMap::default();
         symbol_table.insert(
             "DeepCopyInto".to_string(),
-            vec![kubeadm_id.clone(), podsec_id.clone()].into_iter().map(Into::into).collect(),
+            vec![kubeadm_id.clone(), podsec_id.clone()]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         );
 
         let mut entity_map = HashMap::default();
@@ -13146,8 +13238,8 @@ mod tests {
     /// phase sequence completes.
     struct WalkOutcome {
         scopes: Vec<Scope>,
-        entity_scope_map: HashMap<String, usize>,
-        entity_inner_scope: HashMap<String, usize>,
+        entity_scope_map: EntityScopeMap,
+        entity_inner_scope: EntityScopeMap,
         ast_refs: Vec<AstRef>,
         import_table: HashMap<(String, String), String>,
     }
@@ -13215,13 +13307,13 @@ mod tests {
             owner_id: None,
             kind: "module",
         }];
-        let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
-        let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+        let mut entity_scope_map: EntityScopeMap = HashMap::default();
+        let mut entity_inner_scope: EntityScopeMap = HashMap::default();
         // The closure's own top-level seed, replicated.
         for e in &fx.entities {
             if e.parent_id.is_none() {
                 scopes[0].defs.insert(e.name.clone(), EntityId::from(&e.id));
-                entity_scope_map.insert(e.id.clone(), 0);
+                entity_scope_map.insert(EntityId::from(&e.id), 0);
             }
         }
 
@@ -13944,8 +14036,8 @@ mod tests {
                 owner_id: None,
                 kind: "module",
             }];
-            let mut entity_scope_map: HashMap<String, usize> = HashMap::default();
-            let mut entity_inner_scope: HashMap<String, usize> = HashMap::default();
+            let mut entity_scope_map: EntityScopeMap = HashMap::default();
+            let mut entity_inner_scope: EntityScopeMap = HashMap::default();
             fused_scope_refs_import_walk(
                 tree.root_node(),
                 0,
