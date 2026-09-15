@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Maintenance
+
+- Add a non-blocking Ota execution contract and isolated local-index freshness pressure lane.
+
 ## [0.25.0] - 2026-09-13
 
 ### Added
