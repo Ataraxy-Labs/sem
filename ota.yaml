@@ -1,0 +1,224 @@
+version: 1
+
+metadata:
+  ota:
+    minimum_version: "1.6.27"
+
+project:
+  name: sem
+  description: Bounded source verification and local index freshness proof for sem
+  type: application
+
+execution:
+  default_context: host
+  contexts:
+    host:
+      backend: native
+      env:
+        CARGO_HOME: ${OTA_HOST_WORKSPACE}/.ota/cache/cargo-native
+        CARGO_TARGET_DIR: ${OTA_HOST_WORKSPACE}/.ota/cache/target-native
+        SEM_BIN: ${OTA_HOST_WORKSPACE}/.ota/cache/target-native/debug/sem
+        SEM_CACHE_DIR: ${OTA_HOST_WORKSPACE}/.ota/cache/sem-native/fixture-cache
+        SEM_EVIDENCE_DIR: ${OTA_HOST_WORKSPACE}/.ota/evidence/sem-stale-index
+    pressure-container:
+      backend: container
+      lifecycle: ephemeral
+      env:
+        CARGO_HOME: /workspace/.ota/cache/cargo-container
+        CARGO_TARGET_DIR: /workspace/.ota/cache/target-container
+        SEM_BIN: /workspace/.ota/cache/target-container/debug/sem
+        SEM_CACHE_DIR: /workspace/.ota/cache/sem-container/fixture-cache
+        SEM_EVIDENCE_DIR: /workspace/.ota/evidence/sem-stale-index
+      container:
+        image: sem-ota-pressure:1.0
+        platform: linux/amd64
+        engines: [docker]
+      attachments:
+        isolated_paths:
+          - .ota/cache/cargo-container
+          - .ota/cache/target-container
+          - .ota/cache/sem-container
+
+toolchains:
+  rust:
+    version: ">=1.95"
+  python:
+    version: ">=3.11"
+
+tasks:
+  setup:cargo:native:
+    description: Hydrate sem's locked Cargo dependencies into Ota's native cache
+    notes: |
+      Fetches only the committed Cargo dependency graph. It does not install sem globally, enable
+      sem cloud, alter Git configuration, or start the MCP server.
+    category: setup
+    command:
+      exe: cargo
+      args: [fetch, --locked]
+      cwd: crates
+    requirements:
+      toolchains: [rust]
+    effects:
+      writes: [.ota/cache/cargo-native]
+      network: true
+      network_kind: dependency_hydration
+    safe_for_agent: true
+
+  setup:cargo:container:
+    description: Hydrate sem's locked Cargo dependencies into Ota's container cache
+    notes: |
+      Fetches the committed Cargo graph inside the isolated Linux execution context. It does not
+      install sem globally, enable sem cloud, alter Git configuration, or start the MCP server.
+    category: setup
+    command:
+      exe: cargo
+      args: [fetch, --locked]
+      cwd: crates
+    requirements:
+      toolchains: [rust]
+    effects:
+      writes: [.ota/cache/cargo-container]
+      network: true
+      network_kind: dependency_hydration
+    execution:
+      default_mode: container
+      modes:
+        container:
+          context: pressure-container
+    safe_for_agent: true
+
+  build:
+    description: Build sem's CLI from the locked source workspace
+    notes: |
+      Builds the sem CLI from this checkout. It does not run setup, modify global Git behavior,
+      contact sem cloud, or establish release-artifact equivalence.
+    category: build
+    command:
+      exe: cargo
+      args: [build, --locked, -p, sem-cli]
+      cwd: crates
+    requirements:
+      toolchains: [rust]
+    effects:
+      writes: [.ota/cache/target-native, .ota/cache/target-container]
+    execution:
+      default_mode: native
+      modes:
+        native:
+          context: host
+          depends_on: [setup:cargo:native]
+        container:
+          context: pressure-container
+          depends_on: [setup:cargo:container]
+    safe_for_agent: true
+
+  test:
+    description: Run sem's repository-owned Core and CLI test suites
+    notes: |
+      Preserves the source-owned test command used by sem's Windows workflow. Passing does not
+      prove every parser, MCP consumer, cloud query, package, release, or supported host path.
+      Process-local Git configuration disables ambient commit signing for test-created repositories
+      without modifying user or repository Git settings.
+    category: test
+    command:
+      exe: cargo
+      args: [test, --locked, -p, sem-core, -p, sem-cli]
+      cwd: crates
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: commit.gpgsign
+      GIT_CONFIG_VALUE_0: "false"
+    requirements:
+      toolchains: [rust]
+    effects:
+      writes: [.ota/cache/target-native, .ota/cache/target-container]
+    execution:
+      default_mode: native
+      modes:
+        native:
+          context: host
+          depends_on: [setup:cargo:native]
+        container:
+          context: pressure-container
+          depends_on: [setup:cargo:container]
+    safe_for_agent: true
+
+  local-index:freshness:
+    description: Require sem's warmed local graph to follow a later exact repository revision
+    notes: |
+      Creates a disposable two-commit TypeScript repository, warms sem's local index at revision A,
+      then requires graph and query output at revision B to contain the new entity and edge without
+      retaining revision A's entity or edge. This proves one local CLI path only; cloud-index
+      equivalence, universal parser correctness, and every MCP consumer remain not proved.
+    category: verify
+    command:
+      exe: bash
+      args: [.github/ota/stale-index-fixture.sh]
+    requirements:
+      toolchains: [rust, python]
+    effects:
+      writes: [.ota/cache, .ota/pressure, .ota/evidence]
+    execution:
+      default_mode: native
+      modes:
+        native:
+          context: host
+          depends_on: [build]
+        container:
+          context: pressure-container
+          depends_on: [build]
+    safe_for_agent: true
+
+  verify:
+    description: Run sem's bounded source suite and local-index revision proof
+    notes: |
+      Aggregates the repository-owned Core/CLI tests and the two-revision local-index fixture.
+      Passing is bounded evidence for these selected paths, not repository-wide sem governance.
+    category: verify
+    aggregate:
+      tasks: [test, local-index:freshness]
+    safe_for_agent: true
+
+workflows:
+  default: verify
+  verify:
+    intent: ci_validation
+    description: Verify sem's bounded source and local-index freshness paths
+    run:
+      task: verify
+    notes: |
+      The non-blocking pressure workflow runs this selection natively on Ubuntu. Its Ota-owned Linux
+      container lane invokes the exact test and local-index:freshness tasks independently because
+      released Ota v1.6.27 does not apply a caller-selected mode to aggregate tasks. macOS, Windows,
+      cloud, MCP, setup hooks, packaging, and release remain outside this workflow's proof claim.
+
+agent:
+  posture: readiness_strict
+  entrypoint: verify
+  default_task: verify
+  safe_tasks:
+    - setup:cargo:native
+    - setup:cargo:container
+    - build
+    - test
+    - local-index:freshness
+    - verify
+  verify_after_changes: [verify]
+  writable_paths:
+    - crates
+    - .ota
+  protected_paths:
+    - .github/workflows
+    - crates/Cargo.lock
+    - ota.yaml
+  bootstrap:
+    ota:
+      note: Install the exact released Ota version reviewed for this pressure lane.
+      source:
+        kind: version
+        version: v1.6.27
+  notes: |
+    Use `ota tasks --safe --use` before selecting work. Sem owns code-intelligence correctness;
+    Ota owns only the declared preparation, execution selection, revision fixture, and evidence
+    boundary. Do not infer cloud-index equivalence, universal parser correctness, MCP-consumer
+    correctness, setup-hook safety, package/release readiness, adoption, or endorsement.
