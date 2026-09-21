@@ -1,6 +1,6 @@
 use std::{future::Future, sync::Arc};
 
-use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
+use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::Transport;
 use rmcp::RoleServer;
 use serde::Serialize;
@@ -62,6 +62,20 @@ where
             match parse_client_message(line) {
                 IncomingLine::Message(message) => return Some(*message),
                 IncomingLine::Ignore => {}
+                IncomingLine::MethodNotFound { id } => {
+                    if let Err(error) = write_json_line(
+                        &self.write,
+                        &serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32601, "message": "Method not found"},
+                        }),
+                    )
+                    .await
+                    {
+                        tracing::error!("Error writing method-not-found response: {}", error);
+                        return None;
+                    }
+                }
                 IncomingLine::ParseError => {
                     tracing::debug!("Malformed JSON-RPC frame received");
                     let write = Arc::clone(&self.write);
@@ -101,10 +115,21 @@ enum IncomingLine {
     Ignore,
     ParseError,
     InvalidRequest { id: serde_json::Value },
+    MethodNotFound { id: serde_json::Value },
 }
 
 fn parse_client_message(line: &[u8]) -> IncomingLine {
     match serde_json::from_slice::<ClientJsonRpcMessage>(line) {
+        Ok(JsonRpcMessage::Request(request))
+            if matches!(request.request, ClientRequest::CustomRequest(_)) =>
+        {
+            // Newer clients probe server/discover before legacy initialize.
+            // Passing unknown requests to rmcp's handshake closes the session;
+            // reject them at the transport so the client can negotiate/fallback.
+            IncomingLine::MethodNotFound {
+                id: serde_json::to_value(request.id).expect("request IDs are JSON values"),
+            }
+        }
         Ok(message) => IncomingLine::Message(Box::new(message)),
         Err(error) => {
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -241,6 +266,24 @@ mod tests {
     use super::*;
     use rmcp::model::{ClientRequest, JsonRpcMessage, NumberOrString};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn discovery_probe_replies_method_not_found_then_accepts_initialize() {
+        let (mut input, server_input) = tokio::io::duplex(2048);
+        let (server_output, output) = tokio::io::duplex(2048);
+        let mut transport = ResilientStdioTransport::new(server_input, server_output);
+        input.write_all(br#"{"jsonrpc":"2.0","id":"probe","method":"server/discover","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+"#).await.unwrap();
+        let message = transport.receive().await.unwrap();
+        assert!(matches!(message, JsonRpcMessage::Request(request)
+            if matches!(request.request, ClientRequest::InitializeRequest(_))));
+        let mut line = String::new();
+        BufReader::new(output).read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], "probe");
+        assert_eq!(response["error"]["code"], -32601);
+    }
 
     #[tokio::test]
     async fn malformed_json_emits_parse_error_and_keeps_reading() {
