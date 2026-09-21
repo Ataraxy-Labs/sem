@@ -435,6 +435,9 @@ enum Commands {
     Stats,
     /// Start the MCP server (stdin/stdout transport)
     Mcp {
+        /// Check shared MCP daemon health without starting it (JSON).
+        #[arg(long, conflicts_with = "resident")]
+        status: bool,
         /// Removed: used to spawn the
         /// per-repo sidecar socket. The mmap query index answers cold in
         /// 6-7ms, deleting the sidecar's reason to exist. Kept as a
@@ -949,7 +952,11 @@ fn main() {
         Some(Commands::Stats) => {
             commands::stats::run();
         }
-        Some(Commands::Mcp { resident }) => {
+        Some(Commands::Mcp { resident, status }) => {
+            if status {
+                println!("{}", sem_mcp::shared_status());
+                return;
+            }
             if resident {
                 // No-op: see the `resident` field's doc comment above.
                 return;

@@ -1,0 +1,22 @@
+name: Shared MCP lifecycle
+on:
+  pull_request:
+    paths: ['crates/sem-mcp/**', 'benchmarks/shared-mcp/**', '.github/workflows/shared-mcp.yml']
+  push:
+    branches: [main]
+    paths: ['crates/sem-mcp/**', 'benchmarks/shared-mcp/**', '.github/workflows/shared-mcp.yml']
+jobs:
+  lifecycle:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - run: cargo build --manifest-path crates/Cargo.toml -p sem-mcp -p sem-cli
+      - run: cargo test --manifest-path crates/Cargo.toml -p sem-mcp --lib --tests
+      - run: python3 benchmarks/shared-mcp/run.py --binary crates/target/debug/sem-mcp

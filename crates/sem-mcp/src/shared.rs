@@ -4,13 +4,13 @@
 //! ordinary stdio MCP protocol; `sem mcp` connects them to the shared server.
 
 use std::fs;
-use std::io;
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::io::{self, BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::ServiceExt;
 use tokio::net::UnixStream;
@@ -19,6 +19,29 @@ use tokio::task::JoinSet;
 const DAEMON_ENV: &str = "SEM_MCP_SHARED_DAEMON";
 const DISABLE_ENV: &str = "SEM_MCP_NO_SHARED";
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+pub(crate) fn status() -> serde_json::Value {
+    let Some(socket) = socket_path() else {
+        return serde_json::json!({"status": "no_repository"});
+    };
+    let healthy = probe(&socket).is_ok();
+    serde_json::json!({"status": if healthy {"ready"} else {"unavailable"},
+        "socket": socket, "transport": "unix", "protocol": 2})
+}
+
+fn probe(socket: &Path) -> io::Result<()> {
+    let mut stream = StdUnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"sem-health\",\"version\":\"1\"}}}\n")?;
+    let mut line = String::new();
+    io::BufReader::new(stream).read_line(&mut line)?;
+    let reply: serde_json::Value = serde_json::from_str(&line)?;
+    if reply["id"] != 1 || !reply["result"].is_object() {
+        return Err(io::Error::other("MCP health handshake failed"));
+    }
+    Ok(())
+}
 
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os(DISABLE_ENV).is_some() {
@@ -32,9 +55,11 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         return super::run_stdio();
     };
 
-    if StdUnixStream::connect(&socket).is_err()
-        && (spawn_daemon().is_err() || wait_until_ready(&socket).is_err())
-    {
+    if probe(&socket).is_err() && (spawn_daemon().is_err() || wait_until_ready(&socket).is_err()) {
+        if std::env::var_os("SEM_MCP_REQUIRE_SHARED").is_some() {
+            return Err("shared MCP daemon unavailable (strict shared mode)".into());
+        }
+        eprintln!("sem: shared MCP unavailable; falling back to standalone stdio");
         // Sharing is an optimization, never an availability dependency.
         return super::run_stdio();
     }
@@ -44,12 +69,16 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn runtime_dir() -> Option<PathBuf> {
     let root = crate::server::SemServer::discover_repo_root(None).ok()?;
+    runtime_dir_for(&root)
+}
+
+fn runtime_dir_for(root: &Path) -> Option<PathBuf> {
     let repo = git2::Repository::discover(root).ok()?;
     Some(repo.path().join("sem"))
 }
 
 fn socket_path() -> Option<PathBuf> {
-    Some(runtime_dir()?.join("mcp.sock"))
+    Some(runtime_dir()?.join("mcp-v2.sock"))
 }
 
 fn spawn_daemon() -> io::Result<()> {
@@ -76,8 +105,9 @@ fn spawn_daemon() -> io::Result<()> {
 
 fn wait_until_ready(socket: &Path) -> io::Result<()> {
     let mut last_error = None;
-    for _ in 0..100 {
-        match StdUnixStream::connect(socket) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match probe(socket) {
             Ok(_) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -113,7 +143,21 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     };
     fs::create_dir_all(&runtime_dir)?;
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
-    let socket = runtime_dir.join("mcp.sock");
+    // Hold an OS lock for the daemon lifetime. Crashes release the lock;
+    // competing starters cannot unlink a newly bound live socket.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(runtime_dir.join("mcp-v2.lock"))?;
+    if let Err(error) = lock.try_lock() {
+        return match error {
+            std::fs::TryLockError::WouldBlock => Ok(()),
+            std::fs::TryLockError::Error(error) => Err(error.into()),
+        };
+    }
+    let socket = runtime_dir.join("mcp-v2.sock");
 
     // If a live daemon owns the socket, the concurrently spawned process has
     // nothing to do. Only unlink after proving the endpoint cannot connect.
@@ -121,6 +165,10 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if socket.exists() {
+        use std::os::unix::fs::FileTypeExt;
+        if !fs::symlink_metadata(&socket)?.file_type().is_socket() {
+            return Err("refusing to replace a non-socket at the MCP socket path".into());
+        }
         fs::remove_file(&socket)?;
     }
 
@@ -130,34 +178,48 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let metadata = runtime_dir.join("mcp-v2.json");
+    fs::write(
+        &metadata,
+        serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"),
+            "protocol": 2, "socket": socket
+        }))?,
+    )?;
     listener.set_nonblocking(true)?;
     let result = serve(listener);
     let _ = fs::remove_file(&socket);
+    let _ = fs::remove_file(&metadata);
     result
 }
 
-fn serve(
-    listener: std::os::unix::net::UnixListener,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(listener: std::os::unix::net::UnixListener) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::UnixListener::from_std(listener)?;
-        let server = crate::server::SemServer::new();
+        let root = crate::server::SemServer::discover_repo_root(None)?;
+        let server = crate::server::SemServer::for_repository(root)?;
         server.spawn_prewarm();
         let mut clients = JoinSet::new();
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
         loop {
             if clients.is_empty() {
-                match tokio::time::timeout(IDLE_TIMEOUT, listener.accept()).await {
-                    Ok(Ok((stream, _))) => spawn_client(&mut clients, server.clone(), stream),
+                let accepted = tokio::select! {
+                    _ = terminate.recv() => return Ok(()),
+                    accepted = tokio::time::timeout(IDLE_TIMEOUT, listener.accept()) => accepted,
+                };
+                match accepted {
+                    Ok(Ok((stream, _))) => spawn_client(&mut clients, server.new_session(), stream),
                     Ok(Err(error)) => return Err(error.into()),
                     Err(_) => return Ok(()),
                 }
             } else {
                 tokio::select! {
+                    _ = terminate.recv() => return Ok(()),
                     accepted = listener.accept() => {
                         let (stream, _) = accepted?;
-                        spawn_client(&mut clients, server.clone(), stream);
+                        spawn_client(&mut clients, server.new_session(), stream);
                     }
                     _ = clients.join_next() => {}
                 }
@@ -166,19 +228,19 @@ fn serve(
     })
 }
 
-fn spawn_client(
-    clients: &mut JoinSet<()>,
-    server: crate::server::SemServer,
-    stream: UnixStream,
-) {
+fn spawn_client(clients: &mut JoinSet<()>, server: crate::server::SemServer, stream: UnixStream) {
+    if clients.len() >= 64 {
+        return;
+    }
     clients.spawn(async move {
         let (read, write) = stream.into_split();
         let transport = crate::transport::ResilientStdioTransport::new(read, write);
-        match server.serve(transport).await {
-            Ok(service) => {
+        match tokio::time::timeout(Duration::from_secs(10), server.serve(transport)).await {
+            Ok(Ok(service)) => {
                 let _ = service.waiting().await;
             }
-            Err(error) => tracing::warn!("shared MCP client failed: {error}"),
+            Ok(Err(error)) => tracing::warn!("shared MCP client failed: {error}"),
+            Err(_) => tracing::warn!("shared MCP client handshake timed out"),
         }
     });
 }
@@ -191,13 +253,7 @@ mod tests {
     fn runtime_lives_inside_git_metadata() {
         let dir = tempfile::tempdir().unwrap();
         git2::Repository::init(dir.path()).unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let path = runtime_dir().unwrap();
-        std::env::set_current_dir(previous).unwrap();
-        assert_eq!(
-            path,
-            dir.path().canonicalize().unwrap().join(".git/sem")
-        );
+        let path = runtime_dir_for(dir.path()).unwrap();
+        assert_eq!(path, dir.path().canonicalize().unwrap().join(".git/sem"));
     }
 }
