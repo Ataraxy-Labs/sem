@@ -504,7 +504,7 @@ async function checkRemovedMemberClosure(removed, cwd) {
 
 const tools = new Map([
   ["sem_plan", {
-    description: "One bounded structural planning query. Exact names are resolved and their full entities are read internally; regex patterns return matching source lines. No handles are exposed or required.",
+    description: "Read-only resolve + context query. Use instead of grep/read when you need source symbols, definitions, callers, dependencies, impact, or bounded implementation context. Do not use for raw string/comment search, generated artifacts, datasets, environment setup, or files reported in unindexed_files; use native tools there. Returns a pinned repository revision and explicit structural coverage gaps for a separate write call.",
     schema: object({
       entity_names: { type: "array", items: { type: "string" }, maxItems: 12, description: "Exact or likely function/class/method names. Unqualified names are allowed and may return several definitions." },
       regex_patterns: { type: "array", items: { type: "string" }, maxItems: 6, description: "Source regexes for concepts whose entity name is unknown. Matching lines are automatically expanded to their enclosing entities." },
@@ -945,10 +945,49 @@ const tools = new Map([
       planCalls++;
       planRecoveryAvailable = coverage.recovery_allowed && planCalls < 2 && (names.length > 0 || patterns.length > 0);
       expectedRevision = await workspaceRevision(cwd);
+      const searchedFiles = [...new Set([
+        ...(searchPath ? [searchPath] : []),
+        ...matchedFiles.keys(),
+        ...nameCandidates.flatMap((candidate) => candidate.ranked.map((hit) => hit.file)),
+        ...definitions.map((definition) => definition.file),
+      ])].sort();
+      const structuralCoverage = await Promise.all(searchedFiles.map(async (file) => {
+        try {
+          const outline = await api.outline(file);
+          return { file, indexed: (outline.entities?.length ?? 0) > 0, entities: outline.entities?.length ?? 0 };
+        } catch {
+          return { file, indexed: false, entities: 0 };
+        }
+      }));
+      const indexedFiles = structuralCoverage.filter((item) => item.indexed).map((item) => item.file);
+      const unindexedFiles = structuralCoverage.filter((item) => !item.indexed).map((item) => item.file);
       return {
-        protocol: "sem-transaction/1",
+        protocol: "sem-transaction/2",
         revision: expectedRevision,
+        authority: {
+          mode: "read_only",
+          mutation_allowed: false,
+          write_tool: "weave_transaction",
+          write_requires_revision_digest: true,
+        },
+        applicability: {
+          use_for: ["source symbols", "definitions", "callers and dependencies", "impact", "bounded implementation context"],
+          do_not_use_for: ["raw string or comment search", "generated artifacts", "datasets", "environment setup", "unindexed files"],
+        },
         coverage,
+        structural_file_coverage: {
+          scope: searchPath ?? ".",
+          searched_files: searchedFiles.length,
+          indexed_files: indexedFiles,
+          unindexed_files: unindexedFiles,
+          fallback: unindexedFiles.length > 0 ? "use native grep/read only for unindexed_files" : null,
+        },
+        fallbacks_used: unindexedFiles.length > 0 ? [{
+          from: "structural_index",
+          to: "native grep/read",
+          scope: unindexedFiles,
+          reason: "no structural coverage",
+        }] : [],
         repository,
         definitions,
         resolutions: nameCandidates.map(({ name, expectedParent, ranked, error }) => ({
@@ -988,18 +1027,22 @@ const tools = new Map([
     },
   }],
   ["weave_transaction", {
-    description: "Apply all entity edits as one atomic Weave batch, then run one focused repository check. Submit complete replacement entities returned from sem_plan.",
+    description: "Separate revision-pinned write. Use only after sem_plan for source files with structural coverage. Do not use for environment setup, datasets, generated artifacts, or unindexed files. Apply entity edits atomically, run one focused repository check, and return every fallback used. Submit the exact revision digest and complete replacement entities returned from sem_plan.",
     schema: object({
+      revision_digest: { type: "string", minLength: 64, maxLength: 64, description: "Exact revision.digest returned by sem_plan (or revision_after from the preceding repair receipt)." },
       creates: { type: "array", items: create, maxItems: 10, description: "Complete contents for genuinely new files reported absent by sem_plan." },
       imports: { type: "array", items: importEdit, maxItems: 20, description: "Imports for existing files. Use this instead of guessing exact text in file headers that sem_plan did not return." },
       remove_imports: { type: "array", items: importEdit, maxItems: 20, description: "Complete import statements or unique import-specifier lines to remove atomically from existing files." },
       edits: { type: "array", items: flexibleEdit, maxItems: 100, description: "Existing-file changes as entity edits, 1-based line ranges, or exact old/new text. Large plans are accepted whole, then committed in bounded file-affinity batches." },
       validation_cmd: { type: "string", description: "Optional focused repository test or typecheck command. Prefer the narrow target covering the edited code over the generic detected runner." },
-    }),
+    }, ["revision_digest"]),
     async run(params, cwd) {
       if (planCalls < 1) throw new Error("weave_transaction requires one successful sem_plan call first");
       if (transactionCalls >= 3) throw new Error("transaction protocol permits one implementation and at most two repairs");
       const observedRevision = await workspaceRevision(cwd);
+      if (!expectedRevision || params.revision_digest !== expectedRevision.digest) {
+        throw new Error(`write revision does not match the read-only plan; expected ${expectedRevision?.digest ?? "none"}, received ${params.revision_digest ?? "none"}`);
+      }
       if (!expectedRevision || observedRevision.digest !== expectedRevision.digest) {
         throw new Error(`workspace changed outside the transaction protocol; re-plan required (expected ${expectedRevision?.digest ?? "none"}, observed ${observedRevision.digest})`);
       }
@@ -1125,7 +1168,7 @@ const tools = new Map([
             }
             expectedRevision = await workspaceRevision(cwd);
             return {
-              protocol: "sem-transaction/1",
+              protocol: "sem-transaction/2",
               receipt: {
                 revision_before: observedRevision,
                 revision_after: expectedRevision,
@@ -1226,7 +1269,7 @@ const tools = new Map([
       const revisionBefore = observedRevision;
       expectedRevision = await workspaceRevision(cwd);
       return {
-        protocol: "sem-transaction/1",
+        protocol: "sem-transaction/2",
         receipt: {
           revision_before: revisionBefore,
           revision_after: expectedRevision,
@@ -1242,6 +1285,11 @@ const tools = new Map([
         closure,
         edit: outcome.details ?? outcome,
         check,
+        fallbacks_used: check?.requested_cmd_rejected ? [{
+          from: "requested validation command",
+          to: "detected repository validation",
+          reason: check.requested_cmd_error ?? "requested command was not allowed",
+        }] : [],
         timings_ms: {
           normalize: Math.round(normalizedAt - started),
           create: Math.round(createdAt - normalizedAt),

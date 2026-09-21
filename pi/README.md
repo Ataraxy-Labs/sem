@@ -133,6 +133,12 @@ The bundled config exposes exactly `sem_plan` and `weave_transaction` through
 agent to edit, changing the extension/config paths to absolute paths when the
 `sem` checkout lives elsewhere.
 
+Protocol v2 keeps authority split across those calls: `sem_plan` is a read-only
+resolve + context operation that returns the pinned revision and any searched
+files without structural coverage. `weave_transaction` is the separate write
+operation and requires that exact revision digest; drift or a guessed digest is
+refused before mutation.
+
 For general workloads that mix source edits with environment setup, generated
 artifacts, or data operations, use `config/adaptive-transaction.mjs` instead.
 It keeps `bash` and `write` available and routes from `sem_plan.coverage`:
