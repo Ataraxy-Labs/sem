@@ -6,12 +6,28 @@ pub(crate) mod review_protocol;
 pub mod server;
 pub mod tools;
 mod transport;
+#[cfg(unix)]
+mod shared;
 pub mod watch;
 
 use rmcp::ServiceExt;
 
 /// Run the MCP server on stdin/stdout. Blocks until the client disconnects.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        return shared::run();
+    }
+
+    #[cfg(not(unix))]
+    run_stdio()
+}
+
+/// Run a standalone MCP server on stdin/stdout.
+///
+/// This remains the fallback when repository discovery or the shared daemon
+/// is unavailable, and is intentionally public for embedders.
+pub fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         tracing_subscriber::fmt()
