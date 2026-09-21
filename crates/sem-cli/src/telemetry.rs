@@ -7,12 +7,15 @@
 //!   • `off` — nothing is recorded.
 //!
 //! Records only the command name, CLI version, and OS — never repo names,
-//! paths, file contents, or any identifier (there is no install ID). Switch
+//! paths, or file contents. Uploads carry an install id that is rederived every
+//! day (`hash(local seed + day number)`), so a batch can be grouped with the
+//! rest of that machine's day and with nothing before or after it. The seed
+//! never leaves the machine and the id cannot be linked across days. Switch
 //! modes with `sem telemetry on|local|off`. `SEM_NO_TELEMETRY=1`,
 //! `DO_NOT_TRACK=1`, or `SEM_NO_NETWORK=1` force the safe behavior regardless.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -67,6 +70,10 @@ struct TelemetryState {
     last_flush: u64,
     #[serde(default)]
     last_flush_attempt: u64,
+    /// Random, machine-local seed for the rotating install id. Never uploaded
+    /// itself — only `hash(seed + day)` is, and only in `on` mode.
+    #[serde(default)]
+    install_seed: Option<String>,
 }
 
 /// `SEM_NO_TELEMETRY` / `DO_NOT_TRACK` hard-disable recording. Dev builds never
@@ -129,6 +136,63 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Seconds in a day — the rotation period for the install id.
+const DAY_SECS: u64 = 86_400;
+
+/// A random, machine-local seed. Prefers the OS entropy source; falls back to
+/// process-specific values that differ between machines and runs.
+fn generate_seed() -> String {
+    // Exactly 16 bytes — `/dev/urandom` never reaches EOF, so reading the whole
+    // "file" would never return.
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        let mut buf = [0u8; 16];
+        if f.read_exact(&mut buf).is_ok() {
+            return buf.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&std::process::id(), &mut h);
+    std::hash::Hash::hash(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        &mut h,
+    );
+    std::hash::Hash::hash(&std::env::current_exe().ok(), &mut h);
+    let a = std::hash::Hasher::finish(&h);
+    std::hash::Hash::hash(&a, &mut h);
+    format!("{a:016x}{:016x}", std::hash::Hasher::finish(&h))
+}
+
+/// 128 bits of `hash(seed + day)`, as 32 hex chars. `DefaultHasher::new()` is
+/// keyed with zeros (unlike `RandomState`), so the same seed and day give the
+/// same id in every process — and a different one tomorrow.
+fn install_id_for_day(seed: &str, day: u64) -> String {
+    let half = |salt: u8| -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&salt, &mut h);
+        std::hash::Hash::hash(seed, &mut h);
+        std::hash::Hash::hash(&day, &mut h);
+        std::hash::Hasher::finish(&h)
+    };
+    format!("{:016x}{:016x}", half(0), half(1))
+}
+
+/// Today's install id, creating and persisting the seed on first use.
+fn current_install_id(state: &mut TelemetryState) -> String {
+    let seed = match state.install_seed.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            let s = generate_seed();
+            state.install_seed = Some(s.clone());
+            save_state(state);
+            s
+        }
+    };
+    install_id_for_day(&seed, now_secs() / DAY_SECS)
 }
 
 fn load_state() -> TelemetryState {
@@ -262,8 +326,11 @@ pub fn flush() {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(FLUSH_TIMEOUT_SECS))
         .build();
-    // No install ID — just the anonymous event batch.
-    let body = serde_json::json!({ "events": events });
+    // Rotating daily install id: lets the server count active machines per day
+    // without being able to follow one across days.
+    let mut id_state = load_state();
+    let install_id = current_install_id(&mut id_state);
+    let body = serde_json::json!({ "installId": install_id, "events": events });
 
     let sent = agent
         .post(&format!("{endpoint}/v1/telemetry"))
@@ -371,8 +438,57 @@ pub fn preview() {
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS
     );
+    if mode == Mode::On {
+        let mut s = state;
+        println!(
+            "  batch install id for today: {}",
+            current_install_id(&mut s)
+        );
+    }
     println!(
         "{}",
-        "No repo names, paths, file contents, or identifiers are ever included.".dimmed()
+        "No repo names, paths, or file contents are ever included. The install id is \
+         rederived daily from a seed that never leaves this machine, so batches cannot \
+         be linked across days."
+            .dimmed()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_id_is_stable_within_a_day_and_changes_the_next() {
+        let seed = "0123456789abcdef0123456789abcdef";
+        let day = 20_000_u64;
+        assert_eq!(install_id_for_day(seed, day), install_id_for_day(seed, day));
+        assert_ne!(
+            install_id_for_day(seed, day),
+            install_id_for_day(seed, day + 1)
+        );
+    }
+
+    #[test]
+    fn install_id_differs_between_machines() {
+        let day = 20_000_u64;
+        assert_ne!(
+            install_id_for_day("seed-a", day),
+            install_id_for_day("seed-b", day)
+        );
+    }
+
+    #[test]
+    fn install_id_does_not_leak_the_seed() {
+        let seed = "0123456789abcdef0123456789abcdef";
+        let id = install_id_for_day(seed, 20_000);
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!id.contains(seed));
+    }
+
+    #[test]
+    fn generated_seeds_are_unique() {
+        assert_ne!(generate_seed(), generate_seed());
+    }
 }
