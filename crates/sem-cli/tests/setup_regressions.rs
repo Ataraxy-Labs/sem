@@ -307,3 +307,35 @@ fn setup_and_unsetup_use_git_path_for_linked_worktree_hooks() {
         "unsetup from linked worktree should remove the real hook"
     );
 }
+
+/// `sem setup` changes global git config first, then installs hooks. If a hook
+/// step fails, the machine is half-configured — so setup must say so and exit
+/// non-zero instead of printing "sem is wired in".
+#[test]
+fn setup_reports_incomplete_when_claude_settings_cannot_be_parsed() {
+    let env = IsolatedEnv::new("setup-incomplete");
+    let repo = env.home.join("repo");
+    init_repo(&repo, &env);
+
+    let claude = env.home.join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(claude.join("settings.json"), "{ not json").unwrap();
+
+    let mut command = Command::new(sem_bin());
+    command.arg("setup").current_dir(&repo);
+    env.apply(&mut command);
+    let output = assert_failure(
+        command.output().unwrap(),
+        "sem setup with an unparseable settings.json",
+    );
+
+    let text = output_text(&output);
+    assert!(text.contains("setup incomplete"), "{text}");
+    assert!(!text.contains("sem is wired in"), "{text}");
+    // What did apply is still reported, so nobody has to guess what changed.
+    assert!(text.contains("entity-level git diff"), "{text}");
+    assert!(
+        env.wrapper_path().exists(),
+        "the git diff wrapper should still be installed\n{text}"
+    );
+}
