@@ -4,13 +4,25 @@ pub mod cloud;
 pub mod render;
 pub(crate) mod review_protocol;
 pub mod server;
-pub mod tools;
-mod transport;
 #[cfg(unix)]
 mod shared;
+pub mod tools;
+mod transport;
 pub mod watch;
 
 use rmcp::ServiceExt;
+
+/// Check repository daemon availability without starting one.
+pub fn shared_status() -> serde_json::Value {
+    #[cfg(unix)]
+    {
+        shared::status()
+    }
+    #[cfg(not(unix))]
+    {
+        serde_json::json!({"status": "unsupported", "transport": "stdio"})
+    }
+}
 
 /// Run the MCP server on stdin/stdout. Blocks until the client disconnects.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
