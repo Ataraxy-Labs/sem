@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/bridge/**/*.test.ts' 'test/tools/**/*.test.ts' 'test/codemode/**/*.test.ts' 'test/laws/**/*.test.ts' 'test/transaction/**/*.test.ts'",
     "test:scripts": "node --test 'test/scripts/**/*.test.ts'",
+    "route": "node --experimental-strip-types scripts/route-session.mjs",
     "verify:pin": "node scripts/verify-pin.mjs"
   },
   "devDependencies": {

@@ -132,6 +132,27 @@ The bundled config exposes exactly `sem_plan` and `weave_transaction` through
 `src/transaction/server.mjs`. Run the command from the repository you want the
 agent to edit, changing the extension/config paths to absolute paths when the
 `sem` checkout lives elsewhere.
+
+For general workloads that mix source edits with environment setup, generated
+artifacts, or data operations, use `config/adaptive-transaction.mjs` instead.
+It keeps `bash` and `write` available and routes from `sem_plan.coverage`:
+complete plans use structural transactions, partial plans use hybrid mode, and
+empty plans explicitly fall back after one bounded recovery attempt. The strict
+`config/transaction.mjs` remains available for transaction-only evaluation.
+
+For agent hosts, route **before** starting the session so native tasks do not
+pay MCP or structural-prompt overhead. The versioned admission command accepts
+raw task text or a language-neutral JSON envelope on stdin and always emits a
+JSON decision. A routing error deliberately returns native mode:
+
+```bash
+printf '%s' '{"task":"Rename the API and update all callers across the repository","files":["src/api.ts","src/client.ts"],"index_warm":true}' \
+  | npm run --silent route
+```
+
+Attach `sem_plan` and `weave_transaction` only when
+`attach_structural_tools` is `true`; otherwise launch the agent with its native
+tools and no structural prompt. All adapters must honor `fallback: "native"`.
 - **`PI_SEM_CHECK_ALLOW`** -- extends pure mode's `sem.check({cmd})` allowlist
   beyond the auto-detected runners (`npm`/`yarn`/`pnpm`/`bun`, `cargo
   test`/`build`/`check`/`clippy`, `pytest`, `go test`/`build`/`vet`, `make

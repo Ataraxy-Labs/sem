@@ -2124,7 +2124,7 @@ async function history(entityName: string, opts: { limit?: number }, deps: SemAp
 // report only the failure -- not the full scrollback.
 
 export interface CheckRunner {
-  kind: "declared" | "cargo" | "npm" | "pytest" | "go";
+  kind: "declared" | "cargo" | "npm" | "pytest" | "go" | "maven" | "gradle" | "dotnet" | "ruby" | "composer" | "swift" | "make";
   typecheckCmd?: string[];
   testCmd?: string[];
 }
@@ -2257,6 +2257,37 @@ export async function detectRunner(cwd: string): Promise<CheckRunner | null> {
   if (existsSync(resolve(cwd, "go.mod"))) {
     return { kind: "go", typecheckCmd: ["go", "build", "./..."], testCmd: ["go", "test", "./..."] };
   }
+  if (existsSync(resolve(cwd, "pom.xml"))) {
+    return { kind: "maven", typecheckCmd: ["mvn", "-q", "-DskipTests", "compile"], testCmd: ["mvn", "-q", "test"] };
+  }
+  if (existsSync(resolve(cwd, "gradlew")) || existsSync(resolve(cwd, "build.gradle")) || existsSync(resolve(cwd, "build.gradle.kts"))) {
+    const gradle = existsSync(resolve(cwd, "gradlew")) ? "./gradlew" : "gradle";
+    return { kind: "gradle", typecheckCmd: [gradle, "classes"], testCmd: [gradle, "test"] };
+  }
+  const rootEntries = (() => { try { return readdirSync(cwd); } catch { return []; } })();
+  if (rootEntries.some((name) => name.endsWith(".sln") || name.endsWith(".csproj"))) {
+    return { kind: "dotnet", typecheckCmd: ["dotnet", "build", "--no-restore"], testCmd: ["dotnet", "test", "--no-build"] };
+  }
+  if (existsSync(resolve(cwd, "Package.swift"))) {
+    return { kind: "swift", typecheckCmd: ["swift", "build"], testCmd: ["swift", "test"] };
+  }
+  if (existsSync(resolve(cwd, "composer.json"))) {
+    try {
+      const composer = JSON.parse(await readFile(resolve(cwd, "composer.json"), "utf8")) as { scripts?: Record<string, unknown> };
+      if (composer.scripts && Object.hasOwn(composer.scripts, "test")) {
+        return { kind: "composer", testCmd: ["composer", "test"] };
+      }
+    } catch { /* malformed manifest degrades to later detectors */ }
+  }
+  if (existsSync(resolve(cwd, ".rspec"))) {
+    return { kind: "ruby", testCmd: ["bundle", "exec", "rspec"] };
+  }
+  if (existsSync(resolve(cwd, "Rakefile"))) {
+    const rakefile = readFileSync(resolve(cwd, "Rakefile"), "utf8");
+    if (/^\s*(?:task\s+[:\"']test|test\s*:)/m.test(rakefile)) {
+      return { kind: "ruby", testCmd: ["bundle", "exec", "rake", "test"] };
+    }
+  }
   if (existsSync(resolve(cwd, "package.json"))) {
     let scripts: Record<string, string> = {};
     try {
@@ -2272,6 +2303,10 @@ export async function detectRunner(cwd: string): Promise<CheckRunner | null> {
   }
   if (existsSync(resolve(cwd, "pytest.ini")) || existsSync(resolve(cwd, "pyproject.toml")) || existsSync(resolve(cwd, "setup.cfg"))) {
     return { kind: "pytest", testCmd: ["pytest", "-q"] };
+  }
+  if (existsSync(resolve(cwd, "Makefile"))) {
+    const makefile = readFileSync(resolve(cwd, "Makefile"), "utf8");
+    if (/^test\s*:/m.test(makefile)) return { kind: "make", testCmd: ["make", "test"] };
   }
   return null;
 }
@@ -2373,6 +2408,27 @@ function detectCheckAllowlist(cwd: string): CheckAllowEntry[] {
   if (existsSync(resolve(cwd, "go.mod"))) {
     for (const sub of ["test", "build", "vet"]) entries.push({ tokens: ["go", sub] });
   }
+  if (existsSync(resolve(cwd, "pom.xml"))) {
+    for (const command of [
+      ["mvn", "test"],
+      ["mvn", "compile"],
+      ["mvn", "-q", "test"],
+      ["mvn", "-q", "-DskipTests", "compile"],
+    ]) entries.push({ tokens: command });
+  }
+  if (existsSync(resolve(cwd, "gradlew")) || existsSync(resolve(cwd, "build.gradle")) || existsSync(resolve(cwd, "build.gradle.kts"))) {
+    for (const runner of ["./gradlew", "gradle"]) entries.push({ tokens: [runner], minLength: 2 });
+  }
+  const rootEntries = (() => { try { return readdirSync(cwd); } catch { return []; } })();
+  if (rootEntries.some((name) => name.endsWith(".sln") || name.endsWith(".csproj"))) {
+    for (const sub of ["build", "test"]) entries.push({ tokens: ["dotnet", sub] });
+  }
+  if (existsSync(resolve(cwd, "Package.swift"))) {
+    for (const sub of ["build", "test"]) entries.push({ tokens: ["swift", sub] });
+  }
+  if (existsSync(resolve(cwd, "composer.json"))) entries.push({ tokens: ["composer", "test"] });
+  if (existsSync(resolve(cwd, ".rspec"))) entries.push({ tokens: ["bundle", "exec", "rspec"] });
+  if (existsSync(resolve(cwd, "Rakefile"))) entries.push({ tokens: ["bundle", "exec", "rake"], minLength: 4 });
   if (existsSync(resolve(cwd, "Makefile"))) {
     entries.push({ tokens: ["make"], minLength: 2 });
   }
