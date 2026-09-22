@@ -45,6 +45,29 @@ fn javascript_typescript_interop_is_preserved() {
         .any(|e| e.name == "hello" && e.file_path == "greeter.js"));
 }
 
+#[test]
+fn explicit_this_calls_use_the_owning_class() {
+    let g = graph(&[
+        (
+            "greeter.dart",
+            "class Greeter {\n void hello() {}\n void run() { this.hello(); }\n}\n",
+        ),
+        (
+            "greeter.ts",
+            "export class Greeter {\n hello() {}\n run() { this.hello(); }\n}\n",
+        ),
+    ]);
+    for file in ["greeter.dart", "greeter.ts"] {
+        let deps = g.get_dependencies(&id(&g, file, "run"));
+        assert!(
+            deps.iter()
+                .any(|e| e.name == "hello" && e.file_path == file),
+            "{file}: {deps:?}"
+        );
+        assert!(deps.iter().all(|e| e.file_path == file), "{file}: {deps:?}");
+    }
+}
+
 fn id(g: &EntityGraph, file: &str, name: &str) -> String {
     g.entities
         .values()

@@ -10378,8 +10378,16 @@ fn resolve_ref(
                         {
                             rec.one(Table::ClassMembers, class_name);
                             if let Some(members) = class_members.get(class_name) {
-                                match select_member_profiled!(
+                                let members = visible_members(
                                     members,
+                                    method,
+                                    scopes[idx].owner_id.as_deref(),
+                                    file_path,
+                                    entity_map,
+                                    rec,
+                                );
+                                match select_member_profiled!(
+                                    &members,
                                     method,
                                     argument_labels.as_deref(),
                                     swift_call_signatures,
