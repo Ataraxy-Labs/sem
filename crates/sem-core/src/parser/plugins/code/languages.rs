@@ -2443,11 +2443,14 @@ static SCALA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 static DART_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     class_scope_nodes: &["class_declaration", "mixin_declaration", "enum_declaration"],
     impl_scope_nodes: &[],
-    function_scope_nodes: &["function_signature", "method_signature"],
+    function_scope_nodes: &["function_declaration", "method_declaration"],
     class_name_field: ClassNameField::Simple("name"),
 
-    assignment_rules: &[],
-    assignment_recurse_into: &[],
+    assignment_rules: &[AssignmentRule {
+        node_kind: "local_variable_declaration",
+        strategy: AssignmentStrategy::Declarators,
+    }],
+    assignment_recurse_into: &["function_body", "block"],
 
     param_rules: &[ParamRule {
         node_kind: "formal_parameter",
@@ -2458,12 +2461,16 @@ static DART_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     return_type_field: None,
 
-    call_nodes: &["function_expression_body"],
+    call_nodes: &["call_expression"],
     call_style: CallNodeStyle::FunctionField("function"),
-    new_expr_nodes: &[],
-    new_expr_type_field: "constructor",
+    new_expr_nodes: &["new_expression", "const_object_expression"],
+    new_expr_type_field: "type",
     composite_literal_nodes: &[],
-    member_access: &[],
+    member_access: &[MemberAccess {
+        node_kind: "member_expression",
+        object_field: "object",
+        property_field: "property",
+    }],
     scoped_call_nodes: &[],
 
     self_keywords: &["this"],

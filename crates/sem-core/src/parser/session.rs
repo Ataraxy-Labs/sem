@@ -2624,22 +2624,10 @@ mod tests {
         }
     }
 
-    // --- Dart (kept RED; the fixture proves *why*, not just that it's slow)
-
-    /// Ordinary, idiomatic Dart -- block-bodied top-level functions calling
-    /// each other by name across files -- produces **zero** `Calls` edges.
-    /// `DART_SCOPE_CONFIG` (one of the "Tier 2 Minimal" configs) sets
-    /// `call_nodes: &["function_expression_body"]`, which is an arrow-body
-    /// node kind (`() => expr`), not a call-expression kind at all;
-    /// `collect_all_file_refs`'s call-node branch never fires for a
-    /// statement-body call like `return ping();`. This is a real
-    /// entity/ref-extraction gap in Dart specifically (not a scope-
-    /// resolution eligibility question), out of this change's scope to fix.
-    /// Proven here rather than assumed: if this ever starts producing edges
-    /// (e.g. `collect_all_file_refs` gains real call-expression support for
-    /// Dart), this test will fail loudly and say so.
+    // Dart remains conservatively RED for incremental resolution reuse.
+    // Its ordinary call expressions must nevertheless produce real edges.
     #[test]
-    fn dart_ordinary_calls_are_not_collected_as_refs() {
+    fn dart_ordinary_calls_are_collected_as_refs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         write(
@@ -2661,12 +2649,11 @@ mod tests {
             .filter(|e| e.ref_type == RefType::Calls)
             .collect();
         assert!(
-            call_edges.is_empty(),
-            "expected zero Calls edges for ordinary block-bodied Dart calls \
-             (DART_SCOPE_CONFIG's call_nodes only matches arrow bodies) -- \
-             found {call_edges:?}. If this now fails, Dart's ref extraction \
-             gained real call-expression support and the RED verdict here \
-             needs revisiting."
+            call_edges
+                .iter()
+                .any(|e| e.from_entity.as_str() == "mid.dart::function::run"
+                    && e.to_entity.as_str() == "hub.dart::function::ping"),
+            "missing ordinary Dart call: {call_edges:?}"
         );
     }
 
