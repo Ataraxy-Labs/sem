@@ -4790,7 +4790,8 @@ fn scope_visit_node(
         let is_function_like = config.function_scope_nodes.contains(&kind);
 
         if is_function_like {
-            let func_name = node
+            let signature = function_signature_node(node);
+            let func_name = signature
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("");
@@ -4863,7 +4864,7 @@ fn scope_visit_node(
             }
 
             scan_assignments(node, func_scope_idx, scopes, source, config);
-            scan_function_params(node, func_scope_idx, scopes, source, config);
+            scan_function_params(signature, func_scope_idx, scopes, source, config);
 
             if config.external_method && kind == "method_declaration" {
                 if let Some(receiver) = node.child_by_field_name("receiver") {
@@ -4976,6 +4977,17 @@ fn fused_scope_refs_import_walk(
         worklist[start..].reverse();
     }
     (refs.into_refs(), import_starts, saw_call_node)
+}
+
+/// Dart wraps the callable name and parameters in a signature, but the
+/// declaration (including its body) must own the scope and local bindings.
+fn function_signature_node(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let signature = node.child_by_field_name("signature").unwrap_or(node);
+    if signature.kind() == "method_signature" {
+        signature.named_child(0).unwrap_or(signature)
+    } else {
+        signature
+    }
 }
 
 /// Scan for variable assignments and record type bindings.
@@ -5127,7 +5139,7 @@ fn scan_function_params(
                 for ch in child.named_children(&mut tc) {
                     if matches!(
                         ch.kind(),
-                        "user_type" | "type_annotation" | "type_identifier"
+                        "user_type" | "type_annotation" | "type_identifier" | "type"
                     ) {
                         type_node = Some(ch);
                         break;
@@ -5208,7 +5220,10 @@ fn scan_ts_var_declaration(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "variable_declarator" {
+        if matches!(
+            child.kind(),
+            "variable_declarator" | "initialized_variable_definition"
+        ) {
             let var_name = child
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
@@ -5773,8 +5788,13 @@ fn record_type_from_rhs(
             }
         }
         // TS: new Foo()
-        "new_expression" => {
-            if let Some(constructor) = rhs.child_by_field_name("constructor") {
+        "new_expression" | "const_object_expression" => {
+            // Dart's optional `constructor` field is the named constructor,
+            // not the class. Its `type` field must take precedence.
+            if let Some(constructor) = rhs
+                .child_by_field_name("type")
+                .or_else(|| rhs.child_by_field_name("constructor"))
+            {
                 let name = constructor.utf8_text(source).unwrap_or("");
                 if !name.is_empty() {
                     scopes[scope_idx]
@@ -10236,7 +10256,15 @@ fn resolve_ref(
                         .map(|id| canonical_entity_id(entity_map, id))
                         .or_else(|| {
                             if is_constructor || allow_cross_file_calls {
-                                target_ids.first().cloned()
+                                target_ids
+                                    .iter()
+                                    .find(|id| {
+                                        rec.one(Table::EntityMap, *id);
+                                        entity_map.get(*id).is_some_and(|e| {
+                                            same_language_family(file_path, &e.file_path)
+                                        })
+                                    })
+                                    .cloned()
                             } else {
                                 None
                             }
@@ -10486,8 +10514,33 @@ fn resolve_ref(
             if let Some(class_name) = receiver_type {
                 rec.one(Table::ClassMembers, class_name.as_str());
                 if let Some(members) = class_members.get(class_name.as_str()) {
-                    match select_member_profiled!(
+                    // Class names are not globally unique. Prefer the actual
+                    // imported/local owner, and never select a same-named
+                    // method from an unrelated language's class bucket.
+                    let owner = import_table_by_name
+                        .get(class_name.as_str())
+                        .map(|id| EntityId::from(*id))
+                        .or_else(|| {
+                            match lookup_scope_chain_respecting_shadows_cached(
+                                scope_idx,
+                                scopes,
+                                &class_name,
+                                lookup_cache,
+                            ) {
+                                ScopeChainLookup::Defined(id) => Some(id),
+                                _ => None,
+                            }
+                        });
+                    let members = visible_members(
                         members,
+                        method,
+                        owner.as_deref(),
+                        file_path,
+                        entity_map,
+                        rec,
+                    );
+                    match select_member_profiled!(
+                        &members,
                         method,
                         argument_labels.as_deref(),
                         swift_call_signatures,
@@ -10515,8 +10568,11 @@ fn resolve_ref(
             {
                 rec.one(Table::ClassMembers, receiver);
                 if let Some(members) = class_members.get(receiver) {
+                    let owner = import_table_by_name.get(receiver).copied();
+                    let members =
+                        visible_members(members, method, owner, file_path, entity_map, rec);
                     if let SwiftOverloadSelection::Matched(mid) = select_member_profiled!(
-                        members,
+                        &members,
                         method,
                         argument_labels.as_deref(),
                         swift_call_signatures,
@@ -10842,6 +10898,57 @@ fn lookup_owned_scope_member(scopes: &[Scope], owner_id: &str, member: &str) -> 
         .iter()
         .find(|scope| scope.owner_id.as_deref() == Some(owner_id))
         .and_then(|scope| scope.defs.get(member).cloned())
+}
+
+fn same_language_family(left: &str, right: &str) -> bool {
+    if is_js_ts_file(left) && is_js_ts_file(right) {
+        return true;
+    }
+    let language = |path: &str| {
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(|ext| get_language_config(&format!(".{ext}")))
+            .map(|config| config.id)
+    };
+    matches!((language(left), language(right)), (Some(a), Some(b))
+        if a == b || (matches!(a, "c" | "cpp") && matches!(b, "c" | "cpp")))
+}
+
+fn visible_members(
+    members: &[MemberTarget],
+    method: &str,
+    owner: Option<&str>,
+    file: &str,
+    entities: &EntityInfoMap,
+    rec: &mut Recorder,
+) -> Vec<MemberTarget> {
+    let compatible: Vec<_> = members
+        .iter()
+        .filter(|(_, id)| {
+            rec.one(Table::EntityMap, id);
+            entities
+                .get(id)
+                .is_some_and(|e| same_language_family(file, &e.file_path))
+        })
+        .cloned()
+        .collect();
+    if let Some(owner) = owner {
+        let owned: Vec<_> = compatible
+            .iter()
+            .filter(|(name, id)| {
+                name == method
+                    && entities
+                        .get(id)
+                        .is_some_and(|e| e.parent_id.as_deref() == Some(owner))
+            })
+            .cloned()
+            .collect();
+        if !owned.is_empty() {
+            return owned;
+        }
+    }
+    compatible
 }
 
 fn lookup_entity_member(

@@ -205,7 +205,10 @@ macro_rules! maybe_par_iter {
 /// the coarse-but-correct fix: it clean-misses the whole corpus (code-plugin
 /// entries included, even though their producer didn't change) rather than
 /// inventing a new per-non-code-plugin salt table for a one-time fix.
-pub const FACTS_SCHEMA_VERSION: u32 = 4;
+/// 4 -> 5: Dart call/scope extraction and language/owner-aware member
+/// resolution changed. Invalidate persisted edges and query indexes even
+/// when source bytes and the development package version are unchanged.
+pub const FACTS_SCHEMA_VERSION: u32 = 5;
 
 const MAGIC: &[u8; 8] = b"SEMFACT1";
 
