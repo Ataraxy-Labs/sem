@@ -73,9 +73,10 @@ fn dart_constructor_and_member_edges() {
 
 #[test]
 fn dart_explicit_new_and_const_constructor_edges() {
+    let greeter = GREETER.replace("class Greeter {", "class Greeter {\n const Greeter();");
     for expression in ["new Greeter()", "const Greeter()"] {
         let source = APP.replace("Greeter()", expression);
-        let g = graph(&[("greeter.dart", GREETER), ("app.dart", &source)]);
+        let g = graph(&[("greeter.dart", &greeter), ("app.dart", &source)]);
         let deps = g.get_dependencies(&id(&g, "app.dart", "run"));
         assert!(
             deps.iter().any(|e| e.name == "Greeter"),
