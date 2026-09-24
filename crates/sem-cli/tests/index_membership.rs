@@ -54,6 +54,84 @@ fn prime_index(repo: &Path, cache: &Path) {
     );
 }
 
+#[test]
+fn find_repairs_renames_and_added_duplicates_without_refresh() {
+    let repo = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    fs::write(repo.path().join("a.ts"), "export function original() {}\n").unwrap();
+    fs::write(repo.path().join("b.ts"), "export function existing() {}\n").unwrap();
+    prime_index(repo.path(), cache.path());
+    fs::write(repo.path().join("a.ts"),
+        "export function newlyRenamed() { return 123; }\nexport function existing() { return 456; }\n").unwrap();
+    for (query, expected) in [("newlyRenamed", 1), ("original", 0), ("existing", 2)] {
+        let out = assert_success(
+            sem(repo.path(), cache.path(), &["find", query, "--json"]),
+            query,
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            expected,
+            "{query}: {}",
+            output_text(&out)
+        );
+    }
+    // A second edit must also be visible; no eager graph refresh is involved.
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function finalNameAfterSecondEdit() {}\n",
+    )
+    .unwrap();
+    let out = assert_success(
+        sem(
+            repo.path(),
+            cache.path(),
+            &["find", "finalNameAfterSecondEdit", "--json"],
+        ),
+        "second edit",
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn find_repairs_existing_files_across_languages() {
+    for (file, before, after) in [
+        (
+            "a.py",
+            "def old_name():\n    return 1\n",
+            "def newly_added_name():\n    return 123\n",
+        ),
+        (
+            "a.rs",
+            "fn old_name() {}\n",
+            "fn newly_added_name() { let _x = 123; }\n",
+        ),
+    ] {
+        let repo = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        fs::write(repo.path().join(file), before).unwrap();
+        prime_index(repo.path(), cache.path());
+        fs::write(repo.path().join(file), after).unwrap();
+        let out = assert_success(
+            sem(
+                repo.path(),
+                cache.path(),
+                &["find", "newly_added_name", "--json"],
+            ),
+            file,
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            1,
+            "{file}: {}",
+            output_text(&out)
+        );
+        assert_eq!(rows[0]["file"], file);
+    }
+}
+
 /// Wait until `dir`'s mtime has visibly moved past `before` — the POSIX
 /// signal `Complete` freshness leans on: creating,
 /// deleting, or renaming a directory entry bumps the directory's own mtime.
