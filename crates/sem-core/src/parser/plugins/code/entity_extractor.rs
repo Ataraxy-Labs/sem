@@ -639,8 +639,18 @@ fn visit_node(
 
                     // Visit children for nested entities (methods inside classes, etc.)
                     let next_suppression = Some(node_type.to_string());
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
+                    // Python decorators wrap the definition, so its body is one
+                    // level deeper. Keep the wrapper's identity/source range,
+                    // but traverse the inner definition's containers. Visiting
+                    // the definition itself would emit the entity twice.
+                    let container_owner =
+                        if config.id == "python" && node_type == "decorated_definition" {
+                            node.child_by_field_name("definition").unwrap_or(node)
+                        } else {
+                            node
+                        };
+                    let mut cursor = container_owner.walk();
+                    for child in container_owner.named_children(&mut cursor) {
                         if config.container_node_types.contains(&child.kind()) {
                             let mut inner_cursor = child.walk();
                             let nested: Vec<_> = child.named_children(&mut inner_cursor).collect();
