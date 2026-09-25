@@ -4,9 +4,13 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **The strict and adaptive transaction policies are gone from pi, leaving the simple structural session policy as the only one.** `pi/config/transaction.mjs` and `pi/config/adaptive-transaction.mjs` are removed, and `config/simple-transaction.mjs` is now the documented configuration for `PI_SEM_MODE=transaction`.
+
 ### Added
 
-- **Opt-in simple structural session policy for agents.** `pi/config/simple-transaction.mjs` packages batched exact reads, acknowledged context reuse, scoped edit composition and snapshot-checked edits without fixed discovery/transaction call quotas. Includes regression tests and setup instructions; the existing default protocol is unchanged. This policy remains experimental, not a guarantee of faster sessions or semantic completeness.
+- **Opt-in simple structural session policy for agents.** `pi/config/simple-transaction.mjs` packages batched exact reads, acknowledged context reuse, scoped edit composition and snapshot-checked edits without fixed discovery/transaction call quotas. Includes regression tests and setup instructions. This policy remains experimental, not a guarantee of faster sessions or semantic completeness.
 
 ### Fixed
 

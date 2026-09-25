@@ -124,32 +124,26 @@ cd /path/to/sem/pi
 npm install
 cd /path/to/project
 PI_SEM_MODE=transaction \
-PI_SEM_CONFIG="/path/to/sem/pi/config/transaction.mjs" \
+PI_SEM_CONFIG="/path/to/sem/pi/config/simple-transaction.mjs" \
 /path/to/sem/pi/node_modules/.bin/pi -e /path/to/sem/pi
 ```
 
-The bundled config exposes exactly `sem_plan` and `weave_transaction` through
-`src/transaction/server.mjs`. Run the command from the repository you want the
-agent to edit, changing the extension/config paths to absolute paths when the
-`sem` checkout lives elsewhere.
+The bundled config, `config/simple-transaction.mjs`, is the single structural
+session policy. It starts `src/transaction/simple/sem-session-simple-mcp.mjs` and
+exposes `sem_plan`, `sem_exact`, `weave_transaction` and `weave_program`. Run the
+command from the repository you want the agent to edit, changing the
+extension/config paths to absolute paths when the `sem` checkout lives elsewhere.
 
-Protocol v2 keeps authority split across those calls: `sem_plan` is a read-only
-resolve + context operation that returns the pinned revision and any searched
-files without structural coverage. `weave_transaction` is the separate write
-operation and requires that exact revision digest; drift or a guessed digest is
-refused before mutation.
+Authority stays split across those calls. `sem_plan` is a read-only resolve and
+context operation that returns the pinned revision and any searched files
+without structural coverage, and `sem_exact` serves batched exact reads.
+`weave_transaction` and `weave_program` are the write operations and require the
+exact revision digest, so drift or a guessed digest is refused before mutation.
 
-For general workloads that mix source edits with environment setup, generated
-artifacts, or data operations, use `config/adaptive-transaction.mjs` instead.
-
-For the experimental, quota-free session policy tested on larger changes, use
-`config/simple-transaction.mjs` with `PI_SEM_MODE=transaction`. It adds batched
-exact reads and snapshot-ID edits without changing this default server.
-See [setup, tests, evidence and limitations](src/transaction/simple/README.md).
-It keeps `bash` and `write` available and routes from `sem_plan.coverage`:
-complete plans use structural transactions, partial plans use hybrid mode, and
-empty plans explicitly fall back after one bounded recovery attempt. The strict
-`config/transaction.mjs` remains available for transaction-only evaluation.
+The policy keeps `bash` and `write` available and routes from
+`sem_plan.coverage`: complete plans use structural transactions, partial plans
+use hybrid mode, and empty plans explicitly fall back after one bounded recovery
+attempt. See [setup, tests, evidence and limitations](src/transaction/simple/README.md).
 
 For agent hosts, route **before** starting the session so native tasks do not
 pay MCP or structural-prompt overhead. The versioned admission command accepts
