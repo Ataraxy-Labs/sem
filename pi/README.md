@@ -141,6 +141,11 @@ refused before mutation.
 
 For general workloads that mix source edits with environment setup, generated
 artifacts, or data operations, use `config/adaptive-transaction.mjs` instead.
+
+For the experimental, quota-free session policy tested on larger changes, use
+`config/simple-transaction.mjs` with `PI_SEM_MODE=transaction`. It adds batched
+exact reads and snapshot-ID edits without changing this default server.
+See [setup, tests, evidence and limitations](src/transaction/simple/README.md).
 It keeps `bash` and `write` available and routes from `sem_plan.coverage`:
 complete plans use structural transactions, partial plans use hybrid mode, and
 empty plans explicitly fall back after one bounded recovery attempt. The strict
