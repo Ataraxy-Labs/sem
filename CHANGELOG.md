@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in simple structural session policy for agents.** `pi/config/simple-transaction.mjs` packages batched exact reads, acknowledged context reuse, scoped edit composition and snapshot-checked edits without fixed discovery/transaction call quotas. Includes regression tests and setup instructions; the existing default protocol is unchanged. This policy remains experimental, not a guarantee of faster sessions or semantic completeness.
+
 ### Fixed
 
 - **Indexed name lookup sees renames and added definitions in edited files.** `sem find` checks indexed file freshness and reparses changed files on demand, without requiring a whole dependency-graph refresh. Includes TypeScript, Python and Rust regression coverage.
