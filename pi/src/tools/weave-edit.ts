@@ -144,6 +144,8 @@ export interface WeaveEditDeps {
   /** Execute an atomic batch concurrently only when every edit targets a
    * distinct file. Same-file edits always preserve request order. */
   parallelDistinctFiles?: boolean;
+  /** Exact-read preconditions checked inside the file mutation queue. */
+  snapshotTargets?: ReadonlyMap<string, { sha256: string; start: number; end: number }>;
 }
 
 export interface WeaveEditOutcome {
@@ -835,8 +837,15 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
   try {
     await withFileMutationQueue(absPath, async () => {
       const currentContent = await readFile(absPath, "utf8");
+      const snapshotTarget = deps.snapshotTargets?.get(absPath);
+      if (snapshotTarget && createHash("sha256").update(currentContent).digest("hex") !== snapshotTarget.sha256) {
+        throw new Error("STALE_SNAPSHOT: file changed since exact read");
+      }
       const entitiesBefore = await extractEntities(semBin, absPath, cwd, signal);
-      const resolved = resolveEntity(entitiesBefore, params.entity);
+      const candidates = snapshotTarget
+        ? entitiesBefore.filter(e => e.start_byte === snapshotTarget.start && e.end_byte === snapshotTarget.end)
+        : entitiesBefore;
+      const resolved = resolveEntity(candidates, params.entity);
 
       if (resolved.kind !== "found") {
         queueOutcome = { kind: "resolution-failed", result: resolved };
