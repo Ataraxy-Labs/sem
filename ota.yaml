@@ -2,7 +2,7 @@ version: 1
 
 metadata:
   ota:
-    minimum_version: "1.6.27"
+    minimum_version: "1.6.28"
 
 project:
   name: sem
@@ -188,8 +188,7 @@ workflows:
       task: verify
     notes: |
       The non-blocking pressure workflow runs this selection natively on Ubuntu. Its Ota-owned Linux
-      container lane invokes the exact test and local-index:freshness tasks independently because
-      released Ota v1.6.27 does not apply a caller-selected mode to aggregate tasks. macOS, Windows,
+      container lane independently exercises the exact test and local-index:freshness tasks. macOS, Windows,
       cloud, MCP, setup hooks, packaging, and release remain outside this workflow's proof claim.
 
 agent:
@@ -216,7 +215,7 @@ agent:
       note: Install the exact released Ota version reviewed for this pressure lane.
       source:
         kind: version
-        version: v1.6.27
+        version: v1.6.28
   notes: |
     Use `ota tasks --safe --use` before selecting work. Sem owns code-intelligence correctness;
     Ota owns only the declared preparation, execution selection, revision fixture, and evidence

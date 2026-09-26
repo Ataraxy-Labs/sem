@@ -20,12 +20,12 @@ jobs:
       - name: Compare the bounded contract with repository CI
         id: drift
         continue-on-error: true
-        uses: ota-run/action@6bb5bf686df5a8385202c8c20b6f91c045e3c161 # v1.0.15
+        uses: ota-run/action@8001070c0c9e54ca2b729282df40d1a9f40c8a79 # v1.0.16
         with:
           command: doctor
           source: contract
           fail-on-error: false
-          fail-on-ci-drift: false
+          fail-on-ci-drift: true
           comment-pr: false
       - name: Preserve the drift-check outcome
         if: always()
@@ -45,7 +45,7 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Install contract-owned Ota
-        uses: ota-run/setup@cdb0b0aab3f559b5fb9f47d84925c32a5baee250
+        uses: ota-run/setup@493cba84bf7f7c11c9e8e996d832d93a89c62184 # v1.0.8
         with:
           source: contract
           contract-path: ota.yaml
@@ -84,7 +84,7 @@ jobs:
         shell: bash
         run: mkdir -p ota-pressure/container
       - name: Install contract-owned Ota
-        uses: ota-run/setup@cdb0b0aab3f559b5fb9f47d84925c32a5baee250
+        uses: ota-run/setup@493cba84bf7f7c11c9e8e996d832d93a89c62184 # v1.0.8
         with:
           source: contract
           contract-path: ota.yaml
