@@ -20,6 +20,10 @@ All notable changes to sem are documented in this file.
 - **Telemetry uploads are no longer rejected by the server.** 0.21.0 removed the install id from the upload payload while the ingest endpoint still required one, so every batch uploaded since then was refused and active-install counts only ever reflected 0.20.0 and older. Uploads now carry `hash(local seed + day number)`, where the seed is generated once, stays on the machine and is never sent, so a batch groups with the rest of that machine's day and with nothing before or after it. Telemetry is still local-by-default and opt-in, so this only changes the contents of an upload that someone enabled with `sem telemetry on`.
 - **`sem setup` no longer reports success when part of it failed.** It writes the global `diff.external` config first, then installs the Claude Code hook and the pre-commit hook, and those two steps used to treat a permissions or JSON failure as a warning before falling through to a closing message that listed all three features as live and returned success. An unparseable `~/.claude/settings.json` therefore left changed git config, no hook, and a final line reading "sem is wired in". The closing summary is now built from the steps that actually ran, and a failed step reports what did and did not apply before exiting 2. The successful path is unchanged. Thanks to kantorcodes1 on Reddit for the report.
 
+### Maintenance
+
+- Add a non-blocking Ota execution contract and isolated local-index freshness pressure lane.
+
 ## [0.25.0] - 2026-09-13
 
 ### Added
