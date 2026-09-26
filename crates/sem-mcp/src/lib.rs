@@ -4,14 +4,42 @@ pub mod cloud;
 pub mod render;
 pub(crate) mod review_protocol;
 pub mod server;
+#[cfg(unix)]
+mod shared;
 pub mod tools;
 mod transport;
 pub mod watch;
 
 use rmcp::ServiceExt;
 
+/// Check repository daemon availability without starting one.
+pub fn shared_status() -> serde_json::Value {
+    #[cfg(unix)]
+    {
+        shared::status()
+    }
+    #[cfg(not(unix))]
+    {
+        serde_json::json!({"status": "unsupported", "transport": "stdio"})
+    }
+}
+
 /// Run the MCP server on stdin/stdout. Blocks until the client disconnects.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        return shared::run();
+    }
+
+    #[cfg(not(unix))]
+    run_stdio()
+}
+
+/// Run a standalone MCP server on stdin/stdout.
+///
+/// This remains the fallback when repository discovery or the shared daemon
+/// is unavailable, and is intentionally public for embedders.
+pub fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         tracing_subscriber::fmt()

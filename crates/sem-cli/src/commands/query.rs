@@ -252,12 +252,10 @@ pub(crate) fn is_file_stale(idx: &QueryIndex, root: &Path, path: &str) -> bool {
 /// *corpus-shaped* index answer needs (: `sem impact --all/--tests`'
 /// transitive walk, `sem graph`'s whole-repo dump, `sem context`'s subgraph).
 ///
-/// The entity-scoped verbs (`find`/`callers`/`refs`/`impact --deps`) get away
-/// with proving only the files their own answer touches, because an edit
-/// anywhere else cannot change *their* answer. A transitive walk has no such
-/// boundary: an edit in a file the walk never visits can add an edge *into*
-/// the closure, so the only honest gate is the one the SQL path already
-/// used — the whole corpus, membership and content both.
+/// Name lookup must also inspect changed files that did not previously match:
+/// an edit can introduce a new name. It repairs definition rows locally rather
+/// than rebuilding topology. A transitive walk additionally needs fresh edges
+/// from the whole corpus, so its gate proves membership and content together.
 ///
 /// - membership: `index::complete_check` (`Complete` tier), which needs
 ///   `DIRS`; an image without it is refused outright rather than trusted,
@@ -367,6 +365,32 @@ fn index_answer_verified(
 ) -> Option<Answer> {
     let registry = super::create_registry(&opts.cwd);
     let mut defs = resolve_defs(idx, &opts.query, opts.file.as_deref());
+
+    if verb == Verb::Find {
+        use rayon::prelude::*;
+        // A rename or a new declaration in an existing file is absent from
+        // NAMES. Checking only files of existing hits silently misses it.
+        // Stat the indexed corpus, but parse only changed files: no topology
+        // rebuild or whole-graph serialization is needed for definitions.
+        let files = idx.all_file_paths();
+        let stale: Vec<_> = files
+            .par_iter()
+            .copied()
+            .filter(|path| opts.file.as_deref().is_none_or(|file| file == *path))
+            .filter(|path| file_is_stale(idx, root, path))
+            .collect();
+        defs.retain(|entity| !stale.iter().any(|path| entity.file_path == *path));
+        let fresh: Vec<EntityInfo> = stale
+            .par_iter()
+            .flat_map_iter(|path| reextract_file(&registry, root, path))
+            .filter(|entity| matches_query(entity, &opts.query))
+            .collect();
+        defs.extend(fresh);
+        return Some(Answer {
+            defs,
+            related: Vec::new(),
+        });
+    }
 
     // Definition-side freshness: content-local, repaired in place.
     let def_files: Vec<String> = defs.iter().map(|e| e.file_path.clone()).collect();

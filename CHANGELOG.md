@@ -4,6 +4,22 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **The strict and adaptive transaction policies are gone from pi, leaving the simple structural session policy as the only one.** `pi/config/transaction.mjs` and `pi/config/adaptive-transaction.mjs` are removed, and `config/simple-transaction.mjs` is now the documented configuration for `PI_SEM_MODE=transaction`.
+
+### Added
+
+- **Opt-in simple structural session policy for agents.** `pi/config/simple-transaction.mjs` packages batched exact reads, acknowledged context reuse, scoped edit composition and snapshot-checked edits without fixed discovery/transaction call quotas. Includes regression tests and setup instructions. This policy remains experimental, not a guarantee of faster sessions or semantic completeness.
+
+### Fixed
+
+- **Indexed name lookup sees renames and added definitions in edited files.** `sem find` checks indexed file freshness and reparses changed files on demand, without requiring a whole dependency-graph refresh. Includes TypeScript, Python and Rust regression coverage.
+- **Dart dependency graphs now resolve ordinary calls, constructor-bound receivers and typed parameters.** Callers and refs no longer select a same-named Dart method for a TypeScript receiver (or vice versa); imported class owners take precedence. Persisted graph/query caches are invalidated so upgrades rebuild the affected edges. Fixes #491.
+- **Shared MCP clients keep independent context history and stay bound to their repository.** Concurrent daemon startup is serialized with an OS lock, stale sockets recover after crashes, and handshakes are bounded. Adds `sem mcp --status` for health checks and reproducible lifecycle coverage on macOS and Linux.
+- **Telemetry uploads are no longer rejected by the server.** 0.21.0 removed the install id from the upload payload while the ingest endpoint still required one, so every batch uploaded since then was refused and active-install counts only ever reflected 0.20.0 and older. Uploads now carry `hash(local seed + day number)`, where the seed is generated once, stays on the machine and is never sent, so a batch groups with the rest of that machine's day and with nothing before or after it. Telemetry is still local-by-default and opt-in, so this only changes the contents of an upload that someone enabled with `sem telemetry on`.
+- **`sem setup` no longer reports success when part of it failed.** It writes the global `diff.external` config first, then installs the Claude Code hook and the pre-commit hook, and those two steps used to treat a permissions or JSON failure as a warning before falling through to a closing message that listed all three features as live and returned success. An unparseable `~/.claude/settings.json` therefore left changed git config, no hook, and a final line reading "sem is wired in". The closing summary is now built from the steps that actually ran, and a failed step reports what did and did not apply before exiting 2. The successful path is unchanged. Thanks to kantorcodes1 on Reddit for the report.
+
 ### Maintenance
 
 - Add a non-blocking Ota execution contract and isolated local-index freshness pressure lane.

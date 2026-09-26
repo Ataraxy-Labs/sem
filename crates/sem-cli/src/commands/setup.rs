@@ -17,6 +17,24 @@ enum Outcome {
     Warn(String),
 }
 
+impl Outcome {
+    /// The step ran into something it could not do. `Skipped` is not a failure
+    /// (the step simply did not apply here); `Warn` is.
+    fn is_warn(&self) -> bool {
+        matches!(self, Outcome::Warn(_))
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self, Outcome::Done(_))
+    }
+
+    fn note(&self) -> &str {
+        match self {
+            Outcome::Done(n) | Outcome::Skipped(n) | Outcome::Warn(n) => n,
+        }
+    }
+}
+
 /// A live braille spinner for a setup step, indented into the tree.
 fn step_spinner(label: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
@@ -190,18 +208,58 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     finish_step(pb, "pre-commit hook", &precommit);
 
     println!();
-    println!(
-        "  {} sem is wired in — {} to load it",
-        "✓".green().bold(),
-        "restart your Claude Code session".bold()
-    );
-    println!(
-        "     {} Claude Code hooks · entity-level git diff · blast-radius pre-commit",
-        "·".dimmed()
-    );
-    println!("     revert anytime:  {}\n", "sem unsetup".cyan());
 
-    Ok(())
+    // Step 1 already changed global git config by the time we get here, so a
+    // later failure leaves a half-configured machine. Report what is actually
+    // live rather than claiming everything is, and exit non-zero so a script
+    // can tell the difference.
+    let mut active = vec!["entity-level git diff"];
+    if hooks.is_done() {
+        active.push("Claude Code hooks");
+    }
+    if precommit.is_done() {
+        active.push("blast-radius pre-commit");
+    }
+
+    let failed: Vec<(&str, &Outcome)> = [
+        ("Claude Code hooks", &hooks),
+        ("pre-commit hook", &precommit),
+    ]
+    .into_iter()
+    .filter(|(_, outcome)| outcome.is_warn())
+    .collect();
+
+    if failed.is_empty() {
+        println!(
+            "  {} sem is wired in — {} to load it",
+            "✓".green().bold(),
+            "restart your Claude Code session".bold()
+        );
+        println!("     {} {}", "·".dimmed(), active.join(" · ").dimmed());
+        println!("     revert anytime:  {}\n", "sem unsetup".cyan());
+        return Ok(());
+    }
+
+    println!(
+        "  {} setup incomplete — {} of 3 steps did not apply",
+        "⚠".yellow().bold(),
+        failed.len()
+    );
+    println!("     {} {}", "active:".dimmed(), active.join(" · "));
+    for (label, outcome) in &failed {
+        println!(
+            "     {} {label} — {}",
+            "not applied:".dimmed(),
+            outcome.note().yellow()
+        );
+    }
+    println!("\n     fix the cause and re-run  {}", "sem setup".cyan());
+    println!("     revert everything         {}\n", "sem unsetup".cyan());
+
+    // println! is block-buffered when stdout is a pipe, and process::exit runs
+    // no destructors, so flush before leaving or the report is lost.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(2);
 }
 
 /// Path to Claude Code's user settings file, where session hooks live.
@@ -417,7 +475,10 @@ mod session_hook_tests {
         let n = add_session_hooks(&mut root, "sem hook prompt-submit");
         assert_eq!(n, 1, "the prompt hook is added on a fresh config");
         assert_eq!(root["model"], "opus", "unrelated keys preserved");
-        assert_eq!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo hi");
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo hi"
+        );
         assert!(
             root["hooks"].get("SessionStart").is_none(),
             "no SessionStart hook is installed (mcp --resident is a dead no-op)"

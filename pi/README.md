@@ -124,14 +124,40 @@ cd /path/to/sem/pi
 npm install
 cd /path/to/project
 PI_SEM_MODE=transaction \
-PI_SEM_CONFIG="/path/to/sem/pi/config/transaction.mjs" \
+PI_SEM_CONFIG="/path/to/sem/pi/config/simple-transaction.mjs" \
 /path/to/sem/pi/node_modules/.bin/pi -e /path/to/sem/pi
 ```
 
-The bundled config exposes exactly `sem_plan` and `weave_transaction` through
-`src/transaction/server.mjs`. Run the command from the repository you want the
-agent to edit, changing the extension/config paths to absolute paths when the
-`sem` checkout lives elsewhere.
+The bundled config, `config/simple-transaction.mjs`, is the single structural
+session policy. It starts `src/transaction/simple/sem-session-simple-mcp.mjs` and
+exposes `sem_plan`, `sem_exact`, `weave_transaction` and `weave_program`. Run the
+command from the repository you want the agent to edit, changing the
+extension/config paths to absolute paths when the `sem` checkout lives elsewhere.
+
+Authority stays split across those calls. `sem_plan` is a read-only resolve and
+context operation that returns the pinned revision and any searched files
+without structural coverage, and `sem_exact` serves batched exact reads.
+`weave_transaction` and `weave_program` are the write operations and require the
+exact revision digest, so drift or a guessed digest is refused before mutation.
+
+The policy keeps `bash` and `write` available and routes from
+`sem_plan.coverage`: complete plans use structural transactions, partial plans
+use hybrid mode, and empty plans explicitly fall back after one bounded recovery
+attempt. See [setup, tests, evidence and limitations](src/transaction/simple/README.md).
+
+For agent hosts, route **before** starting the session so native tasks do not
+pay MCP or structural-prompt overhead. The versioned admission command accepts
+raw task text or a language-neutral JSON envelope on stdin and always emits a
+JSON decision. A routing error deliberately returns native mode:
+
+```bash
+printf '%s' '{"task":"Rename the API and update all callers across the repository","files":["src/api.ts","src/client.ts"],"index_warm":true}' \
+  | npm run --silent route
+```
+
+Attach `sem_plan` and `weave_transaction` only when
+`attach_structural_tools` is `true`; otherwise launch the agent with its native
+tools and no structural prompt. All adapters must honor `fallback: "native"`.
 - **`PI_SEM_CHECK_ALLOW`** -- extends pure mode's `sem.check({cmd})` allowlist
   beyond the auto-detected runners (`npm`/`yarn`/`pnpm`/`bun`, `cargo
   test`/`build`/`check`/`clippy`, `pytest`, `go test`/`build`/`vet`, `make

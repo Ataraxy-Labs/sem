@@ -472,6 +472,10 @@ This means sem detects renames and moves, not just additions and deletions. Stru
 
 ## Use with AI agents (MCP)
 
+On macOS and Linux, clients in the same checkout share a warm repository daemon.
+Run `sem mcp --status` to check it. See the [shared runtime contract and reproducible benchmark](docs/shared-mcp.md)
+for session isolation, fallback behavior, and current platform limits.
+
 `sem mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server over stdin/stdout. It's not a command you run and read yourself: it's a server your coding agent launches in the background so it can ask sem questions while it works. That's the reason `mcp` lives alongside the normal commands. The agent gets 8 entity-level tools mirroring the CLI: `sem_entities`, `sem_diff`, `sem_blame`, `sem_impact`, `sem_log`, `sem_context`, `sem_find`, `sem_grep`. (If you're also using sem cloud for code review, four more tools let an agent attach to a review and answer reviewer questions in a loop: `join_review`, `wait_for_branch`, `reply_to_branch`, `list_open_branches`.)
 
 Why an agent wants these: instead of reading whole files and burning tokens, it can ask "what breaks if I change `submitOrder`" (`sem_impact`) or "give me just the context to refactor this function" (`sem_context`, which returns the function's source plus its callers and callees) and get a precise, deterministic answer from the dependency graph instead of a grep result that might miss a caller.

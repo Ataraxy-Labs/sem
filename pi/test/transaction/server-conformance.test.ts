@@ -48,10 +48,20 @@ test("server exposes only the versioned plan and transaction protocol", async ()
   try {
     const listed = await rpc.call("tools/list");
     assert.deepEqual(listed.result.tools.map((tool: any) => tool.name), ["sem_plan", "weave_transaction"]);
+    assert.match(listed.result.tools[0].description, /Do not use for raw string\/comment search/);
+    assert.match(listed.result.tools[1].description, /Do not use for environment setup/);
     const planned = await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
     const value = planned.result.structuredContent;
-    assert.equal(value.protocol, "sem-transaction/1");
+    assert.equal(value.protocol, "sem-transaction/2");
     assert.match(value.revision.digest, /^[0-9a-f]{64}$/);
+    assert.deepEqual(value.authority, {
+      mode: "read_only",
+      mutation_allowed: false,
+      write_tool: "weave_transaction",
+      write_requires_revision_digest: true,
+    });
+    assert.deepEqual(value.structural_file_coverage.unindexed_files, []);
+    assert.deepEqual(value.fallbacks_used, []);
     const duplicate = await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
     assert.match(duplicate.error.message, /exactly one sem_plan/);
   } finally {
@@ -64,10 +74,39 @@ test("transaction refuses a workspace changed after its pinned plan", async () =
   const cwd = repository();
   const rpc = client(cwd);
   try {
-    await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
+    const planned = await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
     writeFileSync(join(cwd, "x.txt"), "changed elsewhere\n");
-    const edited = await rpc.call("tools/call", { name: "weave_transaction", arguments: { edits: [] } });
+    const edited = await rpc.call("tools/call", { name: "weave_transaction", arguments: { revision_digest: planned.result.structuredContent.revision.digest, edits: [] } });
     assert.match(edited.error.message, /workspace changed outside the transaction protocol/);
+  } finally {
+    rpc.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("read-only planning reports structural gaps and write requires the returned revision", async () => {
+  const cwd = repository();
+  writeFileSync(join(cwd, "sample.c"), "int answer(void) { return 42; }\n");
+  execFileSync("git", ["add", "sample.c"], { cwd });
+  execFileSync("git", ["commit", "-qm", "add search fixtures"], { cwd });
+  const rpc = client(cwd);
+  try {
+    const planned = await rpc.call("tools/call", {
+      name: "sem_plan",
+      arguments: { entity_names: ["answer"], path: "missing.ts" },
+    });
+    const value = planned.result.structuredContent;
+    assert.equal(value.authority.mutation_allowed, false);
+    assert.ok(value.structural_file_coverage.indexed_files.includes("sample.c"));
+    assert.ok(value.structural_file_coverage.unindexed_files.includes("missing.ts"));
+    assert.match(value.structural_file_coverage.fallback, /native grep\/read/);
+    assert.deepEqual(value.fallbacks_used[0].scope, ["missing.ts"]);
+
+    const edited = await rpc.call("tools/call", {
+      name: "weave_transaction",
+      arguments: { revision_digest: "0".repeat(64), edits: [] },
+    });
+    assert.match(edited.error.message, /write revision does not match the read-only plan/);
   } finally {
     rpc.close();
     rmSync(cwd, { recursive: true, force: true });
@@ -78,10 +117,10 @@ test("transaction rejects newly invented private collaborator access", async () 
   const cwd = repository();
   const rpc = client(cwd);
   try {
-    await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
+    const planned = await rpc.call("tools/call", { name: "sem_plan", arguments: {} });
     const edited = await rpc.call("tools/call", {
       name: "weave_transaction",
-      arguments: { edits: [{ file: "x.txt", old: "one", new: "context._secret" }] },
+      arguments: { revision_digest: planned.result.structuredContent.revision.digest, edits: [{ file: "x.txt", old: "one", new: "context._secret" }] },
     });
     assert.match(edited.error.message, /invents private collaborator access/);
     assert.match(edited.error.message, /context\._secret/);
@@ -98,10 +137,11 @@ test("an explicit structural-kind change uses a revision-pinned exact replacemen
   execFileSync("git", ["commit", "-qm", "add sample"], { cwd });
   const rpc = client(cwd);
   try {
-    await rpc.call("tools/call", { name: "sem_plan", arguments: { entity_names: ["answer"] } });
+    const planned = await rpc.call("tools/call", { name: "sem_plan", arguments: { entity_names: ["answer"] } });
     const edited = await rpc.call("tools/call", {
       name: "weave_transaction",
       arguments: {
+        revision_digest: planned.result.structuredContent.revision.digest,
         edits: [{
           file: "sample.c",
           entity: { name: "answer", entity_type: "function" },
@@ -127,10 +167,11 @@ test("a mixed transaction never reports committed when one structural edit rolls
   execFileSync("git", ["commit", "-qm", "add sample"], { cwd });
   const rpc = client(cwd);
   try {
-    await rpc.call("tools/call", { name: "sem_plan", arguments: { entity_names: ["answer"] } });
+    const planned = await rpc.call("tools/call", { name: "sem_plan", arguments: { entity_names: ["answer"] } });
     const edited = await rpc.call("tools/call", {
       name: "weave_transaction",
       arguments: {
+        revision_digest: planned.result.structuredContent.revision.digest,
         edits: [
           {
             file: "sample.c",

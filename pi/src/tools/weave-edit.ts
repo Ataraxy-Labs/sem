@@ -138,6 +138,14 @@ export interface WeaveEditDeps {
   semBin: string;
   coordinator: Coordinator | undefined;
   signal?: AbortSignal;
+  /** Skip informational caller reports when a higher-level transaction has
+   * already planned impact and will run an authoritative validation gate. */
+  checkDependents?: boolean;
+  /** Execute an atomic batch concurrently only when every edit targets a
+   * distinct file. Same-file edits always preserve request order. */
+  parallelDistinctFiles?: boolean;
+  /** Exact-read preconditions checked inside the file mutation queue. */
+  snapshotTargets?: ReadonlyMap<string, { sha256: string; start: number; end: number }>;
 }
 
 export interface WeaveEditOutcome {
@@ -829,8 +837,15 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
   try {
     await withFileMutationQueue(absPath, async () => {
       const currentContent = await readFile(absPath, "utf8");
+      const snapshotTarget = deps.snapshotTargets?.get(absPath);
+      if (snapshotTarget && createHash("sha256").update(currentContent).digest("hex") !== snapshotTarget.sha256) {
+        throw new Error("STALE_SNAPSHOT: file changed since exact read");
+      }
       const entitiesBefore = await extractEntities(semBin, absPath, cwd, signal);
-      const resolved = resolveEntity(entitiesBefore, params.entity);
+      const candidates = snapshotTarget
+        ? entitiesBefore.filter(e => e.start_byte === snapshotTarget.start && e.end_byte === snapshotTarget.end)
+        : entitiesBefore;
+      const resolved = resolveEntity(candidates, params.entity);
 
       if (resolved.kind !== "found") {
         queueOutcome = { kind: "resolution-failed", result: resolved };
@@ -841,7 +856,7 @@ async function performOneWeaveEdit(params: OneWeaveEditParams, deps: WeaveEditDe
       // deleting it makes it unresolvable, so "who depended on this" has to
       // be captured now or not at all.
       const dependentsBefore =
-        params.op === "replace" || params.op === "delete"
+        (deps.checkDependents ?? true) && (params.op === "replace" || params.op === "delete")
           ? await checkDependents(semBin, cwd, absPath, resolved.entity.name, signal, ownEntityId(resolved.entity, cwd, absPath))
           : undefined;
 
@@ -1403,21 +1418,39 @@ async function performWeaveEditBatch(edits: OneWeaveEditParams[], atomic: boolea
   // edit so the guard compares against the batch's own most recent output.
   const batchImages = new Map<string, string>();
 
-  for (let i = 0; i < edits.length; i++) {
-    const edit = edits[i]!;
-    const outcome = await performOneWeaveEdit(edit, deps);
-    results.push({ file: edit.file, entity: edit.entity, outcome });
-    if (atomic) {
-      try {
-        batchImages.set(edit.file, readFileSync(resolveTargetPath(deps.cwd, edit.file), "utf8"));
-      } catch {
-        // Unreadable/removed: the restore below falls back to the pre-batch
-        // snapshot as its expected image and reports honestly if that fails.
+  const parallel = deps.parallelDistinctFiles === true && distinctFiles.length === edits.length;
+  if (parallel) {
+    const outcomes = await Promise.all(edits.map((edit) => performOneWeaveEdit(edit, deps)));
+    outcomes.forEach((outcome, i) => {
+      const edit = edits[i]!;
+      results.push({ file: edit.file, entity: edit.entity, outcome });
+      if (stoppedAtIndex === -1 && outcome.isError && atomic) stoppedAtIndex = i;
+      if (atomic) {
+        try {
+          batchImages.set(edit.file, readFileSync(resolveTargetPath(deps.cwd, edit.file), "utf8"));
+        } catch {
+          // Unreadable/removed: rollback uses the pre-batch image as its
+          // expected frame and reports honestly if that guard fails.
+        }
       }
-    }
-    if (outcome.isError && atomic) {
-      stoppedAtIndex = i;
-      break;
+    });
+  } else {
+    for (let i = 0; i < edits.length; i++) {
+      const edit = edits[i]!;
+      const outcome = await performOneWeaveEdit(edit, deps);
+      results.push({ file: edit.file, entity: edit.entity, outcome });
+      if (atomic) {
+        try {
+          batchImages.set(edit.file, readFileSync(resolveTargetPath(deps.cwd, edit.file), "utf8"));
+        } catch {
+          // Unreadable/removed: the restore below falls back to the pre-batch
+          // snapshot as its expected image and reports honestly if that fails.
+        }
+      }
+      if (outcome.isError && atomic) {
+        stoppedAtIndex = i;
+        break;
+      }
     }
   }
 

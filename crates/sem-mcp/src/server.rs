@@ -174,6 +174,7 @@ impl Default for WatchSlot {
 
 #[derive(Clone)]
 pub struct SemServer {
+    bound_repo: Option<PathBuf>,
     context: Arc<Mutex<Option<RepoContext>>>,
     registry: Arc<ParserRegistry>,
     entity_cache: Arc<Mutex<EntityCache>>,
@@ -195,6 +196,27 @@ pub struct SemServer {
 }
 
 impl SemServer {
+    /// Share repository caches, but never another client's context history.
+    pub(crate) fn new_session(&self) -> Self {
+        let mut session = self.clone();
+        session.fill_ledger = Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(10_000).unwrap(),
+        )));
+        session
+    }
+
+    pub(crate) fn for_repository(root: PathBuf) -> Result<Self, String> {
+        let root = root.canonicalize().map_err(|e| e.to_string())?;
+        let git = GitBridge::open(&root).map_err(|e| e.to_string())?;
+        let mut server = Self::new();
+        server.bound_repo = Some(root.clone());
+        server.context = Arc::new(Mutex::new(Some(RepoContext {
+            git,
+            repo_root: root,
+        })));
+        Ok(server)
+    }
+
     pub fn discover_repo_root(file_path_hint: Option<&str>) -> Result<PathBuf, String> {
         // Strategy 1: Absolute file path -> GitBridge::open on parent dir
         if let Some(fp) = file_path_hint {
@@ -266,6 +288,12 @@ impl SemServer {
             Some(fp) if Path::new(fp).is_absolute() => Some(Self::discover_repo_root(Some(fp))?),
             _ => None,
         };
+
+        if let (Some(bound), Some(requested)) = (&self.bound_repo, &explicit_root) {
+            if requested.canonicalize().map_err(|e| e.to_string())? != *bound {
+                return Err("Shared MCP connections are scoped to one repository; start a client in the requested repository.".into());
+            }
+        }
 
         let switch_to: Option<PathBuf> = {
             let guard = self.context.lock().await;
@@ -1296,6 +1324,7 @@ impl SemServer {
 impl SemServer {
     pub fn new() -> Self {
         Self {
+            bound_repo: None,
             context: Arc::new(Mutex::new(None)),
             registry: Arc::new(create_default_registry()),
             entity_cache: Arc::new(Mutex::new(LruCache::new(
@@ -3536,6 +3565,38 @@ mod tests {
             .await
             .expect("repeat after the delta is an unchanged line");
         assert!(repeat.contains("unchanged since you read it"));
+    }
+
+    #[tokio::test]
+    async fn shared_clients_have_independent_context_history() {
+        let server = SemServer::new();
+        let a = server.new_session();
+        let b = server.new_session();
+        for client in [&a, &b] {
+            assert!(client
+                .ledger_reply("same", "id", "f", "a.py", "def f(): pass", "1", "hint")
+                .await
+                .is_none());
+            assert!(client
+                .ledger_reply("same", "id", "f", "a.py", "def f(): pass", "1", "hint")
+                .await
+                .is_some());
+        }
+        assert!(Arc::ptr_eq(&a.graph_cache, &b.graph_cache));
+    }
+
+    #[tokio::test]
+    async fn shared_client_cannot_switch_repository() {
+        let first = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        git2::Repository::init(first.path()).unwrap();
+        git2::Repository::init(other.path()).unwrap();
+        let server = SemServer::for_repository(first.path().into()).unwrap();
+        assert!(server.get_context(other.path().to_str()).await.is_err());
+        assert_eq!(
+            server.get_context(None).await.unwrap().repo_root,
+            first.path().canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]

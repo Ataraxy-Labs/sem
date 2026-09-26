@@ -113,20 +113,10 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   fixture containing a real `import` statement, not just by grep.
 /// * `.zig` (Zig) — whitelisted, not attributed: no node-kind collision;
 ///   resolves through `Table::SymbolTable` like Kotlin.
-/// * `.dart` (Dart) — **left RED, not whitelisted**: `DART_SCOPE_CONFIG` is
-///   one of the "Tier 2 (Minimal)" configs and its `call_nodes` is `&
-///   ["function_expression_body"]`, not an actual call-expression node kind
-///   — ordinary statement-body function calls (`helper();` inside a `{ }`
-///   block) are never even reached by `collect_all_file_refs`'s call-node
-///   branch, only expression-bodied arrow functions (`() => helper()`) are.
-///   The oracle fixture below (ordinary block-bodied functions, the normal
-///   Dart style) confirms this empirically: zero `Calls` edges appear
-/// between its hub and its callers even after, so there is
-///   nothing here for GREEN eligibility to be unsound *about* — but nothing
-///   to gain either. This is a real, narrower entity/ref-extraction gap in
-/// Dart (not scope-resolution eligibility), out of this change's scope to
-///   fix, surfaced here rather than silently routed around by writing
-///   arrow-bodied Dart just to make eligibility look proven.
+/// * `.dart` (Dart) — left RED, not whitelisted. Issue #491 added real
+///   call-expression and local type-binding extraction. Incremental reuse
+///   eligibility still requires a dedicated attribution/oracle audit;
+///   fixing extraction alone is not permission to reuse cached edges.
 ///
 /// for the
 /// full per-language verdict table and why every other language stays

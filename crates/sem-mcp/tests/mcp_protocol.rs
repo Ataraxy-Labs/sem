@@ -40,6 +40,8 @@ impl McpClient {
     fn spawn(repo: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sem-mcp"))
             .current_dir(repo)
+            // These tests exercise one isolated stdio server each.
+            .env("SEM_MCP_NO_SHARED", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

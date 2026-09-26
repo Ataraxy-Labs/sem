@@ -243,6 +243,42 @@ test("detectRunner(): a pytest.ini selects pytest, with no separate typecheck co
   });
 });
 
+for (const [marker, expectedKind, expectedTest] of [
+  ["pom.xml", "maven", ["mvn", "-q", "test"]],
+  ["build.gradle", "gradle", ["gradle", "test"]],
+  ["Example.csproj", "dotnet", ["dotnet", "test", "--no-build"]],
+  ["Package.swift", "swift", ["swift", "test"]],
+] as const) {
+  test(`detectRunner(): ${marker} selects ${expectedKind}`, async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, marker), "");
+      const runner = await detectRunner(dir);
+      assert.equal(runner?.kind, expectedKind);
+      assert.deepEqual(runner?.testCmd, [...expectedTest]);
+    });
+  });
+}
+
+test("detectRunner(): composer only selects a test command the repository declares", async () => {
+  await withTempDir(async (dir) => {
+    writeFileSync(join(dir, "composer.json"), JSON.stringify({ scripts: { test: "phpunit" } }));
+    const runner = await detectRunner(dir);
+    assert.equal(runner?.kind, "composer");
+    assert.deepEqual(runner?.testCmd, ["composer", "test"]);
+  });
+});
+
+test("detectRunner(): Rakefile and Makefile require explicit test targets", async () => {
+  await withTempDir(async (dir) => {
+    writeFileSync(join(dir, "Rakefile"), "task :test do\nend\n");
+    assert.equal((await detectRunner(dir))?.kind, "ruby");
+  });
+  await withTempDir(async (dir) => {
+    writeFileSync(join(dir, "Makefile"), "test:\n\t@true\n");
+    assert.equal((await detectRunner(dir))?.kind, "make");
+  });
+});
+
 test("detectRunner(): an npm project with only a typecheck script selects ONLY that, no invented test command", async () => {
   await withTempDir(async (dir) => {
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { typecheck: "tsc --noEmit" } }));

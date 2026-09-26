@@ -6,8 +6,14 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { buildSemApi } from "../codemode/api.ts";
+import { buildSemApi, detectRunner } from "../codemode/api.ts";
 import { performWeaveEdit } from "../tools/weave-edit.ts";
+import {
+  describePlanCoverage,
+  describeRepositoryCapabilities,
+  normalizeRepositoryPath,
+  partitionTransactionEdits,
+} from "./protocol-generalization.ts";
 
 const runFile = promisify(execFile);
 const argument = (name) => {
@@ -18,7 +24,10 @@ let hostedState = null;
 let planImportAuthority = new Map();
 let planImportFiles = new Map();
 let planCalls = 0;
+let planRecoveryAvailable = false;
 let transactionCalls = 0;
+const transactionBaseline = new Map();
+const transactionCreated = new Set();
 let expectedRevision = null;
 
 async function workspaceRevision(cwd) {
@@ -140,15 +149,18 @@ const flexibleEdit = object({
   range: object({ start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 } }, ["start_line", "end_line"]),
   old: { type: "string", description: "Exact text to replace inside one entity." },
   new: { type: "string", description: "Replacement for old." },
-  allow_signature_change: { type: "boolean", description: "Set true only when a replacement intentionally renames an entity or changes its structural kind, such as replacing a declaration with a compatibility macro." },
+  allow_signature_change: { type: "boolean" },
 });
 
 function uniqueFlexibleText(source, requested) {
   const first = source.indexOf(requested);
   if (first >= 0) {
-    return source.indexOf(requested, first + 1) < 0
-      ? { index: first, text: requested }
-      : null;
+    const repeated = source.indexOf(requested, first + 1) >= 0;
+    if (!repeated) return { index: first, text: requested };
+    if (/^(?:[A-Za-z_]\w*\.)+[A-Za-z_]\w*$/.test(requested)) {
+      return { index: first, text: requested, all: true };
+    }
+    return null;
   }
   const pieces = requested.split(/\s+/).filter(Boolean);
   if (pieces.length < 2) return null;
@@ -326,8 +338,35 @@ async function normalizeEdits(rawEdits, cwd, api) {
           throw new Error(`replacement dereferences nullable self.${match[1]} without preserving its indexed null guard`);
         }
       }
-      const resolved = uniqueFlexibleText(source, raw.old);
+      let resolved = uniqueFlexibleText(source, raw.old);
+      // Repeated snippets such as `mode: CompileMode` are common in large
+      // typed codebases. When the model supplied an entity locator, semantic
+      // scope is stronger evidence than global byte uniqueness: resolve the
+      // snippet inside that entity and translate its offset back to the file.
+      if (!resolved && raw.entity?.name) {
+        const requestedName = raw.entity.name.toLowerCase();
+        const requestedParent = raw.entity.parent_name?.toLowerCase();
+        const requestedType = raw.entity.entity_type?.toLowerCase();
+        const candidates = (outline.entities ?? []).filter((item) =>
+          item.name?.toLowerCase() === requestedName
+          && (!requestedParent || item.parent_name?.toLowerCase() === requestedParent)
+          && (!requestedType || item.type?.toLowerCase() === requestedType)
+        );
+        if (candidates.length === 1) {
+          const candidate = candidates[0];
+          const sourceLines = source.split("\n");
+          const entitySource = sourceLines.slice(candidate.start_line - 1, candidate.end_line).join("\n");
+          const scoped = uniqueFlexibleText(entitySource, raw.old);
+          if (scoped) {
+            const entityOffset = sourceLines.slice(0, candidate.start_line - 1).join("\n").length
+              + (candidate.start_line > 1 ? 1 : 0);
+            resolved = { ...scoped, index: entityOffset + scoped.index };
+          }
+        }
+      }
       if (!resolved) {
+        const alreadyApplied = uniqueFlexibleText(source, raw.new);
+        if (alreadyApplied) continue;
         throw new Error(`old text must occur exactly once in ${file}`);
       }
       raw = { ...raw, old: resolved.text };
@@ -373,6 +412,7 @@ async function normalizeEdits(rawEdits, cwd, api) {
     } else {
       const resolved = uniqueFlexibleText(content, raw.old);
       if (!resolved) {
+        if (uniqueFlexibleText(content, raw.new)) continue;
         throw new Error(`old text must occur exactly once in ${file} entity ${enclosing.name}: ${raw.old.slice(0, 120)}`);
       }
       const inserted = raw.op === "insert_before"
@@ -380,7 +420,9 @@ async function normalizeEdits(rawEdits, cwd, api) {
         : raw.op === "insert_after"
           ? resolved.text + replacement
           : replacement;
-      content = content.slice(0, resolved.index) + inserted + content.slice(resolved.index + resolved.text.length);
+      content = resolved.all && raw.op !== "insert_before" && raw.op !== "insert_after"
+        ? content.split(resolved.text).join(inserted)
+        : content.slice(0, resolved.index) + inserted + content.slice(resolved.index + resolved.text.length);
     }
     composed.set(entityKey, {
       file,
@@ -399,21 +441,82 @@ async function normalizeEdits(rawEdits, cwd, api) {
   return { creates, edits, textEdits };
 }
 
+function declaredMembers(content, file) {
+  const names = new Set();
+  if (file.endsWith(".go")) {
+    const body = content.match(/\bstruct\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+    for (const line of body.split("\n")) {
+      const match = line.match(/^\s*([A-Za-z_]\w*)\s+(?:\*|\[|map\[|chan\s+|func\(|interface\{|[A-Za-z_])/);
+      if (match) names.add(match[1]);
+    }
+  } else if (file.endsWith(".py")) {
+    for (const match of content.matchAll(/\bself\.([A-Za-z_]\w*)\s*(?::[^=\n]+)?=/g)) names.add(match[1]);
+  } else {
+    for (const match of content.matchAll(/^\s*(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+)*([A-Za-z_$][\w$]*)\s*[?:=]/gm)) names.add(match[1]);
+  }
+  return names;
+}
+
+async function removedMemberCandidates(normalizedEdits, cwd, api) {
+  const removed = [];
+  for (const edit of normalizedEdits) {
+    if (edit.op !== "replace" || !edit.entity?.name) continue;
+    let before;
+    try {
+      before = await api.read({ ...edit.entity, file: edit.file }, { full: true, budget: 100_000 });
+    } catch {
+      continue;
+    }
+    const oldMembers = declaredMembers(String(before.content ?? ""), edit.file);
+    const newMembers = declaredMembers(String(edit.content ?? ""), edit.file);
+    for (const name of oldMembers) if (!newMembers.has(name)) removed.push({ owner: edit.entity.name, name, file: edit.file });
+  }
+  return removed;
+}
+
+async function checkRemovedMemberClosure(removed, cwd) {
+  if (removed.length === 0) return { removed, leftovers: [] };
+  const leftovers = [];
+  for (const member of removed) {
+    let files = [member.file];
+    if (member.file.endsWith(".go")) {
+      const directory = path.posix.dirname(member.file);
+      const listed = await runFile("git", ["ls-files", `${directory}/*.go`], { cwd, maxBuffer: 1024 * 1024 });
+      files = listed.stdout.trim().split("\n").filter(Boolean);
+    }
+    for (const file of files) {
+      const source = await fs.readFile(path.resolve(cwd, file), "utf8").catch(() => "");
+      const receiverNames = member.file.endsWith(".go")
+        ? [...source.matchAll(new RegExp(`func\\s*\\(\\s*([A-Za-z_]\\w*)\\s+\\*?${member.owner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\)`, "g"))].map((match) => match[1])
+        : ["self", "this"];
+      const patterns = receiverNames.map((receiver) => `${receiver}.${member.name}`);
+      if (member.file.endsWith(".go") && new RegExp(`&?${member.owner}\\s*\\{`).test(source)) patterns.push(`${member.name}:`);
+      for (const [index, rawLine] of source.split("\n").entries()) {
+        const line = rawLine.trim();
+        if (!line || /^(?:\/\/|#|\*)/.test(line)) continue;
+        const pattern = patterns.find((candidate) => rawLine.includes(candidate));
+        if (pattern) leftovers.push({ owner: member.owner, member: member.name, pattern, file, line: index + 1, text: line });
+      }
+    }
+  }
+  return { removed, leftovers };
+}
+
 const tools = new Map([
   ["sem_plan", {
-    description: "One bounded structural planning query. Exact names are resolved and their full entities are read internally; regex patterns return matching source lines. No handles are exposed or required.",
+    description: "Read-only resolve + context query. Use instead of grep/read when you need source symbols, definitions, callers, dependencies, impact, or bounded implementation context. Do not use for raw string/comment search, generated artifacts, datasets, environment setup, or files reported in unindexed_files; use native tools there. Returns a pinned repository revision and explicit structural coverage gaps for a separate write call.",
     schema: object({
       entity_names: { type: "array", items: { type: "string" }, maxItems: 12, description: "Exact or likely function/class/method names. Unqualified names are allowed and may return several definitions." },
       regex_patterns: { type: "array", items: { type: "string" }, maxItems: 6, description: "Source regexes for concepts whose entity name is unknown. Matching lines are automatically expanded to their enclosing entities." },
+      task: { type: "string", description: "Original task or issue text. Used only to classify source, environment, and data workflows; never sent over the network." },
       path: { type: "string" },
       prefer_tests: { type: "boolean", default: false, description: "Rank test files first when the task explicitly targets tests, fixtures, or test compatibility." },
       max_entities: { type: "integer", minimum: 1, maximum: 16, default: 10 },
       budget_per_entity: { type: "integer", minimum: 300, maximum: 2500, default: 1800 },
     }),
     async run(params, cwd) {
-      if (planCalls >= 1) throw new Error("transaction protocol permits exactly one sem_plan call per session");
+      if (planCalls >= 1 && !planRecoveryAvailable) throw new Error("transaction protocol permits exactly one sem_plan call, plus one recovery call after an empty named query");
       if (transactionCalls > 0) throw new Error("sem_plan must run before any weave_transaction call");
-      planCalls++;
       const started = performance.now();
       const api = buildSemApi({ cwd, semBin: "sem" });
       // Enforce bounds here as well as in the advertised schema. Some MCP
@@ -426,10 +529,11 @@ const tools = new Map([
       const seen = new Set();
       const names = (params.entity_names ?? params.names ?? params.entities ?? []).slice(0, 12);
       const patterns = (params.regex_patterns ?? params.patterns ?? []).slice(0, 6);
+      const searchPath = normalizeRepositoryPath(cwd, params.path);
       const patternReserve = patterns.length > 0 ? Math.min(4, Math.floor(max / 2)) : 0;
       const nameLimit = max - patternReserve;
       const matches = patterns.length > 0
-        ? await api.grep(patterns, { path: params.path === "." ? undefined : params.path, limit: 60 })
+        ? await api.grep(patterns, { path: searchPath, limit: 60 })
         : null;
       const grepDone = performance.now();
       const matchedFiles = new Map();
@@ -555,7 +659,7 @@ const tools = new Map([
           leafToCandidates.set(leaf, list);
         }
         try {
-          const fallbackMatches = await api.grep([...leafToCandidates.keys()], { path: params.path === "." ? undefined : params.path, literal: true, limit: 40 });
+          const fallbackMatches = await api.grep([...leafToCandidates.keys()], { path: searchPath, literal: true, limit: 40 });
           for (const group of fallbackMatches.results ?? []) {
             for (const candidate of leafToCandidates.get(group.pattern) ?? []) {
               if (definitions.length >= nameLimit || resolvedNames.has(candidate.name)) continue;
@@ -830,10 +934,61 @@ const tools = new Map([
       planImportFiles = new Map([...authorityFileCandidates]
         .filter(([, values]) => values.size === 1)
         .map(([symbol, values]) => [symbol, [...values][0]]));
+      const coverage = describePlanCoverage({ definitions, requestedNames: names, resolvedNames, matches });
+      const tracked = await runFile("git", ["ls-files"], { cwd, maxBuffer: 16 * 1024 * 1024 })
+        .then(({ stdout }) => stdout.split("\n").filter(Boolean))
+        .catch(() => []);
+      const repository = describeRepositoryCapabilities(tracked, await detectRunner(cwd), params.task ?? "");
+      if (!repository.semantic_transaction_recommended) coverage.recommended_mode = "native_fallback";
+      else if (repository.dominant_mutation_confidence === "guarded" && coverage.recommended_mode === "transaction") coverage.recommended_mode = "hybrid";
+      else if (repository.validation.scope === "ambiguous" && coverage.recommended_mode === "transaction") coverage.recommended_mode = "hybrid";
+      planCalls++;
+      planRecoveryAvailable = coverage.recovery_allowed && planCalls < 2 && (names.length > 0 || patterns.length > 0);
       expectedRevision = await workspaceRevision(cwd);
+      const searchedFiles = [...new Set([
+        ...(searchPath ? [searchPath] : []),
+        ...matchedFiles.keys(),
+        ...nameCandidates.flatMap((candidate) => candidate.ranked.map((hit) => hit.file)),
+        ...definitions.map((definition) => definition.file),
+      ])].sort();
+      const structuralCoverage = await Promise.all(searchedFiles.map(async (file) => {
+        try {
+          const outline = await api.outline(file);
+          return { file, indexed: (outline.entities?.length ?? 0) > 0, entities: outline.entities?.length ?? 0 };
+        } catch {
+          return { file, indexed: false, entities: 0 };
+        }
+      }));
+      const indexedFiles = structuralCoverage.filter((item) => item.indexed).map((item) => item.file);
+      const unindexedFiles = structuralCoverage.filter((item) => !item.indexed).map((item) => item.file);
       return {
-        protocol: "sem-transaction/1",
+        protocol: "sem-transaction/2",
         revision: expectedRevision,
+        authority: {
+          mode: "read_only",
+          mutation_allowed: false,
+          write_tool: "weave_transaction",
+          write_requires_revision_digest: true,
+        },
+        applicability: {
+          use_for: ["source symbols", "definitions", "callers and dependencies", "impact", "bounded implementation context"],
+          do_not_use_for: ["raw string or comment search", "generated artifacts", "datasets", "environment setup", "unindexed files"],
+        },
+        coverage,
+        structural_file_coverage: {
+          scope: searchPath ?? ".",
+          searched_files: searchedFiles.length,
+          indexed_files: indexedFiles,
+          unindexed_files: unindexedFiles,
+          fallback: unindexedFiles.length > 0 ? "use native grep/read only for unindexed_files" : null,
+        },
+        fallbacks_used: unindexedFiles.length > 0 ? [{
+          from: "structural_index",
+          to: "native grep/read",
+          scope: unindexedFiles,
+          reason: "no structural coverage",
+        }] : [],
+        repository,
         definitions,
         resolutions: nameCandidates.map(({ name, expectedParent, ranked, error }) => ({
           requested_name: name,
@@ -872,39 +1027,55 @@ const tools = new Map([
     },
   }],
   ["weave_transaction", {
-    description: "Apply all entity edits as one atomic Weave batch, then run one focused repository check. Submit complete replacement entities returned from sem_plan.",
+    description: "Separate revision-pinned write. Use only after sem_plan for source files with structural coverage. Do not use for environment setup, datasets, generated artifacts, or unindexed files. Apply entity edits atomically, run one focused repository check, and return every fallback used. Submit the exact revision digest and complete replacement entities returned from sem_plan.",
     schema: object({
+      revision_digest: { type: "string", minLength: 64, maxLength: 64, description: "Exact revision.digest returned by sem_plan (or revision_after from the preceding repair receipt)." },
       creates: { type: "array", items: create, maxItems: 10, description: "Complete contents for genuinely new files reported absent by sem_plan." },
       imports: { type: "array", items: importEdit, maxItems: 20, description: "Imports for existing files. Use this instead of guessing exact text in file headers that sem_plan did not return." },
       remove_imports: { type: "array", items: importEdit, maxItems: 20, description: "Complete import statements or unique import-specifier lines to remove atomically from existing files." },
-      edits: { type: "array", items: flexibleEdit, maxItems: 30, description: "Existing-file changes as entity edits, 1-based line ranges, or exact old/new text. The service resolves ranges/text to enclosing entities before Weave applies them." },
+      edits: { type: "array", items: flexibleEdit, maxItems: 100, description: "Existing-file changes as entity edits, 1-based line ranges, or exact old/new text. Large plans are accepted whole, then committed in bounded file-affinity batches." },
       validation_cmd: { type: "string", description: "Optional focused repository test or typecheck command. Prefer the narrow target covering the edited code over the generic detected runner." },
-    }),
+    }, ["revision_digest"]),
     async run(params, cwd) {
-      if (planCalls !== 1) throw new Error("weave_transaction requires one successful sem_plan call first");
-      if (transactionCalls >= 2) throw new Error("transaction protocol permits one implementation and at most one repair");
+      if (planCalls < 1) throw new Error("weave_transaction requires one successful sem_plan call first");
+      if (transactionCalls >= 3) throw new Error("transaction protocol permits one implementation and at most two repairs");
       const observedRevision = await workspaceRevision(cwd);
+      if (!expectedRevision || params.revision_digest !== expectedRevision.digest) {
+        throw new Error(`write revision does not match the read-only plan; expected ${expectedRevision?.digest ?? "none"}, received ${params.revision_digest ?? "none"}`);
+      }
       if (!expectedRevision || observedRevision.digest !== expectedRevision.digest) {
         throw new Error(`workspace changed outside the transaction protocol; re-plan required (expected ${expectedRevision?.digest ?? "none"}, observed ${observedRevision.digest})`);
       }
-      transactionCalls++;
       const started = performance.now();
       const api = buildSemApi({ cwd, semBin: "sem" });
       const normalized = await normalizeEdits(params.edits, cwd, api);
+      const removedMembers = await removedMemberCandidates(normalized.edits, cwd, api);
       const normalizedAt = performance.now();
       const requestedCreates = [...(params.creates ?? []), ...normalized.creates];
+      // Invalid locators, ambiguous anchors, and other read-only preflight
+      // failures must remain recoverable. Consume an attempt only once the
+      // request is normalized and is about to mutate the working tree.
+      transactionCalls++;
       const created = [];
       const importSnapshots = new Map();
+      for (const item of normalized.edits) {
+        if (!importSnapshots.has(item.file)) {
+          importSnapshots.set(item.file, await fs.readFile(path.resolve(cwd, item.file), "utf8"));
+        }
+        if (!transactionBaseline.has(item.file)) transactionBaseline.set(item.file, importSnapshots.get(item.file));
+      }
       try {
         for (const item of requestedCreates) {
           await api.add({ file: item.file, content: item.content });
           created.push(item.file);
+          transactionCreated.add(item.file);
         }
         for (const item of [...(params.imports ?? []), ...(params.remove_imports ?? []), ...normalized.textEdits]) {
           const absolute = path.resolve(cwd, item.file);
           if (!importSnapshots.has(item.file)) {
             importSnapshots.set(item.file, await fs.readFile(absolute, "utf8"));
           }
+          if (!transactionBaseline.has(item.file)) transactionBaseline.set(item.file, importSnapshots.get(item.file));
         }
         for (const item of params.imports ?? []) {
           let statement = item.statement;
@@ -956,35 +1127,109 @@ const tools = new Map([
         throw error;
       }
       const createdAt = performance.now();
-      let outcome = { text: "no existing entities edited", details: { applied: 0 } };
+      let outcome = { text: "no existing entities edited", details: { applied: 0, batches: [] } };
       if (normalized.edits.length > 0) {
-        try {
-          outcome = await performWeaveEdit(
-            { edits: normalized.edits, atomic: true },
-            { cwd, semBin: "sem" },
-          );
-        } catch (error) {
-          for (const [file, source] of importSnapshots) {
-            await fs.writeFile(path.resolve(cwd, file), source).catch(() => {});
+        const batches = partitionTransactionEdits(normalized.edits);
+        const receipts = [];
+        const committedFiles = new Set();
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+          const batch = batches[batchIndex];
+          let batchOutcome;
+          try {
+            batchOutcome = await performWeaveEdit(
+              { edits: batch, atomic: true, claim: false },
+              {
+                cwd,
+                semBin: "sem",
+                checkDependents: false,
+                parallelDistinctFiles: true,
+              },
+            );
+          } catch (error) {
+            batchOutcome = {
+              isError: true,
+              text: error instanceof Error ? error.message : String(error),
+              details: { rolledBack: true, error: error instanceof Error ? error.message : String(error) },
+            };
           }
-          for (const file of created) await fs.unlink(path.resolve(cwd, file)).catch(() => {});
-          throw error;
-        }
-        const detail = outcome.details ?? {};
-        if (detail.rolledBack || detail.failed > 0 || detail.succeeded === 0) {
-          for (const [file, source] of importSnapshots) {
-            await fs.writeFile(path.resolve(cwd, file), source).catch(() => {});
+          const detail = batchOutcome.details ?? {};
+          const batchFiles = [...new Set(batch.map((edit) => edit.file))];
+          receipts.push({ index: batchIndex, files: batchFiles, ...detail });
+          const failed = batchOutcome.isError || detail.rolledBack || detail.failed > 0 || detail.succeeded === 0;
+          if (failed) {
+            const remainingFiles = new Set(batches.slice(batchIndex).flat().map((edit) => edit.file));
+            // Imports and parser-orphan text edits are applied before entity
+            // edits. Revert them only for the failed and unattempted suffix;
+            // earlier batches remain valid, so the repair call is genuinely
+            // incremental instead of replaying the whole transaction.
+            for (const file of remainingFiles) {
+              const source = importSnapshots.get(file);
+              if (source !== undefined) await fs.writeFile(path.resolve(cwd, file), source).catch(() => {});
+            }
+            expectedRevision = await workspaceRevision(cwd);
+            return {
+              protocol: "sem-transaction/2",
+              receipt: {
+                revision_before: observedRevision,
+                revision_after: expectedRevision,
+                committed: false,
+                validation_passed: false,
+                edits_applied: false,
+              },
+              provisional: true,
+              committed: false,
+              retry_scope: "failed_batch_and_suffix",
+              completed_files: [...committedFiles],
+              failed_files: batchFiles,
+              remaining_files: [...remainingFiles].filter((file) => !batchFiles.includes(file)),
+              edit: { batches: receipts, total_batches: batches.length, completed_batches: batchIndex },
+              check: { pass: false, stage: "weave-batch", error: batchOutcome.text },
+              timings_ms: {
+                normalize: Math.round(normalizedAt - started),
+                create: Math.round(createdAt - normalizedAt),
+                weave: Math.round(performance.now() - createdAt),
+                check: 0,
+                total: Math.round(performance.now() - started),
+              },
+            };
           }
-          for (const file of created) await fs.unlink(path.resolve(cwd, file)).catch(() => {});
+          for (const file of batchFiles) committedFiles.add(file);
         }
+        outcome = {
+          text: `${batches.length} bounded batch(es) applied`,
+          details: {
+            atomic: "per_batch",
+            total: normalized.edits.length,
+            succeeded: normalized.edits.length,
+            batches: receipts,
+          },
+        };
       }
       const editedAt = performance.now();
-      const editDetails = outcome.details ?? {};
-      const editsApplied = normalized.edits.length === 0 || (
-        editDetails.rolledBack !== true &&
-        (editDetails.failed ?? 0) === 0 &&
-        (editDetails.succeeded ?? editDetails.applied ?? 0) > 0
-      );
+      const closure = await checkRemovedMemberClosure(removedMembers, cwd);
+      if (closure.leftovers.length > 0) {
+        if (transactionCalls < 3) {
+          expectedRevision = await workspaceRevision(cwd);
+          return {
+            provisional: true,
+            committed: false,
+            edit: outcome.details ?? outcome,
+            closure,
+            check: { pass: false, stage: "structural-closure", failed: closure.leftovers.slice(0, 20) },
+          };
+        }
+        for (const [file, source] of transactionBaseline) await fs.writeFile(path.resolve(cwd, file), source);
+        for (const file of transactionCreated) await fs.unlink(path.resolve(cwd, file)).catch(() => {});
+        expectedRevision = await workspaceRevision(cwd);
+        return {
+          provisional: false,
+          committed: false,
+          rolled_back: true,
+          edit: outcome.details ?? outcome,
+          closure,
+          check: { pass: false, stage: "structural-closure", failed: closure.leftovers.slice(0, 20) },
+        };
+      }
       let check = await hostedValidation(cwd);
       if (!check) {
         const validationCmd = params.validation_cmd
@@ -1015,10 +1260,16 @@ const tools = new Map([
         }
       }
       const checkedAt = performance.now();
+      const editDetails = outcome.details ?? {};
+      const editsApplied = normalized.edits.length === 0 || (
+        editDetails.rolledBack !== true
+        && (editDetails.failed ?? 0) === 0
+        && (editDetails.succeeded ?? editDetails.applied ?? 0) > 0
+      );
       const revisionBefore = observedRevision;
       expectedRevision = await workspaceRevision(cwd);
       return {
-        protocol: "sem-transaction/1",
+        protocol: "sem-transaction/2",
         receipt: {
           revision_before: revisionBefore,
           revision_after: expectedRevision,
@@ -1027,10 +1278,18 @@ const tools = new Map([
           edits_applied: editsApplied,
         },
         created,
+        provisional: false,
+        committed: check?.pass === true,
         imported: [...importSnapshots.keys()],
         exact_text_edits: normalized.textEdits.length,
+        closure,
         edit: outcome.details ?? outcome,
         check,
+        fallbacks_used: check?.requested_cmd_rejected ? [{
+          from: "requested validation command",
+          to: "detected repository validation",
+          reason: check.requested_cmd_error ?? "requested command was not allowed",
+        }] : [],
         timings_ms: {
           normalize: Math.round(normalizedAt - started),
           create: Math.round(createdAt - normalizedAt),
