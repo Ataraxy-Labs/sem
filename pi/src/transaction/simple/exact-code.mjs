@@ -4,6 +4,7 @@ import os from 'node:os';
 import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {qualifyEntities, indexEntities, lookupEntities} from './entity-lookup.mjs';
 const exec = promisify(execFile);
 const hash = x => createHash('sha256').update(x).digest('hex');
 const fail = code => { throw new Error(code); };
@@ -81,23 +82,19 @@ export class ExactCode {
       } finally { await fs.rm(tmp,{recursive:true,force:true}); }
       entities.sort((a,b)=>order(a.file,b.file)||a.start-b.start||a.end-b.end||order(a.id,b.id));
       // Lexical containment only, not receiver/type or runtime resolution.
-      for(const entity of entities) {
-        const parents=entities.filter(p=>p.file===entity.file&&p.start<=entity.start&&p.end>=entity.end&&
-          (p.start<entity.start||p.end>entity.end)).sort((a,b)=>a.start-b.start||b.end-a.end);
-        entity.qualified_name=[...parents.map(p=>p.name),entity.name].join('.');
-      }
-      this.snapshots.set(revision,{sources,entities,manifest});
+      qualifyEntities(entities);
+      this.snapshots.set(revision,{sources,entities,manifest,...indexEntities(entities)});
     }
     return {revision,files:manifest,missing_files:missing,scope:'explicit_files',coverage:'parser_reported_only',consistency:'captured_file_bytes_not_atomic_repository_snapshot'};
   }
   get(revision) {return this.snapshots.get(revision)??fail('UNKNOWN_SNAPSHOT');}
   resolve(revision,name) {
     if(typeof name!=='string'||!name) fail('INVALID_NAME');
-    const matches=this.get(revision).entities.filter(e=>e.name===name||e.qualified_name===name);
+    const matches=lookupEntities(this.get(revision),{name});
     return {revision,status:matches.length===0?'not_found':matches.length===1?'unique':'ambiguous',matches,coverage:'parser_reported_only'};
   }
   read(revision,id) {
-    const s=this.get(revision), entity=s.entities.find(e=>e.id===id);
+    const s=this.get(revision), entity=s.byId.get(id);
     if(!entity) fail('UNKNOWN_ENTITY');
     const bytes=s.sources.get(entity.file).subarray(entity.start,entity.end);
     return {revision,entity,sha256:hash(bytes),content:new TextDecoder('utf-8',{fatal:true}).decode(bytes),complete:true};
@@ -123,8 +120,7 @@ export class ExactCode {
          Object.keys(selector).some(k=>!['id','name','file','type'].includes(k))||
          (typeof selector.id==='string')===(typeof selector.name==='string')||
          Object.values(selector).some(v=>typeof v!=='string'||!v)) fail('INVALID_SELECTOR');
-      const matches=s.entities.filter(e=>(selector.id?e.id===selector.id:(e.name===selector.name||e.qualified_name===selector.name))&&
-        (!selector.file||e.file===selector.file)&&(!selector.type||e.type===selector.type));
+      const matches=lookupEntities(s,selector);
       const status=matches.length===0?'not_found':matches.length===1?'unique':'ambiguous';
       if(status==='unique') {
         const e=matches[0];
@@ -144,7 +140,7 @@ export class ExactCode {
     if(!Array.isArray(edits)||!edits.length||edits.length>64) fail('INVALID_EDITS');
     const s=this.get(revision), byFile=new Map();
     for(const {id,content} of edits) {
-      const e=s.entities.find(e=>e.id===id);
+      const e=s.byId.get(id);
       if(!e||typeof content!=='string') fail('INVALID_EDIT');
       const group=byFile.get(e.file)||[]; group.push({...e,content});byFile.set(e.file,group);
     }
