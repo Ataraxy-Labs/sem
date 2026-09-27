@@ -38,6 +38,10 @@ struct McpClient {
 
 impl McpClient {
     fn spawn(repo: &Path) -> Self {
+        Self::spawn_with_discovery(repo, false)
+    }
+
+    fn spawn_with_discovery(repo: &Path, discovery: bool) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sem-mcp"))
             .current_dir(repo)
             // These tests exercise one isolated stdio server each.
@@ -55,6 +59,15 @@ impl McpClient {
             stdout,
             next_id: 1,
         };
+        if discovery {
+            let response = client.request("server/discover", json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {"name": "copilot-cli", "version": "1.0.88"}
+                }
+            }));
+            assert_eq!(response["error"]["code"], -32601, "{response}");
+        }
         client.initialize();
         client
     }
@@ -172,6 +185,22 @@ fn tool_text(resp: &Value) -> String {
 }
 
 // ── Fixture repo ──
+
+#[test]
+fn copilot_discovery_falls_back_to_initialize_and_tools_work() {
+    let repo = fixture_repo();
+    let mut client = McpClient::spawn_with_discovery(repo.path(), true);
+    assert!(client
+        .tools_list()
+        .iter()
+        .any(|tool| tool["name"] == "sem_entities"));
+    let response = client.call_tool("sem_entities", json!({"path": "src/needle.py"}));
+    assert!(tool_text(&response).contains("needle_target_fn"));
+    // Unknown methods must also leave an initialized session usable.
+    let response = client.request("future/extension", json!({}));
+    assert_eq!(response["error"]["code"], -32601);
+    assert!(!client.tools_list().is_empty());
+}
 
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")

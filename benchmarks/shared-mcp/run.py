@@ -17,7 +17,7 @@ import tempfile
 import time
 
 
-def read_reply(process, request_id):
+def read_reply(process, request_id, expected_error=None):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
@@ -28,13 +28,16 @@ def read_reply(process, request_id):
             raise RuntimeError("MCP exited before response")
         reply = json.loads(line)
         if reply.get("id") == request_id:
+            if expected_error is not None:
+                assert reply.get("error", {}).get("code") == expected_error, reply
+                return reply["error"]
             if "error" in reply:
                 raise RuntimeError(reply)
             return reply["result"]
     raise TimeoutError("MCP response timed out")
 
 
-def session(binary, repo, shared):
+def session(binary, repo, shared, discovery=False):
     env = dict(os.environ)
     env.pop("SEM_MCP_SHARED_DAEMON", None)
     if shared:
@@ -54,6 +57,9 @@ def session(binary, repo, shared):
         process.stdin.write((json.dumps(message) + "\n").encode())
         process.stdin.flush()
     try:
+        if discovery:
+            send("server/discover", {}, 0)
+            read_reply(process, 0, expected_error=-32601)
         send("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
                             "clientInfo": {"name": "shared-benchmark", "version": "1"}}, 1)
         read_reply(process, 1)
@@ -111,6 +117,10 @@ def main():
         stale.close()
         try:
             cold = session(binary, repo, True)
+            # Copilot's discovery probe must not prevent legacy initialization
+            # or actual tool calls, on either transport path.
+            session(binary, repo, False, discovery=True)
+            session(binary, repo, True, discovery=True)
             stop_daemon(repo, crash=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 concurrent_results = list(pool.map(lambda _: session(binary, repo, True), range(8)))
@@ -130,6 +140,7 @@ def main():
                       "build": str(binary), "concurrent_clients": len(concurrent_results),
                       "stale_socket_recovery": True, "restart_recovery": True,
                       "session_context_isolation": True,
+                      "discovery_fallback_standalone_and_shared": True,
                       "cold_start_ms": cold["ms"],
                       "model_tokens": None, "samples": samples}
             report["summary"] = {name: {"n": len(rows),

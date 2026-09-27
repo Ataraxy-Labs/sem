@@ -14,6 +14,7 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- **Copilot CLI can connect to the MCP server again.** Unsupported discovery probes return `Method not found` without closing the connection, allowing clients to fall back to `initialize` in both standalone and shared modes. Fixes #497.
 - **Indexed name lookup sees renames and added definitions in edited files.** `sem find` checks indexed file freshness and reparses changed files on demand, without requiring a whole dependency-graph refresh. Includes TypeScript, Python and Rust regression coverage.
 - **Dart dependency graphs now resolve ordinary calls, constructor-bound receivers and typed parameters.** Callers and refs no longer select a same-named Dart method for a TypeScript receiver (or vice versa); imported class owners take precedence. Persisted graph/query caches are invalidated so upgrades rebuild the affected edges. Fixes #491.
 - **Shared MCP clients keep independent context history and stay bound to their repository.** Concurrent daemon startup is serialized with an OS lock, stale sockets recover after crashes, and handshakes are bounded. Adds `sem mcp --status` for health checks and reproducible lifecycle coverage on macOS and Linux.

@@ -1,6 +1,8 @@
 use std::{future::Future, sync::Arc};
 
-use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
+use rmcp::model::{
+    ClientJsonRpcMessage, ClientRequest, ErrorCode, ErrorData, ServerJsonRpcMessage,
+};
 use rmcp::transport::Transport;
 use rmcp::RoleServer;
 use serde::Serialize;
@@ -60,7 +62,35 @@ where
 
             let line = without_line_ending(&line);
             match parse_client_message(line) {
-                IncomingLine::Message(message) => return Some(*message),
+                IncomingLine::Message(message) => {
+                    // Reject unsupported extension methods here, before RMCP's
+                    // initialize gate. Clients such as Copilot probe server/discover
+                    // first and fall back to initialize on Method not found.
+                    // Passing the probe to RMCP 1.x instead terminates the session.
+                    if let ClientJsonRpcMessage::Request(request) = message.as_ref() {
+                        if matches!(request.request, ClientRequest::CustomRequest(_)) {
+                            if let Err(error) = self
+                                .send(ServerJsonRpcMessage::error(
+                                    ErrorData::new(
+                                        ErrorCode::METHOD_NOT_FOUND,
+                                        "Method not found",
+                                        None,
+                                    ),
+                                    request.id.clone(),
+                                ))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Error writing method not found response: {}",
+                                    error
+                                );
+                                return None;
+                            }
+                            continue;
+                        }
+                    }
+                    return Some(*message);
+                }
                 IncomingLine::Ignore => {}
                 IncomingLine::ParseError => {
                     tracing::debug!("Malformed JSON-RPC frame received");
@@ -241,6 +271,36 @@ mod tests {
     use super::*;
     use rmcp::model::{ClientRequest, JsonRpcMessage, NumberOrString};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn unsupported_probes_preserve_ids_and_keep_transport_open() {
+        let (mut client_input, server_input) = tokio::io::duplex(4096);
+        let (server_output, client_output) = tokio::io::duplex(4096);
+        let mut transport = ResilientStdioTransport::new(server_input, server_output);
+        client_input
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":0,"method":"server/discover","params":{}}
+{"jsonrpc":"2.0","id":"probe","method":"future/extension","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"ping"}
+"#,
+            )
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), transport.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(message, ClientJsonRpcMessage::Request(request)
+            if matches!(request.request, ClientRequest::PingRequest(_))));
+        let mut output = BufReader::new(client_output);
+        for id in [serde_json::json!(0), serde_json::json!("probe")] {
+            let mut line = String::new();
+            output.read_line(&mut line).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["error"]["code"], -32601);
+        }
+    }
 
     #[tokio::test]
     async fn malformed_json_emits_parse_error_and_keeps_reading() {
