@@ -35,6 +35,7 @@ export function compactSources(sources) {
 // Session-local immutable, explicitly scoped snapshots. Not a whole-repo revision.
 export class ExactCode {
   constructor({semBin='sem', maxBytes=4*1024*1024, maxSnapshots=8}={}) {
+    if(!Number.isSafeInteger(maxSnapshots)||maxSnapshots<1) fail('INVALID_SNAPSHOT_CAPACITY');
     Object.assign(this,{semBin,maxBytes,maxSnapshots}); this.snapshots=new Map();
   }
   async capture(cwd, files, {allowMissing=false}={}) {
@@ -62,7 +63,6 @@ export class ExactCode {
     const manifest=[...sources].map(([file,b])=>({file,sha256:hash(b)}));
     const revision=hash(JSON.stringify([manifest,missing]));
     if(!this.snapshots.has(revision)) {
-      if(this.snapshots.size>=this.maxSnapshots) fail('SNAPSHOT_CAPACITY_REACHED');
       const tmp=await fs.mkdtemp(path.join(os.tmpdir(),'sem-exact-'));
       const entities=[];
       try {
@@ -84,10 +84,20 @@ export class ExactCode {
       // Lexical containment only, not receiver/type or runtime resolution.
       qualifyEntities(entities);
       this.snapshots.set(revision,{sources,entities,manifest,...indexEntities(entities)});
+      // Evict only after a successful capture. Failed parsing must not destroy
+      // usable snapshots. IDs remain revision-bound, never redirected.
+      while(this.snapshots.size>this.maxSnapshots) this.snapshots.delete(this.snapshots.keys().next().value);
     }
+    this.get(revision);
     return {revision,files:manifest,missing_files:missing,scope:'explicit_files',coverage:'parser_reported_only',consistency:'captured_file_bytes_not_atomic_repository_snapshot'};
   }
-  get(revision) {return this.snapshots.get(revision)??fail('UNKNOWN_SNAPSHOT');}
+  get(revision) {
+    const snapshot=this.snapshots.get(revision);
+    if(!snapshot) fail('UNKNOWN_SNAPSHOT: missing or expired; recapture files and use returned revision and entity IDs');
+    this.snapshots.delete(revision);
+    this.snapshots.set(revision,snapshot);
+    return snapshot;
+  }
   resolve(revision,name) {
     if(typeof name!=='string'||!name) fail('INVALID_NAME');
     const matches=lookupEntities(this.get(revision),{name});

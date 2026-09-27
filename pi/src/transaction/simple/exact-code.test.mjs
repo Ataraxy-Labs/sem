@@ -5,6 +5,33 @@ import os from 'node:os';
 import path from 'node:path';
 import {ExactCode} from './exact-code.mjs';
 const semBin=process.env.SEM_TEST_BIN || 'sem';
+test('snapshot LRU survives long sessions and failed captures without reusing stale IDs',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'sem-lru-test-'));
+  try {
+    for(const file of ['a.ts','b.ts','c.ts']) await fs.writeFile(path.join(root,file),'export function value() { return 1; }\n');
+    const api=new ExactCode({semBin,maxSnapshots:2});
+    const a=await api.capture(root,['a.ts']), b=await api.capture(root,['b.ts']);
+    api.query(a.revision,[{file:'a.ts'}]);
+    await api.capture(root,['c.ts']);
+    assert.throws(()=>api.get(b.revision),/expired/);
+    assert.ok(api.get(a.revision));
+    const oldId=api.resolve(a.revision,'value').matches[0].id;
+    const savedBin=api.semBin;
+    api.semBin=path.join(root,'missing-parser');
+    await assert.rejects(api.capture(root,['b.ts']),/ENOENT/);
+    assert.ok(api.get(a.revision));
+    api.semBin=savedBin;
+    for(let n=2;n<=12;n++) {
+      await fs.writeFile(path.join(root,'a.ts'),`export function value() { return ${n}; }\n`);
+      const s=await api.capture(root,['a.ts']);
+      assert.throws(()=>api.read(s.revision,oldId),/UNKNOWN_ENTITY/);
+      assert.ok(api.snapshots.size<=2);
+    }
+    assert.throws(()=>api.prepare(a.revision,[{id:oldId,content:'bad'}]),/expired/);
+    assert.match(await fs.readFile(path.join(root,'a.ts'),'utf8'),/return 12/);
+    for(const maxSnapshots of [0,-1,1.5,NaN]) assert.throws(()=>new ExactCode({maxSnapshots}),/INVALID_SNAPSHOT_CAPACITY/);
+  } finally {await fs.rm(root,{recursive:true,force:true});}
+});
 test('scoped Python methods and missing files resolve without a recovery call',async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'sem-scoped-test-'));
   try {
@@ -79,7 +106,10 @@ test('exact snapshot contract against real SEM parser',async()=>{
     await assert.rejects(api.capture(root,['link.ts']),/SYMLINK/);
     await assert.rejects(new ExactCode({semBin,maxBytes:1}).capture(root,['a.ts']),/SCOPE_TOO_LARGE/);
     const limited=new ExactCode({semBin,maxSnapshots:1});
-    await limited.capture(root,['a.ts']);
-    await assert.rejects(limited.capture(root,['b.ts']),/CAPACITY/);
+    const first=await limited.capture(root,['a.ts']);
+    const next=await limited.capture(root,['b.ts']);
+    assert.equal(limited.snapshots.size,1);
+    assert.throws(()=>limited.get(first.revision),/expired.*recapture/);
+    assert.equal(limited.query(next.revision,[{file:'b.ts'}]).files[0].content,source);
   } finally {await fs.rm(root,{recursive:true,force:true});}
 });

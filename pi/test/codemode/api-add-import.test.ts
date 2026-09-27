@@ -23,6 +23,35 @@ function makeDir(files: Record<string, string>): string {
 
 const api = (dir: string, changes = createChangeLog()) => ({ sem: buildSemApi({ cwd: dir, semBin: "sem", changes }), changes });
 
+test("Go grouped and standalone imports are idempotent with either spec syntax", async () => {
+  for (const declaration of ['import (\n\talias "example.com/lib"\n)', 'import alias "example.com/lib"']) {
+    const original = `package shared\n\n${declaration}\n\nfunc f() {}\n`;
+    const dir = makeDir({ "a.go": original });
+    try {
+      const { sem } = api(dir);
+      for (const spec of ['alias "example.com/lib"', 'import alias "example.com/lib"']) {
+        assert.equal((await sem.addImport("a.go", spec)).alreadyPresent, true);
+        assert.equal(readFileSync(join(dir, "a.go"), "utf8"), original);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("Java imports follow the package and any existing imports", async () => {
+  for (const existing of ["", "\nimport java.util.List;\n"]) {
+    const dir = makeDir({ "A.java": `// License\npackage example.app;\n${existing}\nclass A {}\n` });
+    try {
+      const { sem } = api(dir);
+      await sem.addImport("A.java", "import java.util.Map;");
+      const content = readFileSync(join(dir, "A.java"), "utf8");
+      assert.ok(content.indexOf("package example.app;") < content.indexOf("import java.util.Map;"));
+      if (existing) assert.ok(content.indexOf("import java.util.List;") < content.indexOf("import java.util.Map;"));
+      assert.ok(content.indexOf("import java.util.Map;") < content.indexOf("class A"));
+      assert.equal((await sem.addImport("A.java", "import java.util.Map;")).alreadyPresent, true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
 test("adds a Rust mod declaration after existing mods", async () => {
   const dir = makeDir({ "lib.rs": "pub mod alpha;\nmod beta;\n\npub fn x() {}\n" });
   try {

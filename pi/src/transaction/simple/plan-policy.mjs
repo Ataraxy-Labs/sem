@@ -58,6 +58,12 @@ export function compactDefinition(definition) {
   if (related?.length) result.related = related;
   if (result.entity) {
     result.entity = {...result.entity};
+    // Expose the same field name accepted by edit selectors, rather than
+    // making the model translate (and sometimes invent) a language kind.
+    if (result.entity.type !== undefined && result.entity.entity_type === undefined) {
+      result.entity.entity_type = result.entity.type;
+      delete result.entity.type;
+    }
     if (result.entity.file === result.file) delete result.entity.file;
     if (result.entity.parent_name === null) delete result.entity.parent_name;
   }

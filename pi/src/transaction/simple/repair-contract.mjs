@@ -2,9 +2,13 @@ import {createHash} from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 export function selectEntity(entities, requested) {
-  const sameName=entities.filter(e=>e.name?.toLowerCase()===requested.name.toLowerCase());
-  const candidates=sameName.filter(e=>(!requested.entity_type||e.type===requested.entity_type)
-    &&(!requested.parent_name||e.parent_name?.toLowerCase()===requested.parent_name.toLowerCase()));
+  const exactName=entities.filter(e=>e.name===requested.name);
+  const sameName=exactName.length?exactName:entities.filter(e=>e.name?.toLowerCase()===requested.name.toLowerCase());
+  let candidates=sameName.filter(e=>(!requested.entity_type||e.type===requested.entity_type));
+  if(requested.parent_name) {
+    const exactParent=candidates.filter(e=>e.parent_name===requested.parent_name);
+    candidates=exactParent.length?exactParent:candidates.filter(e=>e.parent_name?.toLowerCase()===requested.parent_name.toLowerCase());
+  }
   const ordinal=requested.ordinal;
   if((ordinal!==undefined&&(!Number.isInteger(ordinal)||ordinal<0||ordinal>=candidates.length))
       ||(ordinal===undefined&&candidates.length!==1)) {

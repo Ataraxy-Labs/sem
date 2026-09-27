@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { boundedInteger, inScope, candidatePage, MAX_PLAN_CALLS, focusedCheck, compactEditReceipt, packDefinitions, compactDefinition } from './plan-policy.mjs';
+test('definition kinds use the edit selector vocabulary without inventing language kinds', () => {
+  const original = {file:'a.go', entity:{name:'Backend',type:'type',file:'a.go'}, content:'type Backend interface {}'};
+  const compact = compactDefinition(original);
+  assert.equal(compact.entity.entity_type, 'type');
+  assert.equal(compact.entity.type, undefined);
+  assert.equal(original.entity.type, 'type');
+  assert.equal(compact.content, original.content);
+});
 test('pages expose all ambiguous definitions without gaps', () => {
   const hits = Array.from({length: 23}, (_,i) => i);
   const seen = []; let offset = 0;

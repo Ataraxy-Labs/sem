@@ -3169,15 +3169,33 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
       if (lines[i]?.trim() === "import (") {
         goImportBlock = true;
         i++;
-        while (i < lines.length && lines[i]!.trim() !== ")") i++;
+        while (i < lines.length && lines[i]!.trim() !== ")") {
+          // Grouped Go specs are indented, unlike top-level declarations.
+          // Compare the whole spec, including aliases; never confuse a
+          // quoted string in a function body with an existing import.
+          if (lines[i]!.trim() === goSpec) {
+            return { file, line: i + 1, added: false, alreadyPresent: true };
+          }
+          i++;
+        }
         if (i < lines.length) goInsertAt = i;
       } else {
         goInsertAt = i;
+        while (/^import\s+/.test(lines[i]?.trim() ?? "")) {
+          if (lines[i]!.trim().replace(/^import\s+/, "") === goSpec) {
+            return { file, line: i + 1, added: false, alreadyPresent: true };
+          }
+          i++;
+        }
       }
     }
   }
   for (let i = 0; i < lines.length; ) {
     const t = lines[i]!.trim();
+    if (file.endsWith(".java") && /^package\s+[\w.]+\s*;/.test(t)) {
+      lastImportIdx = i++;
+      continue;
+    }
     if (/^#\s*include\b/.test(t)) {
       lastImportIdx = i;
       i++;

@@ -5,6 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {selectEntity,invalidateChanged,acknowledgeDefinitions} from './repair-contract.mjs';
+test('exact-case names and parents win without weakening type guards',()=>{
+  const entries=[{name:'ProcessState',type:'function'}, {name:'processState',type:'method',parent_name:'ConnectionState'}];
+  assert.equal(selectEntity(entries,{name:'ProcessState'}),entries[0]);
+  assert.equal(selectEntity(entries,{name:'processState'}),entries[1]);
+  assert.throws(()=>selectEntity(entries,{name:'PROCESSSTATE'}),/Ambiguous/);
+  assert.throws(()=>selectEntity(entries,{name:'ProcessState',entity_type:'method'}),/incompatible/);
+  const members=[{name:'run',type:'method',parent_name:'A'},{name:'run',type:'method',parent_name:'a'}];
+  assert.equal(selectEntity(members,{name:'run',parent_name:'a'}),members[1]);
+});
 test('typed selectors never collapse impl into same-name struct',()=>{
   const entries=[{name:'BuildConfig',type:'struct',start_line:1},{name:'BuildConfig',type:'impl',start_line:10}];
   assert.equal(selectEntity(entries,{name:'BuildConfig',entity_type:'impl'}).start_line,10);
