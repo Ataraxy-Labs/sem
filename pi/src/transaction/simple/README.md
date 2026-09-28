@@ -32,6 +32,17 @@ Set its working directory to the target repository. The four tools are
 config contains the recommended agent instructions. Prewarming is explicit and
 optional; subsequent index freshness is lazy, not an always-running daemon.
 
+The config also includes shared simple-efficiency guidance from
+`efficiency-policy.mjs`: reuse read handles, batch known targets, avoid unrelated
+cleanup, and finish after required final-patch checks rather than rerun solely
+for verbose reporting. Other clients can import `simpleEfficiencyPolicy` and
+append it to their agent instructions. This is guidance, not runtime enforcement;
+it adds no formatter, validation cache, or parallel-write guarantee.
+
+This guidance was replayed with a separate context-on-request development adapter.
+Publishing the guidance alone does not reproduce that adapter or its benchmarks.
+Results varied by task; it is not a universal speed or token-efficiency claim.
+
 ## Validation and limits
 
 Local validation uses SEM's check API. The optional benchmark Docker checker

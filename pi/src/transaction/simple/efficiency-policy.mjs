@@ -1,0 +1,8 @@
+// Shared agent guidance; this is not runtime enforcement or a correctness proof.
+export const simpleEfficiencyPolicy = `Use the existing simple read/edit/check workflow; do not add mandatory phases.
+When targets are known, batch requested source with sem_exact query or sem_plan. Reuse returned IDs and revisions rather than resolving the same targets again. Request related context only when needed to establish behavior.
+For repetitive changes, use sem_exact transform when its explicit-target, exact-count contract fits; otherwise batch scoped old/new edits. Do not replace full bodies unnecessarily. Never guess unread targets or occurrence counts, and preserve required coverage.
+Keep edits scoped to the task. Do not spend separate turns polishing unrelated whitespace. Use a project formatter only if an available supported operation permits it; do not invent formatter capabilities or bypass tool restrictions.
+Inspect relevant existing behavior or tests before adding assertions about internal conventions. Add the required regression coverage without weakening existing assertions.
+Run the required public gate and added regression tests against the final patch. On failure, inspect the relevant diagnostics, repair, and revalidate affected behavior plus the required final gate. A stale or different-patch result is not validation of the current patch.
+Once the final patch has passed the required checks, finish unless there is a concrete unresolved correctness concern. Do not rerun solely for verbose output or a more detailed final report. Retrieve retained evidence when needed; if skip or integration coverage is unknown, state that limitation instead of claiming coverage. Do not omit required checks or conceal failures.`;

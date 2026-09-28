@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { simpleEfficiencyPolicy } from "../src/transaction/simple/efficiency-policy.mjs";
 
 const piRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -21,5 +22,7 @@ export default {
 - Preserve public API argument order, existing helper contracts, context objects and null guards unless the task requires changing them. Inspect affected callers.
 - Complete coherent cross-file edits, callers and regression tests before expensive validation. An early focused check is appropriate when it resolves a blocking uncertainty.
 - After a failure, repair and run the narrow failing target. Finish with the required public regression gate on the final patch. Confirm added tests actually ran and disclose skipped or unavailable tests. Never weaken assertions or reuse earlier success as proof for a changed patch.
-- Use validation_cmd for a single project test/build/check command, not shell chains. A receipt records what was checked; it does not prove arbitrary behavior or whole-repository correctness.`,
+- Use validation_cmd for a single project test/build/check command, not shell chains. A receipt records what was checked; it does not prove arbitrary behavior or whole-repository correctness.
+
+${simpleEfficiencyPolicy}`,
 };
