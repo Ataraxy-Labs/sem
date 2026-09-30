@@ -85,8 +85,8 @@ test('exact snapshot contract against real SEM parser',async()=>{
     assert.equal(api.query(s.revision,[{file:'absent.ts'}]).results[0].status,'not_found');
     assert.deepEqual({revision:s.revision,...batch.sources[0]},read);
     assert.throws(()=>api.query(s.revision,[]),/INVALID_SELECTORS/);
-    assert.throws(()=>api.query(s.revision,[{name:'same',id:e.id}]),/INVALID_SELECTOR/);
-    assert.throws(()=>api.query(s.revision,[{name:'same',file:42}]),/INVALID_SELECTOR/);
+    assert.equal(api.query(s.revision,[{name:'same',id:e.id}]).results[0].error.code,'INVALID_SELECTOR');
+    assert.equal(api.query(s.revision,[{name:'same',file:42}]).results[0].error.code,'INVALID_SELECTOR');
     assert.equal(read.content,Buffer.from(source).subarray(e.start,e.end).toString());
     const replacement='export function same() { return 42; }';
     const prepared=api.prepare(s.revision,[{id:e.id,content:replacement}]);

@@ -38,11 +38,12 @@ export class ExactCode {
     if(!Number.isSafeInteger(maxSnapshots)||maxSnapshots<1) fail('INVALID_SNAPSHOT_CAPACITY');
     Object.assign(this,{semBin,maxBytes,maxSnapshots}); this.snapshots=new Map();
   }
-  async capture(cwd, files, {allowMissing=false}={}) {
+  async capture(cwd, files, {allowMissing=false,partialReads=false}={}) {
     if(!Array.isArray(files)||!files.length||files.length>64) fail('INVALID_FILE_SCOPE');
     const root=await fs.realpath(cwd), sources=new Map();
     let total=0;
     const missing=[];
+    const fileErrors=[];
     for(const file of [...new Set(files)].sort(order)) {
       if(typeof file!=='string'||!file||path.isAbsolute(file)||file.split('/').some(x=>!x||x==='.'||x==='..')) fail('INVALID_PATH');
       const absolute=path.join(root,file);
@@ -52,6 +53,9 @@ export class ExactCode {
         stat=await fs.stat(absolute);
       } catch(error) {
         if(allowMissing&&error.code==='ENOENT') {missing.push(file);continue;}
+        if(partialReads&&error.message==='SYMLINK_NOT_SUPPORTED') {
+          fileErrors.push({file,code:'SYMLINK_NOT_SUPPORTED'});continue;
+        }
         throw error;
       }
       if(!stat.isFile()||stat.size>this.maxBytes-total) fail('SCOPE_TOO_LARGE');
@@ -61,7 +65,7 @@ export class ExactCode {
       sources.set(file,bytes);
     }
     const manifest=[...sources].map(([file,b])=>({file,sha256:hash(b)}));
-    const revision=hash(JSON.stringify([manifest,missing]));
+    const revision=hash(JSON.stringify(fileErrors.length?[manifest,missing,fileErrors]:[manifest,missing]));
     if(!this.snapshots.has(revision)) {
       const tmp=await fs.mkdtemp(path.join(os.tmpdir(),'sem-exact-'));
       const entities=[];
@@ -83,13 +87,13 @@ export class ExactCode {
       entities.sort((a,b)=>order(a.file,b.file)||a.start-b.start||a.end-b.end||order(a.id,b.id));
       // Lexical containment only, not receiver/type or runtime resolution.
       qualifyEntities(entities);
-      this.snapshots.set(revision,{sources,entities,manifest,...indexEntities(entities)});
+      this.snapshots.set(revision,{sources,entities,manifest,fileErrors,...indexEntities(entities)});
       // Evict only after a successful capture. Failed parsing must not destroy
       // usable snapshots. IDs remain revision-bound, never redirected.
       while(this.snapshots.size>this.maxSnapshots) this.snapshots.delete(this.snapshots.keys().next().value);
     }
     this.get(revision);
-    return {revision,files:manifest,missing_files:missing,scope:'explicit_files',coverage:'parser_reported_only',consistency:'captured_file_bytes_not_atomic_repository_snapshot'};
+    return {revision,files:manifest,missing_files:missing,...(fileErrors.length?{file_errors:fileErrors,complete:false}:{}),scope:'explicit_files',coverage:'parser_reported_only',consistency:'captured_file_bytes_not_atomic_repository_snapshot'};
   }
   get(revision) {
     const snapshot=this.snapshots.get(revision);
@@ -116,6 +120,8 @@ export class ExactCode {
     const s=this.get(revision), sources=new Map(), files=new Map();
     let fileBudget=48000;
     const results=selectors.map(selector=>{
+      const unavailable=s.fileErrors?.find(error=>error.file===selector?.file);
+      if(unavailable) return {selector,status:'error',error:unavailable,complete:false};
       if(selector && typeof selector==='object' && Object.keys(selector).length===1 && typeof selector.file==='string' && selector.file) {
         const bytes=s.sources.get(selector.file);
         if(!bytes) return {selector,status:'not_found'};
@@ -129,7 +135,7 @@ export class ExactCode {
       if(!selector||typeof selector!=='object'||Array.isArray(selector)||
          Object.keys(selector).some(k=>!['id','name','file','type'].includes(k))||
          (typeof selector.id==='string')===(typeof selector.name==='string')||
-         Object.values(selector).some(v=>typeof v!=='string'||!v)) fail('INVALID_SELECTOR');
+         Object.values(selector).some(v=>typeof v!=='string'||!v)) return {selector,status:'error',error:{code:'INVALID_SELECTOR'},complete:false};
       const matches=lookupEntities(s,selector);
       const status=matches.length===0?'not_found':matches.length===1?'unique':'ambiguous';
       if(status==='unique') {
@@ -144,7 +150,7 @@ export class ExactCode {
     });
     // Reuse containing source only within this response. No assumption that a
     // previous tool response is still in the model's context.
-    return {revision,results,sources:compactSources([...sources.values()]),...(files.size?{files:[...files.values()]}:{}),coverage:'parser_reported_only'};
+    return {revision,results,...(s.fileErrors?.length?{file_errors:s.fileErrors,complete:false}:{}),sources:compactSources([...sources.values()]),...(files.size?{files:[...files.values()]}:{}),coverage:'parser_reported_only'};
   }
   prepare(revision,edits) {
     if(!Array.isArray(edits)||!edits.length||edits.length>64) fail('INVALID_EDITS');
