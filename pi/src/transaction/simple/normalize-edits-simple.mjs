@@ -185,6 +185,7 @@ export async function normalizeEdits(rawEdits, cwd, api) {
         name: enclosing.name,
         entity_type: enclosing.type,
         ...(enclosing.parent_name ? { parent_name: enclosing.parent_name } : {}),
+        ordinal: (outlines.get(file).entities ?? []).filter(e=>e.name===enclosing.name && e.type===enclosing.type && (!enclosing.parent_name || e.parent_name===enclosing.parent_name)).findIndex(e=>e.start_line===enclosing.start_line && e.end_line===enclosing.end_line),
       },
       op: "replace",
       content,

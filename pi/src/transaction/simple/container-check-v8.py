@@ -39,6 +39,10 @@ def _check(command):
             head=run(['docker','exec',name,'git','-C','/testbed','rev-parse','HEAD'],**options).stdout.strip()
             if head!=os.environ['SEM_VALIDATION_BASE']:
                 return {'pass':None,'stage':'unavailable','error':'Validation image is not at the task base revision'}
+        else:
+            state=json.loads(run(['docker','inspect','--format','{{json .State}}',name],**options).stdout)
+            if state.get('Running') is False:
+                run(['docker','start',name],**options)
         run(['git','add','-N','--','.'],cwd=cwd,**options)
         patch=run(['git','diff','--no-ext-diff','--binary','HEAD'],cwd=cwd,**options).stdout
         previous=subprocess.run(['docker','exec',name,'cat','/tmp/sem-applied.diff'],capture_output=True,text=True)
@@ -77,10 +81,19 @@ def _check(command):
             'executed_argv':argv,
             'patch_unchanged':unchanged,'applied_delta_bytes':len(delta.encode()),
             'exit_code':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
-    except subprocess.TimeoutExpired:
-        # Terminate only this trial's disposable checker, including running tests.
-        subprocess.run(['docker','stop','-t','1',name],capture_output=True,timeout=30)
-        return {'pass':None,'stage':'timeout','error':'Public validation exceeded its bounded timeout'}
+    except subprocess.TimeoutExpired as error:
+        # Terminate the test tree, preserving this disposable checker's caches.
+        def decoded(value):
+            return value.decode('utf-8',errors='replace') if isinstance(value,bytes) else (value or '')
+        recovery='checker_restarted; retry a narrower test target'
+        try:
+            run(['docker','restart','-t','1',name],timeout=30)
+        except (subprocess.SubprocessError,OSError) as restart_error:
+            recovery='checker_restart_failed: '+str(restart_error)[:300]
+        return {'pass':None,'stage':'timeout','error':'Public validation exceeded its bounded timeout',
+                'stdout':decoded(error.stdout),'stderr':decoded(error.stderr),
+                'recovery':recovery,'executed_argv':argv,
+                'checked_patch_sha256':hashlib.sha256(patch.encode()).hexdigest() if 'patch' in locals() else None}
     except (subprocess.CalledProcessError,OSError) as error:
         return {'pass':None,'stage':'unavailable','error':str(getattr(error,'stderr',None) or error)[-12000:]}
 

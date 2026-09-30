@@ -125,6 +125,7 @@ const entity = object({
   entity_type: { type: "string" },
   parent_name: { type: "string" },
   ordinal: { type: "integer", minimum: 0 },
+  start_line: { type: "integer", minimum: 1, description: "Parser-provided start line in the current input snapshot; disambiguates overloaded entities." },
 }, ["name"]);
 const edit = object({
   file: { type: "string" },
