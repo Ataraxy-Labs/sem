@@ -6,7 +6,17 @@ const {parentPort,workerData}=require('node:worker_threads');
 const vm=require('node:vm');
 try {
  const context=vm.createContext(Object.create(null),{codeGeneration:{strings:false,wasm:false}});
- const source='JSON.stringify((function(){"use strict";const entities='+JSON.stringify(workerData.entities)+';const files='+JSON.stringify(workerData.files)+';'+workerData.code+'\\n})())';
+ const helper=String.raw\`function replaceEntity(row,old,value) {
+   if(!entities.includes(row)||!row.entity||typeof row.content!=='string')
+     throw Error('replaceEntity requires a provided entity');
+   if(typeof old!=='string'||!old||typeof value!=='string'||row.content.split(old).length!==2)
+     throw Error('replaceEntity anchor must occur exactly once');
+   const {name,parent_name,start_line}=row.entity;
+   const entity_type=row.entity.entity_type??row.entity.type;
+   if(!name||!entity_type)throw Error('Parser name and kind required');
+   return {file:row.file,entity:{name,entity_type,...(parent_name?{parent_name}:{}),...(Number.isInteger(start_line)?{start_line}:{})},old,new:value};
+ }\`;
+ const source='JSON.stringify((function(){"use strict";const entities='+JSON.stringify(workerData.entities)+';const files='+JSON.stringify(workerData.files)+';'+helper+workerData.code+'\\n})())';
  const value=new vm.Script(source).runInContext(context,{timeout:500});
  if(typeof value!=='string'||value.length>500000)throw new Error('Program must return bounded JSON');
  parentPort.postMessage({value});

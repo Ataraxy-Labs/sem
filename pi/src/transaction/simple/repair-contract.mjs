@@ -9,7 +9,12 @@ export function selectEntity(entities, requested) {
     const exactParent=candidates.filter(e=>e.parent_name===requested.parent_name);
     candidates=exactParent.length?exactParent:candidates.filter(e=>e.parent_name?.toLowerCase()===requested.parent_name.toLowerCase());
   }
-  const ordinal=requested.ordinal;
+  if(requested.start_line!==undefined) {
+    if(!Number.isInteger(requested.start_line)||requested.start_line<1)
+      throw new Error('Invalid entity start_line');
+    candidates=candidates.filter(e=>e.start_line===requested.start_line);
+  }
+  const ordinal=requested.start_line!==undefined ? undefined : requested.ordinal;
   if((ordinal!==undefined&&(!Number.isInteger(ordinal)||ordinal<0||ordinal>=candidates.length))
       ||(ordinal===undefined&&candidates.length!==1)) {
     throw new Error('Ambiguous or incompatible entity selector; use an exact type/parent/ordinal: '+JSON.stringify(sameName.map(e=>({name:e.name,entity_type:e.type,parent_name:e.parent_name,start_line:e.start_line}))));
