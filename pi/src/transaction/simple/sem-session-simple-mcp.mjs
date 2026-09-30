@@ -882,7 +882,7 @@ if(process.env.SEM_EXACT_TOOLS === '1') {
         }
         case 'query': {
           if(Boolean(p.revision)===Boolean(p.files)) throw new Error('PROVIDE_REVISION_OR_FILES');
-          const snapshot=p.files?await exact.capture(cwd,p.files,{allowMissing:true}):null;
+          const snapshot=p.files?await exact.capture(cwd,p.files,{allowMissing:true,partialReads:true}):null;
           return {...exact.query(snapshot?.revision??p.revision,p.selectors),...(snapshot?{snapshot}: {})};
         }
         case 'capture': return exact.capture(cwd,p.files);
