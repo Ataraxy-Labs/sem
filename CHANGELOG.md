@@ -14,6 +14,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- Text search includes eligible files without a structural parser (such as Objective-C++ `.mm` and custom build files), including alongside a warm structural index. Search responses preserve coverage limits separately from result pagination; binary content remains excluded.
+
 - Simple transaction edits preserve overloaded entity selectors. Timed-out public checks retain partial diagnostics and restart their disposable checker so subsequent validation can proceed.
 
 - Simple transaction read batches preserve valid results when another selector is malformed or a requested path is rejected as a symlink. Partial captures report their errors explicitly; strict capture and edit checks remain unchanged.

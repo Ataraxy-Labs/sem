@@ -11,6 +11,28 @@ pub fn find_supported_files_in_path(
     ext_filter: &[String],
     no_default_excludes: bool,
 ) -> Vec<String> {
+    find_files_in_path(
+        root,
+        scan_path,
+        Some(registry),
+        ext_filter,
+        no_default_excludes,
+    )
+}
+
+/// Text discovery must not depend on whether a structural parser exists.
+/// Retains Sem's ignore, hidden-file and binary-path exclusions.
+pub fn find_search_files(root: &Path) -> Vec<String> {
+    find_files_in_path(root, root, None, &[], false)
+}
+
+fn find_files_in_path(
+    root: &Path,
+    scan_path: &Path,
+    registry: Option<&ParserRegistry>,
+    ext_filter: &[String],
+    no_default_excludes: bool,
+) -> Vec<String> {
     let mut files = Vec::new();
 
     let mut builder = ignore::WalkBuilder::new(scan_path);
@@ -57,7 +79,9 @@ pub fn find_supported_files_in_path(
         };
 
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file()
+            || (registry.is_none() && !entry.file_type().is_some_and(|kind| kind.is_file()))
+        {
             continue;
         }
 
@@ -78,7 +102,9 @@ pub fn find_supported_files_in_path(
         if is_probably_binary_path(&rel_path) {
             continue;
         }
-        if !has_supported_plugin(path, &rel_path, registry, ext_filter) {
+        if registry
+            .is_some_and(|registry| !has_supported_plugin(path, &rel_path, registry, ext_filter))
+        {
             continue;
         }
         files.push(rel_path);

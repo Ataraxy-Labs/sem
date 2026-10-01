@@ -27,6 +27,7 @@ test("grep finds literal/regex text hits with file:line:text", async () => {
   await withTempCopy(["sample.ts"], async (dir) => {
     const outcome = await run({ pattern: "export function" }, dir);
     assert.equal(outcome.isError, false, outcome.text);
+    assert.equal(typeof outcome.details.coverage, 'string');
     assert.match(outcome.text, /sample\.ts:L13: export function standalone/);
     assert.match(outcome.text, /sample\.ts:L17: export function helper/);
   });

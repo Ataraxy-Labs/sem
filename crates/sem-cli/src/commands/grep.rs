@@ -58,6 +58,7 @@ pub fn grep_multi_command(cwd: String, patterns: Vec<String>, case_insensitive: 
                     "candidate_files": candidate_files,
                     "total_files": total_files,
                     "origin": origin_label(*origin),
+                    "coverage": "eligible_text_files_best_effort; ignore_hidden_binary_and_default_exclusions_apply",
                 })
             })
             .collect();
@@ -100,12 +101,35 @@ fn search_one(
     let root = super::repo_root_or_cwd(cwd);
     let grep_opts = grep::GrepOptions { case_insensitive };
 
-    let registry = super::create_registry(cwd);
+    let file_paths = super::files::find_search_files(&root);
     let from_index = if std::env::var_os("SEM_NO_INDEX").is_none() {
         super::query::open_index(&root).map(|idx| {
-            grep::search(&idx, &root, pattern, &grep_opts, |dir: &std::path::Path| {
-                super::files::find_supported_files_in_path(&root, dir, &registry, &[], false)
-            })
+            let indexed: std::collections::HashSet<_> = (0..idx.file_count())
+                .map(|i| idx.file_path(i as u32).to_string())
+                .collect();
+            // The structural index cannot contain every text file. Search the
+            // unindexed remainder even when no directory mtime has changed.
+            let extra: Vec<_> = file_paths
+                .iter()
+                .filter(|file| !indexed.contains(*file))
+                .cloned()
+                .collect();
+            let mut report = grep::search(&idx, &root, pattern, &grep_opts, |_| Vec::new())?;
+            report
+                .hits
+                .retain(|hit| file_paths.binary_search(&hit.file).is_ok());
+            report
+                .hits
+                .extend(grep::full_scan(&root, &extra, pattern, &grep_opts)?);
+            report
+                .hits
+                .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+            report
+                .hits
+                .dedup_by(|a, b| a.file == b.file && a.line == b.line);
+            report.candidate_files += extra.len();
+            report.total_files = file_paths.len();
+            Ok::<_, regex::Error>(report)
         })
     } else {
         None
@@ -126,8 +150,6 @@ fn search_one(
         // (a bare `sem grep` on an unindexed repo does not itself trigger a
         // corpus-level build — the next `graph`/`diff`/`impact`/`find` does).
         None => {
-            let file_paths =
-                super::graph::find_supported_files_with_options(&root, &registry, &[], false);
             let hits = grep::full_scan(&root, &file_paths, pattern, &grep_opts)?;
             let n = file_paths.len();
             Ok((hits, CandidateOrigin::FullScan, n, n))
@@ -149,6 +171,7 @@ struct HitRow {
 
 #[derive(Serialize)]
 struct Report {
+    coverage: &'static str,
     hits: Vec<HitRow>,
     candidate_files: usize,
     total_files: usize,
@@ -172,6 +195,8 @@ fn render(
 ) {
     if json {
         let report = Report {
+            coverage:
+                "eligible_text_files_best_effort; ignore_hidden_binary_and_default_exclusions_apply",
             hits: hits
                 .iter()
                 .map(|h| HitRow {

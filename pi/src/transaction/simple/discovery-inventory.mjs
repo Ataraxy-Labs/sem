@@ -9,6 +9,8 @@ export function matchInventory(group, hits, offset = 0, limit = 60) {
     pattern: group.pattern, total, returned: page.length,
     omitted: Math.max(0, total - page.length),
     complete: offset === 0 && !availableMore && !upstreamTruncated,
+    completeness_scope: 'returned_search_results_not_repository_coverage',
+    coverage: group.coverage ?? 'unspecified_upstream_search_scope',
     next_offset: availableMore ? offset + page.length : null,
     upstream_truncated: upstreamTruncated,
     next_action: availableMore ? 'Repeat with match_offset=next_offset.' :
