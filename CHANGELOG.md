@@ -14,6 +14,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- **Portable transaction startup and guarded batches.** The simple server starts without JeV credentials; external ranking requires explicit `SEM_JEV_ENABLED=1` plus credentials and task. Same-file exact-edit batches enforce intermediate snapshot guards and roll back earlier writes on a later edit error.
+
 - Experimental structural-session adapter snapshot adds explicitly scoped reads and edit programs, batched discovery, bounded validation evidence, and timeout recovery. Retained as a research branch: benchmark timings vary with agent-selected validation workloads and do not establish a universal speedup.
 - Text search includes eligible files without a structural parser (such as Objective-C++ `.mm` and custom build files), including alongside a warm structural index. Search responses preserve coverage limits separately from result pagination; binary content remains excluded.
 

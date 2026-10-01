@@ -18,7 +18,7 @@ export default {
 - Read the source needed to make the change; batch related requests when useful. There is no fixed discovery or transaction call quota.
 - Use sem_plan for discovery and sem_exact query for batched explicit-file or symbol reads. Parser coverage is not semantic completeness; resolve ambiguity explicitly and inspect missing context.
 - Do not repeatedly fetch unchanged source already in context. Acknowledge only receipts you actually received; rotate context_epoch after context loss or use refresh_source=true.
-- Use entity-scoped old/new edits for small substitutions. Preserve exact entity type and parent. Use sem_exact apply for one captured entity per file, weave_transaction for multiple targets, and weave_program for repetitive edits. Recapture changed files; do not reuse stale snapshots.
+- Use entity-scoped old/new edits for small substitutions. Preserve exact entity type and parent. Use sem_exact apply for captured, non-overlapping entities (including same-file batches), weave_transaction for other targets, and weave_program for repetitive edits. Recapture changed files; do not reuse stale snapshots.
 - Preserve public API argument order, existing helper contracts, context objects and null guards unless the task requires changing them. Inspect affected callers.
 - Complete coherent cross-file edits, callers and regression tests before expensive validation. An early focused check is appropriate when it resolves a blocking uncertainty.
 - After a failure, repair and run the narrow failing target. Finish with the required public regression gate on the final patch. Confirm added tests actually ran and disclose skipped or unavailable tests. Never weaken assertions or reuse earlier success as proof for a changed patch.

@@ -1046,10 +1046,11 @@ if(tools.has('sem_exact')) {
   };
 }
 const jevCredential = process.env.SEM_JEV_PROXY_TOKEN || process.env.TYPESAFE_API_KEY;
-if (process.env.SEM_JEV_DISABLED !== '1' && (!jevCredential || !process.env.SEM_JEV_TASK)) {
+const jevEnabled = process.env.SEM_JEV_ENABLED === '1' && process.env.SEM_JEV_DISABLED !== '1';
+if (jevEnabled && (!jevCredential || !process.env.SEM_JEV_TASK)) {
   throw new Error('Jev experimental adapter requires credential and task environment; refusing silent unranked trial');
 }
-const jevRank = createJevRanker({key:jevCredential, task:process.env.SEM_JEV_TASK, endpoint:process.env.SEM_JEV_ENDPOINT});
+const jevRank = createJevRanker({key:jevEnabled ? jevCredential : undefined, task:process.env.SEM_JEV_TASK, endpoint:process.env.SEM_JEV_ENDPOINT});
 const unrankedPlan = tools.get('sem_plan').run;
 tools.get('sem_plan').run = async (params,cwd) => jevRank(await unrankedPlan(params,cwd));
 if(tools.has('sem_exact')) {

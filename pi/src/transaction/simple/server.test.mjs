@@ -12,6 +12,8 @@ test('portable simple config exposes exact tools and permits continued discovery
   const server = config.servers[0];
   const client = new McpClient({ ...server, cwd, env: {
     ...server.env,
+    SEM_JEV_ENABLED: '', SEM_JEV_DISABLED: '',
+    SEM_JEV_PROXY_TOKEN: '', TYPESAFE_API_KEY: '', SEM_JEV_TASK: '',
     PATH: process.env.SEM_TEST_BIN
       ? path.dirname(process.env.SEM_TEST_BIN) + path.delimiter + process.env.PATH
       : process.env.PATH,

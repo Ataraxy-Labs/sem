@@ -35,6 +35,10 @@ test('one exact batch edits disjoint same-file entities without recapture, prese
    assert.equal(await fs.readFile(file,'utf8'),source);
    const a=exact.get(snap.revision).entities.find(e=>e.id===id('first'));
    const b=exact.get(snap.revision).entities.find(e=>e.id===id('second'));
+   await assert.rejects(performWeaveEdit({atomic:true,claim:false,edits:[
+    {file:'a.ts',entity:{name:'first'},op:'replace',content:'export function first() { return 100; }'},
+   ]},{cwd:root,semBin,checkDependents:false,snapshotTargetsByEdit:[]}),/INVALID_SNAPSHOT_TARGETS/);
+   assert.equal(await fs.readFile(file,'utf8'),source);
    const thrown=await performWeaveEdit({atomic:true,claim:false,edits:[
     {file:'a.ts',entity:{name:'second'},op:'replace',content:'export function second() { return 200; }'},
     {file:'a.ts',entity:{name:'first'},op:'replace',content:'export function first() { return 100; }'},
