@@ -5,6 +5,24 @@ import os from 'node:os';
 import path from 'node:path';
 import {ExactCode} from './exact-code.mjs';
 const semBin=process.env.SEM_TEST_BIN || 'sem';
+test('parser-declared Go receiver names survive cold and cached capture',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'sem-parent-test-'));
+  try {
+    await fs.writeFile(path.join(root,'a.go'),'package sample\ntype A struct{}\ntype B struct{}\nfunc (a *A) Save() int { return 1 }\nfunc (b B) Save() int { return 2 }\n');
+    await fs.writeFile(path.join(root,'b.go'),'package sample\nfunc Other() {}\n');
+    const api=new ExactCode({semBin});
+    const first=await api.capture(root,['a.go']);
+    const queried=api.query(first.revision,[{name:'A.Save'},{name:'B.Save'},{name:'Save'}]);
+    assert.deepEqual(queried.results.map(x=>x.status),['unique','unique','ambiguous']);
+    assert.match(queried.sources[0].content,/return 1/);
+    assert.equal(queried.sources[0].entity.parent_name,'A');
+    const second=await api.capture(root,['a.go','b.go']);
+    assert.equal(api.lastCaptureParsing.cache_hits,1);
+    assert.equal(api.resolve(second.revision,'A.Save').status,'unique');
+    assert.notEqual(api.resolve(first.revision,'A.Save').matches[0].id,api.resolve(second.revision,'A.Save').matches[0].id);
+    assert.equal(api.resolve(second.revision,'C.Save').status,'not_found');
+  } finally {await fs.rm(root,{recursive:true,force:true});}
+});
 test('snapshot LRU survives long sessions and failed captures without reusing stale IDs',async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'sem-lru-test-'));
   try {

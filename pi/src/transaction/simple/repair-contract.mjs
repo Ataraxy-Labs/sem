@@ -9,6 +9,8 @@ export function selectEntity(entities, requested) {
     const exactParent=candidates.filter(e=>e.parent_name===requested.parent_name);
     candidates=exactParent.length?exactParent:candidates.filter(e=>e.parent_name?.toLowerCase()===requested.parent_name.toLowerCase());
   }
+  // A parser-provided location disambiguates overloads in the checked input
+  // snapshot. Never silently redirect a stale location to a same-name method.
   if(requested.start_line!==undefined) {
     if(!Number.isInteger(requested.start_line)||requested.start_line<1)
       throw new Error('Invalid entity start_line');

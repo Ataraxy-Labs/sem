@@ -20,9 +20,17 @@ import { matchInventory, measuredLookup } from "./discovery-inventory.mjs";
 import { ContextReceipts } from "./context-receipts.mjs";
 import { ExactCode } from "./exact-code.mjs";
 import { applyExact } from "./exact-weave.mjs";
+import { repeatedEdits } from "./repeated-edits.mjs";
 import { normalizeEdits } from "./normalize-edits-simple.mjs";
 import { searchPreviews } from "./search-previews.mjs";
+import { createJevRanker } from "./jev-ranker.mjs";
+import { EntityInterface } from './entity-interface.mjs';
+import {RequestScheduler, requestKind} from './request-scheduler.mjs';
+import {rememberExactSource} from './exact-program-cache.mjs';
 import { pythonModuleHint } from "./import-hints.mjs";
+import {prepareScopedProgram} from './scoped-program.mjs';
+import {formatFiles} from './format-files.mjs';
+import {ReviewDiff} from './review-diff.mjs';
 const contextReceipts = new ContextReceipts();
 import { buildSemApi } from "../../codemode/api.ts";
 import { performWeaveEdit } from "../../tools/weave-edit.ts";
@@ -122,10 +130,9 @@ const object = (properties, required = []) => ({ type: "object", properties, req
 const entity = object({
   name: { type: "string" },
   file: { type: "string" },
-  entity_type: { type: "string" },
+  entity_type: { type: "string", description: "Copy the parser kind returned by the read, never infer it from language syntax (a Go interface may be type). Omit when the name is unique." },
   parent_name: { type: "string" },
   ordinal: { type: "integer", minimum: 0 },
-  start_line: { type: "integer", minimum: 1, description: "Parser-provided start line in the current input snapshot; disambiguates overloaded entities." },
 }, ["name"]);
 const edit = object({
   file: { type: "string" },
@@ -239,18 +246,18 @@ const tools = new Map([
     description: "Batch code discovery: resolve names and references structurally, or read known small files using files when imports/configuration/test layout are needed. Prefer one query containing related targets. Follow up only for missing context. Unresolved names do not prove absence.",
     schema: object({
       entity_names: { type: "array", items: { type: "string" }, maxItems: 12, description: "Exact or likely function/class/method names. Unqualified names are allowed and may return several definitions." },
-      expand_context: {type:"boolean",default:false,description:"Opt in to loading enclosing bodies for regex matches and related types. Default returns match locators and reads only explicitly requested files or entity_names; use explicit reads for selected targets."},
+      expand_context: {type:"boolean",default:false,description:"Opt in to related bodies, imports, member inventories, callsite excerpts and contextual hints. Default returns search locators/previews and only explicitly requested file/entity source; no unsolicited context sidecars."},
       regex_patterns: { type: "array", items: { type: "string" }, maxItems: 6, description: "Source regexes for concepts whose entity name is unknown. Returns compact matching lines; set expand_context=true to also read enclosing entities." },
       match_offset: {type:"integer", minimum:0, maximum:10000, description:"Page offset for compact match locators, independent of definition bodies."},
       path: { type: "string" },
-      context_epoch: {type:"string",minLength:1,maxLength:80,description:"Optional acknowledgement that all previous sem_plan source in this epoch remains in your context. Reuse the ID to avoid repeat bodies; change it after compaction/context loss. Omit for full source."},
+      context_epoch: {type:"string",minLength:1,maxLength:80,description:"Context-retention ID, NOT a file, query, or editing-phase ID. Keep it unchanged across files and edits while previous responses remain in context; rotate only after context loss/compaction. Echo ack_sequence to acknowledge received source. Omit for full source."},
       ack_sequence: {type:"integer",minimum:0,description:"Echo the context_receipt.ack_sequence from the last successfully received sem_plan response to acknowledge its source. Do not acknowledge lost responses."},
       refresh_source: {type:"boolean",description:"Return full source even when acknowledged; clears epoch receipts."},
       known_receipts: {type:"array",items:{type:"string"},maxItems:128,description:"Receipts of definitions already available in your context. Only explicitly acknowledged unchanged bodies are omitted; changed bodies are returned fully."},
-      files: {type:"array",items:{type:"string"},maxItems:8,description:"Optional known repository-relative files. Explicit bounded text fallback, total 48KB shared with entity payloads. Useful for imports, configuration and small test files; check truncated."},
+      files: {type:"array",items:{type:"string"},maxItems:64,description:"Batch related known repository-relative files in one request, not one call per file. Explicit bounded text fallback, total 48KB shared with entity payloads regardless of file count. Useful for imports, configuration and small test files; follow up only for missing/truncated context."},
       candidate_offset: { type: "integer", minimum: 0, default: 0, description: "Per-name pagination offset from resolutions.next_offset. Keep query names, patterns and bounds unchanged when paging." },
       prefer_tests: { type: "boolean", default: false, description: "Rank test files first when the task explicitly targets tests, fixtures, or test compatibility." },
-      max_entities: { type: "integer", minimum: 1, maximum: 64, default: 24, description: "Up to 64 short definitions; full definition payloads share a 48KB byte budget. Oversized payloads return explicit deferred locators." },
+      max_entities: { type: "integer", minimum: 0, maximum: 64, default: 24, description: "Up to 64 short definitions; 0 returns name candidates/search previews and explicit files without entity bodies. Full definition payloads share a 48KB byte budget. Oversized payloads return explicit deferred locators." },
       budget_per_entity: { type: "integer", minimum: 300, maximum: 10000, default: 1800, description: "Read budget per entity; raise for long definitions. The shared 48KB payload cap still applies. See effective_budget_per_entity and truncation flags." },
     }),
     async run(params, cwd) {
@@ -259,7 +266,7 @@ const tools = new Map([
       const api = buildSemApi({ cwd, semBin: "sem" });
       // Enforce bounds here as well as in the advertised schema. Some MCP
       // clients do not validate model-generated arguments before dispatch.
-      const max = boundedInteger(params.max_entities, 24, 1, 64);
+      const max = boundedInteger(params.max_entities, 24, 0, 64);
       const budget = boundedInteger(params.budget_per_entity, 1800, 300, 10000);
       const offset = boundedInteger(params.candidate_offset, 0, 0, 10000);
       const preferTests = params.prefer_tests === true;
@@ -540,7 +547,7 @@ const tools = new Map([
       // hydrated class. Full class reads can be truncated and plausible API
       // names are a common source of otherwise-correct patches. Outlines are
       // structural index facts, so this adds reliability without source grep.
-      const classDefinitions = definitions.filter((definition) =>
+      const classDefinitions = (params.expand_context === true ? definitions : []).filter((definition) =>
         ["class", "struct", "interface", "trait"].includes(definition.entity?.type),
       );
       const outlinesByFile = new Map(await Promise.all(
@@ -570,7 +577,7 @@ const tools = new Map([
         }
         return { file: definition.file, class_name: entity.name, members };
       }))).filter((item) => item.members.length > 0);
-      const invariants = definitions.some((definition) => /\bProxy(?:Handler)?\b|\bownKeys\b|getOwnPropertyDescriptor/.test(definition.content ?? ""))
+      const invariants = params.expand_context === true && definitions.some((definition) => /\bProxy(?:Handler)?\b|\bownKeys\b|getOwnPropertyDescriptor/.test(definition.content ?? ""))
         ? [
             "Proxy ownKeys must return unique domain keys and must not blindly expose callable-target keys such as name or length.",
             "Descriptors synthesized for virtual proxy keys must be configurable to satisfy ECMAScript proxy invariants.",
@@ -585,7 +592,7 @@ const tools = new Map([
         .concat(memberInventory.flatMap((item) => item.members.map((member) => member.name)))
         .filter((name) => typeof name === "string" && /^_[^_]/.test(name) && name.length > 4))];
       const exactCallsites = [];
-      const callsiteSources = [...definitions.map((definition) => ({
+      const callsiteSources = [...(params.expand_context === true ? definitions : []).map((definition) => ({
         file: definition.file,
         entity: definition.entity,
         content: String(definition.content ?? ""),
@@ -672,12 +679,19 @@ const tools = new Map([
         }
         for(const d of fileContext.filter(d=>d.file===file&&!d.truncated))if(d.content===source)programFiles.set(file,d);
       }
-      const contextView=contextReceipts.presentBundle({definitions:packed.definitions.map(compactDefinition),files:fileContext},params);
+      const requestedDefinitions = packed.definitions.map((definition) => {
+        if (params.expand_context === true) return compactDefinition(definition);
+        const { related, ...requested } = definition;
+        return compactDefinition(requested);
+      });
+      const contextView=contextReceipts.presentBundle({definitions:requestedDefinitions,files:fileContext},params);
       return {
         program_cache: {entities:programEntities.size,files:programFiles.size},
         files: contextView.files,
         coverage: "partial",
-        body_policy: "Explicit files and entity_names are read. Regex matches are locators unless expand_context=true; inspect selected source before editing.",
+        body_policy: max===0
+          ? "Entity bodies disabled by max_entities=0. Explicit files are read; name candidates and search previews are not complete entity source. Deferred names are not absent."
+          : "Explicit files and entity_names are read. Search previews are not full source. Related context and metadata require expand_context=true; inspect selected source before editing.",
         definition_payload_bytes: packed.full_definition_bytes,
         definition_byte_budget: packed.byte_budget,
         effective_budget_per_entity: budget,
@@ -698,13 +712,15 @@ const tools = new Map([
             file: hit.file,
           })),
         })),
-        symbol_locations: symbolLocations,
-        imports_by_file: importsByFile.filter((item) => item.imports.length > 0),
-        import_authority: Object.fromEntries(planImportAuthority),
-        import_authority_scope: "Python module hints only; not compiler-resolved import authority",
-        member_inventory: memberInventory,
-        exact_callsites: exactCallsites,
-        invariants,
+        ...(params.expand_context === true ? {
+          symbol_locations: symbolLocations,
+          imports_by_file: importsByFile.filter((item) => item.imports.length > 0),
+          import_authority: Object.fromEntries(planImportAuthority),
+          import_authority_scope: "Python module hints only; not compiler-resolved import authority",
+          member_inventory: memberInventory,
+          exact_callsites: exactCallsites,
+          invariants,
+        } : {}),
         matches: matches ? {
           total_patterns: matches.total_patterns,
           ran: matches.ran,
@@ -713,7 +729,10 @@ const tools = new Map([
           results: searchPreviews((matches.results ?? []).map(group => matchInventory(group, rankedHits(group, preferTests),
             boundedInteger(params.match_offset, 0, 0, 10000)))),
         } : null,
-        unresolved_names: names.filter((name) => !resolvedNames.has(name)),
+        unresolved_names: max===0
+          ?nameCandidates.filter(c=>!c.ranked?.length).map(c=>c.name)
+          :names.filter((name) => !resolvedNames.has(name)),
+        ...(max===0?{deferred_names:nameCandidates.filter(c=>c.ranked?.length).map(c=>c.name)}:{}),
         lookup_timings: lookupTimings,
         timings_ms: {
           grep: Math.round(grepDone - started),
@@ -727,15 +746,16 @@ const tools = new Map([
   ["weave_transaction", {
     description: "Apply a batch of structural edits and run focused validation. For small changes prefer {file,old,new} with a unique source anchor: the backend composes changes into enclosing entities and validates them. Do not resend an entire unchanged function to change a few tokens. Use entity+op for deletion/insertion and content for substantial rewrites.",
     schema: object({
+      format_files: {type:'array',minItems:1,maxItems:64,items:{type:'string'},description:'Optional explicit Go paths to gofmt after successful edits and before validation. Can accompany edits or run alone. Prefer this over writing alignment/spacing edits. Formatting is not semantic verification.'},
       creates: { type: "array", items: create, maxItems: 10, description: "Complete contents for genuinely new files reported absent by sem_plan." },
       imports: { type: "array", items: importEdit, maxItems: 20, description: "Imports for existing files. Use this instead of guessing exact text in file headers that sem_plan did not return." },
       remove_imports: { type: "array", items: importEdit, maxItems: 20, description: "Complete import statements or unique import-specifier lines to remove atomically from existing files." },
       edits: { type: "array", items: flexibleEdit, maxItems: 64, description: "Prefer {file,old,new} for small changes. Include entity with exact entity_type/parent to scope repeated anchors; old must be unique inside that entity. Without entity, old must be unique in the file. Use entity+op:delete for removal, or entity/content for large rewrites. Struct and impl selectors are distinct." },
-      validation_cmd: { type: "string", description: "Optional single project check command. This offline checker supports pytest, cargo, bazel, bazelisk, go, npm, pnpm, yarn, make, gradle and ./gradlew. It does not support python scripts, python -c, shell operators or heredocs; do not retry those with alternative quoting. Unsupported checks remain unverified." },
+      validation_cmd: { type: "string", description: "Optional single project check command. This offline checker supports pytest, python -m pytest, python3 -m pytest, cargo, bazel, bazelisk, go, npm, pnpm, yarn, make, gradle, ./gradlew, mvn and ./mvnw. Python module commands retain their interpreter and test selection. It does not support arbitrary python scripts/modules, python -c, shell operators or heredocs; do not retry those with alternative quoting. Unsupported checks remain unverified." },
     }),
     async run(params, cwd) {
       if (params.validation_cmd?.startsWith('evidence:')) {
-        if (['edits','creates','imports','remove_imports'].some(key=>params[key]?.length)) {
+        if (['edits','creates','imports','remove_imports','format_files'].some(key=>params[key]?.length)) {
           throw new Error('Read validation evidence separately from edits');
         }
         // Inspecting retained evidence neither consumes an edit attempt nor
@@ -841,6 +861,13 @@ const tools = new Map([
           timings_ms: { normalize: Math.round(normalizedAt-started), weave: Math.round(editedAt-createdAt), check: 0, total: Math.round(editedAt-started) },
         };
       }
+      let formatting;
+      if(params.format_files) {
+        try {formatting=await formatFiles(cwd,params.format_files);}
+        catch(error) {formatting={ok:false,error:error.message};}
+        if(!formatting.ok)return {created,imported:[...importSnapshots.keys()],edit:compactEditReceipt(outcome),formatting,
+          check:{pass:null,stage:'format_failed',reason:'Edits remain applied; formatting failed. Validation was not run.'}};
+      }
       let check = await hostedValidation(cwd);
       if (!check) {
         const validationCmd = params.validation_cmd
@@ -854,6 +881,7 @@ const tools = new Map([
         imported: [...importSnapshots.keys()],
         exact_text_edits: normalized.textEdits.length,
         edit: compactEditReceipt(outcome),
+        ...(formatting?{formatting}:{}),
         check,
         timings_ms: {
           normalize: Math.round(normalizedAt - started),
@@ -872,10 +900,18 @@ const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 if(process.env.SEM_EXACT_TOOLS === '1') {
   const exact=new ExactCode();
   tools.set('sem_exact', {
-    description:'Deterministic explicit-scope source operations. Prefer query with an array of selectors to resolve AND read related symbols in one call; pass revision for an existing snapshot OR files to capture and query in one call. A selector with only file reads that entire captured file (48KB shared file budget, oversized files explicitly deferred); mix file and symbol selectors in one query. Names may be exact parser names or full lexical names such as Documenter.generate. qualified_name is derived from enclosing source ranges, not runtime dispatch. Missing files in query return missing_files and not_found without blocking available files; invalid paths and symlinks still fail. Narrow ambiguity with file/type or id. Unique matches return complete source once per ID; overlapping bodies may use content_source byte offsets into a full source in the SAME response; ambiguous matches return locators without choosing. capture/resolve/read remain available. apply accepts id plus either full content or a unique old/new substitution within the captured entity; replaces entities by snapshot ID with file-hash preconditions inside Weave; supports one entity per file per batch, optional validation_cmd, and requires recapture after mutation. Rollback is compensating, not repository-wide isolation. prepare is preview-only. Parser coverage is not semantic completeness. Snapshot IDs are not repository revisions.',
-    schema:object({validation_cmd:{type:'string'},op:{type:'string',enum:['capture','resolve','read','query','prepare','apply']},selectors:{type:'array',minItems:1,maxItems:64,items:{type:'object',properties:{id:{type:'string'},name:{type:'string'},file:{type:'string'},type:{type:'string'}},additionalProperties:false}},files:{type:'array',items:{type:'string'},minItems:1,maxItems:64},revision:{type:'string'},name:{type:'string'},id:{type:'string'},edits:{type:'array',items:{type:'object',properties:{id:{type:'string'},content:{type:'string'},old:{type:'string'},new:{type:'string'},allow_signature_change:{type:'boolean'}},required:['id'],additionalProperties:false},minItems:1,maxItems:64}},['op']),
+    description:'Deterministic explicit-scope source operations. Prefer query with an array of selectors to resolve AND read related symbols in one call; pass revision for an existing snapshot OR files to capture and query in one call. A selector with only file reads that entire captured file (48KB shared file budget, oversized files explicitly deferred); mix file and symbol selectors in one query. Names may be exact parser names or full lexical names such as Documenter.generate. qualified_name is derived from enclosing source ranges, not runtime dispatch. Missing files in query return missing_files and not_found without blocking available files; invalid paths and symlinks still fail. Narrow ambiguity with file/type or id. Unique matches return complete source once per ID; overlapping bodies may use content_source byte offsets into a full source in the SAME response; ambiguous matches return locators without choosing. capture/resolve/read remain available. apply accepts id plus either full content or a unique old/new substitution within the captured entity; replaces entities by snapshot ID with file-hash preconditions inside Weave; supports one entity per file per batch, optional validation_cmd, and requires recapture after mutation. Rollback is compensating, not repository-wide isolation. transform applies one shared literal old/new replacement to explicit targets [{id,count}] from a revision; count is the exact expected non-overlapping occurrence count per entity. Use it for repetitive changes instead of spelling out each occurrence. One entity per file; select an enclosing class when necessary. No regex, implicit target discovery, or semantic-rename guarantee; stale files and count mismatches fail before mutation. prepare is preview-only. Parser coverage is not semantic completeness. Snapshot IDs are not repository revisions.',
+    schema:object({validation_cmd:{type:'string'},old:{type:'string',minLength:1},new:{type:'string'},allow_signature_change:{type:'boolean'},targets:{type:'array',minItems:1,maxItems:64,items:{type:'object',properties:{id:{type:'string'},count:{type:'integer',minimum:1}},required:['id','count'],additionalProperties:false}},op:{type:'string',enum:['capture','resolve','read','query','prepare','apply','transform']},selectors:{type:'array',minItems:1,maxItems:64,items:{type:'object',properties:{id:{type:'string'},name:{type:'string'},file:{type:'string'},type:{type:'string'}},additionalProperties:false}},files:{type:'array',items:{type:'string'},minItems:1,maxItems:64},revision:{type:'string'},name:{type:'string'},id:{type:'string'},edits:{type:'array',items:{type:'object',properties:{id:{type:'string'},content:{type:'string'},old:{type:'string'},new:{type:'string'},allow_signature_change:{type:'boolean'}},required:['id'],additionalProperties:false},minItems:1,maxItems:64}},['op']),
     async run(p,cwd) {
       switch(p.op) {
+        case 'transform': {
+          const generated = repeatedEdits(exact,p.revision,p);
+          try {
+            const result = await applyExact(exact,cwd,p.revision,generated.edits,{validate:p.validation_cmd
+              ?()=>focusedCheck(buildSemApi({cwd,semBin:'sem'}),p.validation_cmd):undefined});
+            return {...result,transform:{...generated.summary,applied:result.status==='applied'}};
+          } finally { await invalidateChanged(cwd,programSnapshots,programEntities,programFiles); }
+        }
         case 'apply': {
           try { return await applyExact(exact,cwd,p.revision,p.edits,{validate:p.validation_cmd
             ?()=>focusedCheck(buildSemApi({cwd,semBin:'sem'}),p.validation_cmd):undefined}); }
@@ -894,11 +930,33 @@ if(process.env.SEM_EXACT_TOOLS === '1') {
       }
     },
   });
+  // Keep literal-to-entity discovery in the existing tool, not another routing choice.
+  const exactTool=tools.get('sem_exact');
+  const rawExact=exactTool.run;
+  exactTool.run=async(p,cwd)=>{
+    const result=await rawExact(p,cwd);
+    if(p.op==='query'||p.op==='read')rememberExactSource(exact,result,programSnapshots,programEntities,programFiles);
+    return result;
+  };
+  exactTool.schema.properties.selectors.items.properties.contains={type:'string',minLength:1};
+  exactTool.schema.properties.selectors.items.properties.view={type:'string',enum:['candidates','source']};
+  exactTool.schema.properties.selectors.items.properties.offset={type:'integer',minimum:0};
+  exactTool.schema.properties.selectors.items.properties.start_byte={type:'integer',minimum:0};
+  exactTool.schema.properties.selectors.items.properties.end_byte={type:'integer',minimum:1};
+  exactTool.description+=' Named selectors also accept view:"source" to read ALL matching bodies within the shared 48KB budget, including ambiguous names, without another resolve/read turn. Ambiguity remains explicit; inspect source_ids and deferred. Omit view to retain unique-only hydration, or use view:"candidates" for locators only. Editing still requires a specific ID.';
+  exactTool.description+=' For uncovered syntax/imports, query {file,start_byte,end_byte} against the same revision for exact UTF-8 range reads; complete means only the requested range, not a complete entity.';
+  exactTool.description+=' Literal discovery: selectors [{contains:"text",file:"optional/path"}] default to compact candidates with IDs, types, byte sizes and matching-line previews; no whole bodies. Select relevant IDs in a batched query using the returned revision to read complete bodies without reparsing. For precise literals, view:"source" fuses discovery and complete bodies in one call. Read before editing IDs. Uncovered matches are explicit, not evidence of absence. Follow next_offset for additional candidates with the same query and revision. This is lexical containment, not resolved call-graph coverage.';
 }
 // Refresh cache validity after every direct transaction, including partial failures.
 // Keep unaffected definitions; never treat pre-edit snapshots as current source.
 const rawTransaction=tools.get('weave_transaction').run;
 tools.get('weave_transaction').run=async(params,cwd)=>{
+  if (!hostedState && requestKind('weave_transaction',params)==='validation') {
+    // Validation-only requests do not mutate source or invalidate read caches.
+    const cmd=params.validation_cmd.replace(/^\.venv\/bin\/pytest\b/, 'pytest')
+      .replace(/^\.venv\/bin\/python\s+-m\s+pytest\b/, 'python -m pytest');
+    return {check:await focusedCheck(buildSemApi({cwd,semBin:'sem'}),cmd)};
+  }
   let result;
   try { result = await rawTransaction(params,cwd); return result; }
   finally {
@@ -910,11 +968,17 @@ tools.get('weave_transaction').run=async(params,cwd)=>{
     }
   }
 };
+const scopedProgramExact=new ExactCode();
 tools.set('weave_program', {
-  description: 'Generate repetitive edits with a synchronous JavaScript function body using cached full entities and files from sem_plan. Return {edits,imports?,creates?,validation_cmd?}, with the same shapes as weave_transaction. No IO/imports. Identity/parse/rollback guards apply. After any transaction, changed-file cache entries are invalidated while unchanged entries remain; query changed files again if needed.',
-  schema: object({code:{type:'string',maxLength:30000}},['code']),
+  description: 'Generate repetitive edits with a synchronous JavaScript function body. Complete source previously read through sem_plan OR sem_exact is available as entities [{file,entity,content}] and files [{file,content}]; candidate-only lookups do not populate source. Return {edits,imports?,creates?,validation_cmd?}, with the same shapes as weave_transaction. Use loops for repeated edits instead of spelling out identical replacements per file. No IO/imports. Identity/parse/rollback guards apply. Changed files are invalidated after transactions; unchanged source remains reusable. Externally changed source fails the hash check before mutation.',
+  schema: object({code:{type:'string',maxLength:30000},files:{type:'array',minItems:1,maxItems:64,items:{type:'string'}}},['code']),
   async run(params,cwd) {
-    if(!programEntities.size&&!programFiles.size)throw new Error('Use sem_plan first to populate source data');
+    if(params.files) {
+      const {generated,receipt}=await prepareScopedProgram(scopedProgramExact,cwd,params.files,params.code);
+      const result=await tools.get('weave_transaction').run(generated,cwd);
+      return {...result,program_inputs:receipt};
+    }
+    if(!programEntities.size&&!programFiles.size)throw new Error('Read complete source with sem_plan or sem_exact first to populate source data');
     const generated=await generateEdits(params.code,[...programEntities.values()],[...programFiles.values()]);
     for(const [file,hash] of programSnapshots) {
       const current=createHash('sha256').update(await fs.readFile(path.resolve(cwd,file))).digest('hex');
@@ -923,11 +987,92 @@ tools.set('weave_program', {
     return await tools.get('weave_transaction').run(generated,cwd);
   },
 });
+tools.get('weave_program').description+=' Optional files:[explicit repository-relative paths] loads fresh file and entity source INSIDE the program, without a preceding model-facing read. This mode exposes only those inputs, not prior caches; files have file/content/sha256 and entities have file/entity/content/source_id/qualified_name. Every generated write must target a listed path; include absent destination paths for creates. Use exact filters and assert expected counts/content before returning edits. Input hashes are checked before Weave applies the generated transaction. No glob discovery, arbitrary IO or automatic semantic correctness is implied. Prefer this for mechanical cross-file changes whose rule is already understood.';
+if(tools.has('sem_exact')) {
+  tools.get('sem_exact').description+=' Qualified lookup also accepts declared_qualified_name from parser-reported parents/receivers, e.g. Backend.Save in Go. This is a syntactic parent alias, not runtime dispatch resolution; ambiguous aliases return all candidates.';
+  tools.get('sem_exact').schema.properties.selectors.items.properties.type.description='Optional exact parser kind copied from a returned entity. Omit unless disambiguating; language syntax names need not match parser kinds.';
+  tools.get('sem_exact').description+=' Invalid byte ranges return per-selector errors with byte_length, never clipped source; other valid selectors in that read batch still return results. Check every selector status.';
+}
+tools.get('weave_program').description+=' Cached entity metadata has name, type and entity_type (identical parser-kind aliases), and parent_name when available. Use entity_type for edit selectors.';
+tools.get('weave_program').description+=' replaceEntity(row,old,new) returns an entity-scoped edit using parser selectors and checks anchor uniqueness. Example: return {edits:selected.map(row=>replaceEntity(row,"old","new"))}; select and assert the intended entities first.';
+tools.get('weave_program').description+=' For understood lexical changes, rewriteLines(file,literal,line=>replacement,expectedLines?) returns guarded old/new edits for every matching line. It preserves unmatched text, builds unique anchors and merges overlapping regions internally. Select explicit input files; this is not semantic rename and also matches comments/strings. Example: return {edits:files.flatMap(f=>rewriteLines(f,"Old.Type",line=>line.replaceAll("Old.Type","Type")))}; declaration changes still require allow_signature_change:true.';
+tools.get('weave_program').description+=' Source contract: entities[].content is the exact parser span, not a full-line slice; leading indentation may lie outside source_range (UTF-8 byte offsets). Use files[].content for line-oriented transformations. rewriteLines passes line text WITHOUT CR/LF to the callback, preserves the original line ending, and deletes the entire line when the callback returns an empty string. Do not also emit a separate edit for a line handled by rewriteLines.';
+tools.get('weave_program').description+=' Explicit-input and exact-cache entities additionally provide line_content and line_range for full-line source including indentation (excluding final LF). These may include neighboring syntax on a shared line: do not treat line_range as entity ownership. Parser content and source_range remain unchanged; never assume a fixed indentation in content.';
+tools.get('weave_program').description+=' Return format_files:[explicit Go paths] to gofmt after edits before validation; do not hand-write spacing/alignment fixes.';
+// Opt-in experimental interface; retain the same tool inventory as the control.
+if(process.env.SEM_ENTITY_INTERFACE==='1') {
+  const workspaces=new Map();
+  const selectorSchema=tools.get('sem_exact').schema.properties.selectors;
+  tools.set('sem_exact',{
+    description:'Addressable entity workspace. orient(files, select?) returns metadata cards without source; select may filter exact name/file and paginate. Read selected addresses in one batch; do not load all bodies by default. list(snapshot, select?) pages an existing snapshot. neighbors(address) returns lexical parents only, not runtime calls. apply(changes:[{address,old,new} OR {address,content}]) uses Weave with stale-file guards; one entity per file per batch. Addresses are snapshot-scoped, not permanent IDs. For already-known code use sem_plan directly; orientation is not a mandatory extra step. Full reads populate weave_program caches. Use weave_transaction for public validation, file creation, imports, or mixed text/entity edits.',
+    schema:object({op:{type:'string',enum:['query','orient','list','neighbors','read','apply']},selectors:selectorSchema,
+      files:{type:'array',items:{type:'string'},minItems:1,maxItems:64},snapshot:{type:'string'},address:{type:'string'},
+      addresses:{type:'array',items:{type:'string'},minItems:1,maxItems:64},
+      select:object({name:{type:'string'},file:{type:'string'},offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1,maximum:100}}),
+      changes:{type:'array',minItems:1,maxItems:64,items:object({address:{type:'string'},old:{type:'string'},new:{type:'string'},content:{type:'string'}},['address'])}},['op']),
+    async run(params,cwd) {
+      if(!workspaces.has(cwd)) workspaces.set(cwd,await new EntityInterface(cwd,{shortAddresses:process.env.SEM_SHORT_ADDRESSES==='1'}).initialize());
+      const api=workspaces.get(cwd);
+      try {
+        const result=await api.dispatch(params);
+        if(params.op==='read'||params.op==='query') rememberExactSource(api.exact,result,programSnapshots,programEntities,programFiles);
+        return result;
+      } finally {
+        if(params.op==='apply') await invalidateChanged(cwd,programSnapshots,programEntities,programFiles);
+      }
+    },
+  });
+  tools.get('sem_exact').description='Prefer query(files OR snapshot, selectors) to resolve and read known names/files in ONE call, returning editable addresses beside source. Selectors support name/file/type, literal contains, and explicit byte ranges as in the regular exact query. Literal candidates are metadata-only unless view:"source" is requested. Ambiguity and missing coverage remain explicit. '+tools.get('sem_exact').description;
+}
+tools.get('sem_exact').description = tools.get('sem_exact').description
+  .replace('supports one entity per file per batch', 'supports disjoint entities in the same file per batch')
+  .replace('guards; one entity per file per batch', 'guards; disjoint same-file entities may be batched');
+if(tools.has('sem_exact')) {
+  const tool=tools.get('sem_exact'),original=tool.run,reviews=new Map();
+  tool.schema.properties.op.enum.push('diff');
+  tool.schema.properties.diff_id={type:'string'};
+  tool.schema.properties.offset={type:'integer',minimum:0};
+  tool.description+=' Optional diff(files:[explicit paths]) reviews changed hunks versus HEAD including untracked additions, rather than rereading full entities. Continue a captured page with diff_id and offset=next_offset. No edits or tests are performed. Includes preexisting changes; recapture after edits.';
+  tool.run=async(params,cwd)=>{
+    if(params.op!=='diff')return original(params,cwd);
+    if(!reviews.has(cwd))reviews.set(cwd,new ReviewDiff());
+    const review=reviews.get(cwd);
+    if(params.diff_id) {
+      if(params.files)throw Error('DIFF_ID_OR_FILES_NOT_BOTH');
+      return review.read(params.diff_id,params.offset??0);
+    }
+    if(params.offset)throw Error('DIFF_PAGINATION_REQUIRES_ID');
+    return review.capture(cwd,params.files);
+  };
+}
+const jevCredential = process.env.SEM_JEV_PROXY_TOKEN || process.env.TYPESAFE_API_KEY;
+if (process.env.SEM_JEV_DISABLED !== '1' && (!jevCredential || !process.env.SEM_JEV_TASK)) {
+  throw new Error('Jev experimental adapter requires credential and task environment; refusing silent unranked trial');
+}
+const jevRank = createJevRanker({key:jevCredential, task:process.env.SEM_JEV_TASK, endpoint:process.env.SEM_JEV_ENDPOINT});
+const unrankedPlan = tools.get('sem_plan').run;
+tools.get('sem_plan').run = async (params,cwd) => jevRank(await unrankedPlan(params,cwd));
+if(tools.has('sem_exact')) {
+  const {addCompoundDiscovery}=await import('./compound-discovery.mjs');
+  addCompoundDiscovery(tools.get('sem_plan'),tools.get('sem_exact'));
+}
+const {normalizeValidation}=await import('./validation-argv.mjs');
+for(const name of ['weave_transaction','sem_exact']) {
+  const tool=tools.get(name);
+  if(!tool)continue;
+  tool.schema.properties.validation_argv={type:'array',minItems:1,maxItems:128,items:{type:'string'},description:'Explicit test executable and arguments; alternative to validation_cmd. Example: ["go","test","-run","TestA|TestB","./package"]. No shell expansion. Prefer direct test commands over make variable overrides.'};
+  tool.description+=' Use validation_argv for exact argument boundaries. Make variable overrides with shell metacharacters are rejected because recipes can reinterpret them.';
+  const run=tool.run;
+  tool.run=(params,cwd)=>run(normalizeValidation(params),cwd);
+}
+tools.get('weave_program').description+=' Create-only programs may return {creates:[{file,content}]} without an empty edits array.';
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-for await (const line of lines) {
+const scheduler = new RequestScheduler();
+const pending = new Set();
+async function handleLine(line) {
   let message;
-  try { message = JSON.parse(line); } catch { continue; }
-  if (message.id === undefined) continue;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.id === undefined) return;
   const reply = { jsonrpc: "2.0", id: message.id };
   try {
     if (message.method === "initialize") {
@@ -937,7 +1082,10 @@ for await (const line of lines) {
     } else if (message.method === "tools/call") {
       const tool = tools.get(message.params?.name);
       if (!tool) throw new Error(`unknown tool: ${message.params?.name}`);
-      const value = await tool.run(message.params.arguments ?? {}, process.cwd());
+      const params=normalizeValidation(message.params.arguments ?? {});
+      const kind=process.env.SEM_CONCURRENT_VALIDATION==='1' && !hostedState
+        ?requestKind(message.params.name,params):'write';
+      const value = await scheduler.run(kind,()=>tool.run(params, process.cwd()));
       reply.result = toolResult(value);
     } else if (message.method === "ping") {
       reply.result = {};
@@ -949,6 +1097,12 @@ for await (const line of lines) {
   }
   send(reply);
 }
+for await (const line of lines) {
+  const task=handleLine(line);
+  pending.add(task);
+  task.finally(()=>pending.delete(task));
+}
+await Promise.allSettled([...pending]);
 if (hostedState) {
   await runFile("docker", ["rm", "-f", hostedState.container], { maxBuffer: 1024 * 1024 }).catch(() => {});
 }

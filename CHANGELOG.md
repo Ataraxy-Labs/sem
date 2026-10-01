@@ -14,6 +14,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- Experimental structural-session adapter snapshot adds explicitly scoped reads and edit programs, batched discovery, bounded validation evidence, and timeout recovery. Retained as a research branch: benchmark timings vary with agent-selected validation workloads and do not establish a universal speedup.
+
 - Simple transaction edits preserve overloaded entity selectors. Timed-out public checks retain partial diagnostics and restart their disposable checker so subsequent validation can proceed.
 
 - Simple transaction read batches preserve valid results when another selector is malformed or a requested path is rejected as a symlink. Partial captures report their errors explicitly; strict capture and edit checks remain unchanged.

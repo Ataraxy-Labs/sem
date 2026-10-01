@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from evidence_focus import summary as focused_summary, read as read_focus
 
 
 def compact_failure(value, limit=3000):
@@ -49,6 +50,33 @@ def present(result, directory, provenance):
     output = dict(result)
     output['evidence'] = {'id': key, 'read_command': 'evidence:' + key + ':0',
                           'characters': len(payload), 'reused_validation': False}
+    output['evidence']['summary_command'] = 'evidence-summary:' + key
+    reports = result.get('test_report_evidence')
+    if isinstance(reports, dict) and reports.get('status') == 'available':
+        # The immutable evidence record above retains all collected details.
+        # Avoid repeating stack traces in every subsequent model context.
+        excerpts = []
+        for failure in reports.get('failures', []):
+            excerpt = {name: value for name, value in failure.items()
+                       if name not in ('detail', 'message')}
+            message = failure.get('message', '')
+            excerpt['message'] = message[:600]
+            excerpt['message_truncated'] = len(message) > 600
+            excerpt['detail_omitted'] = bool(failure.get('detail'))
+            excerpts.append(excerpt)
+        output['test_report_evidence'] = {
+            **reports, 'failures': excerpts,
+            'full_evidence_command': output['evidence']['read_command']}
+    # Failure summaries replace generic tail excerpts, not the authoritative verdict.
+    # Unknown formats preserve the original fallback output.
+    if result.get('pass') is False:
+        focused = focused_summary(directory, key)
+        if focused['diagnostics']:
+            output['stdout'] = result.get('stdout', '')[-1000:]
+            output['stderr'] = result.get('stderr', '')[-500:]
+            output['diagnostics'] = {'complete': False, 'full_output': output['evidence']['read_command']}
+            output['failure_focus'] = focused
+            return output
     if result.get('pass') is False:
         compacted = []
         for field in ('stdout', 'stderr'):
@@ -77,6 +105,8 @@ def present(result, directory, provenance):
 
 
 def read(command, directory):
+    if command.startswith(('evidence-summary:', 'evidence-lines:')):
+        return read_focus(command, directory)
     match = re.fullmatch(r'evidence:([0-9a-f]{64}):(\d{1,10})', command)
     if not match:
         raise ValueError('Expected evidence:<sha256>:<character-offset>')

@@ -4,6 +4,20 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {normalizeEdits} from './normalize-edits-simple.mjs';
+test('ambiguous anchors report the actual entity scope without weakening uniqueness',async()=>{
+ const cwd=await fs.mkdtemp(path.join(os.tmpdir(),'sem-anchor-error-'));
+ const source='class Callback:\n def start(self):\n  """call method; inputs to call method"""\n';
+ try {
+  await fs.writeFile(path.join(cwd,'a.py'),source);
+  const api={outline:async()=>({entities:[{name:'Callback',type:'class',start_line:1,end_line:3},
+   {name:'start',type:'function',parent_name:'Callback',start_line:2,end_line:3}]})};
+  await assert.rejects(normalizeEdits([{file:'a.py',entity:{name:'start',parent_name:'Callback'},old:'call method',new:'async call'}],cwd,api),
+   /scope: entity Callback.start .*multiple exact matches/);
+  await assert.rejects(normalizeEdits([{file:'a.py',entity:{name:'start',parent_name:'Callback'},old:'missing phrase',new:'async call'}],cwd,api),
+   /scope: entity Callback.start .*no unique exact or whitespace-flexible match/);
+  assert.equal(await fs.readFile(path.join(cwd,'a.py'),'utf8'),source);
+ } finally {await fs.rm(cwd,{recursive:true});}
+});
 test('scoped anchors stay scoped when composed into a parent with repeated text',async()=>{
  const cwd=await fs.mkdtemp(path.join(os.tmpdir(),'sem-scope-'));
  const source='impl Foo {\n fn a(mode: Old) {}\n fn b(mode: Old) {}\n}\n';

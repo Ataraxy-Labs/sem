@@ -13,14 +13,18 @@ export function compactResponse(value) {
     const start = source.indexOf(d.content);
     if (start < 0) return d;
     const {content, ...rest} = d;
-    omitted += Buffer.byteLength(content);
-    return {...rest, content_source: {kind: 'file_in_this_response', file: d.file,
+    const reference={...rest, content_source: {kind: 'file_in_this_response', file: d.file,
       start_utf16: start, end_utf16: start+content.length}};
+    if (Buffer.byteLength(JSON.stringify(reference))>=Buffer.byteLength(JSON.stringify(d))) return d;
+    omitted += Buffer.byteLength(content);
+    return reference;
   });
   if (!omitted) return value;
-  return {...value, definitions, source_encoding: {
+  const result={...value, definitions, source_encoding: {
     instruction: 'For content_source, take files[file].content.slice(start_utf16,end_utf16); source is included once in this response.',
     duplicate_source_bytes_omitted: omitted}};
+  // Include explanatory metadata in the break-even calculation too.
+  return Buffer.byteLength(JSON.stringify(result))<Buffer.byteLength(JSON.stringify(value)) ? result : value;
 }
 
 export function toolResult(value) {

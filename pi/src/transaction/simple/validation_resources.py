@@ -5,6 +5,8 @@ BAZEL_FLAGS = ['--jobs=2', '--local_cpu_resources=2', '--local_ram_resources=409
 
 def bounded_command(argv):
     argv = list(argv)
+    if argv[:1] in (['mvn'], ['./mvnw']):
+        return argv if '-o' in argv or '--offline' in argv else argv[:1]+['--offline']+argv[1:]
     start = 0
     if argv[:1] in (['yarn'], ['npm'], ['pnpm']):
         start = 2 if argv[1:2] == ['run'] else 1

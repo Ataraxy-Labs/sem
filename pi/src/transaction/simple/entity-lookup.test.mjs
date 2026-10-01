@@ -37,3 +37,16 @@ test('indexes preserve order, ambiguity, qualifiers and selector filters', () =>
     assert.deepEqual(lookupEntities(snapshot,selector),expected);
   }
 });
+test('declared aliases preserve collisions and exact file/type constraints',()=>{
+  const rows=[
+    {id:'a',name:'Save',qualified_name:'Save',declared_qualified_name:'Backend.Save',file:'a.go',type:'method'},
+    {id:'b',name:'Save',qualified_name:'Save',declared_qualified_name:'Backend.Save',file:'b.go',type:'method'},
+    {id:'c',name:'Backend.Save',qualified_name:'Backend.Save',file:'c.py',type:'function'},
+  ];
+  const snapshot=indexEntities(rows);
+  assert.deepEqual(lookupEntities(snapshot,{name:'Backend.Save'}),rows);
+  assert.deepEqual(lookupEntities(snapshot,{name:'Backend.Save',file:'a.go'}),[rows[0]]);
+  assert.deepEqual(lookupEntities(snapshot,{name:'Backend.Save',type:'function'}),[rows[2]]);
+  assert.deepEqual(lookupEntities(snapshot,{name:'Backend.Save',file:'a.go',type:'function'}),[]);
+  assert.deepEqual(lookupEntities(snapshot,{name:'Other.Save'}),[]);
+});

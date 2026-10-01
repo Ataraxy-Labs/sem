@@ -31,7 +31,9 @@ export function indexEntities(entities) {
   const byId = new Map(), byName = new Map();
   for (const entity of entities) {
     byId.set(entity.id, entity);
-    for (const name of new Set([entity.name, entity.qualified_name])) {
+    // A parser-declared receiver/parent is distinct from lexical containment.
+    // Index both; preserve ambiguity instead of choosing one matching entity.
+    for (const name of new Set([entity.name, entity.qualified_name, entity.declared_qualified_name].filter(Boolean))) {
       if (!byName.has(name)) byName.set(name, []);
       byName.get(name).push(entity);
     }
