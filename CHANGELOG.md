@@ -15,6 +15,7 @@ All notable changes to sem are documented in this file.
 ### Fixed
 
 - Experimental structural-session adapter snapshot adds explicitly scoped reads and edit programs, batched discovery, bounded validation evidence, and timeout recovery. Retained as a research branch: benchmark timings vary with agent-selected validation workloads and do not establish a universal speedup.
+- Text search includes eligible files without a structural parser (such as Objective-C++ `.mm` and custom build files), including alongside a warm structural index. Search responses preserve coverage limits separately from result pagination; binary content remains excluded.
 
 - Simple transaction edits preserve overloaded entity selectors. Timed-out public checks retain partial diagnostics and restart their disposable checker so subsequent validation can proceed.
 

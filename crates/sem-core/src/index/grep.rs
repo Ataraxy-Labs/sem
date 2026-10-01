@@ -183,6 +183,9 @@ fn verify_file(root: &Path, path: &str, matcher: &Regex, hits: &mut Vec<GrepHit>
     let Ok(bytes) = std::fs::read(root.join(path)) else {
         return;
     };
+    if bytes.contains(&0) {
+        return;
+    }
     for (i, mut line) in bytes.split(|&b| b == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
