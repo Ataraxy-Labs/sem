@@ -38,6 +38,7 @@ interface RawGrepHit {
 
 interface RawGrepOutput {
   hits: RawGrepHit[];
+  coverage?: string;
 }
 
 const SemGrepParamsSchema = Type.Object({
@@ -150,7 +151,7 @@ function matchesPathFilter(file: string, path: string): boolean {
  * NOT an error), so any exit code is accepted as long as stdout parses as
  * JSON; only unparseable output (crash, invalid regex → exit 2) throws.
  */
-async function runSemGrepJson(pattern: string, deps: SemGrepDeps): Promise<RawGrepHit[]> {
+async function runSemGrepJson(pattern: string, deps: SemGrepDeps): Promise<RawGrepOutput> {
   const result = await runCommand(deps.semBin, ["grep", pattern, "--json"], deps.cwd, deps.signal);
 
   let parsed: RawGrepOutput;
@@ -163,7 +164,10 @@ async function runSemGrepJson(pattern: string, deps: SemGrepDeps): Promise<RawGr
       }`,
     );
   }
-  return Array.isArray(parsed?.hits) ? parsed.hits : [];
+  if ((result.exitCode !== 0 && result.exitCode !== 1) || !Array.isArray(parsed?.hits)) {
+    throw new Error(`Invalid search response (exit ${result.exitCode})`);
+  }
+  return parsed;
 }
 
 /** Renders one hit as the plain single line used when context is off. */
@@ -209,11 +213,14 @@ async function runOnePattern(pattern: string, params: SemGrepParams, deps: SemGr
     path: params.path ?? null,
     glob: params.glob ?? null,
     context: params.context ?? 0,
+    coverage: "unspecified_cli_search_scope",
   };
 
   let rawHits: RawGrepHit[];
   try {
-    rawHits = await runSemGrepJson(searchPattern(pattern, params.literal), deps);
+    const result = await runSemGrepJson(searchPattern(pattern, params.literal), deps);
+    rawHits = result.hits;
+    baseDetails.coverage = result.coverage ?? "parser_supported_files_only; unsupported_files_may_be_absent";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // P7: the fix for a parse error is almost always "I meant that as
