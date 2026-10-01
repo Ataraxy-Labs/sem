@@ -40,11 +40,20 @@ export async function normalizeEdits(rawEdits, cwd, api) {
   const changes = new Map();
   const outlines = new Map();
   const sources = new Map();
+  const claimed = new Map();
+  let operationIndex = -1;
+  const claim = (file,start,end) => {
+    const spans=claimed.get(file)??[];
+    const conflict=spans.find(s=>start<s.end&&s.start<end);
+    if(conflict) throw new Error(`CONFLICTING_TEXT_EDITS: ${file}: edits[${conflict.index}] and edits[${operationIndex}] overlap original source offsets ${Math.max(start,conflict.start)}-${Math.min(end,conflict.end)}; combine them into one operation; no writes applied`);
+    spans.push({start,end,index:operationIndex});claimed.set(file,spans);
+  };
   const outlineFor = async file => {
     if(!outlines.has(file)) outlines.set(file,await api.outline(file));
     return outlines.get(file);
   };
   for (let raw of rawEdits ?? []) {
+    operationIndex++;
     if (raw.op === "delete" && typeof raw.old === "string" && typeof raw.new !== "string") {
       raw = { ...raw, new: "" };
     }
@@ -72,10 +81,26 @@ export async function normalizeEdits(rawEdits, cwd, api) {
             entity_type: canonical.type,
             ...(canonical.parent_name ? { parent_name: canonical.parent_name } : {}),
           };
+          // A child deletion and a disjoint textual edit of its parent can
+          // share one original-source image. Full replacements still cannot.
+          const hasParent = (outline.entities ?? []).some(parent =>
+            parent.start_line <= canonical.start_line && parent.end_line >= canonical.end_line &&
+            (parent.start_line < canonical.start_line || parent.end_line > canonical.end_line));
+          const hasTextPeer = (rawEdits ?? []).some(peer =>
+            typeof peer.old === 'string' &&
+            path.resolve(cwd, peer.file ?? peer.path ?? peer.entity?.file ?? '') === absolutePath);
+          if ((raw.op ?? raw.operation) === 'delete' && hasParent && hasTextPeer) {
+            if (!sources.has(file)) sources.set(file, await fs.readFile(absolutePath, 'utf8'));
+            const body = sources.get(file).split('\n').slice(canonical.start_line - 1, canonical.end_line).join('\n');
+            if (!body) throw new Error('EMPTY_DELETE_ENTITY');
+            raw = {...raw, entity: normalizedEntity, old: body, new: '', op: 'replace'};
+          }
         }
       }
-      edits.push({ ...raw, entity: normalizedEntity, file, op: raw.op ?? raw.operation ?? "replace", claim: false });
-      continue;
+      if (typeof raw.old !== 'string') {
+        edits.push({ ...raw, entity: normalizedEntity, file, op: raw.op ?? raw.operation ?? "replace", claim: false });
+        continue;
+      }
     }
     let absolute = path.resolve(cwd, file);
     const root = `${path.resolve(cwd)}${path.sep}`;
@@ -91,7 +116,25 @@ export async function normalizeEdits(rawEdits, cwd, api) {
     if (raw.range) {
       startLine = raw.range.start_line;
       endLine = raw.range.end_line;
-      replacement = raw.content;
+      const lines=source.split('\n');
+      if(!Number.isSafeInteger(startLine)||!Number.isSafeInteger(endLine)||
+         startLine<1||endLine<startLine||endLine>lines.length)
+        throw new Error(`INVALID_EDIT_RANGE: ${file}: expected existing inclusive line bounds`);
+      const selected=lines.slice(startLine-1,endLine).join('\n');
+      const hasOld=Object.hasOwn(raw,'old'),hasNew=Object.hasOwn(raw,'new');
+      if(hasOld||hasNew) {
+        if(typeof raw.old!=='string'||typeof raw.new!=='string')
+          throw new Error(`INVALID_RANGE_EDIT: ${file}: provide both old and new strings`);
+        if(raw.old!==selected)
+          throw new Error(`RANGE_SOURCE_MISMATCH: ${file}:${startLine}-${endLine}; old must equal the complete selected lines`);
+        if(Object.hasOwn(raw,'content')&&raw.content!==raw.new)
+          throw new Error(`CONFLICTING_RANGE_REPLACEMENT: ${file}: content and new disagree`);
+        replacement=raw.new;
+      } else {
+        if(typeof raw.content!=='string')
+          throw new Error(`INVALID_RANGE_EDIT: ${file}: provide content or an exact old/new pair`);
+        replacement=raw.content;
+      }
     } else if (typeof raw.old === "string" && typeof raw.new === "string") {
       for (const match of raw.new.matchAll(/self\.(\_[A-Za-z_]\w*)\.[A-Za-z_]\w*/g)) {
         const field = match[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -102,16 +145,24 @@ export async function normalizeEdits(rawEdits, cwd, api) {
         }
       }
       let resolved;
+      let anchorScope=source;
+      let scopeLabel='file';
       if(raw.entity?.name) {
         const selected=selectEntity(outline.entities??[],raw.entity);
         const lines=source.split('\n');
         const body=lines.slice(selected.start_line-1,selected.end_line).join('\n');
+        anchorScope=body;
+        scopeLabel=`entity ${selected.parent_name?selected.parent_name+'.':''}${selected.name} (lines ${selected.start_line}-${selected.end_line})`;
         const local=uniqueFlexibleText(body,raw.old);
         const prefix=lines.slice(0,selected.start_line-1).join('\n');
         resolved=local?{...local,index:local.index+prefix.length+(selected.start_line>1?1:0)}:null;
       } else resolved=uniqueFlexibleText(source,raw.old);
       if (!resolved) {
-        throw new Error(`old text must occur exactly once in ${file}`);
+        const first=anchorScope.indexOf(raw.old);
+        const repeated=first>=0&&anchorScope.indexOf(raw.old,first+1)>=0;
+        const reason=repeated?'multiple exact matches; include more surrounding text':
+          'no unique exact or whitespace-flexible match; reread the selected scope';
+        throw new Error(`old text must occur exactly once in ${file}; scope: ${scopeLabel}; ${reason}`);
       }
       raw = { ...raw, old: resolved.text };
       anchorIndex = resolved.index;
@@ -120,6 +171,12 @@ export async function normalizeEdits(rawEdits, cwd, api) {
       replacement = raw.new;
     } else {
       throw new Error(`edit for ${file} needs entity, range+content, or exact old+new`);
+    }
+    if(anchorIndex!==undefined) claim(file,anchorIndex,anchorIndex+raw.old.length);
+    else if(raw.range) {
+      const lines=source.split('\n');
+      const start=lines.slice(0,startLine-1).join('\n').length+(startLine>1?1:0);
+      claim(file,start,start+lines.slice(startLine-1,endLine).join('\n').length);
     }
     const enclosing = (outline.entities ?? [])
       .filter((item) => item.start_line <= startLine && item.end_line >= endLine)
@@ -185,6 +242,7 @@ export async function normalizeEdits(rawEdits, cwd, api) {
         name: enclosing.name,
         entity_type: enclosing.type,
         ...(enclosing.parent_name ? { parent_name: enclosing.parent_name } : {}),
+        start_line: enclosing.start_line,
         ordinal: (outlines.get(file).entities ?? []).filter(e=>e.name===enclosing.name && e.type===enclosing.type && (!enclosing.parent_name || e.parent_name===enclosing.parent_name)).findIndex(e=>e.start_line===enclosing.start_line && e.end_line===enclosing.end_line),
       },
       op: "replace",

@@ -11,7 +11,7 @@ export function boundedLines(source, limit) {
   return {content,bytes,truncated:content!==source};
 }
 export async function readBoundedFiles(cwd, files, limit=48000) {
-  if(!Array.isArray(files)||files.length>8) throw new Error('At most eight files per request');
+  if(!Array.isArray(files)||files.length>64) throw new Error('At most 64 files per request');
   const root=await fs.realpath(cwd), results=[];
   let remaining=limit;
   for(const file of files) {

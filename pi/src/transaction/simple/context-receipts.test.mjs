@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {ContextReceipts} from './context-receipts.mjs';
 const definition={file:'f.ts',entity:{name:'f'},content:'function f() { /* '+ 'retained source '.repeat(30)+' */ }'};
 
+
 test('never assumes that previous source is retained without explicit epoch',()=>{
   const cache=new ContextReceipts();
   for(let i=0;i<3;i++)assert.equal(cache.present([definition])[0].content,definition.content);

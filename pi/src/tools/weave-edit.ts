@@ -146,6 +146,8 @@ export interface WeaveEditDeps {
   parallelDistinctFiles?: boolean;
   /** Exact-read preconditions checked inside the file mutation queue. */
   snapshotTargets?: ReadonlyMap<string, { sha256: string; start: number; end: number }>;
+  /** Intermediate source guards for ordered edits, including same-file batches. */
+  snapshotTargetsByEdit?: ReadonlyArray<{ file: string; sha256: string; start: number; end: number }>;
 }
 
 export interface WeaveEditOutcome {
@@ -1396,6 +1398,10 @@ async function resyncCoordinationAfterRollback(
  * same batch can touch the same file.
  */
 async function performWeaveEditBatch(edits: OneWeaveEditParams[], atomic: boolean, deps: WeaveEditDeps): Promise<WeaveEditOutcome> {
+  if (deps.snapshotTargetsByEdit && (deps.snapshotTargetsByEdit.length !== edits.length ||
+      deps.snapshotTargetsByEdit.some((target, i) => target.file !== resolveTargetPath(deps.cwd, edits[i]!.file)))) {
+    throw new Error("INVALID_SNAPSHOT_TARGETS");
+  }
   const distinctFiles = Array.from(new Set(edits.map((e) => e.file)));
   const snapshots = new Map<string, string>();
   if (atomic) {
@@ -1418,7 +1424,7 @@ async function performWeaveEditBatch(edits: OneWeaveEditParams[], atomic: boolea
   // edit so the guard compares against the batch's own most recent output.
   const batchImages = new Map<string, string>();
 
-  const parallel = deps.parallelDistinctFiles === true && distinctFiles.length === edits.length;
+  const parallel = deps.parallelDistinctFiles === true && distinctFiles.length === edits.length && !deps.snapshotTargetsByEdit;
   if (parallel) {
     const outcomes = await Promise.all(edits.map((edit) => performOneWeaveEdit(edit, deps)));
     outcomes.forEach((outcome, i) => {
@@ -1437,7 +1443,15 @@ async function performWeaveEditBatch(edits: OneWeaveEditParams[], atomic: boolea
   } else {
     for (let i = 0; i < edits.length; i++) {
       const edit = edits[i]!;
-      const outcome = await performOneWeaveEdit(edit, deps);
+      const target = deps.snapshotTargetsByEdit?.[i];
+      const editDeps = target ? { ...deps, snapshotTargets: new Map([[target.file, target]]) } : deps;
+      let outcome: WeaveEditOutcome;
+      try {
+        outcome = await performOneWeaveEdit(edit, editDeps);
+      } catch (error) {
+        // A stale intermediate guard must still roll back earlier batch writes.
+        outcome = { isError: true, text: String(error), details: { reason: "edit_error", error: String(error) } };
+      }
       results.push({ file: edit.file, entity: edit.entity, outcome });
       if (atomic) {
         try {

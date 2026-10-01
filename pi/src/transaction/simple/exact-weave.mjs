@@ -2,15 +2,22 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {performWeaveEdit} from '../../tools/weave-edit.ts';
+import {splice} from '../../tools/internal/text.ts';
 const hash=b=>createHash('sha256').update(b).digest('hex');
 
 export async function applyExact(exact,cwd,revision,edits,{semBin='sem',validate}={}) {
   const snapshot=exact.get(revision);
   if(!Array.isArray(edits)||!edits.length||edits.length>64) throw new Error('INVALID_EDITS');
-  const root=await fs.realpath(cwd),seen=new Set(),targets=new Map(),batch=[];
+  const root=await fs.realpath(cwd),seen=new Set(),targets=[],batch=[],planned=new Map();
+  const ordered=edits.map(edit=>({edit,entity:snapshot.entities.find(e=>e.id===edit.id)}));
+  if(ordered.some(item=>!item.entity)) throw new Error('INVALID_EDIT');
+  ordered.sort((a,b)=>a.entity.file.localeCompare(b.entity.file)||b.entity.start-a.entity.start);
+  for(let i=1;i<ordered.length;i++) {
+    const a=ordered[i-1].entity,b=ordered[i].entity;
+    if(a.file===b.file&&(b.end>a.start||b.start===a.start)) throw new Error('OVERLAPPING_EDITS');
+  }
   let replacementBytes=0;
-  for(const edit of edits) {
-    const entity=snapshot.entities.find(e=>e.id===edit.id);
+  for(const {edit,entity} of ordered) {
     if(!entity) throw new Error('INVALID_EDIT');
     let content=edit.content;
     if(content!==undefined&&(edit.old!==undefined||edit.new!==undefined)) throw new Error('INVALID_EDIT');
@@ -25,28 +32,37 @@ export async function applyExact(exact,cwd,revision,edits,{semBin='sem',validate
     replacementBytes+=Buffer.byteLength(content);
     if(replacementBytes>exact.maxBytes) throw new Error('RESULT_TOO_LARGE');
     if(edit.allow_signature_change!==undefined&&typeof edit.allow_signature_change!=='boolean') throw new Error('INVALID_EDIT');
-    if(seen.has(entity.file)) throw new Error('MULTIPLE_TARGETS_PER_FILE_NOT_SUPPORTED');
     seen.add(entity.file);
     const file=path.join(root,entity.file);
     if(await fs.realpath(file)!==file) throw new Error('SYMLINK_NOT_SUPPORTED');
     const expected=hash(snapshot.sources.get(entity.file));
     if(hash(await fs.readFile(file))!==expected) throw new Error('STALE_SNAPSHOT');
-    targets.set(file,{sha256:expected,start:entity.start,end:entity.end});
     // Exact entities exclude indentation; Weave replaces whole source lines.
     // Preserve surrounding whitespace, and reject inline siblings rather than
     // silently dropping bytes outside the requested entity.
     const original=snapshot.sources.get(entity.file);
-    const lineStart=original.lastIndexOf(10,entity.start-1)+1;
+    const lineStart=entity.start===0?0:original.lastIndexOf(10,entity.start-1)+1;
     const nextNewline=original.indexOf(10,entity.end);
     const lineEnd=nextNewline<0?original.length:nextNewline;
     const prefix=original.subarray(lineStart,entity.start).toString('utf8');
     const suffix=original.subarray(entity.end,lineEnd).toString('utf8');
     if(!/^[\t ]*$/.test(prefix)||!/^[\t \r]*$/.test(suffix)) throw new Error('INLINE_ENTITY_NOT_SUPPORTED');
-    batch.push({file:entity.file,entity:{name:entity.name,entity_type:entity.type},op:'replace',content:prefix+content+suffix.replace(/\r$/,''),allow_signature_change:edit.allow_signature_change??false});
+    const request={file:entity.file,entity:{name:entity.name,entity_type:entity.type},op:'replace',content:prefix+content+suffix.replace(/\r$/,''),allow_signature_change:edit.allow_signature_change??false};
+    const before=planned.get(file)||original;
+    if(!before.subarray(0,entity.end).equals(original.subarray(0,entity.end))) throw new Error('NONLOCAL_SPLICE_NOT_SUPPORTED');
+    const start_line=original.subarray(0,entity.start).toString('utf8').split('\n').length;
+    const end_line=original.subarray(0,Math.max(entity.start,entity.end-1)).toString('utf8').split('\n').length;
+    const after=Buffer.from(splice(before.toString('utf8'),{start_line,end_line},'replace',request.content).text);
+    const tail=before.subarray(lineEnd);
+    if(!after.subarray(0,lineStart).equals(before.subarray(0,lineStart))||
+       !after.subarray(after.length-tail.length).equals(tail)) throw new Error('NONLOCAL_SPLICE_NOT_SUPPORTED');
+    targets.push({file,sha256:hash(before),start:entity.start,end:entity.end});
+    planned.set(file,after);
+    batch.push(request);
   }
   let outcome;
   try {
-    outcome=await performWeaveEdit({edits:batch,atomic:true,claim:false},{cwd:root,semBin,checkDependents:false,snapshotTargets:targets});
+    outcome=await performWeaveEdit({edits:batch,atomic:true,claim:false},{cwd:root,semBin,checkDependents:false,snapshotTargetsByEdit:targets});
   } catch(error) {
     return {revision,status:'apply_error',error:String(error),validation:'not_run',requires_recapture:true};
   }
