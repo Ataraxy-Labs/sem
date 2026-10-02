@@ -42,6 +42,15 @@ impl McpClient {
     }
 
     fn spawn_with_discovery(repo: &Path, discovery: bool) -> Self {
+        Self::spawn_with_probe(repo, discovery.then(|| json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "copilot-cli", "version": "1.0.88"}
+            }
+        })))
+    }
+
+    fn spawn_with_probe(repo: &Path, probe: Option<Value>) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sem-mcp"))
             .current_dir(repo)
             // These tests exercise one isolated stdio server each.
@@ -59,13 +68,8 @@ impl McpClient {
             stdout,
             next_id: 1,
         };
-        if discovery {
-            let response = client.request("server/discover", json!({
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientInfo": {"name": "copilot-cli", "version": "1.0.88"}
-                }
-            }));
+        if let Some(params) = probe {
+            let response = client.request("server/discover", params);
             assert_eq!(response["error"]["code"], -32601, "{response}");
         }
         client.initialize();
@@ -185,6 +189,16 @@ fn tool_text(resp: &Value) -> String {
 }
 
 // ── Fixture repo ──
+
+#[test]
+fn agy_empty_discovery_probe_keeps_session_usable() {
+    let repo = fixture_repo();
+    // Issue #502: request id 1, server/discover, params {}.
+    let mut client = McpClient::spawn_with_probe(repo.path(), Some(json!({})));
+    assert!(!client.tools_list().is_empty());
+    let response = client.call_tool("sem_entities", json!({"path": "src/needle.py"}));
+    assert!(tool_text(&response).contains("needle_target_fn"));
+}
 
 #[test]
 fn copilot_discovery_falls_back_to_initialize_and_tools_work() {

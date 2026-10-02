@@ -236,8 +236,11 @@ jobs:
         run: ./mcp-publisher publish || (sleep 60 && ./mcp-publisher publish)
 
   publish-crates:
-    needs: [check-version]
-    if: needs.check-version.outputs.should_release == 'true' || inputs.publish_crates_only == true
+    needs: [check-version, semver-check]
+    if: >-
+      always() && needs.check-version.result == 'success' &&
+      ((needs.check-version.outputs.should_release == 'true' && needs.semver-check.result == 'success') ||
+      (inputs.publish_crates_only == true && needs.check-version.outputs.should_release == 'false'))
     runs-on: ubuntu-latest
     defaults:
       run:

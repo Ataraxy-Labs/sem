@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-02
+
 ### Removed
 
 - **The strict and adaptive transaction policies are gone from pi, leaving the simple structural session policy as the only one.** `pi/config/transaction.mjs` and `pi/config/adaptive-transaction.mjs` are removed, and `config/simple-transaction.mjs` is now the documented configuration for `PI_SEM_MODE=transaction`.
