@@ -1,0 +1,35 @@
+{
+  "budget": 2000,
+  "entity": "parse_config",
+  "entityId": "src/config.py::function::parse_config",
+  "entries": [
+    {
+      "content": "def parse_config(text):\n    pairs = [line.split(\"=\", 1) for line in text.splitlines() if line]\n    return dict(pairs)",
+      "entityId": "src/config.py::function::parse_config",
+      "file": "src/config.py",
+      "name": "parse_config",
+      "role": "target",
+      "tokens": 29,
+      "type": "function"
+    },
+    {
+      "content": "def load(path):\n    with open(path) as f:\n        return parse_config(f.read())",
+      "entityId": "src/config.py::function::load",
+      "file": "src/config.py",
+      "name": "load",
+      "role": "direct_dependent",
+      "tokens": 19,
+      "type": "function"
+    }
+  ],
+  "omitted": [
+    {
+      "entities": 1,
+      "role": "direct_dependent",
+      "tests": 1
+    }
+  ],
+  "target_omitted": false,
+  "total_tokens": 48,
+  "truncated": false
+}

@@ -1,0 +1,7 @@
+Architecture view 94f4bd74e26e..d73d4d092b43: 1 files, 2 entities changed, 1 module touched
+1 findings collapsed to 1 facts; 0 listed, 0 need a human decision.
+
+No architectural change that needs a decision.
+
+Also: 1 minor data-flow group (1 path; mostly config → writes logs).
+Unchanged (as far as sem can see): auth, network calls, subprocesses, database access, file writes, environment reads, HTML/HTTP output, public APIs, module dependencies, cycles.

@@ -1,0 +1,26 @@
+[
+  {
+    "end_line": 3,
+    "file": "src/config.py",
+    "name": "parse_config",
+    "parent_id": null,
+    "start_line": 1,
+    "type": "function"
+  },
+  {
+    "end_line": 8,
+    "file": "src/config.py",
+    "name": "load",
+    "parent_id": null,
+    "start_line": 6,
+    "type": "function"
+  },
+  {
+    "end_line": 12,
+    "file": "src/config.py",
+    "name": "main",
+    "parent_id": null,
+    "start_line": 11,
+    "type": "function"
+  }
+]

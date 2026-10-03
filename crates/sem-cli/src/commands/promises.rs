@@ -31,7 +31,7 @@ pub struct VerifyArgs {
     only: Vec<String>,
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

@@ -1,0 +1,2 @@
+⊕ text "splitlines" · 1 hits · 1 files
+╰─▶ src/config.py: parse_config (L2): pairs = [line.split("=", 1) for line in text.splitlines() if line]

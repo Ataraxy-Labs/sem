@@ -1,0 +1,212 @@
+{
+  "coverage": {
+    "callSites": 9,
+    "dynamicMarkers": 0,
+    "externalModeled": 3,
+    "externalUnmodeled": 1,
+    "files": 2,
+    "functions": 6,
+    "pipelineAnswered": 9,
+    "resolvedToRepo": 3,
+    "sinkSites": 2,
+    "sourceSites": 1,
+    "unknown": 2,
+    "unknownByReason": {
+      "unknown receiver type": 2
+    },
+    "unknownRate": 0.222
+  },
+  "entities": [
+    {
+      "cognitive": 0,
+      "cyclomatic": 3,
+      "dynamic": [],
+      "entityId": "src/config.py::function::parse_config",
+      "file": "src/config.py",
+      "key": "src/config.py::parse_config",
+      "line": 1,
+      "module": false,
+      "name": "parse_config",
+      "reads": [],
+      "transitive": {
+        "functionsReachable": 1,
+        "reads": [],
+        "unknownCallsReachable": 2,
+        "writes": []
+      },
+      "unknownCallees": [
+        [
+          2,
+          "splitlines"
+        ],
+        [
+          2,
+          "split"
+        ]
+      ],
+      "unknownCalls": 2,
+      "writes": []
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "dynamic": [],
+      "entityId": "src/config.py::function::load",
+      "file": "src/config.py",
+      "key": "src/config.py::load",
+      "line": 6,
+      "module": false,
+      "name": "load",
+      "reads": [
+        "file-read"
+      ],
+      "transitive": {
+        "functionsReachable": 2,
+        "reads": [
+          "file-read"
+        ],
+        "unknownCallsReachable": 2,
+        "writes": [
+          "file-path"
+        ]
+      },
+      "unknownCallees": [],
+      "unknownCalls": 0,
+      "writes": [
+        "file-path"
+      ]
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "dynamic": [],
+      "entityId": "src/config.py::function::main",
+      "file": "src/config.py",
+      "key": "src/config.py::main",
+      "line": 11,
+      "module": false,
+      "name": "main",
+      "reads": [],
+      "transitive": {
+        "functionsReachable": 3,
+        "reads": [
+          "file-read"
+        ],
+        "unknownCallsReachable": 2,
+        "writes": [
+          "file-path",
+          "log"
+        ]
+      },
+      "unknownCallees": [],
+      "unknownCalls": 0,
+      "writes": [
+        "log"
+      ]
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "dynamic": [],
+      "entityId": "tests/test_config.py::function::test_parse_config",
+      "file": "tests/test_config.py",
+      "key": "tests/test_config.py::test_parse_config",
+      "line": 4,
+      "module": false,
+      "name": "test_parse_config",
+      "reads": [],
+      "transitive": {
+        "functionsReachable": 2,
+        "reads": [],
+        "unknownCallsReachable": 2,
+        "writes": []
+      },
+      "unknownCallees": [],
+      "unknownCalls": 0,
+      "writes": []
+    }
+  ],
+  "escapeCount": 1,
+  "escapes": [
+    {
+      "key": "file-read src/config.py::load [io.TextIOWrapper.read] -> unknown src/config.py::parse_config",
+      "path": [
+        "src/config.py:8 load: source file-read via io.TextIOWrapper.read",
+        "src/config.py:8 load: calls parse_config",
+        "src/config.py:2 parse_config: passed to unresolved text.splitlines()"
+      ],
+      "source": {
+        "class": "file-read",
+        "entity": "load",
+        "file": "src/config.py",
+        "line": 8,
+        "via": "io.TextIOWrapper.read"
+      },
+      "unknown": {
+        "entity": "parse_config",
+        "file": "src/config.py",
+        "line": 2,
+        "why": "unknown receiver type: text.splitlines()"
+      }
+    }
+  ],
+  "flows": [
+    {
+      "interprocedural": true,
+      "key": "file-read src/config.py::load [io.TextIOWrapper.read] -> log src/config.py::main [builtins.print]",
+      "path": [
+        "src/config.py:8 load: source file-read via io.TextIOWrapper.read",
+        "src/config.py:12 main: returned from load",
+        "src/config.py:12 main: sink log via builtins.print"
+      ],
+      "selfPath": false,
+      "sink": {
+        "class": "log",
+        "entity": "main",
+        "entityId": "src/config.py::function::main",
+        "file": "src/config.py",
+        "line": 12,
+        "precision": "resolved",
+        "via": "builtins.print"
+      },
+      "source": {
+        "class": "file-read",
+        "entity": "load",
+        "entityId": "src/config.py::function::load",
+        "file": "src/config.py",
+        "line": 8,
+        "via": "io.TextIOWrapper.read"
+      },
+      "throughState": null
+    }
+  ],
+  "incomplete": false,
+  "incompleteWhy": null,
+  "possibleFlows": [],
+  "precision": "may-flow: flow-insensitive within a function, field-insensitive (a write to any field taints the object), one summary per function (context-insensitive), no alias analysis; sources and sinks only where a model names them. Over-approximates within what was resolved; unresolved calls are reported as unknown, not dropped",
+  "unknownFlows": [
+    {
+      "key": "unknown src/config.py::parse_config -> log src/config.py::main [builtins.print]",
+      "path": [
+        "src/config.py:2 parse_config: unknown: unknown receiver type: text.splitlines()",
+        "src/config.py:8 load: returned from parse_config",
+        "src/config.py:12 main: returned from load",
+        "src/config.py:12 main: sink log via builtins.print"
+      ],
+      "sink": {
+        "class": "log",
+        "entity": "main",
+        "file": "src/config.py",
+        "line": 12,
+        "via": "builtins.print"
+      },
+      "unknown": {
+        "entity": "parse_config",
+        "file": "src/config.py",
+        "line": 2,
+        "why": "unknown receiver type: text.splitlines()"
+      }
+    }
+  ],
+  "unknownThroughState": []
+}

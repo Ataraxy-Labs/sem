@@ -1,0 +1,29 @@
+{
+  "changes": [
+    {
+      "change_type": "added",
+      "commit": {
+        "author": "T",
+        "date": "2023-11-14",
+        "message": "init",
+        "sha": "94f4bd74e26e2f0a13d010fe1b34b653b34cdc31"
+      },
+      "file_path": "src/config.py",
+      "structural_change": true
+    },
+    {
+      "change_type": "modified (logic)",
+      "commit": {
+        "author": "T",
+        "date": "2023-11-14",
+        "message": "change",
+        "sha": "d73d4d092b437bc6a3b1306a3db335f03d0c966e"
+      },
+      "file_path": "src/config.py",
+      "structural_change": true
+    }
+  ],
+  "entity": "parse_config",
+  "file": "src/config.py",
+  "type": "function"
+}

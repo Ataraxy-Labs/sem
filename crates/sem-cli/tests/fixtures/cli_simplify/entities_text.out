@@ -1,0 +1,5 @@
+entities: src/config.py
+
+  function parse_config (L1:3)
+  function load (L6:8)
+  function main (L11:12)

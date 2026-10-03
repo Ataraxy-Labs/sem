@@ -1,0 +1,23 @@
+{
+  "coChanges": [],
+  "commitsScanned": 1,
+  "hotspots": [
+    {
+      "authors": 1,
+      "commits": 1,
+      "entity": "main",
+      "file": "src/config.py",
+      "lastSha": "d73d4d0",
+      "type": "function"
+    },
+    {
+      "authors": 1,
+      "commits": 1,
+      "entity": "parse_config",
+      "file": "src/config.py",
+      "lastSha": "d73d4d0",
+      "type": "function"
+    }
+  ],
+  "pairCommitsSkipped": 0
+}

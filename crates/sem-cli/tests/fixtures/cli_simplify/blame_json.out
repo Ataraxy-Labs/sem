@@ -1,0 +1,38 @@
+[
+  {
+    "author": "T",
+    "commit": "d73d4d092b437bc6a3b1306a3db335f03d0c966e",
+    "date": "2023-11-14",
+    "lines": [
+      1,
+      3
+    ],
+    "name": "parse_config",
+    "summary": "change",
+    "type": "function"
+  },
+  {
+    "author": "T",
+    "commit": "94f4bd74e26e2f0a13d010fe1b34b653b34cdc31",
+    "date": "2023-11-14",
+    "lines": [
+      6,
+      8
+    ],
+    "name": "load",
+    "summary": "init",
+    "type": "function"
+  },
+  {
+    "author": "T",
+    "commit": "d73d4d092b437bc6a3b1306a3db335f03d0c966e",
+    "date": "2023-11-14",
+    "lines": [
+      11,
+      12
+    ],
+    "name": "main",
+    "summary": "change",
+    "type": "function"
+  }
+]

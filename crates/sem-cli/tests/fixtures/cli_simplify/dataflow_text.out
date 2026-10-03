@@ -1,0 +1,7 @@
+2 files, 6 functions; 9 call sites: 3 repo, 3 modeled external, 1 unmodeled external, 2 unresolved (22.2%)
+1 data path(s):
+  file-read src/config.py:8 `load` -> log src/config.py:12 `main` (via builtins.print)
+      src/config.py:8 load: source file-read via io.TextIOWrapper.read
+      src/config.py:12 main: returned from load
+      src/config.py:12 main: sink log via builtins.print
+1 source(s) reach unresolved code; 0 possible (name-only) path(s)

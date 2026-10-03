@@ -1,0 +1,33 @@
+{
+  "candidate_files": 2,
+  "coverage": "eligible_text_files_best_effort; ignore_hidden_binary_and_default_exclusions_apply",
+  "hits": [
+    {
+      "file": "src/config.py",
+      "line": 1,
+      "text": "def parse_config(text):"
+    },
+    {
+      "file": "src/config.py",
+      "line": 8,
+      "text": "        return parse_config(f.read())"
+    },
+    {
+      "file": "tests/test_config.py",
+      "line": 1,
+      "text": "from src.config import parse_config"
+    },
+    {
+      "file": "tests/test_config.py",
+      "line": 4,
+      "text": "def test_parse_config():"
+    },
+    {
+      "file": "tests/test_config.py",
+      "line": 5,
+      "text": "    assert parse_config(\"a=1\") == {\"a\": \"1\"}"
+    }
+  ],
+  "origin": "trigram",
+  "total_files": 2
+}

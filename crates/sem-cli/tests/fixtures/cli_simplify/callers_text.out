@@ -1,0 +1,4 @@
+function parse_config src/config.py:1
+  function load src/config.py:6
+  function test_parse_config tests/test_config.py:4
+  complete: no other textual path to this definition (every code mention of `parse_config` in 2 file(s) (comments and docstrings excluded), aliases one hop, dispatch/registration decorators, getattr with a literal prefix; a name computed entirely at runtime is not modeled)

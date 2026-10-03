@@ -1,0 +1,55 @@
+{
+  "binaryChanges": [],
+  "changes": [
+    {
+      "afterContent": "def parse_config(text):\n    pairs = [line.split(\"=\", 1) for line in text.splitlines() if line]\n    return dict(pairs)",
+      "author": null,
+      "beforeContent": "def parse_config(text):\n    return dict(line.split(\"=\") for line in text.splitlines())",
+      "changeType": "modified",
+      "commitSha": null,
+      "endLine": 3,
+      "entityId": "src/config.py::function::parse_config",
+      "entityName": "parse_config",
+      "entityType": "function",
+      "filePath": "src/config.py",
+      "oldEndLine": 2,
+      "oldEntityName": null,
+      "oldFilePath": null,
+      "oldParentId": null,
+      "oldStartLine": 1,
+      "startLine": 1,
+      "structuralChange": true
+    },
+    {
+      "afterContent": "def main():\n    print(load(\"app.cfg\"))",
+      "author": null,
+      "beforeContent": null,
+      "changeType": "added",
+      "commitSha": null,
+      "endLine": 12,
+      "entityId": "src/config.py::function::main",
+      "entityName": "main",
+      "entityType": "function",
+      "filePath": "src/config.py",
+      "oldEndLine": null,
+      "oldEntityName": null,
+      "oldFilePath": null,
+      "oldParentId": null,
+      "oldStartLine": null,
+      "startLine": 11,
+      "structuralChange": null
+    }
+  ],
+  "summary": {
+    "added": 1,
+    "binary": 0,
+    "deleted": 0,
+    "fileCount": 1,
+    "modified": 1,
+    "moved": 0,
+    "orphan": 0,
+    "renamed": 0,
+    "reordered": 0,
+    "total": 2
+  }
+}

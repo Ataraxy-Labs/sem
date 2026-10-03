@@ -1,0 +1,38 @@
+{
+  "callersComplete": true,
+  "checked": "every code mention of `parse_config` in 2 file(s) (comments and docstrings excluded), aliases one hop, dispatch/registration decorators, getattr with a literal prefix; a name computed entirely at runtime is not modeled",
+  "dependents": [
+    {
+      "entityId": "src/config.py::function::load",
+      "file": "src/config.py",
+      "lines": [
+        6,
+        8
+      ],
+      "name": "load",
+      "type": "function"
+    },
+    {
+      "entityId": "tests/test_config.py::function::test_parse_config",
+      "file": "tests/test_config.py",
+      "lines": [
+        4,
+        5
+      ],
+      "name": "test_parse_config",
+      "type": "function"
+    }
+  ],
+  "entity": {
+    "entityId": "src/config.py::function::parse_config",
+    "file": "src/config.py",
+    "lines": [
+      1,
+      3
+    ],
+    "name": "parse_config",
+    "type": "function"
+  },
+  "incompleteBecause": [],
+  "possibleCallers": []
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "end_line": 3,
+    "file": "src/config.py",
+    "id": "src/config.py::function::parse_config",
+    "name": "parse_config",
+    "start_line": 1,
+    "type": "function"
+  }
+]

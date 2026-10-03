@@ -824,3 +824,21 @@ mod snapshot_tests {
         assert_eq!(snapshot_owner("pkg/__snapshots__/a.test.tsx"), None);
     }
 }
+
+/// True when `repo_root` is a JS/TS workspace: a package.json at the root,
+/// or workspace packages below it.
+pub fn is_js_workspace(repo_root: &str) -> bool {
+    let root = PathBuf::from(repo_root);
+    if root.join("package.json").is_file() {
+        return true;
+    }
+    let c = Common::at(repo_root);
+    let disc = Discovery { exclude_dirs: &c.exclude_dirs, skip_segments: &c.skip_dirs, extensions: &c.exts, root_package: false };
+    !Workspace::discover(&root, &disc).packages.is_empty()
+}
+
+/// `affected-tests` over the whole repository (the root is a package too),
+/// printed exactly as `sem topology affected-tests` prints it.
+pub fn print_affected_tests(repo_root: &str, changed: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    run(TopologyCmd::AffectedTests { common: Common::whole_repo(repo_root), changed })
+}

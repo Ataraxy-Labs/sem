@@ -1,0 +1,5 @@
+src/config.py:1:def parse_config(text):
+src/config.py:8:        return parse_config(f.read())
+tests/test_config.py:1:from src.config import parse_config
+tests/test_config.py:4:def test_parse_config():
+tests/test_config.py:5:    assert parse_config("a=1") == {"a": "1"}

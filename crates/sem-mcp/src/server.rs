@@ -33,25 +33,109 @@ use crate::watch::{watch_enabled, RepoWatcher};
 
 const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
     (functions/classes/methods plus a real cross-file call and import graph). \
-    Prefer these over grep/find for structural questions:\n\
-    - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
-    - \"read / understand the function or class X\" -> sem_context (returns X's full source PLUS its callers and callees, addressed by name, not by line range; use this instead of opening the file to read code)\n\
-    - \"find where a string/symbol appears\" -> sem_entities with `text` (exact-substring search over entity bodies; hits are entities, not line numbers)\n\
-    - \"list the entities in this file/dir\" -> sem_entities with a `path`\n\
-    - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
-    Use grep/find only for text/string search, error messages, config keys, \
-    discovery by an unknown name, and non-code files. Open/read a source file \
-    directly only to edit it (editors require reading the file first) or for \
-    non-code/config; to merely understand code, sem_context is faster and arrives \
-    with the dependency context. sem is deterministic and cross-file, so it won't \
-    hallucinate edges or miss callers the way a text search does.\n\
-    Make the leverage felt. sem_context and sem_impact return `elapsed_ms` (and \
-    `source`: local or cloud) — the real latency you waited on. When one sem call \
-    replaces several grep/read steps or catches what text search can't, say so in \
-    ONE terse, factual clause, e.g. \"(sem_impact: 9ms, 2 transitive callers grep \
-    would miss)\" or \"(sem_context: 7ms, body + 3 deps, no files opened)\". Once \
-    per non-obvious win, never a sales pitch. Default to sem for structural work; \
-    if you fall back to grep/read on a structural question, say why.";
+    Four questions, four verbs:\n\
+    - where is it? -> sem_find (definitions by name; mode callers / refs / context; `in` lists a file or directory) or sem_grep (text)\n\
+    - what does my change touch? -> sem_impact (dependents, deps, the tests to run)\n\
+    - is it correct? -> sem_check (the project's checkers; exit verdict pass / fail / could not decide)\n\
+    - what should a human review? -> sem_certify (the review certificate for a commit range)\n\
+    Also: sem_diff (which entities changed), sem_graph (entity, module, data-flow or system graph), \
+    sem_history (how an entity changed; blame for a file).\n\
+    Prefer sem_find with mode \"context\" over opening a file to understand code: it returns the \
+    entity's source plus its callers and callees, addressed by name. Use sem_grep for strings, \
+    error messages, config keys and non-code files. sem is deterministic and cross-file; when a \
+    caller set may be incomplete it says so.";
+
+/// The tools `tools/list` shows: the core verbs. Every other tool stays
+/// callable by name (older clients call `sem_entities`, `sem_context`,
+/// `sem_callers`, `sem_log`, `sem_blame`), but is not listed.
+pub const LISTED_TOOLS: [&str; 8] = [
+    "sem_find",
+    "sem_grep",
+    "sem_impact",
+    "sem_check",
+    "sem_certify",
+    "sem_diff",
+    "sem_graph",
+    "sem_history",
+];
+
+/// Listed too in a review-listener session (`sem mcp --review`).
+pub const REVIEW_TOOLS: [&str; 4] = ["join_review", "wait_for_branch", "reply_to_branch", "list_open_branches"];
+
+static REVIEW_LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Make this process's sessions list the review-listener tools.
+pub fn list_review_tools() {
+    REVIEW_LISTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `tools/list` shows the tool named `name`.
+pub fn is_listed(name: &str) -> bool {
+    LISTED_TOOLS.contains(&name)
+        || (REVIEW_LISTED.load(std::sync::atomic::Ordering::Relaxed) && REVIEW_TOOLS.contains(&name))
+}
+
+/// The `sem` executable to run for the verbs answered by the CLI: this
+/// process when it is `sem` (`sem mcp`), else `sem` on PATH.
+fn sem_exe() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .filter(|p| p.file_stem().is_some_and(|s| s == "sem"))
+        .unwrap_or_else(|| PathBuf::from("sem"))
+}
+
+/// Runs `sem <args>` in `cwd`: stdout as the result, stderr and the exit
+/// code after it. `verdict` names exit codes for verbs that have them.
+async fn run_sem(cwd: &Path, args: Vec<String>, verdict: fn(i32) -> Option<&'static str>) -> CallToolResult {
+    let cwd = cwd.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(sem_exe())
+            .args(&args)
+            .current_dir(&cwd)
+            .env("SEM_NO_PROGRESS", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+    })
+    .await;
+    let out = match out {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return tool_error(format!("could not run sem: {e}")),
+        Err(e) => return tool_error(format!("could not run sem: {e}")),
+    };
+    let code = out.status.code().unwrap_or(-1);
+    let mut content = vec![Content::text(String::from_utf8_lossy(&out.stdout).to_string())];
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let label = verdict(code);
+    if code != 0 || !stderr.is_empty() {
+        let mut tail = format!("exit {code}");
+        if let Some(l) = label {
+            tail.push_str(&format!(" ({l})"));
+        }
+        if !stderr.is_empty() {
+            tail.push('\n');
+            tail.push_str(&stderr);
+        }
+        content.push(Content::text(tail));
+    }
+    if code == 0 || label.is_some() {
+        CallToolResult::success(content)
+    } else {
+        CallToolResult::error(content)
+    }
+}
+
+fn no_verdict(_: i32) -> Option<&'static str> {
+    None
+}
+
+fn check_verdict(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("pass"),
+        1 => Some("fail"),
+        2 => Some("could not decide"),
+        _ => None,
+    }
+}
 
 const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
 
@@ -2459,13 +2543,79 @@ impl SemServer {
     // ── Find ──
 
     #[tool(
-        description = "Find entity definitions by exact name across the repo. Supports \"type name\" queries (e.g. \"function createProgram\") to disambiguate by kind, plus an optional file restriction. Returns one \"type name file:start_line\" row per match. Pass queries=[...] to batch several lookups in one call."
+        description = "Where is it? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies)."
     )]
     async fn sem_find(
         &self,
         Parameters(params): Parameters<FindParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = match self.get_context(params.file.as_deref()).await {
+        let query = params.query.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
+        let queries = params.queries().map(<[String]>::to_vec);
+        match params.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            None | Some("definitions") => {}
+            Some("callers") => {
+                let Some(q) = query else {
+                    return Ok(tool_error("mode \"callers\" takes one query"));
+                };
+                return self
+                    .sem_callers(Parameters(CallersParams { query: q, file: params.file().map(str::to_string), limit: params.limit, format: params.format.clone() }))
+                    .await;
+            }
+            Some("refs") => {
+                let Some(q) = query else {
+                    return Ok(tool_error("mode \"refs\" takes one query"));
+                };
+                let ctx = match self.get_context(params.file()).await {
+                    Ok(ctx) => ctx,
+                    Err(err) => return Ok(tool_error(err)),
+                };
+                let mut args = vec!["refs".to_string(), q];
+                if let Some(f) = params.file() {
+                    args.extend(["--file".to_string(), f.to_string()]);
+                }
+                if params.format() == "json" {
+                    args.push("--json".to_string());
+                }
+                return Ok(run_sem(&ctx.repo_root, args, no_verdict).await);
+            }
+            Some("context") => {
+                return self
+                    .sem_context(Parameters(ContextParams {
+                        file_path: params.file().map(str::to_string),
+                        entity_name: query,
+                        entities: queries,
+                        token_budget: params.token_budget,
+                        hops: params.hops,
+                        no_default_excludes: None,
+                        fresh: None,
+                        format: params.format.clone(),
+                        mode: params.headers.unwrap_or(false).then(|| "headers".to_string()),
+                    }))
+                    .await;
+            }
+            Some(other) => {
+                return Ok(tool_error(format!("unknown mode \"{other}\": omit it, or use callers, refs or context")));
+            }
+        }
+        if query.is_none() && queries.is_none() && (params.in_path.is_some() || params.text.is_some()) {
+            return self
+                .sem_entities(Parameters(EntitiesParams {
+                    path: params.in_path.clone().or(params.file.clone()),
+                    no_default_excludes: None,
+                    query: None,
+                    limit: None,
+                    text: params.text.clone(),
+                    signatures: None,
+                    format: params.format.clone(),
+                }))
+                .await;
+        }
+        self.find_definitions(params).await
+    }
+
+    /// Definitions by exact name: `sem_find` with no mode.
+    async fn find_definitions(&self, params: FindParams) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ctx = match self.get_context(params.file()).await {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
@@ -2487,7 +2637,7 @@ impl SemServer {
                 .values()
                 .filter(|e| e.name == name)
                 .filter(|e| want_type.is_none_or(|t| e.entity_type == t))
-                .filter(|e| file_filter.is_none_or(|f| e.file_path == f))
+                .filter(|e| file_filter.is_none_or(|f| in_scope(&e.file_path, f)))
                 .collect();
             matches.sort_by(|a, b| {
                 a.file_path
@@ -2704,10 +2854,111 @@ impl SemServer {
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
+    // ── History, check, certify, graph ──
+
+    #[tool(
+        description = "How did this entity change over time? Its versions through git history, logic changes told apart from cosmetic ones. Omit entity_name for the repo's hotspots and co-change pairs. blame=true with file_path: who last changed each entity in that file."
+    )]
+    async fn sem_history(
+        &self,
+        Parameters(params): Parameters<HistoryParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if params.blame.unwrap_or(false) {
+            let Some(file_path) = params.file_path.or(params.entity_name) else {
+                return Ok(tool_error("blame needs file_path"));
+            };
+            return self.sem_blame(Parameters(BlameParams { file_path })).await;
+        }
+        self.sem_log(Parameters(LogParams { entity_name: params.entity_name, file_path: params.file_path, limit: params.limit }))
+            .await
+    }
+
+    #[tool(
+        description = "Is my change correct? Runs the project's checkers on the working tree and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). base: only what changed since that revision. promises=true: prove every promise in .sem/promises can fail."
+    )]
+    async fn sem_check(
+        &self,
+        Parameters(params): Parameters<CheckParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ctx = match self.get_context(None).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let mut args = vec!["check".to_string(), "--json".to_string()];
+        if let Some(base) = params.base {
+            args.extend(["--base".to_string(), base]);
+        }
+        if let Some(checkers) = params.checkers.filter(|c| !c.is_empty()) {
+            args.extend(["--checkers".to_string(), checkers.join(",")]);
+        }
+        if params.promises.unwrap_or(false) {
+            args.push("--promises".to_string());
+        }
+        Ok(run_sem(&ctx.repo_root, args, check_verdict).await)
+    }
+
+    #[tool(
+        description = "What should a human review in this commit range? The review certificate: entities touched, signature changes and the callers they leave behind, promises kept or broken, affected tests, the static reference cone. arch=true: the architecture view (new or removed data paths, side effects, dependencies, cycles), ranked."
+    )]
+    async fn sem_certify(
+        &self,
+        Parameters(params): Parameters<CertifyParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ctx = match self.get_context(None).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let mut args = vec!["certify".to_string(), params.range];
+        if params.arch.unwrap_or(false) {
+            args.push("--arch".to_string());
+        }
+        if params.format.as_deref() == Some("json") {
+            args.push("--json".to_string());
+        }
+        Ok(run_sem(&ctx.repo_root, args, no_verdict).await)
+    }
+
+    #[tool(
+        description = "How is the code connected? layer \"entities\" (default): every function/class and the calls and references between them, as JSON. \"modules\": the JS/TS module graph; operation e.g. [\"metrics\"], [\"cycles\"], [\"blast-radius\", \"pkg-a\"], [\"path\", \"a\", \"b\"], [\"affected-tests\", \"src/a.ts\"]. \"dataflow\": reads, writes and source -> sink paths. \"system\": locked dependencies, layered. Large on big repos: prefer sem_find / sem_impact for one entity."
+    )]
+    async fn sem_graph(
+        &self,
+        Parameters(params): Parameters<GraphParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let ctx = match self.get_context(None).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let op = params.operation.unwrap_or_default();
+        let mut args = vec!["graph".to_string()];
+        match params.layer.as_deref().unwrap_or("entities") {
+            "entities" => args.push("--json".to_string()),
+            "modules" => {
+                args.push("--modules".to_string());
+                args.extend(op);
+            }
+            "dataflow" => args.extend(["--dataflow".to_string(), "--json".to_string()]),
+            "system" => {
+                args.push("--system".to_string());
+                if op.is_empty() {
+                    args.extend(["deps".to_string(), "--json".to_string()]);
+                } else {
+                    let json = op.first().is_some_and(|o| o == "deps");
+                    args.extend(op);
+                    if json {
+                        args.push("--json".to_string());
+                    }
+                }
+            }
+            other => return Ok(tool_error(format!("unknown layer \"{other}\": entities, modules, dataflow or system"))),
+        }
+        Ok(run_sem(&ctx.repo_root, args, no_verdict).await)
+    }
+
     // ── Grep ──
 
     #[tool(
-        description = "Search file contents for a regex or literal pattern across the repo's source files, returning rg-compatible file:line:text hits. Best for strings, error messages, config keys, and non-code files; prefer sem_entities/sem_context for structural questions. Pass patterns=[...] to batch several searches in one call, each pattern's hits kept separate."
+        description = "Search file contents for a regex or literal pattern across the repo's source files, returning rg-compatible file:line:text hits. Best for strings, error messages, config keys, and non-code files; prefer sem_find for structural questions. Pass patterns=[...] to batch several searches in one call, each pattern's hits kept separate."
     )]
     async fn sem_grep(
         &self,
@@ -3089,6 +3340,18 @@ fn omitted_tails_json(
 
 #[tool_handler]
 impl ServerHandler for SemServer {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        Ok(rmcp::model::ListToolsResult {
+            tools: listed_tools(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(MCP_INSTRUCTIONS)
@@ -3328,7 +3591,10 @@ mod tests {
         let info = SemServer::new().get_info();
 
         assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
-        assert!(MCP_INSTRUCTIONS.contains("sem_entities"));
+        for name in LISTED_TOOLS {
+            assert!(MCP_INSTRUCTIONS.contains(name), "instructions name {name}");
+        }
+        assert!(!MCP_INSTRUCTIONS.contains("sem_entities"));
         assert!(!MCP_INSTRUCTIONS.contains("tools: entities"));
     }
 
@@ -4220,6 +4486,20 @@ mod tests {
             );
         }
     }
+}
+
+/// The tools `tools/list` returns, in [`LISTED_TOOLS`] order.
+pub fn listed_tools() -> Vec<rmcp::model::Tool> {
+    let mut tools: Vec<rmcp::model::Tool> = SemServer::tool_router().list_all().into_iter().filter(|t| is_listed(&t.name)).collect();
+    let rank = |n: &str| LISTED_TOOLS.iter().chain(REVIEW_TOOLS.iter()).position(|x| *x == n).unwrap_or(usize::MAX);
+    tools.sort_by_key(|t| rank(&t.name));
+    tools
+}
+
+/// `path` is `scope` or lies under the directory `scope`.
+fn in_scope(path: &str, scope: &str) -> bool {
+    let f = scope.trim_end_matches('/');
+    f.is_empty() || f == "." || path == f || (path.len() > f.len() && path.starts_with(f) && path.as_bytes()[f.len()] == b'/')
 }
 
 fn tool_error(msg: impl Into<String>) -> CallToolResult {

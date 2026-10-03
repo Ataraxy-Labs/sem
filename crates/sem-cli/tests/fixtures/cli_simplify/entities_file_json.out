@@ -1,0 +1,23 @@
+[
+  {
+    "end_line": 3,
+    "name": "parse_config",
+    "parent_id": null,
+    "start_line": 1,
+    "type": "function"
+  },
+  {
+    "end_line": 8,
+    "name": "load",
+    "parent_id": null,
+    "start_line": 6,
+    "type": "function"
+  },
+  {
+    "end_line": 12,
+    "name": "main",
+    "parent_id": null,
+    "start_line": 11,
+    "type": "function"
+  }
+]

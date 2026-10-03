@@ -25,13 +25,28 @@ pub fn shared_status() -> serde_json::Value {
 }
 
 /// Run the MCP server on stdin/stdout. Blocks until the client disconnects.
+///
+/// A session launched by `sem cloud review listen` (it sets
+/// `SEM_REVIEW_DIFF_ID`) runs as [`run_review`].
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("SEM_REVIEW_DIFF_ID").is_some_and(|v| !v.is_empty()) {
+        return run_review();
+    }
     #[cfg(unix)]
     {
         return shared::run();
     }
 
     #[cfg(not(unix))]
+    run_stdio()
+}
+
+/// Run a standalone MCP server that also lists the cloud review-listener
+/// tools (`join_review`, `wait_for_branch`, `reply_to_branch`,
+/// `list_open_branches`). Never the shared daemon: those tools belong to
+/// this one session.
+pub fn run_review() -> Result<(), Box<dyn std::error::Error>> {
+    server::list_review_tools();
     run_stdio()
 }
 

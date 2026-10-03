@@ -1,0 +1,245 @@
+{
+  "base": "94f4bd74e26e2f0a13d010fe1b34b653b34cdc31",
+  "budgetExhausted": null,
+  "changed": [
+    {
+      "change": "modified",
+      "file": "src/config.py",
+      "lines": [
+        1,
+        3
+      ],
+      "name": "parse_config",
+      "oldFile": null,
+      "oldName": null,
+      "type": "function"
+    },
+    {
+      "change": "added",
+      "file": "src/config.py",
+      "lines": [
+        11,
+        12
+      ],
+      "name": "main",
+      "oldFile": null,
+      "oldName": null,
+      "type": "function"
+    }
+  ],
+  "complexity": [
+    {
+      "cognitive": [
+        null,
+        0
+      ],
+      "cyclomatic": [
+        null,
+        1
+      ],
+      "delta": [
+        1,
+        0
+      ],
+      "entity": "src/config.py::main",
+      "file": "src/config.py",
+      "line": 11,
+      "name": "main",
+      "new": true
+    },
+    {
+      "cognitive": [
+        0,
+        0
+      ],
+      "cyclomatic": [
+        2,
+        3
+      ],
+      "delta": [
+        1,
+        0
+      ],
+      "entity": "src/config.py::parse_config",
+      "file": "src/config.py",
+      "line": 1,
+      "name": "parse_config"
+    }
+  ],
+  "coverage": {
+    "base": {
+      "callSites": 6,
+      "dynamicMarkers": 0,
+      "externalModeled": 2,
+      "externalUnmodeled": 1,
+      "files": 1,
+      "functions": 3,
+      "pipelineAnswered": 6,
+      "resolvedToRepo": 1,
+      "sinkSites": 1,
+      "sourceSites": 1,
+      "unknown": 2,
+      "unknownByReason": {
+        "unknown receiver type": 2
+      },
+      "unknownRate": 0.333
+    },
+    "head": {
+      "callSites": 8,
+      "dynamicMarkers": 0,
+      "externalModeled": 3,
+      "externalUnmodeled": 1,
+      "files": 1,
+      "functions": 4,
+      "pipelineAnswered": 8,
+      "resolvedToRepo": 2,
+      "sinkSites": 2,
+      "sourceSites": 1,
+      "unknown": 2,
+      "unknownByReason": {
+        "unknown receiver type": 2
+      },
+      "unknownRate": 0.25
+    }
+  },
+  "dataPaths": {
+    "added": 1,
+    "base": 0,
+    "escapesHead": 1,
+    "head": 1,
+    "newEscapes": 0,
+    "newUnknownPaths": 1,
+    "possibleHead": 0,
+    "removed": 0,
+    "unknownPathsHead": 1
+  },
+  "dependencies": {
+    "derivedFrom": "resolved references between entities (calls, type references, imports) plus JS/TS module imports; tests, examples and benches excluded unless --include-examples; cycles within a Rust crate only (Cargo forbids crate cycles)",
+    "fileCycles": [
+      0,
+      0
+    ],
+    "fileCyclesAtHead": [],
+    "fileEdges": [
+      0,
+      0
+    ],
+    "fileEdgesAdded": 0,
+    "fileEdgesAddedList": [],
+    "fileEdgesRemoved": 0,
+    "packageCycles": [
+      0,
+      0
+    ],
+    "packageCyclesAtHead": [],
+    "packageEdges": [
+      0,
+      0
+    ],
+    "propagationCost": {
+      "file": [
+        0.0,
+        0.0
+      ],
+      "package": [
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "findings": [
+    {
+      "data": {
+        "interprocedural": true,
+        "key": "file-read src/config.py::load [io.TextIOWrapper.read] -> log src/config.py::main [builtins.print]",
+        "path": [
+          "src/config.py:8 load: source file-read via io.TextIOWrapper.read",
+          "src/config.py:12 main: returned from load",
+          "src/config.py:12 main: sink log via builtins.print"
+        ],
+        "selfPath": false,
+        "sink": {
+          "class": "log",
+          "entity": "main",
+          "entityId": "src/config.py::function::main",
+          "file": "src/config.py",
+          "line": 12,
+          "precision": "resolved",
+          "via": "builtins.print"
+        },
+        "source": {
+          "class": "file-read",
+          "entity": "load",
+          "entityId": "src/config.py::function::load",
+          "file": "src/config.py",
+          "line": 8,
+          "via": "io.TextIOWrapper.read"
+        },
+        "throughState": null
+      },
+      "details": [
+        "src/config.py:8 load: source file-read via io.TextIOWrapper.read",
+        "src/config.py:12 main: returned from load",
+        "src/config.py:12 main: sink log via builtins.print"
+      ],
+      "kind": "new-data-path",
+      "severity": "low",
+      "title": "new data path: file-read src/config.py:8 `load` -> log src/config.py:12 `main` (via builtins.print)",
+      "why": "untrusted file contents now flows into the logs"
+    }
+  ],
+  "head": "d73d4d092b437bc6a3b1306a3db335f03d0c966e",
+  "incomplete": false,
+  "moduleGraph": {
+    "edges": [],
+    "hiddenNeighbors": 0,
+    "newEdges": [],
+    "nodes": [
+      {
+        "added": false,
+        "depth": 0,
+        "id": "src",
+        "removed": false,
+        "touched": true
+      }
+    ],
+    "packages": 1,
+    "packagesBase": 1,
+    "touched": [
+      "src"
+    ]
+  },
+  "precision": "may-flow: flow-insensitive within a function, field-insensitive (a write to any field taints the object), one summary per function (context-insensitive), no alias analysis; sources and sinks only where a model names them. Over-approximates within what was resolved; unresolved calls are reported as unknown, not dropped",
+  "scope": {
+    "filesInRepo": 2,
+    "mode": "full"
+  },
+  "serviceBoundaries": {
+    "note": "no OpenAPI/protobuf/queue schema files found; any service boundary is an unmodeled unknown",
+    "schemaFiles": []
+  },
+  "severity": {
+    "high": 0,
+    "info": 0,
+    "low": 1,
+    "medium": 0
+  },
+  "skippedForBudget": [],
+  "summary": {
+    "added": 1,
+    "deleted": 0,
+    "entitiesChanged": 2,
+    "filesChanged": 1,
+    "modified": 1,
+    "moved": 0,
+    "renamed": 0
+  },
+  "unchanged": [
+    "Side effects (env/file/DB/network/subprocess/log/template reads and writes, module state, fields) are unchanged for all 2 function(s) present in both trees.",
+    "No package (directory) dependency was added or removed (0 package edge(s)).",
+    "Cycles unchanged: 0 package-level and 0 file-level strongly connected component(s), identical members.",
+    "Propagation cost unchanged: 0.0% of file pairs reachable (0.0% of package pairs).",
+    "No function signature changed.",
+    "No new import of a repo module that resolves to no file (JS/TS relative, Python relative and repo-absolute; 0 in the changed files at head)."
+  ]
+}

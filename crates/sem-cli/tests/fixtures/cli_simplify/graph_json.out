@@ -1,0 +1,57 @@
+{
+  "edges": [
+    {
+      "fromEntity": "src/config.py::function::load",
+      "refType": "calls",
+      "toEntity": "src/config.py::function::parse_config"
+    },
+    {
+      "fromEntity": "src/config.py::function::main",
+      "refType": "calls",
+      "toEntity": "src/config.py::function::load"
+    },
+    {
+      "fromEntity": "tests/test_config.py::function::test_parse_config",
+      "refType": "calls",
+      "toEntity": "src/config.py::function::parse_config"
+    }
+  ],
+  "entities": [
+    {
+      "endLine": 8,
+      "entityType": "function",
+      "filePath": "src/config.py",
+      "id": "src/config.py::function::load",
+      "name": "load",
+      "startLine": 6
+    },
+    {
+      "endLine": 12,
+      "entityType": "function",
+      "filePath": "src/config.py",
+      "id": "src/config.py::function::main",
+      "name": "main",
+      "startLine": 11
+    },
+    {
+      "endLine": 3,
+      "entityType": "function",
+      "filePath": "src/config.py",
+      "id": "src/config.py::function::parse_config",
+      "name": "parse_config",
+      "startLine": 1
+    },
+    {
+      "endLine": 5,
+      "entityType": "function",
+      "filePath": "tests/test_config.py",
+      "id": "tests/test_config.py::function::test_parse_config",
+      "name": "test_parse_config",
+      "startLine": 4
+    }
+  ],
+  "stats": {
+    "edgeCount": 3,
+    "entityCount": 4
+  }
+}

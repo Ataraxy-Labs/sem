@@ -59,6 +59,14 @@ pub enum SystemCmd {
     },
 }
 
+/// Whether the subcommand prints JSON (`--json`).
+pub fn is_json(cmd: &SystemCmd) -> bool {
+    match cmd {
+        SystemCmd::Deps { json, .. } | SystemCmd::Build { json, .. } => *json,
+        SystemCmd::Fetch { .. } => false,
+    }
+}
+
 fn parse_roots(roots: &[String]) -> Result<Vec<(RootKind, PathBuf)>, String> {
     roots
         .iter()

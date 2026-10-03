@@ -1,0 +1,36 @@
+[
+  {
+    "checked": "every code mention of `parse_config` in 2 file(s) (comments and docstrings excluded), aliases one hop, dispatch/registration decorators, getattr with a literal prefix; a name computed entirely at runtime is not modeled",
+    "complete": true,
+    "dispatch_registrations": [],
+    "entity": {
+      "end_line": 3,
+      "file": "src/config.py",
+      "id": "src/config.py::function::parse_config",
+      "name": "parse_config",
+      "start_line": 1,
+      "type": "function"
+    },
+    "incomplete_because": [],
+    "possible_caller_sites": 0,
+    "possible_callers": [],
+    "related": [
+      {
+        "end_line": 8,
+        "file": "src/config.py",
+        "id": "src/config.py::function::load",
+        "name": "load",
+        "start_line": 6,
+        "type": "function"
+      },
+      {
+        "end_line": 5,
+        "file": "tests/test_config.py",
+        "id": "tests/test_config.py::function::test_parse_config",
+        "name": "test_parse_config",
+        "start_line": 4,
+        "type": "function"
+      }
+    ]
+  }
+]

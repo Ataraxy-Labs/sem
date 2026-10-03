@@ -175,18 +175,42 @@ pub struct FindParams {
     )]
     pub query: Option<String>,
     #[schemars(
-        description = "Several names to look up in one call (batch form of `query`). Each resolves independently; a miss on one never affects the others."
+        description = "Several names to look up in one call (batch form of `query`). Each resolves independently; a miss on one never affects the others. With mode \"context\": several entities packed in one call."
     )]
     pub queries: Option<Vec<String>>,
-    #[schemars(description = "Restrict to entities defined in this file.")]
+    #[schemars(
+        description = "What to answer about the entity: omit for where it is defined; \"callers\" for who calls it; \"refs\" for what it calls and references; \"context\" for its source plus callers and callees in a token budget."
+    )]
+    pub mode: Option<String>,
+    #[schemars(
+        description = "Only in this file or directory. With no query, list every entity there (or, with `text`, search entity bodies there)."
+    )]
+    #[serde(rename = "in")]
+    pub in_path: Option<String>,
+    #[schemars(description = "Restrict to entities defined in this file (same as `in`).")]
     pub file: Option<String>,
+    #[schemars(description = "Mode \"callers\": return at most this many callers.")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Mode \"context\": token budget (default 8000).")]
+    pub token_budget: Option<usize>,
+    #[schemars(description = "Mode \"context\": only related entities within this many graph hops (0 = no bound).")]
+    pub hops: Option<usize>,
+    #[schemars(description = "Mode \"context\": each entity's signature and first doc line instead of its body.")]
+    pub headers: Option<bool>,
+    #[schemars(
+        description = "With no query: exact substring to search for inside entity bodies; hits name the entity that holds them."
+    )]
+    pub text: Option<String>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }
 
 impl FindParams {
     pub fn file(&self) -> Option<&str> {
-        self.file.as_deref().filter(|f| !f.is_empty())
+        self.file
+            .as_deref()
+            .or(self.in_path.as_deref())
+            .filter(|f| !f.is_empty())
     }
 
     pub fn format(&self) -> &str {
@@ -377,4 +401,60 @@ mod tests {
         assert_unknown_fields_return_invalid_params::<ReplyToBranchParams>();
         assert_unknown_fields_return_invalid_params::<ListOpenBranchesParams>();
     }
+}
+
+// ── Core verbs that run the sem CLI ──
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryParams {
+    #[schemars(
+        description = "Entity to trace through git history. Omit for the repo's hotspots and co-change pairs."
+    )]
+    pub entity_name: Option<String>,
+    #[schemars(description = "File containing the entity (auto-detected if omitted). With blame: the file to blame (required).")]
+    pub file_path: Option<String>,
+    #[schemars(description = "Who last changed each entity in file_path, instead of the entity's history.")]
+    pub blame: Option<bool>,
+    #[schemars(description = "Maximum number of commits to analyze. Defaults to 50.")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckParams {
+    #[schemars(description = "Only report what changed since this revision (default: HEAD).")]
+    pub base: Option<String>,
+    #[schemars(description = "Checkers to run, e.g. [\"ts\", \"lint\", \"tests\"] (default: every one the project has).")]
+    pub checkers: Option<Vec<String>>,
+    #[schemars(description = "Prove every promise in .sem/promises can fail (apply its mutation, expect it broken).")]
+    pub promises: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CertifyParams {
+    #[schemars(
+        description = "Commit range: \"base..head\"; \"base...head\" uses the merge base; one ref means \"ref..HEAD\"."
+    )]
+    pub range: String,
+    #[schemars(
+        description = "The architecture view instead of the certificate: new or removed data paths, side effects, dependencies, cycles, ranked."
+    )]
+    pub arch: Option<bool>,
+    #[schemars(description = "Output format: \"text\" (default, markdown) or \"json\".")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphParams {
+    #[schemars(
+        description = "Which graph: \"entities\" (default: functions, classes and the calls between them), \"modules\" (JS/TS module graph), \"dataflow\" (reads, writes, source -> sink paths) or \"system\" (locked dependencies, layered)."
+    )]
+    pub layer: Option<String>,
+    #[schemars(
+        description = "modules: one of graph, metrics, cycles, domains, blast-radius <node>, ancestors <node>, common-ancestors <a> <b>, path <from> <to>, affected-tests <file>...; system: deps or fetch. Given as words, e.g. [\"blast-radius\", \"pkg-a\"]."
+    )]
+    pub operation: Option<Vec<String>>,
 }

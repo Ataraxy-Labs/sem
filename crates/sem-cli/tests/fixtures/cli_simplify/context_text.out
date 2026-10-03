@@ -1,0 +1,15 @@
+context for function parse_config (budget: 8000, used: 50)
+
+  target:
+    function parse_config (src/config.py:1-3, ~29 tokens)
+      def parse_config(text):
+          pairs = [line.split("=", 1) for line in text.splitlines() if line]
+          return dict(pairs)
+  direct dependents:
+    function load (src/config.py:6-8, ~19 tokens)
+      def load(path):
+  transitive dependents:
+    function main (src/config.py:11-12, ~2 tokens)
+      def main():
+
+  not packed: +1 direct dependents (1 tests) · sem impact lists them
