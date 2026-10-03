@@ -1728,7 +1728,7 @@ impl SemServer {
     // ── Tool 2: Diff ──
 
     #[tool(
-        description = "Semantic diff between two refs: shows entity-level changes (added, modified, deleted, renamed) instead of line-level diffs"
+        description = "Which entities changed? Semantic diff between two refs, or the working tree against HEAD: functions and classes added, modified, deleted or renamed, not lines."
     )]
     async fn sem_diff(
         &self,
@@ -1869,7 +1869,7 @@ impl SemServer {
     // ── Tool 4: Impact ──
 
     #[tool(
-        description = "Unified entity analysis: dependencies, dependents, transitive impact, and affected tests. Use 'mode' to narrow: 'all' (default), 'deps', 'dependents', 'tests'."
+        description = "What does changing this entity touch? Its dependencies, its dependents (transitively) and the tests that reach it; says when the caller set may be incomplete. mode narrows: 'all' (default), 'deps', 'dependents', 'tests'. Call before editing, renaming or deleting an entity."
     )]
     async fn sem_impact(
         &self,
@@ -2971,7 +2971,7 @@ impl SemServer {
     // ── Grep ──
 
     #[tool(
-        description = "Search file contents for a regex or literal pattern across the repo's source files, returning rg-compatible file:line:text hits. Best for strings, error messages, config keys, and non-code files; prefer sem_find for structural questions. Pass patterns=[...] to batch several searches in one call, each pattern's hits kept separate."
+        description = "Where does this text appear? Regex or literal search over the repo's source files, rg-style file:line:text hits. For strings, error messages, config keys and non-code files; use sem_find for definitions and callers. patterns=[...] batches several searches, each pattern's hits kept apart."
     )]
     async fn sem_grep(
         &self,
