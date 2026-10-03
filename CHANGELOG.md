@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Experimental simple agent sessions now support explicitly acknowledged exact-source reuse and content-only diff reviews since a captured review. Cold file parses run with bounded concurrency, and batch-edit preflight avoids repeated reads of the same file. Validation result reuse is opt-in and requires an operator-owned complete-input fingerprint provider; ordinary checks continue to execute by default.
+
 ## [0.26.0] - 2026-10-02
 
 ### Removed
