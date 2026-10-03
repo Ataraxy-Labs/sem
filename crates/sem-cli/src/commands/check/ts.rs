@@ -201,7 +201,7 @@ fn tsgo(ctx: &Ctx, project: &str) -> Outcome {
     };
     // never write outputs into the tree: emit (if the config emits) goes to scratch
     let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["-p", project, "--pretty", "false", "--outDir"])
+    cmd.args(["-p", project, "--pretty", "false", "--listFiles", "--outDir"])
         .arg(scratch.path("out"))
         .arg("--tsBuildInfoFile")
         .arg(scratch.path("tsbuildinfo"))
@@ -210,7 +210,17 @@ fn tsgo(ctx: &Ctx, project: &str) -> Outcome {
         Ok(r) => r,
         Err(e) => return Outcome::undecided("ts", "tsgo", e),
     };
-    o.diagnostics = parse_tsc_output(&ran.stdout);
+    // --listFiles prints every program file as an absolute path line
+    let (files, rest): (Vec<&str>, Vec<&str>) = ran.stdout.lines().partition(|l| l.starts_with('/') && Path::new(l).is_file());
+    let canon = ctx.root.canonicalize().unwrap_or_else(|_| ctx.root.clone());
+    o.rechecked = files
+        .iter()
+        .filter_map(|f| Path::new(f).strip_prefix(&ctx.root).or_else(|_| Path::new(f).strip_prefix(&canon)).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|p| !p.contains("node_modules/"))
+        .collect();
+    o.rechecked.sort();
+    o.diagnostics = parse_tsc_output(&rest.join("\n"));
     o.errors = o.diagnostics.iter().filter(|d| is_error(d)).count();
     o.verdict = if o.errors > 0 {
         Verdict::Fail

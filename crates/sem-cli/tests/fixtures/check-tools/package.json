@@ -6,6 +6,7 @@
     "typescript": "5.9.3",
     "eslint": "9.36.0",
     "eslint-plugin-import": "2.32.0",
-    "vitest": "3.2.4"
+    "vitest": "3.2.4",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2"
   }
 }

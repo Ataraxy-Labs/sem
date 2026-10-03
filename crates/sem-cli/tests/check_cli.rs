@@ -368,6 +368,43 @@ fn typescript_external_declarations_changing_forces_full() {
     assert_eq!(c["verdict"], "fail");
 }
 
+#[test]
+fn tsgo_backend_when_the_project_uses_tsgo() {
+    let Some(t) = tools() else { return };
+    if !t.join(".bin/tsgo").exists() {
+        return;
+    }
+    let repo = Repo::new(
+        &[
+            ("package.json", r#"{"name":"fx","private":true,"scripts":{"typecheck":"tsgo"}}"#),
+            ("tsconfig.json", r#"{"compilerOptions":{"strict":true,"noEmit":true,"module":"ESNext","moduleResolution":"bundler","types":[]},"include":["src"]}"#),
+            ("src/a.ts", "export const x: number = 1;\n"),
+        ],
+        Some(&t),
+    );
+    let tsgo = |r: &Repo| {
+        let o = Command::new(t.join(".bin/tsgo")).current_dir(r.path()).args(["--pretty", "false"]).output().unwrap();
+        let mut d: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
+        d.sort();
+        d
+    };
+    let (code, v) = repo.sem(&["--checkers", "ts"]);
+    let c = checker(&v, "ts");
+    assert_eq!(c["tool"], "tsgo", "{c:#}");
+    assert_eq!(c["mode"], "full");
+    assert_eq!(code, 0);
+    assert_eq!(strs(&c["filesRechecked"]), vec!["src/a.ts"]);
+    repo.write("src/b.ts", "export const y: string = 1;\n");
+    let (code, v) = repo.sem(&["--checkers", "ts"]);
+    let c = checker(&v, "ts");
+    assert_eq!(code, 1);
+    assert_eq!(strs(&c["diagnostics"]), tsgo(&repo));
+    // the project's tsc instead, on request: same verdict here
+    let (code, v) = repo.sem(&["--checkers", "ts", "--ts-backend", "tsc"]);
+    assert_eq!(code, 1);
+    assert_eq!(checker(&v, "ts")["tool"], "tsc");
+}
+
 // ---- ESLint ------------------------------------------------------------------
 
 /// `eslint .` on the repo, in sem check's message format, sorted; and whether it passed.
