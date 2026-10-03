@@ -108,3 +108,35 @@ fn topology_check_shares_the_evaluator() {
     assert_eq!(v["violations"], 1);
     assert_eq!(v["laws"][0]["details"][0]["file"], "src/View.tsx");
 }
+
+#[test]
+fn verify_requires_a_mutation_that_breaks_each_promise() {
+    let dir = fixture();
+    let r = dir.path();
+    let laws = r#"{ "laws": [
+  { "id": "rust/no-unwrap",
+    "forbidPattern": { "from": "src/**/*.rs", "query": "((call_expression function: (field_expression field: (field_identifier) @_m)) @unwrap (#eq? @_m \"unwrap\"))" },
+    "mutation": { "file": "src/lib/mod.rs", "replace": ["unwrap_or(0)", "unwrap()"] } },
+  { "id": "rust/new-file",
+    "forbidPattern": { "from": "src/**/*.rs", "query": "((call_expression function: (field_expression field: (field_identifier) @_m)) @unwrap (#eq? @_m \"unwrap\"))" },
+    "mutation": { "file": "src/lib/extra.rs", "create": "fn g(x: Option<u8>) -> u8 { x.unwrap() }\n" } },
+  { "id": "rust/vacuous",
+    "forbidPattern": { "from": "src/**/*.rsx", "query": "(call_expression) @call" },
+    "mutation": { "file": "src/lib/mod.rs", "append": "fn h() { k() }\n" } },
+  { "id": "rust/no-mutation",
+    "forbidPattern": { "from": "src/**/*.rs", "query": "(macro_invocation) @m" } }
+] }"#;
+    fs::remove_file(r.join(".sem/promises/app.json")).unwrap();
+    fs::write(r.join(".sem/promises/v.json"), laws).unwrap();
+    let before = fs::read(r.join("src/lib/mod.rs")).unwrap();
+    let o = sem(r, &["promises", "verify"]);
+    let out = stdout(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("FALSIFIABLE rust/no-unwrap"), "{out}");
+    assert!(out.contains("FALSIFIABLE rust/new-file"), "{out}");
+    assert!(out.contains("UNVERIFIED rust/vacuous  stays kept under its mutation"), "{out}");
+    assert!(out.contains("UNVERIFIED rust/no-mutation  no mutation"), "{out}");
+    assert_eq!(fs::read(r.join("src/lib/mod.rs")).unwrap(), before, "mutated file restored");
+    assert!(!r.join("src/lib/extra.rs").exists(), "created file removed");
+    assert_eq!(sem(r, &["promises", "verify", "--only", "rust/no-unwrap", "rust/new-file"]).status.code(), Some(0));
+}

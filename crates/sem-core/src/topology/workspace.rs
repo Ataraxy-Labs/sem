@@ -41,6 +41,8 @@ pub struct Workspace {
     pub packages: Vec<Package>,
     /// Package name -> index into `packages`.
     pub by_name: BTreeMap<String, usize>,
+    /// tsconfig `paths` of the root and of each package directory.
+    pub ts_paths: Vec<super::tsconfig::TsPaths>,
 }
 
 impl Workspace {
@@ -67,7 +69,17 @@ impl Workspace {
             ws.by_name.insert(pkg.name.clone(), ws.packages.len());
             ws.packages.push(pkg);
         }
+        let dirs: Vec<&str> = std::iter::once("").chain(ws.packages.iter().map(|p| p.dir.as_str())).collect();
+        ws.ts_paths = super::tsconfig::discover(&ws.root, &dirs);
         ws
+    }
+
+    /// The tsconfig `paths` in effect for a repo-relative file (deepest tsconfig wins).
+    pub fn ts_paths_for(&self, rel_path: &str) -> Option<&super::tsconfig::TsPaths> {
+        self.ts_paths
+            .iter()
+            .filter(|t| t.dir.is_empty() || rel_path.starts_with(&format!("{}/", t.dir)))
+            .max_by_key(|t| t.dir.len())
     }
 
     /// Every source file under a package directory (not following symlinks,

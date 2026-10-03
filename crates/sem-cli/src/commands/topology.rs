@@ -130,11 +130,12 @@ impl Common {
 pub struct Ctx {
     common: Common,
     loaded: std::cell::OnceCell<Loaded>,
+    misfits: std::cell::OnceCell<Vec<sem_core::parser::calls::fit::Misfit>>,
 }
 
 impl Ctx {
     pub fn new(common: Common) -> Ctx {
-        Ctx { common, loaded: std::cell::OnceCell::new() }
+        Ctx { common, loaded: std::cell::OnceCell::new(), misfits: std::cell::OnceCell::new() }
     }
 
     fn l(&self) -> &Loaded {
@@ -463,6 +464,8 @@ fn any_match(pats: &[String], text: &str) -> bool {
 ///   { "noCrossPackageRelative": { "from", "except" } }                    relative imports stay in their package
 /// Code-shape laws (a tree-sitter query; every non-`_` capture is a violation):
 ///   { "forbidPattern": { "from", "except", "query", "within" } }   within: node kinds the hit must be inside
+/// Call-fit laws (Python): every call the resolver pins to one repo function fits its signature:
+///   { "callsFit": { "from", "except" } }                           from/except: caller files (default **/*.py)
 /// Any law may carry "promise": the human statement it verifies; results report "kept".
 /// With `scope` (repo-relative paths), only violations involving those files are
 /// reported: code-shape laws read only them; other laws run globally, then filter.
@@ -521,6 +524,16 @@ pub fn check(ctx: &Ctx, laws: &[Value], scope: Option<&BTreeSet<String>>) -> Res
                         v.push(json!({ "file": file.path, "line": r.line, "specifier": r.specifier,
                             "into": l.ex.ws.packages[owner.unwrap()].name }));
                     }
+                }
+            }
+        }
+        if let Some(f) = law.get("callsFit") {
+            let (from, except) = (globs(&f["from"]), globs(&f["except"]));
+            let from = if from.is_empty() { vec!["**/*.py".to_string()] } else { from };
+            for m in python_misfits(ctx)? {
+                if any_match(&from, &m.file) && !any_match(&except, &m.file) {
+                    v.push(json!({ "file": m.file, "line": m.line, "col": m.col, "text": m.text,
+                        "problem": m.problem, "target": m.target, "targetFile": m.target_file }));
                 }
             }
         }
@@ -624,14 +637,38 @@ pub fn check(ctx: &Ctx, laws: &[Value], scope: Option<&BTreeSet<String>>) -> Res
 }
 
 /// Does a violation name one of `set`? One with a `file` is judged by that file
-/// alone; graph violations by any node they mention (file or package).
-fn involves(v: &Value, set: &BTreeSet<String>) -> bool {
+/// (and, for a call that no longer fits, the file defining its target);
+/// graph violations by any node they mention (file or package).
+pub(crate) fn involves(v: &Value, set: &BTreeSet<String>) -> bool {
     match v {
         Value::String(s) => set.contains(s),
         Value::Array(a) => a.iter().any(|x| involves(x, set)),
-        Value::Object(o) => o.get("file").map_or_else(|| o.values().any(|x| involves(x, set)), |f| involves(f, set)),
+        Value::Object(o) => o.get("file").map_or_else(
+            || o.values().any(|x| involves(x, set)),
+            |f| involves(f, set) || o.get("targetFile").is_some_and(|t| involves(t, set)),
+        ),
         _ => false,
     }
+}
+
+/// Python call-fit misfits over every `.py` file under the repo root (not
+/// git-ignored, not under a skipped directory), computed once per check.
+fn python_misfits(ctx: &Ctx) -> Result<Vec<sem_core::parser::calls::fit::Misfit>, String> {
+    if let Some(m) = ctx.misfits.get() {
+        return Ok(m.clone());
+    }
+    let root = PathBuf::from(&ctx.common.repo_root);
+    let skip = ctx.common.skip_dirs.clone();
+    let walk = ignore::WalkBuilder::new(&root).filter_entry(move |e| !skip.iter().any(|s| e.file_name() == s.as_str())).build();
+    let mut files: Vec<String> = walk
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()) && e.path().extension().is_some_and(|x| x == "py"))
+        .filter_map(|e| e.path().strip_prefix(&root).ok().map(|p| p.to_string_lossy().replace('\\', "/")))
+        .collect();
+    files.sort();
+    let m = sem_core::parser::calls::fit::python_misfits(&root, &files);
+    let _ = ctx.misfits.set(m.clone());
+    Ok(m)
 }
 
 /// Violations of every `forbidPattern` law (by law index), from one pass that

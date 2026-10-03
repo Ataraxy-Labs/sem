@@ -18,6 +18,20 @@ pub enum PromisesCmd {
     Check(Sel),
     /// Each promise's id, kept/broken and violation count (always exits 0)
     Status(Sel),
+    /// Prove every promise can fail: apply its `mutation`, expect it BROKEN
+    /// at the mutated file, restore. Exit 1 if any promise has no mutation,
+    /// is broken already, or stays kept under its mutation (a vacuous law)
+    Verify(VerifyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// Only these promise ids (globs)
+    #[arg(long, num_args = 1..)]
+    only: Vec<String>,
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -79,10 +93,133 @@ fn changed_since(root: &Path, git_ref: &str) -> Result<BTreeSet<String>, String>
     Ok(set)
 }
 
+/// A law's `mutation`: the smallest edit that must break it.
+///   { "file": "<repo-relative>", "append": "<text>" }          add text at the end
+///   { "file": "<repo-relative>", "replace": ["<old>", "<new>"] } first occurrence
+///   { "file": "<repo-relative>", "create": "<text>" }          a new file
+enum Edit {
+    Append(String),
+    Replace(String, String),
+    Create(String),
+}
+
+fn parse_mutation(m: &Value) -> Result<(String, Edit), String> {
+    let file = m["file"].as_str().ok_or("mutation needs \"file\"")?.to_string();
+    let edit = if let Some(t) = m["append"].as_str() {
+        Edit::Append(t.to_string())
+    } else if let Some(t) = m["create"].as_str() {
+        Edit::Create(t.to_string())
+    } else if let Some([a, b]) = m["replace"].as_array().map(Vec::as_slice) {
+        Edit::Replace(a.as_str().ok_or("replace: strings")?.to_string(), b.as_str().ok_or("replace: strings")?.to_string())
+    } else {
+        return Err("mutation needs one of \"append\", \"replace\": [old, new], \"create\"".into());
+    };
+    Ok((file, edit))
+}
+
+/// Restores a mutated file's original bytes (or removes a created one) on drop.
+struct Restore {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(b) => {
+                let _ = std::fs::write(&self.path, b);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+fn apply(root: &Path, file: &str, edit: &Edit) -> Result<Restore, String> {
+    let path = root.join(file);
+    let original = std::fs::read(&path).ok();
+    let text = match (edit, &original) {
+        (Edit::Create(t), None) => t.clone(),
+        (Edit::Create(_), Some(_)) => return Err(format!("create: {file} already exists")),
+        (_, None) => return Err(format!("{file}: no such file")),
+        (Edit::Append(t), Some(b)) => format!("{}{t}", String::from_utf8_lossy(b)),
+        (Edit::Replace(a, n), Some(b)) => {
+            let s = String::from_utf8_lossy(b);
+            if !s.contains(a.as_str()) {
+                return Err(format!("replace: {a:?} not found in {file}"));
+            }
+            s.replacen(a.as_str(), n, 1)
+        }
+    };
+    if original.is_none() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let guard = Restore { path: path.clone(), original };
+    std::fs::write(&path, text).map_err(|e| format!("{file}: {e}"))?;
+    Ok(guard)
+}
+
+fn verify(root: &Path, laws: &[Value], json_out: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let fresh = || Ctx::new(Common::at(&root.to_string_lossy()));
+    let before = check(&fresh(), laws, None)?;
+    let mut rows = Vec::new();
+    for (law, base) in laws.iter().zip(&before) {
+        let id = law["id"].as_str().unwrap_or("").to_string();
+        let verdict: Result<Value, String> = (|| {
+            if base["kept"] != true {
+                return Err(format!("already broken ({} violations): a mutation cannot show it can fail", base["violations"]));
+            }
+            let (file, edit) = parse_mutation(law.get("mutation").ok_or("no mutation: add one that must break this law")?)?;
+            let _restore = apply(root, &file, &edit)?;
+            let r = check(&fresh(), std::slice::from_ref(law), None).map_err(|e| e.to_string())?;
+            let set: BTreeSet<String> = [file.clone()].into_iter().collect();
+            let at_file = r[0]["details"].as_array().map(|d| d.iter().filter(|v| super::topology::involves(v, &set)).count()).unwrap_or(0);
+            if at_file == 0 {
+                return Err(format!("stays kept under its mutation of {file} (vacuous as written)"));
+            }
+            Ok(json!({ "file": file, "violations": at_file }))
+        })();
+        rows.push(match verdict {
+            Ok(v) => json!({ "id": id, "falsifiable": true, "mutation": v }),
+            Err(e) => json!({ "id": id, "falsifiable": false, "reason": e }),
+        });
+    }
+    let bad = rows.iter().filter(|r| r["falsifiable"] == false).count();
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&json!({ "promises": rows, "unfalsifiable": bad }))?);
+    } else {
+        for r in &rows {
+            match r["falsifiable"].as_bool() {
+                Some(true) => println!("FALSIFIABLE {}  (mutation of {} -> {} violation(s))", r["id"].as_str().unwrap_or(""), r["mutation"]["file"].as_str().unwrap_or(""), r["mutation"]["violations"]),
+                _ => println!("UNVERIFIED {}  {}", r["id"].as_str().unwrap_or(""), r["reason"].as_str().unwrap_or("")),
+            }
+        }
+    }
+    if bad > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 pub fn run(cmd: PromisesCmd) -> Result<(), Box<dyn std::error::Error>> {
     let (sel, status) = match cmd {
         PromisesCmd::Check(s) => (s, false),
         PromisesCmd::Status(s) => (s, true),
+        PromisesCmd::Verify(v) => {
+            let cwd = std::env::current_dir()?;
+            let root = super::repo_root_or_cwd(&cwd.to_string_lossy());
+            let mut laws = load(&discover(&root))?;
+            if !v.only.is_empty() {
+                laws.retain(|l| v.only.iter().any(|p| glob::matches(p, l["id"].as_str().unwrap_or(""))));
+                if laws.is_empty() {
+                    return Err(format!("no promise matches {:?}", v.only).into());
+                }
+            }
+            return verify(&root, &laws, v.json);
+        }
     };
     let cwd = std::env::current_dir()?;
     let root = super::repo_root_or_cwd(&cwd.to_string_lossy());
@@ -134,6 +271,9 @@ pub fn run(cmd: PromisesCmd) -> Result<(), Box<dyn std::error::Error>> {
 /// for imports; the raw violation for graph laws.
 fn detail_line(d: &Value) -> String {
     let s = |k: &str| d[k].as_str().map(str::to_string).unwrap_or_else(|| d[k].to_string());
+    if d.get("problem").is_some() {
+        return format!("{}:{}:{}  {}  (defined at {})  {}", s("file"), d["line"], d["col"], s("problem"), s("target"), s("text"));
+    }
     match (d.get("file"), d.get("capture")) {
         (Some(_), Some(_)) => format!("{}:{}:{}  {}  {}", s("file"), d["line"], d["col"], s("capture"), s("text")),
         (Some(_), None) => format!("{}:{}  {}", s("file"), d["line"], s("specifier")),

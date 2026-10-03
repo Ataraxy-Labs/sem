@@ -10,5 +10,7 @@ pub mod graph;
 pub mod imports;
 pub mod metrics;
 pub mod pattern;
+pub mod query_scope;
 pub mod resolve;
+pub mod tsconfig;
 pub mod workspace;

@@ -18,6 +18,7 @@
 //! Only stage 1 and the data tables behind [`lang::Lang`] are
 //! language-specific; a new language plugs in by implementing that trait.
 
+pub mod fit;
 pub mod go;
 pub mod infer;
 pub mod ir;

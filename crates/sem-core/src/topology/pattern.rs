@@ -49,7 +49,8 @@ impl Pattern {
 
     fn prepare(&mut self, lang: &Language) -> Result<(), String> {
         if !self.compiled.iter().any(|(l, _)| l == lang) {
-            let q = Query::new(lang, &self.src).map_err(|e| format!("invalid query: {e}"))?;
+            let src = super::query_scope::scope_branch_predicates(&self.src)?;
+            let q = Query::new(lang, &src).map_err(|e| format!("invalid query: {e}"))?;
             self.compiled.push((lang.clone(), q));
         }
         Ok(())
@@ -92,7 +93,8 @@ impl Pattern {
             let p = node.start_position();
             let text = node.utf8_text(source.as_bytes()).unwrap_or("");
             let first = text.lines().next().unwrap_or("").trim();
-            hits.push(Hit { line: p.row + 1, col: p.column + 1, capture: name.to_string(), text: first.chars().take(120).collect() });
+            let capture = super::query_scope::display_name(name).to_string();
+            hits.push(Hit { line: p.row + 1, col: p.column + 1, capture, text: first.chars().take(120).collect() });
         }
         hits
     }
@@ -199,6 +201,18 @@ export const V = () => <div>{open ? <A/> : null}{name}</div>;
     }
 
     #[test]
+    fn alternation_branches_keep_their_own_predicates() {
+        // Same helper capture in both branches, each with its own predicate:
+        // tree-sitter alone conjoins the predicates and matches nothing.
+        let py = "def f():\n    print('x')\n    exit(1)\n    len(y)\n";
+        let q = r#"[((call function: (identifier) @_f) @hit (#eq? @_f "print")) ((call function: (identifier) @_f) @hit (#eq? @_f "exit"))]"#;
+        let hits = Pattern::new(q).find("a.py", py).unwrap();
+        assert_eq!(hits.iter().map(|h| (h.line, h.capture.as_str())).collect::<Vec<_>>(), vec![(2, "hit"), (3, "hit")]);
+        let nested = r#"(call function: [((identifier) @_f (#eq? @_f "print")) ((identifier) @_f (#eq? @_f "exit"))]) @hit"#;
+        assert_eq!(Pattern::new(nested).find("a.py", py).unwrap().len(), 2);
+    }
+
+    #[test]
     fn scan_parses_once_and_splits_hits_per_pattern() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.tsx"), "const v = <div>{x ? 1 : 2}{n + 1}</div>;").unwrap();
@@ -214,3 +228,4 @@ export const V = () => <div>{open ? <A/> : null}{name}</div>;
         assert_eq!(got, vec![vec![("a.tsx", "t")], vec![("a.tsx", "b")], vec![("b.py", "c")]]);
     }
 }
+
