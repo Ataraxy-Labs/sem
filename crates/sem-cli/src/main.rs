@@ -259,6 +259,30 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Promises about the codebase, each verified by a deterministic check
+    ///
+    /// A promise is a law in `.sem/promises/*.json` (the `sem topology check`
+    /// format) carrying a human `"promise"`. Code-shape laws are tree-sitter
+    /// queries in any language sem parses; every non-`_` capture is a
+    /// violation. Example, `.sem/promises/jsx-no-logic.json`:
+    ///
+    ///   {"laws": [{"id": "jsx-no-logic/conditionals",
+    ///     "promise": "JSX contains no conditional rendering",
+    ///     "forbidPattern": {"from": ["**/*.tsx"], "within": ["jsx_expression"],
+    ///                       "query": "(ternary_expression) @conditional"}}]}
+    ///
+    /// `sem promises check` exits 1 while any promise is broken; after an edit,
+    /// `sem promises check --changed <file>` reports only that file's violations.
+    #[command(verbatim_doc_comment)]
+    Promises {
+        #[command(subcommand)]
+        cmd: commands::promises::PromisesCmd,
+    },
+    /// Module topology of a JS/TS workspace: reference graph, graph math, laws
+    Topology {
+        #[command(subcommand)]
+        cmd: commands::topology::TopologyCmd,
+    },
     /// Show the full entity dependency graph
     Graph {
         /// Repository path (defaults to current directory)
@@ -572,6 +596,8 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Diff { .. }) => "diff",
         Some(Commands::Impact { .. }) => "impact",
         Some(Commands::Graph { .. }) => "graph",
+        Some(Commands::Promises { .. }) => "promises",
+        Some(Commands::Topology { .. }) => "topology",
         Some(Commands::Blame { .. }) => "blame",
         Some(Commands::Hook { .. }) => "hook",
         Some(Commands::Log { .. }) => "log",
@@ -682,6 +708,18 @@ fn main() {
                 label,
                 args,
             });
+        }
+        Some(Commands::Promises { cmd }) => {
+            if let Err(e) = commands::promises::run(cmd) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+        Some(Commands::Topology { cmd }) => {
+            if let Err(e) = commands::topology::run(cmd) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
         }
         Some(Commands::Graph {
             path,

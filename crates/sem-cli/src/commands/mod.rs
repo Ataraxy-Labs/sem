@@ -10,11 +10,13 @@ pub mod grep;
 pub mod hook;
 pub mod impact;
 pub mod log;
+pub mod promises;
 pub mod query;
 pub mod repos;
 pub(crate) mod review;
 pub mod setup;
 pub mod stats;
+pub mod topology;
 
 #[cfg(feature = "self-update")]
 pub mod update;

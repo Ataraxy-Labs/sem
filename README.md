@@ -316,6 +316,42 @@ Local, cumulative counters: how many diffs `sem` has run in this environment and
 sem stats
 ```
 
+### sem promises
+
+A promise is something an agent (or a person) claims about the codebase, written down as a check that either passes or fails. "Done" means the check passes. Promises live in `.sem/promises/*.json`; each law may carry a human `"promise"`. Code-shape laws are tree-sitter queries that work in any language sem parses; every capture whose name does not start with `_` counts as a violation, and nested captures are reported once, at the outermost node. For example, `.sem/promises/jsx-no-logic.json`:
+
+```json
+{ "laws": [
+  { "id": "jsx-no-logic/conditionals",
+    "promise": "JSX contains no conditional rendering",
+    "forbidPattern": { "from": ["**/*.tsx", "**/*.jsx"], "within": ["jsx_expression"],
+                       "query": "(ternary_expression) @conditional" } },
+  { "id": "jsx-no-logic/inline-handler-bodies",
+    "promise": "JSX event handlers are references, not block bodies",
+    "forbidPattern": { "from": ["**/*.tsx", "**/*.jsx"], "within": ["jsx_attribute"],
+                       "query": "(arrow_function body: (statement_block (_))) @handler_body" } }
+] }
+```
+
+```bash
+sem promises check                        # KEPT / BROKEN n per promise, then file:line:col  capture  snippet; exit 1 if any broken
+sem promises check --changed src/App.tsx  # only violations in these files (what an edit hook runs)
+sem promises check --since main           # only files changed since a ref, uncommitted and untracked included
+sem promises check --only 'jsx-no-logic/*'   # the check for one checklist item
+sem promises status --json                # id, kept, violation count per promise
+```
+
+The same file also works with `sem topology check --laws`, which adds graph and import laws (`forbid`, `only`, `acyclic`, `layers`, `forbidImport`, `allowImports`) for JS/TS workspaces. With `--changed` or `--since`, those laws still run over the whole graph, but only violations that involve a changed file (or the package containing it) are reported.
+
+To have an agent see a broken promise right after it makes an edit, run [`scripts/promises-hook.sh`](scripts/promises-hook.sh) after each edit. The script exits 2 and prints the violations to stderr when a promise breaks, and stays silent otherwise. In Claude Code, add it to your settings as a `PostToolUse` hook:
+
+```json
+{ "hooks": { "PostToolUse": [ { "matcher": "Edit|Write|MultiEdit",
+    "hooks": [ { "type": "command", "command": "sh /path/to/sem/scripts/promises-hook.sh" } ] } ] } }
+```
+
+The script reads `tool_input.file_path` from the hook's stdin. Other harnesses can pass the edited paths as arguments instead. In pi, for example, an extension can do this from its `tool_result` handler for the edit and write tools: run `sh promises-hook.sh <path>` and append the stderr to the tool result when the script exits 2.
+
 ## Use as default Git diff
 
 Replace `git diff` output with entity-level diffs. Agents and humans get sem output automatically without changing any commands.

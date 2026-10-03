@@ -37,6 +37,9 @@ oxc-fastpath = [
     "dep:oxc_allocator", "dep:oxc_span", "dep:oxc_syntax",
 ]
 
+# Module topology (reference graph + graph math) for JS/TS workspaces.
+topology = ["oxc-fastpath", "parallel", "lang-typescript"]
+
 # Grammar groups
 grammar-core = [
     "lang-typescript", "lang-javascript", "lang-python",
