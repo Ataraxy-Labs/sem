@@ -45,6 +45,49 @@ Results varied by task; it is not a universal speed or token-efficiency claim.
 
 ## Validation and limits
 
+### Session efficiency
+
+- `sem_exact query` reads batches of entity IDs directly. `apply` already accepts
+  disjoint entities within the same file; overlapping edits fail before mutation.
+- Exact query/read responses include source `receipt` values. Send only receipts
+  still available in the agent's context as `known_receipts` to omit unchanged
+  bodies. `refresh_source:true` restores full source. IDs and snapshot metadata
+  remain explicit; acknowledged source is not evidence of current filesystem state.
+  Compacted child slices keep their same-response parent body available.
+- `sem_exact diff` accepts `since_diff` plus the identical explicit `files` scope.
+  It returns content changes since that captured review, including additions and
+  deletions, instead of repeating the whole HEAD diff. Expired baselines fail
+  explicitly. Delta reviews do not represent permission/mode changes.
+- Cold captures parse at most four independent files concurrently. Content-keyed
+  per-file caching retains unchanged parses when other files change. Snapshot IDs
+  and deterministic output ordering are unchanged. This is session-local reuse,
+  not a shared daemon or a compiler dependency graph.
+- Relationship expansion stays opt-in (`expand_context:true`); these changes do
+  not add unsolicited neighbor bodies.
+
+Validation result reuse is **disabled by default**. An operator may configure
+`SEM_VALIDATION_INPUT_KEY_ARGV` as JSON argv for a trusted, external fingerprint
+provider. It receives the exact check command as its final argument and writes a
+nonempty key to stdout. Do not let the agent supply this provider. It must attest
+**all** validation inputs: source and generated files, missing/untracked files,
+resolved dependencies, build configuration, toolchain, environment and mutable
+runtime state. A Git revision/diff alone is insufficient. Only use this contract
+with deterministic/hermetic checks and an immutable provider outside the edited
+repository. If that cannot be guaranteed, leave it unset; normal checks run.
+
+Only successful `stage:test` results are cached, in a bounded session-local cache.
+Keys are rechecked before reuse and after execution. Changed/unavailable keys
+during execution downgrade the verdict to `pass:null`; failures are never cached.
+Reused results explicitly report `validation_cache.reused:true`, `executed:false`
+and their original duration. This is reuse of attested evidence, not a fresh test
+or general proof. It does not replace compiler incremental builds or discover the
+correct test subset automatically.
+
+Run `SEM_TEST_BIN=/path/to/sem node src/transaction/simple/benchmark-session-efficiency.mjs`
+from `pi` for a cold-parse/changed-file/response-size microbenchmark. Agent-session
+speedups require separate repeated, graded benchmark runs; no new end-to-end
+speedup is asserted by this implementation.
+
 Local validation uses SEM's check API. The optional benchmark Docker checker
 requires Python 3 (`SEM_PYTHON` overrides the executable) and all of
 `SEM_VALIDATION_IMAGE`, `SEM_VALIDATION_CONTAINER`, `SEM_VALIDATION_CWD`, and

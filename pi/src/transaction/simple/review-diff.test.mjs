@@ -57,3 +57,21 @@ test('unsafe paths rejected; explicit gitignored additions included',async t=>{
  await fs.writeFile(path.join(root,'ignored.txt'),'requested\n');
  assert.match((await api.capture(root,['ignored.txt'])).diff,/\+requested/);
 });
+test('delta review omits earlier changes and supports additions, deletions and unchanged files',async t=>{
+ const {root,api}=await fixture(t);
+ await fs.writeFile(path.join(root,'a.txt'),'first change\n');
+ const scope=['a.txt','b.txt','new.txt'];
+ const first=await api.capture(root,scope);
+ const unchanged=await api.capture(root,scope,{since:first.diff_id});
+ assert.equal(unchanged.diff,'');assert.equal(unchanged.complete,true);
+ await fs.writeFile(path.join(root,'a.txt'),'second change\n');
+ await fs.unlink(path.join(root,'b.txt'));
+ await fs.writeFile(path.join(root,'new.txt'),'new content\n');
+ const next=await api.capture(root,scope,{since:first.diff_id});
+ assert.match(next.diff,/-first change\n\+second change/);
+ assert.ok(!next.diff.includes('-before'));assert.match(next.diff,/-untouched/);
+ assert.match(next.diff,/\+new content/);assert.ok(!next.diff.includes('sem-review-delta-'));
+ assert.equal(next.since_diff,first.diff_id);
+ await assert.rejects(api.capture(root,['a.txt'],{since:first.diff_id}),/SCOPE_MISMATCH/);
+ await assert.rejects(api.capture(root,scope,{since:'unknown'}),/UNKNOWN_DIFF/);
+});
