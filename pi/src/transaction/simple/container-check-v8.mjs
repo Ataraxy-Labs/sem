@@ -1,7 +1,14 @@
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {focusedCheck as localCheck} from './plan-policy.mjs';
+import {ValidationCache,inputFingerprint} from './validation-cache.mjs';
+const validationCache=new ValidationCache();
 export async function focusedCheck(api,cmd) {
+  // Evidence queries are reads, never reusable validation executions.
+  const fingerprint=typeof cmd==='string'&&!cmd.startsWith('evidence')?inputFingerprint(cmd):null;
+  return validationCache.run(cmd,fingerprint,()=>executeCheck(api,cmd));
+}
+async function executeCheck(api,cmd) {
   if(!process.env.SEM_VALIDATION_IMAGE)return localCheck(api,cmd);
   if(!cmd)return {pass:null,stage:'unavailable',error:'Provide a focused public test/build command'};
   return new Promise(resolve=>{

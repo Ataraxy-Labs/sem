@@ -9,7 +9,7 @@ export async function applyExact(exact,cwd,revision,edits,{semBin='sem',validate
   const snapshot=exact.get(revision);
   if(!Array.isArray(edits)||!edits.length||edits.length>64) throw new Error('INVALID_EDITS');
   const root=await fs.realpath(cwd),seen=new Set(),targets=[],batch=[],planned=new Map();
-  const ordered=edits.map(edit=>({edit,entity:snapshot.entities.find(e=>e.id===edit.id)}));
+  const ordered=edits.map(edit=>({edit,entity:snapshot.byId.get(edit.id)}));
   if(ordered.some(item=>!item.entity)) throw new Error('INVALID_EDIT');
   ordered.sort((a,b)=>a.entity.file.localeCompare(b.entity.file)||b.entity.start-a.entity.start);
   for(let i=1;i<ordered.length;i++) {
@@ -32,11 +32,15 @@ export async function applyExact(exact,cwd,revision,edits,{semBin='sem',validate
     replacementBytes+=Buffer.byteLength(content);
     if(replacementBytes>exact.maxBytes) throw new Error('RESULT_TOO_LARGE');
     if(edit.allow_signature_change!==undefined&&typeof edit.allow_signature_change!=='boolean') throw new Error('INVALID_EDIT');
-    seen.add(entity.file);
     const file=path.join(root,entity.file);
-    if(await fs.realpath(file)!==file) throw new Error('SYMLINK_NOT_SUPPORTED');
-    const expected=hash(snapshot.sources.get(entity.file));
-    if(hash(await fs.readFile(file))!==expected) throw new Error('STALE_SNAPSHOT');
+    if(!seen.has(entity.file)) {
+      if(await fs.realpath(file)!==file) throw new Error('SYMLINK_NOT_SUPPORTED');
+      const expected=hash(snapshot.sources.get(entity.file));
+      if(hash(await fs.readFile(file))!==expected) throw new Error('STALE_SNAPSHOT');
+      seen.add(entity.file);
+    }
+    // One preflight read per file. Weave still checks each queued edit against
+    // its expected intermediate hash immediately before the guarded write.
     // Exact entities exclude indentation; Weave replaces whole source lines.
     // Preserve surrounding whitespace, and reject inline siblings rather than
     // silently dropping bytes outside the requested entity.

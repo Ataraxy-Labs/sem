@@ -7,6 +7,7 @@ import {promisify} from 'node:util';
 import {qualifyEntities, indexEntities, lookupEntities} from './entity-lookup.mjs';
 import {ParseCache} from './parse-cache.mjs';
 import {requireExactPath} from './exact-path.mjs';
+import {parallelMap} from './parallel-map.mjs';
 const exec = promisify(execFile);
 const hash = x => createHash('sha256').update(x).digest('hex');
 const fail = code => { throw new Error(code); };
@@ -36,9 +37,10 @@ export function compactSources(sources) {
 
 // Session-local immutable, explicitly scoped snapshots. Not a whole-repo revision.
 export class ExactCode {
-  constructor({semBin='sem', maxBytes=4*1024*1024, maxSnapshots=8,parseCacheOptions}={}) {
+  constructor({semBin='sem', maxBytes=4*1024*1024, maxSnapshots=8,parseCacheOptions,parseConcurrency=4}={}) {
     if(!Number.isSafeInteger(maxSnapshots)||maxSnapshots<1) fail('INVALID_SNAPSHOT_CAPACITY');
-    Object.assign(this,{semBin,maxBytes,maxSnapshots}); this.snapshots=new Map();
+    if(!Number.isSafeInteger(parseConcurrency)||parseConcurrency<1||parseConcurrency>16) fail('INVALID_PARSE_CONCURRENCY');
+    Object.assign(this,{semBin,maxBytes,maxSnapshots,parseConcurrency}); this.snapshots=new Map();
     this.parseCache=new ParseCache(parseCacheOptions);
   }
   async parseEntityRows(target) {
@@ -88,32 +90,35 @@ export class ExactCode {
     const revision=hash(JSON.stringify(fileErrors.length?[manifest,missing,fileErrors]:[manifest,missing]));
     const parsing={cache_hits:0,parser_calls:0,snapshot_reused:this.snapshots.has(revision)};
     if(!this.snapshots.has(revision)) {
-      let tmp;
+      let tmpPromise;
       const entities=[];
       try {
-        for(const [file,bytes] of sources) {
+        const groups=await parallelMap([...sources],this.parseConcurrency,async([file,bytes])=>{
           const key=JSON.stringify([this.semBin,root,file,hash(bytes)]);
           let rows=this.parseCache.get(key);
           if(rows===undefined) {
-            tmp??=await fs.mkdtemp(path.join(os.tmpdir(),'sem-exact-'));
-            const target=path.join(tmp,file);await fs.mkdir(path.dirname(target),{recursive:true});
+            tmpPromise??=fs.mkdtemp(path.join(os.tmpdir(),'sem-exact-'));
+            const target=path.join(await tmpPromise,file);await fs.mkdir(path.dirname(target),{recursive:true});
             await fs.writeFile(target,bytes);
             rows=await this.parseEntityRows(target);parsing.parser_calls++;
           } else parsing.cache_hits++;
           if(!Array.isArray(rows)) fail('INVALID_PARSER_RESPONSE');
           const validated=[];
+          const fileEntities=[];
           for(const row of rows) {
             const {name,type,start_byte:start,end_byte:end}=row;
             if(typeof name!=='string'||typeof type!=='string'||!Number.isInteger(start)||!Number.isInteger(end)||start<0||end<start||end>bytes.length) fail('INVALID_ENTITY_RANGE');
             const parent=typeof row.parent_name==='string'&&row.parent_name&&typeof row.parent_type==='string'
               ?{parent_name:row.parent_name,parent_type:row.parent_type,declared_qualified_name:row.parent_name+'.'+name}:{};
             const item={file,name,type,start,end,...parent};
-            entities.push({...item,id:hash(JSON.stringify([revision,item]))});
+            fileEntities.push({...item,id:hash(JSON.stringify([revision,item]))});
             validated.push({name,type,start_byte:start,end_byte:end,...parent});
           }
           this.parseCache.set(key,validated);
-        }
-      } finally { if(tmp)await fs.rm(tmp,{recursive:true,force:true}); }
+          return fileEntities;
+        });
+        entities.push(...groups.flat());
+      } finally { if(tmpPromise)await fs.rm(await tmpPromise,{recursive:true,force:true}); }
       entities.sort((a,b)=>order(a.file,b.file)||a.start-b.start||a.end-b.end||order(a.id,b.id));
       // Lexical containment only, not receiver/type or runtime resolution.
       qualifyEntities(entities);

@@ -41,3 +41,25 @@ test('overlapping scopes reuse parses; changed bytes and failures cannot reuse s
     assert.equal(calls,5);
   } finally {await fs.rm(root,{recursive:true,force:true});}
 });
+test('parallel cold parses preserve IDs and warm captures reparse only changed files',async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'sem-parallel-parses-'));
+ t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const files=['a.py','b.py','c.py'];
+ await Promise.all(files.map(f=>fs.writeFile(path.join(root,f),f)));
+ const make=concurrency=>{
+  const exact=new ExactCode({parseConcurrency:concurrency});
+  exact.parseEntityRows=async target=>{
+   await new Promise(r=>setTimeout(r,target.endsWith('a.py')?20:2));
+   return [{name:'f',type:'function',start_byte:0,end_byte:(await fs.readFile(target)).length}];
+  };
+  return exact;
+ };
+ const sequential=make(1),parallel=make(3);
+ const a=await sequential.capture(root,files),b=await parallel.capture(root,files);
+ assert.equal(a.revision,b.revision);
+ assert.deepEqual(sequential.get(a.revision).entities,parallel.get(b.revision).entities);
+ await fs.writeFile(path.join(root,'b.py'),'changed');
+ await parallel.capture(root,files);
+ assert.equal(parallel.lastCaptureParsing.parser_calls,1);assert.equal(parallel.lastCaptureParsing.cache_hits,2);
+ assert.throws(()=>new ExactCode({parseConcurrency:0}),/CONCURRENCY/);
+});

@@ -57,6 +57,23 @@ test('portable simple config exposes exact tools and permits continued discovery
     assert.equal(bundle.reads.status,'ok');
     assert.match(JSON.stringify(bundle.reads.result),/return 1/);
     assert.deepEqual(bundle.search.result.definitions,[]);
+    await fs.writeFile(path.join(cwd,'large.ts'),'export function large() {\n'+'  // source context\n'.repeat(120)+'  return 1;\n}\n');
+    const call=async args=>{
+      const response=await client.callTool('sem_exact',args);
+      assert.notEqual(response.isError,true);
+      return JSON.parse(response.content.filter(x=>x.type==='text').map(x=>x.text).join(''));
+    };
+    const full=await call({op:'query',files:['large.ts'],selectors:[{name:'large'}]});
+    const reused=await call({op:'query',revision:full.revision,selectors:[{id:full.sources[0].entity.id}],known_receipts:[full.sources[0].receipt]});
+    assert.equal(reused.sources[0].content,undefined);assert.equal(reused.sources[0].reused,true);
+    const restored=await call({op:'read',revision:full.revision,id:full.sources[0].entity.id,known_receipts:[full.sources[0].receipt],refresh_source:true});
+    assert.match(restored.content,/return 1/);
+    execFileSync('git',['add','.'],{cwd});
+    execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.test','-c','core.hooksPath=/dev/null','commit','-qm','base'],{cwd});
+    const review=await call({op:'diff',files:['large.ts']});
+    await fs.appendFile(path.join(cwd,'large.ts'),'// later change\n');
+    const delta=await call({op:'diff',files:['large.ts'],since_diff:review.diff_id});
+    assert.match(delta.diff,/\+\/\/ later change/);
   } finally {
     await client.stop();
     await fs.rm(cwd, { recursive: true, force: true });

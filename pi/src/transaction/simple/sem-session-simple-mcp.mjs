@@ -31,6 +31,7 @@ import { pythonModuleHint } from "./import-hints.mjs";
 import {prepareScopedProgram} from './scoped-program.mjs';
 import {formatFiles} from './format-files.mjs';
 import {ReviewDiff} from './review-diff.mjs';
+import {presentExact} from './exact-receipts.mjs';
 const contextReceipts = new ContextReceipts();
 import { buildSemApi } from "../../codemode/api.ts";
 import { performWeaveEdit } from "../../tools/weave-edit.ts";
@@ -1024,25 +1025,35 @@ if(process.env.SEM_ENTITY_INTERFACE==='1') {
   });
   tools.get('sem_exact').description='Prefer query(files OR snapshot, selectors) to resolve and read known names/files in ONE call, returning editable addresses beside source. Selectors support name/file/type, literal contains, and explicit byte ranges as in the regular exact query. Literal candidates are metadata-only unless view:"source" is requested. Ambiguity and missing coverage remain explicit. '+tools.get('sem_exact').description;
 }
-tools.get('sem_exact').description = tools.get('sem_exact').description
+if(tools.has('sem_exact')) tools.get('sem_exact').description = tools.get('sem_exact').description
   .replace('supports one entity per file per batch', 'supports disjoint entities in the same file per batch')
   .replace('guards; one entity per file per batch', 'guards; disjoint same-file entities may be batched');
 if(tools.has('sem_exact')) {
+  const exactTool=tools.get('sem_exact'),readExact=exactTool.run;
+  exactTool.schema.properties.known_receipts={type:'array',items:{type:'string'},maxItems:128,description:'Acknowledge source receipts still in your context to omit unchanged bodies. Omit after context loss. Metadata and editable IDs remain current to the requested snapshot.'};
+  exactTool.schema.properties.refresh_source={type:'boolean',description:'Ignore acknowledged source receipts and return complete requested source.'};
+  exactTool.description+=' Exact query/read return source receipts. known_receipts may omit unchanged source explicitly retained by the caller; refresh_source restores it. Omitted bodies have content_source.kind=acknowledged_receipt, not an empty body.';
+  exactTool.run=async(params,cwd)=>{
+    const result=await readExact(params,cwd);
+    return ['query','read'].includes(params.op)?presentExact(result,params):result;
+  };
   const tool=tools.get('sem_exact'),original=tool.run,reviews=new Map();
   tool.schema.properties.op.enum.push('diff');
   tool.schema.properties.diff_id={type:'string'};
+  tool.schema.properties.since_diff={type:'string',description:'With files, return only file-content changes since this captured review ID in the identical scope. Unknown/expired baselines fail, never silently compare against HEAD.'};
   tool.schema.properties.offset={type:'integer',minimum:0};
   tool.description+=' Optional diff(files:[explicit paths]) reviews changed hunks versus HEAD including untracked additions, rather than rereading full entities. Continue a captured page with diff_id and offset=next_offset. No edits or tests are performed. Includes preexisting changes; recapture after edits.';
+  tool.description+=' For repeated review, since_diff with the identical files scope compares current file content to that captured review, not HEAD. This content-only delta excludes mode changes; expired baselines fail explicitly.';
   tool.run=async(params,cwd)=>{
     if(params.op!=='diff')return original(params,cwd);
     if(!reviews.has(cwd))reviews.set(cwd,new ReviewDiff());
     const review=reviews.get(cwd);
     if(params.diff_id) {
-      if(params.files)throw Error('DIFF_ID_OR_FILES_NOT_BOTH');
+      if(params.files||params.since_diff)throw Error('DIFF_ID_OR_FILES_NOT_BOTH');
       return review.read(params.diff_id,params.offset??0);
     }
     if(params.offset)throw Error('DIFF_PAGINATION_REQUIRES_ID');
-    return review.capture(cwd,params.files);
+    return review.capture(cwd,params.files,{since:params.since_diff});
   };
 }
 const jevCredential = process.env.SEM_JEV_PROXY_TOKEN || process.env.TYPESAFE_API_KEY;
