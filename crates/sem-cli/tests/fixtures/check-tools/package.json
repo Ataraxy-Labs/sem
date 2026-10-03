@@ -1,0 +1,11 @@
+{
+  "name": "sem-check-fixture-tools",
+  "private": true,
+  "description": "Pinned tools the `sem check` integration tests run fixture projects with. scripts/check-fixture-tools.sh installs them into crates/target/check-tools.",
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "eslint": "9.36.0",
+    "eslint-plugin-import": "2.32.0",
+    "vitest": "3.2.4"
+  }
+}

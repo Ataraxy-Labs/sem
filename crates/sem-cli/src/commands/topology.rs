@@ -355,6 +355,42 @@ pub fn run(cmd: TopologyCmd) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The runtime module graph a test run loads, for `sem check`'s affected-test
+/// selection: production and test files of every workspace package plus the
+/// root package, value references only (type-only imports are erased before a
+/// test runs), assets as nodes, no world.
+pub(crate) struct RuntimeGraph {
+    /// Node ids (repo-relative paths) and whether each is a test file.
+    pub nodes: Vec<(String, bool)>,
+    /// Value edges, importer -> imported.
+    pub edges: Vec<(usize, usize)>,
+    /// Relative imports the extraction could not resolve: (importer, specifier).
+    pub unresolved: Vec<(String, String)>,
+}
+
+pub(crate) fn runtime_graph(repo_root: &str) -> RuntimeGraph {
+    module_graph(repo_root, Selector::Value, &[FileKind::Prod, FileKind::Test])
+}
+
+/// Every import between repo files (value and type, every file role): what a
+/// file's lint result can depend on through import-resolving rules.
+pub(crate) fn import_graph(repo_root: &str) -> RuntimeGraph {
+    module_graph(repo_root, Selector::Both, &[FileKind::Prod, FileKind::Test, FileKind::Example, FileKind::Build])
+}
+
+fn module_graph(repo_root: &str, reference: Selector, kinds: &[FileKind]) -> RuntimeGraph {
+    let mut common = Common::at(repo_root);
+    common.root_package = true;
+    common.assets = true;
+    let l = Loaded::load(common);
+    let g = l.graph_with(Some(Granularity::Module), Some(reference), kinds, true, true);
+    RuntimeGraph {
+        nodes: g.nodes.iter().map(|n| (n.id.clone(), n.file_kind == Some(FileKind::Test))).collect(),
+        edges: g.edges.iter().map(|e| (e.from, e.to)).collect(),
+        unresolved: g.unresolved.iter().map(|u| (u.source.clone(), u.specifier.clone())).collect(),
+    }
+}
+
 fn graph_json(g: &Graph) -> Value {
     json!({
         "granularity": g.granularity,
@@ -531,7 +567,7 @@ fn affected_tests(l: &Loaded, g: &Graph, changed: &[String]) -> Value {
 }
 
 /// The test file a jest/vitest snapshot belongs to (`a/__snapshots__/b.test.tsx.snap` -> `a/b.test.tsx`).
-fn snapshot_owner(p: &str) -> Option<String> {
+pub(crate) fn snapshot_owner(p: &str) -> Option<String> {
     let stem = p.strip_suffix(".snap")?;
     let (dir, leaf) = stem.rsplit_once('/').unwrap_or(("", stem));
     let owner_dir = if dir == "__snapshots__" { "" } else { dir.strip_suffix("/__snapshots__")? };

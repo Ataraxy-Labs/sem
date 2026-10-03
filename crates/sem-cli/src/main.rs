@@ -677,20 +677,24 @@ enum Commands {
     /// Is my change correct? Runs the project's checkers; --promises proves the promises can fail
     #[command(
         display_order = 4,
-        long_about = "Is my change correct? Runs the project's checkers on the working tree and \
-        prints one verdict. Exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass).\n\n\
-        Examples:\n  sem check                         every check this project has\n  \
-        sem check --base origin/main      only what changed since origin/main\n  \
-        sem check --promises              prove every promise in .sem/promises can fail\n  \
-        sem check --json                  one JSON object\n\n\
-        This build checks the promises in .sem/promises (the laws `sem certify` reports); the \
-        compiler, type checker, linter and test checkers (--checkers) are not in it yet."
+        long_about = "Is my change correct? Runs the project's compiler, type checker, linter and \
+        tests on the working tree: the same verdict as running each tool on the whole project, \
+        rechecking only what the change can affect when that is provably exact. Exit 0 pass, \
+        1 fail, 2 could not decide.\n\n\
+        Examples:\n  sem check                          every checker the project has\n  \
+        sem check --checkers ts,lint,tests only these\n  \
+        sem check --base origin/main       against origin/main instead of HEAD\n  \
+        sem check --promises               also prove every promise in .sem/promises can fail\n  \
+        sem check --json                   one JSON object with a verification certificate\n\n\
+        Every checker reports its mode (incremental or full), why, the files it rechecked and \
+        its diagnostics. With --promises the promises verdict follows the checkers' (in --json, \
+        as a second JSON object), and the exit code is the worse of the two."
     )]
     Check {
         #[command(flatten)]
-        args: commands::check_stub::CheckArgs,
-        /// Prove every promise can fail: apply its mutation, expect it broken, restore.
-        /// Example: sem check --promises
+        args: commands::check::CheckArgs,
+        /// Also prove every promise in .sem/promises can fail: apply its mutation, expect it
+        /// broken, restore. Example: sem check --promises
         #[arg(long)]
         promises: bool,
     },
@@ -1749,7 +1753,13 @@ fn main() {
             }
         }
         Some(Commands::Check { args, promises }) => {
-            std::process::exit(commands::check_stub::run(args, promises));
+            let (json, directory) = (args.json, args.directory.clone());
+            let code = commands::check::run(args);
+            if !promises {
+                std::process::exit(code);
+            }
+            let proved = commands::check_promises::verify(directory.as_deref(), json);
+            std::process::exit(commands::check_promises::combine(code, proved));
         }
         Some(Commands::History { entity, blame, file, limit, format, json, verbose }) => {
             let json = resolve_json(format, json);
