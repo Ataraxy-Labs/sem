@@ -12,6 +12,11 @@ use super::{language_for, lower_source};
 /// `caller -> file:callee` for every call (`ref caller -> ..` for function
 /// references) that resolves to repo functions.
 fn edges(files: &[(&str, &str)]) -> BTreeSet<String> {
+    edges_at(std::path::Path::new("/nonexistent"), files)
+}
+
+/// [`edges`] with a real root, for layouts that read manifests (`go.mod`).
+fn edges_at(root: &std::path::Path, files: &[(&str, &str)]) -> BTreeSet<String> {
     let facts: Vec<(String, FileFacts)> = files
         .iter()
         .map(|(p, src)| (p.to_string(), lower_source(p, src).expect("rust file")))
@@ -19,7 +24,7 @@ fn edges(files: &[(&str, &str)]) -> BTreeSet<String> {
     let named: Vec<(&str, &FileFacts)> = facts.iter().map(|(p, f)| (p.as_str(), f)).collect();
     let refs: Vec<&FileFacts> = facts.iter().map(|(_, f)| f).collect();
     let lang = language_for(files[0].0).unwrap();
-    let layout = lang.layout(std::path::Path::new("/nonexistent"), &named);
+    let layout = lang.layout(root, &named);
     let tables = ScopeTables::build(&refs, &layout);
     let impls = ImplTables::build(&refs, &tables.view(), lang);
     let r = Resolver::new(lang, &refs, tables.view(), &impls);
@@ -413,4 +418,62 @@ fn go() {
 ",
     )]);
     assert_eq!(got, set(&["go -> src/lib.rs:make", "go -> src/lib.rs:run"]));
+}
+
+#[test]
+fn python_namespace_packages_under_site_packages_resolve() {
+    // `google` has no __init__.py: a PEP 420 namespace package, importable
+    // because its parent is an installed-dependency root.
+    let got = edges(&[
+        ("app/main.py", "from google.protobuf import message\n\ndef run():\n    message.parse()\n"),
+        ("app/__init__.py", ""),
+        (".sem-system/links/0/site-packages/google/protobuf/__init__.py", ""),
+        (
+            ".sem-system/links/0/site-packages/google/protobuf/message.py",
+            "def parse():\n    pass\n",
+        ),
+    ]);
+    assert_eq!(
+        got,
+        set(&["run -> .sem-system/links/0/site-packages/google/protobuf/message.py:parse"])
+    );
+}
+
+#[test]
+fn go_std_module_packages_import_by_bare_path() {
+    let dir = std::env::temp_dir().join(format!("sem-calls-gostd-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("gostd/fmt")).unwrap();
+    std::fs::write(dir.join("go.mod"), "module example.com/app\n").unwrap();
+    std::fs::write(dir.join("gostd/go.mod"), "module std\n").unwrap();
+    let got = edges_at(
+        &dir,
+        &[
+            ("main.go", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println()\n}\n"),
+            ("gostd/fmt/print.go", "package fmt\n\nfunc Println() {}\n"),
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, set(&["main -> gostd/fmt/print.go:Println"]));
+}
+
+#[test]
+fn python_package_init_reexports_are_members() {
+    // `pkg/__init__.py` imports `Client` / `helper` / `deep`: importers of
+    // `pkg` see them, relative and absolute, directly and through an alias.
+    let got = edges(&[
+        (
+            "app/main.py",
+            "from pkg import Client, helper, deep\nimport pkg as P\n\ndef run():\n    Client()\n    helper()\n    deep()\n    P.helper()\n",
+        ),
+        ("app/__init__.py", ""),
+        ("pkg/__init__.py", "from .core import Client as Client\nfrom .sub.x import deep\nfrom pkg.core import helper\n"),
+        ("pkg/core.py", "class Client:\n    pass\n\ndef helper():\n    pass\n"),
+        ("pkg/sub/__init__.py", ""),
+        ("pkg/sub/x.py", "def deep():\n    pass\n"),
+    ]);
+    assert_eq!(
+        got,
+        set(&["run -> pkg/core.py:helper", "run -> pkg/sub/x.py:deep"]),
+        "Client() is a class call (no fn edge in this helper); helper twice"
+    );
 }

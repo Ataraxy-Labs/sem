@@ -1,0 +1,325 @@
+# Boundary-site models: where data leaves or enters the code.
+#
+# Each [[call]] matches call sites by callee text (whitespace removed,
+# argument lists collapsed to `()`); `*` matches any run of characters.
+# Fields:
+#   kind      sql | env | http_out | rpc_out | queue | dispatch | route_in | subprocess | fs
+#   langs     py | go | rs | ts | js
+#   callee    patterns
+#   arg       index of the argument carrying the key / SQL / URL / path
+#             ("last" = last argument)
+#   min_args  skip calls with fewer arguments
+#   decorator true = only decorators/attributes, false = only plain calls
+#   handler   route_in: "decorated" | "last" | "to" (actix `.to(h)`) | "inner" (axum `get(h)`)
+#   method    route_in/http_out: fixed HTTP method; otherwise the callee's
+#             last segment if it names one, else ANY
+#   receiver  the receiver text must contain one of these (case-insensitive)
+#
+# [[member]] matches member/subscript reads (`process.env.X`, `os.environ["X"]`).
+# [[registry]] pairs registration calls with lookup calls by key.
+
+# ---------------------------------------------------------------- env
+[[call]]
+kind = "env"
+langs = ["py"]
+callee = ["os.getenv", "getenv", "os.environ.get", "environ.get", "os.environ.setdefault"]
+arg = 0
+
+[[call]]
+kind = "env"
+langs = ["go"]
+callee = ["os.Getenv", "os.LookupEnv", "viper.GetString", "viper.GetInt", "viper.GetBool", "viper.Get", "viper.GetDuration"]
+arg = 0
+
+[[call]]
+kind = "env"
+langs = ["rs"]
+callee = ["std::env::var", "env::var", "std::env::var_os", "env::var_os", "env!", "option_env!", "dotenvy::var", "dotenv::var"]
+arg = 0
+
+[[member]]
+kind = "env"
+langs = ["py"]
+text = ["*environ[]"]
+
+[[member]]
+kind = "env"
+langs = ["ts", "js"]
+text = ["process.env.*", "import.meta.env.*"]
+
+# ---------------------------------------------------------------- sql
+[[call]]
+kind = "sql"
+langs = ["py"]
+callee = ["*.execute", "*.executemany", "*.executescript", "*.exec_driver_sql", "*.execute_write", "*.execute_write_fn", "*.execute_fn", "*.raw", "text", "sqlalchemy.text", "sa.text"]
+arg = 0
+min_args = 1
+
+[[call]]
+kind = "sql"
+langs = ["go"]
+callee = ["*.Exec", "*.ExecContext", "*.Query", "*.QueryContext", "*.QueryRow", "*.QueryRowContext", "*.NamedExec", "*.NamedExecContext"]
+arg = "sql"
+min_args = 1
+# a database handle, not gin's `c.Query("param")`
+receiver = ["db", "tx", "conn", "stmt", "pool", "sql", "repo", "store"]
+
+[[call]]
+kind = "sql"
+langs = ["go"]
+callee = ["*.Raw", "*.Select", "*.Get", "*.GetContext", "*.SelectContext", "*.Prepare", "*.PrepareContext"]
+arg = "sql"
+min_args = 1
+require_sql = true
+
+# ORM operations: the table comes from a model class named in the call, or
+# (failing that) the models the enclosing entity mentions.
+[[call]]
+kind = "sql"
+langs = ["py"]
+callee = ["*session.add", "*session.add_all", "*session.delete", "*session.get", "*session.exec", "*session.scalars", "*session.scalar", "*session.query", "*session.merge", "*.query.get", "*.query.get_or_404", "*.query.filter_by", "*.query.filter", "*.query.all", "*.query.first", "*.query.count", "*.paginate", "*.objects.*"]
+arg = 0
+orm = true
+
+[[call]]
+kind = "sql"
+langs = ["go"]
+callee = ["*.First", "*.Find", "*.Create", "*.Save", "*.Delete", "*.Updates", "*.Update", "*.Model", "*.AutoMigrate", "*.Association", "*.Count", "*.Take", "*.Last", "*.FirstOrCreate", "*.Pluck", "*.Scan"]
+arg = 0
+orm = true
+receiver = ["db", "tx", "gorm", "conn", "orm"]
+
+[[call]]
+kind = "sql"
+langs = ["ts", "js"]
+callee = ["*prisma.*.find*", "*prisma.*.create*", "*prisma.*.update*", "*prisma.*.delete*", "*prisma.*.upsert", "*prisma.*.count", "*prisma.*.aggregate", "*prisma.*.groupBy", "*Repository.find*", "*Repository.save", "*Repository.delete", "*Repository.remove", "*Repository.update", "*Repository.insert", "*Repository.count", "*Repository.createQueryBuilder", "getRepository", "*.createQueryBuilder"]
+arg = 0
+orm = true
+
+[[call]]
+kind = "sql"
+langs = ["rs"]
+callee = ["sqlx::query!", "sqlx::query_as!", "sqlx::query_scalar!", "query!", "query_as!", "query_scalar!", "sqlx::query", "sqlx::query_as", "sqlx::query_scalar", "query", "query_as"]
+arg = "sql"
+min_args = 1
+
+[[call]]
+kind = "sql"
+langs = ["ts", "js"]
+callee = ["*.query", "*.$queryRaw", "*.$executeRaw", "*.$queryRawUnsafe", "*.$executeRawUnsafe", "*.raw", "*.run", "*.exec", "*.prepare", "*.all", "*.get"]
+arg = 0
+min_args = 1
+require_sql = true
+
+# ---------------------------------------------------------------- http out
+[[call]]
+kind = "http_out"
+langs = ["py"]
+callee = ["requests.*", "httpx.*", "urlopen", "urllib.request.urlopen", "*.session.get", "*.session.post", "aiohttp.request"]
+arg = 0
+min_args = 1
+
+[[call]]
+kind = "http_out"
+langs = ["go"]
+callee = ["http.Get", "http.Post", "http.Head", "http.PostForm", "*.client.Get", "*.client.Post"]
+arg = 0
+min_args = 1
+
+[[call]]
+kind = "http_out"
+langs = ["go"]
+callee = ["http.NewRequest", "http.NewRequestWithContext"]
+arg = "url"
+min_args = 2
+
+[[call]]
+kind = "http_out"
+langs = ["rs"]
+callee = ["reqwest::get", "*client.get", "*client.post", "*client.put", "*client.patch", "*client.delete", "*client.request", "*.http_client.post", "*.http_client.get"]
+arg = 0
+min_args = 1
+
+[[call]]
+kind = "http_out"
+langs = ["ts", "js"]
+callee = ["fetch", "axios", "axios.*", "*.axios.*", "http.request", "https.request", "http.get", "https.get", "*.$http.*", "*.http.get", "*.http.post", "*.http.put", "*.http.delete", "*client).get", "*client).post", "*client).put", "*client).delete", "*client).patch", "*.request", "ky.*", "got", "got.*", "superagent.*"]
+arg = 0
+min_args = 1
+
+# ---------------------------------------------------------------- queues
+[[call]]
+kind = "queue"
+langs = ["py", "go", "rs", "ts", "js"]
+callee = ["*.publish", "*.Publish", "*.basic_publish", "*.send_message", "*.SendMessage", "*.produce", "*.Produce", "*.sendToQueue", "*.subscribe", "*.Subscribe", "*.basic_consume", "*.consume", "*.Consume"]
+arg = 0
+receiver = ["pub", "queue", "topic", "kafka", "amqp", "channel", "producer", "consumer", "sqs", "sns", "nats", "broker", "bus"]
+
+# ---------------------------------------------------------------- subprocess / fs
+[[call]]
+kind = "subprocess"
+langs = ["py"]
+callee = ["subprocess.*", "os.system", "os.popen", "os.exec*", "os.spawn*", "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell"]
+arg = 0
+
+[[call]]
+kind = "subprocess"
+langs = ["go"]
+callee = ["exec.Command", "exec.CommandContext"]
+arg = 0
+
+[[call]]
+kind = "subprocess"
+langs = ["rs"]
+callee = ["Command::new", "std::process::Command::new", "process::Command::new", "tokio::process::Command::new"]
+arg = 0
+
+[[call]]
+kind = "subprocess"
+langs = ["ts", "js"]
+callee = ["child_process.*", "*.execSync", "*.spawnSync", "execSync", "spawnSync", "spawn", "execFile", "execa", "spawn.*", "cp.*", "*.fork"]
+arg = 0
+
+[[call]]
+kind = "fs"
+langs = ["go"]
+callee = ["os.WriteFile", "os.Create", "os.OpenFile", "ioutil.WriteFile", "os.Remove", "os.RemoveAll", "os.MkdirAll", "os.Rename"]
+arg = 0
+
+[[call]]
+kind = "fs"
+langs = ["rs"]
+callee = ["fs::write", "std::fs::write", "File::create", "fs::create_dir_all", "std::fs::create_dir_all", "fs::remove_file", "fs::remove_dir_all", "fs::copy", "fs::rename", "tokio::fs::write"]
+arg = 0
+
+[[call]]
+kind = "fs"
+langs = ["ts", "js"]
+callee = ["fs.writeFile*", "fs.appendFile*", "fs.createWriteStream", "fs.unlink*", "fs.rm*", "fs.mkdir*", "fs.rename*", "fs.copyFile*", "writeFile", "writeFileSync", "mkdirs", "rmdir", "unlink", "*.writeFile", "*.outputFile"]
+arg = 0
+
+[[call]]
+kind = "fs"
+langs = ["py"]
+callee = ["shutil.*", "os.remove", "os.unlink", "os.makedirs", "os.rename", "os.replace", "*.write_text", "*.write_bytes", "*.mkdir", "*.unlink"]
+arg = 0
+
+# ---------------------------------------------------------------- reflective dispatch
+[[call]]
+kind = "dispatch"
+langs = ["py"]
+callee = ["getattr", "importlib.import_module", "import_module", "__import__", "*.load_entrypoints", "*.load_setuptools_entrypoints", "*.hook.*"]
+arg = 1
+
+[[call]]
+kind = "dispatch"
+langs = ["go"]
+callee = ["*.MethodByName", "*.FieldByName", "plugin.Open", "*.Lookup", "reflect.*.Call", "*.Call"]
+arg = 0
+receiver = ["reflect", "plugin", "value", "method", "sym"]
+
+[[call]]
+kind = "dispatch"
+langs = ["ts", "js"]
+callee = ["require", "import", "Reflect.*"]
+arg = 0
+dynamic_only = true
+
+# ---------------------------------------------------------------- inbound routes
+[[call]]
+kind = "route_in"
+langs = ["py"]
+callee = ["*.route", "*.get", "*.post", "*.put", "*.patch", "*.delete", "*.head", "*.options", "*.api_route", "*.websocket"]
+decorator = true
+arg = 0
+handler = "decorated"
+
+[[call]]
+kind = "route_in"
+langs = ["py"]
+callee = ["*.add_url_rule", "*.add_route", "*.add_api_route", "path", "re_path", "url"]
+decorator = false
+arg = 0
+handler = "last"
+path_like = true
+
+# datasette-style route tables: `add_route(View.as_view(ds), r"/regex")`
+[[call]]
+kind = "route_in"
+langs = ["py"]
+callee = ["add_route"]
+decorator = false
+arg = 1
+handler = "first"
+path_like = true
+min_args = 2
+
+[[call]]
+kind = "route_in"
+langs = ["ts", "js"]
+callee = ["*.get", "*.post", "*.put", "*.patch", "*.delete", "*.all", "*.options", "*.head"]
+decorator = false
+arg = 0
+handler = "last"
+path_like = true
+min_args = 2
+
+[[call]]
+kind = "route_in"
+langs = ["ts", "js"]
+callee = ["Get", "Post", "Put", "Patch", "Delete", "All", "Options", "Head"]
+decorator = true
+arg = 0
+handler = "decorated"
+prefix_class_decorator = "Controller"
+
+[[call]]
+kind = "route_in"
+langs = ["go"]
+callee = ["*.GET", "*.POST", "*.PUT", "*.PATCH", "*.DELETE", "*.Any", "*.Handle", "*.HandleFunc", "*.Get", "*.Post", "*.Put", "*.Patch", "*.Delete", "*.Method", "*.MethodFunc"]
+arg = 0
+handler = "last"
+path_like = true
+min_args = 2
+
+[[call]]
+kind = "route_in"
+langs = ["rs"]
+callee = ["get", "post", "put", "patch", "delete", "route", "actix_web::get", "actix_web::post", "web::get", "web::post"]
+decorator = true
+arg = 0
+handler = "decorated"
+
+[[call]]
+kind = "route_in"
+langs = ["rs"]
+callee = ["*.route", "web::resource", "*.service"]
+decorator = false
+arg = 0
+handler = "to"
+path_like = true
+min_args = 2
+
+# ---------------------------------------------------------------- registries
+# `X.register(key, fn)` and `X.exec(key)` on a registry whose receiver ends
+# with the same segment are one dispatch point with a finite candidate set.
+[[registry]]
+langs = ["ts", "js"]
+register = ["*.register"]
+lookup = ["*.exec", "*.execSync", "*.call", "*.run", "*.render", "*.renderSync"]
+key_arg = 0
+value_arg = "last"
+
+[[registry]]
+langs = ["go"]
+register = ["plugin.Register", "caddy.RegisterPlugin", "*.Register", "*.RegisterModule"]
+lookup = []
+key_arg = 0
+value_arg = "last"
+
+[[registry]]
+langs = ["py"]
+register = ["*.register", "*.connect", "*.add_hook"]
+lookup = ["*.get", "*.dispatch", "*.send", "*.fire"]
+key_arg = 0
+value_arg = "last"

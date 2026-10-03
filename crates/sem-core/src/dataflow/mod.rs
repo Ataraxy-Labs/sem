@@ -395,6 +395,12 @@ impl Analysis {
             .collect()
     }
 
+    /// Every escape (data reaching a call with no known target), with or
+    /// without its witness path. `to_json_with(Compact)` only counts them.
+    pub fn escapes_json(&self, paths: bool) -> Vec<Value> {
+        self.out.escapes.iter().map(|e| self.escape_json(e, paths)).collect()
+    }
+
     fn escape_json(&self, e: &engine::Escape, path: bool) -> Value {
         let o = &self.out;
         let s = &o.srcs[e.src as usize];

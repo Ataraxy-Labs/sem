@@ -1106,11 +1106,17 @@ fn layout(root: &FsPath, files: &[(&str, &FileFacts)]) -> Layout {
                 .strip_prefix(mdir.as_str())
                 .unwrap_or(dir)
                 .trim_start_matches('/');
-            let import = if rel.is_empty() {
+            // GOROOT/src's module is `std`: its packages import by bare path
+            let import = if mpath == "std" {
+                rel.to_string()
+            } else if rel.is_empty() {
                 mpath.clone()
             } else {
                 format!("{mpath}/{rel}")
             };
+            if import.is_empty() {
+                continue;
+            }
             layout.dir_crates.insert(import, i);
         }
     }

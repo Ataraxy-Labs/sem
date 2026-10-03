@@ -22,6 +22,7 @@ pub mod repos;
 pub(crate) mod review;
 pub mod setup;
 pub mod stats;
+pub mod system;
 pub mod topology;
 
 #[cfg(feature = "self-update")]

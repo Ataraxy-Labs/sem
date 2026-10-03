@@ -305,8 +305,12 @@ impl<'a> ScopeTables<'a> {
                     .or_default()
                     .push(Def::Value(fi as u32, i as u32));
             }
+            let uses_home = |local: u32| match (local, pooled_dir, layout.pooled_uses.get(fi)) {
+                (0, Some(d), Some(true)) => d,
+                _ => b + local,
+            };
             for u in &f.uses {
-                uses[(b + u.scope) as usize].push(u);
+                uses[uses_home(u.scope) as usize].push(u);
             }
             for (sc, name) in &f.private {
                 private.insert((home(*sc), &**name));

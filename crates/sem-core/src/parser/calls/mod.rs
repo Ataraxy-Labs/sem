@@ -78,8 +78,8 @@ pub struct Stats {
     /// Resolved to a repo definition sem has no entity for.
     pub no_entity: usize,
     pub unresolved: HashMap<&'static str, usize>,
-    /// Every site's answer as a JSON line, with `SEM_CALLS_SITES` set (debug
-    /// builds only).
+    /// Every site's answer as a JSON line, with `SEM_CALLS_SITES` set (`sem
+    /// system` sets it around its layer builds).
     pub sites: Vec<String>,
 }
 
@@ -134,8 +134,9 @@ pub(crate) fn resolve_call_edges(
         .filter(|p| language_for(p).is_some())
         .collect();
     let started = std::time::Instant::now();
-    // Diagnostics for developing the call graph: debug builds only.
-    let report = cfg!(debug_assertions) && std::env::var_os("SEM_CALLS_STATS").is_some();
+    // Per-outcome counts and the per-site dump: `sem system` turns these on
+    // around its layer builds to measure each layer's unknown rate.
+    let report = std::env::var_os("SEM_CALLS_STATS").is_some();
     let trees: HashMap<&str, (&str, &tree_sitter::Tree)> = parsed
         .iter()
         .map(|(p, src, tree)| (p.as_str(), (src.as_str(), tree)))
@@ -189,9 +190,7 @@ pub(crate) fn resolve_call_edges(
                     ..stats.clone()
                 }
             );
-            if let Some(path) =
-                std::env::var_os("SEM_CALLS_SITES").filter(|_| cfg!(debug_assertions))
-            {
+            if let Some(path) = std::env::var_os("SEM_CALLS_SITES") {
                 use std::io::Write;
                 let mut out = std::fs::OpenOptions::new()
                     .create(true)
@@ -274,7 +273,7 @@ pub fn resolve<'e>(
     let ids = EntityIds::build(files, entities);
     let fn_ids = &ids.fns;
     let owners = owner_index(entities);
-    let dump = cfg!(debug_assertions) && std::env::var_os("SEM_CALLS_SITES").is_some();
+    let dump = std::env::var_os("SEM_CALLS_SITES").is_some();
     let no_owners = OwnerIndex::default();
 
     let hints = if lang.infer_params_from_calls() {
@@ -316,8 +315,8 @@ pub fn resolve<'e>(
         pairs.extend(override_pairs(&resolver(), &facts, &impls));
     }
     for (decl, imp) in pairs {
-        let from = fn_ids[decl.0 as usize][decl.1 as usize];
-        let to = fn_ids[imp.0 as usize][imp.1 as usize];
+        let id = |(f, i): FnRef| fn_ids.get(f as usize).and_then(|v| v.get(i as usize)).copied().flatten();
+        let (from, to) = (id(decl), id(imp));
         if let (Some(from), Some(to)) = (from, to) {
             edges.push(CallEdge {
                 from,
@@ -528,9 +527,10 @@ fn classify_file<'e>(
         };
         // a site in a function sem has no entity for (a const initializer)
         // belongs to the entity around it
+        // (a file sem extracted no entities from has no id table: no owner)
         let from = site
             .func
-            .and_then(|func| ids.fns[fi as usize][func as usize])
+            .and_then(|func| ids.fns.get(fi as usize)?.get(func as usize).copied().flatten())
             .or_else(|| owners.at_row(site.row));
         let mut answer: Vec<Option<&str>> = Vec::new();
         match &pick {

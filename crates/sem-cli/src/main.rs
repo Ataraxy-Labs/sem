@@ -296,6 +296,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: commands::topology::TopologyCmd,
     },
+    /// Whole-system graph: locked dependencies, stdlib, DB schema, config/routes, contracts and a
+    /// runtime trace, layered, with the share of call and flow sites each layer leaves unknown
+    System {
+        #[command(subcommand)]
+        cmd: commands::system::SystemCmd,
+    },
     /// Review certificate for a commit range: entities touched, signature changes and
     /// the callers they leave behind, callee deltas, laws kept/broken with witnesses,
     /// module reachability deltas (JS/TS), affected tests, and the static reference cone
@@ -703,6 +709,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Graph { .. }) => "graph",
         Some(Commands::Promises { .. }) => "promises",
         Some(Commands::Topology { .. }) => "topology",
+        Some(Commands::System { .. }) => "system",
         Some(Commands::Certify { .. }) => "certify",
         Some(Commands::ArchDiff { .. }) => "arch-diff",
         Some(Commands::Dataflow { .. }) => "dataflow",
@@ -819,6 +826,12 @@ fn main() {
         }
         Some(Commands::Promises { cmd }) => {
             if let Err(e) = commands::promises::run(cmd) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+        Some(Commands::System { cmd }) => {
+            if let Err(e) = commands::system::run(cmd) {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }

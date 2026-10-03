@@ -52,6 +52,10 @@ pub struct Layout {
     /// Files whose top-level items live in their directory's scope, shared
     /// by the package (every Go file; a Python `__init__.py`).
     pub pooled: Vec<bool>,
+    /// Pooled files whose top-level imports are also members of their
+    /// package (a Python `__init__.py` re-exports what it imports; a Go
+    /// file's imports stay file-local).
+    pub pooled_uses: Vec<bool>,
     /// Importable name (import path) -> directory module index.
     pub dir_crates: HashMap<String, usize>,
 }

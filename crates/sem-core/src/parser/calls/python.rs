@@ -1364,6 +1364,10 @@ fn layout(files: &[(&str, &FileFacts)]) -> Layout {
             .iter()
             .map(|(p, _)| p.ends_with("__init__.py"))
             .collect(),
+        pooled_uses: files
+            .iter()
+            .map(|(p, _)| p.ends_with("__init__.py"))
+            .collect(),
         ..Layout::default()
     };
     layout.add_directory_modules(&orphans, files.len());
@@ -1390,7 +1394,26 @@ fn layout(files: &[(&str, &FileFacts)]) -> Layout {
             layout.dir_crates.insert(name, d);
         }
     }
-    // PEP 420: a top-level directory is importable as a namespace package
+    // PEP 420: a directory directly on the import path is importable as a
+    // namespace package. The input root is on it, and so is any directory
+    // named `site-packages` / `dist-packages` (an installed-dependency root).
+    let on_path = |p: &Option<usize>| match p {
+        Some(0) => true,
+        Some(p) => matches!(layout.dirs[*p].0.as_str(), "site-packages" | "dist-packages"),
+        None => false,
+    };
+    let namespace: Vec<(String, usize)> = layout
+        .dirs
+        .iter()
+        .enumerate()
+        .filter(|(d, (_, parent))| on_path(parent) && !is_pkg[*d])
+        .map(|(d, (name, _))| (name.clone(), d))
+        .collect();
+    for (name, d) in namespace {
+        if !layout.dir_crates.contains_key(&name) && !counts.contains_key(&name) {
+            layout.dir_crates.insert(name, d);
+        }
+    }
     for (d, (name, parent)) in layout.dirs.iter().enumerate() {
         if *parent == Some(0) && !layout.dir_crates.contains_key(name) && !counts.contains_key(name)
         {
