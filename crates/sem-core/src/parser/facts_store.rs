@@ -208,9 +208,18 @@ macro_rules! maybe_par_iter {
 /// 4 -> 5: Dart call/scope extraction and language/owner-aware member
 /// resolution changed. Invalidate persisted edges and query indexes even
 /// when source bytes and the development package version are unchanged.
-/// 5 -> 6: members of decorated Python classes (`@deco class A:`) are now
+///
+/// 5 -> 6: Rust, Go and Python stopped being scope-resolved, and the
+/// scope-resolver machinery that only served them was deleted.
+/// `PrecomputedFileFacts` lost `init_params`, `attr_to_param` and
+/// `ctor_call_sites` (and with the last, the `CtorCallFacts` type), and
+/// `ImportStmtFacts` lost its `PyFromImport`/`PyModuleImport` variants,
+/// renamed `RustUse` to `UseDeclaration` and turned `GoImport { packages }`
+/// into the payload-free `ImportDeclaration` — a changed enum variant set,
+/// exactly the case this doc's rule exists for.
+/// 6 -> 7: members of decorated Python classes (`@deco class A:`) are now
 /// extracted; unchanged files must re-extract to gain them.
-pub const FACTS_SCHEMA_VERSION: u32 = 6;
+pub const FACTS_SCHEMA_VERSION: u32 = 7;
 
 const MAGIC: &[u8; 8] = b"SEMFACT1";
 
@@ -797,10 +806,16 @@ const SHARD_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// `None` can now get `Some`. Corpus dedup is first-writer-wins,
 /// so without this bump every pre-existing `.cs`/`.cpp` corpus entry would
 /// silently keep denying the new facts a slot forever -- exactly the hazard
-/// the salt-bump discipline exists to prevent. Python/Go/Java/Rust are intentionally *not* bumped here: this
-/// change's `graph.rs` admission test dispatches only `csharp`/`cpp` to the
-/// new precompute function (those four families are NO-GO as-is), so their producer output is
-/// unchanged.
+/// the salt-bump discipline exists to prevent. Python/Go/Java/Rust were
+/// intentionally *not* bumped by that change: its `graph.rs` admission test
+/// dispatched only `csharp`/`cpp` to the new precompute function, so their
+/// producer output was unchanged.
+///
+/// `rust`/`go`/`python` were bumped to `ts-0.23-calls1` when those three
+/// languages stopped being scope-resolved (their call graph now comes from
+/// `parser::calls`): their producer went back to writing
+/// `precomputed: None` unconditionally, whatever a previous build — with
+/// Go admitted unconditionally, or Rust/Python switched on — had written.
 ///
 /// `yaml` was bumped `handrolled-1` -> `handrolled-2`:
 /// a multi-document YAML file's same-named top-level keys in different
@@ -843,125 +858,18 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("typescript", "ts-0.23-u16-exportspan"),
     ("tsx", "ts-0.23-u16-exportspan"),
     ("javascript", "ts-0.23-u16-exportspan"),
-    // MUL: python's producer now emits populated
-    // import_stmts (Field 10) *and* ctor_call_sites (Field 11) — bumped from
-    // "ts-0.23" following rust's/go's/java's salt-bump precedent. Shipped
-    // unconditionally (maxRSS -7.95%/-7.80% on home-assistant/core, a
-    // net decrease) and reconfirmed by a follow-up re-check (maxRSS -1.63% median, still
-    // negative), but a 2026-08-22 re-verification found peak memory footprint —
-    // the now-corrected ceiling metric — reads +25.29-27.44% against the
-    // same +15% ceiling, above it. Demoted to gated behind `SEM_MUL_PYTHON`
-    // (`MUL_RUNTIME_GATES`'s "python" row carries the pre-switch salt,
-    // "ts-0.23"); this table's salt is unchanged — it now serves as the
-    // switched-*on* salt, C++'s/rust's/java's shape (go's too, until Go was
-    // admitted unconditionally and removed its switch
-    // entirely — see below).
-    ("python", "ts-0.23-mp4"),
-    // MUL: go's producer now emits populated
-    // import_stmts (Field 10) — bumped from "ts-0.23" following the same
-    // salt-bump discipline as rust's mp2 bump. Gated behind `SEM_MUL_GO`
-    // (`MUL_RUNTIME_GATES`'s "go" row carries the pre-switch salt,
-    // "ts-0.23"), and must STAY gated: its memory check passed but
-    // `edge_dump_probe` found a real, deterministic correctness regression
-    // on kubernetes (not bit-identical ON vs OFF) — see
-    // `mul_precompute_admits`'s doc comment.
-    //
-    // mp3 -> mp5: fixed half of that regression —
-    // `GoImport::packages` now carries each spec's *full* import path
-    // instead of a bare last-`/`-segment reduction, so `register_go_
-    // package_imports` can disambiguate same-named packages by declaring
-    // directory (kubernetes has dozens of directories literally named
-    // `v1`). Producer-visible (the stored `packages` strings' content
-    // changed) but not a shape change (`Vec<String>` throughout), so this
-    // is a salt-bump case, not a `FACTS_SCHEMA_VERSION` bump — same
-    // category as this table's other content-only producer bumps. Kept
-    // even though the switch stays off in production (must not be flipped
-    // — see below): a stale mp3-salted entry from a local SEM_MUL_GO=1
-    // debugging session must not silently answer a post-fix lookup.
-    // Correctness is *closer* but not closed: fixing this collision
-    // collapsed a large class of cross-package false-positive edges
-    // (kubernetes's own OFF-path edge count dropped ~9%, all confirmed
-    // spurious), but `edge_dump_probe` ON vs OFF is still not
-    // bit-identical — a second, still-unfixed mechanism (see
-    // `mul_precompute_admits`'s doc comment) means the switch just must
-    // not be flipped in production until that regression is root-caused
-    // and fixed.
-    //
-    // mp5 -> mp5-dm5t: fixed the mechanism `mul_precompute_
-    // admits`'s doc comment above named as "(2), not fixed" — id-staleness.
-    // `registry::resolve_go_method_parent_ids` rewrites a cross-file Go
-    // method's `id`/`parent_id`, but ran *after* pass 1 had already keyed
-    // that file's `PrecomputedFileFacts.entity_scope_map`/
-    // `entity_inner_scope`/`return_type_map` by the pre-rewrite id — a
-    // pass-2 lookup by the post-rewrite id missed, silently defaulting to
-    // scope 0 (`ENTITY_SCOPE_LOOKUP`'s honest-miss counter: kubernetes
-    // fallback_pct 27.10% -> 0.00%). The fix re-keys this build's fresh
-    // facts for exactly the files the rewrite touched
-    // (`GoParentsResolved::rekeyed_ids`/`rekeyed_files`,
-    // `PrecomputedFileFacts::rekey_entity_ids`) immediately after the
-    // rewrite runs, and additionally cascades a rewritten method's new id
-    // down through every descendant whose `parent_id` embedded the old id
-    // as a literal prefix (`build_entity_id`'s own contract) — previously
-    // only the method's own id/parent_id were rewritten, leaving nested
-    // locals' `parent_id` dangling. Both are `SemanticEntity`/
-    // `PrecomputedFileFacts` content changes for `.go` files specifically
-    // (`is_go_file` guards every mutation both fixes make), hence this
-    // entry's bump, not a table-wide one — kept even though the switch
-    // stays off in production, same discipline as every prior bump on
-    // this entry. `edge_dump_probe` ON vs OFF on kubernetes: bit-identical
-    // (0-line diff, was 30,795) for the method-id-rewrite mechanism this
-    // fix targets. A second, independent, much smaller mechanism (the
-    // registration-gap species is chasing, unrelated to Go's id
-    // rewrite) is still open at this point — see that change.
-    //
-    // mp5-dm5t -> mp5-dm5t-bpn2 (+ the Go memory-check work):
-    // closed the registration-gap species named just above
-    // (function-nested entities never entering any scope's `.defs`) for
-    // every language at once, including Go — `ENTITY_SCOPE_LOOKUP`'s
-    // `fallback_pct` collapsed 14.01% -> 0.00% on kubernetes. Combined
-    // with the id-rekey fix above, both known correctness species were
-    // closed — but the Go memory-check work's own precondition check (before
-    // trusting that "closed" claim enough to admit Go) found a third,
-    // inverted one: `edge_dump_probe` ON vs OFF on kubernetes was *still*
-    // not bit-identical (331,120 vs 331,117), 3 dangling edges pointing at
-    // ids no entity held. Root cause: `PrecomputedFileFacts::rekey_entity_
-    // ids` (the mp5-dm5t fix above) rekeyed `entity_scope_map`/
-    // `entity_inner_scope`/`return_type_map`'s keys but never revisited
-    // `Scope::defs`' values or `Scope::owner_id` — the two other places a
-    // `Scope` caches an entity id, both populated by the same registration
-    // loops reinstated. Fixed by walking `self.scopes` too.
-    // Producer-visible (`.defs`/`owner_id` values a corpus-cached
-    // `PrecomputedFileFacts` carries can now differ from a pre-fix build's)
-    // but not a shape change, so it's a bump case again. `edge_dump_probe`
-    // ON vs OFF on kubernetes: bit-identical (331,117 edges both sides).
-    // Go's correctness blocker chain is now fully closed, and its memory
-    // check (three order-swapped pairs, kubernetes, both `/usr/bin/time -l`
-    // fields) cleared the +15% ceiling (+6.78% to +8.46% peak footprint,
-    // maxRSS flat) — so unlike every prior bump on this entry, this one
-    // ships with the switch removed, not kept off: Go is admitted
-    // unconditionally, [`crate::parser::scope_resolve::MUL_RUNTIME_GATES`]
-    // no longer carries a "go" row, and this table's salt is what every
-    // build now writes under, not a switched-*on* value waiting for a
-    // switch. Bumped regardless of that, per the same discipline: a
-    // pre-bpn2 corpus entry (written under a local `SEM_MUL_GO=1`
-    // debugging session before this fix existed) must not silently answer
-    // a post-fix lookup now that the enriched path runs on every build.
-    ("go", "ts-0.23-mp5-dm5t-bpn2"),
-    // MUL: rust's producer now emits populated
-    // import_stmts (Field 10) — bumped from "ts-0.23" following
-    // the same salt-bump precedent. Shipped unconditionally
-    // (+11.16%/+11.28% against the +15% ceiling) but a later
-    // same-binary re-verification found the ceiling actually busted
-    // (+17.7-19.6%) — demoted to gated behind `SEM_MUL_RUST`
-    // (`MUL_RUNTIME_GATES`'s "rust" row carries the pre-switch salt,
-    // "ts-0.23"); this table's salt is unchanged — it now serves as the
-    // switched-*on* salt, C#'s/java's shape (go's too, until Go was
-    // admitted unconditionally — see above).
-    ("rust", "ts-0.23-mp2"),
-    // MUL: java's imports classify as GoImport
-    // and are now descriptor-dispatched too — the same salt-bump
-    // as go's original one (go's own entry is now several bumps further —
-    // see above). Correctness is clean (bit-identical edge_dump_probe on
+    // Not scope-resolved (their call graph is `parser::calls`'), so their
+    // producer writes `precomputed: None` unconditionally. Bumped from their
+    // MUL-era salts (python "ts-0.23-mp4", go "ts-0.23-mp5-dm5t-bpn2", rust
+    // "ts-0.23-mp2" — each the salt a build with that language's precompute
+    // on wrote under) so no entry carrying precomputed facts from the old
+    // producer answers a lookup from this one.
+    ("python", "ts-0.23-calls1"),
+    ("go", "ts-0.23-calls1"),
+    ("rust", "ts-0.23-calls1"),
+    // MUL: java's imports classify as an import-statement descriptor
+    // (`import_declaration`) and are descriptor-dispatched — the same
+    // salt-bump as go's original MUL one. Correctness is clean (bit-identical edge_dump_probe on
     // elasticsearch, full oracle battery) but it busted its own +15%
     // peak-RSS ceiling (+20.97%/+21.01%, both pairs) — gated behind
     // `SEM_MUL_JAVA`, pre-switch salt "ts-0.23", C#'s shape.
@@ -975,8 +883,7 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     // footprint +26.33-28.11%). Demoted to gated behind `SEM_MUL_CPP`
     // (`MUL_RUNTIME_GATES`'s "cpp" row carries the pre-switch salt,
     // "ts-0.23"); this table's salt is unchanged — it now serves as the
-    // switched-*on* salt, C#'s/rust's/java's/python's shape (go's too,
-    // until Go was admitted unconditionally — see above).
+    // switched-*on* salt, C#'s/java's shape.
     ("cpp", "ts-0.23-mp1"),
     ("ruby", "ts-0.23"),
     ("csharp", "ts-0.23-mp1"),
@@ -1054,19 +961,13 @@ fn language_salt(lang_id: &str) -> &'static str {
 /// time rather than by the table — every language registered in
 /// [`crate::parser::scope_resolve::MUL_RUNTIME_GATES`] is gated behind an
 /// opt-in env var because its precompute path costs more peak memory than
-/// the +15% ceiling allows: C#; Java (measured over its ceiling); Rust
-/// (+17.7-19.6% against +15%, after an earlier +11% reading had shipped it
-/// unconditionally and a re-verification found it worse); and C++/Python,
-/// both measured against peak memory footprint (compressed-page-aware)
-/// rather than plain maxRSS — C++'s maxRSS itself busts the ceiling too at
-/// +19.98-21.02%, Python's maxRSS stays negative but its footprint reads
-/// +25.29-27.44% — see
-/// [`crate::parser::scope_resolve::mul_precompute_admits`]). Go's
-/// precompute was gated too (memory was fine but its edges weren't
-/// bit-identical on kubernetes, a correctness regression) until that
-/// regression was closed and the memory check cleared on the corrected
-/// metric too — it is unconditional now, the only precompute language that
-/// is, and has no row in this table.
+/// the +15% ceiling allows: C#; Java (measured over its ceiling); and C++,
+/// measured against peak memory footprint (compressed-page-aware) rather
+/// than plain maxRSS — its maxRSS itself busts the ceiling too at
+/// +19.98-21.02% — see
+/// [`crate::parser::scope_resolve::mul_precompute_admits`]). Rust, Go and
+/// Python are not precomputed at all (not scope-resolved), so they have no
+/// row in this table.
 ///
 /// The salt names **the producer that wrote the entry**, so a switch that
 /// changes the producer has to move the salt with it — in *both* directions.
@@ -2905,12 +2806,9 @@ mod corpus_tests {
             )
             .expect("populate");
 
-        // Python is gated (`SEM_MUL_PYTHON`, off by default since the 2026-08-22 demotion) — the
-        // effective salt this default-settings populate wrote under is the
-        // gate's pre-switch salt, not `LANGUAGE_SALTS`'s raw table entry
-        // ("ts-0.23-mp4", the switched-*on* salt). Deriving it via
-        // `effective_language_salt` rather than hardcoding keeps this test
-        // honest about whichever state the switch is in.
+        // Deriving the salt via `effective_language_salt` rather than
+        // hardcoding keeps this test honest about any producer switch the
+        // language may carry (Python has none: it is not precomputed).
         let py_salt = effective_language_salt("python");
         assert!(corpus.get("a.py", hash, &py_salt).is_some());
         assert!(

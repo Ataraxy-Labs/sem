@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::facts_store::FactsStore;
-use sem_core::parser::graph::{EntityGraph, RefType};
+use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
 use sem_core::parser::session::GraphSession;
@@ -123,11 +123,7 @@ fn fingerprint(graph: &EntityGraph, entities: &[SemanticEntity]) -> Fingerprint 
         .edges
         .iter()
         .map(|e| {
-            let kind = match e.ref_type {
-                RefType::Calls => "calls",
-                RefType::TypeRef => "typeref",
-                RefType::Imports => "imports",
-            };
+            let kind = e.ref_type.as_str();
             format!("{}\u{1f}{}\u{1f}{}", e.from_entity, e.to_entity, kind)
         })
         .collect();

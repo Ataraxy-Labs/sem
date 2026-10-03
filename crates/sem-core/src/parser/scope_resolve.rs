@@ -80,7 +80,6 @@ use crate::parser::plugins::code::languages::{
 };
 use crate::parser::plugins::code::{is_pathological_large_file, parse_tree};
 
-type AttrToParamIndex<'a> = HashMap<(&'a str, &'a str), Vec<(&'a str, &'a str)>>;
 type EntityScopeMap = HashMap<EntityId, usize>;
 type ResolvedReference = (EntityId, RefType, &'static str);
 
@@ -601,9 +600,6 @@ pub(crate) struct PreBuiltLookups {
     pub(crate) class_members: ClassMembers,
     pub(crate) owner_members: OwnerMembers,
     pub(crate) entity_ranges: EntityRanges,
-    /// Go package index: pkg_name → [(entity_name, entity_id, declaring_dir)]
-    /// Avoids O(symbol_table) scan per Go import.
-    pub(crate) go_pkg_index: GoPkgIndex,
     /// Repo-level language overrides (`.semrc`, `.gitattributes`), custom
     /// extension → canonical extension, exactly as
     /// [`crate::parser::registry::ParserRegistry::resolve_file_path`] applies
@@ -1124,15 +1120,9 @@ pub(crate) fn resolve_with_scopes_full_for_entities(
     )
 }
 
-/// One file's contribution to the four corpus-wide maps pass 1's scan builds:
-/// return types by entity id, instance attribute types, `__init__` params, and
-/// the attribute→param mapping.
-type Pass1FileScan = (
-    HashMap<String, String>,
-    HashMap<(String, String), String>,
-    HashMap<String, Vec<String>>,
-    HashMap<(String, String), String>,
-);
+/// One file's contribution to the two corpus-wide maps pass 1's scan builds:
+/// return types by entity id and instance attribute types.
+type Pass1FileScan = (HashMap<String, String>, HashMap<(String, String), String>);
 
 /// Whole-corpus state the chunked path builds once and reuses for every chunk.
 ///
@@ -1180,7 +1170,7 @@ pub(crate) struct ChunkedResolveInputs<'a> {
     /// three are corpus-invariant across chunks: the same `&PreBuiltLookups`
     /// and `&entity_map` are passed into every chunk's call, and the
     /// extensions are compile-time constants (`JS_TS_EXTENSIONS` here,
-    /// `&[".py"]` below). Before this field the lock lived inside
+    /// `&[".rs"]` below). Before this field the lock lived inside
     /// `resolve_with_scopes_full_inner` — created per call, i.e. per chunk —
     /// so one bare namespace import per chunk rebuilt a corpus-sized index,
     /// corpus-proportional × chunk-count (linux: ~31 thread-s across ~16
@@ -1188,16 +1178,13 @@ pub(crate) struct ChunkedResolveInputs<'a> {
     /// indexes"). Still lazy: nothing is built unless some chunk actually
     /// sees the triggering import form — just at most once per corpus now.
     pub(crate) top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
-    /// Python's sibling index (`register_namespace_import`, bare
-    /// `import module`), same invariance argument and same hoist as
-    /// `top_level_entities` above. Kept as two separate locks because the two
-    /// handlers build over different extension sets (`&[".py"]` vs
-    /// `JS_TS_EXTENSIONS`), exactly as before the hoist.
-    pub(crate) py_top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
-    /// Rust's sibling index (`register_rust_module_import`, relative
-    /// module-alias `use` form), same invariance argument and same hoist as
+    /// `register_rust_module_import`'s sibling index (module-alias `use`
+    /// form), same invariance argument and same hoist as
     /// `top_level_entities` above. Its own lock because it is built over its
-    /// own extension set (`&[".rs"]`), exactly like the Python/TS split.
+    /// own extension set (`&[".rs"]`). Rust files are no longer
+    /// scope-resolved, but PHP's grammar names its trait `use` statement
+    /// `use_declaration` too, so the handler still runs for PHP — see
+    /// [`ImportStmtFacts::UseDeclaration`].
     pub(crate) rust_top_level_entities: &'a OnceLock<TopLevelEntityIndex>,
 }
 
@@ -1257,10 +1244,8 @@ pub(crate) fn resolve_with_scopes_full_chunked(
 /// have to re-parse the file to get them (CUT 1).
 ///
 /// Scoped to JS/TS files only. Every *other* tree-touching computation the
-/// chunked path performs — `extract_imports_from_ast`'s Python
-/// (`import_from_statement`/self+cls `import_statement`), Rust
-/// (`use_declaration`), and Go (`import_declaration`) branches; ctor-infer's
-/// `scan_constructor_calls` (hardcoded to Python's `call` node kind); and
+/// chunked path performs — `extract_imports_from_ast`'s `use_declaration`
+/// (PHP trait `use`) and `import_declaration` (Java/Scala/Swift) branches, and
 /// Swift call-signature building (gated on `.swift` files) — is a *structural*
 /// no-op for a JS/TS AST: those node kinds never occur in the JS/TS grammars,
 /// and `extract_imports_from_ast`'s own JS/TS branches
@@ -1283,25 +1268,17 @@ pub struct PrecomputedFileFacts {
     /// (function/method entity id -> declared/inferred return type name).
     return_type_map: HashMap<String, String>,
     instance_attr_types: HashMap<(String, String), String>,
-    init_params: HashMap<String, Vec<String>>,
-    attr_to_param: HashMap<(String, String), String>,
     /// Field 10 (MUL phase 2): one descriptor per
     /// import-statement node the pruned replay would have dispatched, in
     /// that same order. Populated by [`precompute_scope_resolvable_file_facts`]
-    /// via [`record_import_stmts_pruned`] — no longer always empty as of
-    /// phase 2: **Python is admitted unconditionally**
-    /// ([`mul_precompute_admits`]) and has real imports, so this field is
-    /// populated on every active Python file. **C++ stays empty**: also
-    /// admitted unconditionally, but import-free by construction of the
-    /// TREELESS gate this field sits behind (a file only reaches `Some(..)`
-    /// there with an empty `import_starts`). **C#/Rust/Java are
-    /// populated only when their gate is flipped on** (`SEM_MUL_CSHARP`/
-    /// `SEM_MUL_RUST`/`SEM_MUL_JAVA`; see [`mul_precompute_admits`]'s doc
-    /// comment for why each stays gated — memory) — off by default, so
-    /// empty in the common case but not provably so. **Go is admitted
-    /// unconditionally** (correctness chain closed, memory
-    /// check cleared), so this field is populated on every active Go file,
-    /// the same shape as Python's. Always
+    /// via [`record_import_stmts_pruned`]. **Java** is the only admitted
+    /// language with a pass-2 consumer for these
+    /// ([`mul_precompute_consumes_imports`]), and only when its gate is
+    /// flipped on (`SEM_MUL_JAVA`; see [`mul_precompute_admits`]'s doc comment
+    /// for why it stays gated — memory) — off by default, so empty in the
+    /// common case but not provably so. **C++/C# stay empty**: import-free by
+    /// construction of the TREELESS gate this field sits behind (a file only
+    /// reaches `Some(..)` there with an empty `import_starts`). Always
     /// empty from [`precompute_js_ts_file_facts`] too: JS/TS imports are
     /// never replayed from a tree in a [`crate::parser::session::GraphSession`]
     /// build (`skip_js_ts_imports` is unconditionally `true` there), so
@@ -1313,22 +1290,6 @@ pub struct PrecomputedFileFacts {
     /// `ImportStmtFacts` type `record_import_stmts_pruned` builds on the
     /// tree-driven path, dispatched by the same function either way.
     import_stmts: Vec<ImportStmtFacts>,
-    /// Field 11 (MUL phase 2/3): one descriptor per
-    /// constructor-call-shaped `"call"` node — `scan_constructor_calls`'
-    /// former per-node inputs — recorded by [`record_ctor_call_sites`] in
-    /// that same worklist order. Populated only when the fused walk saw a
-    /// literal `"call"`-kind node *and* [`mul_precompute_consumes_calls`]
-    /// admits this file's language (Python today); always empty for every
-    /// other admitted language, because none of their grammars use the
-    /// literal kind string `"call"` (C#'s is `invocation_expression`, C++/
-    /// Rust's is `call_expression`, Go/Java's is `call_expression`/
-    /// `method_invocation`) — the same structural no-op Field 10's doc
-    /// comment already establishes for JS/TS. Always empty from
-    /// [`precompute_js_ts_file_facts`] too, for the identical reason.
-    /// Consumed by `infer_constructor_param_types` via
-    /// [`apply_ctor_call_facts`] — no tree, no second traversal — exactly
-    /// mirroring `import_stmts`/`dispatch_import_stmts_from_facts`'s shape.
-    ctor_call_sites: Vec<CtorCallFacts>,
 }
 
 impl PrecomputedFileFacts {
@@ -1337,95 +1298,6 @@ impl PrecomputedFileFacts {
     /// consume the same bytes pass 1 read instead of a second `read_to_string`.
     pub(crate) fn content(&self) -> &str {
         &self.content
-    }
-
-    /// repair the id-staleness species — pass 1's per-file
-    /// precompute (`precompute_scope_resolvable_file_facts`) builds this
-    /// file's `entity_scope_map`/`entity_inner_scope`/`return_type_map`
-    /// against the entity ids `all_entities` held for this file *at that
-    /// time*. `resolve_go_method_parent_ids` runs after every file's
-    /// entities are assembled and, for a Go method with a cross-file
-    /// receiver type, rewrites both `parent_id` and `id` (`registry.rs`) —
-    /// so a Go file's facts, already built, are keyed by the pre-rewrite
-    /// id while pass 2 looks entities up by the post-rewrite id. Call this
-    /// once per rewrite, scoped to exactly the files
-    /// [`crate::parser::registry::GoParentsResolved`] reports as touched,
-    /// before those facts reach the CLEAN gate or the session's carried
-    /// store. `rekey` empty is a guaranteed no-op (checked before any field
-    /// is touched) — the common case, since it is non-empty only for a
-    /// build that actually contains a Go method whose receiver type lives
-    /// in a different file of the same package (most corpora have none;
-    /// Go's precompute path itself runs unconditionally.
-    /// `registry.rs::GoParentsResolved` hands out a `std::collections::HashMap`
-    /// (it has no `rustc_hash` dependency of its own), not this module's
-    /// `FxHashMap` alias — spelled out fully qualified here rather than
-    /// widening `registry.rs`'s public surface with a dependency it
-    /// otherwise doesn't need.
-    ///
-    /// (a follow-up to the Go memory-check work): the original repair above missed
-    /// [`Scope::defs`] and [`Scope::owner_id`] — the two other places this
-    /// struct stores an *entity id* rather than a plain name string, by
-    /// [`Scope`]'s own field doc comments (`defs`: "name -> entity_id",
-    /// `owner_id`: "Which entity owns this scope"). Both are populated by
-    /// `scope_visit_node`'s registration loops (the class-like/mod_item/
-    /// function-like branches insert a child's `entity.id` into its parent
-    /// scope's `.defs` and set the owning scope's `.owner_id` to the same
-    /// kind of id) at precompute time — before the Go rewrite runs — and
-    /// were never revisited, so a cross-file-rewritten method's nested
-    /// locals kept a pre-rewrite `.defs` value pointing at an id no entity
-    /// holds any more (a dangling edge target on resolve, not merely a
-    /// missed lookup) and any scope `.owner_id` matching an old id likewise
-    /// went stale (a missed lookup in [`lookup_owned_scope_member`], the
-    /// opposite failure shape). Every *other* field on [`Scope`] holds a
-    /// plain name string by its own doc comment — `bindings` (names only,
-    /// no values), `binding_rows` (name -> source rows), `types` (var_name
-    /// -> class_*name*, from `x = Foo()`), `pending_call_types` (var_name ->
-    /// function *name*), `pending_field_types` (var_name -> (object_var,
-    /// property) *names*) — none of those are ever compared against
-    /// `entity_map`/`all_entities` by id, so rewriting them here would
-    /// corrupt real type/binding names on any accidental string collision
-    /// with a rewritten id; they are deliberately left untouched.
-    pub(crate) fn rekey_entity_ids(&mut self, rekey: &std::collections::HashMap<String, String>) {
-        if rekey.is_empty() {
-            return;
-        }
-        for map in [&mut self.entity_scope_map, &mut self.entity_inner_scope] {
-            let stale: Vec<EntityId> = map
-                .keys()
-                .filter(|id| rekey.contains_key(id.as_str()))
-                .cloned()
-                .collect();
-            for old_id in stale {
-                if let Some(value) = map.remove(&old_id) {
-                    map.insert(EntityId::from(&rekey[old_id.as_str()]), value);
-                }
-            }
-        }
-        let stale_return_types: Vec<String> = self
-            .return_type_map
-            .keys()
-            .filter(|id| rekey.contains_key(id.as_str()))
-            .cloned()
-            .collect();
-        for old_id in stale_return_types {
-            if let Some(value) = self.return_type_map.remove(&old_id) {
-                self.return_type_map.insert(rekey[&old_id].clone(), value);
-            }
-        }
-        for scope in &mut self.scopes {
-            for value in scope.defs.values_mut() {
-                if let Some(new_id) = rekey.get(value.as_str()) {
-                    *value = EntityId::from(new_id);
-                }
-            }
-            if let Some(new_id) = scope
-                .owner_id
-                .as_deref()
-                .and_then(|old_id| rekey.get(old_id))
-            {
-                scope.owner_id = Some(EntityId::from(new_id));
-            }
-        }
     }
 
     /// Approximate heap footprint (attribution), summed across every
@@ -1440,7 +1312,7 @@ impl PrecomputedFileFacts {
     /// (Stage 2 trim). Every collection here is built by repeated
     /// `push`/`insert` over the course of one file's tree walk
     /// (`fused_scope_refs_import_walk`/`record_import_stmts_pruned`/
-    /// `record_ctor_call_sites`/`scan_*`), with no `with_capacity` sizing
+    /// `scan_*`), with no `with_capacity` sizing
     /// hint — the walk cannot know its own eventual length in advance — so
     /// `Vec`/`HashMap` growth-doubling routinely leaves the last reallocation
     /// step's slack (up to ~2x for a `Vec`, similar for `HashMap`'s bucket
@@ -1489,26 +1361,14 @@ impl PrecomputedFileFacts {
         self.ast_refs.shrink_to_fit();
         self.return_type_map.shrink_to_fit();
         self.instance_attr_types.shrink_to_fit();
-        for params in self.init_params.values_mut() {
-            params.shrink_to_fit();
-        }
-        self.init_params.shrink_to_fit();
-        self.attr_to_param.shrink_to_fit();
         for descriptor in &mut self.import_stmts {
             match descriptor {
-                ImportStmtFacts::PyFromImport { specifiers, .. } => specifiers.shrink_to_fit(),
-                ImportStmtFacts::PyModuleImport { modules } => modules.shrink_to_fit(),
                 ImportStmtFacts::TsImport { items, .. } => items.shrink_to_fit(),
                 ImportStmtFacts::TsReExport { specifiers, .. } => specifiers.shrink_to_fit(),
-                ImportStmtFacts::RustUse { .. } => {}
-                ImportStmtFacts::GoImport { packages } => packages.shrink_to_fit(),
+                ImportStmtFacts::UseDeclaration { .. } | ImportStmtFacts::ImportDeclaration => {}
             }
         }
         self.import_stmts.shrink_to_fit();
-        for site in &mut self.ctor_call_sites {
-            site.arg_shapes.shrink_to_fit();
-        }
-        self.ctor_call_sites.shrink_to_fit();
     }
 
     /// Same walk as [`Self::approx_heap_bytes`], split by field instead of
@@ -1520,18 +1380,10 @@ impl PrecomputedFileFacts {
     /// containers hold are walked as well: each [`Scope`]'s six internal
     /// collections' keys/values by `.capacity()`, every [`AstRefKind`]
     /// variant's `String` payloads (`argument_labels` included), the actual
-    /// key+value string bytes of the return-type/instance-attr/init-param
-    /// maps, and — new as of this change, closing a gap the four maps above
-    /// already had fixed — every [`ImportStmtFacts`]/[`CtorCallFacts`]
-    /// variant's own nested `String`/`Vec` payloads (`import_stmts`/
-    /// `ctor_call_sites` previously counted only `size_of::<T>() *
-    /// capacity()`, i.e. the enum/struct's stack shape, blind to the heap
-    /// bytes owned by the `String`s and `Vec`s inside each variant — exactly
-    /// the same class of undercount Card 2 named and fixed for the other
-    /// four maps, just never extended to Fields 10/11 because nothing had
-    /// measured them in isolation before). Still an approximation by
-    /// `.capacity()`, not allocator-level accounting. See
-    ///.
+    /// key+value string bytes of the return-type/instance-attr maps, and
+    /// every [`ImportStmtFacts`] variant's own nested `String`/`Vec` payloads.
+    /// Still an approximation by `.capacity()`, not allocator-level
+    /// accounting.
     pub(crate) fn field_heap_bytes(&self) -> PrecomputedFieldBytes {
         fn argument_labels_bytes(labels: &Option<Vec<Option<String>>>) -> usize {
             labels.as_ref().map_or(0, |labels| {
@@ -1665,37 +1517,11 @@ impl PrecomputedFileFacts {
                 })
                 .sum::<usize>();
 
-        let init_params = self.init_params.capacity()
-            * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<String>>() + 1)
-            + self
-                .init_params
-                .iter()
-                .map(|(name, params)| {
-                    name.capacity()
-                        + params.capacity() * std::mem::size_of::<String>()
-                        + params.iter().map(String::capacity).sum::<usize>()
-                })
-                .sum::<usize>();
-
-        let attr_to_param = self.attr_to_param.capacity()
-            * (std::mem::size_of::<(String, String)>() + std::mem::size_of::<String>() + 1)
-            + self
-                .attr_to_param
-                .iter()
-                .map(|((class_name, attr), param)| {
-                    class_name.capacity() + attr.capacity() + param.capacity()
-                })
-                .sum::<usize>();
-
         let import_stmts = self.import_stmts.capacity() * std::mem::size_of::<ImportStmtFacts>()
             + self
                 .import_stmts
                 .iter()
                 .map(|descriptor| match descriptor {
-                    ImportStmtFacts::PyFromImport { module, specifiers } => {
-                        module.capacity() + string_pair_vec_bytes(specifiers)
-                    }
-                    ImportStmtFacts::PyModuleImport { modules } => string_pair_vec_bytes(modules),
                     ImportStmtFacts::TsImport { source, items } => {
                         source.capacity()
                             + items.capacity() * std::mem::size_of::<TsClauseItem>()
@@ -1713,28 +1539,8 @@ impl PrecomputedFileFacts {
                     ImportStmtFacts::TsReExport { source, specifiers } => {
                         source.capacity() + string_pair_vec_bytes(specifiers)
                     }
-                    ImportStmtFacts::RustUse { text } => text.capacity(),
-                    ImportStmtFacts::GoImport { packages } => {
-                        packages.capacity() * std::mem::size_of::<String>()
-                            + packages.iter().map(String::capacity).sum::<usize>()
-                    }
-                })
-                .sum::<usize>();
-
-        let ctor_call_sites = self.ctor_call_sites.capacity()
-            * std::mem::size_of::<CtorCallFacts>()
-            + self
-                .ctor_call_sites
-                .iter()
-                .map(|site| {
-                    site.callee.capacity()
-                        + site.arg_shapes.capacity() * std::mem::size_of::<Option<String>>()
-                        + site
-                            .arg_shapes
-                            .iter()
-                            .filter_map(|shape| shape.as_ref())
-                            .map(String::capacity)
-                            .sum::<usize>()
+                    ImportStmtFacts::UseDeclaration { text } => text.capacity(),
+                    ImportStmtFacts::ImportDeclaration => 0,
                 })
                 .sum::<usize>();
 
@@ -1745,10 +1551,7 @@ impl PrecomputedFileFacts {
             ast_refs,
             return_type_map,
             instance_attr_types,
-            init_params,
-            attr_to_param,
             import_stmts,
-            ctor_call_sites,
         }
     }
 
@@ -1781,26 +1584,12 @@ impl PrecomputedFileFacts {
     }
 
     /// Stage-0 instrument (interning-for-memory wave): every
-    /// module/specifier/path string `import_stmts` owns — the Field 10
-    /// lever the Python memory-check work named but did not attempt. Diagnostic
+    /// module/specifier/path string `import_stmts` owns. Diagnostic
     /// only — never called outside `mem_profile`'s `SEM_PROFILE_MEM=1` gate.
     pub(crate) fn import_stmt_intern_candidates(&self) -> Vec<&str> {
         let mut out = Vec::with_capacity(self.import_stmts.len() * 2);
         for descriptor in &self.import_stmts {
             match descriptor {
-                ImportStmtFacts::PyFromImport { module, specifiers } => {
-                    out.push(module.as_str());
-                    for (original, local) in specifiers {
-                        out.push(original.as_str());
-                        out.push(local.as_str());
-                    }
-                }
-                ImportStmtFacts::PyModuleImport { modules } => {
-                    for (name, alias) in modules {
-                        out.push(name.as_str());
-                        out.push(alias.as_str());
-                    }
-                }
                 ImportStmtFacts::TsImport { source, items } => {
                     out.push(source.as_str());
                     for item in items {
@@ -1821,12 +1610,8 @@ impl PrecomputedFileFacts {
                         out.push(local.as_str());
                     }
                 }
-                ImportStmtFacts::RustUse { text } => out.push(text.as_str()),
-                ImportStmtFacts::GoImport { packages } => {
-                    for pkg in packages {
-                        out.push(pkg.as_str());
-                    }
-                }
+                ImportStmtFacts::UseDeclaration { text } => out.push(text.as_str()),
+                ImportStmtFacts::ImportDeclaration => {}
             }
         }
         out
@@ -1845,10 +1630,7 @@ pub(crate) struct PrecomputedFieldBytes {
     pub(crate) ast_refs: usize,
     pub(crate) return_type_map: usize,
     pub(crate) instance_attr_types: usize,
-    pub(crate) init_params: usize,
-    pub(crate) attr_to_param: usize,
     pub(crate) import_stmts: usize,
-    pub(crate) ctor_call_sites: usize,
 }
 
 impl PrecomputedFieldBytes {
@@ -1859,10 +1641,7 @@ impl PrecomputedFieldBytes {
             + self.ast_refs
             + self.return_type_map
             + self.instance_attr_types
-            + self.init_params
-            + self.attr_to_param
             + self.import_stmts
-            + self.ctor_call_sites
     }
 
     pub(crate) fn add(&mut self, other: &Self) {
@@ -1872,10 +1651,7 @@ impl PrecomputedFieldBytes {
         self.ast_refs += other.ast_refs;
         self.return_type_map += other.return_type_map;
         self.instance_attr_types += other.instance_attr_types;
-        self.init_params += other.init_params;
-        self.attr_to_param += other.attr_to_param;
         self.import_stmts += other.import_stmts;
-        self.ctor_call_sites += other.ctor_call_sites;
     }
 }
 
@@ -1894,10 +1670,7 @@ pub(crate) fn dummy_precomputed_facts_for_test(content: &str) -> PrecomputedFile
         ast_refs: Vec::new(),
         return_type_map: HashMap::default(),
         instance_attr_types: HashMap::default(),
-        init_params: HashMap::default(),
-        attr_to_param: HashMap::default(),
         import_stmts: Vec::new(),
-        ctor_call_sites: Vec::new(),
     }
 }
 
@@ -1907,9 +1680,9 @@ pub(crate) fn dummy_precomputed_facts_for_test(content: &str) -> PrecomputedFile
 /// file isn't JS/TS or has no scope-resolve config (callers should fall back
 /// to the ordinary re-parse path for it).
 ///
-/// Uses file-local substitutes for the `entity_map`/`children_by_parent` that
-/// `build_scopes_from_ast` normally receives as corpus-wide maps: every
-/// lookup it does against them is keyed by an id that belongs to *this* file
+/// Uses a file-local substitute for the `children_by_parent` that
+/// `build_scopes_from_ast` normally receives as a corpus-wide map: every
+/// lookup it does against it is keyed by an id that belongs to *this* file
 /// (JS/TS declarations never nest across files), so a map built from just
 /// this file's entities produces identical results — verified by the
 /// equivalence hash in the fix-phase notes.
@@ -1927,21 +1700,8 @@ pub(crate) fn precompute_js_ts_file_facts(
     let source = content.as_bytes();
 
     let file_entities: Vec<&SemanticEntity> = entities.iter().collect();
-    let mut entity_map: EntityInfoMap = HashMap::default();
     let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in &file_entities {
-        entity_map.insert(
-            (&entity.id).into(),
-            EntityInfo {
-                id: (&entity.id).into(),
-                name: entity.name.clone(),
-                entity_type: entity.entity_type.clone(),
-                file_path: entity.file_path.clone(),
-                parent_id: entity.parent_id.as_ref().map(Into::into),
-                start_line: entity.start_line,
-                end_line: entity.end_line,
-            },
-        );
         if let Some(ref pid) = entity.parent_id {
             children_by_parent
                 .entry(pid.as_str())
@@ -2000,7 +1760,6 @@ pub(crate) fn precompute_js_ts_file_facts(
         &mut entity_inner_scope,
         &file_lookup,
         &children_by_parent,
-        &entity_map,
         source,
         config,
     );
@@ -2015,16 +1774,7 @@ pub(crate) fn precompute_js_ts_file_facts(
     );
 
     let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
-    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
-    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
-    scan_init_self_attrs(
-        tree.root_node(),
-        source,
-        &mut instance_attr_types,
-        &mut init_params,
-        &mut attr_to_param,
-        config,
-    );
+    scan_init_self_attrs(tree.root_node(), source, &mut instance_attr_types, config);
 
     let ast_refs = collect_all_file_refs(tree.root_node(), source, config);
 
@@ -2036,16 +1786,11 @@ pub(crate) fn precompute_js_ts_file_facts(
         ast_refs,
         return_type_map,
         instance_attr_types,
-        init_params,
-        attr_to_param,
         // JS/TS never replays imports from a tree in a session build
         // (`skip_js_ts_imports` is unconditionally true there — see this
         // field's doc comment on the struct), so there is nothing to
         // record.
         import_stmts: Vec::new(),
-        // JS/TS's call-expression node kind is never the literal `"call"`
-        // Field 11 (Python-only) scans for — see this field's doc comment.
-        ctor_call_sites: Vec::new(),
     };
     // Stage 2: same slack-reclaim as the scope-resolvable
     // producer's own construction site — see `shrink_to_fit`'s doc comment.
@@ -2090,9 +1835,8 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// regime. The ceiling is henceforth defined against **peak memory
 /// footprint**, with maxRSS reported alongside for continuity; every
 /// admission decided under the old metric was re-read, and verdicts flip
-/// mechanically under the corrected metric — see C++'s and Python's entries
-/// below, both demoted
-/// by this change. This is a Darwin-specific accounting distinction
+/// mechanically under the corrected metric — see C++'s entry below, demoted
+/// by this change (Python was the other; it is no longer admitted at all). This is a Darwin-specific accounting distinction
 /// (`task_info`/VM-compressor semantics); Linux carries no equivalent
 /// compressor by default, so Linux re-validation under this same two-field
 /// discipline is a separate, still-open task.
@@ -2117,7 +1861,7 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// tight (≤1.8 points of spread across pairs), so this is not measurement
 /// noise. Under the corrected metric, C++ now stays gated (`SEM_MUL_CPP`, off by default,
 /// [`MUL_RUNTIME_GATES`] row with `pre_switch_salt = "ts-0.23"`) — C#'s/
-/// Java's/Rust's shape, not its own original one.
+/// Java's shape, not its own original one.
 ///
 /// **C# (`csharp`): off by default**, opt-in via `SEM_MUL_CSHARP=1`. The gate's
 /// *correctness* is not in question — every correctness invariant holds, zero CLEAN violations,
@@ -2136,251 +1880,34 @@ pub(crate) fn precompute_js_ts_file_facts(
 /// upgrading `sem-core` must not make it. Phase 2/3 widen this function — not
 /// the `graph.rs` call site, which is now just its consumer.
 ///
-/// **Rust (`rust`): off by default, gated on `SEM_MUL_RUST`** — demoted
-/// (2026-08-22) from MUL phase 2's original unconditional
-/// verdict. Correctness is not in question — CLEAN is 100% on every
-/// census corpus regardless of language (MUL-A), and TREELESS accepts
-/// Rust's import-bearing files because [`mul_precompute_consumes_imports`]
-/// routes them through Field 10's descriptor path (`import_stmts`) instead
-/// of requiring the tree — verified bit-identical (`edge_dump_probe`
-/// sha256) on rust-lang/rust and on this crate's own tree, both before and
-/// after this demotion. It is **memory** that moved: shipped
-/// unconditionally on a same-binary reading of **+11.16%/+11.28%** against
-/// the +15% peak-RSS ceiling. A follow-up
-/// pinned-baseline-vs-HEAD comparison, eight commits later, re-measured
-/// **+18.2%/+21.2%** — above the ceiling — which by itself could have been a
-/// binaries-eight-commits-apart artifact. A further re-verification isolated the admission
-/// variable exactly (same binary at the same commit, one predicate flipped,
-/// shared source tree otherwise) and got **+17.72%/+19.64%/+19.35%** across
-/// three order-swapped pairs on rust-lang/rust — unanimous direction, all
-/// above +15%, confirming the earlier reading was not the artifact; the
-/// original +11% reading was the outlier, most plausibly because the original
-/// protocol (`sem find <nonexistent>`, bare "fresh `SEM_CACHE_DIR`") did not
-/// isolate `SEM_FACTS_CORPUS_DIR` the way a later
-/// finding says it needed to, so the ON side plausibly benefited from
-/// partial corpus warmth that suppressed its measured peak RSS. Under the corrected metric,
-/// Rust now stays gated (`SEM_MUL_RUST`, off by default,
-/// [`MUL_RUNTIME_GATES`] row with `pre_switch_salt = "ts-0.23"`) — C#'s/
-/// Java's shape, not its own original one.
-///
 /// **Java (`java`): off by default, gated on `SEM_MUL_JAVA`** — MUL phase 2.
 /// Correctness is clean: `edge_dump_probe` sha256
 /// bit-identical ON vs OFF on elasticsearch (1,257,229 edges both sides),
 /// `incr_probe` 8/8 `ORACLE ok`, `facts_probe` 4/4 `ORACLE ok`,
 /// `facts_corpus_probe` cross-repo 861/861 hits + adversarial salt-clean-miss
-/// proof. Java's `import_declaration` nodes were already descriptor-dispatched
-/// before this change — they classify as `GoImport` (`classify_import_stmt`'s
-/// doc comment: the kind is shared with Go/Swift's grammars) and resolve
-/// through `register_go_package_imports`, which only ever matches
-/// `.go`-suffixed entities (`build_go_pkg_index`) — a documented, pre-existing
-/// no-op for Java, preserved verbatim by this
-/// admission. It is **memory** that fails: `/usr/bin/time -l` on
+/// proof. Java's `import_declaration` nodes are descriptor-dispatched as
+/// [`ImportStmtFacts::ImportDeclaration`], which registers nothing — a
+/// documented no-op for Java. It is **memory** that fails: `/usr/bin/time -l` on
 /// elasticsearch measured **+20.97% and +21.01% against the +15% ceiling,
-/// reproducibly, on both order-swapped pairs** — C#'s shape, not Rust's/C++'s.
+/// reproducibly, on both order-swapped pairs** — C#'s shape.
 /// Consistent with dotnet's own overshoot: Java's pre-Field-10 FASTPATH byte
 /// share was the smallest of any admitted language (0.98%, MUL-A), so
 /// admission moves nearly all of its bytes onto the fast path at once.
 ///
-/// **Go (`go`): admitted unconditionally (the Go memory-check work,
-/// 2026-08-22)** — the correctness blocker chain and the memory check both
-/// closed cleanly, so the same no-switch precedent applies (`"go" => true`, no
-/// `SEM_MUL_GO` switch, no [`MUL_RUNTIME_GATES`] row).
-/// Root-cause analysis found two compounding issues behind kubernetes's non-bit-identical
-/// `edge_dump_probe`: (1) `build_go_pkg_index`/`register_go_package_imports`
-/// keyed packages by their bare last-path-segment string ("v1", "util", ...)
-/// with no disambiguation by full import path, so common short package names
-/// collided repo-wide (kubernetes has dozens of directories literally named
-/// `v1`, one per API group) — latent on the AST path because type-directed
-/// (`class_members`-based) resolution normally wins first, but exposed
-/// whenever it didn't, silently substituting one same-named package's
-/// methods for another's; (2) something about the fast path measurably
-/// increases how often that type-directed resolution fails for Go
-/// specifically, pushing more calls into the (formerly polluted) fallback.
-///
-/// The fix for (1): `GoImport::packages` now carries each import spec's
-/// *full* path (not reduced to a bare segment), and
-/// `register_go_package_imports` disambiguates a same-named bucket by
-/// matching the import path's trailing segments against each candidate's
-/// declaring directory (`select_go_pkg_candidate`) before inserting only the
-/// winning candidate's entries — not the whole polluted bucket — into a
-/// file's `import_table`. Proven at the unit level (RED before the fix,
-/// GREEN after: a same-named-package fixture that used to resolve to the
-/// wrong package's method now resolves to the importing file's own) and at
-/// corpus scale: kubernetes's OFF-path edge count alone dropped from 366,905
-/// to 334,664 (~9%), every one of those ~32k edges a confirmed
-/// cross-package false positive (spot-checked: `cmd/kubeadm/.../types.go`'s
-/// `ClusterConfiguration::DeepCopy` now correctly resolves within its own
-/// package instead of to `pod-security-admission`'s). `extract_imports_ms`
-/// on kubernetes fell from ~83s to ~24s (`SEM_PROFILE_RESOLVE=2`) — the old
-/// code was inserting entire polluted buckets (every same-named package's
-/// symbols) into every importing file's `import_table`; the fix inserts one
-/// package's worth.
-///
-/// (2)'s mechanism was left as an honest residual — "root cause not
-/// isolated in this change." A follow-up investigation (2026-08-22) found and fixed it:
-/// `registry::resolve_go_method_parent_ids` — the one cross-file entity
-/// rewrite this crate performs, run once `all_entities` is fully assembled
-/// — rewrites a Go method's `id`/`parent_id` when its receiver type lives in
-/// a *different* file, but ran *after* pass 1's precompute
-/// (`precompute_scope_resolvable_file_facts`) had already keyed that file's
-/// `PrecomputedFileFacts.entity_scope_map`/`entity_inner_scope`/
-/// `return_type_map` by the pre-rewrite id. Pass 2 looks entities up by the
-/// post-rewrite id — a clean miss, silently defaulting `scope_idx` to 0
-/// (module scope) via `.unwrap_or(0)`, which is exactly the scope-blind
-/// state the honest-miss backstop above (`scope_lookup_missed`) was
-/// built to make safe rather than wrong-but-plausible: from scope 0,
-/// `resolve_ref`'s type-directed branch (the one `in.DeepCopyInto(out)`
-/// case above needs) fails to find the real local binding and the call
-/// falls through to the package-qualified fallback instead — precisely the
-/// `ClusterConfiguration::DeepCopy`-shaped divergence already
-/// documented, just a different mechanism than the bare-segment collision
-/// already fixed.
-///
-/// The fix has two parts, both scoped to `.go` files by construction
-/// (`is_go_file` guards every mutation either makes): (a)
-/// `resolve_go_method_parent_ids` now returns the old-id -> new-id map for
-/// every entity it rewrites (`GoParentsResolved::rekeyed_ids`/
-/// `rekeyed_files`), and the build's call site
-/// (`EntityGraph::build_incremental_core`, `graph.rs`) re-keys this build's
-/// fresh `PrecomputedFileFacts` for exactly the files the rewrite touched,
-/// immediately after the rewrite runs and before the CLEAN gate or the
-/// session's carried store ever reads them
-/// (`PrecomputedFileFacts::rekey_entity_ids`); (b) the rewrite cascades a
-/// method's new id down through every descendant whose `parent_id` embedded
-/// the method's old id as a literal prefix (`build_entity_id`'s own
-/// contract — a child's id is `format!("{parent_id}::{name}")`), since a
-/// rewritten method's *own* local variables/constants/nested types were
-/// left with a dangling `parent_id` otherwise (only the method's own
-/// id/parent_id were being rewritten before this change).
-///
-/// `edge_dump_probe` ON vs OFF on kubernetes, at the current HEAD:
-/// **bit-identical, 0-line diff** (was 334,664 vs 331,190, ~30,795 lines) —
-/// `sha256` matches, both sides 330,558 edges, for the id-staleness
-/// signature the fix targeted. Another honest residual remained: a
-/// *separate* fallback residual (14.01%, `ENTITY_SCOPE_LOOKUP`'s
-/// `fallback_pct`) — the same species was independently
-/// being chased for TS/JS (nested entities inside a plain function never
-/// entering any scope's `.defs`, via `scope_visit_node`'s function-like
-/// branch never running the class-like/`mod_item` branches' registration
-/// loop). A follow-up fix (2026-08-22) closed it for both languages at once —
-/// the earlier attempt's regression was a pre-existing precedence bug in
-/// `resolve_ref` (the `.bindings` shadow gate short-circuited before
-/// `.defs` ever ran), not the registration loop itself; fixing the
-/// precedence bug and reinstating the loop together collapsed Go's
-/// `fallback_pct` to 0.00% with a four-corpus convergent correctness
-/// signature (Go, TS/JS, Python, Rust) and no lost correct edge anywhere.
-///
-/// **The Go memory-check work found a third species — this one
-/// inverted.** The correctness-chain-closed claim above was cross-checked
-/// against `edge_dump_probe` ON vs OFF at the current HEAD before
-/// trusting it for admission, and it failed: 331,120 (ON) vs 331,117 (OFF),
-/// 3 edges present only under `SEM_MUL_GO=1`. Root cause, confirmed with a
-/// throwaway entity-id dump (not shipped) and a scoped, reverted debug
-/// print: all 3 targets are **dangling** — ids no entity in the graph
-/// holds — not edges OFF was missing. `PrecomputedFileFacts::rekey_entity_
-/// ids` rekeys `entity_scope_map`/`entity_inner_scope`/
-/// `return_type_map`'s keys, but never revisited [`Scope::defs`]' *values*
-/// or [`Scope::owner_id`] — the two other places a `Scope` caches an entity
-/// id, both populated by `scope_visit_node`'s registration loops during
-/// pass 1's precompute, which runs *before* the cross-file rewrite +
-/// cascade. A rewritten method's nested locals kept a pre-rewrite `.defs`
-/// value once the rewrite ran, surviving into a `Calls` edge whose target
-/// no entity held any more — and the stale id incidentally evaded the
-/// existing parent-child containment filter downstream
-/// (`scope_resolve.rs`'s `is_parent_child` check: `entity_map.get` on a
-/// dangling id returns `None`, so the filter fails open instead of
-/// correctly suppressing the edge as containment, not a call).
-/// `rekey_entity_ids` now additionally walks `self.scopes` and rewrites
-/// exactly those two id-valued fields — every other `Scope` field holds a
-/// plain name string by its own doc comment and is deliberately left
-/// untouched. Post-fix, `edge_dump_probe` ON vs OFF on kubernetes is
-/// bit-identical again (331,117 edges both sides, matching sha256); traced
-/// (not assumed) that both paths now correctly resolve the 3 calls to their
-/// valid rekeyed ids and both then correctly suppress them via the same
-/// containment filter — ghosts dead everywhere, not new edges gained
-/// anywhere. `edge_dump_probe` also grew a `DANGLING_EDGE_ORACLE` (every
-/// edge endpoint must name a real entity id) so this bug class is
-/// self-detecting going forward; clean (0 dangling) on kubernetes both
-/// switch states plus rust-lang/rust, microsoft/TypeScript, and
-/// home-assistant/core as controls, with zero edge-count movement on the
-/// three non-Go corpora (`rekey_entity_ids` is a guaranteed no-op whenever
-/// `rekey` is empty, which it always is absent a Go cross-file rewrite).
-///
-/// **The memory check.** Go's correctness blocker chain is now fully
-/// closed — `SEM_MUL_GO=1` vs unset produce byte-identical graphs on every
-/// corpus this project has touched — so the remaining question was purely
-/// the ceiling. `/usr/bin/time -l sem graph --no-cache --json`, same
-/// binary, fresh `SEM_CACHE_DIR` + isolated `SEM_FACTS_CORPUS_DIR` per run,
-/// 3 order-swapped pairs on kubernetes, both `/usr/bin/time -l` fields
-/// captured using the same two-field protocol used above:
-///
-/// | pair | order | OFF maxRSS | ON maxRSS | Δ maxRSS | OFF footprint | ON footprint | Δ footprint |
-/// |---|---|---:|---:|---:|---:|---:|---:|
-/// | 1 | OFF→ON | 3,217,178,624 B | 3,234,611,200 B | +0.54% | 2,838,072,416 B | 3,078,229,184 B | **+8.46%** |
-/// | 2 | ON→OFF | 3,233,054,720 B | 3,214,868,480 B | -0.56% | 2,841,185,400 B | 3,048,574,096 B | **+7.30%** |
-/// | 3 | OFF→ON | 3,225,468,928 B | 3,232,776,192 B | +0.23% | 2,873,560,160 B | 3,068,398,784 B | **+6.78%** |
-///
-/// maxRSS: flat, noise-band (-0.56% to +0.54%). Footprint: unanimous
-/// **+6.78% to +8.46%**, tight (<1.7 points of spread), comfortably under
-/// the +15% ceiling on every pair — Go clears both fields, unlike C++/
-/// Python/Rust/Java, all of which busted the ceiling on at least one field.
-/// Under the corrected metric, Go is **admitted unconditionally**: `mul_precompute_admits`
-/// gained a plain `"go" => true` arm, `go_precompute_enabled`/`SEM_MUL_GO`
-/// removed (no switched-off state left to preserve — the same close-out
-/// precedent as above, not left as unused scaffolding), [`MUL_RUNTIME_GATES`]'s
-/// "go" row deleted. `LANGUAGE_SALTS`'s go entry bumped again
-/// (`rekey_entity_ids`'s new `.defs`/`owner_id` rewriting is a
-/// content-only producer change, the usual salt-bump discipline) so a stale
-/// pre-fix corpus entry from an earlier local `SEM_MUL_GO=1` session can
-/// never silently answer a post-fix lookup now that the path is always on.
-///
-/// **Python (`python`): off by default, gated on `SEM_MUL_PYTHON`** —
-/// demoted (2026-08-22) from MUL phase 2's original unconditional
-/// verdict. Correctness is untouched by this demotion — `edge_dump_probe`
-/// sha256 bit-identical ON vs OFF on home-assistant/core (310,398 edges both
-/// sides), `incr_probe` 8/8 `ORACLE ok`, `facts_probe` 4/4 `ORACLE ok`,
-/// `facts_corpus_probe` 109/109 hits on a real two-copy corpus, all as
-/// the earlier Python measurement round already established; none of that changes here. It is **memory**,
-/// again, and specifically the metric: measured **-7.95%/-7.80%** peak
-/// maxRSS on home-assistant/core; a follow-up re-derivation using a corrected
-/// (`--no-cache`, fresh-`SEM_CACHE_DIR`) protocol got a weaker but still
-/// negative **-1.63% median** (four of five pairs negative) — both readings
-/// comfortably under the old +15% maxRSS ceiling, the basis for the
-/// original unconditional verdict. The 2026-08-22 re-verification re-ran that exact protocol capturing
-/// *both* `/usr/bin/time -l` fields: maxRSS reproduced the earlier finding almost
-/// exactly (**-1.04%/-3.99%/-1.71%**, three order-swapped pairs, still
-/// negative), but peak memory footprint reads **+26.02%/+25.29%/+27.44%** —
-/// unanimous, tight (≤2.2 points of spread), and well above the ceiling
-/// under the corrected metric. The mechanism is exactly what this
-/// function's doc note above names: Python's admission populates many
-/// short, repetitive identifier strings (the fast path's `import_stmts`/
-/// `ctor_call_sites` records) that the VM compressor eats once they go idle
-/// mid-build, so they drop out of maxRSS's resident-page count while still
-/// counting against footprint's task-level commitment — the same reason
-/// admission looks like a maxRSS *win* while being a footprint *loss*. Under
-/// the corrected metric, Python now stays gated (`SEM_MUL_PYTHON`, off by default,
-/// [`MUL_RUNTIME_GATES`] row with `pre_switch_salt = "ts-0.23"`) — C#'s/
-/// Java's/Rust's/C++'s shape, not its own original one.
-///
 /// The switches that remain ([`MUL_RUNTIME_GATES`]) exist so a future change
 /// can re-measure/re-diagnose without a rebuild — every gated language's
 /// only blocker is memory under the corrected (footprint) metric (a future
-/// memory lever could promote any of them). Go's chain (correctness, then
-/// memory) is closed and it no longer has a row here.
+/// memory lever could promote any of them). Rust, Go and Python are not
+/// admitted at all: they are not scope-resolved (their call graph comes from
+/// `parser::calls`, which lowers them in pass 1 itself), so there is nothing
+/// for pass 2 to consume.
 pub fn mul_precompute_admits(lang_id: &str) -> bool {
     match lang_id {
         "cpp" => cpp_precompute_enabled(),
         "csharp" => csharp_precompute_enabled(),
-        "rust" => rust_precompute_enabled(),
-        // Admitted unconditionally (the Go memory-check work): correctness
-        // blocker chain closed (see
-        // this function's own doc comment), memory check cleared (+6.78% to
-        // +8.46% peak footprint, three order-swapped pairs on kubernetes,
-        // comfortably under the +15% ceiling). No `SEM_MUL_GO` switch, no
-        // `MUL_RUNTIME_GATES` row — the same close-out precedent as above.
-        "go" => true,
         "java" => java_precompute_enabled(),
-        "python" => python_precompute_enabled(),
+        // Rust, Go and Python are not scope-resolved at all: their call
+        // graph is `calls`'s, which lowers them in pass 1 itself.
         _ => false,
     }
 }
@@ -2392,23 +1919,6 @@ fn csharp_precompute_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("SEM_MUL_CSHARP").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes")
-        )
-    })
-}
-
-/// MUL phase 2 follow-up: switch for Rust, same shape as
-/// [`csharp_precompute_enabled`] — (`adde06a`) shipped Rust unconditionally
-/// on a same-binary reading of +11.16%/+11.28% against the +15% peak-RSS
-/// ceiling; a same-binary re-verification at campaign HEAD (`602dc6e`, three
-/// order-swapped pairs) found +17.72%/+19.64%/+19.35% instead — consistently
-/// above the ceiling. Demoted to gated. See [`mul_precompute_admits`]'s doc
-/// comment.
-fn rust_precompute_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("SEM_MUL_RUST").ok().as_deref(),
             Some("1") | Some("on") | Some("true") | Some("yes")
         )
     })
@@ -2447,25 +1957,6 @@ fn cpp_precompute_enabled() -> bool {
     })
 }
 
-/// 2026-08-22 follow-up: switch for Python, same shape as
-/// [`csharp_precompute_enabled`] — shipped/reconfirmed Python
-/// unconditionally on maxRSS readings of -7.95%/-7.80% then -1.63% median,
-/// both comfortably under the +15% ceiling. The same protocol, capturing
-/// peak memory footprint alongside maxRSS, found maxRSS still negative
-/// (-1.04%/-3.99%/-1.71%) but footprint reads +26.02%/+25.29%/+27.44% —
-/// above the ceiling under the corrected metric, three order-swapped
-/// pairs, unanimous direction. Demoted to gated. See
-/// [`mul_precompute_admits`]'s doc comment.
-fn python_precompute_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("SEM_MUL_PYTHON").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes")
-        )
-    })
-}
-
 /// MUL Phase 2 (MUL;): whether pass 2
 /// has a real consumer for [`PrecomputedFileFacts::import_stmts`] for
 /// `lang_id` — i.e. whether [`precompute_scope_resolvable_file_facts`]'s
@@ -2478,40 +1969,12 @@ fn python_precompute_enabled() -> bool {
 /// import handlers hadn't been ported to the descriptor path yet (true of
 /// every language before landed Field 10). `cpp`/`csharp` are import-free
 /// by construction (census), so this predicate is never exercised for
-/// them; `rust`, `go`, `java`, `python` are the four languages where it
-/// actually widens TREELESS — all four ride the same six descriptor-ized
-/// handlers built (`ImportStmtFacts`'s variants), so admitting a new one
-/// here is a table row, not a new mechanism. Python needs both this *and*
-/// [`mul_precompute_consumes_calls`] — MUL-A census found imports the
-/// *larger* half of Python's tree-need on HA (16,559 of ~16,600
-/// tree-needing files), `"call"` nodes the rest — before either widened
-/// TREELESS, admitting Python here alone would still fail almost every real
-/// HA file on the call half.
+/// them; `java` is the one admitted language where it actually widens
+/// TREELESS, riding the descriptor-ized handlers (`ImportStmtFacts`'s
+/// variants), so admitting a new one here is a table row, not a new
+/// mechanism.
 fn mul_precompute_consumes_imports(lang_id: &str) -> bool {
-    matches!(lang_id, "rust" | "go" | "java" | "python")
-}
-
-/// MUL Phase 2 (MUL;): the call-node
-/// sibling of [`mul_precompute_consumes_imports`] — whether pass 2 has a
-/// real consumer for [`PrecomputedFileFacts::ctor_call_sites`] for `lang_id`,
-/// i.e. whether the TREELESS gate may accept a file whose fused walk saw a
-/// literal `"call"`-kind node instead of falling back to the re-parse path
-/// for it.
-///
-/// Python only, by construction: `scan_constructor_calls`'s node-kind test
-/// was always hardcoded to the literal string `"call"`, which is Python's
-/// grammar's name for a call expression — no other grammar this crate
-/// resolves ever produces a node of that literal kind (C#'s is
-/// `invocation_expression`, C++/Rust/Go's is `call_expression`, Java's is
-/// `method_invocation`), so the scan was always a structural no-op for
-/// every other language, exactly as `PrecomputedFileFacts`'s own doc
-/// comment already established for Field 10's JS/TS case. Widening this
-/// predicate to any of those languages would be a dead table row, not a
-/// missed admission — see the per-language `..._call_expression_stays_
-/// treeless`/`..._method_invocation_stays_treeless` tests, which pin the
-/// no-op directly against each grammar.
-fn mul_precompute_consumes_calls(lang_id: &str) -> bool {
-    matches!(lang_id, "python")
+    matches!(lang_id, "java")
 }
 
 /// One language whose [`mul_precompute_admits`] verdict is a *runtime*
@@ -2534,10 +1997,8 @@ fn mul_precompute_consumes_calls(lang_id: &str) -> bool {
 /// (an independent client simulation) hardcoded a *second*, unconnected copy
 /// of the same branch and the same `"ts-0.23"` literal — two places a future
 /// switch could be added to [`mul_precompute_admits`] without being added
-/// to, silently reproducing the same hazard for whichever language got missed. MUL
-/// phase 2/3 name Rust/Go/Java/Python as the next
-/// languages `mul_precompute_admits` is expected to grow gates for, which is
-/// exactly the scenario this table exists to make structural: wiring a new
+/// to, silently reproducing the same hazard for whichever language got missed.
+/// This table makes that structural: wiring a new
 /// runtime-gated language means adding one match arm to
 /// [`mul_precompute_admits`] *and* one row here, both in this module, both
 /// touched by the same diff — `facts_store.rs` and
@@ -2562,47 +2023,25 @@ pub const MUL_RUNTIME_GATES: &[MulRuntimeGate] = &[
     // MUL: measured and stays gated — memory
     // (+20.97%/+21.01% vs +15%). See `mul_precompute_admits`'s doc comment.
     // A language promoted to unconditional has this row deleted, not left
-    // stale (the same close-out precedent applied to Go below) — and the
-    // reverse holds too: a language demoted back to gated
-    // (rust, below) gets a row added back too.
+    // stale — and the reverse holds too: a language demoted back to gated
+    // gets a row added back too.
     MulRuntimeGate {
         lang_id: "java",
         pre_switch_salt: "ts-0.23",
     },
-    // MUL phase 2 follow-up: rust was unconditional at
-    // (`adde06a`) but a same-binary re-verification at campaign HEAD found
-    // its peak-RSS delta re-measures at +17.7-19.6%, above the +15% ceiling
-    // own +11% reading had passed. `pre_switch_salt` is `"ts-0.23"` —
-    // the prior salt, i.e. what a build from before Rust's admission ever
-    // existed wrote under — so a switched-off build today shares corpus
-    // entries with that prior world (a true revert), and the table's
-    // current `"ts-0.23-mp2"` (unchanged from) becomes the switched-*on*
-    // salt, isolating richer entries the same way `resolve_gated_salt`
-    // already handles for java.
-    MulRuntimeGate {
-        lang_id: "rust",
-        pre_switch_salt: "ts-0.23",
-    },
     // 2026-08-22: the ceiling was redefined against peak memory
     // footprint (see `mul_precompute_admits`'s doc note above its C++
-    // entry) — cpp and python were the two remaining unconditional
-    // admissions, and both re-measure over the new ceiling on the
-    // corrected metric even though their maxRSS readings (the metric their
-    // original verdicts used) still look fine or favorable. `pre_switch_
-    // salt` is `"ts-0.23"` for both — the original, prior salt, i.e. what a
-    // build from before either admission ever existed wrote under — so a
-    // switched-off build today shares corpus entries with that pre-
-    // admission world (a true revert), and each table's current salt
-    // (`"ts-0.23-mp1"` for cpp, `"ts-0.23-mp4"` for python, both unchanged
-    // from their original bumps) becomes the switched-*on* salt, isolating
-    // richer entries the same way `resolve_gated_salt` already handles for
-    // go/java/rust.
+    // entry) — cpp re-measures over the new ceiling on the corrected
+    // metric even though its maxRSS reading (the metric its original
+    // verdict used) still looks fine. `pre_switch_salt` is `"ts-0.23"` —
+    // the original, prior salt, i.e. what a build from before the admission
+    // ever existed wrote under — so a switched-off build today shares corpus
+    // entries with that pre-admission world (a true revert), and the table's
+    // current salt (`"ts-0.23-mp1"`, unchanged from its original bump)
+    // becomes the switched-*on* salt, isolating richer entries the same way
+    // `resolve_gated_salt` already handles for csharp/java.
     MulRuntimeGate {
         lang_id: "cpp",
-        pre_switch_salt: "ts-0.23",
-    },
-    MulRuntimeGate {
-        lang_id: "python",
         pre_switch_salt: "ts-0.23",
     },
 ];
@@ -2657,21 +2096,8 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     let source = content.as_bytes();
 
     let file_entities: Vec<&SemanticEntity> = entities.iter().collect();
-    let mut entity_map: EntityInfoMap = HashMap::default();
     let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in &file_entities {
-        entity_map.insert(
-            (&entity.id).into(),
-            EntityInfo {
-                id: (&entity.id).into(),
-                name: entity.name.clone(),
-                entity_type: entity.entity_type.clone(),
-                file_path: entity.file_path.clone(),
-                parent_id: entity.parent_id.as_ref().map(Into::into),
-                start_line: entity.start_line,
-                end_line: entity.end_line,
-            },
-        );
         if let Some(ref pid) = entity.parent_id {
             children_by_parent
                 .entry(pid.as_str())
@@ -2718,10 +2144,9 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     // The fused triple walk: scopes/entity_scope_map/
     // entity_inner_scope (mutated in place) and ast_refs are the first four
     // `PrecomputedFileFacts` fields (the doc's "one program point"); the
-    // returned `import_starts`/`saw_call_node` are exactly what decides
-    // TREELESS below — structurally, from what this walk saw, not from a
-    // language table.
-    let (ast_refs, import_starts, saw_call_node) = fused_scope_refs_import_walk(
+    // returned `import_starts` is exactly what decides TREELESS below —
+    // structurally, from what this walk saw, not from a language table.
+    let (ast_refs, import_starts) = fused_scope_refs_import_walk(
         tree.root_node(),
         0,
         &mut scopes,
@@ -2729,28 +2154,22 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         &mut entity_inner_scope,
         &file_lookup,
         &children_by_parent,
-        &entity_map,
         source,
         config,
     );
 
     // TREELESS(F): no node kind `classify_import_stmt` handles (unless
     // `lang_id` has a pass-2 consumer for the recorded descriptors — Field
-    // 10, MUL phase 2, `mul_precompute_consumes_imports` below), and no
-    // literal `"call"` node (unless `lang_id` has a pass-2 consumer for
-    // *those* descriptors too — Field 11, MUL phase 2,
-    // `mul_precompute_consumes_calls` below). Failing either means pass 2
-    // would still need this file's tree for something pass 1 cannot yet
-    // hand it a descriptor for, so no facts are emitted — this file falls
-    // back to the re-parse path exactly as it does today. This is what
+    // 10, MUL phase 2, `mul_precompute_consumes_imports` below). Failing
+    // that means pass 2 would still need this file's tree for something
+    // pass 1 cannot yet hand it a descriptor for, so no facts are emitted —
+    // this file falls back to the re-parse path exactly as it does today. This is what
     // keeps JS/TS's own precompute (unconditional, relying on
     // `skip_js_ts_imports`) from needing to route through this function at
     // all: a JS/TS file with real imports would fail this gate, which is
     // correct for *this* function but would be wrong for JS/TS's actual
     // license.
-    if (!import_starts.is_empty() && !mul_precompute_consumes_imports(lang_config.id))
-        || (saw_call_node && !mul_precompute_consumes_calls(lang_config.id))
-    {
+    if !import_starts.is_empty() && !mul_precompute_consumes_imports(lang_config.id) {
         return None;
     }
 
@@ -2766,18 +2185,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     // grammar it does run for emits a `TsImport`/`TsReExport`-classified
     // node, so the flag is inert here; `false` is the semantically correct
     // value (pass 1 has no chunked-vs-full notion to skip).
-    let import_stmts =
-        record_import_stmts_pruned(tree.root_node(), &import_starts, source, config, false);
-
-    // Field 11 (MUL phase 2): same discipline —
-    // `saw_call_node` is provably `false` here unless `mul_precompute_
-    // consumes_calls` just admitted it (the gate above), so this is either a
-    // one-node no-op (nothing to record) or the real Python scan.
-    let ctor_call_sites = if saw_call_node {
-        record_ctor_call_sites(tree.root_node(), source)
-    } else {
-        Vec::new()
-    };
+    let import_stmts = record_import_stmts_pruned(tree.root_node(), &import_starts, source, false);
 
     let mut return_type_map: HashMap<String, String> = HashMap::default();
     scan_return_types(
@@ -2789,16 +2197,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
     );
 
     let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
-    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
-    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
-    scan_init_self_attrs(
-        tree.root_node(),
-        source,
-        &mut instance_attr_types,
-        &mut init_params,
-        &mut attr_to_param,
-        config,
-    );
+    scan_init_self_attrs(tree.root_node(), source, &mut instance_attr_types, config);
 
     let mut facts = PrecomputedFileFacts {
         content,
@@ -2808,10 +2207,7 @@ pub(crate) fn precompute_scope_resolvable_file_facts(
         ast_refs,
         return_type_map,
         instance_attr_types,
-        init_params,
-        attr_to_param,
         import_stmts,
-        ctor_call_sites,
     };
     // Stage 2: reclaim this file's push/insert-loop Vec/HashMap
     // slack before it joins the corpus-wide map it lives in for the rest of
@@ -2899,15 +2295,11 @@ fn resolve_with_scopes_full_inner(
             ranges.sort_unstable();
         }
 
-        // Build Go package index for O(1) import lookup
-        let go_pkg_index = build_go_pkg_index(&symbol_table, entity_map);
-
         owned_lookups = PreBuiltLookups {
             symbol_table: Arc::new(symbol_table),
             class_members,
             owner_members,
             entity_ranges,
-            go_pkg_index,
             // No registry reaches this fallback — it exists for callers that
             // hand us entities without one — so there are no overrides to
             // honor and `reparse_language_config` keeps the raw extension.
@@ -2919,7 +2311,6 @@ fn resolve_with_scopes_full_inner(
     let class_members = &lookups.class_members;
     let owner_members = &lookups.owner_members;
     let entity_ranges = &lookups.entity_ranges;
-    let go_pkg_index = &lookups.go_pkg_index;
 
     // File-path / parent_id indexed entity lookups. Both are a pure function
     // of `all_entities` alone (same result no matter which chunk is being
@@ -2944,11 +2335,6 @@ fn resolve_with_scopes_full_inner(
 
     // Instance attribute types: (class_name, attr_name) -> class_name_of_attr
     let mut instance_attr_types: HashMap<(String, String), String> = HashMap::default();
-
-    // __init__ param info: class_name -> (ordered_params, attr_to_param mapping)
-    // attr_to_param: attr_name -> param_name (for self.attr = param patterns)
-    let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
-    let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
 
     // Merge pre-parsed trees with disk-parsed trees for missing files
     let mut owned_parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
@@ -2997,14 +2383,6 @@ fn resolve_with_scopes_full_inner(
             // cold build for nothing (linux: 29,158 / 333 MB) — see
             // ": parse ceiling".
             //
-            // The one consumer that does *not* repeat the predicate is
-            // `infer_constructor_param_types`' `scan_constructor_calls` sweep,
-            // which walks every tree in this vector. It is a provable no-op
-            // unless `init_params` *and* `attr_to_param` are both non-empty
-            // (its own early return), and both are built exclusively from files
-            // that pass the predicate above; the gate section of records the
-            // bit-identical entity/edge measurement on all five giants that
-            // makes the elimination observationally sound, not just argued.
             // (`?` on the admission test itself: the grammar this file is
             // re-parsed *with* still comes from `reparse_language_config`.)
             scope_resolve_config_for_path(file_path)?;
@@ -3113,24 +2491,15 @@ fn resolve_with_scopes_full_inner(
     // function of corpus-invariant inputs there (see
     // `ChunkedResolveInputs::top_level_entities`'s doc comment). Every other
     // caller keeps a per-call lock, exactly the old behavior (one call ==
-    // the whole corpus for them anyway). The py lock is sibling
-    // of the TS one: same struct, built lazily (only if a `.py` bare
-    // `import module` statement is actually seen) restricted to `.py` files
-    // — see `build_top_level_entity_index` and `register_namespace_import`.
+    // the whole corpus for them anyway). The `.rs` lock is sibling of the TS
+    // one: same struct, built lazily (only if a `use_declaration` actually
+    // registers a module alias) restricted to `.rs` files — see
+    // `build_top_level_entity_index` and `register_rust_module_import`.
     let owned_top_level_entities = OnceLock::new();
-    let owned_py_top_level_entities = OnceLock::new();
     let owned_rust_top_level_entities = OnceLock::new();
-    let (top_level_entities, py_top_level_entities, rust_top_level_entities) = match chunked {
-        Some(c) => (
-            c.top_level_entities,
-            c.py_top_level_entities,
-            c.rust_top_level_entities,
-        ),
-        None => (
-            &owned_top_level_entities,
-            &owned_py_top_level_entities,
-            &owned_rust_top_level_entities,
-        ),
+    let (top_level_entities, rust_top_level_entities) = match chunked {
+        Some(c) => (c.top_level_entities, c.rust_top_level_entities),
+        None => (&owned_top_level_entities, &owned_rust_top_level_entities),
     };
 
     // Pass 1: Scan ALL files for return types and instance attr types first
@@ -3140,8 +2509,6 @@ fn resolve_with_scopes_full_inner(
     let pass1_results: Vec<(
         &str,
         HashMap<String, String>,
-        HashMap<(String, String), String>,
-        HashMap<String, Vec<String>>,
         HashMap<(String, String), String>,
     )> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
@@ -3167,14 +2534,10 @@ fn resolve_with_scopes_full_inner(
 
             let mut local_instance_attr_types: HashMap<(String, String), String> =
                 HashMap::default();
-            let mut local_init_params: HashMap<String, Vec<String>> = HashMap::default();
-            let mut local_attr_to_param: HashMap<(String, String), String> = HashMap::default();
             scan_init_self_attrs(
                 tree.root_node(),
                 source,
                 &mut local_instance_attr_types,
-                &mut local_init_params,
-                &mut local_attr_to_param,
                 config,
             );
 
@@ -3182,15 +2545,13 @@ fn resolve_with_scopes_full_inner(
                 file_path.as_str(),
                 local_return_type_map,
                 local_instance_attr_types,
-                local_init_params,
-                local_attr_to_param,
             ))
         })
         .collect();
 
     // Merge in `file_paths` order (not "all freshly-scanned files, then all
-    // precomputed files" or vice versa) so `instance_attr_types`/`init_params`/
-    // `attr_to_param` — keyed by class *name*, not entity id, so two
+    // precomputed files" or vice versa) so `instance_attr_types` — keyed by
+    // class *name*, not entity id, so two
     // same-named classes in different files can collide — see the same
     // last-write-wins overwrite order the original single `parsed_files`-order
     // merge produced, regardless of which files took the CUT 1
@@ -3199,7 +2560,7 @@ fn resolve_with_scopes_full_inner(
     // file, so merge order can't affect it either way.)
     let mut pass1_by_file: HashMap<&str, Pass1FileScan> = pass1_results
         .into_iter()
-        .map(|(fp, rtm, iat, ip, atp)| (fp, (rtm, iat, ip, atp)))
+        .map(|(fp, rtm, iat)| (fp, (rtm, iat)))
         .collect();
     for file_path in file_paths {
         if let Some(facts) = precomputed_facts.and_then(|m| m.get(file_path)) {
@@ -3215,43 +2576,13 @@ fn resolve_with_scopes_full_inner(
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
-            init_params.extend(
-                facts
-                    .init_params
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-            attr_to_param.extend(
-                facts
-                    .attr_to_param
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-        } else if let Some((rtm, iat, ip, atp)) = pass1_by_file.remove(file_path.as_str()) {
+        } else if let Some((rtm, iat)) = pass1_by_file.remove(file_path.as_str()) {
             return_type_map.extend(rtm);
             instance_attr_types.extend(iat);
-            init_params.extend(ip);
-            attr_to_param.extend(atp);
         }
     }
     prof::add_pass1_scan_ns(__pass1_t0.elapsed());
 
-    // Pass 1b: Infer constructor parameter types from call sites
-    // For `Transaction(get_connection())`, infer conn param has type Connection.
-    // Then resolve self.conn = conn -> (Transaction, conn) -> Connection
-    let __ctor_infer_t0 = Instant::now();
-    infer_constructor_param_types(
-        parsed_files,
-        precomputed_facts,
-        file_paths,
-        &return_type_map,
-        &init_params,
-        &attr_to_param,
-        &symbol_table,
-        entity_map,
-        &mut instance_attr_types,
-    );
-    prof::add_ctor_infer_ns(__ctor_infer_t0.elapsed());
     let __return_types_by_name_t0 = Instant::now();
     let func_name_return_types =
         deterministic_return_types_by_name(&return_type_map, symbol_table, entity_map);
@@ -3323,7 +2654,7 @@ fn resolve_with_scopes_full_inner(
                 // attributed per file — no single file's read set can name this
                 // dependency, so it is fingerprinted whole (`Table`'s own doc:
                 // a whole-table guard's *change* forces every eligible file
-                // RED, exactly like `GuardPyWildcardImport`'s narrower cousin).
+                // RED, exactly like `GuardRustModuleAlias`'s narrower cousin).
                 sink.whole(
                     Table::GuardSwiftCallSignatures,
                     hash_swift_signatures(&swift_call_signatures),
@@ -3543,7 +2874,7 @@ fn resolve_with_scopes_full_inner(
                 // JS/TS pass-1 producer's calls.
                 __sb.fused_path = true;
                 let __t = __prof_on.then(Instant::now);
-                let (all_file_refs, import_starts, _saw_call_node) = fused_scope_refs_import_walk(
+                let (all_file_refs, import_starts) = fused_scope_refs_import_walk(
                     tree.root_node(),
                     0,
                     &mut scopes,
@@ -3551,7 +2882,6 @@ fn resolve_with_scopes_full_inner(
                     &mut entity_inner_scope,
                     &file_lookup,
                     children_by_parent,
-                    entity_map,
                     source,
                     config,
                 );
@@ -3604,12 +2934,9 @@ fn resolve_with_scopes_full_inner(
             // construction, MUL-A) and for JS/TS
             // (`precompute_js_ts_file_facts` never records any — see
             // `PrecomputedFileFacts::import_stmts`'s doc comment); nonzero
-            // unconditionally for Python (admitted since) and Go
-            // (admitted since), and nonzero for C#/Rust/Java only
-            // when each's own gate (`SEM_MUL_CSHARP`/`SEM_MUL_RUST`/
-            // `SEM_MUL_JAVA`) is flipped on — see
-            // [`mul_precompute_admits`]'s doc comment for why each of those
-            // three stays off by default.
+            // only for Java, when its gate (`SEM_MUL_JAVA`) is flipped on —
+            // see [`mul_precompute_admits`]'s doc comment for why it stays
+            // off by default.
             if let Some(facts) = precomputed {
                 if !facts.import_stmts.is_empty() {
                     let skip_js_ts_imports = pre_built_import_table.is_some();
@@ -3620,10 +2947,8 @@ fn resolve_with_scopes_full_inner(
                         entity_map,
                         &mut local_import_table,
                         &mut scopes,
-                        go_pkg_index,
                         &ts_default_exports,
                         top_level_entities,
-                        py_top_level_entities,
                         rust_top_level_entities,
                         parsed_files,
                         &content_by_file,
@@ -3651,7 +2976,6 @@ fn resolve_with_scopes_full_inner(
                         tree.root_node(),
                         import_starts,
                         source,
-                        config,
                         skip_js_ts_imports,
                     );
                     dispatch_import_stmts_from_facts(
@@ -3661,10 +2985,8 @@ fn resolve_with_scopes_full_inner(
                         entity_map,
                         &mut local_import_table,
                         &mut scopes,
-                        go_pkg_index,
                         &ts_default_exports,
                         top_level_entities,
-                        py_top_level_entities,
                         rust_top_level_entities,
                         parsed_files,
                         &content_by_file,
@@ -3741,10 +3063,9 @@ fn resolve_with_scopes_full_inner(
                 // One lookup chain, kept single-pass: `scope_lookup_missed`
                 // is true exactly when BOTH maps missed and `scope_idx` below
                 // is the `unwrap_or(0)` default — not when an entity
-                // legitimately resolves to scope 0. Threaded into `resolve_ref`
-                // (where the Go package-qualified fallback must not guess from
-                // an unknown scope context) and counted here for precomputed
-                // files, where a miss means the facts clone was incomplete.
+                // legitimately resolves to scope 0. Counted here for
+                // precomputed files, where a miss means the facts clone was
+                // incomplete.
                 let scope_idx_lookup = entity_inner_scope
                     .get(&entity.id)
                     .or_else(|| entity_scope_map.get(&entity.id))
@@ -3852,7 +3173,6 @@ fn resolve_with_scopes_full_inner(
                                 let resolved = resolve_ref(
                                     ast_ref,
                                     scope_idx,
-                                    scope_lookup_missed,
                                     &scopes,
                                     &symbol_table,
                                     &class_members,
@@ -3884,7 +3204,6 @@ fn resolve_with_scopes_full_inner(
                             let resolved = resolve_ref(
                                 ast_ref,
                                 scope_idx,
-                                scope_lookup_missed,
                                 &scopes,
                                 &symbol_table,
                                 &class_members,
@@ -4125,7 +3444,7 @@ fn hash_swift_signatures(sigs: &HashMap<String, SwiftCallSignature>) -> u64 {
 /// content hash. Only ids that can cross a file boundary are recorded, and those
 /// all arrive through the tables below.
 ///
-/// Returns the `GuardPyWildcardImport` value it folded, so an incremental
+/// Returns the `GuardRustModuleAlias` value it folded, so an incremental
 /// rebuild can carry it forward and update it by XOR rather than refolding the
 /// corpus (see [`fingerprint_corpus_tables_incremental`]).
 pub(crate) fn fingerprint_corpus_tables(
@@ -4134,10 +3453,10 @@ pub(crate) fn fingerprint_corpus_tables(
     fp: &mut TableFingerprints,
 ) -> u64 {
     let mut sink = FingerprintSink::new(fp, 0);
-    // `register_namespace_import` (Python's bare `import module` form) scans
+    // `register_rust_module_import` (the module-alias `use` form) scans
     // every `(name, target file)` pair below looking for ones whose file
     // matches the imported module — an unbounded read (see `Table::
-    // GuardPyWildcardImport`'s doc). Fold every pair into one order-independent
+    // GuardRustModuleAlias`'s doc). Fold every pair into one order-independent
     // guard hash (XOR, since the pairs have no stable order) as this same loop
     // already visits them for the per-key `SymbolTable`/`EntityMap`
     // fingerprints, so the guard costs one extra `u64` XOR per pair, not a
@@ -4173,22 +3492,13 @@ pub(crate) fn fingerprint_corpus_tables(
             .u(info.end_line);
         sink.one(Table::EntityMap, id, h.finish());
     }
-    for (pkg, bucket) in &lookups.go_pkg_index {
-        sink.one(Table::GoPkgIndex, pkg, hash_go_pkg_entries(&bucket.entries));
-    }
-    sink.whole(Table::GuardPyWildcardImport, wildcard_import_guard);
-    // Same fold, second tag: `register_rust_module_import` (Rust's relative
-    // module-alias `use` form) has the identical unbounded-read
-    // shape over the identical `(name, file_path)` data — see
-    // `Table::GuardRustModuleAlias`'s doc for why it still gets its own tag
-    // rather than reusing the Python one above.
     sink.whole(Table::GuardRustModuleAlias, wildcard_import_guard);
     wildcard_import_guard
 }
 
 /// The keys `maintain_entity_lookups_incremental` removed from or inserted into
-/// each corpus table this build, plus the XOR delta to the Python
-/// wildcard-import guard those same entities imply.
+/// each corpus table this build, plus the XOR delta to the
+/// `GuardRustModuleAlias` wildcard-import guard those same entities imply.
 ///
 /// Everything here is `O(touched files' entities)`, never `O(corpus)`.
 #[derive(Default)]
@@ -4206,7 +3516,7 @@ pub(crate) struct TouchedCorpusKeys {
     pub(crate) wildcard_guard_delta: u64,
 }
 
-/// One entity's contribution to the `GuardPyWildcardImport` XOR fold.
+/// One entity's contribution to the `GuardRustModuleAlias` XOR fold.
 ///
 /// [`fingerprint_corpus_tables`] spells that fold as "for every `(name, id)` in
 /// `symbol_table`, XOR in `hash(name, entity_map[id].file_path)`". That is the
@@ -4234,11 +3544,6 @@ pub(crate) fn wildcard_guard_contribution(name: &str, file_path: &str) -> u64 {
 ///   is byte-identical to last build's;
 /// * a key that *vanished* is `remove`d, not left stale — the case that would
 ///   otherwise keep a file GREEN whose lookup now misses.
-///
-/// `go_pkg_index` is **not** maintained here; the caller falls back to the whole
-/// fold whenever it is non-empty (i.e. whenever the corpus has `.go` files),
-/// because that index is a re-derivation of the other tables under a different
-/// key shape (file stem / directory name) with no per-file key index of its own.
 pub(crate) fn fingerprint_corpus_tables_incremental(
     touched: &TouchedCorpusKeys,
     lookups: &PreBuiltLookups,
@@ -4293,12 +3598,6 @@ pub(crate) fn fingerprint_corpus_tables_incremental(
     }
     *wildcard_import_guard ^= touched.wildcard_guard_delta;
     fp.put(
-        key_whole(Table::GuardPyWildcardImport, 0),
-        *wildcard_import_guard,
-    );
-    // Same value, second tag — mirrors `fingerprint_corpus_tables`'s pairing
-    // of `GuardPyWildcardImport`/`GuardRustModuleAlias` above.
-    fp.put(
         key_whole(Table::GuardRustModuleAlias, 0),
         *wildcard_import_guard,
     );
@@ -4308,20 +3607,6 @@ fn hash_member_list(members: &[MemberTarget]) -> u64 {
     let mut h = ValueHasher::new();
     for (name, id) in members {
         h.s(name).s(id);
-    }
-    h.finish()
-}
-
-/// [`hash_member_list`]'s sibling for [`GoPkgIndex`] buckets: the
-/// declaring-directory field is new information a bucket carries that
-/// `hash_member_list`'s two-tuple shape cannot fold in, so a dedicated
-/// fingerprint keeps `Table::GoPkgIndex`'s invalidation correct rather than
-/// silently truncating the read-set to `(name, id)` and missing a change
-/// that only moves an entity's declaring directory.
-fn hash_go_pkg_entries(entries: &[GoPkgEntry]) -> u64 {
-    let mut h = ValueHasher::new();
-    for (name, id, decl_dir) in entries {
-        h.s(name).s(id).s(decl_dir);
     }
     h.finish()
 }
@@ -4557,7 +3842,6 @@ fn build_scopes_from_ast(
     entity_inner_scope: &mut EntityScopeMap,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_map: &EntityInfoMap,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) {
@@ -4573,7 +3857,6 @@ fn build_scopes_from_ast(
             entity_inner_scope,
             file_lookup,
             children_by_parent,
-            entity_map,
             source,
             config,
         );
@@ -4596,7 +3879,6 @@ fn scope_visit_node(
     entity_inner_scope: &mut EntityScopeMap,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_map: &EntityInfoMap,
     source: &[u8],
     config: &ScopeResolveConfig,
 ) -> usize {
@@ -4606,7 +3888,7 @@ fn scope_visit_node(
         // Class-like scope: config-driven
         let is_class_like = config.class_scope_nodes.contains(&kind);
 
-        // Impl scope: config-driven (Rust impl_item, Swift extension)
+        // Impl scope: config-driven (Swift extension)
         let is_impl = config.impl_scope_nodes.contains(&kind);
 
         if is_class_like || is_impl {
@@ -4617,24 +3899,6 @@ fn scope_visit_node(
             } else {
                 match &config.class_name_field {
                     ClassNameField::Simple(field) => node
-                        .child_by_field_name(field)
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .unwrap_or(""),
-                    ClassNameField::TypeSpec { spec_kind, field } => {
-                        let mut name = "";
-                        let mut cursor = node.walk();
-                        for child in node.named_children(&mut cursor) {
-                            if child.kind() == *spec_kind {
-                                name = child
-                                    .child_by_field_name(field)
-                                    .and_then(|n| n.utf8_text(source).ok())
-                                    .unwrap_or("");
-                                break;
-                            }
-                        }
-                        name
-                    }
-                    ClassNameField::ImplType(field) => node
                         .child_by_field_name(field)
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or(""),
@@ -4740,52 +4004,6 @@ fn scope_visit_node(
             }
         }
 
-        // Rust mod_item: create a module scope so nested functions resolve
-        // names from the parent scope (e.g. super::target() walks up correctly).
-        if kind == "mod_item" {
-            let mod_name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("");
-            let mod_scope_idx = scopes.len();
-            scopes.push(Scope {
-                parent: Some(current_scope),
-                defs: HashMap::default(),
-                bindings: HashSet::default(),
-                binding_rows: HashMap::default(),
-                types: HashMap::default(),
-                pending_call_types: HashMap::default(),
-                pending_field_types: HashMap::default(),
-                owner_id: None,
-                kind: "module",
-            });
-
-            // Register any entities that are children of this module
-            let line = node.start_position().row + 1;
-            let mod_entity =
-                file_lookup.find_at_line(mod_name, line, |entity| entity.entity_type == "module");
-
-            if let Some(me) = mod_entity {
-                scopes[mod_scope_idx].owner_id = Some(EntityId::from(&me.id));
-                entity_scope_map
-                    .entry(EntityId::from(&me.id))
-                    .or_insert(current_scope);
-                entity_inner_scope.insert(EntityId::from(&me.id), mod_scope_idx);
-
-                // Register child entities in the module scope
-                if let Some(children) = children_by_parent.get(me.id.as_str()) {
-                    for child_entity in children {
-                        scopes[mod_scope_idx]
-                            .defs
-                            .insert(child_entity.name.clone(), EntityId::from(&child_entity.id));
-                        entity_scope_map.insert(EntityId::from(&child_entity.id), mod_scope_idx);
-                    }
-                }
-            }
-
-            return mod_scope_idx;
-        }
-
         // Function-like scope: config-driven
         let is_function_like = config.function_scope_nodes.contains(&kind);
 
@@ -4796,27 +4014,7 @@ fn scope_visit_node(
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("");
 
-            let parent_scope = if config.external_method && kind == "method_declaration" {
-                let receiver_type = node
-                    .utf8_text(source)
-                    .ok()
-                    .and_then(|t| extract_go_receiver_type(t));
-                if let Some(ref struct_name) = receiver_type {
-                    let found = scopes.iter().enumerate().find(|(_, s)| {
-                        s.kind == "class"
-                            && s.owner_id.as_ref().map_or(false, |oid| {
-                                entity_map
-                                    .get(oid)
-                                    .map_or(false, |e| e.name == *struct_name)
-                            })
-                    });
-                    found.map(|(idx, _)| idx).unwrap_or(current_scope)
-                } else {
-                    current_scope
-                }
-            } else {
-                current_scope
-            };
+            let parent_scope = current_scope;
 
             let func_scope_idx = scopes.len();
             scopes.push(Scope {
@@ -4853,41 +4051,10 @@ fn scope_visit_node(
                         entity_scope_map.insert(EntityId::from(&entity.id), func_scope_idx);
                     }
                 }
-                if config.external_method
-                    && kind == "method_declaration"
-                    && parent_scope != current_scope
-                {
-                    scopes[parent_scope]
-                        .defs
-                        .insert(fe.name.clone(), EntityId::from(&fe.id));
-                }
             }
 
             scan_assignments(node, func_scope_idx, scopes, source, config);
             scan_function_params(signature, func_scope_idx, scopes, source, config);
-
-            if config.external_method && kind == "method_declaration" {
-                if let Some(receiver) = node.child_by_field_name("receiver") {
-                    let mut rcursor = receiver.walk();
-                    for param in receiver.named_children(&mut rcursor) {
-                        if param.kind() == "parameter_declaration" {
-                            let param_name = param
-                                .child_by_field_name("name")
-                                .and_then(|n| n.utf8_text(source).ok())
-                                .unwrap_or("");
-                            let param_type = param
-                                .child_by_field_name("type")
-                                .map(|n| extract_base_type(n, source))
-                                .unwrap_or_default();
-                            if !param_name.is_empty() && !param_type.is_empty() {
-                                scopes[func_scope_idx]
-                                    .types
-                                    .insert(param_name.to_string(), param_type);
-                            }
-                        }
-                    }
-                }
-            }
 
             return func_scope_idx;
         }
@@ -4925,29 +4092,18 @@ fn fused_scope_refs_import_walk(
     entity_inner_scope: &mut EntityScopeMap,
     file_lookup: &FileEntityLookup<'_>,
     children_by_parent: &HashMap<&str, Vec<&SemanticEntity>>,
-    entity_map: &EntityInfoMap,
     source: &[u8],
     config: &ScopeResolveConfig,
-) -> (Vec<AstRef>, Vec<usize>, bool) {
+) -> (Vec<AstRef>, Vec<usize>) {
     let mut refs = AstRefCollector::new();
     let mut import_starts: Vec<usize> = Vec::new();
-    // MUL Phase 1: whether the walk saw a literal `"call"`-kind
-    // node — the one ctor-infer's `scan_constructor_calls` hardcodes to
-    // Python's grammar (`TREELESS` predicate). One extra
-    // `kind()` comparison on nodes this walk already visits, decided
-    // structurally from what the walk saw rather than a language table.
-    let mut saw_call_node = false;
     // Each entry: (node, current_scope, inside-a-recorded-import)
     let mut worklist: Vec<(tree_sitter::Node, usize, bool)> = vec![(root, root_scope, false)];
 
     while let Some((node, current_scope, in_import)) = worklist.pop() {
         refs_visit_node(node, source, config, &mut refs);
 
-        if !saw_call_node && node.kind() == "call" {
-            saw_call_node = true;
-        }
-
-        let is_import = !in_import && classify_import_stmt(node.kind(), config).is_some();
+        let is_import = !in_import && classify_import_stmt(node.kind()).is_some();
         if is_import {
             // Pre-order ⇒ pushed in ascending byte order, so the vec is
             // sorted and `subtree_contains_import_start` may binary-search.
@@ -4963,7 +4119,6 @@ fn fused_scope_refs_import_walk(
             entity_inner_scope,
             file_lookup,
             children_by_parent,
-            entity_map,
             source,
             config,
         );
@@ -4976,7 +4131,7 @@ fn fused_scope_refs_import_walk(
         );
         worklist[start..].reverse();
     }
-    (refs.into_refs(), import_starts, saw_call_node)
+    (refs.into_refs(), import_starts)
 }
 
 /// Dart wraps the callable name and parameters in a signature, but the
@@ -5014,15 +4169,6 @@ fn scan_assignments(
                         AssignmentStrategy::Declarators => {
                             scan_ts_var_declaration(child, scope_idx, scopes, source);
                         }
-                        AssignmentStrategy::PatternBased => {
-                            scan_rust_let_declaration(child, scope_idx, scopes, source);
-                        }
-                        AssignmentStrategy::ShortVar => {
-                            scan_go_short_var(child, scope_idx, scopes, source);
-                        }
-                        AssignmentStrategy::VarSpec => {
-                            scan_go_var_declaration(child, scope_idx, scopes, source);
-                        }
                     }
                 }
             }
@@ -5053,7 +4199,7 @@ fn scan_function_params(
     source: &[u8],
     config: &ScopeResolveConfig,
 ) {
-    // Try "parameters" field first (Python, TS, Rust, Go, etc.)
+    // Try "parameters" field first (TS, Java, C#, etc.)
     // Fallback to direct children for languages like Swift where
     // params are direct children of function_declaration.
     let mut params_node = node.child_by_field_name("parameters");
@@ -5102,28 +4248,6 @@ fn scan_function_params(
                     .or_else(|| child.named_child(0).filter(|n| n.kind() == "identifier"))
                     .and_then(|n| n.utf8_text(source).ok())
                     .unwrap_or(""),
-                ParamNameField::RustPattern => child
-                    .child_by_field_name("pattern")
-                    .and_then(|n| {
-                        if n.kind() == "identifier" {
-                            n.utf8_text(source).ok()
-                        } else if n.kind() == "mut_pattern" {
-                            n.named_child(0).and_then(|c| c.utf8_text(source).ok())
-                        } else if n.kind() == "reference_pattern" {
-                            n.named_child(0).and_then(|c| {
-                                if c.kind() == "identifier" {
-                                    c.utf8_text(source).ok()
-                                } else if c.kind() == "mut_pattern" {
-                                    c.named_child(0).and_then(|cc| cc.utf8_text(source).ok())
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(""),
             };
 
             if param_name.is_empty() || rule.skip_names.contains(&param_name) {
@@ -5160,7 +4284,7 @@ fn scan_function_params(
     }
 }
 
-/// Python/TS: `x = Foo()` or `x = func()`
+/// `x = Foo()` or `x = func()`
 fn scan_single_assignment(
     node: tree_sitter::Node,
     scope_idx: usize,
@@ -5561,159 +4685,8 @@ fn swift_property_segment_end_for_name(
     segment_end
 }
 
-/// Rust: `let x: Type = ...` or `let x = Foo::new()`
-fn scan_rust_let_declaration(
-    node: tree_sitter::Node,
-    scope_idx: usize,
-    scopes: &mut Vec<Scope>,
-    source: &[u8],
-) {
-    let var_name = node
-        .child_by_field_name("pattern")
-        .and_then(|n| {
-            // Pattern can be just an identifier or `mut x`
-            if n.kind() == "identifier" {
-                n.utf8_text(source).ok()
-            } else if n.kind() == "mut_pattern" {
-                n.named_child(0).and_then(|c| c.utf8_text(source).ok())
-            } else {
-                None
-            }
-        })
-        .unwrap_or("")
-        .to_string();
-
-    if var_name.is_empty() {
-        return;
-    }
-    record_binding(scopes, scope_idx, &var_name, node.start_position().row);
-
-    // Check for explicit type annotation: `let x: Connection = ...`
-    if let Some(type_node) = node.child_by_field_name("type") {
-        let type_text = extract_base_type(type_node, source);
-        if !type_text.is_empty() && type_text.chars().next().map_or(false, |c| c.is_uppercase()) {
-            scopes[scope_idx].types.insert(var_name, type_text);
-            return;
-        }
-    }
-
-    // Check RHS value
-    if let Some(value) = node.child_by_field_name("value") {
-        record_type_from_rhs(value, &var_name, scope_idx, scopes, source);
-    }
-}
-
-/// Go: `x := Foo{}` or `x := NewFoo()`
-fn scan_go_short_var(
-    node: tree_sitter::Node,
-    scope_idx: usize,
-    scopes: &mut Vec<Scope>,
-    source: &[u8],
-) {
-    let left = match node.child_by_field_name("left") {
-        Some(l) => l,
-        None => return,
-    };
-    let right = match node.child_by_field_name("right") {
-        Some(r) => r,
-        None => return,
-    };
-
-    // left is expression_list, right is expression_list
-    let var_name = if left.kind() == "expression_list" {
-        left.named_child(0)
-            .and_then(|n| n.utf8_text(source).ok())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        left.utf8_text(source).unwrap_or("").to_string()
-    };
-
-    if var_name.is_empty() {
-        return;
-    }
-    record_binding(scopes, scope_idx, &var_name, left.start_position().row);
-
-    let rhs = if right.kind() == "expression_list" {
-        match right.named_child(0) {
-            Some(n) => n,
-            None => return,
-        }
-    } else {
-        right
-    };
-
-    record_type_from_rhs(rhs, &var_name, scope_idx, scopes, source);
-}
-
-/// Go: `var x Type = ...` or `var x = Foo{}`
-fn scan_go_var_declaration(
-    node: tree_sitter::Node,
-    scope_idx: usize,
-    scopes: &mut Vec<Scope>,
-    source: &[u8],
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "var_spec" {
-            let var_name = child
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
-                .to_string();
-            if var_name.is_empty() {
-                // Try first named child as name
-                if let Some(first) = child.named_child(0) {
-                    if first.kind() == "identifier" {
-                        let name = first.utf8_text(source).unwrap_or("").to_string();
-                        if !name.is_empty() {
-                            record_binding(scopes, scope_idx, &name, first.start_position().row);
-                            // Check for type child
-                            if let Some(type_node) = child.child_by_field_name("type") {
-                                let type_text = extract_base_type(type_node, source);
-                                if !type_text.is_empty()
-                                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                                {
-                                    scopes[scope_idx].types.insert(name, type_text);
-                                }
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            let binding_row = child
-                .child_by_field_name("name")
-                .map(|n| n.start_position().row)
-                .unwrap_or_else(|| child.start_position().row);
-            record_binding(scopes, scope_idx, &var_name, binding_row);
-
-            // Check for explicit type
-            if let Some(type_node) = child.child_by_field_name("type") {
-                let type_text = extract_base_type(type_node, source);
-                if !type_text.is_empty()
-                    && type_text.chars().next().map_or(false, |c| c.is_uppercase())
-                {
-                    scopes[scope_idx].types.insert(var_name, type_text);
-                    continue;
-                }
-            }
-
-            // Check RHS value
-            if let Some(value) = child.child_by_field_name("value") {
-                let rhs = if value.kind() == "expression_list" {
-                    value.named_child(0).unwrap_or(value)
-                } else {
-                    value
-                };
-                record_type_from_rhs(rhs, &var_name, scope_idx, scopes, source);
-            }
-        }
-    }
-}
-
 /// Record type binding from a RHS expression (works for all languages).
-/// Handles: constructor calls, new expressions, struct literals, function calls.
+/// Handles: constructor calls, new expressions, function calls.
 fn record_type_from_rhs(
     rhs: tree_sitter::Node,
     var_name: &str,
@@ -5722,7 +4695,7 @@ fn record_type_from_rhs(
     source: &[u8],
 ) {
     match rhs.kind() {
-        // Python/Go: Foo() or func()
+        // Foo() or func() (`call` is Ruby's call node kind)
         "call" | "call_expression" => {
             let func_node = rhs
                 .child_by_field_name("function")
@@ -5741,48 +4714,6 @@ fn record_type_from_rhs(
                         scopes[scope_idx]
                             .pending_call_types
                             .insert(var_name.to_string(), name.to_string());
-                    }
-                }
-                // Rust: Type::new() / Type::from() etc.
-                if func.kind() == "scoped_identifier" {
-                    let text = func.utf8_text(source).unwrap_or("");
-                    let parts: Vec<&str> = text.split("::").collect();
-                    if parts.len() >= 2 {
-                        let type_name = parts[0];
-                        let method_name = parts[parts.len() - 1];
-                        if type_name.chars().next().map_or(false, |c| c.is_uppercase()) {
-                            scopes[scope_idx]
-                                .types
-                                .insert(var_name.to_string(), type_name.to_string());
-                        } else {
-                            scopes[scope_idx]
-                                .pending_call_types
-                                .insert(var_name.to_string(), method_name.to_string());
-                        }
-                    }
-                }
-                // Go: package.NewFoo() or package.GetFoo()
-                if func.kind() == "selector_expression" {
-                    let field = func
-                        .child_by_field_name("field")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .unwrap_or("");
-                    // Go convention: NewFoo() returns *Foo
-                    if let Some(type_name) = field.strip_prefix("New") {
-                        if !type_name.is_empty()
-                            && type_name.chars().next().map_or(false, |c| c.is_uppercase())
-                        {
-                            scopes[scope_idx]
-                                .types
-                                .insert(var_name.to_string(), type_name.to_string());
-                        }
-                    } else if field.starts_with("Get")
-                        || field.chars().next().map_or(false, |c| c.is_uppercase())
-                    {
-                        // Other Go package functions: record for return type resolution
-                        scopes[scope_idx]
-                            .pending_call_types
-                            .insert(var_name.to_string(), field.to_string());
                     }
                 }
             }
@@ -5809,17 +4740,6 @@ fn record_type_from_rhs(
                 let name = extract_base_type(type_node, source);
                 if !name.is_empty() && name.chars().next().map_or(false, |c| c.is_uppercase()) {
                     scopes[scope_idx].types.insert(var_name.to_string(), name);
-                }
-            }
-        }
-        // Go: Foo{} (composite_literal / struct literal)
-        "composite_literal" => {
-            if let Some(type_node) = rhs.child_by_field_name("type") {
-                let name = type_node.utf8_text(source).unwrap_or("");
-                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
-                    scopes[scope_idx]
-                        .types
-                        .insert(var_name.to_string(), name.to_string());
                 }
             }
         }
@@ -5892,94 +4812,6 @@ pub fn extract_go_receiver_type(content: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
-}
-
-/// pkg identifier (bare last-path-segment string — the local name a Go call
-/// site actually spells, e.g. `v1` in `v1.Pod{}`) → every entity any
-/// same-named package exports, each carrying its own declaring directory
-/// (Go-admission finding): kubernetes has dozens
-/// of packages literally named `v1`, one per API group, so a bucket keyed
-/// only on this bare string is not a single package's symbol table — it is
-/// the union of every package that happens to share the name. The
-/// declaring-directory field is what lets [`register_go_package_imports`]
-/// pick the one candidate a specific import actually means, instead of
-/// inserting the whole polluted union into a file's `import_table`.
-type GoPkgEntry = (String, EntityId, String);
-pub(crate) type GoPkgIndex = HashMap<String, GoPkgBucket>;
-
-#[derive(Default)]
-pub(crate) struct GoPkgBucket {
-    // Keep the original (name, id, directory) order for fingerprint parity
-    // and last-write-wins behavior when a package repeats a symbol name.
-    entries: Vec<GoPkgEntry>,
-    directories: Vec<(String, Vec<usize>)>,
-}
-
-impl GoPkgBucket {
-    fn index_directories(&mut self) {
-        self.entries.sort_unstable();
-        let mut by_directory: HashMap<&str, Vec<usize>> = HashMap::default();
-        for (index, (_, _, directory)) in self.entries.iter().enumerate() {
-            by_directory
-                .entry(directory.as_str())
-                .or_default()
-                .push(index);
-        }
-        self.directories = by_directory
-            .into_iter()
-            .map(|(directory, indices)| (directory.to_owned(), indices))
-            .collect();
-        self.directories.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    }
-}
-
-/// Build Go package index: pkg_name → [(entity_name, entity_id, declaring_dir)].
-/// Maps each entity's containing directory name to itself — Go import paths
-/// name packages, which are directories; Go has no per-file "package", so a
-/// file's own name (independent of its declared `package` identifier) is not
-/// a legitimate resolution key. An earlier revision of this function also
-/// keyed on the file's own stripped-of-`.go` stem, matching the bare last
-/// segment of a Go import path against a corpus file's *filename* rather
-/// than its *directory*. That route was deleted (afterward
-/// verification): kubernetes has real source files literally named after Go
-/// standard-library packages (`os.go`, `time.go`, `errors.go`, ...), and
-/// with no signal to tell "this bucket entry is the stdlib package" from
-/// "this bucket entry is a corpus-local file that happens to share its bare
-/// name," the file-stem route mis-resolved calls like `time.Now()` to a
-/// same-named local file's own `Now` (majority of a ~5k-edge false-positive
-/// class on kubernetes, gone once the route was removed). The directory
-/// route below is the Go-correct heuristic and is unaffected by this
-/// deletion.
-pub(crate) fn build_go_pkg_index(
-    symbol_table: &SymbolTable,
-    entity_map: &EntityInfoMap,
-) -> GoPkgIndex {
-    let mut idx: GoPkgIndex = HashMap::default();
-    for (name, target_ids) in symbol_table.iter() {
-        for target_id in target_ids {
-            if let Some(entity) = entity_map.get(target_id) {
-                if !entity.file_path.ends_with(".go") {
-                    continue;
-                }
-                let decl_dir = crate::parser::registry::go_package_dir(&entity.file_path);
-                if let Some(parent_start) = entity.file_path.rfind('/') {
-                    let parent_path = &entity.file_path[..parent_start];
-                    let dir_name = parent_path.rsplit('/').next().unwrap_or(parent_path);
-                    if !dir_name.is_empty() {
-                        idx.entry(dir_name.to_string()).or_default().entries.push((
-                            name.clone(),
-                            target_id.clone(),
-                            decl_dir.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for bucket in idx.values_mut() {
-        bucket.index_directories();
-    }
-    idx
 }
 
 /// Scan function bodies/signatures for return types to build a return type map.
@@ -6086,8 +4918,9 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
             if child.kind() == "return_statement" {
                 let mut inner_cursor = child.walk();
                 for ret_child in child.named_children(&mut inner_cursor) {
-                    // Python: call, TS/Go: call_expression
-                    if ret_child.kind() == "call" || ret_child.kind() == "call_expression" {
+                    // `call_expression` (TS, Kotlin, ...). Ruby's `call` node has
+                    // no `function` field, so only this kind can match below.
+                    if ret_child.kind() == "call_expression" {
                         if let Some(func) = ret_child.child_by_field_name("function") {
                             if func.kind() == "identifier" {
                                 let name = func.utf8_text(source).unwrap_or("");
@@ -6106,15 +4939,6 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
                             }
                         }
                     }
-                    // Go: StructName{} (composite_literal)
-                    if ret_child.kind() == "composite_literal" {
-                        if let Some(type_node) = ret_child.child_by_field_name("type") {
-                            let name = type_node.utf8_text(source).unwrap_or("");
-                            if name.chars().next().map_or(false, |c| c.is_uppercase()) {
-                                return Some(name.to_string());
-                            }
-                        }
-                    }
                 }
             }
             // Recurse into blocks (function_body wraps the block in kotlin-ng).
@@ -6127,14 +4951,12 @@ fn find_return_constructor(root: tree_sitter::Node, source: &[u8]) -> Option<Str
     None
 }
 
-/// Scan for instance attribute types: __init__ self.attr patterns (Python/TS),
-/// struct field declarations (Rust/Go).
+/// Scan for instance attribute types: constructor-body `this.attr` patterns
+/// (TS/Swift/Kotlin) and typed field declarations (Java/C#).
 fn scan_init_self_attrs(
     root: tree_sitter::Node,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
-    init_params_map: &mut HashMap<String, Vec<String>>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
     config: &ScopeResolveConfig,
 ) {
     let mut worklist = vec![root];
@@ -6158,46 +4980,12 @@ fn scan_init_self_attrs(
                     if !class_name.is_empty() {
                         // Determine lang for scan_class_for_init using init_node_kind as discriminator
                         let lang = match *init_node_kind {
-                            "function_definition" => "python",
                             "method_definition" => "typescript",
                             "init_declaration" => "swift",
                             "anonymous_initializer" => "kotlin",
                             _ => "typescript",
                         };
-                        scan_class_for_init(
-                            node,
-                            &class_name,
-                            source,
-                            instance_attr_types,
-                            init_params_map,
-                            attr_to_param_map,
-                            lang,
-                        );
-                    }
-                }
-            }
-            InitStrategy::StructFields { struct_nodes } => {
-                if struct_nodes.contains(&kind) {
-                    // Rust struct: extract field types directly
-                    if kind == "struct_item" {
-                        let struct_name = node
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("")
-                            .to_string();
-
-                        if !struct_name.is_empty() {
-                            scan_rust_struct_fields(
-                                node,
-                                &struct_name,
-                                source,
-                                instance_attr_types,
-                            );
-                        }
-                    }
-                    // Go: extract field types from type declarations
-                    if kind == "type_declaration" {
-                        scan_go_struct_fields(node, source, instance_attr_types);
+                        scan_class_for_init(node, &class_name, source, instance_attr_types, lang);
                     }
                 }
             }
@@ -6217,46 +5005,6 @@ fn scan_init_self_attrs(
         }
 
         push_named_children_rev(&mut worklist, node);
-    }
-}
-
-/// Rust: extract field types from `struct Foo { conn: Connection, ... }`
-fn scan_rust_struct_fields(
-    node: tree_sitter::Node,
-    struct_name: &str,
-    source: &[u8],
-    instance_attr_types: &mut HashMap<(String, String), String>,
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "field_declaration_list" {
-            let mut inner_cursor = child.walk();
-            for field in child.named_children(&mut inner_cursor) {
-                if field.kind() == "field_declaration" {
-                    let field_name = field
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .unwrap_or("");
-                    let field_type = field
-                        .child_by_field_name("type")
-                        .map(|n| extract_base_type(n, source))
-                        .unwrap_or_default();
-
-                    if !field_name.is_empty()
-                        && !field_type.is_empty()
-                        && field_type
-                            .chars()
-                            .next()
-                            .map_or(false, |c| c.is_uppercase())
-                    {
-                        instance_attr_types.insert(
-                            (struct_name.to_string(), field_name.to_string()),
-                            field_type,
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -6309,73 +5057,11 @@ fn scan_java_class_fields(
     }
 }
 
-/// Go: extract field types from `type Foo struct { conn Connection; ... }`
-fn scan_go_struct_fields(
-    node: tree_sitter::Node,
-    source: &[u8],
-    instance_attr_types: &mut HashMap<(String, String), String>,
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "type_spec" {
-            let struct_name = child
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
-                .to_string();
-
-            if struct_name.is_empty() {
-                continue;
-            }
-
-            // Look for struct_type child
-            if let Some(type_node) = child.child_by_field_name("type") {
-                if type_node.kind() == "struct_type" {
-                    let mut fields_cursor = type_node.walk();
-                    for field_list in type_node.named_children(&mut fields_cursor) {
-                        if field_list.kind() == "field_declaration_list" {
-                            let mut inner = field_list.walk();
-                            for field in field_list.named_children(&mut inner) {
-                                if field.kind() == "field_declaration" {
-                                    // Go field: name type
-                                    let field_name = field
-                                        .child_by_field_name("name")
-                                        .and_then(|n| n.utf8_text(source).ok())
-                                        .unwrap_or("");
-                                    let field_type = field
-                                        .child_by_field_name("type")
-                                        .map(|n| extract_base_type(n, source))
-                                        .unwrap_or_default();
-
-                                    if !field_name.is_empty()
-                                        && !field_type.is_empty()
-                                        && field_type
-                                            .chars()
-                                            .next()
-                                            .map_or(false, |c| c.is_uppercase())
-                                    {
-                                        instance_attr_types.insert(
-                                            (struct_name.clone(), field_name.to_string()),
-                                            field_type,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn scan_class_for_init(
     root: tree_sitter::Node,
     class_name: &str,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
-    init_params_map: &mut HashMap<String, Vec<String>>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
     lang: &str,
 ) {
     // Kotlin: extract primary constructor params (class_parameter nodes with val/var)
@@ -6398,27 +5084,6 @@ fn scan_class_for_init(
         for child in node.named_children(&mut cursor) {
             let ck = child.kind();
 
-            // Python __init__
-            if ck == "function_definition" && lang == "python" {
-                let name = child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                if name == "__init__" {
-                    let params = extract_init_params(child, source);
-                    let ordered_params = extract_init_param_names_ordered(child, source);
-                    init_params_map.insert(class_name.to_string(), ordered_params);
-                    scan_init_body(
-                        child,
-                        class_name,
-                        &params,
-                        source,
-                        instance_attr_types,
-                        attr_to_param_map,
-                    );
-                }
-            }
-
             // TS constructor
             if ck == "method_definition" && lang == "typescript" {
                 let name = child
@@ -6427,38 +5092,18 @@ fn scan_class_for_init(
                     .unwrap_or("");
                 if name == "constructor" {
                     // Scan for this.attr = param patterns
-                    scan_ts_constructor_body(
-                        child,
-                        class_name,
-                        source,
-                        instance_attr_types,
-                        init_params_map,
-                        attr_to_param_map,
-                    );
+                    scan_ts_constructor_body(child, class_name, source, instance_attr_types);
                 }
             }
 
             // Swift init_declaration
             if ck == "init_declaration" && lang == "swift" {
-                scan_swift_init_body(
-                    child,
-                    class_name,
-                    source,
-                    instance_attr_types,
-                    init_params_map,
-                    attr_to_param_map,
-                );
+                scan_swift_init_body(child, class_name, source, instance_attr_types);
             }
 
             // Kotlin anonymous_initializer (init { ... } block)
             if ck == "anonymous_initializer" && lang == "kotlin" {
-                scan_kotlin_init_body(
-                    child,
-                    class_name,
-                    source,
-                    instance_attr_types,
-                    attr_to_param_map,
-                );
+                scan_kotlin_init_body(child, class_name, source, instance_attr_types);
             }
 
             // TS: typed class field declarations `private conn: Connection`
@@ -6514,12 +5159,8 @@ fn scan_swift_init_body(
     class_name: &str,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
-    init_params_map: &mut HashMap<String, Vec<String>>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
 ) {
     let params = extract_init_params(node, source);
-    let ordered_params = extract_init_param_names_ordered(node, source);
-    init_params_map.insert(class_name.to_string(), ordered_params);
 
     // Walk body looking for self.X = Y
     let mut worklist = vec![node];
@@ -6552,17 +5193,11 @@ fn scan_swift_init_body(
                                     || right.kind() == "identifier"
                                 {
                                     let rhs_name = right.utf8_text(source).unwrap_or("");
-                                    if params.contains_key(rhs_name) {
-                                        attr_to_param_map.insert(
+                                    if let Some(Some(type_hint)) = params.get(rhs_name) {
+                                        instance_attr_types.insert(
                                             (class_name.to_string(), prop.to_string()),
-                                            rhs_name.to_string(),
+                                            type_hint.clone(),
                                         );
-                                        if let Some(Some(type_hint)) = params.get(rhs_name) {
-                                            instance_attr_types.insert(
-                                                (class_name.to_string(), prop.to_string()),
-                                                type_hint.clone(),
-                                            );
-                                        }
                                     }
                                 }
                             }
@@ -6789,7 +5424,6 @@ fn scan_kotlin_init_body(
     class_name: &str,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
 ) {
     let mut worklist = vec![node];
     while let Some(wnode) = worklist.pop() {
@@ -6815,15 +5449,6 @@ fn scan_kotlin_init_body(
                                 .child_by_field_name("right")
                                 .or_else(|| child.named_child(1))
                             {
-                                if right.kind() == "simple_identifier"
-                                    || right.kind() == "identifier"
-                                {
-                                    let rhs_name = right.utf8_text(source).unwrap_or("");
-                                    attr_to_param_map.insert(
-                                        (class_name.to_string(), prop.to_string()),
-                                        rhs_name.to_string(),
-                                    );
-                                }
                                 // If RHS is a constructor call, record type directly
                                 if right.kind() == "call_expression" {
                                     let callee = right
@@ -6960,23 +5585,12 @@ fn scan_ts_constructor_body(
     class_name: &str,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
-    init_params_map: &mut HashMap<String, Vec<String>>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
 ) {
     // Extract constructor params
     let params = extract_init_params(node, source);
-    let ordered_params = extract_init_param_names_ordered(node, source);
-    init_params_map.insert(class_name.to_string(), ordered_params);
 
     // Scan body for this.X = param
-    scan_init_body_this(
-        node,
-        class_name,
-        &params,
-        source,
-        instance_attr_types,
-        attr_to_param_map,
-    );
+    scan_init_body_this(node, class_name, &params, source, instance_attr_types);
 }
 
 /// Scan constructor body for `this.attr = param` patterns (TS variant)
@@ -6986,7 +5600,6 @@ fn scan_init_body_this(
     params: &HashMap<String, Option<String>>,
     source: &[u8],
     instance_attr_types: &mut HashMap<(String, String), String>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
 ) {
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -7012,18 +5625,11 @@ fn scan_init_body_this(
                                     if let Some(right) = inner.child_by_field_name("right") {
                                         if right.kind() == "identifier" {
                                             let rhs_name = right.utf8_text(source).unwrap_or("");
-                                            if params.contains_key(rhs_name) {
-                                                attr_to_param_map.insert(
+                                            if let Some(Some(type_hint)) = params.get(rhs_name) {
+                                                instance_attr_types.insert(
                                                     (class_name.to_string(), prop.to_string()),
-                                                    rhs_name.to_string(),
+                                                    type_hint.clone(),
                                                 );
-                                                if let Some(Some(type_hint)) = params.get(rhs_name)
-                                                {
-                                                    instance_attr_types.insert(
-                                                        (class_name.to_string(), prop.to_string()),
-                                                        type_hint.clone(),
-                                                    );
-                                                }
                                             }
                                         }
                                         if right.kind() == "new_expression" {
@@ -7051,33 +5657,6 @@ fn scan_init_body_this(
             }
         }
     }
-}
-
-/// Extract __init__ parameter names in order (excluding self).
-fn extract_init_param_names_ordered(func_node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(params_node) = func_node.child_by_field_name("parameters") {
-        let mut cursor = params_node.walk();
-        for child in params_node.named_children(&mut cursor) {
-            let param_name = if child.kind() == "identifier" {
-                child.utf8_text(source).unwrap_or("").to_string()
-            } else if child.kind() == "typed_parameter" || child.kind() == "typed_default_parameter"
-            {
-                child
-                    .child_by_field_name("name")
-                    .or_else(|| child.named_child(0))
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                continue;
-            };
-            if param_name != "self" && param_name != "cls" && !param_name.is_empty() {
-                names.push(param_name);
-            }
-        }
-    }
-    names
 }
 
 fn extract_init_params(
@@ -7112,189 +5691,6 @@ fn extract_init_params(
         }
     }
     params
-}
-
-fn scan_init_body(
-    root: tree_sitter::Node,
-    class_name: &str,
-    params: &HashMap<String, Option<String>>,
-    source: &[u8],
-    instance_attr_types: &mut HashMap<(String, String), String>,
-    attr_to_param_map: &mut HashMap<(String, String), String>,
-) {
-    let mut worklist = vec![root];
-    while let Some(node) = worklist.pop() {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "expression_statement" || child.kind() == "assignment" {
-                let assign = if child.kind() == "assignment" {
-                    child
-                } else {
-                    let mut inner_cursor = child.walk();
-                    let children: Vec<_> = child.named_children(&mut inner_cursor).collect();
-                    match children.into_iter().find(|c| c.kind() == "assignment") {
-                        Some(a) => a,
-                        None => continue,
-                    }
-                };
-
-                if let Some(left) = assign.child_by_field_name("left") {
-                    if left.kind() == "attribute" {
-                        let obj = left
-                            .child_by_field_name("object")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let attr = left
-                            .child_by_field_name("attribute")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-
-                        if obj == "self" && !attr.is_empty() {
-                            if let Some(right) = assign.child_by_field_name("right") {
-                                if right.kind() == "identifier" {
-                                    let rhs_name = right.utf8_text(source).unwrap_or("");
-                                    // Record attr -> param mapping for later inference
-                                    if params.contains_key(rhs_name) {
-                                        attr_to_param_map.insert(
-                                            (class_name.to_string(), attr.to_string()),
-                                            rhs_name.to_string(),
-                                        );
-                                    }
-                                    // If param has type hint, directly set the type
-                                    if let Some(Some(type_hint)) = params.get(rhs_name) {
-                                        instance_attr_types.insert(
-                                            (class_name.to_string(), attr.to_string()),
-                                            type_hint.clone(),
-                                        );
-                                    }
-                                }
-                                if right.kind() == "call" {
-                                    if let Some(func) = right.child_by_field_name("function") {
-                                        if func.kind() == "identifier" {
-                                            let fname = func.utf8_text(source).unwrap_or("");
-                                            if fname
-                                                .chars()
-                                                .next()
-                                                .map_or(false, |c| c.is_uppercase())
-                                            {
-                                                instance_attr_types.insert(
-                                                    (class_name.to_string(), attr.to_string()),
-                                                    fname.to_string(),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if child.kind() == "block" {
-                worklist.push(child);
-            }
-        }
-    }
-}
-
-/// Infer constructor parameter types by analyzing call sites across all files.
-/// For `Transaction(get_connection())`, we know get_connection() returns Connection,
-/// so Transaction.__init__'s conn param has type Connection,
-/// and self.conn in Transaction has type Connection.
-/// `parsed_files`' AST-path files are supplemented with `precomputed_facts`'
-/// [`PrecomputedFileFacts::ctor_call_sites`] (Field 11, MUL) for any file whose language [`mul_precompute_consumes_calls`]
-/// admits — a fast-path file was never in `parsed_files` to begin with (its
-/// tree died at the end of pass 1), so without this it would silently
-/// contribute nothing to `instance_attr_types` the moment TREELESS starts
-/// accepting `"call"`-bearing files for that language.
-///
-/// `file_paths` drives the merge order (not `parsed_files`'s own order):
-/// on the production chunked-resolve path `parsed_files` is already exactly
-/// `file_paths` with declined files filtered out (`pre_parsed` is `None`
-/// there — no separate pre-parsed group to interleave), so this is order-
-/// preserving for that path, and it is the only order in which a
-/// precomputed-facts file and a freshly-parsed file can be merged uniformly
-/// at all, since only `file_paths` names both.
-#[allow(clippy::too_many_arguments)]
-fn infer_constructor_param_types(
-    parsed_files: &[(String, String, tree_sitter::Tree)],
-    precomputed_facts: Option<&HashMap<String, PrecomputedFileFacts>>,
-    file_paths: &[String],
-    return_type_map: &HashMap<String, String>,
-    init_params: &HashMap<String, Vec<String>>,
-    attr_to_param: &HashMap<(String, String), String>,
-    symbol_table: &SymbolTable,
-    entity_map: &EntityInfoMap,
-    instance_attr_types: &mut HashMap<(String, String), String>,
-) {
-    // the scan writes to `instance_attr_types` only from inside
-    // `if let Some(param_names) = init_params.get(callee)` *and* `if let
-    // Some(attrs) = attr_to_param_index.get(..)` (see `apply_ctor_call_facts`).
-    // With either input empty the whole scan is a provable no-op, so
-    // returning here cannot change the result — but it does skip the two
-    // whole-corpus folds below (`deterministic_return_types_by_name` alone is
-    // `O(every id in symbol_table)`, and this runs once per 5,000-file chunk:
-    // ~83ms of the monster's warm rebuild, entirely thrown away on a corpus
-    // with no constructor-parameter facts at all).
-    if init_params.is_empty() || attr_to_param.is_empty() {
-        return;
-    }
-    let func_name_returns =
-        deterministic_return_types_by_name(return_type_map, symbol_table, entity_map);
-    let attr_to_param_index = build_attr_to_param_index(attr_to_param);
-
-    let parsed_by_path: HashMap<&str, &(String, String, tree_sitter::Tree)> = parsed_files
-        .iter()
-        .map(|entry| (entry.0.as_str(), entry))
-        .collect();
-
-    // Scan every file for constructor call sites: ClassName(arg1, arg2, ...).
-    // Parallelized: each file produces local results, then merged in
-    // `file_paths` order (see this function's own doc comment for why).
-    let local_results: Vec<HashMap<(String, String), String>> = maybe_par_iter!(file_paths)
-        .filter_map(|file_path| {
-            let owned;
-            let descriptors: &[CtorCallFacts] = if let Some(facts) =
-                precomputed_facts.and_then(|m| m.get(file_path))
-            {
-                if facts.ctor_call_sites.is_empty() {
-                    return None;
-                }
-                prof::add_precomputed_ctor_call_engagement(1, facts.ctor_call_sites.len() as u64);
-                &facts.ctor_call_sites
-            } else if let Some(entry) = parsed_by_path.get(file_path.as_str()) {
-                let source = entry.1.as_bytes();
-                owned = record_ctor_call_sites(entry.2.root_node(), source);
-                if owned.is_empty() {
-                    return None;
-                }
-                &owned
-            } else {
-                return None;
-            };
-            let mut local_attr_types: HashMap<(String, String), String> = HashMap::default();
-            apply_ctor_call_facts(
-                descriptors,
-                &func_name_returns,
-                init_params,
-                &attr_to_param_index,
-                &mut local_attr_types,
-            );
-            if local_attr_types.is_empty() {
-                None
-            } else {
-                Some(local_attr_types)
-            }
-        })
-        .collect();
-
-    for local in local_results {
-        let mut local_entries: Vec<((String, String), String)> = local.into_iter().collect();
-        local_entries.sort_unstable();
-        for (key, val) in local_entries {
-            instance_attr_types.entry(key).or_insert(val);
-        }
-    }
 }
 
 /// `name -> return type`, where the type is the one carried by the *first* id
@@ -7340,158 +5736,6 @@ fn deterministic_return_types_by_name(
         }
     }
     by_name
-}
-
-fn build_attr_to_param_index(
-    attr_to_param: &HashMap<(String, String), String>,
-) -> AttrToParamIndex<'_> {
-    let mut index: AttrToParamIndex<'_> =
-        HashMap::with_capacity_and_hasher(attr_to_param.len(), Default::default());
-    for ((class_name, attr_name), param_name) in attr_to_param {
-        index
-            .entry((class_name.as_str(), param_name.as_str()))
-            .or_default()
-            .push((class_name.as_str(), attr_name.as_str()));
-    }
-    for attrs in index.values_mut() {
-        attrs.sort_unstable();
-    }
-    index
-}
-
-/// Field 11 (MUL phase 2/3): one descriptor per
-/// constructor-call-shaped `"call"` node — the syntactic half of the former
-/// `scan_constructor_calls`, minus the corpus-dependent lookups it used to
-/// make inline (`init_params`/`attr_to_param_index`/`func_name_returns`, all
-/// only ever available after every file in the corpus has been scanned).
-/// [`record_ctor_call_sites`] builds these from `(root, source)` alone;
-/// [`apply_ctor_call_facts`] is the corpus-dependent other half. Mirrors
-/// Field 10's `ImportStmtFacts`/`record_import_stmts_pruned`/
-/// `dispatch_import_stmts_from_facts` split exactly.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CtorCallFacts {
-    /// The call's `function` field text — already filtered to "identifier
-    /// node, uppercase first character", the one purely-syntactic pre-filter
-    /// the original scan applied before ever consulting `init_params`, so
-    /// applying it at record time discards nothing a corpus-side lookup
-    /// could still act on.
-    callee: String,
-    /// One entry per named child of the call's `arguments` node, in order.
-    /// `Some(name)` iff that argument is itself a `"call"` node whose own
-    /// `function` field is a bare `identifier` — the only argument shape
-    /// the original `infer_expr_type` ever resolved to a type (its
-    /// `"identifier"` and catch-all arms are both unconditionally `None`).
-    /// `name` is recorded uninterpreted: whether it resolves to a
-    /// constructor type (uppercase) or a function's declared return type
-    /// (via `func_name_returns`) is corpus-dependent and stays in
-    /// [`infer_arg_type_from_shape`].
-    arg_shapes: Vec<Option<String>>,
-}
-
-/// Record [`CtorCallFacts`] in the same worklist order `scan_constructor_calls`
-/// used to walk directly (`push_named_children_rev`) — a pure function of one
-/// file's tree, no corpus-wide map consulted, matching Field 10's
-/// `record_import_stmts_pruned`.
-fn record_ctor_call_sites(root: tree_sitter::Node, source: &[u8]) -> Vec<CtorCallFacts> {
-    let mut out = Vec::new();
-    let mut worklist = vec![root];
-    while let Some(node) = worklist.pop() {
-        if node.kind() == "call" {
-            if let Some(func) = node.child_by_field_name("function") {
-                if func.kind() == "identifier" {
-                    let callee = func.utf8_text(source).unwrap_or("");
-                    if callee.chars().next().map_or(false, |c| c.is_uppercase()) {
-                        let mut arg_shapes = Vec::new();
-                        if let Some(args_node) = node.child_by_field_name("arguments") {
-                            let mut args_cursor = args_node.walk();
-                            for arg in args_node.named_children(&mut args_cursor) {
-                                arg_shapes.push(record_arg_call_shape(arg, source));
-                            }
-                        }
-                        out.push(CtorCallFacts {
-                            callee: callee.to_string(),
-                            arg_shapes,
-                        });
-                    }
-                }
-            }
-        }
-        push_named_children_rev(&mut worklist, node);
-    }
-    out
-}
-
-/// The one argument shape `infer_expr_type`/[`infer_arg_type_from_shape`] can
-/// ever resolve to a type: the argument is itself a `"call"` node whose
-/// `function` field is a bare `identifier`. Every other shape resolves to
-/// `None` deterministically, with no corpus data, so recording anything for
-/// those would be dead weight the apply side could never use.
-fn record_arg_call_shape(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    if node.kind() != "call" {
-        return None;
-    }
-    let func = node.child_by_field_name("function")?;
-    if func.kind() != "identifier" {
-        return None;
-    }
-    Some(func.utf8_text(source).unwrap_or("").to_string())
-}
-
-/// Replays [`record_ctor_call_sites`]' descriptors against the corpus-wide
-/// maps `scan_constructor_calls` used to consult inline — the only
-/// corpus-dependent step, run after every file's own scan has been merged
-/// (Field 11). One-to-one with the old function's body:
-/// `arg_shapes[i]` stands in for `infer_expr_type(arg, source,
-/// func_name_returns)`, resolved by [`infer_arg_type_from_shape`].
-fn apply_ctor_call_facts(
-    descriptors: &[CtorCallFacts],
-    func_name_returns: &HashMap<String, String>,
-    init_params: &HashMap<String, Vec<String>>,
-    attr_to_param_index: &AttrToParamIndex<'_>,
-    instance_attr_types: &mut HashMap<(String, String), String>,
-) {
-    for facts in descriptors {
-        let Some(param_names) = init_params.get(&facts.callee) else {
-            continue;
-        };
-        for (arg_idx, shape) in facts.arg_shapes.iter().enumerate() {
-            if arg_idx >= param_names.len() {
-                break;
-            }
-            let param_name = &param_names[arg_idx];
-            let Some(arg_type) = infer_arg_type_from_shape(shape, func_name_returns) else {
-                continue;
-            };
-            if let Some(attrs) =
-                attr_to_param_index.get(&(facts.callee.as_str(), param_name.as_str()))
-            {
-                for (cn, attr) in attrs {
-                    instance_attr_types
-                        .entry(((*cn).to_string(), (*attr).to_string()))
-                        .or_insert_with(|| arg_type.clone());
-                }
-            }
-        }
-    }
-}
-
-/// The corpus-dependent half of the old `infer_expr_type`'s `"call"` arm:
-/// given the recorded callee name of a `"call"`-shaped argument, resolve its
-/// type — the callee itself if it looks like a constructor (uppercase first
-/// character), or its declared return type from `func_name_returns`
-/// otherwise. `None` (no recorded shape, i.e. every other argument kind)
-/// stays `None`, exactly matching `infer_expr_type`'s `"identifier"` and
-/// catch-all arms.
-fn infer_arg_type_from_shape(
-    shape: &Option<String>,
-    func_name_returns: &HashMap<String, String>,
-) -> Option<String> {
-    let name = shape.as_ref()?;
-    if name.chars().next().map_or(false, |c| c.is_uppercase()) {
-        Some(name.clone())
-    } else {
-        func_name_returns.get(name).cloned()
-    }
 }
 
 /// Resolve pending call types using the return type map.
@@ -7687,10 +5931,8 @@ fn resolve_ts_default_re_exports(
 /// by file — so a namespace-import specifier resolves via `O(1)`
 /// `entities_by_file`/`stem_index` lookups instead of an `O(symbol_table)`
 /// scan repeated once per import statement. Originally JS/TS-only
-/// (hardcoded `is_js_ts_file`); generalized so Python's
-/// `register_namespace_import` — previously the one caller *without* this
-/// index, scanning the whole corpus per bare `import module` statement, see
-/// its doc comment — can share the same structure and the same fix shape.
+/// (hardcoded `is_js_ts_file`); generalized so the `.rs` module-alias
+/// registration (`register_rust_module_import`) can share the same structure.
 fn build_top_level_entity_index(
     symbol_table: &SymbolTable,
     entity_map: &EntityInfoMap,
@@ -7916,8 +6158,8 @@ fn only_js_ts_statement_trivia(mut text: &str) -> bool {
 
 /// Extract import statements from the AST.
 ///
-/// `rec` records every cross-file read the Python/Rust/Go branches below make
-/// against `symbol_table`/`entity_map`/`go_pkg_index`. The JS/TS
+/// `rec` records every cross-file read the `use_declaration` branch below
+/// makes against `symbol_table`/`entity_map`. The JS/TS
 /// branches do not take a recorder: they run only when `skip_js_ts_imports` is
 /// false, which — inside a [`crate::parser::session::GraphSession`] build —
 /// never happens, because `pre_built_import_table` is always `Some` there and
@@ -7943,11 +6185,8 @@ fn extract_imports_from_ast<'a>(
     entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
-    config: &ScopeResolveConfig,
-    go_pkg_index: &GoPkgIndex,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     rust_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     parsed_files: &'a [(String, String, tree_sitter::Tree)],
     content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
@@ -7970,7 +6209,7 @@ fn extract_imports_from_ast<'a>(
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            match classify_import_stmt(child.kind(), config) {
+            match classify_import_stmt(child.kind()) {
                 Some(stmt) => {
                     let descriptor =
                         build_import_stmt_facts(stmt, child, source, skip_js_ts_imports);
@@ -7981,10 +6220,8 @@ fn extract_imports_from_ast<'a>(
                         entity_map,
                         import_table,
                         scopes,
-                        go_pkg_index,
                         ts_default_exports,
                         top_level_entities,
-                        py_top_level_entities,
                         rust_top_level_entities,
                         parsed_files,
                         content_by_file,
@@ -8000,84 +6237,55 @@ fn extract_imports_from_ast<'a>(
 }
 
 /// The import-statement node kinds `extract_imports_from_ast` handles (and
-/// therefore never descends into), classified. Pure in `(kind, config)` —
-/// factored out so the fused walk's recorder, the pruned replay,
-/// and the unfused walk agree on the handled set H by construction: H =
+/// therefore never descends into), classified. Pure in `kind` — factored out
+/// so the fused walk's recorder, the pruned replay, and the unfused walk agree
+/// on the handled set H by construction: H =
 /// {named node c : classify(c) is Some ∧ no ancestor of c is in H}.
 ///
-/// `import_declaration` is the Go handler's arm but the kind also occurs in
-/// Java/Swift grammars, where the handler runs and resolves nothing —
-/// long-standing behavior, preserved as-is.
+/// The kind strings are grammar node names, not language ids, so a kind is
+/// handled for every scope-resolved grammar that happens to use it — which is
+/// why `use_declaration` (Rust's `use`, no longer scope-resolved) still runs
+/// for PHP's trait `use`, and `import_declaration` (Go's import, likewise)
+/// still marks Java/Scala/Swift imports handled.
 #[derive(Clone, Copy)]
 enum ImportStmtKind {
-    /// Python `from x import y` (`import_from_statement`).
-    PyFromImport,
-    /// Python `import mod [as m]` (`import_statement` when the config knows
-    /// both `self` and `cls`).
-    PyModuleImport,
-    /// JS/TS `import ... from '...'` (`import_statement` when the config does
-    /// not know `cls`).
+    /// JS/TS `import ... from '...'` (`import_statement`).
     TsImport,
-    /// JS/TS `export ... from '...'` (`export_statement`, same gate).
+    /// JS/TS `export ... from '...'` (`export_statement`).
     TsReExport,
-    /// Rust `use ...` (`use_declaration`).
-    RustUse,
-    /// Go `import (...)` (`import_declaration`).
-    GoImport,
+    /// `use_declaration` — PHP's trait `use` statement is the one remaining
+    /// scope-resolved grammar that produces it.
+    UseDeclaration,
+    /// `import_declaration` (Java/Scala/Swift).
+    ImportDeclaration,
 }
 
-fn classify_import_stmt(kind: &str, config: &ScopeResolveConfig) -> Option<ImportStmtKind> {
+fn classify_import_stmt(kind: &str) -> Option<ImportStmtKind> {
     match kind {
-        "import_from_statement" => Some(ImportStmtKind::PyFromImport),
-        "import_statement"
-            if config.self_keywords.contains(&"self") && config.self_keywords.contains(&"cls") =>
-        {
-            Some(ImportStmtKind::PyModuleImport)
-        }
-        "import_statement" if !config.self_keywords.contains(&"cls") => {
-            Some(ImportStmtKind::TsImport)
-        }
-        "export_statement" if !config.self_keywords.contains(&"cls") => {
-            Some(ImportStmtKind::TsReExport)
-        }
-        "use_declaration" => Some(ImportStmtKind::RustUse),
-        "import_declaration" => Some(ImportStmtKind::GoImport),
+        "import_statement" => Some(ImportStmtKind::TsImport),
+        "export_statement" => Some(ImportStmtKind::TsReExport),
+        "use_declaration" => Some(ImportStmtKind::UseDeclaration),
+        "import_declaration" => Some(ImportStmtKind::ImportDeclaration),
         _ => None,
     }
 }
 
 /// (MUL phase 2): one serializable
 /// descriptor per import-statement node in `H` (the set `classify_import_stmt`
-/// selects) — every value the six handlers below used to read directly off
+/// selects) — every value the handlers below used to read directly off
 /// the `tree_sitter::Node`, and nothing else. No corpus-wide table
-/// (`symbol_table`/`entity_map`/`go_pkg_index`/`top_level_entities`) is
+/// (`symbol_table`/`entity_map`/`top_level_entities`) is
 /// represented here — those stay pass-2 inputs, supplied to
 /// [`dispatch_import_stmt`] alongside a descriptor, exactly as they used to
 /// be supplied alongside a node.
 ///
-/// The design doc glosses this as one flat `(kind, module path string,
-/// [(original, local)] specifier pairs, alias)` tuple; recovering the actual
-/// per-kind reads below shows that shape undersells two handlers —
-/// `TsImport` interleaves up to three distinct clause items (default name,
-/// namespace alias, named-specifier list) in document order, and `GoImport`
-/// can carry more than one package path per node (`import ("fmt"; "os")`).
 /// An enum keyed on [`ImportStmtKind`] is the minimal-sufficient shape: each
-/// variant carries exactly what its handler reads, no more (`PyFromImport`,
-/// `TsReExport`, `RustUse`, `GoImport`'s single-string case *do* reduce to
-/// the doc's tuple/string shape, unchanged in spirit). `kind` itself needs no
+/// variant carries exactly what its handler reads, no more. `TsImport`
+/// interleaves up to three distinct clause items (default name, namespace
+/// alias, named-specifier list) in document order. `kind` itself needs no
 /// separate field — the variant tag serializes it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ImportStmtFacts {
-    /// Python `from <module> import a, b as c`.
-    PyFromImport {
-        module: String,
-        /// `(original, local)`, already filtered for `!original.is_empty()`.
-        specifiers: Vec<(String, String)>,
-    },
-    /// Python `import a, b as c` — one `(module_name, alias)` pair per
-    /// comma-separated module reference; `alias == module_name` when the
-    /// statement had no `as` clause.
-    PyModuleImport { modules: Vec<(String, String)> },
     /// TS/JS `import ... from '...'`. `items` preserves the exact document
     /// order `import_clause`'s named children were visited in — the same
     /// order the original handler's single pass produced its resolve calls.
@@ -8091,24 +6299,20 @@ pub(crate) enum ImportStmtFacts {
         source: String,
         specifiers: Vec<(String, String)>,
     },
-    /// Rust `use ...;` — the fully preprocessed statement text (trimmed;
-    /// `use `/`pub use ` prefix, trailing `;`, and one leading
-    /// `crate::`/`super::`/`self::` segment already stripped, exactly as
-    /// the original handler prepared it before its own text-only parsing
-    /// began). That parsing is pure string logic with no further tree or
-    /// corpus reads, so it stays in the dispatcher, operating on this field.
-    RustUse { text: String },
-    /// Go `import (...)` — one *full* package import path per spec
-    /// (stripped of quotes; Go-admission
-    /// finding), in the same order the original handler discovered and
-    /// registered them. Used to be reduced to the bare last `/` segment
-    /// here — the same string `register_go_package_imports` still uses as
-    /// its O(1) bucket key — but a bucket keyed only on that bare string
-    /// can hold entries from more than one same-named package (kubernetes
-    /// has dozens of directories literally named `v1`), so the full path
-    /// now survives into `register_go_package_imports`, which needs it to
-    /// pick the one declaring package a given import actually names.
-    GoImport { packages: Vec<String> },
+    /// A `use_declaration` node — the fully preprocessed statement text
+    /// (trimmed; `use `/`pub use ` prefix, trailing `;`, and one leading
+    /// `crate::`/`super::`/`self::` segment already stripped). The parsing is
+    /// Rust `use` syntax (it was written for Rust); the one remaining
+    /// scope-resolved grammar that produces this node kind is PHP's trait
+    /// `use Foo;`, which it reduces to a plain imported name. That parsing is
+    /// pure string logic with no further tree or corpus reads, so it stays in
+    /// the dispatcher, operating on this field.
+    UseDeclaration { text: String },
+    /// An `import_declaration` node (Java/Scala/Swift). Handled — so never
+    /// descended into — but registers nothing: its only resolver was Go's
+    /// package-import registration, and those grammars never produce the
+    /// Go `import_spec`/string-literal children it read.
+    ImportDeclaration,
 }
 
 /// One item of a TS/JS `import_clause`, in the order
@@ -8126,11 +6330,10 @@ pub(crate) enum TsClauseItem {
 /// Build the [`ImportStmtFacts`] descriptor `node` (already classified as
 /// `stmt`) carries. Pure in `(stmt, node, source, skip_js_ts_imports)` —
 /// touches no corpus-wide table, so it is safe to call during pass 1's
-/// precompute (before `symbol_table`/`entity_map`/`go_pkg_index` exist) as
-/// well as during pass 2's tree-driven replay. This function, plus
-/// [`dispatch_import_stmt`] below, is the exact factoring of what used to be
-/// six standalone `extract_*` functions: read-from-tree here,
-/// resolve-against-corpus there.
+/// precompute (before `symbol_table`/`entity_map` exist) as well as during
+/// pass 2's tree-driven replay. This function, plus [`dispatch_import_stmt`]
+/// below, is the exact factoring of the standalone `extract_*` handlers:
+/// read-from-tree here, resolve-against-corpus there.
 ///
 /// `skip_js_ts_imports` short-circuits `TsImport`/`TsReExport` to an empty
 /// stub *before* walking the node: [`dispatch_import_stmt`] discards a
@@ -8144,7 +6347,7 @@ pub(crate) enum TsClauseItem {
 /// no other grammar this crate resolves emits `import_statement`/
 /// `export_statement` nodes classified as `TsImport`/`TsReExport`
 /// (`classify_import_stmt`'s kind strings are JS/TS-specific), so this flag
-/// is a no-op for Python/Rust/Go's own descriptors.
+/// is a no-op for every other descriptor.
 fn build_import_stmt_facts(
     stmt: ImportStmtKind,
     node: tree_sitter::Node,
@@ -8167,65 +6370,6 @@ fn build_import_stmt_facts(
         _ => {}
     }
     match stmt {
-        ImportStmtKind::PyFromImport => {
-            let module = node
-                .child_by_field_name("module_name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .unwrap_or("")
-                .to_string();
-            let mut specifiers = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if child.kind() == "dotted_name" || child.kind() == "aliased_import" {
-                    let (original, local) = if child.kind() == "aliased_import" {
-                        let orig = child
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let alias = child
-                            .child_by_field_name("alias")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or(orig);
-                        (orig.to_string(), alias.to_string())
-                    } else {
-                        let name = child.utf8_text(source).unwrap_or("");
-                        (name.to_string(), name.to_string())
-                    };
-                    if !original.is_empty() {
-                        specifiers.push((original, local));
-                    }
-                }
-            }
-            ImportStmtFacts::PyFromImport { module, specifiers }
-        }
-        ImportStmtKind::PyModuleImport => {
-            let mut modules = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                let (module_name, alias) = match child.kind() {
-                    "dotted_name" => {
-                        let name = child.utf8_text(source).unwrap_or("");
-                        (name.to_string(), name.to_string())
-                    }
-                    "aliased_import" => {
-                        let orig = child
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or("");
-                        let alias = child
-                            .child_by_field_name("alias")
-                            .and_then(|n| n.utf8_text(source).ok())
-                            .unwrap_or(orig);
-                        (orig.to_string(), alias.to_string())
-                    }
-                    _ => continue,
-                };
-                if !module_name.is_empty() {
-                    modules.push((module_name, alias));
-                }
-            }
-            ImportStmtFacts::PyModuleImport { modules }
-        }
         ImportStmtKind::TsImport => {
             let source_path = node
                 .child_by_field_name("source")
@@ -8336,7 +6480,7 @@ fn build_import_stmt_facts(
                 specifiers,
             }
         }
-        ImportStmtKind::RustUse => {
+        ImportStmtKind::UseDeclaration => {
             let text = node.utf8_text(source).unwrap_or("").trim().to_string();
             let text = text.strip_prefix("use ").unwrap_or(&text);
             let text = text.strip_prefix("pub use ").unwrap_or(text);
@@ -8346,59 +6490,11 @@ fn build_import_stmt_facts(
                 .or_else(|| text.strip_prefix("super::"))
                 .or_else(|| text.strip_prefix("self::"))
                 .unwrap_or(text);
-            ImportStmtFacts::RustUse {
+            ImportStmtFacts::UseDeclaration {
                 text: text.to_string(),
             }
         }
-        ImportStmtKind::GoImport => {
-            let mut packages = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if child.kind() == "import_spec" || child.kind() == "import_spec_list" {
-                    collect_go_import_pkg_names(child, source, &mut packages);
-                } else if child.kind() == "interpreted_string_literal"
-                    || child.kind() == "raw_string_literal"
-                {
-                    let path = child
-                        .utf8_text(source)
-                        .unwrap_or("")
-                        .trim_matches('"')
-                        .trim_matches('`');
-                    packages.push(path.to_string());
-                }
-            }
-            ImportStmtFacts::GoImport { packages }
-        }
-    }
-}
-
-/// Tree-only half of the old `extract_go_import_specs`: collects package
-/// import paths (stripped of quotes; the *full* path, not reduced to a
-/// bare last `/` segment — needs the whole string to disambiguate
-/// same-named packages, see [`register_go_package_imports`]) from a Go
-/// `import_spec`/`import_spec_list` subtree, appending them to `out` in the
-/// same LIFO worklist order the original handler dispatched them in.
-fn collect_go_import_pkg_names(root: tree_sitter::Node, source: &[u8], out: &mut Vec<String>) {
-    let mut worklist = vec![root];
-    while let Some(node) = worklist.pop() {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "import_spec" {
-                let path_node = child
-                    .child_by_field_name("path")
-                    .or_else(|| child.named_child(0));
-                if let Some(pn) = path_node {
-                    let path = pn
-                        .utf8_text(source)
-                        .unwrap_or("")
-                        .trim_matches('"')
-                        .trim_matches('`');
-                    out.push(path.to_string());
-                }
-            } else {
-                worklist.push(child);
-            }
-        }
+        ImportStmtKind::ImportDeclaration => ImportStmtFacts::ImportDeclaration,
     }
 }
 
@@ -8418,10 +6514,8 @@ fn dispatch_import_stmt<'a>(
     entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
-    go_pkg_index: &GoPkgIndex,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     rust_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     parsed_files: &'a [(String, String, tree_sitter::Tree)],
     content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
@@ -8430,37 +6524,6 @@ fn dispatch_import_stmt<'a>(
     rec: &mut Recorder,
 ) {
     match descriptor {
-        ImportStmtFacts::PyFromImport { module, specifiers } => {
-            for (original, local) in specifiers {
-                resolve_import_name(
-                    original,
-                    local,
-                    module,
-                    file_path,
-                    &[".py"],
-                    symbol_table,
-                    entity_map,
-                    import_table,
-                    scopes,
-                    rec,
-                );
-            }
-        }
-        ImportStmtFacts::PyModuleImport { modules } => {
-            for (module_name, alias) in modules {
-                register_namespace_import(
-                    alias,
-                    module_name,
-                    file_path,
-                    &[".py"],
-                    py_top_level_entities,
-                    symbol_table,
-                    entity_map,
-                    import_table,
-                    rec,
-                );
-            }
-        }
         ImportStmtFacts::TsImport { source, items } => {
             if !skip_js_ts_imports {
                 for item in items {
@@ -8539,7 +6602,10 @@ fn dispatch_import_stmt<'a>(
                 }
             }
         }
-        // Rust: `use crate::module::Name;` or `use crate::module::{A, B};`.
+        // `use_declaration`, parsed as Rust's `use crate::module::Name;` or
+        // `use crate::module::{A, B};` — the grammar it was written for. Rust
+        // files are no longer scope-resolved; the one remaining producer is
+        // PHP's trait `use Foo;`, which takes the single-name branch below.
         //
         // every segment this parses is tried two ways, not one —
         // as an imported *item* (`resolve_import_name`: `Name` is a
@@ -8566,7 +6632,7 @@ fn dispatch_import_stmt<'a>(
         // doc). `register_rust_module_import` itself does item-granularity
         // disambiguation ([`select_rust_module_item_winner`]) for genuine
         // workspace-local same-stem collisions that survive this skip.
-        ImportStmtFacts::RustUse { text } => {
+        ImportStmtFacts::UseDeclaration { text } => {
             if let Some(brace_pos) = text.find("::{") {
                 let module_path = &text[..brace_pos];
                 let source_module = module_path.rsplit("::").next().unwrap_or(module_path);
@@ -8667,18 +6733,7 @@ fn dispatch_import_stmt<'a>(
                 }
             }
         }
-        ImportStmtFacts::GoImport { packages } => {
-            for import_path in packages {
-                register_go_package_imports(
-                    import_path,
-                    file_path,
-                    import_table,
-                    scopes,
-                    go_pkg_index,
-                    rec,
-                );
-            }
-        }
+        ImportStmtFacts::ImportDeclaration => {}
     }
 }
 
@@ -8714,7 +6769,6 @@ fn record_import_stmts_pruned(
     root: tree_sitter::Node,
     import_starts: &[usize],
     source: &[u8],
-    config: &ScopeResolveConfig,
     skip_js_ts_imports: bool,
 ) -> Vec<ImportStmtFacts> {
     let mut out = Vec::new();
@@ -8722,7 +6776,7 @@ fn record_import_stmts_pruned(
     while let Some(node) = worklist.pop() {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            match classify_import_stmt(child.kind(), config) {
+            match classify_import_stmt(child.kind()) {
                 Some(stmt) => out.push(build_import_stmt_facts(
                     stmt,
                     child,
@@ -8752,10 +6806,8 @@ fn dispatch_import_stmts_from_facts<'a>(
     entity_map: &EntityInfoMap,
     import_table: &mut HashMap<(String, String), String>,
     scopes: &mut Vec<Scope>,
-    go_pkg_index: &GoPkgIndex,
     ts_default_exports: &TsDefaultExportTable,
     top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     rust_top_level_entities: &OnceLock<TopLevelEntityIndex>,
     parsed_files: &'a [(String, String, tree_sitter::Tree)],
     content_by_file: &OnceLock<HashMap<&'a str, &'a str>>,
@@ -8771,10 +6823,8 @@ fn dispatch_import_stmts_from_facts<'a>(
             entity_map,
             import_table,
             scopes,
-            go_pkg_index,
             ts_default_exports,
             top_level_entities,
-            py_top_level_entities,
             rust_top_level_entities,
             parsed_files,
             content_by_file,
@@ -8803,98 +6853,6 @@ fn subtree_contains_import_start(node: tree_sitter::Node, starts: &[usize]) -> b
 /// registration attempt for names that are obviously not modules.
 fn is_rust_type_name(name: &str) -> bool {
     name.chars().next().map_or(false, |c| c.is_uppercase())
-}
-
-/// `import_path` is the full, unreduced string a Go `import_spec` names
-/// (e.g. `k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1`) — see
-/// [`ImportStmtFacts::GoImport`]'s doc comment for why this stopped being
-/// reduced to its last `/` segment before reaching this function.
-#[allow(clippy::too_many_arguments)]
-fn register_go_package_imports(
-    import_path: &str,
-    file_path: &str,
-    import_table: &mut HashMap<(String, String), String>,
-    scopes: &mut Vec<Scope>,
-    go_pkg_index: &GoPkgIndex,
-    rec: &mut Recorder,
-) {
-    // The bare identifier a call site actually spells (`v1` in `v1.Pod{}`)
-    // is still the O(1) bucket key — only the disambiguation inside the
-    // bucket is new.
-    let pkg_name = import_path.rsplit('/').next().unwrap_or(import_path);
-    // Use pre-built package index for O(1) lookup instead of O(symbol_table) scan.
-    // Recorded unconditionally: a miss is a dependency too — a
-    // package that resolves to nothing today may gain entries when a new
-    // file declares that package, which must invalidate this import. Keyed
-    // on the bucket (`pkg_name`), not the winning candidate: any change to
-    // *any* same-named package must invalidate this file's resolution,
-    // since it was consulted to pick the winner.
-    rec.one(Table::GoPkgIndex, pkg_name);
-    let Some(bucket) = go_pkg_index.get(pkg_name) else {
-        return;
-    };
-    // a bucket keyed by bare last segment can hold entries from
-    // more than one declaring package (kubernetes has dozens of directories
-    // literally named `v1`, one per API group) — inserting the whole bucket
-    // used to merge every one of their exported names into this file's
-    // import_table, last-write-wins, with no relationship to which package
-    // this file actually imports. `select_go_pkg_candidate` picks the one
-    // declaring directory `import_path` actually names; a bucket with only
-    // one distinct directory (the overwhelming common case) short-circuits
-    // without comparing anything, so this costs nothing extra when there is
-    // nothing to disambiguate.
-    let Some((_, indices)) = select_go_pkg_candidate(bucket, import_path) else {
-        return;
-    };
-    for &index in indices {
-        let (name, target_id, _) = &bucket.entries[index];
-        import_table.insert((file_path.to_string(), name.clone()), target_id.to_string());
-        if !scopes.is_empty() {
-            scopes[0].defs.insert(name.clone(), target_id.clone());
-        }
-    }
-}
-
-/// Which declaring directory (of possibly several sharing `entries`' bare
-/// bucket key) `import_path` actually means — the fix for 's
-/// kubernetes collision. Picks the directory whose own trailing path
-/// segments overlap `import_path`'s trailing segments the longest: a Go
-/// import path always ends with its package's declaring directory's own
-/// segments (a module-path prefix aside), the same signal
-/// `registry::resolve_go_method_parent_ids` already trusts to key
-/// same-package method/type pairs. Ties (equal overlap) resolve to the
-/// lexicographically smaller directory — deterministic, matching this
-/// module's other tie-breaks (`find_import_file`'s `min_by`).
-///
-/// The directory list and each directory's ordered entry positions are built
-/// once, not collected/sorted from every exported symbol for every import.
-/// Selection allocates nothing and visits distinct directories only. For a
-/// single-directory bucket, `max_by` never invokes its comparator.
-fn select_go_pkg_candidate<'a>(
-    bucket: &'a GoPkgBucket,
-    import_path: &str,
-) -> Option<(&'a str, &'a [usize])> {
-    bucket
-        .directories
-        .iter()
-        .max_by(|a, b| {
-            trailing_path_overlap(import_path, &a.0)
-                .cmp(&trailing_path_overlap(import_path, &b.0))
-                .then_with(|| b.0.cmp(&a.0))
-        })
-        .map(|(directory, indices)| (directory.as_str(), indices.as_slice()))
-}
-
-/// How many trailing `/`-separated segments two paths share, scanning from
-/// the end. `go_pkg_index`'s bucket key already guarantees at least one
-/// segment matches for every candidate this is called with (that shared
-/// last segment is what put them in the same bucket), so this always
-/// returns >= 1 for a real candidate.
-fn trailing_path_overlap(a: &str, b: &str) -> usize {
-    a.rsplit('/')
-        .zip(b.rsplit('/'))
-        .take_while(|(x, y)| x == y)
-        .count()
 }
 
 /// Shared helper: resolve an imported name against the symbol table.
@@ -9087,134 +7045,42 @@ fn register_ts_namespace_import<'a>(
     }
 }
 
-/// Python's bare `import module` form. The read this needs — "any top-level
-/// entity anywhere in the corpus whose file could match `source_path`" — is
-/// still too diffuse to name with individual `(table, key)` pairs, so the
-/// *incremental-invalidation* guard stays whole (see
-/// [`Table::GuardPyWildcardImport`]: any future change to any
-/// `(name, target file)` pair in the corpus invalidates this file, which is
-/// conservative but never wrong) — that guard is unchanged by this comment's
-/// history.
-///
-/// what *did* change is how the match itself is computed. This
-/// used to scan every entry of `symbol_table` — every distinct name across
-/// the whole corpus, and every entity behind each name — checking each
-/// against `source_path`, once per bare `import module` statement in the
-/// build. On home-assistant-core (18k Python files, ~258k entities, bare
-/// module imports like `import logging`/`import os` in nearly every file)
-/// that scan dominated the entire resolve phase: ~1,563s of summed
-/// per-thread CPU time out of a ~91s wall build (attributed via
-/// `SEM_PROFILE_RESOLVE=1`'s `scope_build_ms` bucket — see
-/// "Python pathology" section). `py_top_level_
-/// entities` is the fix: the exact same `(file -> top-level entities)`
-/// grouping [`build_top_level_entity_index`] already builds for JS/TS
-/// namespace imports, generalized to any extension set and built **once**
-/// (lazily, via `OnceLock`) instead of re-scanned per import statement. The
-/// match below reproduces [`import_source_matches_file`]'s semantics exactly
-/// — every corpus file that could plausibly be the target, not just the one
-/// `find_import_file` would pick — just evaluated against the small
-/// candidate/stem set for *this* specifier instead of every entity in the
-/// corpus.
-#[allow(clippy::too_many_arguments)]
-fn register_namespace_import(
-    alias: &str,
-    source_path: &str,
-    file_path: &str,
-    extensions: &[&str],
-    py_top_level_entities: &OnceLock<TopLevelEntityIndex>,
-    symbol_table: &SymbolTable,
-    entity_map: &EntityInfoMap,
-    import_table: &mut HashMap<(String, String), String>,
-    rec: &mut Recorder,
-) {
-    rec.whole(Table::GuardPyWildcardImport);
-    let index = py_top_level_entities
-        .get_or_init(|| build_top_level_entity_index(symbol_table, entity_map, extensions));
-
-    // Every corpus file that could match this specifier: the bounded
-    // relative/dotted candidate list when there is one, or every file
-    // sharing the bare specifier's stem otherwise — the same two cases
-    // `import_source_matches_file` distinguishes, now evaluated as index
-    // lookups instead of a linear scan.
-    let matched_files: Vec<String> =
-        match import_file_candidates(file_path, source_path, extensions) {
-            Some(candidates) => candidates
-                .into_iter()
-                .filter(|candidate| index.entities_by_file.contains_key(candidate.as_str()))
-                .collect(),
-            None => match_bare_import_stem(&index.stem_index, source_path)
-                .cloned()
-                .unwrap_or_default(),
-        };
-
-    for candidate_file in &matched_files {
-        let Some(entries) = index.entities_by_file.get(candidate_file.as_str()) else {
-            continue;
-        };
-        for (name, target_id) in entries {
-            let qualified_name = format!("{alias}.{name}");
-            import_table.insert((file_path.to_string(), qualified_name), target_id.clone());
-        }
-    }
-}
-
 /// Rust: `use crate::a::module_name;` / `use super::module_name;` /
 /// `use self::module_name;` where `module_name` is itself a module (not an
 /// item) — registers every top-level item of the aliased module, keyed
 /// `alias::item`, so a later `module_name::some_fn()` call resolves through
-/// `resolve_ref`'s `ScopedCall` arm.
+/// `resolve_ref`'s `ScopedCall` arm. Rust files are no longer scope-resolved;
+/// this still runs for PHP, whose trait `use` statement is also a
+/// `use_declaration` node (see [`ImportStmtFacts::UseDeclaration`]) — it only
+/// ever matches `.rs` files, so it writes nothing on a corpus without them.
 ///
-/// A structural copy of [`register_namespace_import`] immediately above
-/// (same unbounded-read shape, same stem-match resolution, `::` in the
-/// qualified key instead of `.`) — kept as a separate function rather than
-/// parameterizing the separator because the two also diverge on which
-/// `Table` guard they record (`GuardRustModuleAlias`, not
-/// `GuardPyWildcardImport` — see that variant's doc for why a shared tag
-/// would be misleading despite the identical fold value) and because
-/// `extract_rust_use` calls this once per `use` *segment* whether or not
-/// the segment turns out to name a real module (see this function's own
-/// "no name-only guessing" note below), unlike Python's `import module`
-/// form where the caller already knows it is registering a module.
+/// Records the whole-table guard `GuardRustModuleAlias` (an unbounded read)
+/// and is called once per `use` *segment* whether or not the segment turns
+/// out to name a real module (see the "no name-only guessing" note below).
 ///
 /// No name-only global guessing: a call only resolves through the entries
 /// this writes if `source_path` (the segment as written in a real `use`
-/// statement in this file) actually matches a real corpus file's stem —
-/// exactly [`register_namespace_import`]'s own guarantee, not a new,
-/// looser one. A module name that doesn't exist anywhere in the corpus
-/// matches zero files and writes zero entries. The caller (`dispatch_
-/// import_stmt`'s `RustUse` arm) additionally never calls this at all when
-/// the `use` path is rooted at `std`/`core`/`alloc` — see `rust_use_path_
-/// is_external_std` — since an external stdlib import can never legitimately
-/// name a corpus file outside the rust-lang/rust tree itself.
+/// statement in this file) actually matches a real corpus file's stem.
+/// A module name that doesn't exist anywhere in the corpus matches zero
+/// files and writes zero entries. The caller (`dispatch_import_stmt`'s
+/// `UseDeclaration` arm) additionally never calls this at all when the `use`
+/// path is rooted at `std`/`core`/`alloc` — see
+/// `rust_use_path_is_external_std`.
 ///
-/// `source_path` is only ever the bare last
-/// `::`-segment of the `use` path (`extract_rust_use`'s two call sites both
-/// reduce to it before calling this — see `dispatch_import_stmt`'s `RustUse`
-/// arm). When that bare segment collides — two-plus files share a stem, e.g.
+/// `source_path` is only ever the bare last `::`-segment of the `use` path.
+/// When that bare segment collides — two-plus files share a stem, e.g.
 /// `a/util.rs` and `b/util.rs` — the bucket is a REAL collision only for the
 /// specific item names two-plus of its files actually define; most item
-/// names in a same-stem bucket are defined by exactly one file. An earlier
-/// attempt at this fix pre-filtered the whole bucket down to one file
-/// *before* looking at item names at all (by directory/`qualifying_path`
-/// trailing-overlap, else lexicographically-smallest) — the wrong
-/// granularity: it silently dropped every item the chosen file didn't
-/// happen to define, even when a losing candidate did (verified concretely
-/// on rust-lang/rust: `std::cmp::max` resolved to nothing because the
-/// tie-break's winner among 7 same-stem `cmp.rs` files wasn't `library/
-/// core/src/cmp.rs`, the one that actually defines `max`). This version
-/// instead folds every matched file's entries by item *name* first (`per_
-/// item` below), then asks, per name: how many of the matched files define
-/// it? Exactly one -> that one wins, unconditionally (the original
-/// unfiltered code's accidental correctness on the common case, now
-/// deliberate). Two or more -> [`select_rust_module_item_winner`] uses
+/// names in a same-stem bucket are defined by exactly one file. So every
+/// matched file's entries are folded by item *name* first (`per_item`
+/// below), then, per name: exactly one definer wins unconditionally; two or
+/// more go to [`select_rust_module_item_winner`], which uses
 /// `qualifying_path` (the `use` path's segments before the bare name,
 /// `crate`/`self`/`super` stripped since they name no real directory) to
-/// discriminate by directory trailing-overlap, mirroring [`select_go_pkg_
-/// candidate`]/[`trailing_path_overlap`] but scoped to just the item's own
-/// definers, not the whole bucket; a tie (including an all-zero tie, i.e.
-/// no `qualifying_path` information to discriminate with) writes nothing
-/// for that item — an honest miss, never a last-write-wins blend and never
-/// a lexicographically-smallest guess.
+/// discriminate by directory trailing-overlap; a tie (including an all-zero
+/// tie, i.e. no `qualifying_path` information to discriminate with) writes
+/// nothing for that item — an honest miss, never a last-write-wins blend and
+/// never a lexicographically-smallest guess.
 #[allow(clippy::too_many_arguments)]
 fn register_rust_module_import(
     alias: &str,
@@ -9276,7 +7142,7 @@ fn register_rust_module_import(
 /// wins outright, no scoring needed. Two-plus definers need `qualifying_
 /// path` (the `use` path's segments before the bare alias, [`rust_
 /// qualifying_path`]) to discriminate by directory trailing-overlap
-/// ([`rust_module_path_overlap`], mirroring [`select_go_pkg_candidate`]): a
+/// ([`rust_module_path_overlap`]): a
 /// unique nonzero-overlap winner wins; a tie — including an all-zero tie,
 /// i.e. no information to discriminate with — is an honest miss, never
 /// lexicographically-smallest, never last-write-wins.
@@ -9371,9 +7237,9 @@ fn rust_file_dir(file_path: &str) -> &str {
 
 /// How many trailing segments `qualifying_path` (`::`-separated, e.g. "a" or
 /// "crate::a" already stripped down to "a") and `candidate_dir`
-/// (`/`-separated, a real repo path) share, scanning from the end. Mirrors
-/// [`trailing_path_overlap`]'s shape for Go, adapted to Rust's `::`
-/// separator on one side and a real filesystem `/` separator on the other.
+/// (`/`-separated, a real repo path) share, scanning from the end — Rust's
+/// `::` separator on one side and a real filesystem `/` separator on the
+/// other.
 fn rust_module_path_overlap(qualifying_path: &str, candidate_dir: &str) -> usize {
     qualifying_path
         .rsplit("::")
@@ -9803,24 +7669,6 @@ fn refs_visit_node(
             }
             return;
         }
-
-        // Composite literal nodes (e.g. Go "composite_literal")
-        if config.composite_literal_nodes.contains(&kind) {
-            if let Some(type_node) = node.child_by_field_name("type") {
-                let name = type_node.utf8_text(source).unwrap_or("");
-                if name.chars().next().map_or(false, |c| c.is_uppercase())
-                    && !is_builtin(name, config)
-                {
-                    refs.push_call(
-                        name,
-                        None,
-                        type_node.start_position().row,
-                        type_node.start_byte(),
-                        type_node.end_byte(),
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -10093,16 +7941,6 @@ fn resolve_qualified_callee_name(
 fn resolve_ref(
     ast_ref: &AstRef,
     scope_idx: usize,
-    // True exactly when the caller's entity scope-index lookup missed BOTH
-    // `entity_inner_scope` and `entity_scope_map`, so `scope_idx` is the
-    // `unwrap_or(0)` default rather than a real resolution — the entity's
-    // scope context is *unknown*, not module-level. The Go package-qualified
-    // MethodCall fallback keys off this: guessing a callee from the import
-    // table while blind to the scope context manufactures wrong edges, and a
-    // wrong edge is a lie where a missing edge is merely honest. A lookup HIT
-    // on scope 0 (a genuine module-level entity) leaves this false and the
-    // fallback fully active.
-    scope_lookup_missed: bool,
     scopes: &[Scope],
     symbol_table: &SymbolTable,
     class_members: &ClassMembers,
@@ -10451,7 +8289,7 @@ fn resolve_ref(
                 }
             }
 
-            // Handle chained var.field.method() pattern (e.g. Go receiver: t.Conn.Execute())
+            // Handle chained var.field.method() pattern (e.g. t.conn.execute())
             if receiver.contains('.')
                 && !receiver.starts_with("self.")
                 && !receiver.starts_with("this.")
@@ -10746,24 +8584,6 @@ fn resolve_ref(
                 }
             }
 
-            // Go package-qualified call: package.Function()
-            // Try the method name directly in the import table — but only
-            // when this entity's scope lookup actually HIT. On a missed
-            // entity-id lookup the scope context is unknown (`scope_idx` is
-            // just the unwrap_or(0) default), and guessing a callee from the
-            // import table produces wrong edges: a missing edge is honest, a
-            // wrong edge is a lie. A hit on scope 0 for a genuine
-            // module-level entity keeps the fallback active.
-            if !scope_lookup_missed && file_path.ends_with(".go") {
-                if let Some(target_id) = import_table_by_name.get(method.as_ref()) {
-                    return Some((
-                        canonical_entity_id(entity_map, *target_id),
-                        RefType::Calls,
-                        "import",
-                    ));
-                }
-            }
-
             // Last resort: a repo-wide unique METHOD name is unambiguous even
             // when the receiver's type is unknown — `index.keep_levels()` can
             // only mean the one `keep_levels` the repo defines. One candidate,
@@ -10774,7 +8594,7 @@ fn resolve_ref(
             // unknowable and the missing edge is pure blindness; in static
             // languages an unresolved receiver is deliberate (shadowed
             // import, instance property) and must stay unresolved.
-            let dynamic_receiver_lang = file_path.ends_with(".py") || file_path.ends_with(".rb");
+            let dynamic_receiver_lang = file_path.ends_with(".rb");
             if allow_cross_file_calls && dynamic_receiver_lang {
                 rec.one(Table::SymbolTable, method.as_ref());
                 if let Some(target_ids) = symbol_table.get(method.as_ref()) {
@@ -11187,63 +9007,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn go_directory_index_preserves_flat_selection_order_and_fingerprints() {
-        let mut bucket = GoPkgBucket::default();
-        for directory in ["b/v1", "x/a/v1", "a/v1", "über/v1"] {
-            for ordinal in (0..8).rev() {
-                bucket.entries.push((
-                    format!("Method{}", ordinal % 2),
-                    EntityId::from(format!("{directory}/types.go::method::M{ordinal}")),
-                    directory.to_owned(),
-                ));
-            }
-        }
-        let mut flat = bucket.entries.clone();
-        flat.sort_unstable();
-        let fingerprint = hash_go_pkg_entries(&flat);
-        bucket.index_directories();
-        assert_eq!(bucket.entries, flat);
-        assert_eq!(hash_go_pkg_entries(&bucket.entries), fingerprint);
-        assert_eq!(bucket.directories.len(), 4);
-
-        for import_path in [
-            "example.com/b/v1",
-            "example.com/x/a/v1",
-            "example.com/a/v1",
-            "example.com/über/v1",
-            "unknown/v1",
-            "v1",
-            "",
-        ] {
-            // Original selector: sort all per-entity directories on every call.
-            let mut directories: Vec<&str> = flat.iter().map(|(_, _, dir)| dir.as_str()).collect();
-            directories.sort_unstable();
-            directories.dedup();
-            let expected_dir = directories
-                .into_iter()
-                .max_by(|a, b| {
-                    trailing_path_overlap(import_path, a)
-                        .cmp(&trailing_path_overlap(import_path, b))
-                        .then_with(|| b.cmp(a))
-                })
-                .unwrap();
-            let expected: Vec<_> = flat
-                .iter()
-                .filter(|(_, _, dir)| dir == expected_dir)
-                .collect();
-            let (selected_dir, indices) = select_go_pkg_candidate(&bucket, import_path).unwrap();
-            assert_eq!(selected_dir, expected_dir);
-            assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
-            let selected: Vec<_> = indices
-                .iter()
-                .map(|&index| &bucket.entries[index])
-                .collect();
-            assert_eq!(selected, expected);
-        }
-        assert!(select_go_pkg_candidate(&GoPkgBucket::default(), "v1").is_none());
-    }
-
-    #[test]
     fn scope_ids_share_canonical_storage_and_decode_legacy_text() {
         let text = "über.py::function::callee";
         let legacy = serde_json::json!({
@@ -11282,8 +9045,8 @@ mod tests {
     /// content the container-capacity terms skip — each [`Scope`]'s six
     /// internal collections' String contents, every [`AstRefKind`] variant's
     /// String payloads (`argument_labels` included), and the actual
-    /// key+value string bytes of `return_type_map`/`instance_attr_types`/
-    /// `init_params`/`attr_to_param`. Inserting known-size strings must grow
+    /// key+value string bytes of `return_type_map`/`instance_attr_types`.
+    /// Inserting known-size strings must grow
     /// the estimate by at least those bytes (`.capacity()` >= `.len()` is the
     /// honest bound; a fresh hash table's own slack only adds more).
     #[test]
@@ -11338,7 +9101,7 @@ mod tests {
             end_byte: 1,
         });
 
-        // The four maps: actual key+value string bytes.
+        // The two maps: actual key+value string bytes.
         let (rt_key, rt_val) = ("rt".repeat(55), "RT".repeat(65));
         facts.return_type_map.insert(rt_key.clone(), rt_val.clone());
 
@@ -11348,19 +9111,6 @@ mod tests {
         facts
             .instance_attr_types
             .insert((ia_class.clone(), ia_attr.clone()), ia_ty.clone());
-
-        let ip_key = "ip".repeat(16);
-        let ip_param = "IP".repeat(17);
-        facts
-            .init_params
-            .insert(ip_key.clone(), vec![ip_param.clone()]);
-
-        let ap_class = "ac".repeat(18);
-        let ap_attr = "aa".repeat(19);
-        let ap_param = "AP".repeat(21);
-        facts
-            .attr_to_param
-            .insert((ap_class.clone(), ap_attr.clone()), ap_param.clone());
 
         let after = facts.approx_heap_bytes();
 
@@ -11382,12 +9132,7 @@ mod tests {
             + rt_val.len()
             + ia_class.len()
             + ia_attr.len()
-            + ia_ty.len()
-            + ip_key.len()
-            + ip_param.len()
-            + ap_class.len()
-            + ap_attr.len()
-            + ap_param.len();
+            + ia_ty.len();
 
         assert!(
             after >= before + inserted,
@@ -11449,16 +9194,9 @@ mod tests {
 
         let mut specifiers = Vec::with_capacity(32);
         specifiers.push(("Original".to_string(), "local".to_string()));
-        facts.import_stmts.push(ImportStmtFacts::PyFromImport {
-            module: "pkg.mod".to_string(),
+        facts.import_stmts.push(ImportStmtFacts::TsReExport {
+            source: "./mod".to_string(),
             specifiers,
-        });
-
-        let mut arg_shapes = Vec::with_capacity(32);
-        arg_shapes.push(Some("Inner".to_string()));
-        facts.ctor_call_sites.push(CtorCallFacts {
-            callee: "Outer".to_string(),
-            arg_shapes,
         });
 
         // Pre-condition: every collection above really is over-capacity, or
@@ -11474,16 +9212,12 @@ mod tests {
         };
         assert!(labels_cap_len.0 > labels_cap_len.1);
         let specifiers_cap_len = match &facts.import_stmts[0] {
-            ImportStmtFacts::PyFromImport { specifiers, .. } => {
+            ImportStmtFacts::TsReExport { specifiers, .. } => {
                 (specifiers.capacity(), specifiers.len())
             }
             _ => unreachable!(),
         };
         assert!(specifiers_cap_len.0 > specifiers_cap_len.1);
-        assert!(
-            facts.ctor_call_sites[0].arg_shapes.capacity()
-                > facts.ctor_call_sites[0].arg_shapes.len()
-        );
         let defs_cap_before = facts.scopes[0].defs.capacity();
         let bindings_cap_before = facts.scopes[0].bindings.capacity();
 
@@ -11508,15 +9242,11 @@ mod tests {
             _ => unreachable!(),
         }
         match &facts.import_stmts[0] {
-            ImportStmtFacts::PyFromImport { specifiers, .. } => {
+            ImportStmtFacts::TsReExport { specifiers, .. } => {
                 assert_eq!(specifiers.capacity(), specifiers.len())
             }
             _ => unreachable!(),
         }
-        assert_eq!(
-            facts.ctor_call_sites[0].arg_shapes.capacity(),
-            facts.ctor_call_sites[0].arg_shapes.len()
-        );
 
         // Values are untouched — shrink_to_fit is a pure capacity operation.
         assert_eq!(
@@ -11537,8 +9267,8 @@ mod tests {
             _ => unreachable!(),
         }
         match &facts.import_stmts[0] {
-            ImportStmtFacts::PyFromImport { module, specifiers } => {
-                assert_eq!(module, "pkg.mod");
+            ImportStmtFacts::TsReExport { source, specifiers } => {
+                assert_eq!(source, "./mod");
                 assert_eq!(
                     specifiers,
                     &vec![("Original".to_string(), "local".to_string())]
@@ -11546,11 +9276,6 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        assert_eq!(facts.ctor_call_sites[0].callee, "Outer");
-        assert_eq!(
-            facts.ctor_call_sites[0].arg_shapes,
-            vec![Some("Inner".to_string())]
-        );
 
         // The attributed byte estimate must actually drop: real slack
         // existed pre-shrink (the pre-condition asserts above), so a no-op
@@ -11560,102 +9285,6 @@ mod tests {
             after_bytes < before_bytes,
             "shrink_to_fit did not reduce the attributed estimate: before={before_bytes} after={after_bytes}"
         );
-    }
-
-    /// Honest-miss backstop: the Go package-qualified MethodCall fallback
-    /// (`import_table_by_name.get(method)`) must fire only when this entity's
-    /// scope-index lookup HIT. A hit landing on scope 0 legitimately (a
-    /// genuine module-level entity) keeps the fallback; a MISS (both maps
-    /// lacked the id, so `scope_idx` is just the `unwrap_or(0)` default)
-    /// means the scope context is unknown and guessing a callee from the
-    /// import table would manufacture a wrong edge — a missing edge is
-    /// honest, a wrong edge is a lie.
-    #[test]
-    fn go_import_table_method_fallback_suppressed_only_on_scope_lookup_miss() {
-        let scopes = vec![Scope {
-            parent: None,
-            defs: HashMap::default(),
-            bindings: HashSet::default(),
-            binding_rows: HashMap::default(),
-            types: HashMap::default(),
-            pending_call_types: HashMap::default(),
-            pending_field_types: HashMap::default(),
-            owner_id: None,
-            kind: "module",
-        }];
-        let mut import_table_by_name = HashMap::default();
-        import_table_by_name.insert("Format", "go-fmt-target");
-
-        let ast_ref = AstRef {
-            kind: AstRefKind::MethodCall {
-                receiver: Arc::from("pkg"),
-                method: Arc::from("Format"),
-                argument_labels: None,
-            },
-            row: 0,
-            start_byte: 0,
-            end_byte: 1,
-        };
-        let file_lookup = FileEntityLookup::new(&[]);
-        let empty_entity_map = HashMap::default();
-        let symbol_table = HashMap::default();
-        let class_members = HashMap::default();
-        let owner_members = HashMap::default();
-        let instance_attr_types = HashMap::default();
-        let swift_call_signatures = HashMap::default();
-
-        // Lookup HIT (false): every scope-chain branch misses against the
-        // empty fixtures, so the import-table fallback resolves the method.
-        let resolved_hit = resolve_ref(
-            &ast_ref,
-            0,
-            false,
-            &scopes,
-            &symbol_table,
-            &class_members,
-            &owner_members,
-            &import_table_by_name,
-            &instance_attr_types,
-            &empty_entity_map,
-            &swift_call_signatures,
-            "main.go",
-            "caller-entity",
-            false,
-            false,
-            &file_lookup,
-            &mut ScopeLookupCache::default(),
-            None,
-            &mut Recorder::off(),
-        );
-        assert_eq!(
-            resolved_hit,
-            Some(("go-fmt-target".into(), RefType::Calls, "import"))
-        );
-
-        // Lookup MISS (true): identical inputs except the flag — the
-        // fallback is suppressed and the ref honestly stays unresolved.
-        let resolved_missed = resolve_ref(
-            &ast_ref,
-            0,
-            true,
-            &scopes,
-            &symbol_table,
-            &class_members,
-            &owner_members,
-            &import_table_by_name,
-            &instance_attr_types,
-            &empty_entity_map,
-            &swift_call_signatures,
-            "main.go",
-            "caller-entity",
-            false,
-            false,
-            &file_lookup,
-            &mut ScopeLookupCache::default(),
-            None,
-            &mut Recorder::off(),
-        );
-        assert_eq!(resolved_missed, None);
     }
 
     /// `precompute_js_ts_file_facts` must seed
@@ -12042,160 +9671,6 @@ mod tests {
         );
     }
 
-    /// the id-staleness species itself, at the exact grain it
-    /// bites — a Go method's `PrecomputedFileFacts` entry, built by pass 1
-    /// against the pre-rewrite id, must still be reachable by the
-    /// post-rewrite id pass 2 actually looks up. Same `Hub`/`Ping`
-    /// cross-file receiver shape as
-    /// `go_parent_repair_must_run_before_clean_gate_adjudication` above (the
-    /// witness fixture this one is deliberately modeled on), but probing
-    /// `entity_scope_map`/`entity_inner_scope`/`return_type_map` — the three
-    /// id-keyed fields `resolve_ref`'s pass-2 lookup (`scope_resolve.rs`,
-    /// `entity_inner_scope.get(&entity.id).or_else(|| entity_scope_map.get(&entity.id))`)
-    /// and `deterministic_return_types_by_name` actually read — rather than
-    /// the CLEAN gate's separate cross-file-child question.
-    #[test]
-    fn go_parent_rewrite_id_survives_precomputed_scope_lookup_after_rekey() {
-        let mut package_meta = std::collections::BTreeMap::new();
-        package_meta.insert("go.package".to_string(), "pkgA".to_string());
-
-        let mut hub = mk_entity("pkgA/hub.go", "struct", "Hub", None, 1, 1);
-        hub.metadata = Some(package_meta.clone());
-
-        let mut ping = mk_entity("pkgA/ping.go", "method", "Ping", None, 1, 1);
-        ping.metadata = Some(package_meta);
-        ping.content = "func (h *Hub) Ping() string { return \"pong\" }".to_string();
-
-        // The pre-rewrite id pass 1's precompute would have keyed this
-        // file's facts against — `Ping.parent_id` is still unset here,
-        // exactly as it is inside `precompute_scope_resolvable_file_facts`'s
-        // per-file call, which runs before any file sees the others'.
-        let pre_rewrite_id = ping.id.clone();
-
-        let mut facts = dummy_precomputed_facts_for_test("");
-        facts
-            .entity_scope_map
-            .insert(EntityId::from(&pre_rewrite_id), 0);
-        facts
-            .entity_inner_scope
-            .insert(EntityId::from(&pre_rewrite_id), 0);
-        facts
-            .return_type_map
-            .insert(pre_rewrite_id.clone(), "string".to_string());
-
-        let mut all_entities = vec![hub.clone(), ping];
-        let go_parents_resolved =
-            crate::parser::registry::resolve_go_method_parent_ids(&mut all_entities);
-
-        let post_rewrite_id = all_entities[1].id.clone();
-        assert_ne!(
-            pre_rewrite_id, post_rewrite_id,
-            "sanity: the rewrite must actually change Ping's id when its \
-             receiver type is found cross-file"
-        );
-        assert!(
-            go_parents_resolved.rekeyed_files().contains("pkgA/ping.go"),
-            "the rewrite must report ping.go as touched so a caller knows \
-             which file's precomputed facts need re-keying"
-        );
-
-        // Pre-repair: this is the bug. Pass 2 would look Ping up by its new
-        // id and find nothing in any of the three maps.
-        assert!(facts.entity_scope_map.get(&post_rewrite_id).is_none());
-        assert!(facts.entity_inner_scope.get(&post_rewrite_id).is_none());
-        assert!(facts.return_type_map.get(&post_rewrite_id).is_none());
-
-        facts.rekey_entity_ids(go_parents_resolved.rekeyed_ids());
-
-        // Post-repair: the same precomputed entry, now reachable by the id
-        // pass 2 will actually ask for, and the stale key is gone rather
-        // than left behind as a dangling duplicate.
-        assert_eq!(
-            facts.entity_scope_map.get(&post_rewrite_id),
-            Some(&0),
-            "entity_scope_map must carry Ping's scope entry under its \
-             rewritten id"
-        );
-        assert_eq!(
-            facts.entity_inner_scope.get(&post_rewrite_id),
-            Some(&0),
-            "entity_inner_scope must carry Ping's scope entry under its \
-             rewritten id"
-        );
-        assert_eq!(
-            facts.return_type_map.get(&post_rewrite_id),
-            Some(&"string".to_string()),
-            "return_type_map must carry Ping's return type under its \
-             rewritten id"
-        );
-        assert!(
-            facts.entity_scope_map.get(&pre_rewrite_id).is_none(),
-            "the stale pre-rewrite key must not survive re-keying as a \
-             dangling duplicate"
-        );
-        assert!(facts.entity_inner_scope.get(&pre_rewrite_id).is_none());
-        assert!(facts.return_type_map.get(&pre_rewrite_id).is_none());
-    }
-
-    /// `TREELESS(F)` is decided from what the
-    /// fused walk actually saw, not a per-language table. Originally
-    /// (before Field 10/11 existed) a Python file with a real
-    /// `import` statement failed the gate outright — Python had no pass-2
-    /// consumer for either descriptor kind yet. MUL phase 2
-    /// (`mul_precompute_consumes_imports`/`mul_precompute_consumes_calls`)
-    /// gave it both, so this now pins the *current* verdict: an import-only
-    /// Python file (no `"call"` node) gets fast-path facts, with
-    /// `import_stmts` populated and `ctor_call_sites` empty — the Field-11
-    /// analog of `precompute_scope_resolvable_file_facts_some_for_rust_with_imports`.
-    #[test]
-    fn precompute_scope_resolvable_file_facts_some_for_python_with_imports_only() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "import os\n\nclass Foo:\n    pass\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("has_import.py", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts = precompute_scope_resolvable_file_facts(
-            "has_import.py",
-            source.to_string(),
-            &tree,
-            &entities,
-        );
-        let facts = facts.expect(
-            "a Python file with an import and no call must get fast-path \
-             facts now that Field 10 gives pass 2 a tree-free consumer for \
-             its import_stmts",
-        );
-        assert_eq!(facts.import_stmts.len(), 1);
-        assert!(
-            facts.ctor_call_sites.is_empty(),
-            "no \"call\" node in this fixture, so nothing should be recorded"
-        );
-    }
-
-    /// the positive control — a Python file with **no** import and
-    /// **no** `"call"` node (`TREELESS` per) does get fast-path facts.
-    #[test]
-    fn precompute_scope_resolvable_file_facts_some_when_treeless() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "class Foo:\n    x = 1\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("treeless.py", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts = precompute_scope_resolvable_file_facts(
-            "treeless.py",
-            source.to_string(),
-            &tree,
-            &entities,
-        );
-        assert!(
-            facts.is_some(),
-            "an import-less, call-less Python file is TREELESS and must get \
-             fast-path facts, exactly like the census's HA __init__.py stubs"
-        );
-    }
-
     /// /: Swift is out of scope in every phase —
     /// `build_swift_call_signatures` is corpus-wide, not per-file, so no
     /// Swift file may ever take this fast path regardless of what its own
@@ -12240,8 +9715,7 @@ mod tests {
         assert!(
             facts.is_some(),
             "a C# file with a using directive and a method call must still \
-             be TREELESS — neither classify_import_stmt nor the literal \
-             \"call\" kind fire for C#'s grammar"
+             be TREELESS — classify_import_stmt does not fire for C#'s grammar"
         );
     }
 
@@ -12273,87 +9747,26 @@ mod tests {
              it must be opt-in (SEM_MUL_CSHARP=1) until a memory fix lands"
         );
         // Phase 1 was originally exactly two families (C#, C++); both are
-        // now gated. Everything else — java/rust/python are all gated
-        // off-by-default via SEM_MUL_JAVA/SEM_MUL_RUST/SEM_MUL_PYTHON,
-        // tested below; go is unconditional, tested below too —
-        // and JS/TS, which has its own unconditional precompute on a
-        // different branch — must not reach this producer with the env
-        // switches unset.
-        for lang in ["java", "c", "typescript", "javascript", "swift", "ruby"] {
+        // now gated. Everything else — java is gated off-by-default via
+        // SEM_MUL_JAVA, tested below; rust/go/python are not scope-resolved
+        // at all; JS/TS has its own unconditional precompute on a different
+        // branch — must not reach this producer with the env switches unset.
+        for lang in [
+            "java",
+            "c",
+            "typescript",
+            "javascript",
+            "swift",
+            "ruby",
+            "rust",
+            "go",
+            "python",
+        ] {
             assert!(
                 !mul_precompute_admits(lang),
                 "{lang} is not in MUL phase 1's GO/NO-GO table"
             );
         }
-    }
-
-    /// MUL Phase 2 follow-up: rust was admitted unconditionally
-    /// at (phase-2 section, +11.16%/+11.28%
-    /// against the +15% ceiling), but a same-binary re-verification at
-    /// campaign HEAD found the delta re-measures at +17.72%/+19.64%/
-    /// +19.35% — above the ceiling, three order-swapped pairs, unanimous
-    /// direction. Demoted to opt-in (`SEM_MUL_RUST=1`), gated like C#/Java,
-    /// not unconditional like phase 1's C++ or phase 2's Python.
-    #[test]
-    fn mul_phase2_rust_default_matches_the_measured_verdict() {
-        assert!(
-            !mul_precompute_admits("rust"),
-            "rust's same-binary peak-RSS re-verification measured \
-             +17.72%/+19.64%/+19.35% against the +15% ceiling — above it, \
-             unlike the original +11.16%/+11.28% reading — so it must be \
-             opt-in (SEM_MUL_RUST=1) until a memory fix lands"
-        );
-    }
-
-    /// the Go memory-check work: Go's correctness blocker chain closed
-    /// (/this change's own `rekey_entity_ids`
-    /// fix — `edge_dump_probe` ON vs OFF bit-identical on kubernetes,
-    /// 331,117 edges both sides) and its memory check cleared (+6.78% to
-    /// +8.46% peak footprint, three order-swapped pairs on kubernetes,
-    /// under the +15% ceiling; maxRSS flat). Admitted unconditionally —
-    /// same shape as phase 1's C++/phase 2's Python at their own admission
-    /// time, both since demoted; a default that contradicts the measured
-    /// verdict is a correctness-of-record bug even when every answer it
-    /// produces is right.
-    #[test]
-    fn mul_phase2_go_default_matches_the_measured_verdict() {
-        assert!(
-            mul_precompute_admits("go"),
-            "go's correctness blocker chain is closed and its memory check \
-             (+6.78% to +8.46% peak footprint, three order-swapped pairs on \
-             kubernetes) clears the +15% ceiling on both fields — it must be \
-             unconditional, not gated"
-        );
-    }
-
-    /// MUL: a Rust file
-    /// with a real `use` import must now get fast-path facts. This producer
-    /// does not itself consult `mul_precompute_admits`/`SEM_MUL_RUST` (that
-    /// gate is `graph.rs`'s call-site job) — it only decides TREELESS, and
-    /// Field 10 gives Rust's import handling a tree-free consumer
-    /// (`mul_precompute_consumes_imports`), so a non-empty `import_starts`
-    /// no longer fails the gate for this one language.
-    #[test]
-    fn precompute_scope_resolvable_file_facts_some_for_rust_with_imports() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "use std::collections::HashMap;\n\nstruct Foo {\n    x: i32,\n}\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("foo.rs", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts =
-            precompute_scope_resolvable_file_facts("foo.rs", source.to_string(), &tree, &entities);
-        let facts = facts.expect(
-            "a Rust file with a `use` import must get fast-path facts now \
-             that Field 10 gives pass 2 a tree-free consumer for its \
-             import_stmts",
-        );
-        assert_eq!(
-            facts.import_stmts.len(),
-            1,
-            "the recorded import_stmts must actually carry the \
-             use-declaration descriptor, not an empty stub"
-        );
     }
 
     /// MUL: the shipped default must match the
@@ -12376,78 +9789,12 @@ mod tests {
         );
     }
 
-    /// MUL: a Go file
-    /// with a real multi-spec `import (...)` block must now get fast-path
-    /// facts — mirrors `precompute_scope_resolvable_file_facts_some_for_rust_with_imports`.
-    /// This producer does not itself consult `mul_precompute_admits`
-    /// (that gate is `graph.rs`'s call-site job) — it only
-    /// decides TREELESS, and `mul_precompute_consumes_imports` is unconditional
-    /// (a pure function of `lang_id`, not env-gated), so this is testable
-    /// without touching the process-global admission switch.
-    #[test]
-    fn precompute_scope_resolvable_file_facts_some_for_go_with_imports() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source =
-            "package demo\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\ntype Foo struct {\n\tX int\n}\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("foo.go", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts =
-            precompute_scope_resolvable_file_facts("foo.go", source.to_string(), &tree, &entities);
-        let facts = facts.expect(
-            "a Go file with a multi-spec import block must get fast-path \
-             facts now that Field 10 gives pass 2 a tree-free consumer for \
-             its import_stmts",
-        );
-        assert_eq!(
-            facts.import_stmts.len(),
-            1,
-            "one import_declaration node produces one descriptor, carrying \
-             both package specs (GoImport::packages), not one per spec"
-        );
-        match &facts.import_stmts[0] {
-            ImportStmtFacts::GoImport { packages } => {
-                assert_eq!(
-                    packages,
-                    &vec!["fmt".to_string(), "os".to_string()],
-                    "both packages in the multi-spec block must be recorded, in order"
-                );
-            }
-            other => panic!("expected GoImport, got {other:?}"),
-        }
-    }
-
-    /// A Go file with a function call (`call_expression`, not the literal
-    /// `"call"` Python's grammar uses) must still be TREELESS — same
-    /// pinning as Rust's call-node test.
-    #[test]
-    fn precompute_scope_resolvable_file_facts_go_call_expression_stays_treeless() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "package demo\n\nfunc bar() {}\n\nfunc foo() {\n\tbar()\n}\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("call.go", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts =
-            precompute_scope_resolvable_file_facts("call.go", source.to_string(), &tree, &entities);
-        assert!(
-            facts.is_some(),
-            "Go's call-expression node kind is not the literal \"call\" \
-             ctor-infer hardcodes to Python's grammar, so a Go file with a \
-             function call must still be TREELESS"
-        );
-    }
-
     /// MUL Phase 2: a Java file with a real `import` statement must now get
     /// fast-path facts too. Java's `import_declaration` nodes classify as
-    /// `ImportStmtKind::GoImport` (shared grammar kind, `classify_import_stmt`'s
-    /// doc comment) and dispatch through `register_go_package_imports`,
-    /// which only ever matches `.go`-suffixed entities — a documented,
-    /// pre-existing no-op for Java that this test pins by asserting the
-    /// descriptor is recorded (Field 10 fired) while the resulting
-    /// `import_table` stays empty (the no-op is preserved, not silently
-    /// turned into new resolution behavior by this admission).
+    /// `ImportStmtKind::ImportDeclaration` (`classify_import_stmt`'s doc
+    /// comment), whose descriptor registers nothing — a documented no-op for
+    /// Java that this test pins by asserting the descriptor is recorded
+    /// (Field 10 fired).
     #[test]
     fn precompute_scope_resolvable_file_facts_some_for_java_with_imports() {
         let registry = crate::parser::plugins::create_default_registry();
@@ -12466,7 +9813,7 @@ mod tests {
         let facts = facts.expect(
             "a Java file with import statements must get fast-path facts \
              now that Field 10 gives pass 2 a tree-free consumer for its \
-             import_stmts (via the shared GoImport descriptor kind)",
+             import_stmts (via the ImportDeclaration descriptor kind)",
         );
         assert_eq!(
             facts.import_stmts.len(),
@@ -12475,15 +9822,15 @@ mod tests {
         );
         for stmt in &facts.import_stmts {
             assert!(
-                matches!(stmt, ImportStmtFacts::GoImport { .. }),
-                "Java imports must classify as GoImport (shared grammar \
+                matches!(stmt, ImportStmtFacts::ImportDeclaration),
+                "Java imports must classify as ImportDeclaration (grammar \
                  kind), not a Java-specific variant: {stmt:?}"
             );
         }
     }
 
-    /// A Java file with a method call (`method_invocation`, not the literal
-    /// `"call"` Python's grammar uses) must still be TREELESS.
+    /// A Java file with a method call (`method_invocation`) must still be
+    /// TREELESS.
     #[test]
     fn precompute_scope_resolvable_file_facts_java_method_invocation_stays_treeless() {
         let registry = crate::parser::plugins::create_default_registry();
@@ -12500,307 +9847,7 @@ mod tests {
         );
         assert!(
             facts.is_some(),
-            "Java's method_invocation node kind is not the literal \"call\" \
-             ctor-infer hardcodes to Python's grammar, so a Java file with \
-             a method call must still be TREELESS"
-        );
-    }
-
-    /// The call-node half of TREELESS is untouched by Field 10: Rust's
-    /// grammar names calls `call_expression`, not the literal `"call"`
-    /// Python's grammar uses, so a Rust file with a function call must
-    /// still be TREELESS — pinning that `mul_precompute_consumes_imports`
-    /// widens only the import half of the gate, not the call half
-    /// (`mul_precompute_consumes_calls`, Field 11, Python-only).
-    #[test]
-    fn precompute_scope_resolvable_file_facts_rust_call_expression_stays_treeless() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "fn bar() {}\nfn foo() {\n    bar();\n}\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("call.rs", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts =
-            precompute_scope_resolvable_file_facts("call.rs", source.to_string(), &tree, &entities);
-        assert!(
-            facts.is_some(),
-            "Rust's call-expression node kind is not the literal \"call\" \
-             ctor-infer hardcodes to Python's grammar, so a Rust file with \
-             a function call must still be TREELESS"
-        );
-    }
-
-    /// 2026-08-22 follow-up: python was admitted unconditionally
-    /// (maxRSS -7.95%/-7.80%) and reconfirmed by an earlier re-check (maxRSS -1.63% median,
-    /// weaker but still negative) — both readings comfortably under the old
-    /// +15% maxRSS ceiling. The 2026-08-22 re-verification re-ran that exact protocol capturing *both*
-    /// `/usr/bin/time -l` fields: maxRSS again reads negative
-    /// (-1.04%/-3.99%/-1.71%), but peak memory footprint — the metric the
-    /// ceiling is now measured against — reads +26.02%/+25.29%/+27.44%, above
-    /// the ceiling, three order-swapped pairs, unanimous direction. Demoted
-    /// to opt-in (`SEM_MUL_PYTHON=1`), gated like C#/Java/Rust/C++, not
-    /// unconditional like its own original verdict.
-    #[test]
-    fn mul_phase2_python_default_matches_the_measured_verdict() {
-        assert!(
-            !mul_precompute_admits("python"),
-            "python's maxRSS reading stayed negative under the 2026-08-22 re-verification \
-             (-1.04%/-3.99%/-1.71%), but peak memory footprint — the corrected \
-             metric — measured +26.02%/+25.29%/+27.44% against the +15% \
-             ceiling on home-assistant/core, above it on all three \
-             order-swapped pairs, so it must be opt-in (SEM_MUL_PYTHON=1) \
-             until a memory fix lands"
-        );
-    }
-
-    /// MUL: a Python
-    /// file with both a real import statement *and* a real `"call"` node
-    /// must now get fast-path facts — mirrors the Rust/Go/Java "some_for_..."
-    /// tests, but Python needs both `mul_precompute_consumes_imports` *and*
-    /// `mul_precompute_consumes_calls` to admit it, unlike the other three
-    /// (import-only).
-    #[test]
-    fn precompute_scope_resolvable_file_facts_some_for_python_with_imports_and_calls() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "import os\n\n\nclass Foo:\n    def __init__(self):\n        self.x = Bar()\n";
-        let (entities, tree) = registry
-            .extract_entities_with_tree("foo.py", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let facts =
-            precompute_scope_resolvable_file_facts("foo.py", source.to_string(), &tree, &entities);
-        let facts = facts.expect(
-            "a Python file with an import and a call must get fast-path \
-             facts now that Field 10 and Field 11 both give pass 2 a \
-             tree-free consumer",
-        );
-        assert_eq!(
-            facts.import_stmts.len(),
-            1,
-            "the recorded import_stmts must carry the import descriptor"
-        );
-        assert_eq!(
-            facts.ctor_call_sites.len(),
-            1,
-            "the recorded ctor_call_sites must carry the Bar() call descriptor"
-        );
-        assert_eq!(facts.ctor_call_sites[0].callee, "Bar");
-    }
-
-    /// The positive control's mirror: a Python file with a `"call"` node but
-    /// **no** consumer admitted (simulated by asserting the raw walk output,
-    /// since `mul_precompute_consumes_calls` is a pure function of `lang_id`
-    /// and cannot be flipped per-test) records exactly one descriptor per
-    /// qualifying call — lowercase callees are excluded at record time,
-    /// matching the old `scan_constructor_calls`'s own pre-filter.
-    #[test]
-    fn record_ctor_call_sites_filters_lowercase_callees_and_non_identifier_functions() {
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "class Foo:\n    def __init__(self):\n        self.a = Bar(get_conn())\n        self.b = helper()\n        self.c = obj.Method()\n";
-        let (_entities, tree) = registry
-            .extract_entities_with_tree("mixed.py", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let descriptors = record_ctor_call_sites(tree.root_node(), source.as_bytes());
-        // Only `Bar(get_conn())` qualifies: `helper()` is lowercase (not a
-        // ctor call at all, so never even reaches the worklist's `if` body)
-        // and `obj.Method()`'s function field is `attribute`, not a bare
-        // `identifier`.
-        assert_eq!(
-            descriptors.len(),
-            1,
-            "expected exactly one ctor-call descriptor, got {descriptors:?}"
-        );
-        assert_eq!(descriptors[0].callee, "Bar");
-        assert_eq!(
-            descriptors[0].arg_shapes,
-            vec![Some("get_conn".to_string())],
-            "the sole argument is itself a call to a bare identifier, so its \
-             shape must record that callee name uninterpreted"
-        );
-    }
-
-    /// (MUL phase 2): record-vs-direct
-    /// equivalence witness for the ctor-call scan, mirroring
-    /// `record_then_dispatch_matches_dispatch_direct`'s proof for Field 10.
-    ///
-    /// this used to compare against a *fresh test-local
-    /// transcription* of `scan_constructor_calls`/`infer_expr_type`, written
-    /// once by the same author who wrote the refactor it was meant to check
-    /// — a self-agreement risk (a transcription error shared between spec
-    /// and implementation would pass silently). The functions immediately
-    /// below (`frozen_pre_w5_scan_constructor_calls`/
-    /// `frozen_pre_w5_infer_expr_type`) are instead extracted verbatim from
-    /// git history — `git show 9c80258^:crates/sem-core/src/parser/
-    /// scope_resolve.rs`, the commit immediately before deleted the
-    /// original direct-dispatch scan — with only mechanical renames to avoid
-    /// colliding with `record_ctor_call_sites`/`apply_ctor_call_facts`'s own
-    /// names. This makes the "direct" side genuinely independent evidence: a
-    /// real historical implementation, never touched by the refactor under
-    /// test, not a paraphrase written to match it.
-    #[test]
-    fn record_then_apply_matches_direct_scan_for_ctor_calls() {
-        // --- frozen prior originals from commit 9c80258^ (parent of "MUL
-        // phase-2: build Field 11 (ctor_call_sites)"), verbatim except for
-        // the `frozen_pre_w5_` name prefix. Do not edit to "improve" or
-        // "modernize" — any behavioral drift here defeats the point of this
-        // test. If real behavior needs to change, change the production
-        // functions and let this test go RED as the signal. Clippy style
-        // suggestions (map_or -> is_some_and, explicit counter -> enumerate)
-        // are suppressed for the same reason -- "modernizing" the style would
-        // stop being the verbatim original this test exists to check against. ---
-        #[allow(clippy::unnecessary_map_or, clippy::explicit_counter_loop)]
-        fn frozen_pre_w5_scan_constructor_calls(
-            root: tree_sitter::Node,
-            source: &[u8],
-            func_name_returns: &HashMap<String, String>,
-            init_params: &HashMap<String, Vec<String>>,
-            attr_to_param_index: &AttrToParamIndex<'_>,
-            instance_attr_types: &mut HashMap<(String, String), String>,
-        ) {
-            let mut worklist = vec![root];
-            while let Some(node) = worklist.pop() {
-                let kind = node.kind();
-
-                if kind == "call" {
-                    if let Some(func) = node.child_by_field_name("function") {
-                        if func.kind() == "identifier" {
-                            let class_name = func.utf8_text(source).unwrap_or("");
-                            // Only process uppercase names (constructor calls)
-                            if class_name
-                                .chars()
-                                .next()
-                                .map_or(false, |c| c.is_uppercase())
-                            {
-                                if let Some(param_names) = init_params.get(class_name) {
-                                    // Extract argument types
-                                    if let Some(args_node) = node.child_by_field_name("arguments") {
-                                        let mut arg_idx = 0;
-                                        let mut args_cursor = args_node.walk();
-                                        for arg in args_node.named_children(&mut args_cursor) {
-                                            if arg_idx >= param_names.len() {
-                                                break;
-                                            }
-                                            let param_name = &param_names[arg_idx];
-
-                                            // Try to infer the argument's type
-                                            let arg_type = frozen_pre_w5_infer_expr_type(
-                                                arg,
-                                                source,
-                                                func_name_returns,
-                                            );
-
-                                            if let Some(at) = arg_type {
-                                                if let Some(attrs) = attr_to_param_index
-                                                    .get(&(class_name, param_name.as_str()))
-                                                {
-                                                    for (cn, attr) in attrs {
-                                                        instance_attr_types
-                                                            .entry((
-                                                                (*cn).to_string(),
-                                                                (*attr).to_string(),
-                                                            ))
-                                                            .or_insert_with(|| at.clone());
-                                                    }
-                                                }
-                                            }
-
-                                            arg_idx += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                push_named_children_rev(&mut worklist, node);
-            }
-        }
-
-        /// Infer the type of an expression node.
-        #[allow(clippy::unnecessary_map_or)]
-        fn frozen_pre_w5_infer_expr_type(
-            node: tree_sitter::Node,
-            source: &[u8],
-            func_name_returns: &HashMap<String, String>,
-        ) -> Option<String> {
-            match node.kind() {
-                "call" => {
-                    if let Some(func) = node.child_by_field_name("function") {
-                        if func.kind() == "identifier" {
-                            let name = func.utf8_text(source).unwrap_or("");
-                            // Constructor call: Foo() -> type is Foo
-                            if name.chars().next().map_or(false, |c| c.is_uppercase()) {
-                                return Some(name.to_string());
-                            }
-                            // Function call with known return type
-                            if let Some(ret) = func_name_returns.get(name) {
-                                return Some(ret.clone());
-                            }
-                        }
-                    }
-                    None
-                }
-                "identifier" => {
-                    // Could be a variable, but we don't have scope info here
-                    None
-                }
-                _ => None,
-            }
-        }
-        // --- end frozen prior originals ---
-
-        let registry = crate::parser::plugins::create_default_registry();
-        let source = "class Connection:\n    def __init__(self):\n        pass\n\n\nclass Transaction:\n    def __init__(self, conn):\n        self.conn = conn\n\n\ndef get_connection():\n    return Connection()\n\n\nt = Transaction(get_connection())\n";
-        let (_entities, tree) = registry
-            .extract_entities_with_tree("txn.py", source)
-            .expect("extract");
-        let tree = tree.expect("tree");
-        let source_bytes = source.as_bytes();
-
-        let mut func_name_returns: HashMap<String, String> = HashMap::default();
-        func_name_returns.insert("get_connection".to_string(), "Connection".to_string());
-        let mut init_params: HashMap<String, Vec<String>> = HashMap::default();
-        init_params.insert("Transaction".to_string(), vec!["conn".to_string()]);
-        let mut attr_to_param: HashMap<(String, String), String> = HashMap::default();
-        attr_to_param.insert(
-            ("Transaction".to_string(), "conn".to_string()),
-            "conn".to_string(),
-        );
-        let attr_to_param_index = build_attr_to_param_index(&attr_to_param);
-
-        let mut direct_result: HashMap<(String, String), String> = HashMap::default();
-        frozen_pre_w5_scan_constructor_calls(
-            tree.root_node(),
-            source_bytes,
-            &func_name_returns,
-            &init_params,
-            &attr_to_param_index,
-            &mut direct_result,
-        );
-        assert_eq!(
-            direct_result.get(&("Transaction".to_string(), "conn".to_string())),
-            Some(&"Connection".to_string()),
-            "non-vacuity: the fixture must actually exercise the resolution path"
-        );
-
-        let descriptors = record_ctor_call_sites(tree.root_node(), source_bytes);
-        let mut record_apply_result: HashMap<(String, String), String> = HashMap::default();
-        apply_ctor_call_facts(
-            &descriptors,
-            &func_name_returns,
-            &init_params,
-            &attr_to_param_index,
-            &mut record_apply_result,
-        );
-
-        assert_eq!(
-            record_apply_result, direct_result,
-            "record_ctor_call_sites + apply_ctor_call_facts must land on the \
-             same instance_attr_types as the frozen prior direct tree walk \
-             (commit 9c80258^) -- genuinely independent evidence, not a \
-             self-transcribed spec"
+            "a Java file with a method call must still be TREELESS"
         );
     }
 
@@ -12923,388 +9970,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn go_package_index_entries_are_sorted() {
-        let first_id = "pkg/foo/a.go::function::zeta".to_string();
-        let second_id = "pkg/foo/b.go::function::alpha".to_string();
-
-        let mut symbol_table = HashMap::default();
-        symbol_table.insert(
-            "zeta".to_string(),
-            vec![first_id.clone()].into_iter().map(Into::into).collect(),
-        );
-        symbol_table.insert(
-            "alpha".to_string(),
-            vec![second_id.clone()]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
-
-        let mut entity_map = HashMap::default();
-        entity_map.insert(
-            (first_id.clone()).into(),
-            EntityInfo {
-                id: (first_id.clone()).into(),
-                name: "zeta".to_string(),
-                entity_type: "function".to_string(),
-                file_path: "pkg/foo/a.go".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        entity_map.insert(
-            (second_id.clone()).into(),
-            EntityInfo {
-                id: (second_id.clone()).into(),
-                name: "alpha".to_string(),
-                entity_type: "function".to_string(),
-                file_path: "pkg/foo/b.go".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-
-        let index = build_go_pkg_index(&symbol_table, &entity_map);
-
-        assert_eq!(
-            index.get("foo").map(|bucket| &bucket.entries),
-            Some(&vec![
-                ("alpha".to_string(), second_id.into(), "pkg/foo".to_string()),
-                ("zeta".to_string(), first_id.into(), "pkg/foo".to_string()),
-            ])
-        );
-    }
-
-    /// Filter semantics of the shared `build_go_pkg_index`, which graph.rs's
-    /// cold build path delegates to (unification + the deferred
-    /// route deletion): a Go file contributes to the index via its
-    /// DIRECTORY name only — Go import paths name packages, which are
-    /// directories, never files, so a bucket keyed on a file's own
-    /// stripped-of-`.go` stem is not a legitimate Go resolution key.
-    /// (An earlier revision of this function *did* key on the file stem
-    /// too; kubernetes has real source files literally named after Go
-    /// stdlib packages — `os.go`, `time.go` — and with no signal to tell
-    /// "this bucket entry is the stdlib package" from "this bucket entry is
-    /// a corpus-local file sharing its bare name," that route mis-resolved
-    /// e.g. `time.Now()` calls to a same-named local file's own `Now`, a
-    /// ~5k-edge false-positive class caught in verification and removed.)
-    /// This fixture pins: (1) a `.go` file's own stripped stem creates NO
-    /// bucket of its own, only its parent directory does; (2) the concrete
-    /// stdlib-collision shape (a file literally named `os.go`) creates no
-    /// `"os"` bucket; (3) a non-.go twin still contributes nothing at all,
-    /// anywhere.
-    #[test]
-    fn go_package_index_keys_by_directory_not_file_stem() {
-        let go_id = "pkg/foo/zeta.go::function::Run".to_string();
-        let py_twin_id = "pkg/foo/zeta.py::function::Run".to_string();
-        let py_util_id = "pkg/bar/helpers.py::function::UtilFn".to_string();
-        // The concrete kubernetes shape that exposed the file-stem route's
-        // false positive: a corpus file literally named after a Go stdlib
-        // package (`pkg/kubelet/container/os.go`, minimized here).
-        let stdlib_shadow_id = "pkg/quux/os.go::function::Stat".to_string();
-
-        let mut symbol_table = HashMap::default();
-        symbol_table.insert(
-            "Run".to_string(),
-            vec![go_id.clone(), py_twin_id.clone()]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
-        symbol_table.insert(
-            "UtilFn".to_string(),
-            vec![py_util_id.clone()]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
-        symbol_table.insert(
-            "Stat".to_string(),
-            vec![stdlib_shadow_id.clone()]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
-
-        let mut entity_map = HashMap::default();
-        entity_map.insert(
-            (go_id.clone()).into(),
-            EntityInfo {
-                id: (go_id.clone()).into(),
-                name: "Run".to_string(),
-                entity_type: "function".to_string(),
-                file_path: "pkg/foo/zeta.go".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        entity_map.insert(
-            (py_twin_id.clone()).into(),
-            EntityInfo {
-                id: (py_twin_id.clone()).into(),
-                name: "Run".to_string(),
-                entity_type: "function".to_string(),
-                file_path: "pkg/foo/zeta.py".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        entity_map.insert(
-            (py_util_id.clone()).into(),
-            EntityInfo {
-                id: (py_util_id.clone()).into(),
-                name: "UtilFn".to_string(),
-                entity_type: "function".to_string(),
-                file_path: "pkg/bar/helpers.py".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        entity_map.insert(
-            (stdlib_shadow_id.clone()).into(),
-            EntityInfo {
-                id: (stdlib_shadow_id.clone()).into(),
-                name: "Stat".to_string(),
-                entity_type: "function".to_string(),
-                file_path: "pkg/quux/os.go".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-
-        let index = build_go_pkg_index(&symbol_table, &entity_map);
-
-        // The `.go` file's own stem ("zeta") creates no bucket at all —
-        // only its directory ("foo") does.
-        assert!(!index.contains_key("zeta"));
-        assert_eq!(
-            index.get("foo").map(|bucket| &bucket.entries),
-            Some(&vec![(
-                "Run".to_string(),
-                go_id.clone().into(),
-                "pkg/foo".to_string()
-            )])
-        );
-
-        // The stdlib-name-colliding file creates no "os" bucket — the exact
-        // false positive this fixture pins closed. Its entry is reachable
-        // only via its own directory, "quux".
-        assert!(!index.contains_key("os"));
-        assert_eq!(
-            index.get("quux").map(|bucket| &bucket.entries),
-            Some(&vec![(
-                "Stat".to_string(),
-                stdlib_shadow_id.clone().into(),
-                "pkg/quux".to_string()
-            )])
-        );
-
-        // The `.py` files contribute nothing at all — not under their own
-        // stem, not under their directory, not into any other bucket.
-        assert!(!index.contains_key("helpers"));
-        assert!(!index.contains_key("bar"));
-        for bucket in index.values() {
-            for (_name, id, _dir) in &bucket.entries {
-                assert_ne!(id, &py_twin_id);
-                assert_ne!(id, &py_util_id);
-            }
-        }
-    }
-
-    /// the collision at the root of kubernetes's 30,801-line
-    /// `edge_dump_probe` divergence, reproduced as a minimal fixture. Two
-    /// distinct Go packages, both declared in a directory literally named
-    /// `v1` (kubernetes has dozens — one per API group), each with its own
-    /// `DeepCopyInto` method. Bare-last-segment bucketing (the pre-fix
-    /// behavior) merges both into `go_pkg_index["v1"]`, and inserting the
-    /// whole bucket into a file's `import_table` picks whichever entry
-    /// sorts last — the exact mechanism that resolved kubeadm's
-    /// `DeepCopyInto` call to `pod-security-admission`'s method instead of
-    /// its own.
-    #[test]
-    fn go_package_index_collision_is_real_before_disambiguation() {
-        let kubeadm_id =
-            "cmd/kubeadm/app/apis/kubeadm/v1/types.go::method::DeepCopyInto".to_string();
-        let podsec_id =
-            "staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go::method::DeepCopyInto"
-                .to_string();
-
-        let mut symbol_table = HashMap::default();
-        symbol_table.insert(
-            "DeepCopyInto".to_string(),
-            vec![kubeadm_id.clone(), podsec_id.clone()]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
-
-        let mut entity_map = HashMap::default();
-        entity_map.insert(
-            (kubeadm_id.clone()).into(),
-            EntityInfo {
-                id: (kubeadm_id.clone()).into(),
-                name: "DeepCopyInto".to_string(),
-                entity_type: "method".to_string(),
-                file_path: "cmd/kubeadm/app/apis/kubeadm/v1/types.go".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        entity_map.insert(
-            (podsec_id.clone()).into(),
-            EntityInfo {
-                id: (podsec_id.clone()).into(),
-                name: "DeepCopyInto".to_string(),
-                entity_type: "method".to_string(),
-                file_path: "staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go"
-                    .to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-
-        let index = build_go_pkg_index(&symbol_table, &entity_map);
-        let bucket = index
-            .get("v1")
-            .expect("both packages share the bare \"v1\" bucket — the collision is real");
-        assert_eq!(
-            bucket.entries.len(),
-            2,
-            "the index itself does not distinguish the two \"v1\" packages \
-             by bare name alone — disambiguation happens downstream, in \
-             register_go_package_imports, using each entry's own declaring \
-             directory (the third tuple element)"
-        );
-        let dirs: std::collections::BTreeSet<&str> = bucket
-            .entries
-            .iter()
-            .map(|(_, _, dir)| dir.as_str())
-            .collect();
-        assert_eq!(
-            dirs,
-            std::collections::BTreeSet::from([
-                "cmd/kubeadm/app/apis/kubeadm/v1",
-                "staging/src/k8s.io/pod-security-admission/admission/api/v1",
-            ]),
-            "each entry must carry its own declaring directory, distinct \
-             from the other package's — this is what makes disambiguation \
-             possible at all"
-        );
-    }
-
-    /// `register_go_package_imports` must resolve a
-    /// package-qualified call to the *importing file's own* package, never
-    /// a same-named package elsewhere in the repo — the fix for the
-    /// collision the test above proves exists in the raw index. A file that
-    /// imports kubeadm's `v1` (full import path, not just "v1") must get
-    /// kubeadm's `DeepCopyInto` in its `import_table`, never
-    /// pod-security-admission's — the exact substitution kubernetes's
-    /// `edge_dump_probe` diff caught (30,801 lines,
-    /// Go-admission finding).
-    #[test]
-    fn register_go_package_imports_resolves_the_file_own_import_not_a_same_named_collision() {
-        let kubeadm_id =
-            "cmd/kubeadm/app/apis/kubeadm/v1/types.go::method::DeepCopyInto".to_string();
-        let podsec_id =
-            "staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go::method::DeepCopyInto"
-                .to_string();
-
-        let mut symbol_table = HashMap::default();
-        symbol_table.insert(
-            "DeepCopyInto".to_string(),
-            vec![kubeadm_id.clone(), podsec_id.clone()]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
-
-        let mut entity_map = HashMap::default();
-        entity_map.insert(
-            (kubeadm_id.clone()).into(),
-            EntityInfo {
-                id: (kubeadm_id.clone()).into(),
-                name: "DeepCopyInto".to_string(),
-                entity_type: "method".to_string(),
-                file_path: "cmd/kubeadm/app/apis/kubeadm/v1/types.go".to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        entity_map.insert(
-            (podsec_id.clone()).into(),
-            EntityInfo {
-                id: (podsec_id.clone()).into(),
-                name: "DeepCopyInto".to_string(),
-                entity_type: "method".to_string(),
-                file_path: "staging/src/k8s.io/pod-security-admission/admission/api/v1/types.go"
-                    .to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-
-        let index = build_go_pkg_index(&symbol_table, &entity_map);
-
-        let mut import_table: HashMap<(String, String), String> = HashMap::default();
-        let mut scopes: Vec<Scope> = Vec::new();
-        let mut rec = Recorder::off();
-        register_go_package_imports(
-            "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1",
-            "cmd/kubeadm/app/apis/kubeadm/types.go",
-            &mut import_table,
-            &mut scopes,
-            &index,
-            &mut rec,
-        );
-
-        assert_eq!(
-            import_table.get(&(
-                "cmd/kubeadm/app/apis/kubeadm/types.go".to_string(),
-                "DeepCopyInto".to_string()
-            )),
-            Some(&kubeadm_id),
-            "a file importing kubeadm's v1 must resolve DeepCopyInto to \
-             kubeadm's own method, never pod-security-admission's — before \
-             the fix this landed on whichever of the two sorted last"
-        );
-
-        // The mirror import: a *different* file importing
-        // pod-security-admission's v1 must resolve to *its* DeepCopyInto —
-        // proving this is real per-file disambiguation, not the collision
-        // just happening to sort kubeadm first in this fixture.
-        let mut import_table_2: HashMap<(String, String), String> = HashMap::default();
-        let mut scopes_2: Vec<Scope> = Vec::new();
-        let mut rec_2 = Recorder::off();
-        register_go_package_imports(
-            "k8s.io/pod-security-admission/admission/api/v1",
-            "staging/src/k8s.io/pod-security-admission/admission/api/other.go",
-            &mut import_table_2,
-            &mut scopes_2,
-            &index,
-            &mut rec_2,
-        );
-        assert_eq!(
-            import_table_2.get(&(
-                "staging/src/k8s.io/pod-security-admission/admission/api/other.go".to_string(),
-                "DeepCopyInto".to_string()
-            )),
-            Some(&podsec_id),
-            "the mirror file, importing pod-security-admission's v1, must \
-             resolve to pod-security-admission's own DeepCopyInto"
-        );
-    }
-
     // ------------------------------------------------------------------
     // The fusion-witness: the triple-walk fusion invariant.
     //
@@ -13423,32 +10088,6 @@ mod tests {
             .collect()
     }
 
-    fn register_target(
-        fx_symbols: &mut SymbolTable,
-        fx_entity_map: &mut EntityInfoMap,
-        file: &str,
-        name: &str,
-    ) -> String {
-        let id = format!("{file}::function::{name}");
-        fx_symbols
-            .entry(name.to_string())
-            .or_default()
-            .push(id.clone().into());
-        fx_entity_map.insert(
-            (id.clone()).into(),
-            EntityInfo {
-                id: (id.clone()).into(),
-                name: name.to_string(),
-                entity_type: "function".to_string(),
-                file_path: file.to_string(),
-                parent_id: None,
-                start_line: 1,
-                end_line: 3,
-            },
-        );
-        id
-    }
-
     /// Everything the three walks observably produce, captured after the
     /// phase sequence completes.
     struct WalkOutcome {
@@ -13475,9 +10114,6 @@ mod tests {
         /// witness: same descriptor type, same `dispatch_import_stmt`, two
         /// different traversal/batching strategies around it.
         FusedReplay,
-        /// The deliberately wrong variant for the positive control: handlers
-        /// fired in document order instead of extract's LIFO order.
-        BrokenDocOrder,
     }
 
     fn run_walks(fx: &WalkFixture, mode: ImportMode) -> WalkOutcome {
@@ -13534,7 +10170,7 @@ mod tests {
 
         let (ast_refs, fused_starts): (Vec<AstRef>, Option<Vec<usize>>) = match mode {
             ImportMode::FusedReplay => {
-                let (refs, starts, _saw_call_node) = fused_scope_refs_import_walk(
+                let (refs, starts) = fused_scope_refs_import_walk(
                     tree.root_node(),
                     0,
                     &mut scopes,
@@ -13542,13 +10178,12 @@ mod tests {
                     &mut entity_inner_scope,
                     &file_lookup,
                     &children_by_parent,
-                    &entity_map,
                     source,
                     config,
                 );
                 (refs, Some(starts))
             }
-            ImportMode::SpecSequential | ImportMode::BrokenDocOrder => {
+            ImportMode::SpecSequential => {
                 build_scopes_from_ast(
                     tree.root_node(),
                     0,
@@ -13557,7 +10192,6 @@ mod tests {
                     &mut entity_inner_scope,
                     &file_lookup,
                     &children_by_parent,
-                    &entity_map,
                     source,
                     config,
                 );
@@ -13569,13 +10203,11 @@ mod tests {
         // Phase order preserved: the import handlers run after the walk(s),
         // exactly where the pass-2 closure runs them.
         let mut import_table: HashMap<(String, String), String> = HashMap::default();
-        let go_pkg_index = build_go_pkg_index(&fx.symbol_table, &entity_map);
         let ts_default_exports = TsDefaultExportTable {
             exports_by_file: HashMap::default(),
             sorted_files: Vec::new(),
         };
         let top_level_entities = OnceLock::new();
-        let py_top_level_entities = OnceLock::new();
         let rust_top_level_entities = OnceLock::new();
         let parsed_files: &[(String, String, tree_sitter::Tree)] = &[];
         let content_by_file = OnceLock::new();
@@ -13593,11 +10225,8 @@ mod tests {
                     &entity_map,
                     &mut import_table,
                     &mut scopes,
-                    config,
-                    &go_pkg_index,
                     &ts_default_exports,
                     &top_level_entities,
-                    &py_top_level_entities,
                     &rust_top_level_entities,
                     parsed_files,
                     &content_by_file,
@@ -13609,13 +10238,8 @@ mod tests {
             ImportMode::FusedReplay => {
                 let starts = fused_starts.expect("fused mode records starts");
                 if !starts.is_empty() {
-                    let descriptors = record_import_stmts_pruned(
-                        tree.root_node(),
-                        &starts,
-                        source,
-                        config,
-                        false,
-                    );
+                    let descriptors =
+                        record_import_stmts_pruned(tree.root_node(), &starts, source, false);
                     dispatch_import_stmts_from_facts(
                         &descriptors,
                         fx.file_path,
@@ -13623,10 +10247,8 @@ mod tests {
                         &entity_map,
                         &mut import_table,
                         &mut scopes,
-                        &go_pkg_index,
                         &ts_default_exports,
                         &top_level_entities,
-                        &py_top_level_entities,
                         &rust_top_level_entities,
                         parsed_files,
                         &content_by_file,
@@ -13634,49 +10256,6 @@ mod tests {
                         false,
                         &mut rec,
                     );
-                }
-            }
-            ImportMode::BrokenDocOrder => {
-                // Document-order handler firing: collect H in pre-order, then
-                // dispatch forward. Everything else identical.
-                let mut handled: Vec<tree_sitter::Node> = Vec::new();
-                let mut worklist: Vec<(tree_sitter::Node, bool)> = vec![(tree.root_node(), false)];
-                while let Some((node, in_import)) = worklist.pop() {
-                    let is_import =
-                        !in_import && classify_import_stmt(node.kind(), config).is_some();
-                    if is_import {
-                        handled.push(node);
-                    }
-                    let start = worklist.len();
-                    let mut cursor = node.walk();
-                    worklist.extend(
-                        node.named_children(&mut cursor)
-                            .map(|c| (c, in_import || is_import)),
-                    );
-                    worklist[start..].reverse();
-                }
-                for node in handled {
-                    if let Some(stmt) = classify_import_stmt(node.kind(), config) {
-                        let descriptor = build_import_stmt_facts(stmt, node, source, false);
-                        dispatch_import_stmt(
-                            &descriptor,
-                            fx.file_path,
-                            &fx.symbol_table,
-                            &entity_map,
-                            &mut import_table,
-                            &mut scopes,
-                            &go_pkg_index,
-                            &ts_default_exports,
-                            &top_level_entities,
-                            &py_top_level_entities,
-                            &rust_top_level_entities,
-                            parsed_files,
-                            &content_by_file,
-                            &exported_names_by_file,
-                            false,
-                            &mut rec,
-                        );
-                    }
                 }
             }
         }
@@ -13714,109 +10293,6 @@ mod tests {
     }
 
     // ---- fixture generators, one per family --------------------------------
-
-    fn gen_python(g: &mut Gen, with_order_pair: bool) -> WalkFixture {
-        let file = "gen_fixture.py";
-        let mut symbols = HashMap::default();
-        let mut emap = HashMap::default();
-        for m in 0..3 {
-            for n in 0..3 {
-                register_target(
-                    &mut symbols,
-                    &mut emap,
-                    &format!("mod{m}.py"),
-                    &format!("name{m}_{n}"),
-                );
-            }
-        }
-        register_target(&mut symbols, &mut emap, "mod0.py", "shared");
-        register_target(&mut symbols, &mut emap, "mod1.py", "shared");
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut entities: Vec<SemanticEntity> = Vec::new();
-
-        for _ in 0..g.below(3) {
-            let m = g.below(3);
-            let n = g.below(3);
-            if g.chance(2) {
-                lines.push(format!("from mod{m} import name{m}_{n}"));
-            } else {
-                lines.push(format!("from mod{m} import name{m}_{n} as al{m}_{n}"));
-            }
-        }
-        if g.chance(3) {
-            lines.push(format!("import mod{}", g.below(3)));
-        }
-        if with_order_pair || g.chance(2) {
-            // The order-sensitivity witness: same alias, two targets, nested
-            // in sibling containers. Extract handles the except-branch first,
-            // so mod0's binding lands last and wins.
-            lines.push("try:".to_string());
-            lines.push("    from mod0 import shared as S".to_string());
-            lines.push("except ImportError:".to_string());
-            lines.push("    from mod1 import shared as S".to_string());
-        }
-
-        let n_classes = 1 + g.below(2);
-        for c in 0..n_classes {
-            let cname = format!("Klass{c}");
-            let class_start = lines.len() + 1;
-            lines.push(format!("class {cname}:"));
-            let cid = format!("{file}::class::{cname}");
-            let n_methods = 1 + g.below(2);
-            for m in 0..n_methods {
-                let mname = format!("meth{c}_{m}");
-                let meth_start = lines.len() + 1;
-                lines.push(format!("    def {mname}(self, arg: Klass0):"));
-                lines.push(format!("        x = name{}_{}()", g.below(3), g.below(3)));
-                lines.push("        x.helper()".to_string());
-                if g.chance(3) {
-                    lines.push(format!(
-                        "        from mod{} import name{}_0",
-                        g.below(3),
-                        g.below(3)
-                    ));
-                }
-                lines.push(format!("        return meth{c}_0()"));
-                let meth_end = lines.len();
-                entities.push(mk_entity(
-                    file,
-                    "method",
-                    &mname,
-                    Some(&cid),
-                    meth_start,
-                    meth_end,
-                ));
-            }
-            let class_end = lines.len();
-            entities.insert(
-                entities.len() - n_methods,
-                mk_entity(file, "class", &cname, None, class_start, class_end),
-            );
-        }
-        let fn_start = lines.len() + 1;
-        lines.push("def top_fn(a, b):".to_string());
-        lines.push("    v = Klass0()".to_string());
-        lines.push("    v.meth0_0()".to_string());
-        lines.push("    return top_fn(a, b)".to_string());
-        entities.push(mk_entity(
-            file,
-            "function",
-            "top_fn",
-            None,
-            fn_start,
-            lines.len(),
-        ));
-
-        WalkFixture {
-            file_path: file,
-            ext: ".py",
-            source: lines.join("\n") + "\n",
-            entities,
-            symbol_table: symbols,
-            entity_map: emap,
-        }
-    }
 
     fn gen_csharp(g: &mut Gen) -> WalkFixture {
         let file = "gen_fixture.cs";
@@ -13869,113 +10345,9 @@ mod tests {
         }
     }
 
-    fn gen_rust(g: &mut Gen) -> WalkFixture {
-        let file = "gen_fixture.rs";
-        let mut symbols = HashMap::default();
-        let mut emap = HashMap::default();
-        register_target(&mut symbols, &mut emap, "helpers.rs", "helper_a");
-        register_target(&mut symbols, &mut emap, "helpers.rs", "helper_b");
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut entities: Vec<SemanticEntity> = Vec::new();
-        lines.push("use crate::helpers::helper_a;".to_string());
-        if g.chance(2) {
-            lines.push("mod inner {".to_string());
-            lines.push("    use crate::helpers::helper_b;".to_string());
-            lines.push("    fn nested() { helper_b(); }".to_string());
-            lines.push("}".to_string());
-        }
-        let s_start = lines.len() + 1;
-        lines.push("struct Thing;".to_string());
-        entities.push(mk_entity(file, "struct", "Thing", None, s_start, s_start));
-        let impl_start = lines.len() + 1;
-        lines.push("impl Thing {".to_string());
-        let iid = format!("{file}::impl::Thing");
-        let m_start = lines.len() + 1;
-        lines.push("    fn go(&self) {".to_string());
-        lines.push("        let t = Thing;".to_string());
-        lines.push("        helper_a();".to_string());
-        lines.push("        Thing::go2();".to_string());
-        lines.push("        println!(\"x\");".to_string());
-        lines.push("    }".to_string());
-        let m_end = lines.len();
-        lines.push("}".to_string());
-        let impl_end = lines.len();
-        entities.push(mk_entity(file, "impl", "Thing", None, impl_start, impl_end));
-        entities.push(mk_entity(file, "method", "go", Some(&iid), m_start, m_end));
-        for f in 0..1 + g.below(2) {
-            let f_start = lines.len() + 1;
-            lines.push(format!("fn free{f}() {{"));
-            lines.push(format!("    free{}();", g.below(2)));
-            lines.push("}".to_string());
-            entities.push(mk_entity(
-                file,
-                "function",
-                &format!("free{f}"),
-                None,
-                f_start,
-                lines.len(),
-            ));
-        }
-
-        WalkFixture {
-            file_path: file,
-            ext: ".rs",
-            source: lines.join("\n") + "\n",
-            entities,
-            symbol_table: symbols,
-            entity_map: emap,
-        }
-    }
-
-    fn gen_go(g: &mut Gen) -> WalkFixture {
-        let file = "gen_fixture.go";
-        let mut symbols = HashMap::default();
-        let mut emap = HashMap::default();
-        register_target(&mut symbols, &mut emap, "pkg/util/util.go", "DoWork");
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut entities: Vec<SemanticEntity> = Vec::new();
-        lines.push("package gen".to_string());
-        lines.push("import (".to_string());
-        lines.push("\t\"fmt\"".to_string());
-        lines.push("\tu \"example.com/pkg/util\"".to_string());
-        lines.push(")".to_string());
-        let s_start = lines.len() + 1;
-        lines.push("type Box struct { N int }".to_string());
-        entities.push(mk_entity(file, "struct", "Box", None, s_start, s_start));
-        for m in 0..1 + g.below(2) {
-            let m_start = lines.len() + 1;
-            lines.push(format!("func (b *Box) Fill{m}() {{"));
-            lines.push("\tv := Box{N: 1}".to_string());
-            lines.push("\tfmt.Println(v)".to_string());
-            lines.push("\tu.DoWork()".to_string());
-            lines.push(format!("\tb.Fill{}()", g.below(2)));
-            lines.push("}".to_string());
-            entities.push(mk_entity(
-                file,
-                "method",
-                &format!("Fill{m}"),
-                None,
-                m_start,
-                lines.len(),
-            ));
-        }
-
-        WalkFixture {
-            file_path: file,
-            ext: ".go",
-            source: lines.join("\n") + "\n",
-            entities,
-            symbol_table: symbols,
-            entity_map: emap,
-        }
-    }
-
     /// MUL: Java's import statements are the
     /// documented no-op (`import_declaration` classifies as
-    /// `GoImport`, which only ever resolves against `.go`-suffixed
-    /// entities). This fixture still carries two real imports so the walk
+    /// `ImportDeclaration`, which registers nothing). This fixture still carries two real imports so the walk
     /// records descriptors for them (Field 10 must fire even though
     /// dispatch resolves nothing), plus a same-class method call so the
     /// non-import halves of the walk (scopes/refs) are exercised the same
@@ -14075,18 +10447,16 @@ mod tests {
     #[test]
     fn fused_triple_walk_matches_three_sequential_walks() {
         let mut g = Gen::new(0x5EED_3A03);
-        let mut family_scopes = [0usize; 6];
-        let mut family_refs = [0usize; 6];
-        let mut family_imports = [0usize; 6];
+        let mut family_scopes = [0usize; 3];
+        let mut family_refs = [0usize; 3];
+        let mut family_imports = [0usize; 3];
 
         for round in 0..24 {
+            let _ = round;
             let fixtures: Vec<(usize, WalkFixture)> = vec![
-                (0, gen_python(&mut g, round == 0)),
-                (1, gen_csharp(&mut g)),
-                (2, gen_rust(&mut g)),
-                (3, gen_go(&mut g)),
-                (4, gen_typescript(&mut g)),
-                (5, gen_java(&mut g)),
+                (0, gen_csharp(&mut g)),
+                (1, gen_typescript(&mut g)),
+                (2, gen_java(&mut g)),
             ];
             for (family, fx) in fixtures {
                 let spec = run_walks(&fx, ImportMode::SpecSequential);
@@ -14101,10 +10471,7 @@ mod tests {
 
         // NON-VACUITY: every family battery built real scopes and collected
         // real refs; the resolvable-import families resolved imports.
-        for (family, name) in ["python", "csharp", "rust", "go", "typescript", "java"]
-            .iter()
-            .enumerate()
-        {
+        for (family, name) in ["csharp", "typescript", "java"].iter().enumerate() {
             assert!(
                 family_scopes[family] > 0,
                 "non-vacuity: {name} samples built no non-root scopes"
@@ -14114,258 +10481,18 @@ mod tests {
                 "non-vacuity: {name} samples collected no refs"
             );
         }
-        assert!(
-            family_imports[0] > 0,
-            "non-vacuity: python samples resolved no imports"
-        );
-        assert!(
-            family_imports[2] > 0,
-            "non-vacuity: rust samples resolved no imports"
-        );
-        // MUL: go's aliased multi-spec import
-        // block (`gen_go`'s "example.com/pkg/util" registered against
-        // `pkg/util/util.go::DoWork`) must actually resolve through
-        // `go_pkg_index` — this was an unasserted gap (every other
-        // resolvable-import family had this check, go did not) closed by
-        // this change since it is now touching this exact test.
-        assert!(
-            family_imports[3] > 0,
-            "non-vacuity: go samples resolved no imports"
-        );
         // C# has no import-statement kinds at all — the fused walk must
         // record nothing, which is exactly where dotnet's extract cost goes.
         assert_eq!(
-            family_imports[1], 0,
+            family_imports[0], 0,
             "csharp samples must resolve no imports (no matching kinds)"
         );
-        // MUL Phase 2: Java's imports
-        // classify as GoImport (shared grammar kind) but `go_pkg_index`
-        // only ever matches `.go`-suffixed entities, so dispatch is a
-        // documented no-op — the fused walk still records descriptors
-        // (proven by `precompute_scope_resolvable_file_facts_some_for_
-        // java_with_imports`), it just resolves none of them.
+        // MUL Phase 2: Java's imports classify as ImportDeclaration, whose
+        // dispatch resolves nothing — the fused walk still records
+        // descriptors, it just resolves none.
         assert_eq!(
-            family_imports[5], 0,
-            "java samples must resolve no imports (GoImport dispatch is a \
-             no-op for .java files — go_pkg_index never matches them)"
-        );
-    }
-
-    /// POSITIVE CONTROL for the replay order: on the same-alias-two-targets
-    /// nested pair, extract's LIFO order (except-branch handled before
-    /// try-branch, so the try-branch import wins last-write-wins) differs
-    /// from document order. A fused implementation that fired handlers in
-    /// document order would be caught by the invariant test on exactly this
-    /// fixture; this test proves the fixture really distinguishes the two.
-    #[test]
-    fn import_replay_order_is_load_bearing() {
-        let mut g = Gen::new(0x5EED_3A04);
-        let fx = gen_python(&mut g, true);
-
-        let spec = run_walks(&fx, ImportMode::SpecSequential);
-        let fused = run_walks(&fx, ImportMode::FusedReplay);
-        let broken = run_walks(&fx, ImportMode::BrokenDocOrder);
-
-        let key = (fx.file_path.to_string(), "S".to_string());
-        assert_eq!(
-            spec.import_table.get(&key).map(String::as_str),
-            Some("mod0.py::function::shared"),
-            "spec: extract handles the except-branch first, so the try-branch (mod0) wins"
-        );
-        assert_eq!(
-            spec.import_table.get(&key),
-            fused.import_table.get(&key),
-            "fused replay must reproduce extract's order"
-        );
-        assert_eq!(
-            broken.import_table.get(&key).map(String::as_str),
-            Some("mod1.py::function::shared"),
-            "positive control: document order picks the other target"
-        );
-        assert_ne!(
-            spec.import_table.get(&key),
-            broken.import_table.get(&key),
-            "positive control: the order-witness pair must distinguish the orders"
-        );
-    }
-
-    /// (MUL phase 2): explicit
-    /// record-then-dispatch vs dispatch-direct equivalence witness, on top
-    /// of `fused_triple_walk_matches_three_sequential_walks`'s
-    /// `SpecSequential`-vs-`FusedReplay` comparison (which this refactor
-    /// turns into exactly this same proof, across 5 language families and
-    /// 24 rounds — see that test's and `ImportMode`'s doc comments).
-    ///
-    /// This test pins the composition directly, at the function level
-    /// rather than through `run_walks`' indirection: it calls
-    /// [`record_import_stmts_pruned`] then [`dispatch_import_stmts_from_facts`]
-    /// by hand — the same two calls pass 2's one production caller and the
-    /// fused-walk precompute producer both make, with no wrapper function
-    /// in between — and compares the result against `extract_imports_from_ast`
-    /// dispatching descriptors directly, per node, during a fresh full
-    /// traversal. It also asserts on the raw `Vec<ImportStmtFacts>`
-    /// `record_import_stmts_pruned` returns, so a future change to a
-    /// handler's descriptor shape gets caught here even if it happens not
-    /// to move any `import_table` entry on this fixture.
-    #[test]
-    fn record_then_dispatch_matches_dispatch_direct() {
-        let mut g = Gen::new(0x5EED_3A05);
-        let fx = gen_python(&mut g, true);
-        let config = scope_resolve_config_for_path(fx.file_path).expect("config");
-        let lang = crate::parser::plugins::code::languages::get_language_config(fx.ext)
-            .expect("language config");
-        let tree =
-            crate::parser::plugins::code::parse_tree(lang, &fx.source).expect("fixture parses");
-        let source = fx.source.as_bytes();
-
-        let (_ast_refs, import_starts, _saw_call) = {
-            let file_entities: Vec<&SemanticEntity> = fx.entities.iter().collect();
-            let file_lookup = FileEntityLookup::new(&file_entities);
-            let mut children_by_parent: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
-            let mut entity_map = fx.entity_map.clone();
-            for e in &fx.entities {
-                entity_map.insert(
-                    (&e.id).into(),
-                    EntityInfo {
-                        id: (&e.id).into(),
-                        name: e.name.clone(),
-                        entity_type: e.entity_type.clone(),
-                        file_path: e.file_path.clone(),
-                        parent_id: e.parent_id.as_ref().map(Into::into),
-                        start_line: e.start_line,
-                        end_line: e.end_line,
-                    },
-                );
-                if let Some(ref pid) = e.parent_id {
-                    children_by_parent.entry(pid.as_str()).or_default().push(e);
-                }
-            }
-            let mut scopes: Vec<Scope> = vec![Scope {
-                parent: None,
-                defs: HashMap::default(),
-                bindings: HashSet::default(),
-                binding_rows: HashMap::default(),
-                types: HashMap::default(),
-                pending_call_types: HashMap::default(),
-                pending_field_types: HashMap::default(),
-                owner_id: None,
-                kind: "module",
-            }];
-            let mut entity_scope_map: EntityScopeMap = HashMap::default();
-            let mut entity_inner_scope: EntityScopeMap = HashMap::default();
-            fused_scope_refs_import_walk(
-                tree.root_node(),
-                0,
-                &mut scopes,
-                &mut entity_scope_map,
-                &mut entity_inner_scope,
-                &file_lookup,
-                &children_by_parent,
-                &entity_map,
-                source,
-                config,
-            )
-        };
-        assert!(
-            !import_starts.is_empty(),
-            "non-vacuity: the load-bearing python fixture must have real imports"
-        );
-
-        let descriptors =
-            record_import_stmts_pruned(tree.root_node(), &import_starts, source, config, false);
-        assert!(
-            !descriptors.is_empty(),
-            "record_import_stmts_pruned must record at least one descriptor"
-        );
-
-        let entity_map = fx.entity_map.clone();
-        let go_pkg_index: GoPkgIndex = HashMap::default();
-        let ts_default_exports = TsDefaultExportTable {
-            exports_by_file: HashMap::default(),
-            sorted_files: Vec::new(),
-        };
-        let top_level_entities = OnceLock::new();
-        let py_top_level_entities = OnceLock::new();
-        let rust_top_level_entities = OnceLock::new();
-        let parsed_files: &[(String, String, tree_sitter::Tree)] = &[];
-        let content_by_file = OnceLock::new();
-        let exported_names_by_file: Mutex<HashMap<String, Arc<HashSet<String>>>> =
-            Mutex::new(HashMap::default());
-
-        // Record-then-dispatch, by hand, two calls.
-        let mut by_hand_table: HashMap<(String, String), String> = HashMap::default();
-        let mut by_hand_scopes: Vec<Scope> = vec![Scope {
-            parent: None,
-            defs: HashMap::default(),
-            bindings: HashSet::default(),
-            binding_rows: HashMap::default(),
-            types: HashMap::default(),
-            pending_call_types: HashMap::default(),
-            pending_field_types: HashMap::default(),
-            owner_id: None,
-            kind: "module",
-        }];
-        let mut rec = Recorder::off();
-        dispatch_import_stmts_from_facts(
-            &descriptors,
-            fx.file_path,
-            &fx.symbol_table,
-            &entity_map,
-            &mut by_hand_table,
-            &mut by_hand_scopes,
-            &go_pkg_index,
-            &ts_default_exports,
-            &top_level_entities,
-            &py_top_level_entities,
-            &rust_top_level_entities,
-            parsed_files,
-            &content_by_file,
-            &exported_names_by_file,
-            false,
-            &mut rec,
-        );
-
-        // Dispatch-direct: build a descriptor and dispatch it immediately,
-        // per node, during a fresh full traversal (extract's own shape) —
-        // must land on the same import_table as the batched record-then-
-        // dispatch path above.
-        let mut direct_table: HashMap<(String, String), String> = HashMap::default();
-        let mut direct_scopes: Vec<Scope> = vec![Scope {
-            parent: None,
-            defs: HashMap::default(),
-            bindings: HashSet::default(),
-            binding_rows: HashMap::default(),
-            types: HashMap::default(),
-            pending_call_types: HashMap::default(),
-            pending_field_types: HashMap::default(),
-            owner_id: None,
-            kind: "module",
-        }];
-        let mut rec3 = Recorder::off();
-        extract_imports_from_ast(
-            tree.root_node(),
-            fx.file_path,
-            source,
-            &fx.symbol_table,
-            &entity_map,
-            &mut direct_table,
-            &mut direct_scopes,
-            config,
-            &go_pkg_index,
-            &ts_default_exports,
-            &top_level_entities,
-            &py_top_level_entities,
-            &rust_top_level_entities,
-            parsed_files,
-            &content_by_file,
-            &exported_names_by_file,
-            false,
-            &mut rec3,
-        );
-
-        assert_eq!(
-            by_hand_table, direct_table,
-            "record-then-dispatch must equal dispatch-direct"
+            family_imports[2], 0,
+            "java samples must resolve no imports (ImportDeclaration dispatch is a no-op)"
         );
     }
 
@@ -14383,7 +10510,6 @@ mod tests {
     fn skipped_ts_import_descriptor_is_a_stub_not_a_full_walk() {
         let mut g = Gen::new(0x5EED_3A06);
         let fx = gen_typescript(&mut g);
-        let config = scope_resolve_config_for_path(fx.file_path).expect("config");
         let lang = crate::parser::plugins::code::languages::get_language_config(fx.ext)
             .expect("language config");
         let tree =
@@ -14394,9 +10520,9 @@ mod tests {
         let import_node = tree
             .root_node()
             .named_children(&mut cursor)
-            .find(|c| classify_import_stmt(c.kind(), config).is_some())
+            .find(|c| classify_import_stmt(c.kind()).is_some())
             .expect("fixture has a leading TS import statement");
-        let stmt = classify_import_stmt(import_node.kind(), config).expect("classified");
+        let stmt = classify_import_stmt(import_node.kind()).expect("classified");
 
         let full = build_import_stmt_facts(stmt, import_node, source, false);
         let skipped = build_import_stmt_facts(stmt, import_node, source, true);
@@ -14427,13 +10553,11 @@ mod tests {
         // (empty) effect once `skip_js_ts_imports=true` at dispatch time —
         // the stub is a pure optimization, never an observable difference.
         let entity_map = fx.entity_map.clone();
-        let go_pkg_index: GoPkgIndex = HashMap::default();
         let ts_default_exports = TsDefaultExportTable {
             exports_by_file: HashMap::default(),
             sorted_files: Vec::new(),
         };
         let top_level_entities = OnceLock::new();
-        let py_top_level_entities = OnceLock::new();
         let rust_top_level_entities = OnceLock::new();
         let parsed_files: &[(String, String, tree_sitter::Tree)] = &[];
         let content_by_file = OnceLock::new();
@@ -14462,10 +10586,8 @@ mod tests {
                 &entity_map,
                 &mut table,
                 &mut scopes,
-                &go_pkg_index,
                 &ts_default_exports,
                 &top_level_entities,
-                &py_top_level_entities,
                 &rust_top_level_entities,
                 parsed_files,
                 &content_by_file,
@@ -14661,14 +10783,10 @@ class ViaParamProp {
         let tree = parser.parse(&source[..], None).expect("parse");
 
         let mut instance_attr_types = HashMap::default();
-        let mut init_params_map = HashMap::default();
-        let mut attr_to_param_map = HashMap::default();
         scan_init_self_attrs(
             tree.root_node(),
             &source[..],
             &mut instance_attr_types,
-            &mut init_params_map,
-            &mut attr_to_param_map,
             scope_config,
         );
 

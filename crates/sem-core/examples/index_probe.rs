@@ -310,12 +310,7 @@ fn oracle(graph: &EntityGraph, bytes: Vec<u8>) -> QueryIndex {
 /// `refs_of_typed` decodes through the writer's own `format::refs::pack` —
 /// this label only has to be *consistent*, not equal to the writer's u8s).
 fn ref_type_label(rt: &sem_core::parser::graph::RefType) -> &'static str {
-    use sem_core::parser::graph::RefType;
-    match rt {
-        RefType::Calls => "calls",
-        RefType::TypeRef => "typeref",
-        RefType::Imports => "imports",
-    }
+    rt.as_str()
 }
 
 /// Outcome of one exhaustive pass of [`refs_check`] — kept separate from

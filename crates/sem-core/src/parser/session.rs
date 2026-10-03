@@ -685,11 +685,7 @@ mod tests {
             .edges
             .iter()
             .map(|e| {
-                let kind = match e.ref_type {
-                    RefType::Calls => "calls",
-                    RefType::TypeRef => "typeref",
-                    RefType::Imports => "imports",
-                };
+                let kind = e.ref_type.as_str();
                 format!("{}\u{1f}{}\u{1f}{}", e.from_entity, e.to_entity, kind)
             })
             .collect();
@@ -1393,12 +1389,12 @@ mod tests {
     /// A hub every file imports (via `from pkg.hub import ...`), a same-package
     /// `Mid` that calls through it, a constructor-inference pair (`Widget`'s
     /// `__init__` stashes its `hub` argument as `self.hub`, and `factory.py`
-    /// instantiates it as `Widget(Hub())` from a third file — exactly the
-    /// cross-file constructor-parameter-type inference
-    /// `infer_constructor_param_types`/`scan_constructor_calls` exists for), a
-    /// bare `import pkg.hub` consumer (exercises `register_namespace_import`'s
-    /// whole-table guard, `Table::GuardPyWildcardImport`), two files declaring
-    /// the same class name, six leaves, and four islands.
+    /// instantiates it as `Widget(Hub())` from a third file), a bare
+    /// `import pkg.hub` consumer, two files declaring the same class name, six
+    /// leaves, and four islands. These are the shapes the old scope resolver
+    /// special-cased for Python (cross-file constructor-parameter inference, the
+    /// bare-`import` whole-table guard); Python's call graph now comes from
+    /// `parser::calls`, and the fixture keeps holding warm == cold over them.
     fn write_python_fixture(root: &Path) -> Vec<String> {
         write(root, "pkg/__init__.py", "");
         write(
@@ -1418,16 +1414,15 @@ mod tests {
             "pkg/widget.py",
             "class Widget:\n    def __init__(self, hub):\n        self.hub = hub\n\n    def relay(self):\n        return self.hub.ping()\n",
         );
-        // ...instantiated with a `Hub` here (the constructor-call site
-        // `scan_constructor_calls` scans for)...
+        // ...instantiated with a `Hub` here...
         write(
             root,
             "pkg/factory.py",
             "from pkg.hub import Hub\nfrom pkg.widget import Widget\n\n\ndef make_widget():\n    w = Widget(Hub())\n    return w\n",
         );
-        // ...so that `Widget.relay`'s `self.hub.ping()` above (in a *fourth*
-        // file's read set) only resolves correctly if `instance_attr_types`
-        // learned `(Widget, hub) -> Hub` from `factory.py`'s call site.
+        // ...so that `Widget.relay`'s `self.hub.ping()` above only resolves
+        // correctly if `(Widget, hub) -> Hub` is learned from `factory.py`'s
+        // call site.
         write(
             root,
             "pkg/dupe_a.py",
@@ -1438,8 +1433,7 @@ mod tests {
             "pkg/dupe_b.py",
             "class Shape:\n    def area(self):\n        return 2\n",
         );
-        // Bare `import module` form: `register_namespace_import`'s
-        // whole-table guard, not a bounded per-key read.
+        // Bare `import module` form.
         write(
             root,
             "pkg/wildcard_consumer.py",
@@ -1464,18 +1458,6 @@ mod tests {
             );
         }
         walk_sorted(root)
-    }
-
-    #[test]
-    fn python_oracle_no_op_rebuild_is_green() {
-        let stats = assert_warm_matches_cold_for("python-no-op", write_python_fixture, |root| {
-            (walk_sorted(root), Vec::new())
-        });
-        assert_eq!(stats.files_seed_red, 0);
-        assert!(
-            stats.files_green > 0,
-            "a no-op Python rebuild must reuse something: {stats:?}"
-        );
     }
 
     #[test]
@@ -1511,9 +1493,9 @@ mod tests {
 
     #[test]
     fn python_oracle_touch_the_wildcard_import_target() {
-        // `wildcard_consumer.py`'s bare `import pkg.hub` depends on the whole
-        // `Table::GuardPyWildcardImport` surface, not a bounded key — a hub
-        // rewrite must still invalidate it correctly.
+        // `wildcard_consumer.py`'s bare `import pkg.hub` depends on every
+        // top-level name of the module, not a bounded key — a hub rewrite
+        // must still invalidate it correctly.
         assert_warm_matches_cold_for(
             "python-touch-wildcard-target",
             write_python_fixture,
@@ -1528,55 +1510,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn python_blast_radius_is_proportional_to_the_edit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let files = write_python_fixture(root);
-        let registry = create_default_registry();
-        let mut session = GraphSession::build(root, &files, &registry);
-
-        let path = "pkg/island_0.py";
-        let mut body = std::fs::read_to_string(root.join(path)).expect("read");
-        body.push_str("\n\ndef islandExtra():\n    return 9\n");
-        write(root, path, &body);
-        let leaf = session.rebuild(&files, &[path.to_string()], &registry);
-        assert!(
-            leaf.files_red <= 3,
-            "a leaf touch should keep the RED set tiny, got {leaf:?}"
-        );
-
-        // A structural rewrite of the hub every other file reaches, directly
-        // or through ctor-inference — this must RED its true dependents.
-        write(
-            root,
-            "pkg/hub.py",
-            "class Hub:\n    def ping(self):\n        return 'x'\n\n    def extra(self):\n        return True\n\n\ndef spawn_hub():\n    return Hub()\n",
-        );
-        let hub = session.rebuild(&files, &["pkg/hub.py".to_string()], &registry);
-        assert!(
-            hub.files_red > leaf.files_red,
-            "a structural hub edit must invalidate more than a leaf edit: hub {hub:?} vs leaf {leaf:?}"
-        );
-        let green = session.green_files();
-        for i in 0..4 {
-            let island = format!("pkg/island_{i}.py");
-            assert!(
-                green.contains(island.as_str()),
-                "{island} imports nothing shared and must stay GREEN: {hub:?}"
-            );
-        }
-    }
-
     // --- Go -------------------------------------------------------------
 
     /// `pkgA` spans two files (`hub.go`, `hub_extra.go`) so `Hub`'s two
     /// methods exercise `resolve_go_method_parent_ids`'s cross-file receiver
     /// rewrite — `Shared`'s `parent_id` is only known once both files'
     /// entities are merged. `mid.go` calls `MakeHub` from the same package
-    /// (the `Table::SymbolTable` fallback, same-package). `main.go` and six
-    /// leaves cross the package boundary via `import ".../pkgA"`, exercising
-    /// `Table::GoPkgIndex`. Four islands touch nothing shared.
+    /// (same-package). `main.go` and six leaves cross the package boundary
+    /// via `import ".../pkgA"`. Four islands touch nothing shared.
     fn write_go_fixture(root: &Path) -> Vec<String> {
         write(
             root,
@@ -1622,18 +1563,6 @@ mod tests {
     }
 
     #[test]
-    fn go_oracle_no_op_rebuild_is_green() {
-        let stats = assert_warm_matches_cold_for("go-no-op", write_go_fixture, |root| {
-            (walk_sorted(root), Vec::new())
-        });
-        assert_eq!(stats.files_seed_red, 0);
-        assert!(
-            stats.files_green > 0,
-            "a no-op Go rebuild must reuse something: {stats:?}"
-        );
-    }
-
-    #[test]
     fn go_oracle_touch_a_leaf() {
         assert_warm_matches_cold_for("go-touch-leaf", write_go_fixture, |root| {
             let path = "island_0.go";
@@ -1646,9 +1575,9 @@ mod tests {
 
     #[test]
     fn go_oracle_touch_the_pkg_index_hub() {
-        // Rewrites `Hub`'s methods across both its files — `Table::GoPkgIndex`
-        // and `resolve_go_method_parent_ids`'s cross-file receiver rewrite
-        // both must survive a warm rebuild, not just a cold one.
+        // Rewrites `Hub`'s methods across both its files — cross-package
+        // imports and `resolve_go_method_parent_ids`'s cross-file receiver
+        // rewrite both must survive a warm rebuild, not just a cold one.
         assert_warm_matches_cold_for("go-touch-pkg-index-hub", write_go_fixture, |root| {
             write(
                     root,
@@ -1665,45 +1594,6 @@ mod tests {
                 vec!["pkgA/hub.go".to_string(), "pkgA/hub_extra.go".to_string()],
             )
         });
-    }
-
-    #[test]
-    fn go_blast_radius_is_proportional_to_the_edit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let files = write_go_fixture(root);
-        let registry = create_default_registry();
-        let mut session = GraphSession::build(root, &files, &registry);
-
-        let path = "island_0.go";
-        let mut body = std::fs::read_to_string(root.join(path)).expect("read");
-        body.push_str("\nfunc IslandExtra() int { return 9 }\n");
-        write(root, path, &body);
-        let leaf = session.rebuild(&files, &[path.to_string()], &registry);
-        assert!(
-            leaf.files_red <= 3,
-            "a leaf touch should keep the RED set tiny, got {leaf:?}"
-        );
-
-        // A structural rewrite of the package every other file imports.
-        write(
-            root,
-            "pkgA/hub.go",
-            "package pkgA\n\ntype Hub struct{}\n\nfunc (h *Hub) Ping() string {\n\treturn \"x\"\n}\n\nfunc SpawnHub() *Hub {\n\treturn &Hub{}\n}\n",
-        );
-        let hub = session.rebuild(&files, &["pkgA/hub.go".to_string()], &registry);
-        assert!(
-            hub.files_red > leaf.files_red,
-            "a structural hub edit must invalidate more than a leaf edit: hub {hub:?} vs leaf {leaf:?}"
-        );
-        let green = session.green_files();
-        for i in 0..4 {
-            let island = format!("island_{i}.go");
-            assert!(
-                green.contains(island.as_str()),
-                "{island} imports nothing shared and must stay GREEN: {hub:?}"
-            );
-        }
     }
 
     // --- Kotlin (whitelisted, not attributed) ----------------------------
@@ -2268,13 +2158,13 @@ mod tests {
         }
     }
 
-    // --- PHP (whitelisted; use_declaration collides with Rust's extractor,
-    // proven to be a safe miss, not a silent no-op) -------------------------
+    // --- PHP (whitelisted; use_declaration collides with Rust's `use`
+    // handler, proven to be a safe miss, not a silent no-op) -----------------
 
     /// `mid.php` carries a real `use App\Utils\Helper;` statement so the
-    /// `use_declaration` name collision with `extract_rust_use` (Rust's own
-    /// extractor) is actually exercised, not just reasoned about: PHP's `\`
-    /// namespace separator means `extract_rust_use`'s `"::"` split never
+    /// `use_declaration` name collision with the `use` handler written for
+    /// Rust is actually exercised, not just reasoned about: PHP's `\`
+    /// namespace separator means the handler's `"::"` split never
     /// fires, so it falls into the single-segment branch and looks up the
     /// entire backslash-joined path as one symbol name — always a miss
     /// (correctly recorded as a read, per `resolve_import_name`'s

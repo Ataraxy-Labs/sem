@@ -89,7 +89,7 @@ use std::time::Instant;
 
 use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::facts_store::{FactsCorpus, IngestError, RemoteFact, FACTS_SCHEMA_VERSION};
-use sem_core::parser::graph::{EntityGraph, RefType};
+use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::incremental::FileFacts;
 use sem_core::parser::plugins::code::languages::get_language_config;
 use sem_core::parser::plugins::create_default_registry;
@@ -148,11 +148,7 @@ fn fingerprint(graph: &EntityGraph, entities: &[SemanticEntity]) -> Fingerprint 
         .edges
         .iter()
         .map(|e| {
-            let kind = match e.ref_type {
-                RefType::Calls => "calls",
-                RefType::TypeRef => "typeref",
-                RefType::Imports => "imports",
-            };
+            let kind = e.ref_type.as_str();
             format!("{}\u{1f}{}\u{1f}{}", e.from_entity, e.to_entity, kind)
         })
         .collect();
@@ -324,9 +320,9 @@ const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("typescript", "ts-0.23-u16-exportspan"),
     ("tsx", "ts-0.23-u16-exportspan"),
     ("javascript", "ts-0.23-u16-exportspan"),
-    ("python", "ts-0.23-mp4"),
-    ("go", "ts-0.23-mp5-dm5t-bpn2"),
-    ("rust", "ts-0.23-mp2"),
+    ("python", "ts-0.23-calls1"),
+    ("go", "ts-0.23-calls1"),
+    ("rust", "ts-0.23-calls1"),
     ("java", "ts-0.23-mp3"),
     ("c", "ts-0.23"),
     ("cpp", "ts-0.23-mp1"),
@@ -373,10 +369,10 @@ const DEFAULT_LANGUAGE_SALT: &str = "unmapped-1";
 fn language_salt(lang_id: &str) -> &'static str {
     // Mirrors `facts_store::producer_language_salt` / `resolve_gated_salt`:
     // any language registered in `MUL_RUNTIME_GATES` (MUL phase 1's C#/C++
-    // precomputes, MUL phase 2's Go/Java/Rust/Python precomputes — C++ and
-    // Python joined the table on 2026-08-22, demoted from their prior
-    // unconditional admissions once the ceiling was redefined against peak
-    // memory footprint) has a run-time producer switch, so the salt this
+    // precomputes and MUL phase 2's Java precompute — C++ joined the table on
+    // 2026-08-22, demoted from its prior unconditional admission once the
+    // ceiling was redefined against peak memory footprint) has a run-time
+    // producer switch, so the salt this
     // probe predicts has to follow it, or the oracle reports a miss against
     // a corpus entry that is in fact correct. Consulting the real table
     // replaces what used to be this file's own independent

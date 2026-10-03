@@ -594,6 +594,8 @@ fn ref_kind_u8(ref_type: &RefType) -> u8 {
         RefType::Calls => 0,
         RefType::TypeRef => 1,
         RefType::Imports => 2,
+        RefType::Refs => 3,
+        RefType::Dispatch => 4,
     }
 }
 

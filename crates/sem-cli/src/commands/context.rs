@@ -445,6 +445,8 @@ fn collect_subgraph(idx: &QueryIndex, at: usize) -> Option<(Vec<usize>, Vec<Enti
             RefType::Calls => 0,
             RefType::Imports => 1,
             RefType::TypeRef => 2,
+            RefType::Refs => 3,
+            RefType::Dispatch => 4,
         }
     };
 

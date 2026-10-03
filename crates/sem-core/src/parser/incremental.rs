@@ -87,8 +87,6 @@ pub(crate) enum Table {
     FuncNameReturnTypes = 7,
     /// importing file path -> that file's whole import-table slice
     ImportsForFile = 8,
-    /// go package name -> [(entity name, entity id)]
-    GoPkgIndex = 11,
     /// bag-of-words: class name -> [(member name, member id)]
     BowClassMembers = 12,
     /// bag-of-words: (class name, file path) membership
@@ -106,27 +104,15 @@ pub(crate) enum Table {
     /// Whole-table guard: swift call signatures (empty unless the repo has
     /// `.swift` sources, in which case any change forces a full re-resolve).
     GuardSwiftCallSignatures = 200,
-    /// Whole-table guard: Python's bare `import module` / `import module as m`
-    /// form (`register_namespace_import`). That function scans *every*
-    /// entry of `symbol_table`/`entity_map` looking for ones whose file matches
-    /// the imported module — an unbounded read no `(table, key)` pair can name,
-    /// because a symbol added anywhere in the corpus could start (or stop)
-    /// matching. Recorded only by the one file whose AST actually contains this
-    /// import form; every other file's read set never touches this key, so this
-    /// guard costs nothing for files that don't use the pattern.
-    GuardPyWildcardImport = 201,
-    /// Whole-table guard: Rust's relative module-alias `use` form
-    /// (`register_rust_module_import`) — `use crate::a::module_name;`
-    /// / `use super::module_name;` / `use self::module_name;` followed by a
-    /// qualified call `module_name::item()`. Same unbounded-read shape as
-    /// `GuardPyWildcardImport` immediately above (a symbol added anywhere in
-    /// the corpus could start or stop matching the aliased module's stem), and
-    /// in fact folds the exact same `(name, file_path)` data — kept as its own
-    /// tag rather than reusing `GuardPyWildcardImport` purely so a Rust file's
-    /// read set doesn't read as "depends on a Python guard" (and so a
-    /// mixed-language corpus's read sets stay self-describing); the two guards
-    /// always change together regardless. Recorded only by the one file whose
-    /// AST actually contains this import form.
+    /// Whole-table guard: the module-alias `use` form
+    /// (`register_rust_module_import`, reached from a `use_declaration` node —
+    /// only PHP's trait `use` now, since Rust files are no longer
+    /// scope-resolved). It scans every top-level entity of every `.rs` file
+    /// whose stem matches the aliased name — an unbounded read no
+    /// `(table, key)` pair can name, because a symbol added anywhere in the
+    /// corpus could start (or stop) matching — so it folds every
+    /// `(name, file_path)` pair of the corpus into one value. Recorded only by
+    /// the one file whose AST actually contains this import form.
     GuardRustModuleAlias = 202,
 }
 
@@ -302,7 +288,7 @@ impl Recorder {
     }
 
     /// Record a dependency on an entire whole-table guard (see e.g.
-    /// [`Table::GuardSwiftCallSignatures`], [`Table::GuardPyWildcardImport`]):
+    /// [`Table::GuardSwiftCallSignatures`], [`Table::GuardRustModuleAlias`]):
     /// this file's result depends on the table's contents in a way too diffuse
     /// to name with individual keys, so any change to the guarded table at all
     /// must invalidate this file.

@@ -1240,11 +1240,7 @@ fn insert_edges_table(tx: &Transaction<'_>, graph: &EntityGraph) -> Result<(), r
     let mut stmt =
         tx.prepare("INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)")?;
     for edge in &graph.edges {
-        let rt = match edge.ref_type {
-            RefType::Calls => "calls",
-            RefType::TypeRef => "typeref",
-            RefType::Imports => "imports",
-        };
+        let rt = edge.ref_type.as_str();
         stmt.execute(params![edge.from_entity, edge.to_entity, rt])?;
     }
     Ok(())
@@ -1875,6 +1871,8 @@ impl DiskCache {
                 let ref_type = match rt.as_str() {
                     "calls" => RefType::Calls,
                     "imports" => RefType::Imports,
+                    "refs" => RefType::Refs,
+                    "dispatch" => RefType::Dispatch,
                     _ => RefType::TypeRef,
                 };
                 Ok(EntityRef {
@@ -2274,11 +2272,7 @@ impl DiskCache {
                 {
                     continue;
                 }
-                let rt = match edge.ref_type {
-                    RefType::Calls => "calls",
-                    RefType::TypeRef => "typeref",
-                    RefType::Imports => "imports",
-                };
+                let rt = edge.ref_type.as_str();
                 ins.execute(params![edge.from_entity, edge.to_entity, rt])?;
             }
         }

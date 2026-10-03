@@ -19,28 +19,21 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 
 /// Extensions whose cross-file reads `scope_resolve.rs` now attributes through
 /// the read-set recorder, beyond the original JS/TS set:
-/// * `.py` — `extract_python_import`/`extract_python_module_import`, via
-///   `resolve_import_name` (`Table::SymbolTable`/`Table::EntityMap`, bounded
-///   per import) and `register_namespace_import` (whole-table guard,
-///   `Table::GuardPyWildcardImport`, for the bare `import module` form only).
-/// * `.go` — `register_go_package_imports` now records `Table::GoPkgIndex`
-///   (the table already existed and was fingerprinted; only the *read* site
-///   was missing).
-/// * `.rs` — `extract_rust_use`, via the same `resolve_import_name` path as
-///   Python's `from X import Y`.
+/// * `.py`/`.go`/`.rs` — not resolved by `scope_resolve` or bag-of-words at
+///   all: their call graph comes from `parser::calls`, recomputed every
+///   build, so no cached scope/bag-of-words result exists for them whose
+///   read set could be incomplete.
 /// * `.kt` — whitelisted, not attributed: `KOTLIN_SCOPE_CONFIG` produces
 ///   `call_expression`/`navigation_expression` nodes, none of which are
-///   `import_from_statement`/`import_statement`/`use_declaration`/
-///   `import_declaration` (Kotlin's own `import_header` node kind is not
-///   handled by `extract_imports_from_ast` at all), so that function is a
-///   structural no-op for Kotlin source, and `scan_constructor_calls`
-///   (hardcoded to `kind == "call"`) never matches Kotlin's `call_expression`
-///   nodes either. Its cross-file resolution is entirely the generic
+///   `import_statement`/`use_declaration`/`import_declaration` (Kotlin's own
+///   `import_header` node kind is not handled by `extract_imports_from_ast`
+///   at all), so that function is a structural no-op for Kotlin source. Its
+///   cross-file resolution is entirely the generic
 ///   `Table::SymbolTable`/`Table::ClassMembers` fallback every language
 ///   already shares — confirmed empirically, not just by grep: a bare
 ///   cross-file function call (no import statement at all) resolves via
-///   `resolve_ref`'s step-3 `Table::SymbolTable` fallback exactly like
-///   Python's or Go's does. Proof is grep evidence plus the oracle fixture
+///   `resolve_ref`'s step-3 `Table::SymbolTable` fallback. Proof is grep
+///   evidence plus the oracle fixture
 ///   below, not a per-file read-set gap closed, so it belongs in the same
 ///   list as the genuinely newly-instrumented languages for GREEN
 ///   eligibility purposes.
@@ -67,19 +60,17 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   bash/fish call become a ref to resolve in the first place.
 /// * `.java` — whitelisted, not attributed, with a caveat worth recording:
 ///   tree-sitter-java's import statement node kind is *also* named
-///   `"import_declaration"` — the exact kind `extract_imports_from_ast`
-///   routes to `extract_go_import` (Go's extractor). This looked like a
-///   correctness landmine until traced through: Go's extractor only acts on
-///   an `import_declaration`'s `import_spec`/`import_spec_list`/string-
-///   literal children, and Java's grammar only ever puts `asterisk`/
-///   `identifier`/`scoped_identifier` children under that node — no overlap,
-///   so it silently no-ops on Java source (verified: the fixture below
-///   includes a real `import java.util.List;` statement and stays bit-
-///   identical warm vs. cold). Java's actual cross-file resolution is the
+///   `"import_declaration"` — the kind Go's import handler was keyed on. That
+///   handler only ever acted on Go's `import_spec`/`import_spec_list`/
+///   string-literal children, which Java's grammar never produces, so it
+///   no-oped on Java source; the kind is now handled as
+///   `ImportStmtFacts::ImportDeclaration`, which registers nothing (verified:
+///   the fixture below includes a real `import java.util.List;` statement and
+///   stays bit-identical warm vs. cold). Java's actual cross-file resolution is the
 ///   `ClassName.staticMethod()` static-call path in `resolve_ref`
 ///   (`Table::ClassMembers`, already generic and recorded).
 /// * `.cs` (C#) — whitelisted, not attributed: no node-kind collision at
-///   all (`c-sharp`'s grammar has no node named any of the five kinds
+///   all (`c-sharp`'s grammar has no node named any of the kinds
 ///   `extract_imports_from_ast` recognizes), same static-call path as Java.
 /// * `.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx` (C++) — whitelisted, not
 ///   attributed: no node-kind collision; free functions resolve through
@@ -91,8 +82,8 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 /// * `.php`/`.inc`/`.phtml`/`.module` (PHP) — whitelisted, **with a real
 ///   landmine found and defused, not just checked**: tree-sitter-php's `use`
 ///   statement node kind is `"use_declaration"` — the exact kind `extract_
-///   imports_from_ast` routes to `extract_rust_use` (Rust's extractor).
-///   Unlike Java/Go, this one does not clean-miss: `extract_rust_use` reads
+///   imports_from_ast` routes to the `use` handler written for Rust's `use`.
+///   Unlike Java, this one does not clean-miss: the handler reads
 ///   the node's raw *text*, not its child kinds, so it always "succeeds" at
 ///   parsing something. Fed PHP's `use App\Foo\Bar;`, it finds no `"::"`
 ///   (PHP's separator is `\`), so it falls into the single-segment branch
@@ -100,8 +91,7 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   — a real symbol lookup, correctly recorded through `resolve_import_name`
 ///   (`rec.one`/`rec.two` fire), that is a structural *miss* every time
 ///   because no PHP entity is ever named with embedded backslashes. A miss
-///   is a dependency too (see `register_namespace_import`'s doc comment),
-///   so this is conservative, not wrong — proven, not assumed: the fixture
+///   is a dependency too, so this is conservative, not wrong — proven, not assumed: the fixture
 ///   below includes a real `use` statement and both the oracle
 ///   (warm-vs-cold bit-identical) and a `use`-target-touching mutation stay
 ///   green through it.
@@ -109,7 +99,7 @@ pub(crate) fn is_js_ts_file(file_path: &str) -> bool {
 ///   same `"import_declaration"`-name collision as Java, checked the same
 ///   way: Scala's `import_declaration` never has an `import_spec`/`import_
 ///   spec_list`/string-literal child either (its children are Scala type/
-///   pattern nodes), so `extract_go_import` no-ops here too — verified by a
+///   pattern nodes), so it registers nothing here too — verified by a
 ///   fixture containing a real `import` statement, not just by grep.
 /// * `.zig` (Zig) — whitelisted, not attributed: no node-kind collision;
 ///   resolves through `Table::SymbolTable` like Kotlin.

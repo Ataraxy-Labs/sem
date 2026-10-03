@@ -69,7 +69,7 @@ impl LanguageConfig {
 pub struct ScopeResolveConfig {
     /// AST node types that create class/struct scopes
     pub class_scope_nodes: &'static [&'static str],
-    /// AST node types that create impl scopes (Rust impl_item, Swift extension)
+    /// AST node types that create impl scopes (Swift extension)
     pub impl_scope_nodes: &'static [&'static str],
     /// AST node types that create function/method scopes
     pub function_scope_nodes: &'static [&'static str],
@@ -96,11 +96,9 @@ pub struct ScopeResolveConfig {
     pub new_expr_nodes: &'static [&'static str],
     /// Field name on new-expression nodes that holds the type/constructor name.
     pub new_expr_type_field: &'static str,
-    /// AST node types for struct/composite literals (Go `Foo{}`)
-    pub composite_literal_nodes: &'static [&'static str],
     /// How member access / method calls are represented in the AST
     pub member_access: &'static [MemberAccess],
-    /// Scoped identifier nodes (Rust `Type::method`)
+    /// Scoped identifier nodes (C++ `ns::f`, Ruby `A::b`, PHP `Foo::bar`)
     pub scoped_call_nodes: &'static [&'static str],
 
     /// Self/this keywords to recognize
@@ -112,9 +110,6 @@ pub struct ScopeResolveConfig {
     /// Import extraction function (the only truly per-language piece)
     pub import_extractor: Option<ImportExtractorFn>,
 
-    /// Whether methods are declared externally with receiver types (Go-style)
-    pub external_method: bool,
-
     /// Language builtins to skip during resolution
     pub builtins: &'static [&'static str],
 }
@@ -122,7 +117,7 @@ pub struct ScopeResolveConfig {
 /// How call nodes expose the callee/function.
 pub enum CallNodeStyle {
     /// The call node has a field (e.g. "function") containing either an identifier
-    /// (bare call) or a member_expression (method call). Python, TS, Rust, Go, C#, C++.
+    /// (bare call) or a member_expression (method call), e.g. TS, C#, C++, PHP.
     FunctionField(&'static str),
     /// The call node directly has object (optional) + method name fields.
     /// Java: method_invocation(object, name). Ruby: call(receiver, method).
@@ -140,13 +135,6 @@ pub enum CallNodeStyle {
 pub enum ClassNameField {
     /// Simple field lookup: `node.child_by_field_name(field)`
     Simple(&'static str),
-    /// Go-style: look for a child of type `spec_kind`, then get field `field` from it
-    TypeSpec {
-        spec_kind: &'static str,
-        field: &'static str,
-    },
-    /// Rust impl: get name from `node.child_by_field_name(field)` (the "type" field)
-    ImplType(&'static str),
 }
 
 /// A rule for scanning assignment nodes to extract type bindings.
@@ -157,16 +145,10 @@ pub struct AssignmentRule {
 
 /// Strategy for extracting variable name and type from an assignment node.
 pub enum AssignmentStrategy {
-    /// Python/TS: `x = Foo()` - left/right fields on assignment node
+    /// `x = Foo()` - left/right fields on assignment node
     LeftRight,
     /// TS: `const x = new Foo()` - variable_declarator children
     Declarators,
-    /// Rust: `let x: Type = value` - pattern + type + value fields
-    PatternBased,
-    /// Go: `x := Foo{}` - expression_list left/right
-    ShortVar,
-    /// Go: `var x Type = ...` - var_spec children
-    VarSpec,
 }
 
 /// A rule for extracting typed parameters from function signatures.
@@ -183,8 +165,6 @@ pub enum ParamNameField {
     Simple(&'static str),
     /// Field with fallback to first named child if identifier
     WithFallback(&'static str),
-    /// Rust pattern matching (identifier, mut_pattern, reference_pattern)
-    RustPattern,
 }
 
 /// How member access (obj.field / obj.method()) is represented in the AST.
@@ -196,7 +176,7 @@ pub struct MemberAccess {
 
 /// Strategy for extracting instance attribute types from class definitions.
 pub enum InitStrategy {
-    /// Python/TS: scan constructor body for self.attr = param patterns
+    /// TS/Swift/Kotlin: scan constructor body for this.attr = param patterns
     ConstructorBody {
         class_nodes: &'static [&'static str],
         init_names: &'static [&'static str],
@@ -205,10 +185,6 @@ pub enum InitStrategy {
         access_kind: &'static str,
         obj_field: &'static str,
         prop_field: &'static str,
-    },
-    /// Rust/Go: extract field types directly from struct declarations
-    StructFields {
-        struct_nodes: &'static [&'static str],
     },
     /// Java/C#: extract field types from typed field declarations in the class body
     ClassFields {
@@ -627,7 +603,7 @@ static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_python,
-    scope_resolve: Some(&PYTHON_SCOPE_CONFIG),
+    scope_resolve: None,
 };
 
 #[cfg(feature = "lang-go")]
@@ -646,7 +622,7 @@ static GO_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_go,
-    scope_resolve: Some(&GO_SCOPE_CONFIG),
+    scope_resolve: None,
 };
 
 #[cfg(feature = "lang-rust")]
@@ -670,7 +646,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_rust,
-    scope_resolve: Some(&RUST_SCOPE_CONFIG),
+    scope_resolve: None,
 };
 
 #[cfg(feature = "lang-java")]
@@ -1331,116 +1307,6 @@ static FISH_CONFIG: LanguageConfig = LanguageConfig {
 
 // ─── Scope Resolve Configs for Supported Languages ────────────────────────────
 
-static PYTHON_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
-    class_scope_nodes: &["class_definition"],
-    impl_scope_nodes: &[],
-    function_scope_nodes: &["function_definition"],
-    class_name_field: ClassNameField::Simple("name"),
-
-    assignment_rules: &[
-        AssignmentRule {
-            node_kind: "assignment",
-            strategy: AssignmentStrategy::LeftRight,
-        },
-        AssignmentRule {
-            node_kind: "expression_statement",
-            strategy: AssignmentStrategy::LeftRight,
-        },
-    ],
-    assignment_recurse_into: &["block"],
-
-    param_rules: &[
-        ParamRule {
-            node_kind: "typed_parameter",
-            name_field: ParamNameField::WithFallback("name"),
-            type_field: "type",
-            skip_names: &["self", "cls"],
-        },
-        ParamRule {
-            node_kind: "typed_default_parameter",
-            name_field: ParamNameField::WithFallback("name"),
-            type_field: "type",
-            skip_names: &["self", "cls"],
-        },
-    ],
-
-    return_type_field: None,
-
-    call_nodes: &["call"],
-    call_style: CallNodeStyle::FunctionField("function"),
-    new_expr_nodes: &[],
-    new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
-    member_access: &[MemberAccess {
-        node_kind: "attribute",
-        object_field: "object",
-        property_field: "attribute",
-    }],
-    scoped_call_nodes: &[],
-
-    self_keywords: &["self", "cls"],
-
-    init_strategy: InitStrategy::ConstructorBody {
-        class_nodes: &["class_definition"],
-        init_names: &["__init__"],
-        init_node_kind: "function_definition",
-        self_keyword: "self",
-        access_kind: "attribute",
-        obj_field: "object",
-        prop_field: "attribute",
-    },
-
-    import_extractor: None, // set via import_rules
-    external_method: false,
-
-    builtins: &[
-        "print",
-        "len",
-        "range",
-        "str",
-        "int",
-        "float",
-        "bool",
-        "list",
-        "dict",
-        "set",
-        "tuple",
-        "type",
-        "super",
-        "isinstance",
-        "issubclass",
-        "getattr",
-        "setattr",
-        "hasattr",
-        "delattr",
-        "open",
-        "input",
-        "map",
-        "filter",
-        "zip",
-        "enumerate",
-        "sorted",
-        "reversed",
-        "min",
-        "max",
-        "sum",
-        "any",
-        "all",
-        "abs",
-        "round",
-        "format",
-        "repr",
-        "id",
-        "hash",
-        "ValueError",
-        "TypeError",
-        "KeyError",
-        "RuntimeError",
-        "Exception",
-        "StopIteration",
-    ],
-};
-
 static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     class_scope_nodes: &["class_declaration", "abstract_class_declaration"],
     impl_scope_nodes: &[],
@@ -1488,7 +1354,6 @@ static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &["new_expression"],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "member_expression",
         object_field: "object",
@@ -1509,7 +1374,6 @@ static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     },
 
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "console",
@@ -1587,204 +1451,6 @@ static TS_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     ],
 };
 
-static RUST_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
-    class_scope_nodes: &["struct_item"],
-    impl_scope_nodes: &["impl_item"],
-    function_scope_nodes: &["function_item"],
-    class_name_field: ClassNameField::Simple("name"),
-
-    assignment_rules: &[AssignmentRule {
-        node_kind: "let_declaration",
-        strategy: AssignmentStrategy::PatternBased,
-    }],
-    assignment_recurse_into: &["block", "expression_statement"],
-
-    param_rules: &[ParamRule {
-        node_kind: "parameter",
-        name_field: ParamNameField::RustPattern,
-        type_field: "type",
-        skip_names: &["self"],
-    }],
-
-    return_type_field: Some("return_type"),
-
-    call_nodes: &["call_expression"],
-    call_style: CallNodeStyle::FunctionField("function"),
-    new_expr_nodes: &[],
-    new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
-    member_access: &[MemberAccess {
-        node_kind: "field_expression",
-        object_field: "value",
-        property_field: "field",
-    }],
-    scoped_call_nodes: &["scoped_identifier"],
-
-    self_keywords: &["self"],
-
-    init_strategy: InitStrategy::StructFields {
-        struct_nodes: &["struct_item"],
-    },
-
-    import_extractor: None,
-    external_method: false,
-
-    builtins: &[
-        "println",
-        "eprintln",
-        "print",
-        "eprint",
-        "dbg",
-        "format",
-        "write",
-        "writeln",
-        "vec",
-        "panic",
-        "todo",
-        "unimplemented",
-        "unreachable",
-        "assert",
-        "assert_eq",
-        "assert_ne",
-        "debug_assert",
-        "Some",
-        "None",
-        "Ok",
-        "Err",
-        "Box",
-        "Vec",
-        "String",
-        "HashMap",
-        "HashSet",
-        "Arc",
-        "Rc",
-        "Mutex",
-        "RwLock",
-        "Cell",
-        "RefCell",
-        "Option",
-        "Result",
-        "Iterator",
-        "IntoIterator",
-        "Clone",
-        "Copy",
-        "Debug",
-        "Display",
-        "Default",
-        "From",
-        "Into",
-        "TryFrom",
-        "TryInto",
-        "Send",
-        "Sync",
-        "Sized",
-        "Unpin",
-        "cfg",
-        "derive",
-        "include",
-        "env",
-    ],
-};
-
-static GO_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
-    class_scope_nodes: &["type_declaration"],
-    impl_scope_nodes: &[],
-    function_scope_nodes: &["function_declaration", "method_declaration"],
-    class_name_field: ClassNameField::TypeSpec {
-        spec_kind: "type_spec",
-        field: "name",
-    },
-
-    assignment_rules: &[
-        AssignmentRule {
-            node_kind: "short_var_declaration",
-            strategy: AssignmentStrategy::ShortVar,
-        },
-        AssignmentRule {
-            node_kind: "var_declaration",
-            strategy: AssignmentStrategy::VarSpec,
-        },
-    ],
-    assignment_recurse_into: &["block"],
-
-    param_rules: &[ParamRule {
-        node_kind: "parameter_declaration",
-        name_field: ParamNameField::Simple("name"),
-        type_field: "type",
-        skip_names: &[],
-    }],
-
-    return_type_field: Some("result"),
-
-    call_nodes: &["call_expression"],
-    call_style: CallNodeStyle::FunctionField("function"),
-    new_expr_nodes: &[],
-    new_expr_type_field: "constructor",
-    composite_literal_nodes: &["composite_literal"],
-    member_access: &[MemberAccess {
-        node_kind: "selector_expression",
-        object_field: "operand",
-        property_field: "field",
-    }],
-    scoped_call_nodes: &[],
-
-    self_keywords: &[],
-
-    init_strategy: InitStrategy::StructFields {
-        struct_nodes: &["type_declaration"],
-    },
-
-    import_extractor: None,
-    external_method: true,
-
-    builtins: &[
-        "fmt",
-        "log",
-        "os",
-        "io",
-        "strings",
-        "strconv",
-        "bytes",
-        "make",
-        "len",
-        "cap",
-        "append",
-        "copy",
-        "delete",
-        "close",
-        "panic",
-        "recover",
-        "new",
-        "print",
-        "println",
-        "error",
-        "string",
-        "int",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "uint",
-        "uint8",
-        "uint16",
-        "uint32",
-        "uint64",
-        "float32",
-        "float64",
-        "complex64",
-        "complex128",
-        "bool",
-        "byte",
-        "rune",
-        "uintptr",
-        "Println",
-        "Printf",
-        "Sprintf",
-        "Fprintf",
-        "Errorf",
-    ],
-};
-
 // ─── Tier 1 Scope Resolve Configs ─────────────────────────────────────────────
 
 static JAVA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
@@ -1825,7 +1491,6 @@ static JAVA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     },
     new_expr_nodes: &["object_creation_expression"],
     new_expr_type_field: "type",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "method_invocation",
         object_field: "object",
@@ -1843,7 +1508,6 @@ static JAVA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         ],
     },
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "System",
@@ -1911,7 +1575,6 @@ static CSHARP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &["object_creation_expression"],
     new_expr_type_field: "type",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "member_access_expression",
         object_field: "expression",
@@ -1923,7 +1586,6 @@ static CSHARP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "Console",
@@ -1979,7 +1641,6 @@ static CPP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &["new_expression"],
     new_expr_type_field: "type",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "field_expression",
         object_field: "argument",
@@ -1989,11 +1650,8 @@ static CPP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     self_keywords: &["this"],
 
-    init_strategy: InitStrategy::StructFields {
-        struct_nodes: &["class_specifier", "struct_specifier"],
-    },
+    init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "std",
@@ -2047,7 +1705,6 @@ static RUBY_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     },
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "call",
         object_field: "receiver",
@@ -2059,7 +1716,6 @@ static RUBY_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "puts",
@@ -2120,7 +1776,6 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FirstChild,
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "navigation_expression",
         object_field: "expression",
@@ -2140,7 +1795,6 @@ static KOTLIN_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         prop_field: "navigation_suffix",
     },
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "println",
@@ -2234,7 +1888,6 @@ static PHP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &["object_creation_expression"],
     new_expr_type_field: "type",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "member_call_expression",
         object_field: "object",
@@ -2246,7 +1899,6 @@ static PHP_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "echo",
@@ -2318,7 +1970,6 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FirstChild,
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "navigation_expression",
         object_field: "target",
@@ -2338,7 +1989,6 @@ static SWIFT_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
         prop_field: "suffix",
     },
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "print",
@@ -2417,7 +2067,6 @@ static SCALA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "field_expression",
         object_field: "value",
@@ -2429,7 +2078,6 @@ static SCALA_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "println", "print", "require", "assert", "String", "Int", "Long", "Double", "Float",
@@ -2465,7 +2113,6 @@ static DART_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &["new_expression", "const_object_expression"],
     new_expr_type_field: "type",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "member_expression",
         object_field: "object",
@@ -2477,7 +2124,6 @@ static DART_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "print",
@@ -2511,7 +2157,6 @@ static ZIG_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("function"),
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[MemberAccess {
         node_kind: "field_expression",
         object_field: "object",
@@ -2523,7 +2168,6 @@ static ZIG_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "std",
@@ -2554,7 +2198,6 @@ static BASH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("name"),
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[],
     scoped_call_nodes: &[],
 
@@ -2562,7 +2205,6 @@ static BASH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "echo", "printf", "cd", "ls", "cat", "grep", "sed", "awk", "if", "then", "else", "fi",
@@ -2591,7 +2233,6 @@ static FISH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
     call_style: CallNodeStyle::FunctionField("name"),
     new_expr_nodes: &[],
     new_expr_type_field: "constructor",
-    composite_literal_nodes: &[],
     member_access: &[],
     scoped_call_nodes: &[],
 
@@ -2599,7 +2240,6 @@ static FISH_SCOPE_CONFIG: ScopeResolveConfig = ScopeResolveConfig {
 
     init_strategy: InitStrategy::None,
     import_extractor: None,
-    external_method: false,
 
     builtins: &[
         "echo",

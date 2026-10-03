@@ -715,6 +715,8 @@ fn ref_kind_from_u8(kind: u8) -> crate::parser::graph::RefType {
     match kind {
         1 => RefType::TypeRef,
         2 => RefType::Imports,
+        3 => RefType::Refs,
+        4 => RefType::Dispatch,
         _ => RefType::Calls,
     }
 }

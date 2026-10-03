@@ -18,7 +18,7 @@
 //! `rayon::ThreadPoolBuilder` and runs the same cold build inside each via
 //! `.install(...)` — the standard way to vary parallelism within one test.
 
-use sem_core::parser::graph::{is_test_entity, RefType};
+use sem_core::parser::graph::is_test_entity;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::session::GraphSession;
 use std::path::Path;
@@ -89,11 +89,7 @@ fn build_snapshot(root: &Path, files: &[String], num_threads: usize) -> GraphSna
             .edges
             .iter()
             .map(|e| {
-                let kind = match e.ref_type {
-                    RefType::Calls => "calls",
-                    RefType::TypeRef => "typeref",
-                    RefType::Imports => "imports",
-                };
+                let kind = e.ref_type.as_str();
                 (e.from_entity.to_string(), e.to_entity.to_string(), kind)
             })
             .collect();

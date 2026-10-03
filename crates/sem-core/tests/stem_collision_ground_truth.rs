@@ -1,8 +1,15 @@
 //! Independent ground-truth fixtures
 //! for the stem/bare-name matching family (`match_bare_import_stem`,
 //! `import_file_candidates`, `find_import_file`'s bare fallback, and their
-//! callers `register_namespace_import` / `register_rust_module_import` /
-//! `resolve_import_name` in scope_resolve.rs / import_resolution.rs).
+//! scope-resolver callers).
+//!
+//! Python and Rust files are no longer scope-resolved — their call graph
+//! comes from `parser::calls` — and the Python/Rust/Go import handlers the
+//! comments below name (`register_namespace_import`,
+//! `register_go_package_imports`, Rust's module-alias registration) no
+//! longer run for them. The fixtures stay as end-to-end guards: they drive
+//! `EntityGraph::build`, so they now hold the calls pipeline to the same
+//! known-by-construction edge targets.
 //!
 //! Motivation: Go's `build_go_pkg_index` keyed packages by their bare last
 //! path segment ("v1"), so kubernetes's dozens of same-named `v1` directories
@@ -205,13 +212,14 @@ fn python_bare_import_of_ambiguous_stem_does_not_silently_pick_arbitrarily() {
         ),
     ]);
 
+    // Neither `a/` nor `b/` is an importable root for a bare `import util`,
+    // and nothing else disambiguates them: exact-or-unknown binds neither,
+    // which is also the deterministic, unblended answer.
     let target = edge_target(&graph, "use_it", "helper");
-    assert!(
-        target == Some("a/util.py::function::helper")
-            || target == Some("b/util.py::function::helper"),
-        "a bare `import util` matching two same-named files must resolve to \
-         exactly one of them, not a missing/blended edge -- got {target:?}. \
-         Full edge set: {:#?}",
+    assert_eq!(
+        target, None,
+        "a bare `import util` matching two same-named, non-importable files \
+         must not bind to either (a guess) -- got {target:?}. Full edge set: {:#?}",
         graph.edges
     );
 }
@@ -313,49 +321,47 @@ fn rust_std_prefixed_use_never_resolves_to_a_same_named_local_file() {
     );
 }
 
-/// (ii) Item-granularity disambiguation, isolated from the directory-overlap
-/// tie-break -- and deliberately adversarial to it. `a/net.rs` and `b/
-/// net.rs` share a bare stem; only `b/net.rs` defines `only_b` (each file's
-/// function is uniquely its own, no name overlap). The importer's
-/// qualifying segment (`"x"`, from `use crate::x::net;`) matches *neither*
-/// candidate's real directory, so the earlier fix (per-bucket trailing-overlap,
-/// else lexicographically-smallest) ties at zero and falls to
-/// `a/net.rs` -- the *wrong* file for this lookup, having already thrown
-/// away `b/net.rs`'s entries before ever checking which file defines
-/// `only_b`. That is exactly the failure shape verified on rust-lang/rust
-/// (`std::cmp::max` silently dropped because the tie-break's single winner
-/// wasn't the file defining `max`). This redo's `select_rust_module_item_
-/// winner` folds by item name first, so `only_b`'s single definer wins
-/// outright regardless of which file the directory tie-break would have
-/// preferred for the bucket as a whole.
+/// (ii) Same-stem files are told apart by the module path itself: `use
+/// crate::b::net;` names `b/net.rs` exactly, so `net::only_b()` binds there.
+/// A `use` path naming a module that is not in the input (`crate::x::net`,
+/// no `x/` anywhere) binds to nothing -- never to whichever same-stem file
+/// happens to define an item of that name (a guess, even when unique).
 #[test]
 fn rust_module_alias_collision_resolves_by_which_file_defines_the_item() {
-    let graph = build_graph_over(&[
-        (
-            "a/net.rs",
-            "pub fn only_a() -> &'static str {\n    \"from_a\"\n}\n",
-        ),
-        (
-            "b/net.rs",
-            "pub fn only_b() -> &'static str {\n    \"from_b\"\n}\n",
-        ),
-        (
-            "importer.rs",
-            "use crate::x::net;\n\nfn use_it() -> &'static str {\n    net::only_b()\n}\n",
-        ),
-    ]);
-
+    let files = |importer: &'static str| {
+        vec![
+            (
+                "a/net.rs",
+                "pub fn only_a() -> &'static str {\n    \"from_a\"\n}\n",
+            ),
+            (
+                "b/net.rs",
+                "pub fn only_b() -> &'static str {\n    \"from_b\"\n}\n",
+            ),
+            ("importer.rs", importer),
+        ]
+    };
+    let graph = build_graph_over(&files(
+        "use crate::b::net;\n\nfn use_it() -> &'static str {\n    net::only_b()\n}\n",
+    ));
     let target = edge_target(&graph, "use_it", "only_b");
     assert_eq!(
         target,
         Some("b/net.rs::function::only_b"),
-        "net::only_b() must resolve to b/net.rs -- the only same-stem file \
-         that defines `only_b` at all -- even though the `use` path's own \
-         qualifying segment (\"x\") doesn't match either candidate's real \
-         directory, and even though a directory-overlap tie-break that \
-         picks per-bucket instead of per-item would fall to a/net.rs \
-         (lexicographically smaller) and silently drop `only_b` entirely \
-         -- got {target:?}. Full edge set: {:#?}",
+        "`use crate::b::net; net::only_b()` must resolve to b/net.rs -- got \
+         {target:?}. Full edge set: {:#?}",
+        graph.edges
+    );
+
+    let graph = build_graph_over(&files(
+        "use crate::x::net;\n\nfn use_it() -> &'static str {\n    net::only_b()\n}\n",
+    ));
+    let target = edge_target(&graph, "use_it", "only_b");
+    assert_eq!(
+        target, None,
+        "`use crate::x::net;` names a module absent from the input; it must \
+         produce no edge (honest miss), not a guess -- got {target:?}. Full \
+         edge set: {:#?}",
         graph.edges
     );
 }

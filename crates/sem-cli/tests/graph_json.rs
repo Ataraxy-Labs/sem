@@ -161,28 +161,27 @@ def make_conn():
     .expect("write backup fixture");
 }
 
-fn assert_holder_uses_primary_get(graph_json: &Value) {
+/// `holder.py` calls `make_conn()` without importing it, and two unrelated
+/// modules define one: the name is unbound there, so `self.conn`'s type is
+/// unknowable and `conn.get()` must bind to neither same-named `get` (a
+/// guess either way). What must hold is that the answer is the same on
+/// every run and every cache path.
+fn assert_holder_does_not_guess_conn_get(graph_json: &Value) {
     let edges = graph_json["edges"].as_array().expect("edges array");
-
-    assert!(
-        edges.iter().any(|edge| {
-            edge["fromEntity"]
-                .as_str()
-                .map_or(false, |from| from.contains("Holder::use"))
-                && edge["toEntity"] == "a_primary.py::class::Primary::get"
-                && edge["refType"] == "calls"
-        }),
-        "Holder.use should resolve conn.get to Primary.get: {edges:?}"
-    );
-    assert!(
-        !edges.iter().any(|edge| {
-            edge["fromEntity"]
-                .as_str()
-                .map_or(false, |from| from.contains("Holder::use"))
-                && edge["toEntity"] == "z_backup.py::class::Backup::get"
-        }),
-        "Holder.use should not resolve conn.get to Backup.get: {edges:?}"
-    );
+    for target in [
+        "a_primary.py::class::Primary::get",
+        "z_backup.py::class::Backup::get",
+    ] {
+        assert!(
+            !edges.iter().any(|edge| {
+                edge["fromEntity"]
+                    .as_str()
+                    .map_or(false, |from| from.contains("Holder::use"))
+                    && edge["toEntity"] == target
+            }),
+            "Holder.use must not guess conn.get -> {target}: {edges:?}"
+        );
+    }
 }
 
 #[test]
@@ -236,7 +235,7 @@ fn graph_json_is_stable_for_ambiguous_constructor_resolution() {
 
     let first_stdout = run_sem_graph_json_stdout(&repo.path);
     let first: Value = serde_json::from_str(&first_stdout).expect("parse first graph json");
-    assert_holder_uses_primary_get(&first);
+    assert_holder_does_not_guess_conn_get(&first);
 
     for _ in 0..8 {
         assert_eq!(run_sem_graph_json_stdout(&repo.path), first_stdout);
@@ -262,7 +261,7 @@ fn graph_json_cached_incremental_matches_full_for_ambiguous_constructor_resoluti
 
     let cached_incremental: Value =
         serde_json::from_str(&cached_incremental_stdout).expect("parse cached graph json");
-    assert_holder_uses_primary_get(&cached_incremental);
+    assert_holder_does_not_guess_conn_get(&cached_incremental);
 
     for _ in 0..4 {
         assert_eq!(

@@ -279,6 +279,8 @@ fn ref_type_sort_key(ref_type: &RefType) -> u8 {
         RefType::Calls => 0,
         RefType::Imports => 1,
         RefType::TypeRef => 2,
+        RefType::Refs => 3,
+        RefType::Dispatch => 4,
     }
 }
 

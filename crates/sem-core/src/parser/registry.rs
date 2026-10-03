@@ -1,6 +1,6 @@
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::model::entity::{build_entity_id, disambiguate_colliding_entity_ids, SemanticEntity};
@@ -396,34 +396,10 @@ impl ParserRegistry {
 /// for that call site the two coincide; that is the only call site the gate
 /// is ever wired into.
 ///
-/// no longer zero-sized. Carries the id-staleness repair kit — the
-/// old id -> new id map for every entity this rewrite actually mutated, plus
-/// the set of files any of those entities live in — so a caller can re-key
-/// `PrecomputedFileFacts`' id-keyed fields (`entity_scope_map`,
-/// `entity_inner_scope`, `return_type_map`, and — since closed the
-/// gap those three alone left open — every `Scope`'s `defs` values and
-/// `owner_id`; see `PrecomputedFileFacts::rekey_entity_ids`) for exactly the
-/// files this rewrite touched, immediately after calling it and before
-/// those facts are read by anything. Both collections are empty whenever no
-/// Go method's receiver-type parent needed rewriting — most corpora have
-/// none — empty is a guaranteed no-op for the rekey, not merely a fast path.
+/// Zero-sized: Go files never carry `PrecomputedFileFacts` (they are not
+/// scope-resolved), so there are no id-keyed facts for a rewrite to re-key.
 pub struct GoParentsResolved {
-    rekeyed_ids: HashMap<String, String>,
-    rekeyed_files: HashSet<String>,
-}
-
-impl GoParentsResolved {
-    /// Old id -> new id, for every entity this call actually rewrote.
-    pub(crate) fn rekeyed_ids(&self) -> &HashMap<String, String> {
-        &self.rekeyed_ids
-    }
-
-    /// Every file path with at least one rewritten entity — the exact set of
-    /// files whose `PrecomputedFileFacts` (if any, from this build) need
-    /// `rekey_entity_ids` called against them.
-    pub(crate) fn rekeyed_files(&self) -> &HashSet<String> {
-        &self.rekeyed_files
-    }
+    _private: (),
 }
 
 pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) -> GoParentsResolved {
@@ -446,7 +422,6 @@ pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) -> GoParent
     }
 
     let mut rekeyed_ids: HashMap<String, String> = HashMap::new();
-    let mut rekeyed_files: HashSet<String> = HashSet::new();
 
     for entity in entities.iter_mut() {
         if !is_go_file(&entity.file_path) || entity.entity_type != "method" {
@@ -481,7 +456,6 @@ pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) -> GoParent
             Some(parent_id),
         );
         if entity.id != old_id {
-            rekeyed_files.insert(entity.file_path.clone());
             rekeyed_ids.insert(old_id, entity.id.clone());
         }
     }
@@ -520,7 +494,6 @@ pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) -> GoParent
             let new_id = format!("{new_parent_id}{suffix}");
             entity.parent_id = Some(new_parent_id);
             entity.id = new_id.clone();
-            rekeyed_files.insert(entity.file_path.clone());
             rekeyed_ids.insert(old_id, new_id);
             changed = true;
         }
@@ -529,10 +502,7 @@ pub fn resolve_go_method_parent_ids(entities: &mut [SemanticEntity]) -> GoParent
         }
     }
 
-    GoParentsResolved {
-        rekeyed_ids,
-        rekeyed_files,
-    }
+    GoParentsResolved { _private: () }
 }
 
 fn is_go_file(file_path: &str) -> bool {
@@ -556,12 +526,9 @@ fn go_package_name(entity: &SemanticEntity) -> Option<&str> {
 
 /// A Go package's declaring directory — the unambiguous identity a package
 /// actually has (every file in one directory shares one package; Go has no
-/// sub-directory packages). `pub(crate)` so `scope_resolve.rs`'s
-/// `build_go_pkg_index` keys on the same notion of "this package" that
-/// `resolve_go_method_parent_ids` above already trusts for same-package
-/// cross-file method/type pairing, instead of a second, independent
-/// derivation that could drift from this one.
-pub(crate) fn go_package_dir(file_path: &str) -> &str {
+/// sub-directory packages), which `resolve_go_method_parent_ids` above
+/// trusts for same-package cross-file method/type pairing.
+fn go_package_dir(file_path: &str) -> &str {
     file_path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 

@@ -19,8 +19,7 @@
 //!   * the *structural* half of the property, per file: would this file's tree
 //!     still be needed in pass 2 after the walk's outputs were precomputed?
 //!     That is true iff it contains an import statement kind
-//!     `classify_import_stmt` handles (Python/Rust/Go/Java/TS) or a Python-style
-//!     `call` node (ctor-infer's `scan_constructor_calls`) or is `.swift`
+//!     `classify_import_stmt` handles (TS/Java/Scala/Swift/PHP) or is `.swift`
 //!     (`build_swift_call_signatures`).
 //!   * the raw language constructs the property names, counted from source:
 //!     C# `partial` type declarations, C++ out-of-line member definitions
@@ -111,15 +110,11 @@ fn family_of(ext: &str) -> &'static str {
 /// file whose tree contains one of these kinds still needs its tree in pass 2
 /// for `replay_import_stmts_pruned`, because the handlers read corpus-wide
 /// tables and therefore cannot run in pass 1.
-fn is_handled_import_kind(kind: &str, self_keywords: &[&str]) -> bool {
-    match kind {
-        "import_from_statement" => true,
-        "import_statement" => true, // Py (self+cls) or TS (!cls) — both handled
-        "export_statement" => !self_keywords.contains(&"cls"),
-        "use_declaration" => true,
-        "import_declaration" => true,
-        _ => false,
-    }
+fn is_handled_import_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "import_statement" | "export_statement" | "use_declaration" | "import_declaration"
+    )
 }
 
 #[derive(Default, Clone)]
@@ -136,7 +131,6 @@ struct FamilyStats {
     dirty_child_files: u64,
     /// files whose tree is still needed in pass 2 after the walk is precomputed
     needs_tree_imports: u64,
-    needs_tree_ctor: u64,
     needs_tree_swift: u64,
     needs_tree_any: u64,
     parse_failures: u64,
@@ -158,7 +152,6 @@ struct FileFacts {
     entity_count: u64,
     qualified_names: u64,
     has_handled_import: bool,
-    has_py_call: bool,
     parse_failed: bool,
     cs_partial: u64,
     cpp_out_of_line: u64,
@@ -249,9 +242,8 @@ fn main() {
 
             // Structural half: does pass 2 still need this file's tree?
             let mut has_handled_import = false;
-            let mut has_py_call = false;
             let mut parse_failed = false;
-            if let Some(cfg) = get_language_config(&ext).and_then(|c| c.scope_resolve) {
+            if get_language_config(&ext).is_some_and(|c| c.scope_resolve.is_some()) {
                 let lang_cfg = get_language_config(&ext).expect("checked");
                 if is_pathological_large_file(&content) {
                     parse_failed = true;
@@ -261,17 +253,14 @@ fn main() {
                         let mut cursor = node.walk();
                         for child in node.named_children(&mut cursor) {
                             let kind = child.kind();
-                            if is_handled_import_kind(kind, cfg.self_keywords) {
+                            if is_handled_import_kind(kind) {
                                 has_handled_import = true;
                                 // extract does not descend into a handled node
                                 continue;
                             }
-                            if kind == "call" {
-                                has_py_call = true;
-                            }
                             worklist.push(child);
                         }
-                        if has_handled_import && has_py_call {
+                        if has_handled_import {
                             break;
                         }
                     }
@@ -302,7 +291,6 @@ fn main() {
                 entity_count,
                 qualified_names,
                 has_handled_import,
-                has_py_call,
                 parse_failed,
                 cs_partial,
                 cpp_out_of_line,
@@ -387,13 +375,10 @@ fn main() {
         if f.has_handled_import {
             s.needs_tree_imports += 1;
         }
-        if f.has_py_call {
-            s.needs_tree_ctor += 1;
-        }
         if swift {
             s.needs_tree_swift += 1;
         }
-        if f.has_handled_import || f.has_py_call || swift {
+        if f.has_handled_import || swift {
             s.needs_tree_any += 1;
         }
         s.cs_partial_types += f.cs_partial;
@@ -453,7 +438,6 @@ fn main() {
                 && family_of(&f.ext) != "JS/TS"
                 && !dirty_parent_idx.contains(i)
                 && !f.has_handled_import
-                && !f.has_py_call
                 && f.ext != ".swift"
         })
         .count();
@@ -465,7 +449,6 @@ fn main() {
                 && family_of(&f.ext) != "JS/TS"
                 && !dirty_parent_idx.contains(i)
                 && !f.has_handled_import
-                && !f.has_py_call
                 && f.ext != ".swift"
         })
         .map(|(_, f)| f.bytes)
@@ -487,7 +470,7 @@ fn main() {
          clean_and_treeless_bytes={clean_and_treeless_bytes}"
     );
     println!(
-        "{:<22} {:>8} {:>9} {:>11} {:>11} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "{:<22} {:>8} {:>9} {:>11} {:>11} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8}",
         "family",
         "files",
         "entities",
@@ -497,13 +480,12 @@ fn main() {
         "dirtyChd",
         "needTree",
         "imports",
-        "pycall",
         "qualNm",
         "MB"
     );
     for (family, s) in &fam {
         println!(
-            "{:<22} {:>8} {:>9} {:>11} {:>11} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8.1}",
+            "{:<22} {:>8} {:>9} {:>11} {:>11} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8.1}",
             family,
             s.files,
             s.entities,
@@ -513,7 +495,6 @@ fn main() {
             s.dirty_child_files,
             s.needs_tree_any,
             s.needs_tree_imports,
-            s.needs_tree_ctor,
             s.qualified_entity_names,
             s.bytes as f64 / (1024.0 * 1024.0)
         );

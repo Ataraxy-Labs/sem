@@ -297,16 +297,13 @@ pub(crate) fn precomputed_facts_field_breakdown<S: BuildHasher>(
             acc
         },
     );
-    let rows: [(&str, usize); 9] = [
+    let rows: [(&str, usize); 6] = [
         ("scopes", totals.scopes),
         ("entity_scope_maps", totals.entity_scope_maps),
         ("ast_refs", totals.ast_refs),
         ("return_type_map", totals.return_type_map),
         ("instance_attr_types", totals.instance_attr_types),
-        ("init_params", totals.init_params),
-        ("attr_to_param", totals.attr_to_param),
         ("import_stmts", totals.import_stmts),
-        ("ctor_call_sites", totals.ctor_call_sites),
     ];
     eprintln!(
         "SEM_PROFILE_MEM[{label}] precomputed_facts_fields content={:.1}MB total={:.1}MB",

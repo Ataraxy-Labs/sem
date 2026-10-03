@@ -29,6 +29,9 @@ struct Pass1FileProduct<'a> {
     parsed: Option<(String, String, tree_sitter::Tree)>,
     precomputed: Option<scope_resolve::PrecomputedFileFacts>,
     content_hash: Option<u64>,
+    /// Stage-1 facts for the call-graph pipeline (`calls`), lowered while
+    /// this file's tree is in hand.
+    call_facts: Option<Box<calls::ir::FileFacts>>,
 }
 
 /// Everything a warm rebuild carries into [`EntityGraph::build_incremental_core`]
@@ -93,7 +96,7 @@ pub(crate) struct BuildCarry<'a, 'i> {
     /// precisely so the tables that *are* refolded whole every build keep
     /// their "a vanished key reads as absent" property.
     pub(crate) corpus_fp: &'a mut crate::parser::incremental::TableFingerprints,
-    /// The running `Table::GuardPyWildcardImport` XOR fold that goes with
+    /// The running `Table::GuardRustModuleAlias` XOR fold that goes with
     /// `corpus_fp`. XOR is its own inverse, so this is maintainable in
     /// `O(touched entities)` — see `wildcard_guard_contribution`.
     pub(crate) wildcard_guard: &'a mut u64,
@@ -205,6 +208,7 @@ macro_rules! maybe_into_par_iter {
 
 use crate::git::types::{FileChange, FileStatus};
 use crate::model::entity::SemanticEntity;
+use crate::parser::calls;
 use crate::parser::import_resolution::{
     build_js_ts_named_export_sources, build_stem_index, find_import_file, find_import_target,
     import_file_candidates, import_source_matches_file, is_js_ts_file,
@@ -642,6 +646,26 @@ pub enum RefType {
     TypeRef,
     /// Import/use statement reference
     Imports,
+    /// A function mentioned as a value (passed, stored), not invoked here.
+    Refs,
+    /// The source may run this target at runtime: a trait/interface method
+    /// declaration one of its implementations, a base method an override,
+    /// a call with several possible targets (`#[cfg]` twins, a union-typed
+    /// receiver) each of them.
+    Dispatch,
+}
+
+impl RefType {
+    /// The kind's wire name (as serialized: `calls`, `typeref`, ...).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RefType::Calls => "calls",
+            RefType::TypeRef => "typeref",
+            RefType::Imports => "imports",
+            RefType::Refs => "refs",
+            RefType::Dispatch => "dispatch",
+        }
+    }
 }
 
 /// A complete entity dependency graph for a set of files.
@@ -950,6 +974,8 @@ fn ref_type_sort_key(ref_type: &RefType) -> u8 {
         RefType::Calls => 0,
         RefType::Imports => 1,
         RefType::TypeRef => 2,
+        RefType::Refs => 3,
+        RefType::Dispatch => 4,
     }
 }
 
@@ -1386,7 +1412,9 @@ fn resolve_references_with_file_indexes<'a>(
             .rfind('.')
             .map(|i| &entity.file_path[i..])
             .unwrap_or("");
-        if crate::parser::plugins::code::languages::get_language_config(ext).is_none() {
+        if crate::parser::plugins::code::languages::get_language_config(ext).is_none()
+            || calls::language_for(&entity.file_path).is_some()
+        {
             continue;
         }
         entities_by_file
@@ -1629,14 +1657,12 @@ fn resolve_scopes_in_file_chunks(
     // contain the triggering import form, then shared by every later chunk
     // instead of being rebuilt corpus-sized once per chunk.
     let top_level_entities = OnceLock::new();
-    let py_top_level_entities = OnceLock::new();
     let rust_top_level_entities = OnceLock::new();
     let chunked = scope_resolve::ChunkedResolveInputs {
         facts: precomputed_facts,
         entity_index: &entity_index,
         corpus_has_swift,
         top_level_entities: &top_level_entities,
-        py_top_level_entities: &py_top_level_entities,
         rust_top_level_entities: &rust_top_level_entities,
     };
 
@@ -2162,6 +2188,7 @@ impl EntityGraph {
                         parsed: None,
                         precomputed: None,
                         content_hash: None,
+                        call_facts: None,
                     });
                 }
                 let full_path = root.join(file_path);
@@ -2177,6 +2204,7 @@ impl EntityGraph {
                         parsed,
                         precomputed: None,
                         content_hash: hash,
+                        call_facts: None,
                     })
                 } else if crate::parser::import_resolution::is_js_ts_file(
                     registry
@@ -2202,6 +2230,7 @@ impl EntityGraph {
                         parsed: None,
                         precomputed: facts,
                         content_hash: hash,
+                        call_facts: None,
                     })
                 } else if {
                     // MUL Phase 1's GO/NO-GO table: C++ and C# are
@@ -2244,6 +2273,23 @@ impl EntityGraph {
                         parsed: None,
                         precomputed: facts,
                         content_hash: hash,
+                        call_facts: None,
+                    })
+                } else if calls::language_for(file_path).is_some() {
+                    let (entities, tree) =
+                        registry.extract_entities_with_tree(file_path, &content)?;
+                    let hash = recording.then(|| content_hash(&content));
+                    let call_facts = tree
+                        .as_ref()
+                        .and_then(|t| calls::lower_file(file_path, t, &content))
+                        .map(Box::new);
+                    Some(Pass1FileProduct {
+                        file_path: file_path.as_str(),
+                        entities: Some(entities),
+                        parsed: None,
+                        precomputed: None,
+                        content_hash: hash,
+                        call_facts,
                     })
                 } else {
                     let entities = registry.extract_entities(file_path, &content);
@@ -2254,6 +2300,7 @@ impl EntityGraph {
                         parsed: None,
                         precomputed: None,
                         content_hash: hash,
+                        call_facts: None,
                     })
                 }
             })
@@ -2277,6 +2324,7 @@ impl EntityGraph {
         // exactly those files' entities by slicing `all_entities` instead of
         // re-scanning the whole corpus to find them.
         let mut clean_gate_candidate_spans: Vec<(String, usize, usize)> = Vec::new();
+        let mut call_facts: HashMap<String, calls::ir::FileFacts> = HashMap::default();
         for product in per_file {
             let start = all_entities.len();
             match product.entities {
@@ -2299,6 +2347,9 @@ impl EntityGraph {
                     c.content_hashes.insert(product.file_path.to_string(), hash);
                 }
                 let _ = c;
+            }
+            if let Some(f) = product.call_facts {
+                call_facts.insert(product.file_path.to_string(), *f);
             }
             if let Some(p) = product.parsed {
                 parsed_files.push(p);
@@ -2335,30 +2386,6 @@ impl EntityGraph {
         // not just the claim.
         let go_parents_resolved: GoParentsResolved =
             resolve_go_method_parent_ids(&mut all_entities);
-        // the id-staleness species, Go instance. Pass 1's
-        // per-file precompute (`precompute_scope_resolvable_file_facts`,
-        // called per-file inside the loop above, before `all_entities` was
-        // complete enough for the rewrite above to run) built each file's
-        // `entity_scope_map`/`entity_inner_scope`/`return_type_map` keyed by
-        // the pre-rewrite entity id. The rewrite just above changes a Go
-        // method's id when its receiver type lives in another file of the
-        // same package — so those three maps, for exactly the files that
-        // happened, are now keyed by ids pass 2 will never look up again.
-        // Re-key this build's fresh facts (the only ones the rewrite could
-        // have raced with — every carried-over file's facts predate this
-        // build's own entity ids) before the CLEAN gate or the session's
-        // store ever reads them. `rekeyed_ids()` empty is a guaranteed
-        // no-op — the common case, since it is nonempty only when this
-        // build actually contains a cross-file Go receiver method (most
-        // corpora have none; Go's precompute path itself runs
-        // unconditionally as of).
-        if !go_parents_resolved.rekeyed_ids().is_empty() {
-            for file_path in go_parents_resolved.rekeyed_files() {
-                if let Some(facts) = fresh_precomputed.get_mut(file_path) {
-                    facts.rekey_entity_ids(go_parents_resolved.rekeyed_ids());
-                }
-            }
-        }
         // MUL Phase 1: the CLEAN gate. Pass 1's precompute (both
         // `precompute_js_ts_file_facts` and, as of this change,
         // `precompute_scope_resolvable_file_facts`) can only ever see this
@@ -2791,20 +2818,6 @@ impl EntityGraph {
 
         let symbol_table = Arc::new(symbol_table_plain);
 
-        // Build owned Go package index for scope resolver. Delegates to the
-        // shared `scope_resolve::build_go_pkg_index`; this closed a divergence:
-        // the old hand-inlined copy here lacked the shared fn's `.go` extension
-        // filter (it stripped any extension), so on mixed corpora non-.go files
-        // were indexed as noise entries keyed by their stripped stems/dirs.
-        // Non-.go files now contribute nothing.
-        let __lookup_go_pkg_t0 = std::time::Instant::now();
-        let owned_go_pkg_index: scope_resolve::GoPkgIndex =
-            if file_paths.iter().any(|f| f.ends_with(".go")) {
-                scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
-            } else {
-                HashMap::default()
-            };
-        resolve_profile::add_lookup_go_pkg_ns(__lookup_go_pkg_t0.elapsed());
         resolve_profile::add_entity_lookup_build_ns(__entity_lookup_build_t0.elapsed());
 
         // checkpoint 1: "post-pass-1" — all_entities plus every
@@ -2858,7 +2871,6 @@ impl EntityGraph {
             class_members: scope_class_members,
             owner_members: scope_owner_members,
             entity_ranges: scope_entity_ranges,
-            go_pkg_index: owned_go_pkg_index,
             ext_overrides: registry
                 .ext_overrides()
                 .iter()
@@ -2889,12 +2901,10 @@ impl EntityGraph {
             // — the one failure mode that turns a should-be-RED file GREEN.
             //
             // Falls back to the whole fold whenever the tables themselves were
-            // rebuilt whole, or whenever `go_pkg_index` is non-empty (a `.go`
-            // corpus): that index has no per-file key index, so its keys'
-            // disappearance cannot be detected key-by-key.
+            // rebuilt whole.
             match touched_corpus_keys
                 .as_ref()
-                .filter(|_| pre_built.go_pkg_index.is_empty() && !carry_corpus_fp.is_empty())
+                .filter(|_| !carry_corpus_fp.is_empty())
             {
                 Some(touched) => scope_resolve::fingerprint_corpus_tables_incremental(
                     touched,
@@ -3026,6 +3036,17 @@ impl EntityGraph {
                 ],
             );
         }
+
+        // Call edges for the languages `calls` owns, resolved now so its
+        // per-file facts are freed before scope resolution builds its tables.
+        let call_edges = calls::resolve_call_edges(
+            root,
+            file_paths,
+            &all_entities,
+            &entity_map,
+            call_facts,
+            &parsed_files,
+        );
 
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
         let has_scope_lang = file_paths.iter().any(|f| {
@@ -3188,6 +3209,7 @@ impl EntityGraph {
         let mut combined: Vec<ResolvedEdge> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
+        calls::apply_call_edges(&entity_map, call_edges, &mut combined);
         let __dedupe_t0 = std::time::Instant::now();
         let mut all_resolved = dedupe_resolved_edges(combined);
         resolve_profile::add_dedupe_ns(__dedupe_t0.elapsed());
@@ -3472,6 +3494,15 @@ impl EntityGraph {
                 .and_then(|c| c.scope_resolve)
                 .is_some()
         });
+        let mut call_edges = calls::resolve_call_edges(
+            root,
+            file_paths,
+            &all_entities,
+            &entity_map,
+            HashMap::default(),
+            &retained_parsed_files,
+        );
+        call_edges.retain(|(from, _, _)| needs_resolution.contains(from.as_str()));
         let parsed_files: Vec<(String, String, tree_sitter::Tree)> = if !has_scope_lang {
             Vec::new()
         } else if !retained_parsed_files.is_empty() && scope_file_paths.len() == file_paths.len() {
@@ -3496,19 +3527,11 @@ impl EntityGraph {
             Some(parsed_files.as_slice()),
         );
 
-        let owned_go_pkg_index: scope_resolve::GoPkgIndex =
-            if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
-                scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
-            } else {
-                HashMap::default()
-            };
-
         let pre_built = scope_resolve::PreBuiltLookups {
             symbol_table: Arc::clone(&symbol_table),
             class_members: scope_class_members,
             owner_members: scope_owner_members,
             entity_ranges: scope_entity_ranges,
-            go_pkg_index: owned_go_pkg_index,
             ext_overrides: registry
                 .ext_overrides()
                 .iter()
@@ -3583,6 +3606,7 @@ impl EntityGraph {
             .collect();
         combined.extend(export_edges);
         combined.extend(resolved_refs);
+        calls::apply_call_edges(&entity_map, call_edges, &mut combined);
         let mut all_resolved = dedupe_resolved_edges(combined);
         sort_resolved_refs(&mut all_resolved);
 
@@ -4098,7 +4122,7 @@ impl EntityGraph {
         // is not affected by target changes. Drop ALL cached edges from stale-file entities
         // (even content_clean ones) because import/scope context may have changed even when
         // entity content didn't. See: https://github.com/Ataraxy-Labs/sem/issues/116
-        let kept_edges: Vec<EntityRef> = cached_edges
+        let mut kept_edges: Vec<EntityRef> = cached_edges
             .into_iter()
             .filter(|e| {
                 if !current_entity_ids.contains(e.from_entity.as_str())
@@ -4268,6 +4292,14 @@ impl EntityGraph {
             HashMap::default();
         let pre_parsed_content =
             snapshot_bow_content(&resolve_file_paths, &parsed_files, &no_precomputed);
+        let call_edges = calls::resolve_call_edges(
+            root,
+            all_file_paths,
+            &all_entities,
+            &entity_map,
+            HashMap::default(),
+            &parsed_files,
+        );
         let (scope_edges, scope_consumed_words) = if has_scope_lang {
             // Pass pre-parsed stale-file trees; scope_resolve reads affected clean files from disk
             let resolve_set: HashSet<&str> =
@@ -4281,18 +4313,11 @@ impl EntityGraph {
             } else {
                 Some(relevant_parsed)
             };
-            let owned_go_pkg_index: scope_resolve::GoPkgIndex =
-                if resolve_file_paths.iter().any(|f| f.ends_with(".go")) {
-                    scope_resolve::build_go_pkg_index(&symbol_table, &entity_map)
-                } else {
-                    HashMap::default()
-                };
             let pre_built = scope_resolve::PreBuiltLookups {
                 symbol_table: Arc::clone(&symbol_table),
                 class_members: scope_class_members,
                 owner_members: scope_owner_members,
                 entity_ranges: scope_entity_ranges,
-                go_pkg_index: owned_go_pkg_index,
                 ext_overrides: registry
                     .ext_overrides()
                     .iter()
@@ -4346,6 +4371,28 @@ impl EntityGraph {
         let mut combined: Vec<ResolvedEdge> = scope_edges;
         combined.extend(export_edges);
         combined.extend(resolved_refs);
+        // Call edges of `calls`-owned files are whole-program facts: recompute
+        // them all (stale files from their trees, the rest re-read) and let
+        // them replace the kept cached ones, exactly as a full build would.
+        let mut kept_as_resolved: Vec<ResolvedEdge> = kept_edges
+            .drain(..)
+            .map(|e| {
+                (
+                    canonical_entity_id(&entity_map, &e.from_entity),
+                    canonical_entity_id(&entity_map, &e.to_entity),
+                    e.ref_type,
+                )
+            })
+            .collect();
+        calls::apply_call_edges(&entity_map, Vec::new(), &mut kept_as_resolved);
+        kept_edges.extend(kept_as_resolved.into_iter().map(
+            |(from_entity, to_entity, ref_type)| EntityRef {
+                from_entity: from_entity.into(),
+                to_entity: to_entity.into(),
+                ref_type,
+            },
+        ));
+        calls::apply_call_edges(&entity_map, call_edges, &mut combined);
         let mut all_resolved = dedupe_resolved_edges(combined);
         sort_resolved_refs(&mut all_resolved);
 
@@ -7387,7 +7434,7 @@ where
     F: FnMut(usize, usize, usize) -> bool,
 {
     let mut names = HashSet::default();
-    if !matches!(ext, ".js" | ".jsx" | ".ts" | ".tsx" | ".py" | ".swift") {
+    if !matches!(ext, ".js" | ".jsx" | ".ts" | ".tsx" | ".swift") {
         return names;
     }
 
@@ -7406,15 +7453,6 @@ where
                     &mut names,
                 );
             }
-            ".py" => {
-                collect_python_local_bindings(
-                    line,
-                    line_no,
-                    line_start,
-                    &mut include_token,
-                    &mut names,
-                );
-            }
             _ => {}
         }
         line_start += chunk.len();
@@ -7426,12 +7464,6 @@ where
 
 static JS_TS_SWIFT_LOCAL_DECL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:const|let|var)\s+([A-Za-z_]\w*)").unwrap());
-
-static PY_LOCAL_ASSIGN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]+)?([+\-*/%&|^]?=)").unwrap());
-
-static PY_FOR_BINDING_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*for\s+([A-Za-z_]\w*)\s+in\b").unwrap());
 
 // Clojure `:require [ns :refer [sym1 sym2]]` — matches inside any require form.
 // `[^\[\]]*` prevents crossing both `[` and `]` boundaries, so the regex cannot
@@ -7474,40 +7506,6 @@ fn collect_local_binding_captures<F>(
             );
         }
     }
-}
-
-fn collect_python_local_bindings<F>(
-    line: &str,
-    line_no: usize,
-    line_start: usize,
-    include_token: &mut F,
-    names: &mut HashSet<String>,
-) where
-    F: FnMut(usize, usize, usize) -> bool,
-{
-    if let Some(cap) = PY_LOCAL_ASSIGN_RE.captures(line) {
-        if let (Some(name_match), Some(op_match)) = (cap.get(1), cap.get(2)) {
-            if line.as_bytes().get(op_match.end()) != Some(&b'=') {
-                maybe_add_local_binding_name(
-                    name_match.as_str(),
-                    line_no,
-                    line_start,
-                    name_match,
-                    include_token,
-                    names,
-                );
-            }
-        }
-    }
-
-    collect_local_binding_captures(
-        line,
-        line_no,
-        line_start,
-        &PY_FOR_BINDING_RE,
-        include_token,
-        names,
-    );
 }
 
 fn maybe_add_local_binding_name<F>(
@@ -8332,6 +8330,8 @@ mod tests {
             RefType::Calls => 0,
             RefType::Imports => 1,
             RefType::TypeRef => 2,
+            RefType::Refs => 3,
+            RefType::Dispatch => 4,
         }
     }
 
@@ -8890,7 +8890,11 @@ comment with Helper
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "a.py", "def use_it():\n    return helper()\n");
+        write_file(
+            root,
+            "a.py",
+            "from b import helper\n\ndef use_it():\n    return helper()\n",
+        );
         write_file(root, "b.py", "def helper():\n    return 1\n");
 
         let (cached_graph, cached_entities) =
@@ -8960,7 +8964,11 @@ comment with Helper
         let (dir, registry) = create_test_repo();
         let root = dir.path();
 
-        write_file(root, "a.py", "def use_it():\n    return helper()\n");
+        write_file(
+            root,
+            "a.py",
+            "from b import helper\n\ndef use_it():\n    return helper()\n",
+        );
         write_file(root, "b.py", "def other():\n    return 1\n");
 
         let (cached_graph, cached_entities) =
@@ -11592,26 +11600,12 @@ def make_conn():
             .expect("Holder.use entity should exist");
         let deps = graph.get_dependencies(use_id);
 
+        // `make_conn` is unbound in holder.py (two unrelated modules define
+        // one): `self.conn`'s type is unknowable, so `conn.get()` binds to
+        // neither same-named `get` — and the answer is identical every run.
         assert!(
-            deps.iter().any(|d| {
-                d.name == "get"
-                    && d.parent_id
-                        .as_deref()
-                        .map_or(false, |parent| parent.contains("Primary"))
-            }),
-            "Holder.use should resolve conn.get to Primary.get. Deps: {:?}",
-            deps.iter()
-                .map(|d| (&d.name, &d.parent_id))
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            !deps.iter().any(|d| {
-                d.name == "get"
-                    && d.parent_id
-                        .as_deref()
-                        .map_or(false, |parent| parent.contains("Backup"))
-            }),
-            "Holder.use should not resolve conn.get to Backup.get. Deps: {:?}",
+            !deps.iter().any(|d| d.name == "get"),
+            "Holder.use must not guess conn.get. Deps: {:?}",
             deps.iter()
                 .map(|d| (&d.name, &d.parent_id))
                 .collect::<Vec<_>>()

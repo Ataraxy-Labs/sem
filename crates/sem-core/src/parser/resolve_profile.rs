@@ -87,7 +87,6 @@ fn bucket_range_label(b: usize) -> String {
 // ---- phase-level wall-time accumulators (nanoseconds) ----
 static REPARSE_NS: AtomicU64 = AtomicU64::new(0);
 static PASS1_SCAN_NS: AtomicU64 = AtomicU64::new(0);
-static CTOR_INFER_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_GROUP_NS: AtomicU64 = AtomicU64::new(0);
 static PASS2_WALL_NS: AtomicU64 = AtomicU64::new(0);
 static SCOPE_BUILD_NS: AtomicU64 = AtomicU64::new(0);
@@ -149,32 +148,6 @@ static SB_PRECOMPUTED_IMPORT_FILES: AtomicU64 = AtomicU64::new(0);
 /// MUL: total `import_stmts` descriptors dispatched
 /// from precomputed facts, summed across those files.
 static SB_PRECOMPUTED_IMPORT_DESCRIPTORS: AtomicU64 = AtomicU64::new(0);
-/// MUL Phase 2 (MUL;): files whose
-/// precomputed facts carried nonempty `ctor_call_sites`, applied without a
-/// tree (`infer_constructor_param_types`, not `ScopeBuildAccum` — this scan
-/// runs once per build in its own pass-1b step, not per file inside pass 2's
-/// closure, so it is bumped directly rather than through
-/// [`merge_scope_build`]).
-static SB_PRECOMPUTED_CTOR_CALL_FILES: AtomicU64 = AtomicU64::new(0);
-/// MUL: total `ctor_call_sites` descriptors applied
-/// from precomputed facts, summed across those files.
-static SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS: AtomicU64 = AtomicU64::new(0);
-
-/// MUL Phase 2 (MUL;): record that one
-/// file's precomputed `ctor_call_sites` were applied without a tree.
-/// Engagement proof, not inference — called only when
-/// `infer_constructor_param_types` actually sourced a file's descriptors
-/// from `PrecomputedFileFacts` and that `Vec` was nonempty, mirroring
-/// `ScopeBuildAccum::precomputed_import_descriptors`'s discipline for Field
-/// 10.
-pub fn add_precomputed_ctor_call_engagement(files: u64, descriptors: u64) {
-    if !enabled() {
-        return;
-    }
-    SB_PRECOMPUTED_CTOR_CALL_FILES.fetch_add(files, Ordering::Relaxed);
-    SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS.fetch_add(descriptors, Ordering::Relaxed);
-}
-
 // ---- pass-2 diagnostic counters (entity scope-index lookups + type-directed
 // method resolution). Same zero-cost-when-off contract as everything above;
 // like the phase timers they are on at `SEM_PROFILE_RESOLVE=1` *and* `=2`,
@@ -371,14 +344,13 @@ static SYMBOL_TABLE_BY_FILE_NS: AtomicU64 = AtomicU64::new(0);
 /// `build_incremental_core`'s "Pass A + Pass B" — the single O(all
 /// entities) loop building `symbol_table`, `entity_map`, `scope_class_members`,
 /// `scope_owner_members`, `scope_entity_ranges`, plus the local `&str`-borrowed
-/// maps (`class_members`, `enclosing_class`, `class_child_names`, …) and
-/// `go_pkg_index` — every one of them rebuilt whole on *every* warm rebuild
+/// maps (`class_members`, `enclosing_class`, `class_child_names`, …) — every one of them rebuilt whole on *every* warm rebuild
 /// before this change, never previously instrumented as its own bucket (it sat
 /// inside the unattributed gap between `pass1_scan_ms` and `resolve_phase_ms`
 /// in every prior section of this document).
 static ENTITY_LOOKUP_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 /// `fingerprint_corpus_tables` — the whole-table hash pass over
-/// `symbol_table`/`class_members`/`owner_members`/`entity_map`/`go_pkg_index`
+/// `symbol_table`/`class_members`/`owner_members`/`entity_map`
 /// that runs once per build, before any read set is evaluated, regardless of
 /// how many files are RED. Never previously instrumented as its own bucket.
 static FINGERPRINT_CORPUS_TABLES_NS: AtomicU64 = AtomicU64::new(0);
@@ -401,8 +373,6 @@ static LOOKUP_OWNED_NS: AtomicU64 = AtomicU64::new(0);
 /// The `&str`-borrowed Pass B loop: `enclosing_class` + bag-of-words
 /// `class_members`.
 static LOOKUP_PASS_B_NS: AtomicU64 = AtomicU64::new(0);
-/// `go_pkg_index` (zero on corpora with no `.go` files).
-static LOOKUP_GO_PKG_NS: AtomicU64 = AtomicU64::new(0);
 /// `fingerprint_bow_tables` — the whole-table fold over `class_members`,
 /// `class_entity_files` and `parent_child_pairs` run immediately before
 /// bag-of-words' read sets are evaluated. Sibling of
@@ -734,7 +704,6 @@ macro_rules! add_ns_fn {
 }
 add_ns_fn!(add_reparse_ns, REPARSE_NS);
 add_ns_fn!(add_pass1_scan_ns, PASS1_SCAN_NS);
-add_ns_fn!(add_ctor_infer_ns, CTOR_INFER_NS);
 add_ns_fn!(add_import_group_ns, IMPORT_GROUP_NS);
 add_ns_fn!(add_pass2_wall_ns, PASS2_WALL_NS);
 add_ns_fn!(add_chunk_entity_index_ns, CHUNK_ENTITY_INDEX_NS);
@@ -761,7 +730,6 @@ add_ns_fn!(add_lookup_pass_a_ns, LOOKUP_PASS_A_NS);
 add_ns_fn!(add_lookup_child_ranges_ns, LOOKUP_CHILD_RANGES_NS);
 add_ns_fn!(add_lookup_owned_ns, LOOKUP_OWNED_NS);
 add_ns_fn!(add_lookup_pass_b_ns, LOOKUP_PASS_B_NS);
-add_ns_fn!(add_lookup_go_pkg_ns, LOOKUP_GO_PKG_NS);
 add_ns_fn!(add_fingerprint_bow_tables_ns, FINGERPRINT_BOW_TABLES_NS);
 add_ns_fn!(add_pass1_wall_ns, PASS1_WALL_NS);
 add_ns_fn!(add_assemble_ns, ASSEMBLE_NS);
@@ -887,7 +855,6 @@ pub fn reset() {
     }
     REPARSE_NS.store(0, Ordering::Relaxed);
     PASS1_SCAN_NS.store(0, Ordering::Relaxed);
-    CTOR_INFER_NS.store(0, Ordering::Relaxed);
     IMPORT_GROUP_NS.store(0, Ordering::Relaxed);
     PASS2_WALL_NS.store(0, Ordering::Relaxed);
     SCOPE_BUILD_NS.store(0, Ordering::Relaxed);
@@ -908,8 +875,6 @@ pub fn reset() {
         &SB_REFS_COLLECTED,
         &SB_PRECOMPUTED_IMPORT_FILES,
         &SB_PRECOMPUTED_IMPORT_DESCRIPTORS,
-        &SB_PRECOMPUTED_CTOR_CALL_FILES,
-        &SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -941,7 +906,6 @@ pub fn reset() {
     LOOKUP_CHILD_RANGES_NS.store(0, Ordering::Relaxed);
     LOOKUP_OWNED_NS.store(0, Ordering::Relaxed);
     LOOKUP_PASS_B_NS.store(0, Ordering::Relaxed);
-    LOOKUP_GO_PKG_NS.store(0, Ordering::Relaxed);
     FINGERPRINT_BOW_TABLES_NS.store(0, Ordering::Relaxed);
     PASS1_WALL_NS.store(0, Ordering::Relaxed);
     ASSEMBLE_NS.store(0, Ordering::Relaxed);
@@ -1020,11 +984,10 @@ pub fn maybe_print_report() {
 
     eprintln!("SEM_PROFILE_RESOLVE report ---------------------------------");
     eprintln!(
-        "PHASE_NS files={} reparse_ms={:.2} pass1_scan_ms={:.2} ctor_infer_ms={:.2} return_types_by_name_ms={:.2} import_group_ms={:.2} pass2_wall_ms={:.2} chunk_entity_index_ms={:.2} scope_merge_ms={:.2} scope_dedup_ms={:.2} scope_build_ms={:.2} ref_collect_ms={:.2} ref_loop_ms={:.2} resolve_ref_ms={:.2}",
+        "PHASE_NS files={} reparse_ms={:.2} pass1_scan_ms={:.2} return_types_by_name_ms={:.2} import_group_ms={:.2} pass2_wall_ms={:.2} chunk_entity_index_ms={:.2} scope_merge_ms={:.2} scope_dedup_ms={:.2} scope_build_ms={:.2} ref_collect_ms={:.2} ref_loop_ms={:.2} resolve_ref_ms={:.2}",
         FILES_PROCESSED.load(Ordering::Relaxed),
         ms(REPARSE_NS.load(Ordering::Relaxed)),
         ms(PASS1_SCAN_NS.load(Ordering::Relaxed)),
-        ms(CTOR_INFER_NS.load(Ordering::Relaxed)),
         ms(RETURN_TYPES_BY_NAME_NS.load(Ordering::Relaxed)),
         ms(IMPORT_GROUP_NS.load(Ordering::Relaxed)),
         ms(PASS2_WALL_NS.load(Ordering::Relaxed)),
@@ -1067,7 +1030,7 @@ pub fn maybe_print_report() {
         ms(SCOPE_BUILD_NS.load(Ordering::Relaxed).saturating_sub(sb_sum)),
     );
     eprintln!(
-        "SCOPE_BUILD_WORK files_precomputed={} files_ast={} files_fused={} entities_spanned={} scopes_built={} refs_collected={} files_precomputed_with_imports={} precomputed_import_descriptors={} files_precomputed_with_ctor_calls={} precomputed_ctor_call_descriptors={}",
+        "SCOPE_BUILD_WORK files_precomputed={} files_ast={} files_fused={} entities_spanned={} scopes_built={} refs_collected={} files_precomputed_with_imports={} precomputed_import_descriptors={}",
         SB_FILES_PRECOMPUTED.load(Ordering::Relaxed),
         SB_FILES_AST.load(Ordering::Relaxed),
         SB_FILES_FUSED.load(Ordering::Relaxed),
@@ -1076,8 +1039,6 @@ pub fn maybe_print_report() {
         SB_REFS_COLLECTED.load(Ordering::Relaxed),
         SB_PRECOMPUTED_IMPORT_FILES.load(Ordering::Relaxed),
         SB_PRECOMPUTED_IMPORT_DESCRIPTORS.load(Ordering::Relaxed),
-        SB_PRECOMPUTED_CTOR_CALL_FILES.load(Ordering::Relaxed),
-        SB_PRECOMPUTED_CTOR_CALL_DESCRIPTORS.load(Ordering::Relaxed),
     );
 
     // Pass-2 diagnostic counters. The scope-index pair covers precomputed-file
@@ -1129,12 +1090,11 @@ pub fn maybe_print_report() {
         ms(FINGERPRINT_CORPUS_TABLES_NS.load(Ordering::Relaxed)),
     );
     eprintln!(
-        "LOOKUP_NS pass_a_ms={:.2} child_ranges_ms={:.2} owned_ms={:.2} pass_b_ms={:.2} go_pkg_ms={:.2} fingerprint_bow_ms={:.2}",
+        "LOOKUP_NS pass_a_ms={:.2} child_ranges_ms={:.2} owned_ms={:.2} pass_b_ms={:.2} fingerprint_bow_ms={:.2}",
         ms(LOOKUP_PASS_A_NS.load(Ordering::Relaxed)),
         ms(LOOKUP_CHILD_RANGES_NS.load(Ordering::Relaxed)),
         ms(LOOKUP_OWNED_NS.load(Ordering::Relaxed)),
         ms(LOOKUP_PASS_B_NS.load(Ordering::Relaxed)),
-        ms(LOOKUP_GO_PKG_NS.load(Ordering::Relaxed)),
         ms(FINGERPRINT_BOW_TABLES_NS.load(Ordering::Relaxed)),
     );
     eprintln!(
