@@ -470,10 +470,20 @@ fn mark(t: &mut crate::timings::Timings, name: &'static str) {
     }
 }
 
+/// The data-flow deadline inside a whole-command budget: propagation gets
+/// half of what is left after the trees are built, the engine's final pass
+/// up to a quarter of that again (at least 1 s), and the rest is held for
+/// the phases after it (escape resolution, JSON, dependencies, compose), so
+/// `--budget` bounds the command's wall time, not one phase of it.
+pub(crate) fn dataflow_deadline(now: std::time::Instant, end: std::time::Instant) -> std::time::Instant {
+    now + end.saturating_duration_since(now).mul_f64(0.5)
+}
+
 pub fn arch_diff_command(opts: ArchDiffOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let t0 = std::time::Instant::now();
+    let end = opts.budget.map(|b| t0 + b);
     let root = super::repo_root_or_cwd(&opts.cwd);
     let (base, head) = certify::resolve_range(&root, &opts.range)?;
-    let t0 = std::time::Instant::now();
     let mut timings = crate::timings::Timings::from_env("arch-diff");
     let (bt, ht, region) = certify::build_trees_in(&root, &base, &head, opts.scope)?;
     mark(&mut timings, "build_trees");
@@ -485,7 +495,7 @@ pub fn arch_diff_command(opts: ArchDiffOptions) -> Result<(), Box<dyn std::error
     let include = opts.include_examples;
     let prod = |files: &[String]| -> Vec<String> { files.iter().filter(|f| !non_prod(f, include)).cloned().collect() };
     let (bprod, hprod) = (prod(&bt.files), prod(&ht.files));
-    let limits = dataflow::Limits { deadline: opts.budget.map(|b| std::time::Instant::now() + b), max_rss_bytes: opts.max_memory };
+    let limits = dataflow::Limits { deadline: end.map(|e| dataflow_deadline(std::time::Instant::now(), e)), max_rss_bytes: opts.max_memory };
     let (ba, ha) = std::thread::scope(|sc| {
         let b = sc.spawn(|| analyze_tree(bt.dir.path(), &bprod, &bt.entities, &models, limits, bt.scope.as_ref()));
         let h = sc.spawn(|| analyze_tree(ht.dir.path(), &hprod, &ht.entities, &models, limits, ht.scope.as_ref()));
@@ -501,7 +511,7 @@ pub fn arch_diff_command(opts: ArchDiffOptions) -> Result<(), Box<dyn std::error
     mark(&mut timings, "deps");
     let (bm, hm) = (measure(&bd), measure(&hd));
     mark(&mut timings, "measure");
-    let report = compose(&cert, &bj, &hj, &bd, &hd, &bm, &hm, &bt, &ht, region.as_ref(), opts.max_items, t0.elapsed());
+    let report = compose(&cert, &bj, &hj, &bd, &hd, &bm, &hm, &bt, &ht, region.as_ref(), opts.max_items, t0, end);
     mark(&mut timings, "compose");
     timings.finish();
     match opts.format {
@@ -547,8 +557,11 @@ fn compose(
     ht: &Tree,
     region: Option<&super::region::Region>,
     max: usize,
-    elapsed: std::time::Duration,
+    t0: std::time::Instant,
+    end: Option<std::time::Instant>,
 ) -> Value {
+    let late = || end.is_some_and(|e| std::time::Instant::now() >= e);
+    let mut skipped: Vec<&str> = Vec::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     // diff-scoped: repo-wide facts hold within the analyzed region only
@@ -968,17 +981,36 @@ fn compose(
     if (hr - br) * 100.0 >= 5.0 {
         findings.push(Finding { severity: Severity::Low, kind: "unknown-coverage", title: format!("unresolved call rate {:.1}% -> {:.1}%", br * 100.0, hr * 100.0), details: Vec::new(), data: json!({ "before": br, "after": hr }) });
     }
-    let (bs, hs) = (schema_files(bt.dir.path(), &bt.files), schema_files(ht.dir.path(), &ht.files));
+    let (bs, hs) = if late() {
+        skipped.push("service schemas");
+        (BTreeSet::new(), BTreeSet::new())
+    } else {
+        (schema_files(bt.dir.path(), &bt.files), schema_files(ht.dir.path(), &ht.files))
+    };
     let changed_files: BTreeSet<String> = arr(&cert["entities"]).iter().map(|e| s(&e["file"])).collect();
     let touched_schema: Vec<&String> = hs.iter().filter(|f| !bs.contains(*f) || changed_files.contains(*f)).collect();
     // imports of repo modules that resolve to no file: JS/TS relative
-    // imports, Python relative and repo-absolute imports
+    // imports, Python relative and repo-absolute imports. Python: when no
+    // module file was added or removed, an unchanged file's imports resolve
+    // the same in both trees, so only the changed files are parsed (the
+    // whole-tree parse, twice, serially, was 3-14 s of sympy's compose).
+    let py_check = python_files_to_check(bt, ht);
     let broken = |t: &Tree| -> BTreeSet<(String, String)> {
         let mut b = super::topology::broken_relative_imports(&t.dir.path().to_string_lossy(), t.scope.as_ref());
-        b.extend(sem_core::topology::pyimports::broken_imports_in(t.dir.path(), &t.all_files, t.scope.as_ref()));
+        let check: Option<std::collections::HashSet<String>> = match (&py_check, t.scope.as_ref()) {
+            (Some(c), Some(sc)) => Some(c.intersection(sc).cloned().collect()),
+            (Some(c), None) => Some(c.clone()),
+            (None, sc) => sc.cloned(),
+        };
+        b.extend(sem_core::topology::pyimports::broken_imports_in(t.dir.path(), &t.all_files, check.as_ref()));
         b
     };
-    let (bb, hb) = (broken(bt), broken(ht));
+    let (bb, hb) = if late() {
+        skipped.push("broken imports");
+        (BTreeSet::new(), BTreeSet::new())
+    } else {
+        (broken(bt), broken(ht))
+    };
     for (file, spec) in hb.difference(&bb) {
         // generated at build time, often gitignored (protobuf, version stamps)
         let leaf = spec.rsplit(['.', '/']).next().unwrap_or(spec);
@@ -991,8 +1023,9 @@ fn compose(
             data: json!({ "file": file, "specifier": spec }),
         });
     }
-    if hb.difference(&bb).next().is_none() {
-        unchanged.push(format!("No new import of a repo module that resolves to no file{within} (JS/TS relative, Python relative and repo-absolute; {} at head).", hb.len()));
+    if hb.difference(&bb).next().is_none() && !skipped.contains(&"broken imports") {
+        let at_head = if py_check.is_some() { format!("{} in the changed files at head", hb.len()) } else { format!("{} at head", hb.len()) };
+        unchanged.push(format!("No new import of a repo module that resolves to no file{within} (JS/TS relative, Python relative and repo-absolute; {at_head})."));
     }
     for f in &touched_schema {
         findings.push(Finding { severity: Severity::Medium, kind: "service-boundary", title: format!("service schema added or changed: {f} (its consumers are not modeled as edges)"), details: Vec::new(), data: json!({ "file": f }) });
@@ -1037,8 +1070,29 @@ fn compose(
         } else {
             Value::Null
         },
-        "elapsedMs": elapsed.as_millis() as u64,
+        "elapsedMs": t0.elapsed().as_millis() as u64,
+        "skippedForBudget": skipped,
     })
+}
+
+/// The Python files whose imports can differ between the trees: the changed
+/// ones, when the set of Python files is the same in both; `None` (all of
+/// them) when a module was added or removed, since that can break or mend an
+/// import in a file this change did not touch.
+fn python_files_to_check(bt: &Tree, ht: &Tree) -> Option<std::collections::HashSet<String>> {
+    fn py(t: &Tree) -> BTreeSet<&String> {
+        t.all_files.iter().filter(|f| f.ends_with(".py")).collect()
+    }
+    let (bp, hp) = (py(bt), py(ht));
+    if bp != hp {
+        return None;
+    }
+    Some(
+        hp.into_iter()
+            .filter(|f| std::fs::read(bt.dir.path().join(f.as_str())).ok() != std::fs::read(ht.dir.path().join(f.as_str())).ok())
+            .cloned()
+            .collect(),
+    )
 }
 
 /// What was analyzed: whole trees, or a diff-scoped region with the names
@@ -1208,6 +1262,12 @@ fn short(sha: &Value) -> String {
     x[..12.min(x.len())].to_string()
 }
 
+/// Checks the budget ran out before.
+fn skipped_note(r: &Value) -> Option<String> {
+    let k: Vec<String> = arr(&r["skippedForBudget"]).iter().map(s).collect();
+    (!k.is_empty()).then(|| format!("Not checked, the time budget ran out first: {}. Raise --budget (or 0) to include them.", k.join(", ")))
+}
+
 /// The notice a partial (budget-exhausted) report carries.
 fn budget_note(r: &Value) -> Option<String> {
     let b = &r["budgetExhausted"];
@@ -1228,6 +1288,9 @@ fn budget_note(r: &Value) -> Option<String> {
 pub fn render_text(r: &Value, max: usize) -> String {
     let mut o = String::new();
     if let Some(n) = budget_note(r) {
+        o += &format!("{n}\n");
+    }
+    if let Some(n) = skipped_note(r) {
         o += &format!("{n}\n");
     }
     if let Some(n) = scope_note(r) {
@@ -1277,6 +1340,9 @@ pub fn render_md(r: &Value, max: usize) -> String {
     let sm = &r["summary"];
     o += &format!("## Architecture delta `{}..{}`\n\n", short(&r["base"]), short(&r["head"]));
     if let Some(n) = budget_note(r) {
+        o += &format!("> **{n}**\n\n");
+    }
+    if let Some(n) = skipped_note(r) {
         o += &format!("> **{n}**\n\n");
     }
     if let Some(n) = scope_note(r) {

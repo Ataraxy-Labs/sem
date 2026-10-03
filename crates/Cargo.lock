@@ -2287,6 +2287,7 @@ dependencies = [
  "git2",
  "ignore",
  "indicatif",
+ "memchr",
  "mimalloc",
  "openssl-sys",
  "rayon",

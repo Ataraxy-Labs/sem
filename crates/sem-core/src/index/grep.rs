@@ -413,8 +413,30 @@ fn literal_runs(pattern: &str) -> Vec<String> {
                 i += 1;
             }
             '(' => {
+                // A group is opaque: its content may be an alternation
+                // (`(get|has)`, where neither branch is mandatory) or
+                // optional (`(abc)?`), so it contributes no required literal.
+                // Skip to the matching ')', honoring escapes and classes.
                 flush(&mut buf, &mut runs);
-                i += 1;
+                let mut depth = 0usize;
+                let mut in_class = false;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 1,
+                        '[' if !in_class => in_class = true,
+                        ']' if in_class => in_class = false,
+                        '(' if !in_class => depth += 1,
+                        ')' if !in_class => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                i += 1; // consume ')', or step past end
             }
             '[' => {
                 flush(&mut buf, &mut runs);
@@ -509,6 +531,18 @@ mod tests {
         assert_eq!(split_top_level("foo|bar", '|'), vec!["foo", "bar"]);
         assert_eq!(split_top_level("a(b|c)d", '|'), vec!["a(b|c)d"]);
         assert_eq!(split_top_level("[a|b]", '|'), vec!["[a|b]"]);
+    }
+
+    #[test]
+    fn groups_are_opaque_so_inner_alternation_and_optional_groups_require_nothing() {
+        // `(get|has)attr\(` must not require "get|has" (a trigram no file
+        // holds: every match was dropped) nor "get" (absent from `hasattr(`).
+        assert_eq!(literal_runs(r"(get|has)attr\("), vec!["attr("]);
+        // an optional group contributes nothing either
+        assert_eq!(literal_runs("(abc)?def"), vec!["def"]);
+        assert_eq!(literal_runs("x(a(b|c)d)*yz"), vec!["x", "yz"]);
+        assert_eq!(literal_runs(r"(a\)b)cde"), vec!["cde"]);
+        assert_eq!(literal_runs("([)])foo"), vec!["foo"]);
     }
 
     #[test]

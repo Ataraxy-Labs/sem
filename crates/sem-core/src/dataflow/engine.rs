@@ -487,7 +487,9 @@ impl<'a> Engine<'a> {
                 why = Some("work budget");
                 break;
             }
-            if work % 64 == 0 && late(self.inp.limits.deadline) {
+            // checked every function: one analysis of a large function can
+            // take tens of milliseconds, and 64 of them overran the budget
+            if late(self.inp.limits.deadline) {
                 incomplete = true;
                 why = Some("time budget");
                 break;
@@ -515,8 +517,8 @@ impl<'a> Engine<'a> {
             let now = std::time::Instant::now();
             now.max(d) + (d.saturating_duration_since(start) / 4).max(std::time::Duration::from_secs(1))
         });
-        for (k, &fr) in all.iter().enumerate() {
-            if k % 64 == 0 && late(grace) {
+        for &fr in &all {
+            if late(grace) {
                 incomplete = true;
                 why = Some("time budget");
                 break;

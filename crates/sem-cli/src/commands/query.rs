@@ -79,6 +79,12 @@ pub fn find_multi_command(cwd: String, queries: Vec<String>, file: Option<String
         for (query, answer) in &answers {
             if answer.defs.is_empty() {
                 eprintln!("{} no entity named '{}'", "error:".red().bold(), query);
+                let root = super::repo_root_or_cwd(&cwd);
+                if let Some(idx) = open_index(&root) {
+                    for m in super::qualified::near_matches(&idx, query, file.as_deref(), 5) {
+                        eprintln!("    near: {} {} {}:{}  ({})", m.entity_type.dimmed(), m.qualified_name.bold(), m.file, m.start_line, m.why);
+                    }
+                }
                 continue;
             }
             for def in &answer.defs {
@@ -116,9 +122,35 @@ pub fn find_command(opts: QueryOptions) {
 /// held back, json is just the capped list the caller asked for.
 pub fn callers_command(opts: QueryOptions, limit: Option<usize>) {
     let mut answer = resolve(&opts, Verb::Callers);
+    if answer.defs.is_empty() {
+        report_miss(&opts.cwd, &opts.query, opts.file.as_deref(), opts.json, Verb::Callers);
+        return;
+    }
+    let root = super::repo_root_or_cwd(&opts.cwd);
+    let idx = open_index(&root);
+    // Registrations of one dispatcher (`@dispatch`, `@f.register`,
+    // `@overload`) share a name by design; `--file` cannot pick one when they
+    // live in one file. They are one callable: answer once, for the group.
+    let mut group: Vec<EntityInfo> = Vec::new();
+    if answer.defs.len() > 1 && is_dispatch_group(&root, &answer.defs) {
+        group = answer.defs.clone();
+        let mut seen = std::collections::HashSet::new();
+        let merged: Vec<EntityInfo> = answer
+            .related
+            .iter()
+            .flatten()
+            .filter(|e| seen.insert(e.id.to_string()))
+            .filter(|e| !group.iter().any(|g| g.id == e.id))
+            .cloned()
+            .collect();
+        answer.defs.truncate(1);
+        answer.related = vec![merged];
+    }
     if answer.defs.len() > 1 {
         refuse_ambiguous(&answer.defs, &opts);
     }
+
+    let verdict = caller_verdict(&root, idx.as_ref(), &answer.defs[0], &answer.related[0], &group);
 
     let mut hidden = 0;
     if let Some(cap) = limit {
@@ -129,91 +161,189 @@ pub fn callers_command(opts: QueryOptions, limit: Option<usize>) {
             }
         }
     }
-    render(&answer, Verb::Callers, opts.json, &opts.query);
-    if hidden > 0 && !opts.json {
+    if opts.json {
+        let def = &answer.defs[0];
+        let row = serde_json::json!({
+            "entity": to_row(def),
+            "related": answer.related[0].iter().map(to_row).collect::<Vec<_>>(),
+            "complete": verdict.complete,
+            "incomplete_because": verdict.incomplete_because,
+            "checked": verdict.checked,
+            "possible_callers": verdict.possible_callers,
+            "possible_caller_sites": verdict.possible_caller_sites,
+            "dispatch_registrations": group.iter().map(to_row).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&vec![row]).unwrap_or_default());
+        return;
+    }
+    let def = &answer.defs[0];
+    println!("{} {} {}:{}", def.entity_type.dimmed(), def.name.bold(), def.file_path, def.start_line);
+    if !group.is_empty() {
+        let mut by_file: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
+        for g in &group {
+            by_file.entry(g.file_path.as_str()).or_default().push(format!("L{}", g.start_line));
+        }
+        let at: Vec<String> = by_file.iter().map(|(f, ls)| format!("{f} {}", ls.join(","))).collect();
+        println!("  one dispatcher, {} registrations ({}); callers below are the dispatcher's", group.len(), at.join("; "));
+    }
+    let related = &answer.related[0];
+    if related.is_empty() {
+        if verdict.complete {
+            println!("  (callers: none)");
+        } else {
+            println!("  (callers: none resolved by the static graph; see below: this is NOT a proof of no callers)");
+        }
+    }
+    for row in related {
+        println!("  {} {} {}:{}", row.entity_type.dimmed(), row.name, row.file_path, row.start_line);
+    }
+    if hidden > 0 {
         println!("{}", format!("  … {hidden} more (raise --limit)").dimmed());
     }
-    if !opts.json {
-        if let (Some(def), Some(related)) = (answer.defs.first(), answer.related.first()) {
-            print_name_matched_call_sites(&opts.cwd, def, related, limit.unwrap_or(25));
-        }
+    print!("{}", super::completeness::render_text(&verdict, limit.unwrap_or(25), "  "));
+}
+
+/// Same-named definitions that are all registrations of one dispatcher:
+/// every one carries the same `@dispatch(...)` / `@multimethod` decorator
+/// (multipledispatch keys its default namespace by function name), or the
+/// same `@X.register` (one singledispatch `X`). Routes, signal receivers and
+/// `@overload` stubs are not one callable and are not grouped.
+fn is_dispatch_group(root: &Path, defs: &[EntityInfo]) -> bool {
+    let name = &defs[0].name;
+    if !defs.iter().all(|d| &d.name == name) {
+        return false;
+    }
+    let mut cache: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut keys: Vec<Option<String>> = Vec::new();
+    for d in defs {
+        let src = cache
+            .entry(d.file_path.as_str())
+            .or_insert_with(|| std::fs::read_to_string(root.join(&d.file_path)).unwrap_or_default());
+        let key = super::completeness::decorators(src, d.start_line).iter().find_map(|dec| dispatch_key(dec));
+        keys.push(key);
+    }
+    keys[0].is_some() && keys.iter().all(|k| k == &keys[0])
+}
+
+fn dispatch_key(decorator: &str) -> Option<String> {
+    let head = decorator.trim_start_matches('@').split('(').next()?.trim();
+    let last = head.rsplit('.').next().unwrap_or(head);
+    match last {
+        "dispatch" | "multimethod" | "multidispatch" => Some(format!("dispatch:{head}")),
+        "register" if head.contains('.') => Some(format!("register:{head}")),
+        _ => None,
     }
 }
 
-/// Call sites the graph could not attribute: for a *member* (method,
-/// property), `obj.name(...)` with an untyped receiver — the common case in
-/// Python/Ruby/JS — resolves to nothing, so "callers: none" would read as
-/// "safe to change". List the entities whose body contains `.name(` instead,
-/// clearly labelled as a by-name match (they may call a same-named member of
-/// another class). Served from the index's trigram tier; skipped when there
-/// is no index.
-fn print_name_matched_call_sites(cwd: &str, def: &EntityInfo, resolved: &[EntityInfo], cap: usize) {
-    if def.parent_id.is_none() || def.name.len() < 3 {
-        return;
-    }
-    let root = super::repo_root_or_cwd(cwd);
-    let Some(idx) = open_index(&root) else {
-        return;
-    };
-    let pattern = format!(r"\.{}\s*\(", regex::escape(&def.name));
-    let registry = super::create_registry(cwd);
-    let Ok(report) = index::grep::search(
-        &idx,
-        &root,
-        &pattern,
-        &index::grep::GrepOptions { case_insensitive: false },
-        |dir: &Path| super::files::find_supported_files_in_path(&root, dir, &registry, &[], false),
-    ) else {
-        return;
-    };
-    let known: std::collections::HashSet<String> = resolved
-        .iter()
-        .map(|e| e.id.to_string())
-        .chain(std::iter::once(def.id.to_string()))
-        .collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut rows: Vec<(EntityInfo, usize)> = Vec::new();
-    for hit in &report.hits {
-        // innermost entity enclosing the hit line
-        let enclosing = idx
-            .entities_in_file(&hit.file)
-            .into_iter()
-            .filter(|e| e.start_line() <= hit.line && hit.line <= e.end_line())
-            .min_by_key(|e| e.end_line() - e.start_line());
-        let Some(e) = enclosing else { continue };
-        let info = e.to_entity_info();
-        let id = info.id.to_string();
-        if known.contains(&id) || !seen.insert(id) {
-            continue;
+/// The completeness verdict for `def`'s caller set (`resolved`), from the
+/// source text of the corpus the index covers. `group`: the other
+/// registrations of the same dispatcher, whose spans are not callers.
+pub(crate) fn caller_verdict(
+    root: &Path,
+    idx: Option<&QueryIndex>,
+    def: &EntityInfo,
+    resolved: &[EntityInfo],
+    group: &[EntityInfo],
+) -> super::completeness::Verdict {
+    use super::completeness as c;
+    let def_src = std::fs::read_to_string(root.join(&def.file_path)).unwrap_or_default();
+    let mut decorators = c::decorators(&def_src, def.start_line);
+    // one entry per registration (two may carry the same decorator text)
+    for g in group.iter().filter(|g| g.id != def.id) {
+        if let Ok(src) = std::fs::read_to_string(root.join(&g.file_path)) {
+            decorators.extend(c::decorators(&src, g.start_line));
         }
-        rows.push((info, hit.line));
     }
-    if rows.is_empty() {
-        return;
-    }
-    println!(
-        "  {}",
-        format!(
-            "+ {} more by name `.{}(` (receiver type not resolved; may be another class's {}):",
-            rows.len(),
-            def.name,
-            def.name
-        )
-        .dimmed()
-    );
-    for (info, line) in rows.iter().take(cap) {
-        println!(
-            "  {} {} {}:{} (call at L{})",
-            info.entity_type.dimmed(),
-            info.name,
-            info.file_path,
-            info.start_line,
-            line
-        );
-    }
-    if rows.len() > cap {
-        println!("{}", format!("  … {} more (raise --limit)", rows.len() - cap).dimmed());
-    }
+    // An index whose text tier predates an edit would hide the edited
+    // files' mentions from the scan: use it only while every file is fresh.
+    let idx = idx.filter(|idx| !any_content_stale(idx, root));
+    let registry = super::create_registry(&root.to_string_lossy());
+    let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap_or_default();
+    // Without an index (`SEM_NO_INDEX=1`, a cold path): the same scan over
+    // every supported file, entities re-extracted per file on demand.
+    let all_files: std::cell::OnceCell<Vec<String>> = std::cell::OnceCell::new();
+    let files_containing = |needle: &str| -> Vec<String> {
+        let mut files: Vec<String> = match idx {
+            Some(idx) => index::grep::search(
+                idx,
+                root,
+                &regex::escape(needle),
+                &index::grep::GrepOptions { case_insensitive: false },
+                |dir: &Path| super::files::find_supported_files_in_path(root, dir, &registry, &[], false),
+            )
+            .map(|r| r.hits.into_iter().map(|h| h.file).collect())
+            .unwrap_or_default(),
+            None => all_files
+                .get_or_init(|| super::graph::find_supported_files_with_options(root, &registry, &[], false))
+                .iter()
+                .filter(|f| read(f).contains(needle))
+                .cloned()
+                .collect(),
+        };
+        files.sort();
+        files.dedup();
+        files
+    };
+    let extracted: std::cell::RefCell<std::collections::HashMap<String, Vec<EntityInfo>>> = Default::default();
+    let enclosing = |file: &str, line: usize| -> Option<c::Enclosing> {
+        if let Some(idx) = idx {
+            let ents = idx.entities_in_file(file);
+            let e = ents.iter().filter(|e| e.start_line() <= line && line <= e.end_line()).min_by_key(|e| e.end_line() - e.start_line())?;
+            let owners = super::qualified::index_owners(idx, e.index());
+            return Some(c::Enclosing { display: super::qualified::display_name(&owners, e.name()), entity_type: e.entity_type().to_string(), start_line: e.start_line() });
+        }
+        let mut cache = extracted.borrow_mut();
+        let all = cache.entry(file.to_string()).or_insert_with(|| reextract_file(&registry, root, file));
+        let e = all.iter().filter(|e| e.start_line <= line && line <= e.end_line).min_by_key(|e| e.end_line - e.start_line)?;
+        let owners = super::qualified::list_owners(all, e);
+        Some(c::Enclosing { display: super::qualified::display_name(&owners, &e.name), entity_type: e.entity_type.clone(), start_line: e.start_line })
+    };
+    let owner_name = match idx {
+        Some(idx) => idx.entities_in_file(&def.file_path).into_iter().find(|e| e.id() == def.id.as_str()).and_then(|e| {
+            super::qualified::index_owners(idx, e.index()).first().map(|s| s.to_string())
+        }),
+        None => {
+            let all = reextract_file(&registry, root, &def.file_path);
+            all.iter().find(|e| e.id == def.id).and_then(|e| super::qualified::list_owners(&all, e).first().map(|s| s.to_string()))
+        }
+    };
+    let target = c::Target {
+        name: &def.name,
+        file: &def.file_path,
+        span: (def.start_line, def.end_line),
+        decorators,
+        owner: owner_name.as_deref(),
+    };
+    let mut resolved_spans: Vec<(String, usize, usize)> =
+        resolved.iter().map(|e| (e.file_path.clone(), e.start_line, e.end_line)).collect();
+    resolved_spans.extend(group.iter().map(|g| (g.file_path.clone(), g.start_line, g.end_line)));
+
+    const MAX_FILES: usize = 4000;
+    let mut not_checked = None;
+    let scan_corpus = |name: &str, not_checked: &mut Option<String>| -> (Vec<c::Mention>, usize) {
+        let mut files = files_containing(name);
+        if files.len() > MAX_FILES {
+            *not_checked = Some(format!("`{name}` appears in {} files; only the first {MAX_FILES} were classified", files.len()));
+            files.truncate(MAX_FILES);
+        }
+        let n = files.len();
+        let ms = files.iter().flat_map(|f| c::scan_file(f, &read(f), name)).collect();
+        (ms, n)
+    };
+    let (mentions, files_scanned) = scan_corpus(&def.name, &mut not_checked);
+    let alias_mentions = c::alias_hop(&mentions, &def.name, |alias, scope| match scope {
+        Some(f) => c::scan_file(f, &read(f), alias),
+        None => scan_corpus(alias, &mut None).0,
+    });
+    let mut attr_files = files_containing("getattr(");
+    attr_files.extend(files_containing("hasattr("));
+    attr_files.sort();
+    attr_files.dedup();
+    let dynamic: Vec<(String, String, usize)> = attr_files
+        .iter()
+        .flat_map(|f| c::dynamic_prefixes(f, &read(f)).into_iter().map(move |(p, l)| (p, f.clone(), l)))
+        .collect();
+    c::assess(&target, &mentions, &alias_mentions, &resolved_spans, &dynamic, files_scanned, not_checked, enclosing)
 }
 
 /// The callers-verb refusal: every candidate definition listed, exit 1.
@@ -234,12 +364,24 @@ fn refuse_ambiguous(defs: &[EntityInfo], opts: &QueryOptions) -> ! {
             opts.query,
             defs.len()
         );
+        let root = super::repo_root_or_cwd(&opts.cwd);
+        let idx = open_index(&root);
         for def in defs {
+            let shown = idx
+                .as_ref()
+                .and_then(|idx| {
+                    let at = idx.entities_in_file(&def.file_path).into_iter().find(|e| e.id() == def.id.as_str())?.index();
+                    Some(super::qualified::display_name(&super::qualified::index_owners(idx, at), &def.name))
+                })
+                .unwrap_or_else(|| def.name.clone());
             eprintln!(
-                "  {} {} {}:{}",
+                "  {} {} {}:{}   (retry: `{}` or `{}@{}`)",
                 def.entity_type.dimmed(),
-                def.name.bold(),
+                shown.bold(),
                 def.file_path,
+                def.start_line,
+                shown,
+                def.name,
                 def.start_line
             );
         }
@@ -281,6 +423,10 @@ fn to_row(e: &EntityInfo) -> DefRow {
 
 fn run(opts: QueryOptions, verb: Verb) {
     let answer = resolve(&opts, verb);
+    if answer.defs.is_empty() {
+        report_miss(&opts.cwd, &opts.query, opts.file.as_deref(), opts.json, verb);
+        return;
+    }
     render(&answer, verb, opts.json, &opts.query);
 }
 
@@ -413,6 +559,15 @@ fn index_answer(idx: &QueryIndex, root: &Path, opts: &QueryOptions, verb: Verb) 
 
     let mut answer = primary?;
 
+    if verb == Verb::Callers && any_content_stale(idx, root) {
+        // A caller added to a file that had no edge to the definition is in
+        // neither the CSR row nor the files this answer stats: an edited
+        // file anywhere can hold a new caller. Decline to the cold build,
+        // which rewrites the index, rather than serve a caller set the edit
+        // may have outdated.
+        return None;
+    }
+
     if !complete.new_files.is_empty() {
         if verb != Verb::Find {
             // A new file might introduce an edge this fast path has no way
@@ -424,9 +579,8 @@ fn index_answer(idx: &QueryIndex, root: &Path, opts: &QueryOptions, verb: Verb) 
         let matched: Vec<EntityInfo> = complete
             .new_files
             .iter()
-            .flat_map(|path| reextract_file(&registry, root, path))
-            .filter(|e| matches_query(e, &opts.query))
-            .filter(|e| opts.file.as_deref().is_none_or(|f| e.file_path == f))
+            .flat_map(|path| reextract_matching(&registry, root, path, &opts.query))
+            .filter(|e| opts.file.as_deref().is_none_or(|f| super::qualified::in_scope(&e.file_path, f)))
             .collect();
         answer.defs.extend(matched);
     }
@@ -456,14 +610,13 @@ fn index_answer_verified(
         let stale: Vec<_> = files
             .par_iter()
             .copied()
-            .filter(|path| opts.file.as_deref().is_none_or(|file| file == *path))
+            .filter(|path| opts.file.as_deref().is_none_or(|file| super::qualified::in_scope(path, file)))
             .filter(|path| file_is_stale(idx, root, path))
             .collect();
         defs.retain(|entity| !stale.iter().any(|path| entity.file_path == *path));
         let fresh: Vec<EntityInfo> = stale
             .par_iter()
-            .flat_map_iter(|path| reextract_file(&registry, root, path))
-            .filter(|entity| matches_query(entity, &opts.query))
+            .flat_map_iter(|path| reextract_matching(&registry, root, path, &opts.query))
             .collect();
         defs.extend(fresh);
         return Some(Answer {
@@ -476,13 +629,12 @@ fn index_answer_verified(
     let def_files: Vec<String> = defs.iter().map(|e| e.file_path.clone()).collect();
     for path in dedup(def_files) {
         if file_is_stale(idx, root, &path) {
-            let fresh = reextract_file(&registry, root, &path);
+            let fresh = reextract_matching(&registry, root, &path, &opts.query);
             defs.retain(|e| e.file_path != path);
             defs.extend(
                 fresh
                     .into_iter()
-                    .filter(|e| matches_query(e, &opts.query))
-                    .filter(|e| opts.file.as_deref().is_none_or(|f| e.file_path == f)),
+                    .filter(|e| opts.file.as_deref().is_none_or(|f| super::qualified::in_scope(&e.file_path, f))),
             );
         }
     }
@@ -539,13 +691,26 @@ fn cold_build_answer(root: &Path, opts: &QueryOptions, verb: Verb) -> Answer {
     let (graph, _entities) =
         super::graph::get_or_build_graph(root, &file_paths, &registry, false, source_scope);
 
-    let defs: Vec<EntityInfo> = graph
+    let exact: Vec<EntityInfo> = graph
         .entities
         .values()
         .filter(|e| matches_query(e, &opts.query))
-        .filter(|e| opts.file.as_deref().is_none_or(|f| e.file_path == f))
+        .filter(|e| opts.file.as_deref().is_none_or(|f| super::qualified::in_scope(&e.file_path, f)))
         .cloned()
         .collect();
+    let defs = if exact.is_empty() {
+        let q = super::qualified::parse(&opts.query);
+        let hits: Vec<EntityInfo> = graph
+            .entities
+            .values()
+            .filter(|e| super::entity_matches_qualified(&graph, e, &opts.query))
+            .filter(|e| opts.file.as_deref().is_none_or(|f| super::qualified::in_scope(&e.file_path, f)))
+            .cloned()
+            .collect();
+        super::qualified::narrow_by_line(&q, hits, |e| (e.start_line, e.end_line))
+    } else {
+        exact
+    };
 
     let related = if verb == Verb::Find {
         Vec::new()
@@ -580,6 +745,26 @@ fn resolve_defs(idx: &QueryIndex, query: &str, file: Option<&str>) -> Vec<Entity
         .collect()
 }
 
+/// Re-extract one file and keep the entities the (possibly qualified)
+/// query names — the owner chain comes from the same re-extract.
+fn reextract_matching(registry: &ParserRegistry, root: &Path, path: &str, query: &str) -> Vec<EntityInfo> {
+    let all = reextract_file(registry, root, path);
+    let exact: Vec<EntityInfo> = all.iter().filter(|e| super::entity_matches_query(e, query)).cloned().collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let q = super::qualified::parse(query);
+    let hits: Vec<EntityInfo> = all
+        .iter()
+        .filter(|e| {
+            let owners = super::qualified::list_owners(&all, e);
+            super::qualified::matches(&q, &e.name, &e.entity_type, &owners, &e.file_path, (e.start_line, e.end_line))
+        })
+        .cloned()
+        .collect();
+    super::qualified::narrow_by_line(&q, hits, |e| (e.start_line, e.end_line))
+}
+
 fn matches_query(e: &EntityInfo, query: &str) -> bool {
     super::entity_matches_query(e, query)
 }
@@ -602,13 +787,17 @@ pub(crate) fn resolve_by_name_indices(
         .lookup(name)
         .iter()
         .filter(|e| want_type.is_none_or(|t| e.entity_type() == t))
-        .filter(|e| file.is_none_or(|f| e.file_path() == f))
+        .filter(|e| file.is_none_or(|f| super::qualified::in_scope(e.file_path(), f)))
         .map(index::Entity::index)
         .collect();
     if hits.is_empty() && query.contains("::") {
         if let Some(at) = resolve_by_id_index(idx, query) {
             hits.push(at);
         }
+    }
+    if hits.is_empty() {
+        // `Class.method`, `module.func`, `pkg.mod.Class.method`, `name@line`
+        hits = super::qualified::resolve_index(idx, query, file);
     }
     hits
 }
@@ -641,6 +830,13 @@ pub(crate) fn resolve_by_id_index(idx: &QueryIndex, id: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Any indexed file whose content changed since the index was written
+/// (a stat each, a read only where the mtime disagrees).
+pub(crate) fn any_content_stale(idx: &QueryIndex, root: &Path) -> bool {
+    use rayon::prelude::*;
+    idx.all_file_paths().par_iter().any(|path| file_is_stale(idx, root, path))
 }
 
 fn file_is_stale(idx: &QueryIndex, root: &Path, path: &str) -> bool {
@@ -685,9 +881,42 @@ fn dedup(mut paths: Vec<String>) -> Vec<String> {
     paths
 }
 
+/// A miss: say so, then the nearest entities the index knows (same member
+/// under another owner, case/punctuation variants, small typos), so a wrong
+/// guess costs one retry instead of a switch back to grep. Exit 1.
+fn report_miss(cwd: &str, query: &str, file: Option<&str>, json: bool, verb: Verb) {
+    if json && verb == Verb::Find {
+        // `find --json` keeps its contract: a miss is `[]`, exit 0
+        // (pi's sem_find and the transaction server parse it as an array).
+        println!("[]");
+        return;
+    }
+    let root = super::repo_root_or_cwd(cwd);
+    let near = open_index(&root)
+        .map(|idx| super::qualified::near_matches(&idx, query, file, 8))
+        .unwrap_or_default();
+    if json {
+        let out = serde_json::json!({ "resolved": false, "query": query, "near_matches": near });
+        println!("{}", serde_json::to_string(&out).unwrap_or_default());
+    } else {
+        eprintln!("{} no entity named '{}'{}", "error:".red().bold(), query,
+            file.map(|f| format!(" in {f}")).unwrap_or_default());
+        if near.is_empty() {
+            eprintln!("  no near match either; a non-definition (attribute, local, string key) is not an entity: try `sem grep '{}'`",
+                super::qualified::parse(query).bare());
+        } else {
+            eprintln!("  near matches (retry with one of these names, or --file):");
+            for m in &near {
+                eprintln!("    {} {} {}:{}  ({})", m.entity_type.dimmed(), m.qualified_name.bold(), m.file, m.start_line, m.why);
+            }
+        }
+    }
+    std::process::exit(1);
+}
+
 fn render(answer: &Answer, verb: Verb, json: bool, query: &str) {
     if answer.defs.is_empty() {
-        if json {
+        if json && verb == Verb::Find {
             println!("[]");
         } else {
             eprintln!("{} no entity named '{}'", "error:".red().bold(), query);

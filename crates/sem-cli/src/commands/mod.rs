@@ -3,6 +3,7 @@ pub mod arch_diff;
 pub mod certify;
 pub mod cloud;
 pub mod consent;
+pub mod completeness;
 pub mod context;
 pub mod diff;
 pub mod entities;
@@ -13,6 +14,7 @@ pub mod hook;
 pub mod impact;
 pub mod log;
 pub mod promises;
+pub mod qualified;
 pub mod query;
 pub(crate) mod region;
 pub mod repos;
@@ -202,19 +204,11 @@ pub fn entity_matches_qualified(
     if entity_matches_query(entity, query) {
         return true;
     }
-    // Accept both `Parent.child` and `Parent::child` — agents reach for
-    // whichever qualifier their working language uses.
-    let split = query.rsplit_once("::").or_else(|| query.rsplit_once('.'));
-    if let Some((parent_part, child_part)) = split {
-        if entity.name == child_part {
-            if let Some(pid) = &entity.parent_id {
-                if let Some(parent) = graph.entities.get(pid) {
-                    return parent.name == parent_part;
-                }
-            }
-        }
-    }
-    false
+    // `Parent.child`, `Parent::child`, `module.Parent.child`, `name@line`:
+    // the same matcher the index-backed verbs use (`qualified::matches`).
+    let q = qualified::parse(query);
+    let owners = qualified::graph_owners(graph, entity);
+    qualified::matches(&q, &entity.name, &entity.entity_type, &owners, &entity.file_path, (entity.start_line, entity.end_line))
 }
 
 /// "Did you mean": when a (possibly qualified or file-scoped) name resolves to

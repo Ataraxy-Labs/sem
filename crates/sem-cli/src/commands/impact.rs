@@ -59,6 +59,58 @@ pub(crate) const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 /// only fire on a separator), which is precisely why the fast paths need no
 /// `--entity-id`/`--file` gate to be safe on a name-only query: the
 /// `candidates.len != 1` ambiguity check is the whole guarantee.
+/// The repo root of the running `impact`, for the completeness verdict the
+/// print functions append (they are many and take no root).
+static IMPACT_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Completeness of `entity`'s direct caller set — the root of every
+/// transitive answer `impact` gives. `resolved`: the direct dependents the
+/// answer used, when the caller has them; otherwise the index's.
+fn root_verdict(entity: &EntityInfo, resolved: Option<&[&EntityInfo]>) -> Option<super::completeness::Verdict> {
+    let root = IMPACT_ROOT.get()?;
+    let idx = super::query::open_index(root);
+    let owned: Vec<EntityInfo> = match resolved {
+        Some(r) => r.iter().map(|e| (*e).clone()).collect(),
+        None => idx
+            .as_ref()
+            .and_then(|idx| {
+                let at = super::query::resolve_by_id_index(idx, entity.id.as_str())?;
+                Some(idx.callers_of(at).iter().map(sem_core::index::Entity::to_entity_info).collect())
+            })
+            .unwrap_or_default(),
+    };
+    Some(super::query::caller_verdict(root, idx.as_ref(), entity, &owned, &[]))
+}
+
+fn annotate_json(out: &mut serde_json::Value, v: Option<&super::completeness::Verdict>) {
+    let Some(v) = v else { return };
+    if let Some(o) = out.as_object_mut() {
+        o.insert("callersComplete".into(), serde_json::json!(v.complete));
+        o.insert("incompleteBecause".into(), serde_json::json!(v.incomplete_because));
+        o.insert("possibleCallers".into(), serde_json::json!(v.possible_callers));
+        o.insert("checked".into(), serde_json::json!(v.checked));
+    }
+}
+
+fn print_verdict(v: Option<&super::completeness::Verdict>) {
+    match v {
+        Some(v) => print!("\n{}", super::completeness::render_text(v, 15, "  ")),
+        None => println!("\n  completeness: not checked"),
+    }
+}
+
+/// The loud "no test" line: an untested change is unverified, not fine.
+fn print_no_tests(entity: &EntityInfo, v: Option<&super::completeness::Verdict>) {
+    println!(
+        "\n  {} {}",
+        "✗".red().bold(),
+        format!("NO TEST REACHES `{}`: this change is unverified by any test sem can find.", entity.name).red().bold()
+    );
+    if v.is_some_and(|v| !v.complete) {
+        println!("    the search followed resolved callers only; tests may reach it through the possible callers below.");
+    }
+}
+
 fn is_qualified_name(name: &str) -> bool {
     name.contains('.') || name.contains("::")
 }
@@ -88,6 +140,7 @@ pub fn impact_command(opts: ImpactOptions) {
     // observable under `SEM_TIMINGS` as its own phase rather than as an empty
     // report. The integration suite distinguishes tiers by exactly this.
     let mut timings = Timings::from_env("impact");
+    let _ = IMPACT_ROOT.set(super::repo_root_or_cwd(&opts.cwd));
 
     // The index-backed Deps fast path goes first: it used to bypass the
     // sidecar (now deleted —) and still
@@ -962,7 +1015,8 @@ fn print_cached_result(result: &CachedImpactResult, mode: ImpactMode, json: bool
             print_cached_dependents(&result.entity, &result.dependents, json);
         }
         ImpactMode::Tests => {
-            print_cached_tests(&result.entity, &result.tests, result.tests_truncated, json);
+            let dependents: Vec<&EntityInfo> = result.dependents.iter().collect();
+            print_cached_tests(&result.entity, &result.tests, (!dependents.is_empty()).then_some(&dependents[..]), result.tests_truncated, json);
         }
         ImpactMode::All => {
             print_cached_all(result, json, depth);
@@ -1009,16 +1063,22 @@ fn print_cached_deps(entity: &EntityInfo, deps: &[EntityInfo], json: bool) {
 /// Shared by [`print_cached_dependents`] and [`print_dependents`] — same
 /// relationship as [`print_impact_deps`], for the dependents direction.
 fn print_impact_dependents(entity: &EntityInfo, dependents: &[&EntityInfo], json: bool) {
+    let verdict = root_verdict(entity, Some(dependents));
     if json {
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "entity": entity_json(entity),
             "dependents": entity_list_json(dependents),
         });
+        annotate_json(&mut output, verdict.as_ref());
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
         print_entity_header(entity);
         if dependents.is_empty() {
-            println!("\n  {} {}", "✓".green().bold(), "No dependents.".dimmed());
+            if verdict.as_ref().is_some_and(|v| v.complete) {
+                println!("\n  {} {}", "✓".green().bold(), "No dependents.".dimmed());
+            } else {
+                println!("\n  {}", "No dependents resolved by the static graph (NOT a proof of none; see below).".yellow());
+            }
         } else {
             println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
             for dep in dependents {
@@ -1031,6 +1091,7 @@ fn print_impact_dependents(entity: &EntityInfo, dependents: &[&EntityInfo], json
                 );
             }
         }
+        print_verdict(verdict.as_ref());
         println!();
     }
 }
@@ -1040,12 +1101,15 @@ fn print_cached_dependents(entity: &EntityInfo, dependents: &[EntityInfo], json:
     print_impact_dependents(entity, &dependents, json);
 }
 
-fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool, json: bool) {
+fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], dependents: Option<&[&EntityInfo]>, truncated: bool, json: bool) {
+    let verdict = root_verdict(entity, dependents);
     if json {
         let mut output = serde_json::json!({
             "entity": entity_json(entity),
             "tests": owned_entity_list_json(tests),
+            "noTestReaches": tests.is_empty(),
         });
+        annotate_json(&mut output, verdict.as_ref());
         if truncated {
             output
                 .as_object_mut()
@@ -1056,7 +1120,7 @@ fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool
     } else {
         print_entity_header(entity);
         if tests.is_empty() {
-            println!("\n  {} {}", "✓".green().bold(), "No tests found.".dimmed());
+            print_no_tests(entity, verdict.as_ref());
         } else {
             println!(
                 "\n  {} {}",
@@ -1089,6 +1153,7 @@ fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool
             }
         }
         print_cached_tests_truncation_warning(truncated);
+        print_verdict(verdict.as_ref());
         println!();
     }
 }
@@ -1127,6 +1192,7 @@ fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
                 "entities": impact_entities,
             },
             "tests": owned_entity_list_json(&result.tests),
+            "noTestReaches": result.tests.is_empty(),
         });
         if result.tests_truncated {
             output
@@ -1134,9 +1200,13 @@ fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
                 .unwrap()
                 .insert("testsTruncated".to_string(), serde_json::json!(true));
         }
+        let dependents: Vec<&EntityInfo> = result.dependents.iter().collect();
+        annotate_json(&mut output, root_verdict(&result.entity, Some(&dependents)).as_ref());
         println!("{}", serde_json::to_string(&output).unwrap());
         return;
     }
+    let dependents: Vec<&EntityInfo> = result.dependents.iter().collect();
+    let verdict = root_verdict(&result.entity, Some(&dependents));
 
     print_entity_header(&result.entity);
 
@@ -1167,11 +1237,7 @@ fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
     }
 
     if result.impact.is_empty() {
-        println!(
-            "\n  {} {}",
-            "✓".green().bold(),
-            "No other entities are affected by changes to this entity.".dimmed()
-        );
+        no_impact_line(verdict.as_ref());
     } else {
         let max_depth_seen = result
             .impact
@@ -1241,8 +1307,20 @@ fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
         }
     }
     print_cached_tests_truncation_warning(result.tests_truncated);
+    if result.tests.is_empty() {
+        print_no_tests(&result.entity, verdict.as_ref());
+    }
+    print_verdict(verdict.as_ref());
 
     println!();
+}
+
+fn no_impact_line(v: Option<&super::completeness::Verdict>) {
+    if v.is_some_and(|v| v.complete) {
+        println!("\n  {} {}", "✓".green().bold(), "No other entities are affected by changes to this entity.".dimmed());
+    } else {
+        println!("\n  {}", "No other entity is affected through resolved references (NOT a proof; see below).".yellow());
+    }
 }
 
 fn print_deps(graph: &EntityGraph, entity: &sem_core::parser::graph::EntityInfo, json: bool) {
@@ -1264,7 +1342,7 @@ fn print_tests(
 ) {
     let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
     if !tests.is_empty() {
-        print_tests_result(entity, &tests, json);
+        print_tests_result(entity, &tests, Some(&graph.get_dependents(&entity.id)), json);
         return;
     }
     // Graph edges can miss tests that call the target through a module
@@ -1293,7 +1371,7 @@ fn print_tests(
         );
     }
     let refs: Vec<&EntityInfo> = owned.iter().collect();
-    print_tests_result(entity, &refs, json);
+    print_tests_result(entity, &refs, Some(&graph.get_dependents(&entity.id)), json);
 }
 
 /// True when `name` appears in `body` as a whole word (not as a substring of
@@ -1328,20 +1406,23 @@ fn print_tests_with_ids(
     json: bool,
 ) {
     let tests = test_impact_from_ids(graph, &entity.id, test_entity_ids);
-    print_tests_result(entity, &tests, json);
+    print_tests_result(entity, &tests, Some(&graph.get_dependents(&entity.id)), json);
 }
 
-fn print_tests_result(entity: &EntityInfo, tests: &[&EntityInfo], json: bool) {
+fn print_tests_result(entity: &EntityInfo, tests: &[&EntityInfo], dependents: Option<&[&EntityInfo]>, json: bool) {
+    let verdict = root_verdict(entity, dependents);
     if json {
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "entity": entity_json(entity),
             "tests": entity_list_json(tests),
+            "noTestReaches": tests.is_empty(),
         });
+        annotate_json(&mut output, verdict.as_ref());
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
         print_entity_header(entity);
         if tests.is_empty() {
-            println!("\n  {} {}", "✓".green().bold(), "No tests found.".dimmed());
+            print_no_tests(entity, verdict.as_ref());
         } else {
             println!(
                 "\n  {} {}",
@@ -1370,6 +1451,7 @@ fn print_tests_result(entity: &EntityInfo, tests: &[&EntityInfo], json: bool) {
                 }
             }
         }
+        print_verdict(verdict.as_ref());
         println!();
     }
 }
@@ -1441,9 +1523,13 @@ fn print_all_with_tests(
                 "entities": impact_entities,
             },
             "tests": entity_list_json(tests),
+            "noTestReaches": tests.is_empty(),
         });
+        let mut output = output;
+        annotate_json(&mut output, root_verdict(entity, Some(&dependents)).as_ref());
         println!("{}", serde_json::to_string(&output).unwrap());
     } else {
+        let verdict = root_verdict(entity, Some(&dependents));
         print_entity_header(entity);
 
         // Dependencies
@@ -1476,11 +1562,7 @@ fn print_all_with_tests(
 
         // Transitive impact grouped by depth
         if impact_bounded.is_empty() {
-            println!(
-                "\n  {} {}",
-                "✓".green().bold(),
-                "No other entities are affected by changes to this entity.".dimmed()
-            );
+            no_impact_line(verdict.as_ref());
         } else {
             let max_depth_seen = impact_bounded.iter().map(|(_, d)| *d).max().unwrap_or(0);
             let depth_label = if depth == 0 {
@@ -1543,7 +1625,10 @@ fn print_all_with_tests(
                     t.file_path.dimmed(),
                 );
             }
+        } else {
+            print_no_tests(entity, verdict.as_ref());
         }
+        print_verdict(verdict.as_ref());
 
         println!();
     }

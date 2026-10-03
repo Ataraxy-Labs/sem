@@ -98,9 +98,17 @@ pub fn analyze_until(
     // incomplete
     let lowered_count = std::sync::atomic::AtomicUsize::new(0);
     let cut = std::sync::atomic::AtomicBool::new(false);
+    let late = std::sync::atomic::AtomicBool::new(false);
     let lowered = |p: &&String| -> Option<(DfFile, Option<FileFacts>)> {
         use std::sync::atomic::Ordering::Relaxed;
         if cut.load(Relaxed) {
+            return None;
+        }
+        // the deadline holds during lowering too: a whole-tree parse of a
+        // large repository can take the budget by itself
+        if limits.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            late.store(true, Relaxed);
+            cut.store(true, Relaxed);
             return None;
         }
         if let Some(max) = limits.max_rss_bytes {
@@ -223,7 +231,7 @@ pub fn analyze_until(
     let mut out = out;
     if cut.into_inner() {
         out.incomplete = true;
-        out.incomplete_why = Some("memory budget");
+        out.incomplete_why = Some(if late.into_inner() { "time budget" } else { "memory budget" });
     }
     Analysis { files, fn_entity, out }
 }

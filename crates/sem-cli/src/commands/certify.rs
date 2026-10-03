@@ -552,6 +552,69 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
         }
     }
 
+    // -- completeness of the caller sets this change relies on ----------------
+    // The static graph's callers are the ones the resolver pinned. A
+    // signature change or a deletion is only safe if those are all of them;
+    // say for each such entity (and each modified one) whether they are, from
+    // the head tree's source text (commands::completeness).
+    let corpus = HeadCorpus::load(ht);
+    let mut possible_outside: Vec<Value> = Vec::new();
+    let mut assessed = 0usize;
+    let mut not_assessed = 0usize;
+    let mut sig_index: HashMap<(String, String, usize), usize> = HashMap::new();
+    for (i, g) in signature_changes.iter().enumerate() {
+        sig_index.insert((s(&g["entity"]), s(&g["file"]), g["line"].as_u64().unwrap_or(0) as usize), i);
+    }
+    for c in &changes {
+        if !matches!(c.change_type, ChangeType::Modified | ChangeType::Deleted | ChangeType::Renamed | ChangeType::Moved) {
+            continue;
+        }
+        if !matches!(c.entity_type.as_str(), "function" | "method" | "class" | "struct" | "constructor" | "property" | "getter" | "setter" | "variable" | "constant" | "interface" | "trait" | "enum" | "type") {
+            continue;
+        }
+        let key = (c.entity_name.clone(), c.file_path.clone(), c.start_line);
+        let is_sig = sig_index.contains_key(&key);
+        if assessed >= MAX_ASSESSED && !is_sig {
+            not_assessed += 1;
+            continue;
+        }
+        assessed += 1;
+        let id = c.entity_id.as_str();
+        let in_head = hg.entities.contains_key(id);
+        // the old name is what stale callers still say
+        let name = if matches!(c.change_type, ChangeType::Renamed) { c.old_entity_name.clone().unwrap_or_else(|| c.entity_name.clone()) } else { c.entity_name.clone() };
+        let resolved: Vec<(String, usize, usize)> = if in_head {
+            h_in.get(id).into_iter().flatten().filter_map(|(f, _)| hg.entities.get(*f)).map(|e| (e.file_path.clone(), e.start_line, e.end_line)).collect()
+        } else {
+            Vec::new()
+        };
+        let (def_file, span) = match hg.entities.get(id) {
+            Some(e) => (e.file_path.clone(), (e.start_line, e.end_line)),
+            None => (c.file_path.clone(), (0, 0)),
+        };
+        let v = corpus.verdict(&name, &def_file, span, &resolved, if in_head { Some(&c.after_content) } else { None });
+        let touched = |file: &str, line: usize| -> bool {
+            hg.entities.values().any(|e| e.file_path == file && e.start_line <= line && line <= e.end_line && within(hg, e.id.as_str(), &touched_head))
+        };
+        let outside: Vec<Value> = v
+            .possible_callers
+            .iter()
+            .filter(|p| !p.sites.iter().all(|st| touched(&p.file, st.line)))
+            .map(|p| json!({ "entity": p.entity, "type": p.entity_type, "file": p.file, "line": p.start_line,
+                "sites": p.sites.iter().map(|st| json!({"line": st.line, "kind": st.kind, "via": st.via})).collect::<Vec<_>>() }))
+            .collect();
+        if let Some(&i) = sig_index.get(&key) {
+            let g = &mut signature_changes[i];
+            g["callersComplete"] = json!(v.complete);
+            g["incompleteBecause"] = json!(v.incomplete_because);
+            g["possibleCallersNotModified"] = json!(outside);
+        }
+        if !v.complete {
+            possible_outside.push(json!({ "entity": c.entity_name, "type": c.entity_type, "file": c.file_path, "line": c.start_line,
+                "change": kind_str(&c.change_type), "incompleteBecause": v.incomplete_because, "possibleCallersNotModified": outside }));
+        }
+    }
+
     // -- static reference cone (head) -----------------------------------------
     let mut cone: HashSet<&str> = HashSet::new();
     let mut q: VecDeque<&str> = VecDeque::new();
@@ -689,12 +752,16 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
         "entities": entities_out,
         "signatureChanges": signature_changes,
         "untouchedCallers": untouched_callers,
+        "callerSetsIncomplete": possible_outside,
+        "callerSetsAssessed": assessed,
+        "callerSetsNotAssessed": not_assessed,
         "calleeDeltas": callee_deltas,
         "laws": { "sources": law_sources, "results": laws_out },
         "moduleReachability": module_out,
         "cone": { "sourceFiles": total_files, "filesWithStaticDependents": dependent_files.len(),
             "dependentFiles": dependent_files, "filesOutsideCone": total_files.saturating_sub(cone_files.len().max(changed_files.len())) },
         "affectedTests": affected_tests,
+        "noTestReaches": affected_tests.is_empty(),
         "limits": "static reference graph only: calls the resolver cannot pin (dynamic dispatch, reflection, string-keyed lookup, callbacks registered at runtime) and non-code consumers are not modeled",
     });
     Ok(cert)
@@ -702,6 +769,13 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
 
 fn s(v: &Value) -> String {
     v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+}
+
+fn possible_line(x: &Value) -> String {
+    let sites: Vec<String> = x["sites"].as_array().cloned().unwrap_or_default().iter().take(4).map(|st| {
+        format!("L{} {}{}", st["line"], s(&st["kind"]), st["via"].as_str().map(|v| format!(" via `{v}`")).unwrap_or_default())
+    }).collect();
+    format!("{}:{} `{}` ({})", s(&x["file"]), x["line"], s(&x["entity"]), sites.join(", "))
 }
 
 fn caller_line(c: &Value) -> String {
@@ -756,12 +830,26 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
         for x in stale.iter().take(max) {
             o += &format!("    - still refers to old name: {}\n", caller_line(x));
         }
+        if g["callersComplete"] == false {
+            let pc = arr(&g["possibleCallersNotModified"]);
+            o += &format!("  INCOMPLETE caller set: {}\n", arr(&g["incompleteBecause"]).iter().map(|r| s(&r["detail"])).collect::<Vec<_>>().join("; "));
+            o += &format!("  possible callers the static graph did not resolve, NOT modified by this change: {}\n", pc.len());
+            for x in pc.iter().take(max) {
+                o += &format!("    - {}\n", possible_line(x));
+            }
+            if pc.len() > max {
+                o += &format!("    - … +{} more\n", pc.len() - max);
+            }
+        }
     }
 
     o += "\n## Callers outside this change (of modified/deleted entities)\n";
     let uc = arr(&c["untouchedCallers"]);
-    if uc.is_empty() {
-        o += "none found in the static graph\n";
+    let inc = arr(&c["callerSetsIncomplete"]);
+    if uc.is_empty() && inc.is_empty() {
+        o += &format!("none found, and the caller sets of the {} changed entities assessed are complete (every textual mention is a resolved caller)\n", c["callerSetsAssessed"]);
+    } else if uc.is_empty() {
+        o += "none resolved by the static graph, but that is NOT a proof: see the incomplete caller sets (signature changes above, the rest below)\n";
     }
     for (i, u) in uc.iter().enumerate() {
         if i >= max * 2 {
@@ -778,6 +866,30 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
         if callers.len() > max {
             o += &format!("    - … +{} more\n", callers.len() - max);
         }
+    }
+
+    // signature changes already listed theirs above
+    let in_sigs = |u: &Value| sigs.iter().any(|g| g["entity"] == u["entity"] && g["file"] == u["file"] && g["line"] == u["line"]);
+    let inc_rest: Vec<&Value> = inc.iter().filter(|u| !in_sigs(u)).collect();
+    if !inc_rest.is_empty() {
+        o += &format!("\n## Incomplete caller sets ({} more entit{}): possible callers the static graph could not resolve\n", inc_rest.len(), if inc_rest.len() == 1 { "y" } else { "ies" });
+        for u in inc_rest.iter().take(max * 2) {
+            let pc = arr(&u["possibleCallersNotModified"]);
+            o += &format!("- {} `{}` ({}:{}): {}; {} possible caller(s) not modified by this change\n", s(&u["change"]), s(&u["entity"]), s(&u["file"]), u["line"],
+                arr(&u["incompleteBecause"]).iter().map(|r| s(&r["detail"])).collect::<Vec<_>>().join("; "), pc.len());
+            for x in pc.iter().take(max) {
+                o += &format!("    - {}\n", possible_line(x));
+            }
+            if pc.len() > max {
+                o += &format!("    - … +{} more\n", pc.len() - max);
+            }
+        }
+        if inc_rest.len() > max * 2 {
+            o += &format!("- … +{} more entities\n", inc_rest.len() - max * 2);
+        }
+    }
+    if c["callerSetsNotAssessed"].as_u64().unwrap_or(0) > 0 {
+        o += &format!("({} further changed entities were not assessed for caller completeness)\n", c["callerSetsNotAssessed"]);
     }
 
     o += "\n## Calls removed/added inside modified entities\n";
@@ -863,7 +975,11 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
     o += "\n## Tests that statically reach the change\n";
     let t = arr(&c["affectedTests"]);
     if t.is_empty() {
-        o += "none found\n";
+        o += "NO TEST REACHES THIS CHANGE: it is unverified. No test file has a static reference path to any changed entity";
+        if !inc.is_empty() {
+            o += " (the search followed resolved callers only; tests may reach it through the possible callers above)";
+        }
+        o += ".\n";
     } else {
         o += &format!("{} file(s): {}{}\n", t.len(), t.iter().take(max).map(s).collect::<Vec<_>>().join(", "), more(t.len()));
     }
@@ -874,6 +990,80 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
         o = format!("{cut}\n… (certificate truncated at {max_chars} characters)\n");
     }
     o
+}
+
+/// Changed entities assessed for caller completeness beyond the signature
+/// changes (which are always assessed).
+const MAX_ASSESSED: usize = 60;
+
+/// The head tree's source text, loaded once, for the completeness scans.
+struct HeadCorpus<'a> {
+    tree: &'a Tree,
+    files: Vec<(String, String)>,
+    dynamic: Vec<(String, String, usize)>,
+    by_file: HashMap<&'a str, Vec<&'a EntityInfo>>,
+}
+
+impl<'a> HeadCorpus<'a> {
+    fn load(t: &'a Tree) -> Self {
+        let files: Vec<(String, String)> = t
+            .all_files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(t.dir.path().join(f)).ok().map(|c| (f.clone(), c)))
+            .collect();
+        let dynamic = files
+            .iter()
+            .flat_map(|(f, c)| super::completeness::dynamic_prefixes(f, c).into_iter().map(move |(p, l)| (p, f.clone(), l)))
+            .collect();
+        let mut by_file: HashMap<&str, Vec<&EntityInfo>> = HashMap::new();
+        for e in t.graph.entities.values() {
+            by_file.entry(e.file_path.as_str()).or_default().push(e);
+        }
+        HeadCorpus { tree: t, files, dynamic, by_file }
+    }
+
+    fn scan(&self, name: &str, only: Option<&str>) -> Vec<super::completeness::Mention> {
+        let finder = memchr::memmem::Finder::new(name.as_bytes());
+        self.files
+            .iter()
+            .filter(|(f, _)| only.is_none_or(|o| o == f))
+            .filter(|(_, c)| finder.find(c.as_bytes()).is_some())
+            .flat_map(|(f, c)| super::completeness::scan_file(f, c, name))
+            .collect()
+    }
+
+    fn verdict(&self, name: &str, file: &str, span: (usize, usize), resolved: &[(String, usize, usize)], content: Option<&Option<String>>) -> super::completeness::Verdict {
+        use super::completeness as c;
+        let mentions = self.scan(name, None);
+        let alias = c::alias_hop(&mentions, name, |a, scope| self.scan(a, scope));
+        let decorators = content
+            .and_then(|c| c.as_deref())
+            .map(|body| {
+                let src = self.files.iter().find(|(f, _)| f == file).map(|(_, c)| c.as_str()).unwrap_or("");
+                let mut d = c::decorators(src, span.0);
+                d.extend(body.lines().take_while(|l| l.trim_start().starts_with('@')).map(|l| l.trim().to_string()));
+                d.sort();
+                d.dedup();
+                d
+            })
+            .unwrap_or_default();
+        let files_with = self.files.iter().filter(|(_, c)| c.contains(name)).count();
+        let owner = self.tree.graph.entities.values()
+            .find(|e| e.file_path == file && e.start_line == span.0 && e.name == name)
+            .and_then(|e| e.parent_id.as_ref())
+            .and_then(|p| self.tree.graph.entities.get(p.as_str()))
+            .map(|p| p.name.clone());
+        let target = c::Target { name, file, span, decorators, owner: owner.as_deref() };
+        c::assess(&target, &mentions, &alias, resolved, &self.dynamic, files_with, None, |f, line| {
+            let ents = self.by_file.get(f)?;
+            let e = ents.iter().filter(|e| e.start_line <= line && line <= e.end_line).min_by_key(|e| e.end_line - e.start_line)?;
+            Some(c::Enclosing {
+                display: super::qualified::display_name(&super::qualified::graph_owners(&self.tree.graph, e), &e.name),
+                entity_type: e.entity_type.clone(),
+                start_line: e.start_line,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
