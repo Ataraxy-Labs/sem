@@ -72,7 +72,15 @@ try {
 // shareable configs, and typescript (the TS parser's).
 function versions() {
   const out = { eslint: eslintVersion };
-  const nm = path.join(cwd, "node_modules");
+  // the node_modules Node resolves from: the nearest one up from the root
+  let nm = path.join(cwd, "node_modules");
+  for (let d = cwd; ; d = path.dirname(d)) {
+    if (fs.existsSync(path.join(d, "node_modules"))) {
+      nm = path.join(d, "node_modules");
+      break;
+    }
+    if (path.dirname(d) === d) break;
+  }
   const add = (name) => {
     try {
       out[name] = JSON.parse(fs.readFileSync(path.join(nm, name, "package.json"), "utf8")).version;

@@ -343,6 +343,34 @@ fn typescript_certificate_and_state_digests() {
     assert!(checker(&v3, "ts")["state"]["out"].is_null());
 }
 
+/// A state is shared by every checkout of the tree: a clone elsewhere, with its
+/// own node_modules link, starts incremental from it (a land queue's lander
+/// worktree and the submitter's clone are different checkouts).
+#[test]
+fn states_are_shared_across_checkouts() {
+    let Some(t) = tools() else { return };
+    let repo = Repo::new(TS_FILES, Some(&t));
+    let c = ts_case(&repo, None, "first checkout");
+    assert_eq!(c["mode"], "full");
+    let other = tempfile::tempdir().unwrap();
+    let dst = other.path().join("nested/clone");
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    let o = Command::new("git").args(["clone", "-q"]).arg(repo.path()).arg(&dst).output().unwrap();
+    assert!(o.status.success());
+    std::os::unix::fs::symlink(&t, dst.join("node_modules")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sem"))
+        .current_dir(&dst)
+        .env("SEM_CHECK_CACHE_DIR", repo.store.path())
+        .args(["check", "--json", "--checkers", "ts"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let c = checker(&v, "ts");
+    assert_eq!(c["mode"], "incremental", "{c:#}");
+    assert_eq!(c["filesRecheckedCount"], 0, "{c:#}");
+    assert_eq!(c["state"]["from"], "base");
+}
+
 #[test]
 fn typescript_external_declarations_changing_forces_full() {
     let Some(t) = tools() else { return };

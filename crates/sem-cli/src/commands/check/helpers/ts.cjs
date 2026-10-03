@@ -39,7 +39,7 @@ const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
 
-const HELPER_VERSION = "sem-check-ts/1";
+const HELPER_VERSION = "sem-check-ts/2";
 const T0 = process.hrtime.bigint();
 const ms = () => Number(process.hrtime.bigint() - T0) / 1e6;
 const cwd = process.cwd();
@@ -70,6 +70,18 @@ try {
 const sha = (s) => crypto.createHash("sha1").update(s).digest("hex");
 const rel = (f) => path.relative(cwd, f).split(path.sep).join("/");
 const isRepo = (r) => !r.startsWith("..") && !path.isAbsolute(r) && !r.includes("node_modules/");
+// A non-repo file's identity independent of where the checkout is (every
+// clone and worktree has its own node_modules, or links one): its path from
+// the first node_modules segment on, else its path relative to the root.
+const extKey = (f) => {
+  const r = rel(f);
+  const i = r.indexOf("node_modules/");
+  return i >= 0 ? r.slice(i) : r;
+};
+const keyOf = (f) => {
+  const r = rel(f);
+  return isRepo(r) ? r : extKey(f);
+};
 const fmtHost = { getCurrentDirectory: () => cwd, getCanonicalFileName: (f) => f, getNewLine: () => "\n" };
 const fmt = (d) => ts.formatDiagnostic(d, fmtHost).replace(/\n$/, "");
 
@@ -102,7 +114,11 @@ if (!pc.fileNames.length && (pc.projectReferences || []).length) {
   finish({ verdict: "undecided", error: `${rel(configPath)} is a solution (references only, no files of its own): its full check is \`tsc -b\`; point ts.project at a project config, or check it with a "commands" entry`, tsVersion: ts.version }, 0);
 }
 const optionsKey = sha(
-  JSON.stringify(pc.options, (k, v) => (k === "configFile" || k === "configFilePath" ? undefined : v)) +
+  // paths inside the options (pathsBasePath, rootDir, outDir, ...) are
+  // absolute: compare them relative to the checkout
+  JSON.stringify(pc.options, (k, v) =>
+    k === "configFile" || k === "configFilePath" ? undefined : typeof v === "string" && v.startsWith(cwd) ? "<root>" + v.slice(cwd.length) : v,
+  ) +
     JSON.stringify(pc.projectReferences || []),
 );
 
@@ -125,7 +141,11 @@ const extHashes = {};
 for (const sf of all) {
   const r = rel(sf.fileName);
   if (isRepo(r)) repoFiles.push(sf);
-  else extHashes[r] = sha(sf.text);
+  else {
+    // two files with one key (nested installs of one package): both hashes count
+    const k = extKey(sf.fileName);
+    extHashes[k] = extHashes[k] ? [extHashes[k], sha(sf.text)].sort().join(",") : sha(sf.text);
+  }
 }
 const bySrc = new Map(repoFiles.map((sf) => [rel(sf.fileName), sf]));
 
@@ -161,14 +181,14 @@ function importsOf(sf) {
   const out = [];
   for (const n of sf.imports || []) {
     const f = resolveSpec(sf, n.text, modeOf(sf, n));
-    out.push([n.text, f ? rel(f) : "?"]);
+    out.push([n.text, f ? keyOf(f) : "?"]);
   }
   for (const m of sf.moduleAugmentations || []) {
     if (!ts.isStringLiteral(m)) continue;
     const f = resolveSpec(sf, m.text, undefined);
-    out.push(["augment:" + m.text, f ? rel(f) : "?"]);
+    out.push(["augment:" + m.text, f ? keyOf(f) : "?"]);
   }
-  for (const r of sf.referencedFiles || []) out.push(["ref:" + r.fileName, rel(path.resolve(path.dirname(sf.fileName), r.fileName))]);
+  for (const r of sf.referencedFiles || []) out.push(["ref:" + r.fileName, keyOf(path.resolve(path.dirname(sf.fileName), r.fileName))]);
   return out;
 }
 function revOf(importsByFile) {
@@ -611,6 +631,8 @@ else {
     reasons.push(`external: ${extChanged.length} non-repo program file(s) differ (${extChanged.slice(0, 3).join(", ")}${extChanged.length > 3 ? ", ..." : ""})`);
   const fmtChanged = repoFiles.map((sf) => rel(sf.fileName)).filter((f) => old.files[f] && old.files[f].fmt !== (bySrc.get(f).impliedNodeFormat || 0));
   if (fmtChanged.length) reasons.push(`module-format: ${fmtChanged.slice(0, 3).join(", ")}`);
+  // diagnostics in non-repo files name them relative to the checkout
+  if (Object.keys(old.outside || {}).length && old.root !== cwd) reasons.push("external-diagnostics: the state's non-repo diagnostics were recorded in another checkout");
   const was = old.manifests || {};
   for (const f of new Set([...Object.keys(was), ...Object.keys(nowManifests)]))
     if (was[f] !== nowManifests[f]) reasons.push(`manifest: ${f} (a field that steers module resolution or module format changed)`);
@@ -829,6 +851,7 @@ if (stateOut) {
   result.stateOut = writeState(stateOut, {
     helper: HELPER_VERSION,
     tsVersion: ts.version,
+    root: cwd,
     project: rel(configPath),
     config: configHashes,
     options: optionsKey,
