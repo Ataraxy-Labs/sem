@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use super::ir::*;
-use super::models::{CbArg, Handler, Kind, Models};
+use super::models::{CbArg, Handler, Kind, Model, Models};
 use crate::parser::calls::SiteAnswer;
 
 pub type FnRef = (u32, u32);
@@ -234,6 +234,11 @@ pub struct Output {
 #[derive(Clone, Debug)]
 enum Target {
     Repo(Vec<FnRef>, usize),
+    /// A method selected by a runtime name (`getattr(self, name)(..)`):
+    /// the candidates run for their effects on the arguments; the result
+    /// is the arguments' data and an explicit unknown, not the union of
+    /// every candidate's return.
+    Dispatch(Vec<FnRef>),
     External(String, Precision),
     ExternalTypeLast(String, String),
     Unknown(String),
@@ -569,6 +574,26 @@ impl<'a> Engine<'a> {
         for _ in 0..2 {
             for fi in 0..self.inp.files.len() {
                 let f = &self.inp.files[fi];
+                // a module-level definition bound by a decorator whose model
+                // says what it returns (`@click.group() def cli` is a
+                // `click.Group`, so `@cli.command()` qualifies)
+                if f.fns.iter().any(|d| !d.decorators.is_empty() && d.owner.is_none()) {
+                    let module = (fi as u32, 0u32);
+                    let mtypes = self.local_types(module);
+                    let lang = self.lang(module);
+                    for d in f.fns.iter().filter(|d| d.owner.is_none() && !d.is_module) {
+                        for chain in &d.decorators {
+                            let Some(q) = self.qualify_chain(module, chain, &mtypes) else { continue };
+                            let t = self.inp.models.lookup(lang, &q).into_iter().find_map(|m| match &m.kind {
+                                Kind::Returns(t) => Some(t.clone()),
+                                _ => None,
+                            });
+                            if let Some(t) = t {
+                                self.global_types[fi].insert(d.name.clone(), t);
+                            }
+                        }
+                    }
+                }
                 for (i, d) in f.fns.iter().enumerate() {
                     let fr = (fi as u32, i as u32);
                     let types = self.local_types(fr);
@@ -655,9 +680,61 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // methods of repo classes deriving from a modeled framework base
+        let base_models: Vec<(Lang, &Model)> = [Lang::Python, Lang::Ts, Lang::Go, Lang::Rust]
+            .into_iter()
+            .flat_map(|lang| self.inp.models.handlers(lang).into_iter().map(move |m| (lang, m)))
+            .filter(|(_, m)| matches!(&m.kind, Kind::Handler(h) if !h.methods.is_empty()))
+            .collect();
+        if !base_models.is_empty() {
+            for fi in 0..self.inp.files.len() {
+                let lang = self.lang((fi as u32, 0));
+                for (cls, _) in &self.inp.files[fi].classes {
+                    let bases = self.framework_bases(fi as u32, cls);
+                    for (lm, m) in &base_models {
+                        let Kind::Handler(h) = &m.kind else { continue };
+                        if *lm != lang || !bases.contains(&m.pattern) {
+                            continue;
+                        }
+                        for (i, d) in self.inp.files[fi].fns.iter().enumerate() {
+                            if d.owner.as_deref() == Some(cls.as_str()) && h.names_method(&d.name) {
+                                found.push(((fi as u32, i as u32), h.clone(), format!("{}.{}", m.pattern, d.name)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for (g, h, q) in found {
             self.registered.entry(g).or_default().push((h, q));
         }
+    }
+
+    /// The qualified external base classes of a repo class, through repo
+    /// base classes (matched by name, as the `subclasses` map is).
+    fn framework_bases(&self, fi: u32, cls: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<(u32, String)> = HashSet::new();
+        let mut work = vec![(fi, cls.to_string())];
+        while let Some((fi, cls)) = work.pop() {
+            if !seen.insert((fi, cls.clone())) || seen.len() > 64 {
+                continue;
+            }
+            let module = (fi, 0u32);
+            let Some((_, bases)) = self.inp.files[fi as usize].classes.iter().find(|(c, _)| *c == cls) else { continue };
+            for b in bases {
+                if let Some(q) = self.qualify_chain(module, b, &HashMap::new()) {
+                    out.push(q);
+                }
+                let last = b.rsplit('.').next().unwrap_or(b);
+                for (gi, g) in self.inp.files.iter().enumerate() {
+                    if g.classes.iter().any(|(c, _)| c == last) {
+                        work.push((gi as u32, last.to_string()));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The repo functions a value that is exactly one name denotes
@@ -685,6 +762,13 @@ impl<'a> Engine<'a> {
         if let Some(t) = types.get(base).or_else(|| self.global_types[fr.0 as usize].get(base)) {
             return Some(format!("{t}{}", rest.replace('.', sep)));
         }
+        // a field of self with a known type (`@self.app.post(..)`)
+        let d = self.df(fr);
+        if d.self_name.as_deref() == Some(base) {
+            let (owner, (field, tail)) = (d.owner.as_ref()?, split_field(rest)?);
+            let t = self.field_types.get(&(fr.0, owner.clone(), field))?;
+            return Some(format!("{t}{}", tail.replace('.', sep)));
+        }
         let i = self.import_of(fr, base)?;
         Some(qualified(&i.path, rest, base, lang))
     }
@@ -697,7 +781,7 @@ impl<'a> Engine<'a> {
             .lookup(self.lang(fr), &q)
             .into_iter()
             .filter_map(|m| match &m.kind {
-                Kind::Handler(h) if h.arg.is_none() => Some((h.clone(), q.clone())),
+                Kind::Handler(h) if h.arg.is_none() && h.methods.is_empty() => Some((h.clone(), q.clone())),
                 _ => None,
             })
             .collect()
@@ -709,6 +793,27 @@ impl<'a> Engine<'a> {
             Some(q) => h.except_types.iter().any(|e| *e == q),
             None => false,
         }
+    }
+
+    /// Does one of these decorators inject the first parameter for a
+    /// handler (`@click.pass_context`)?
+    fn injects_first(&self, fr: FnRef, decorators: &[String], h: &Handler) -> bool {
+        if h.injects_first.is_empty() {
+            return false;
+        }
+        let module = (fr.0, 0u32);
+        decorators.iter().any(|c| self.qualify_chain(module, c, &HashMap::new()).is_some_and(|q| h.injects_first.contains(&q)))
+    }
+
+    /// Is a parameter default a call with arguments to one of a handler's
+    /// injecting names (`Depends(get_db)`; a bare `Depends()` builds the
+    /// declared class from the request, so it stays input)?
+    fn injected_default(&self, fr: FnRef, default: Option<&str>, h: &Handler) -> bool {
+        let Some((callee, args)) = default.filter(|_| !h.except_defaults.is_empty()).and_then(|d| d.split_once('(')) else { return false };
+        if args.trim_start().starts_with(')') {
+            return false;
+        }
+        self.qualify_chain((fr.0, 0), callee.trim(), &HashMap::new()).is_some_and(|q| h.except_defaults.contains(&q))
     }
 
     /// Declared parameter types and assignment-derived local types.
@@ -905,6 +1010,12 @@ impl<'a> Engine<'a> {
                 let method = chain.rsplit(['.', ':']).next().unwrap_or(chain);
                 let is_self = d.self_name.as_deref() == Some(base.as_str());
                 let base_plain = base.trim_end_matches('!');
+                // `m = getattr(self, name); m(..)`: any method of the class
+                if lang == Lang::Python && chain == base {
+                    if let Some(fns) = self.getattr_self_methods(fr, base) {
+                        return Target::Dispatch(fns);
+                    }
+                }
                 // 1. a local value's method
                 if !is_self && d.params.iter().any(|p| p.name.split(',').any(|n| n == base)) || (!is_self && types.contains_key(base.as_str()) && !d.is_module) {
                     if let Some(t) = types.get(base.as_str()) {
@@ -1054,6 +1165,108 @@ impl<'a> Engine<'a> {
                 Target::External(chain.clone(), Precision::Resolved)
             }
         }
+    }
+
+    /// A local bound to `getattr(self, <name>)` in a method: the methods
+    /// that name may select, the class's own, its subclasses' and its repo
+    /// bases' (dunders excluded); when the hierarchy holds some of them as
+    /// values (a dispatch table `{"x": self.x}`), those only. A may-rule:
+    /// a method reachable by name but absent from the table is missed.
+    /// Bounded to the receiver's class hierarchy; `getattr` on any other
+    /// object stays unknown.
+    fn getattr_self_methods(&self, fr: FnRef, local: &str) -> Option<Vec<FnRef>> {
+        let d = self.df(fr);
+        let (owner, me) = (d.owner.as_ref()?, d.self_name.as_ref()?);
+        if self.import_of(fr, "getattr").is_some() {
+            return None;
+        }
+        let bound = d.stmts.iter().any(|s| match s {
+            Stmt::Assign { to, from, .. } => {
+                to.iter().any(|p| matches!(p, Place::Local(n) | Place::Name(n) if n == local))
+                    && matches!((from.reads.as_slice(), from.calls.as_slice()), ([], [ci]) if d.calls.get(*ci as usize).is_some_and(|c| {
+                        matches!(&c.callee, Callee::Path { chain, .. } if chain == "getattr")
+                            && c.args.first().is_some_and(|a| matches!(a.reads.as_slice(), [r] if r.chain == *me) && a.calls.is_empty())
+                    }))
+            }
+            _ => false,
+        });
+        if !bound {
+            return None;
+        }
+        // `self` is an instance of the owner or a descendant: the owner's
+        // ancestors (inherited methods) and descendants (overrides), by class
+        // name as `subclasses` is keyed; not the ancestors' other children
+        let mut classes: Vec<(u32, String)> = vec![(fr.0, owner.clone())];
+        let mut seen: HashSet<(u32, String)> = classes.iter().cloned().collect();
+        for up in [true, false] {
+            let mut work: Vec<(u32, String)> = vec![(fr.0, owner.clone())];
+            while let Some((cf, c)) = work.pop() {
+                let next: Vec<(u32, String)> = if up {
+                    let bases = self.inp.files[cf as usize].classes.iter().find(|(n, _)| *n == c).map(|(_, b)| b.clone()).unwrap_or_default();
+                    let mut v = Vec::new();
+                    for b in bases {
+                        let last = b.rsplit('.').next().unwrap_or(&b).to_string();
+                        for (gi, g) in self.inp.files.iter().enumerate() {
+                            if g.classes.iter().any(|(n, _)| *n == last) {
+                                v.push((gi as u32, last.clone()));
+                            }
+                        }
+                    }
+                    v
+                } else {
+                    self.subclasses.get(&c).cloned().unwrap_or_default()
+                };
+                for x in next {
+                    if seen.len() < 64 && seen.insert(x.clone()) {
+                        classes.push(x.clone());
+                        work.push(x);
+                    }
+                }
+            }
+        }
+        // the hierarchy's methods (dunders excluded) and, of those, the ones
+        // the hierarchy holds as values (`self.actions = {"x": self.x}`): a
+        // dispatch table, which narrows the candidates when there is one
+        let mut all: Vec<(FnRef, String)> = Vec::new();
+        for (cf, c) in &classes {
+            for ((o, name), is) in &self.methods[*cf as usize] {
+                if o == c {
+                    all.extend(is.iter().map(|&i| ((*cf, i), name.clone())));
+                }
+            }
+        }
+        let names: HashSet<&str> = all.iter().map(|(_, n)| n.as_str()).collect();
+        let mut held: HashSet<String> = HashSet::new();
+        for &(g, _) in &all {
+            let gd = self.df(g);
+            let Some(me) = gd.self_name.as_deref() else { continue };
+            let mut see = |v: &Val| {
+                for r in &v.reads {
+                    if let Some(n) = r.chain.strip_prefix(me).and_then(|x| x.strip_prefix('.')) {
+                        if names.contains(n) {
+                            held.insert(n.to_string());
+                        }
+                    }
+                }
+            };
+            for st in &gd.stmts {
+                match st {
+                    Stmt::Assign { from: v, .. } | Stmt::Eval(v) | Stmt::Return(v) => see(v),
+                }
+            }
+            for c in &gd.calls {
+                c.args.iter().for_each(&mut see);
+                c.kwargs.iter().for_each(|(_, v)| see(v));
+            }
+        }
+        let mut fns: Vec<FnRef> = all
+            .iter()
+            .filter(|(_, n)| !n.starts_with("__") && (held.is_empty() || held.contains(n)))
+            .map(|(g, _)| *g)
+            .collect();
+        fns.sort_unstable();
+        fns.dedup();
+        Some(fns)
     }
 
     /// Callback parameters a model gives facts to: `(param name, (source
@@ -1258,8 +1471,9 @@ impl<'a> Engine<'a> {
         // 1. decorators / registrations of this function
         let handlers: Vec<(Handler, String)> = self.registered.get(&fr).cloned().unwrap_or_default();
         for (h, q) in &handlers {
+            let first_injected = self.injects_first(fr, &d.decorators, h);
             for (i, p) in d.params.iter().enumerate() {
-                if h.params.as_ref().is_some_and(|ps| !ps.contains(&(i as u32))) || self.excepted(fr, p.ty.as_deref(), h) {
+                if h.params.as_ref().is_some_and(|ps| !ps.contains(&(i as u32))) || self.excepted(fr, p.ty.as_deref(), h) || (i == 0 && first_injected) || self.injected_default(fr, p.default.as_deref(), h) {
                     continue;
                 }
                 bind(self, cx, &p.name, u32::MAX - 256 - i as u32, d.row, &h.class, format!("parameter `{}` of a {q} handler", p.name));
@@ -1277,7 +1491,7 @@ impl<'a> Engine<'a> {
             }
             for chain in &cp.decorators {
                 for (h, q) in self.decorator_handlers(fr, chain, &cx.types.clone()) {
-                    if h.params.as_ref().is_some_and(|ps| !ps.contains(&cp.index)) || self.excepted(fr, cp.ty.as_deref(), &h) {
+                    if h.params.as_ref().is_some_and(|ps| !ps.contains(&cp.index)) || self.excepted(fr, cp.ty.as_deref(), &h) || (cp.index == 0 && self.injects_first(fr, &cp.decorators, &h)) || self.injected_default(fr, cp.default.as_deref(), &h) {
                         continue;
                     }
                     bind(self, cx, &cp.name, at, cp.row, &h.class, format!("parameter `{}` of a {q} handler", cp.name));
@@ -1580,6 +1794,100 @@ impl<'a> Engine<'a> {
         ret
     }
 
+    /// A call of repo functions `fns` (plus `opaque` targets without a
+    /// body) with these argument labels: their summaries applied here.
+    #[allow(clippy::too_many_arguments)]
+    fn call_repo(&mut self, cx: &mut Cx, row: u32, splat: bool, fns: Vec<FnRef>, opaque: usize, args: &[Labels], kwargs: &[(String, Labels)], recv: &Labels) -> Labels {
+        let mut all: Labels = args.iter().flatten().copied().collect();
+        all.extend(kwargs.iter().flat_map(|(_, l)| l.iter().copied()));
+        all.extend(recv.iter().copied());
+        let here = cx.fr;
+        let step = |what: String| Step { at_fn: here, row, what };
+        let mut ret = Labels::new();
+        if opaque > 0 {
+            ret.extend(all.iter().copied());
+        }
+        for g in fns {
+            self.callers.entry(g).or_default().insert(cx.fr);
+            let gd = self.df(g);
+            let s = self.summaries[g.0 as usize][g.1 as usize].clone();
+            let subst = |l: Label| -> Labels {
+                match l {
+                    Label::Param(j) => {
+                        if splat {
+                            return all.clone();
+                        }
+                        let mut o = args.get(j as usize).cloned().unwrap_or_default();
+                        if let Some(p) = gd.params.get(j as usize) {
+                            for (k, v) in kwargs {
+                                if p.name.split(',').any(|n| n == k) {
+                                    o.extend(v.iter().copied());
+                                }
+                            }
+                        }
+                        o
+                    }
+                    other => [other].into_iter().collect(),
+                }
+            };
+            let callee = self.fn_label(g);
+            for &l in &s.ret {
+                for x in subst(l) {
+                    if matches!(x, Label::Src(_) | Label::Unk(_)) && !matches!(l, Label::Param(_)) {
+                        self.arrive.entry((cx.fr, x)).or_insert((g, row));
+                    }
+                    ret.insert(x);
+                }
+            }
+            for ((site, l), path) in &s.sinks {
+                for x in subst(*l) {
+                    let p = || {
+                        let mut p = vec![step(format!("calls {callee}"))];
+                        p.extend(path.iter().cloned());
+                        p
+                    };
+                    self.record_sink(cx, *site, x, p, false);
+                }
+            }
+            for ((site, l), path) in &s.possible {
+                for x in subst(*l) {
+                    let p = || {
+                        let mut p = vec![step(format!("calls {callee}"))];
+                        p.extend(path.iter().cloned());
+                        p
+                    };
+                    self.record_sink(cx, *site, x, p, true);
+                }
+            }
+            for j in 0..gd.params.len() {
+                let node = (g, j as u16);
+                for x in subst(Label::Param(j as u16)) {
+                    match x {
+                        Label::Src(o) => {
+                            self.src_at_param.entry((o, node)).or_insert_with(|| (here, step(format!("calls {callee}"))));
+                        }
+                        Label::Param(p) => {
+                            self.param_edges.entry((here, p)).or_default().entry(node).or_insert_with(|| step(format!("calls {callee}")));
+                        }
+                        Label::State(r) => {
+                            self.state_at_param.entry((r, node)).or_insert_with(|| step(format!("calls {callee}")));
+                        }
+                        Label::Unk(_) => {}
+                    }
+                }
+            }
+            for (st, l) in &s.writes {
+                for x in subst(*l) {
+                    self.write_state(cx, *st, x, row);
+                }
+            }
+            if self.counting {
+                self.facts[cx.fr.0 as usize][cx.fr.1 as usize].calls_repo.insert(g);
+            }
+        }
+        ret
+    }
+
     fn eval_call_with(&mut self, cx: &mut Cx, ci: u32, args: &[Labels], kwargs: &[(String, Labels)], recv: &Labels) -> Labels {
         let d = self.df(cx.fr);
         let c = &d.calls[ci as usize];
@@ -1593,87 +1901,16 @@ impl<'a> Engine<'a> {
         let mut ret = Labels::new();
         match target {
             Target::Repo(fns, opaque) => {
-                if opaque > 0 {
-                    ret.extend(all.iter().copied());
+                ret.extend(self.call_repo(cx, c.row, c.splat, fns, opaque, args, kwargs, recv));
+                if self.counting {
+                    self.coverage.repo += 1;
                 }
-                for g in fns {
-                    self.callers.entry(g).or_default().insert(cx.fr);
-                    let gd = self.df(g);
-                    let s = self.summaries[g.0 as usize][g.1 as usize].clone();
-                    let subst = |l: Label| -> Labels {
-                        match l {
-                            Label::Param(j) => {
-                                if c.splat {
-                                    return all.clone();
-                                }
-                                let mut o = args.get(j as usize).cloned().unwrap_or_default();
-                                if let Some(p) = gd.params.get(j as usize) {
-                                    for (k, v) in kwargs {
-                                        if p.name.split(',').any(|n| n == k) {
-                                            o.extend(v.iter().copied());
-                                        }
-                                    }
-                                }
-                                o
-                            }
-                            other => [other].into_iter().collect(),
-                        }
-                    };
-                    let callee = self.fn_label(g);
-                    for &l in &s.ret {
-                        for x in subst(l) {
-                            if matches!(x, Label::Src(_) | Label::Unk(_)) && !matches!(l, Label::Param(_)) {
-                                self.arrive.entry((cx.fr, x)).or_insert((g, c.row));
-                            }
-                            ret.insert(x);
-                        }
-                    }
-                    for ((site, l), path) in &s.sinks {
-                        for x in subst(*l) {
-                            let p = || {
-                                let mut p = vec![step(format!("calls {callee}"))];
-                                p.extend(path.iter().cloned());
-                                p
-                            };
-                            self.record_sink(cx, *site, x, p, false);
-                        }
-                    }
-                    for ((site, l), path) in &s.possible {
-                        for x in subst(*l) {
-                            let p = || {
-                                let mut p = vec![step(format!("calls {callee}"))];
-                                p.extend(path.iter().cloned());
-                                p
-                            };
-                            self.record_sink(cx, *site, x, p, true);
-                        }
-                    }
-                    for j in 0..gd.params.len() {
-                        let node = (g, j as u16);
-                        for x in subst(Label::Param(j as u16)) {
-                            match x {
-                                Label::Src(o) => {
-                                    self.src_at_param.entry((o, node)).or_insert_with(|| (here, step(format!("calls {callee}"))));
-                                }
-                                Label::Param(p) => {
-                                    self.param_edges.entry((here, p)).or_default().entry(node).or_insert_with(|| step(format!("calls {callee}")));
-                                }
-                                Label::State(r) => {
-                                    self.state_at_param.entry((r, node)).or_insert_with(|| step(format!("calls {callee}")));
-                                }
-                                Label::Unk(_) => {}
-                            }
-                        }
-                    }
-                    for (st, l) in &s.writes {
-                        for x in subst(*l) {
-                            self.write_state(cx, *st, x, c.row);
-                        }
-                    }
-                    if self.counting {
-                        self.facts[cx.fr.0 as usize][cx.fr.1 as usize].calls_repo.insert(g);
-                    }
-                }
+            }
+            Target::Dispatch(fns) => {
+                let _ = self.call_repo(cx, c.row, c.splat, fns, 0, args, kwargs, recv);
+                let u = self.unk(cx.fr, c.at, c.row, "runtime-selected method");
+                ret.extend(all.iter().copied());
+                ret.insert(u);
                 if self.counting {
                     self.coverage.repo += 1;
                 }
@@ -1735,6 +1972,17 @@ impl<'a> Engine<'a> {
                         Kind::Sanitizer | Kind::Returns(_) | Kind::Callback(..) => modeled = true,
                         Kind::ParamSource(_) => {}
                         Kind::Handler(_) => modeled = true,
+                        Kind::Invoke(k) => {
+                            modeled = true;
+                            // runs the repo function passed at `k` with the
+                            // arguments after it (`asyncio.to_thread(f, x)`)
+                            let k = *k as usize;
+                            let fns = c.args.get(k).map(|a| self.fns_named_by(cx.fr, a)).unwrap_or_default();
+                            if !fns.is_empty() {
+                                let rest = args.get(k + 1..).unwrap_or_default();
+                                ret.extend(self.call_repo(cx, c.row, c.splat, fns, 0, rest, kwargs, &Labels::new()));
+                            }
+                        }
                     }
                 }
                 if self.counting {

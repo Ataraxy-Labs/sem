@@ -383,7 +383,7 @@ impl<'s> Lower<'s> {
         };
         if ps.kind() == "identifier" {
             // `x => ..`
-            return vec![Param { name: self.text(ps).to_string(), ty: None }];
+            return vec![Param { name: self.text(ps).to_string(), ty: None, default: None }];
         }
         self.params_of_list(ps)
     }
@@ -396,20 +396,26 @@ impl<'s> Lower<'s> {
                 t.trim_start_matches(':').trim().to_string()
             });
             match (self.lang, p.kind()) {
-                (_, "identifier") => out.push(Param { name: self.text(p).into(), ty: None }),
+                (_, "identifier") => out.push(Param { name: self.text(p).into(), ty: None, default: None }),
                 (Lang::Python, "typed_parameter") => {
                     if let Some(id) = kids(p).into_iter().find(|c| c.kind() == "identifier") {
-                        out.push(Param { name: self.text(id).into(), ty });
+                        out.push(Param { name: self.text(id).into(), ty, default: None });
+                    } else if let Some(sp) = kids(p).into_iter().find(|c| matches!(c.kind(), "list_splat_pattern" | "dictionary_splat_pattern")) {
+                        // `*args: T` / `**kwargs: T`
+                        for b in self.binders(sp) {
+                            out.push(Param { name: b, ty: None, default: None });
+                        }
                     }
                 }
                 (Lang::Python, "default_parameter" | "typed_default_parameter") => {
                     if let Some(nm) = p.child_by_field_name("name") {
-                        out.push(Param { name: self.text(nm).into(), ty });
+                        let default = p.child_by_field_name("value").map(|v| self.text(v).to_string());
+                        out.push(Param { name: self.text(nm).into(), ty, default });
                     }
                 }
                 (Lang::Python, "list_splat_pattern" | "dictionary_splat_pattern") => {
                     for b in self.binders(p) {
-                        out.push(Param { name: b, ty: None });
+                        out.push(Param { name: b, ty: None, default: None });
                     }
                 }
                 (Lang::Ts, "required_parameter" | "optional_parameter") => {
@@ -417,27 +423,27 @@ impl<'s> Lower<'s> {
                     let names = self.binders(pat);
                     // a destructured parameter is one argument
                     let name = if names.len() == 1 { names[0].clone() } else { names.join(",") };
-                    out.push(Param { name, ty });
+                    out.push(Param { name, ty, default: None });
                 }
                 (Lang::Ts, _) => {
                     let names = self.binders(p);
                     if !names.is_empty() {
-                        out.push(Param { name: names.join(","), ty: None });
+                        out.push(Param { name: names.join(","), ty: None, default: None });
                     }
                 }
                 (Lang::Go, "parameter_declaration" | "variadic_parameter_declaration") => {
                     let names: Vec<Node> = kids(p).into_iter().filter(|c| c.kind() == "identifier").collect();
                     if names.is_empty() {
-                        out.push(Param { name: "_".into(), ty: ty.clone() });
+                        out.push(Param { name: "_".into(), ty: ty.clone(), default: None });
                     }
                     for nm in names {
-                        out.push(Param { name: self.text(nm).into(), ty: ty.clone() });
+                        out.push(Param { name: self.text(nm).into(), ty: ty.clone(), default: None });
                     }
                 }
                 (Lang::Rust, "parameter") => {
                     let pat = p.child_by_field_name("pattern").unwrap_or(p);
                     let names = self.binders(pat);
-                    out.push(Param { name: names.join(","), ty });
+                    out.push(Param { name: names.join(","), ty, default: None });
                 }
                 (Lang::Rust, "self_parameter") => {}
                 (Lang::Rust, "closure_parameters") => out.extend(self.params_of_list(p)),
@@ -1256,7 +1262,7 @@ impl<'s> Lower<'s> {
         let params = self.params(n);
         for (index, p) in params.iter().enumerate() {
             if p.ty.is_some() || !decorators.is_empty() {
-                let cp = ClosureParam { name: p.name.clone(), index: index as u32, ty: p.ty.clone(), decorators: decorators.clone(), row: row(n) };
+                let cp = ClosureParam { name: p.name.clone(), index: index as u32, ty: p.ty.clone(), decorators: decorators.clone(), row: row(n), default: p.default.clone() };
                 self.fnm(fi).closure_params.push(cp);
             }
             for nm in p.name.split(',') {

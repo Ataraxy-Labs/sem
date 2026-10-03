@@ -15,6 +15,15 @@
     { "match": ["mcp.server.Server", "mcp.server.lowlevel.Server", "mcp.server.lowlevel.server.Server"], "kind": "returns", "type": "mcp.server.lowlevel.Server" },
     { "match": ["mcp.server.lowlevel.Server.call_tool", "mcp.server.lowlevel.Server.read_resource", "mcp.server.lowlevel.Server.get_prompt"], "kind": "handler", "class": "tool-input" },
     { "match": ["builtins.input"], "kind": "source", "class": "cli-input" },
+    { "match": ["fastapi.FastAPI", "fastapi.applications.FastAPI"], "kind": "returns", "type": "fastapi.FastAPI" },
+    { "match": ["fastapi.APIRouter", "fastapi.routing.APIRouter"], "kind": "returns", "type": "fastapi.APIRouter" },
+    { "match": ["fastapi.FastAPI.get", "fastapi.FastAPI.post", "fastapi.FastAPI.put", "fastapi.FastAPI.patch", "fastapi.FastAPI.delete", "fastapi.FastAPI.head", "fastapi.FastAPI.options", "fastapi.FastAPI.api_route", "fastapi.FastAPI.websocket", "fastapi.APIRouter.get", "fastapi.APIRouter.post", "fastapi.APIRouter.put", "fastapi.APIRouter.patch", "fastapi.APIRouter.delete", "fastapi.APIRouter.head", "fastapi.APIRouter.options", "fastapi.APIRouter.api_route", "fastapi.APIRouter.websocket"], "kind": "handler", "class": "http-input", "except_types": ["fastapi.BackgroundTasks", "fastapi.Response", "fastapi.responses.Response", "starlette.responses.Response", "starlette.background.BackgroundTasks"], "except_defaults": ["fastapi.Depends", "fastapi.Security", "fastapi.params.Depends", "fastapi.params.Security"] },
+    { "match": ["homeassistant.config_entries.ConfigFlow", "homeassistant.config_entries.OptionsFlow", "homeassistant.config_entries.OptionsFlowWithConfigEntry", "homeassistant.config_entries.ConfigSubentryFlow", "homeassistant.data_entry_flow.FlowHandler"], "kind": "handler", "class": "http-input", "methods": ["async_step_*"] },
+    { "match": ["typer.Typer", "typer.main.Typer"], "kind": "returns", "type": "typer.Typer" },
+    { "match": ["typer.Typer.command", "typer.Typer.callback"], "kind": "handler", "class": "cli-input", "except_types": ["typer.Context", "click.Context", "click.core.Context"] },
+    { "match": ["typer.run"], "kind": "handler", "class": "cli-input", "arg": 0, "except_types": ["typer.Context", "click.Context", "click.core.Context"] },
+    { "match": ["click.Group", "click.core.Group", "click.group", "click.decorators.group", "click.Group.group", "click.core.Group.group"], "kind": "returns", "type": "click.Group" },
+    { "match": ["click.command", "click.decorators.command", "click.group", "click.decorators.group", "click.Group.command", "click.Group.group", "click.core.Group.command", "click.core.Group.group"], "kind": "handler", "class": "cli-input", "except_types": ["click.Context", "click.core.Context", "typer.Context"], "injects_first": ["click.pass_context", "click.pass_obj", "click.decorators.pass_context", "click.decorators.pass_obj"] },
 
     { "match": ["builtins.open", "io.open", "codecs.open"], "kind": "returns", "type": "io.TextIOWrapper" },
     { "match": ["builtins.open", "io.open", "codecs.open", "pathlib.Path", "os.remove", "os.unlink", "os.rmdir", "shutil.rmtree", "flask.send_file", "werkzeug.utils.send_file"], "kind": "sink", "class": "file-path", "args": [0] },
@@ -26,6 +35,10 @@
 
     { "match": ["subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.Popen", "subprocess.getoutput", "subprocess.getstatusoutput", "os.system", "os.popen", "os.execv", "os.execve", "os.execvp", "os.execl", "os.execlp", "os.spawnv", "os.spawnl", "asyncio.create_subprocess_shell", "asyncio.create_subprocess_exec"], "kind": "sink", "class": "exec" },
     { "match": ["builtins.eval", "builtins.exec", "builtins.compile"], "kind": "sink", "class": "exec" },
+    { "match": ["asyncio.to_thread", "concurrent.futures.Executor.submit", "concurrent.futures.ThreadPoolExecutor.submit", "concurrent.futures.ProcessPoolExecutor.submit", "homeassistant.core.HomeAssistant.async_add_executor_job", "homeassistant.core.HomeAssistant.async_add_job", "starlette.concurrency.run_in_threadpool", "fastapi.concurrency.run_in_threadpool", "anyio.to_thread.run_sync"], "kind": "invoke", "arg": 0 },
+    { "match": ["asyncio.AbstractEventLoop.run_in_executor", "asyncio.BaseEventLoop.run_in_executor"], "kind": "invoke", "arg": 1 },
+    { "match": ["concurrent.futures.ThreadPoolExecutor", "concurrent.futures.ProcessPoolExecutor"], "kind": "returns", "type": "concurrent.futures.Executor" },
+    { "match": ["asyncio.get_event_loop", "asyncio.get_running_loop", "asyncio.new_event_loop"], "kind": "returns", "type": "asyncio.AbstractEventLoop" },
     { "match": ["builtins.eval", "builtins.exec", "builtins.getattr", "builtins.setattr", "builtins.delattr", "builtins.__import__", "builtins.globals", "builtins.locals", "builtins.vars", "importlib.import_module"], "kind": "dynamic" },
 
     { "match": ["sqlite3.connect"], "kind": "returns", "type": "sqlite3.Connection" },

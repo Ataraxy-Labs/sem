@@ -156,6 +156,8 @@ pub struct Param {
     pub name: String,
     /// The declared type as written (`*http.Request`, `Request`).
     pub ty: Option<String>,
+    /// The default value as written (Python: `Depends(get_db)`).
+    pub default: Option<String>,
 }
 
 /// A parameter of a closure / nested function inlined into its enclosing
@@ -170,6 +172,7 @@ pub struct ClosureParam {
     /// Decorators of the nested definition, as callee chains (`mcp.tool`).
     pub decorators: Vec<String>,
     pub row: u32,
+    pub default: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

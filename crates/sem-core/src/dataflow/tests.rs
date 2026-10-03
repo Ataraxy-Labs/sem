@@ -371,3 +371,131 @@ fn minified_bundles_are_not_analyzed() {
     let v = run(&[("static/bundle.js", long.as_str()), ("static/app.min.js", "var a=process.env.X;require('child_process').exec(a);\n")]);
     assert_eq!(v["coverage"]["files"], 0, "{v:#}");
 }
+
+#[test]
+fn python_typer_and_click_command_parameters_are_cli_input() {
+    let v = run(&[
+        (
+            "tool/store.py",
+            "import os\n\nclass Store:\n    def __init__(self, base):\n        self.base = base\n\n    def read(self, name):\n        with open(os.path.join(self.base, name)) as f:\n            return f.read()\n",
+        ),
+        (
+            "tool/cli.py",
+            "import subprocess\nimport typer\nimport click\nfrom tool.store import Store\n\napp = typer.Typer()\n\n@app.command()\ndef show(name: str, ctx: typer.Context):\n    store = Store('/srv')\n    print(store.read(name=name))\n    subprocess.run(ctx.info_name, shell=True)\n\ndef helper(name: str):\n    return open(name).read()\n\n@click.group()\ndef cli():\n    pass\n\n@cli.command()\n@click.argument('cmd')\ndef run(cmd):\n    subprocess.run(cmd, shell=True)\n\n@cli.command()\n@click.pass_context\ndef info(context, name):\n    subprocess.run(context.info_name, shell=True)\n    open(name)\n\ndef main(path: str):\n    return open(path).read()\n\nif __name__ == '__main__':\n    typer.run(main)\n",
+        ),
+    ]);
+    // `helper` is not a command; `ctx: typer.Context` and a
+    // `@click.pass_context` first parameter are injected
+    let got = flows(&v, "flows");
+    for want in ["cli-input show -> file-path Store.read", "cli-input run -> exec run", "cli-input main -> file-path main", "cli-input info -> file-path info"] {
+        assert!(got.contains(want), "missing {want}: {got:?}");
+    }
+    assert!(!got.iter().any(|f| f.contains("helper") || f.starts_with("cli-input show -> exec") || f.starts_with("cli-input info -> exec")), "{got:?}");
+}
+
+#[test]
+fn python_home_assistant_flow_steps_take_user_input() {
+    let v = run(&[
+        ("comp/__init__.py", "import requests\n\nasync def lookup(key):\n    return requests.get('https://api.example/' + key + '/x')\n"),
+        (
+            "comp/flow.py",
+            "import os\nfrom homeassistant import config_entries\nfrom homeassistant.config_entries import ConfigFlow\nfrom . import lookup\n\nclass Options(config_entries.OptionsFlow):\n    async def async_step_init(self, user_input=None):\n        if user_input is not None:\n            self._key = user_input['key']\n        return await self.async_step_next()\n\n    async def async_step_next(self, user_input=None):\n        return await lookup(self._key)\n\n    def helper(self, cmd):\n        os.system(cmd)\n\nclass Base(ConfigFlow):\n    pass\n\nclass Flow(Base, domain='x'):\n    async def async_step_user(self, user_input=None):\n        os.system(user_input['cmd'])\n\nclass NotAFlow:\n    async def async_step_user(self, user_input=None):\n        os.system(user_input['cmd'])\n",
+        ),
+    ]);
+    let got = flows(&v, "flows");
+    // a step's input stored in a field reaches a later step's call; a flow
+    // derived through a repo base class counts; `helper` and a class that is
+    // not a flow do not
+    for want in ["http-input Options.async_step_init -> net-send lookup", "http-input Flow.async_step_user -> exec Flow.async_step_user"] {
+        assert!(got.contains(want), "missing {want}: {got:?}");
+    }
+    assert!(!got.iter().any(|f| f.contains("NotAFlow") || f.contains("helper")), "{got:?}");
+}
+
+#[test]
+fn python_fastapi_route_parameters_are_input() {
+    let v = run(&[
+        ("svc/work.py", "import requests\n\ndef fetch(url):\n    return requests.get(url)\n"),
+        (
+            "svc/server.py",
+            "import os\nimport subprocess\nfrom fastapi import FastAPI, APIRouter, BackgroundTasks, Depends\nfrom pydantic import BaseModel\nfrom svc.work import fetch\n\nrouter = APIRouter()\n\nclass Req(BaseModel):\n    url: str\n\nclass Query(BaseModel):\n    cmd: str\n\ndef get_cfg():\n    return 'x'\n\n@router.get('/f/{name}')\ndef read(name: str, tasks: BackgroundTasks, cfg: str = Depends(get_cfg), q: Query = Depends()):\n    os.system(tasks.name)\n    os.system(cfg)\n    subprocess.run(q.cmd)\n    return open(name).read()\n\nclass Server:\n    def __init__(self):\n        self.app = FastAPI()\n        self.routes()\n\n    def routes(self):\n        @self.app.post('/go')\n        async def go(req: Req):\n            return fetch(req.url)\n\ndef helper(name: str):\n    return open(name).read()\n",
+        ),
+    ]);
+    let got = flows(&v, "flows");
+    // a body model through a nested `@self.app.post`; `BackgroundTasks` and
+    // `Depends(get_cfg)` are injected, a bare `Depends()` model is input
+    for want in ["http-input read -> file-path read", "http-input Server.routes -> net-send fetch", "http-input read -> exec read"] {
+        assert!(got.contains(want), "missing {want}: {got:?}");
+    }
+    assert!(!got.iter().any(|f| f.contains("helper")), "{got:?}");
+    let execs: Vec<&Value> = v["flows"].as_array().unwrap().iter().filter(|f| f["sink"]["class"] == "exec").collect();
+    assert!(execs.iter().all(|f| f["sink"]["line"] == 22), "{execs:#?}");
+}
+
+#[test]
+fn python_typed_splat_parameters_receive_arguments() {
+    let v = run(&[(
+        "conn.py",
+        "import os\nimport requests\nfrom typing import Any\n\nclass Conn:\n    @staticmethod\n    def fetch(data: str) -> str:\n        return requests.get(data.replace('ipfs://', 'https://')).text\n\n    def generate_text(self, prompt: str, system_prompt: str, model: str = None, **kwargs) -> str:\n        return self.fetch(system_prompt)\n\n    def perform_action(self, action_name: str, **kwargs: Any) -> Any:\n        return self.generate_text(**kwargs)\n\ndef main():\n    kw = {}\n    kw['system_prompt'] = os.environ['P']\n    Conn().perform_action('generate-text', **kw)\n",
+    )]);
+    // `**kwargs: Any` is a parameter: what is passed to it is forwarded
+    assert!(flows(&v, "flows").contains("env main -> net-send Conn.fetch"), "{v:#}");
+}
+
+#[test]
+fn python_thread_offload_runs_the_passed_function() {
+    let v = run(&[
+        ("work.py", "import os\n\nclass Agent:\n    def act(self, x):\n        os.system(x)\n\ndef job(path):\n    return open(path).read()\n"),
+        (
+            "st.py",
+            "import asyncio\nimport os\nfrom work import Agent, job\n\nclass State:\n    def __init__(self):\n        self.agent = Agent()\n\n    async def go(self):\n        return await asyncio.to_thread(self.agent.act, os.getenv('Y'))\n\n    async def read(self):\n        loop = asyncio.get_running_loop()\n        return await loop.run_in_executor(None, job, os.getenv('P'))\n",
+        ),
+    ]);
+    // the function handed to `asyncio.to_thread` / `run_in_executor` runs
+    // with the arguments after it
+    assert_eq!(flows(&v, "flows"), set(&["env State.go -> exec Agent.act", "env State.read -> file-path job"]), "{v:#}");
+}
+
+#[test]
+fn python_none_placeholder_field_takes_its_later_type() {
+    let v = run(&[
+        ("agent.py", "import os\n\nclass Agent:\n    def perform_action(self, x):\n        os.system(x)\n"),
+        (
+            "cli.py",
+            "import os\nfrom agent import Agent\n\nclass CLI:\n    def __init__(self):\n        self.agent = None\n\n    def load(self):\n        self.agent = Agent()\n\n    def act(self):\n        return self.agent.perform_action(os.environ['X'])\n",
+        ),
+        (
+            "st.py",
+            "import asyncio\nimport os\nfrom cli import CLI\n\nclass State:\n    def __init__(self):\n        self.cli = CLI()\n\n    async def go(self):\n        return await asyncio.to_thread(self.cli.agent.perform_action, os.getenv('Y'))\n",
+        ),
+    ]);
+    // `self.agent = None` in `__init__` does not hide `self.agent = Agent()`;
+    // `asyncio.to_thread` runs the method it is handed
+    assert_eq!(flows(&v, "flows"), set(&["env CLI.act -> exec Agent.perform_action", "env State.go -> exec Agent.perform_action"]), "{v:#}");
+}
+
+#[test]
+fn python_thread_offload_and_getattr_self_dispatch_are_followed() {
+    let v = run(&[
+        (
+            "conn.py",
+            "import requests\nimport subprocess\n\nclass Base:\n    def perform_action(self, action_name, **kwargs):\n        raise NotImplementedError\n\nclass Web(Base):\n    def __init__(self):\n        self.actions = {'fetch': self.fetch}\n\n    def perform_action(self, action_name, **kwargs):\n        method = getattr(self, action_name.replace('-', '_'))\n        return method(**kwargs)\n\n    def fetch(self, url):\n        return requests.get(url)\n\n    def shell(self, url):\n        subprocess.run(url, shell=True)\n\nclass Other:\n    def run(self, cmd):\n        subprocess.run(cmd, shell=True)\n\n    def call(self, obj, name, arg):\n        f = getattr(obj, name)\n        return f(arg)\n",
+        ),
+        (
+            "manager.py",
+            "from typing import Dict\nfrom conn import Base\n\nclass Manager:\n    def __init__(self):\n        self.connections: Dict[str, Base] = {}\n\n    def perform_action(self, name: str, action: str, params: list):\n        conn = self.connections[name]\n        kwargs = {}\n        for i, p in enumerate(['url']):\n            kwargs[p] = params[i]\n        return conn.perform_action(action, **kwargs)\n",
+        ),
+        (
+            "server.py",
+            "import asyncio\nfrom fastapi import FastAPI\nfrom manager import Manager\nfrom conn import Other\n\nclass Server:\n    def __init__(self):\n        self.app = FastAPI()\n        self.mgr = Manager()\n\n    def routes(self):\n        @self.app.post('/a')\n        async def act(body: dict):\n            return await asyncio.to_thread(self.mgr.perform_action, body['c'], action=body['a'], params=body['p'])\n\n        @self.app.post('/o')\n        async def other(q: str):\n            return Other().call(Other(), 'run', q)\n",
+        ),
+    ]);
+    let got = flows(&v, "flows");
+    // `asyncio.to_thread` runs `Manager.perform_action`, whose `connection`
+    // may be a `Web`, whose `getattr(self, ..)` may select `fetch`
+    assert!(got.contains("http-input Server.routes -> net-send Web.fetch"), "{got:?}");
+    // `Web` holds `fetch` in a dispatch table, which narrows the candidates
+    // (no flow into `Web.shell`); `getattr` on another object is not
+    // resolved (no flow into `Other.run`)
+    assert!(!got.iter().any(|f| f.contains("exec")), "{got:?}");
+}

@@ -82,12 +82,17 @@ impl<'a> Resolver<'a> {
     }
 
     /// An `exports` entry that points at build output that is not there
-    /// (`./dist/types/core/src/x.d.ts`, `./dist/index.js`): the source file it
-    /// was built from, re-rooted at its `src/` segment or with the first
-    /// `dist|build|lib|out` segment replaced by `src`.
+    /// (`./dist/types/core/src/x.d.ts`, `./dist/esm/index.node.js`): the
+    /// source file it was built from, re-rooted at its `src/` segment, or with
+    /// the first `dist|build|lib|out` segment replaced by `src` (dropping
+    /// format directories after it: `dist/esm/x.js` -> `src/x.ts`).
+    /// Runtime conditions are tried before `types`, Node's first (`node`,
+    /// then `import`, `module`, `default`, `require`), and an implementation
+    /// beats a declaration file: calls resolve into function bodies.
     fn built_to_source(&self, idx: usize, exports: &Value, key: &str) -> Option<Target> {
         let dir = &self.ws.packages[idx].dir;
-        let targets = ["types", "import", "default"].iter().filter_map(|c| exports_lookup_with(exports, key, c));
+        let mut decl: Option<Target> = None;
+        let targets = ["node", "import", "module", "default", "require", "types"].iter().filter_map(|c| exports_lookup_with(exports, key, c));
         for t in targets {
             let t = normalize(&t);
             let stem = [".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs"]
@@ -96,20 +101,32 @@ impl<'a> Resolver<'a> {
                 .unwrap_or(&t)
                 .to_string();
             let segs: Vec<&str> = stem.split('/').collect();
-            let src_rel = if let Some(i) = segs.iter().position(|s| *s == "src") {
-                Some(segs[i..].join("/"))
-            } else {
-                segs.iter()
-                    .position(|s| matches!(*s, "dist" | "build" | "lib" | "out"))
-                    .map(|i| segs[..i].iter().chain(["src"].iter()).chain(segs[i + 1..].iter()).copied().collect::<Vec<_>>().join("/"))
-            };
-            if let Some(rel) = src_rel {
+            let mut rels: Vec<String> = Vec::new();
+            if let Some(i) = segs.iter().position(|s| *s == "src") {
+                rels.push(segs[i..].join("/"));
+            } else if let Some(i) = segs.iter().position(|s| matches!(*s, "dist" | "build" | "lib" | "out")) {
+                for skip in 0..segs.len().saturating_sub(i + 1) {
+                    rels.push(segs[..i].iter().chain(["src"].iter()).chain(segs[i + 1 + skip..].iter()).copied().collect::<Vec<_>>().join("/"));
+                }
+            }
+            for rel in rels {
                 if let Target::File(f) = self.file_or_path(&normalize(&format!("{dir}/{rel}"))) {
+                    if is_declaration(&f) {
+                        decl.get_or_insert(Target::File(f));
+                        continue;
+                    }
                     return Some(Target::File(f));
                 }
             }
+            // a target that is itself a repo source (`types: ./src/index.d.ts`)
+            if let Target::File(f) = self.file_or_path(&normalize(&format!("{dir}/{t}"))) {
+                if !is_declaration(&f) {
+                    return Some(Target::File(f));
+                }
+                decl.get_or_insert(Target::File(f));
+            }
         }
-        None
+        decl
     }
 
     fn in_package(&self, idx: usize, target: &str) -> Target {
@@ -255,6 +272,10 @@ fn pick(v: &Value) -> Option<String> {
     }
 }
 
+fn is_declaration(f: &str) -> bool {
+    [".d.ts", ".d.mts", ".d.cts"].iter().any(|x| f.ends_with(x))
+}
+
 pub fn normalize(p: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for seg in p.split('/') {
@@ -315,6 +336,23 @@ mod tests {
         let r = Resolver { ws: &w, files: &files };
         assert_eq!(r.resolve("packages/app/src/main.ts", "@x/core"), Target::File("packages/core/src/index.ts".into()));
         assert_eq!(r.resolve("packages/app/src/main.ts", "@x/core/deep/util"), Target::File("packages/core/src/deep/util.ts".into()));
+    }
+
+    #[test]
+    fn unbuilt_exports_prefer_node_implementation_over_declarations() {
+        let pkg = r#"{"name":"@x/conv","main":"./dist/esm/index.browser.js","exports":{".":{"browser":"./dist/esm/index.browser.js","node":"./dist/esm/index.node.js","import":"./dist/esm/index.browser.js","types":"./src/index.d.ts"}}}"#;
+        let (_d, w) = ws(&[
+            ("package.json", r#"{"workspaces":["packages/*","play"]}"#),
+            ("packages/conv/package.json", pkg),
+            ("packages/conv/src/index.d.ts", ""),
+            ("packages/conv/src/index.node.ts", ""),
+            ("packages/conv/src/index.browser.ts", ""),
+            ("play/package.json", r#"{"name":"play"}"#),
+            ("play/run.mjs", ""),
+        ]);
+        let files: HashSet<String> = ["packages/conv/src/index.d.ts", "packages/conv/src/index.node.ts", "packages/conv/src/index.browser.ts", "play/run.mjs"].iter().map(|s| s.to_string()).collect();
+        let r = Resolver { ws: &w, files: &files };
+        assert_eq!(r.resolve("play/run.mjs", "@x/conv"), Target::File("packages/conv/src/index.node.ts".into()));
     }
 
     #[test]

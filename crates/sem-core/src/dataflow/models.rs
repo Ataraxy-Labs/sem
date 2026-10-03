@@ -23,7 +23,19 @@
 //!   (`@mcp.tool()`, `@app.route(..)`), or, with `arg`, one passed by name
 //!   at argument `arg` of a call to it (`path("x/", views.show)`). A
 //!   parameter declared with a type in `except_types` is not input (an
-//!   injected framework context).
+//!   injected framework context), nor is the first parameter of a
+//!   definition also decorated with a name in `injects_first`
+//!   (`@click.pass_context`), nor one whose default is a call with
+//!   arguments to a name in `except_defaults` (`db = Depends(get_db)`). With `methods` (names, a trailing `*` a
+//!   prefix) the matched name is a framework base class instead: the
+//!   methods so named of a repo class deriving from it (directly or through
+//!   repo classes) are the handlers (Home Assistant `async_step_*` flow
+//!   steps).
+//! - `invoke` `{arg}`: the call runs the function passed at argument
+//!   `arg` with the arguments after it and every keyword argument
+//!   (`asyncio.to_thread(f, x, y=z)` calls `f(x, y=z)`). A repo function
+//!   named there is analyzed as called; the result still carries the
+//!   arguments' data as any unmodeled call's does.
 //! - `dynamic`: the call defeats static tracking (reflection, `eval`): an
 //!   explicit unknown.
 //! - `sanitizer`: the result carries no data of its arguments (`int(x)`).
@@ -70,6 +82,22 @@ pub struct Handler {
     pub params: Option<Vec<u32>>,
     pub arg: Option<u32>,
     pub except_types: Vec<String>,
+    /// Decorators that inject the definition's first parameter.
+    pub injects_first: Vec<String>,
+    /// Method names (trailing `*` = prefix): the model names a base class.
+    pub methods: Vec<String>,
+    /// Calls whose result, as a parameter default, is injected.
+    pub except_defaults: Vec<String>,
+}
+
+impl Handler {
+    /// Is `name` one of this base-class handler's methods?
+    pub fn names_method(&self, name: &str) -> bool {
+        self.methods.iter().any(|m| match m.strip_suffix('*') {
+            Some(p) => name.starts_with(p),
+            None => m == name,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +108,7 @@ pub enum Kind {
     Returns(String),
     ParamSource(String),
     Callback(CbArg, Vec<CbParam>),
+    Invoke(u32),
     Dynamic,
     Sanitizer,
 }
@@ -175,6 +204,14 @@ pub fn validate(v: &Value) -> Vec<String> {
                         errs.push(format!("models[{i}]: handler `params` must be a list of parameter indices"));
                     }
                 }
+                for key in ["except_types", "injects_first", "methods", "except_defaults"] {
+                    if m.get(key).is_some_and(|a| !a.as_array().is_some_and(|a| a.iter().all(Value::is_string))) {
+                        errs.push(format!("models[{i}]: handler `{key}` must be a list of names"));
+                    }
+                }
+                if m.get("methods").is_some() && m.get("arg").is_some() {
+                    errs.push(format!("models[{i}]: handler `methods` and `arg` exclude each other"));
+                }
                 if m.get("arg").is_some_and(|a| a.as_u64().is_none()) {
                     errs.push(format!("models[{i}]: handler `arg` must be an argument index"));
                 }
@@ -205,6 +242,11 @@ pub fn validate(v: &Value) -> Vec<String> {
                     _ => errs.push(format!("models[{i}]: callback needs non-empty `params`")),
                 }
             }
+            "invoke" => {
+                if m["arg"].as_u64().is_none() {
+                    errs.push(format!("models[{i}]: invoke `arg` must be an argument index"));
+                }
+            }
             "dynamic" | "sanitizer" => {}
             k => errs.push(format!("models[{i}]: unknown kind `{k}`")),
         }
@@ -228,6 +270,9 @@ fn parse_kind(m: &Value) -> Option<Kind> {
             params: m["params"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()),
             arg: m["arg"].as_u64().map(|x| x as u32),
             except_types: m["except_types"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            except_defaults: m["except_defaults"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            methods: m["methods"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            injects_first: m["injects_first"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
         }),
         "sink" => Kind::Sink(
             class()?,
@@ -253,6 +298,7 @@ fn parse_kind(m: &Value) -> Option<Kind> {
                 })
                 .collect(),
         ),
+        "invoke" => Kind::Invoke(m["arg"].as_u64()? as u32),
         "dynamic" => Kind::Dynamic,
         "sanitizer" => Kind::Sanitizer,
         _ => return None,
@@ -304,7 +350,7 @@ impl Models {
                     None => {
                         idx.exact.entry(n.clone()).or_default().push(i);
                         if let Some(k) = split_type_method(lang, &n) {
-                            if matches!(kind, Kind::Sink(..) | Kind::Source(_) | Kind::Returns(_) | Kind::Callback(..) | Kind::Sanitizer | Kind::Dynamic) {
+                            if matches!(kind, Kind::Sink(..) | Kind::Source(_) | Kind::Returns(_) | Kind::Callback(..) | Kind::Sanitizer | Kind::Dynamic | Kind::Invoke(_)) {
                                 idx.by_type_method.entry(k.clone()).or_default().push(i);
                             }
                             if matches!(kind, Kind::Sink(..)) {

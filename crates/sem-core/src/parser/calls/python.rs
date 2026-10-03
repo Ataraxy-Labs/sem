@@ -758,7 +758,13 @@ impl<'a> Lower<'a> {
                     while let Some(v) = value.filter(|v| v.kind() == "assignment") {
                         value = v.child_by_field_name("right");
                     }
-                    let init = value.map(|r| self.expr(r));
+                    // `self.x = None` (a placeholder, typically set later
+                    // in another method) does not type the attribute: a
+                    // `None` has no members, so it is never the receiver
+                    // a call through `self.x` resolves on
+                    let placeholder = value.is_some_and(|v| v.kind() == "none")
+                        && left.is_some_and(|l| l.kind() == "attribute");
+                    let init = value.filter(|_| !placeholder).map(|r| self.expr(r));
                     if let Some(left) = left {
                         self.assign(left, ty, init, n, func, scope, this);
                     }
