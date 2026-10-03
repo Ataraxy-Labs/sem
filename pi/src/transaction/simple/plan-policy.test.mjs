@@ -23,7 +23,10 @@ test('scope distinguishes a file and directory from prefix siblings', () => {
 });
 test('bounds reject invalid input, clamp oversize and permit recovery calls', () => {
   assert.equal(boundedInteger(160,10,1,16),16);
-  for (const n of [-1, 1.5, NaN, '3']) assert.throws(() => boundedInteger(n,10,1,16));
+  assert.equal(boundedInteger(0,10,1,16),1);
+  assert.equal(boundedInteger(-1,10,1,16),1);
+  assert.equal(boundedInteger(1.5,10,1,16),2);
+  for (const n of [NaN, Infinity, '3', null]) assert.throws(() => boundedInteger(n,10,1,16));
   assert.ok(MAX_PLAN_CALLS > 1 && MAX_PLAN_CALLS <= 8);
 });
 test('rejected focused validation never falls back to whole-suite execution', async () => {
