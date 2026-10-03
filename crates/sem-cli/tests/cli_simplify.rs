@@ -705,11 +705,12 @@ fn impact_diff_reports_each_changed_entity_in_impact_shape() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    let names: Vec<&str> = docs
+    let mut names: Vec<&str> = docs
         .iter()
         .map(|d| d["entity"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["parse_config", "main"]);
+    names.sort();
+    assert_eq!(names, ["main", "parse_config"]);
     // each one is exactly `sem impact --entity-id <id> --json`
     let single = sem(
         repo.path(),
@@ -722,7 +723,13 @@ fn impact_diff_reports_each_changed_entity_in_impact_shape() {
         ],
     );
     assert_eq!(
-        normalize(text.lines().next().unwrap().as_bytes(), repo.path()),
+        normalize(
+            text.lines()
+                .find(|l| l.contains("\"name\":\"parse_config\",\"type\""))
+                .unwrap()
+                .as_bytes(),
+            repo.path()
+        ),
         normalize(&single.stdout, repo.path())
     );
 
@@ -744,8 +751,16 @@ fn impact_diff_reports_each_changed_entity_in_impact_shape() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(docs[0]["tests"][0]["name"], "test_parse_config");
-    assert_eq!(docs[1]["noTestReaches"], true);
+    let by_name = |n: &str| {
+        docs.iter()
+            .find(|d| d["entity"]["name"] == n)
+            .unwrap_or_else(|| panic!("no report for {n}"))
+    };
+    assert_eq!(
+        by_name("parse_config")["tests"][0]["name"],
+        "test_parse_config"
+    );
+    assert_eq!(by_name("main")["noTestReaches"], true);
 }
 
 #[test]

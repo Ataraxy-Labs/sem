@@ -90,7 +90,11 @@ pub fn impact_diff_command(opts: ImpactDiffOptions) -> Result<(), Box<dyn std::e
     let mut missing = 0usize;
     for id in ids {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.current_dir(&root).args([
+        // The parent run already counted itself and checked for updates.
+        cmd.current_dir(&root)
+            .env("SEM_NO_TELEMETRY", "1")
+            .env("SEM_NO_UPDATE_CHECK", "1");
+        cmd.args([
             "impact",
             "--entity-id",
             &id,
