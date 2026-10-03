@@ -33,11 +33,10 @@ use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 use sem_core::index::{self, QueryIndex};
-use sem_core::parser::graph::{EntityGraph, EntityInfo};
+use sem_core::parser::graph::EntityInfo;
 use sem_core::parser::registry::ParserRegistry;
 use serde::Serialize;
 
-use crate::build_cache::write_query_index;
 
 pub struct QueryOptions {
     pub cwd: String,
@@ -133,6 +132,87 @@ pub fn callers_command(opts: QueryOptions, limit: Option<usize>) {
     render(&answer, Verb::Callers, opts.json, &opts.query);
     if hidden > 0 && !opts.json {
         println!("{}", format!("  … {hidden} more (raise --limit)").dimmed());
+    }
+    if !opts.json {
+        if let (Some(def), Some(related)) = (answer.defs.first(), answer.related.first()) {
+            print_name_matched_call_sites(&opts.cwd, def, related, limit.unwrap_or(25));
+        }
+    }
+}
+
+/// Call sites the graph could not attribute: for a *member* (method,
+/// property), `obj.name(...)` with an untyped receiver — the common case in
+/// Python/Ruby/JS — resolves to nothing, so "callers: none" would read as
+/// "safe to change". List the entities whose body contains `.name(` instead,
+/// clearly labelled as a by-name match (they may call a same-named member of
+/// another class). Served from the index's trigram tier; skipped when there
+/// is no index.
+fn print_name_matched_call_sites(cwd: &str, def: &EntityInfo, resolved: &[EntityInfo], cap: usize) {
+    if def.parent_id.is_none() || def.name.len() < 3 {
+        return;
+    }
+    let root = super::repo_root_or_cwd(cwd);
+    let Some(idx) = open_index(&root) else {
+        return;
+    };
+    let pattern = format!(r"\.{}\s*\(", regex::escape(&def.name));
+    let registry = super::create_registry(cwd);
+    let Ok(report) = index::grep::search(
+        &idx,
+        &root,
+        &pattern,
+        &index::grep::GrepOptions { case_insensitive: false },
+        |dir: &Path| super::files::find_supported_files_in_path(&root, dir, &registry, &[], false),
+    ) else {
+        return;
+    };
+    let known: std::collections::HashSet<String> = resolved
+        .iter()
+        .map(|e| e.id.to_string())
+        .chain(std::iter::once(def.id.to_string()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<(EntityInfo, usize)> = Vec::new();
+    for hit in &report.hits {
+        // innermost entity enclosing the hit line
+        let enclosing = idx
+            .entities_in_file(&hit.file)
+            .into_iter()
+            .filter(|e| e.start_line() <= hit.line && hit.line <= e.end_line())
+            .min_by_key(|e| e.end_line() - e.start_line());
+        let Some(e) = enclosing else { continue };
+        let info = e.to_entity_info();
+        let id = info.id.to_string();
+        if known.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        rows.push((info, hit.line));
+    }
+    if rows.is_empty() {
+        return;
+    }
+    println!(
+        "  {}",
+        format!(
+            "+ {} more by name `.{}(` (receiver type not resolved; may be another class's {}):",
+            rows.len(),
+            def.name,
+            def.name
+        )
+        .dimmed()
+    );
+    for (info, line) in rows.iter().take(cap) {
+        println!(
+            "  {} {} {}:{} (call at L{})",
+            info.entity_type.dimmed(),
+            info.name,
+            info.file_path,
+            info.start_line,
+            line
+        );
+    }
+    if rows.len() > cap {
+        println!("{}", format!("  … {} more (raise --limit)", rows.len() - cap).dimmed());
     }
 }
 
@@ -451,7 +531,13 @@ fn index_answer_verified(
 fn cold_build_answer(root: &Path, opts: &QueryOptions, verb: Verb) -> Answer {
     let registry = super::create_registry(&opts.cwd);
     let file_paths = super::graph::find_supported_files_with_options(root, &registry, &[], false);
-    let (graph, _entities) = EntityGraph::build(root, &file_paths, &registry);
+    // One cold build serves every verb: go through the shared graph cache
+    // (full save + a complete index with test flags and byte spans), so the
+    // `sem context` / `sem impact` that usually follow a first `sem find`
+    // answer from the index instead of paying for a second full build.
+    let source_scope = super::graph::cache_source_scope(root, &[], false);
+    let (graph, _entities) =
+        super::graph::get_or_build_graph(root, &file_paths, &registry, false, source_scope);
 
     let defs: Vec<EntityInfo> = graph
         .entities
@@ -482,17 +568,8 @@ fn cold_build_answer(root: &Path, opts: &QueryOptions, verb: Verb) -> Answer {
             .collect()
     };
 
-    // Self-heal: a repo that reaches this fallback now has a fresh index for
-    // every subsequent query (the change's item 4).
-    // `None` for the test classification: this path builds topology only and
-    // has no `SemanticEntity` bodies, which `is_test_entity` needs. The image
-    // it writes therefore carries no `FLAG_ENTITY_TESTS`, and `sem impact
-    // --tests`/`--all`'s index fast path declines on it rather than reading
-    // an uncomputed field as "no tests". Same reasoning for `None`
-    // byte spans: no bodies in scope, so `sem context`'s index
-    // reroute declines on this image exactly like the test-flag readers do.
-    write_query_index(root, &file_paths, &graph, None, None, None);
-
+    // Self-heal: `get_or_build_graph` above already saved the cache and wrote
+    // a complete index, so every subsequent query is served from it.
     Answer { defs, related }
 }
 

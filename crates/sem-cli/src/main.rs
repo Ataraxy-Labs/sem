@@ -248,12 +248,25 @@ enum Commands {
 
         /// Pattern to search for, repeatable (rg-style `-e p1 -e p2`); each
         /// pattern's hits are reported separately rather than merged
-        #[arg(long = "regexp", short = 'e', conflicts_with = "pattern")]
+        #[arg(long = "regexp", short = 'e')]
         patterns: Vec<String>,
 
         /// Case-insensitive match (disables the trigram prefilter)
         #[arg(long, short = 'i')]
         ignore_case: bool,
+
+        /// Only report hits under these files or directories (rg-style
+        /// trailing paths, relative to the current directory)
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+
+        /// Print only the paths of files with at least one hit (rg -l)
+        #[arg(long = "files-with-matches", short = 'l')]
+        files_with_matches: bool,
+
+        /// Accepted for rg/grep compatibility: line numbers are always shown
+        #[arg(long = "line-number", short = 'n', hide = true)]
+        line_number: bool,
 
         /// Output as JSON (one object: hits, candidate_files, total_files, origin)
         #[arg(long)]
@@ -850,14 +863,28 @@ fn main() {
             pattern,
             patterns,
             ignore_case,
+            paths,
+            files_with_matches,
+            line_number: _,
             json,
         }) => {
             let cwd = std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            // With `-e`, every positional is a path (rg semantics), so the
+            // first positional clap parsed as `pattern` joins `paths`.
+            let (pattern, paths) = if patterns.is_empty() {
+                (pattern, paths)
+            } else {
+                (None, pattern.into_iter().chain(paths).collect())
+            };
+            let scope = commands::grep::Scope {
+                paths,
+                files_with_matches,
+            };
             if patterns.len() > 1 {
-                commands::grep::grep_multi_command(cwd, patterns, ignore_case, json);
+                commands::grep::grep_multi_command(cwd, patterns, ignore_case, json, &scope);
             } else {
                 // Positional pattern, or exactly one -e: the single form,
                 // byte-identical to what it always produced.
@@ -869,6 +896,7 @@ fn main() {
                     pattern: single,
                     case_insensitive: ignore_case,
                     json,
+                    scope,
                 });
             }
         }

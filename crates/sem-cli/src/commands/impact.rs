@@ -878,6 +878,7 @@ fn find_entity<'a>(
 
     if matching.is_empty() {
         eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
+        super::print_name_suggestions(graph, name, "impact");
         std::process::exit(1);
     }
 
@@ -897,6 +898,7 @@ fn find_entity<'a>(
                 name,
                 file
             );
+            super::print_name_suggestions(graph, name, "impact");
             std::process::exit(1);
         }
         // Multiple matches even within the file — fall through to ambiguity error

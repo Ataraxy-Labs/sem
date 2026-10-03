@@ -456,10 +456,11 @@ fn any_match(pats: &[String], text: &str) -> bool {
 ///   { "only": { "to", "from": [..] } }                              only `from` may depend on `to`
 ///   { "acyclic": { "scope" } }                                      no cycle inside scope
 ///   { "layers": [lowest, .., highest] }                             no edge from a lower to a higher layer
-/// Reference laws (over every import in scanned files; globs or lists of globs):
+/// Reference laws (over every import in scanned files; globs or lists of globs; optional
+/// `kind`: value | type | both, default both — `value` skips `import type` / all-`type` specifiers):
 ///   { "forbidImport": { "from", "except", "specifier", "to", "forms" } }  matching files must not import it
 ///   { "allowImports": { "from", "except", "specifiers", "forms" } }       matching files import only these
-///   { "noCrossPackageRelative": { "from" } }                              relative imports stay in their package
+///   { "noCrossPackageRelative": { "from", "except" } }                    relative imports stay in their package
 /// Code-shape laws (a tree-sitter query; every non-`_` capture is a violation):
 ///   { "forbidPattern": { "from", "except", "query", "within" } }   within: node kinds the hit must be inside
 /// Any law may carry "promise": the human statement it verifies; results report "kept".
@@ -487,9 +488,15 @@ pub fn check(ctx: &Ctx, laws: &[Value], scope: Option<&BTreeSet<String>>) -> Res
             let (from, except) = (globs(&f["from"]), globs(&f["except"]));
             let (specs, to) = (globs(if allow { &f["specifiers"] } else { &f["specifier"] }), globs(&f["to"]));
             let forms = globs(&f["forms"]);
+            // optional reference kind filter, as for graph laws: value | type | both (default both)
+            let sel = match law["kind"].as_str().unwrap_or("both") {
+                "value" => Selector::Value,
+                "type" => Selector::Type,
+                _ => Selector::Both,
+            };
             for file in l.ex.files.iter().filter(|x| any_match(&from, &x.path) && !any_match(&except, &x.path)) {
                 for r in &file.refs {
-                    if !forms.is_empty() && !forms.contains(&form_name(r.form)) {
+                    if (!forms.is_empty() && !forms.contains(&form_name(r.form))) || !sel.admits(r.kind) {
                         continue;
                     }
                     let hit_spec = any_match(&specs, &r.specifier);
@@ -503,8 +510,8 @@ pub fn check(ctx: &Ctx, laws: &[Value], scope: Option<&BTreeSet<String>>) -> Res
         }
         if let Some(f) = law.get("noCrossPackageRelative") {
             let l = ctx.l();
-            let from = globs(&f["from"]);
-            for file in l.ex.files.iter().filter(|x| from.is_empty() || any_match(&from, &x.path)) {
+            let (from, except) = (globs(&f["from"]), globs(&f["except"]));
+            for file in l.ex.files.iter().filter(|x| (from.is_empty() || any_match(&from, &x.path)) && !any_match(&except, &x.path)) {
                 for r in file.refs.iter().filter(|r| r.specifier.starts_with('.')) {
                     let owner = match &r.target {
                         Target::File(p) | Target::Path(p) => l.ex.ws.owner_of(p),

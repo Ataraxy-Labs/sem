@@ -107,8 +107,9 @@ use crate::utils::hash::content_hash_bytes;
 /// `index.sem` -- the bump is what makes an existing cache drop its stale
 /// indexes instead of keeping them. `entity_changes` the *table* survives
 /// (the semantic commit index below still owns it); only its two indexes
-/// were part of that census.
-pub const CACHE_SCHEMA_VERSION: i32 = 11;
+/// were part of that census. v12: members of decorated Python classes are
+/// now extracted, so cached entity rows for unchanged files are stale.
+pub const CACHE_SCHEMA_VERSION: i32 = 12;
 pub const CACHE_KIND_FULL: &str = "full";
 pub const CACHE_KIND_TOPOLOGY: &str = "topology";
 /// Every index this cache maintains, and the one production statement that

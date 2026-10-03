@@ -214,6 +214,41 @@ pub fn entity_matches_qualified(
     false
 }
 
+/// "Did you mean": when a (possibly qualified or file-scoped) name resolves to
+/// nothing, list the entities carrying its bare member name, each with its
+/// owner and location, on stdout — so a wrong guess at the owning class
+/// (`ModelAdmin.lookup_allowed` for a method defined on `BaseModelAdmin`) or
+/// at the file costs one retry instead of a switch back to grep.
+pub fn print_name_suggestions(
+    graph: &sem_core::parser::graph::EntityGraph,
+    query: &str,
+    command: &str,
+) {
+    let bare = query
+        .rsplit_once("::")
+        .or_else(|| query.rsplit_once('.'))
+        .map(|(_, child)| child)
+        .unwrap_or(query);
+    let mut hits: Vec<_> = graph.entities.values().filter(|e| e.name == bare).collect();
+    if hits.is_empty() {
+        return;
+    }
+    hits.sort_by_key(|e| (&e.file_path, e.start_line));
+    println!("'{query}' not found; entities named '{bare}' (re-run `sem {command}` with `Owner.{bare}` or --file):");
+    for e in hits.iter().take(12) {
+        let owner = e
+            .parent_id
+            .as_ref()
+            .and_then(|pid| graph.entities.get(pid))
+            .map(|p| format!("{}.", p.name))
+            .unwrap_or_default();
+        println!("  {} {owner}{} {}:{}", e.entity_type, e.name, e.file_path, e.start_line);
+    }
+    if hits.len() > 12 {
+        println!("  … {} more", hits.len() - 12);
+    }
+}
+
 fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
     let (entity_type, name) = query.split_once(' ')?;
     if entity_type.is_empty() || name.is_empty() {

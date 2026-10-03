@@ -13,6 +13,45 @@ pub struct GrepOptions {
     pub pattern: String,
     pub case_insensitive: bool,
     pub json: bool,
+    pub scope: Scope,
+}
+
+/// Output scoping shared by the single and multi-pattern forms: rg-style
+/// trailing paths (hits outside them are dropped) and `-l`.
+#[derive(Default)]
+pub struct Scope {
+    pub paths: Vec<String>,
+    pub files_with_matches: bool,
+}
+
+impl Scope {
+    /// Keep hits under one of the requested paths (repo-relative prefixes),
+    /// then collapse to one row per file under `-l`.
+    fn apply(&self, cwd: &str, hits: Vec<GrepHit>) -> Vec<GrepHit> {
+        let hits = if self.paths.is_empty() {
+            hits
+        } else {
+            let root = super::repo_root_or_cwd(cwd);
+            let prefixes: Vec<String> = self
+                .paths
+                .iter()
+                .map(|p| super::normalize_repo_relative_path(std::path::Path::new(cwd), &root, p))
+                .map(|p| p.trim_end_matches('/').to_string())
+                .collect();
+            hits.into_iter()
+                .filter(|h| {
+                    prefixes.iter().any(|p| {
+                        p == "." || p.is_empty() || h.file == *p || h.file.starts_with(&format!("{p}/"))
+                    })
+                })
+                .collect()
+        };
+        if !self.files_with_matches {
+            return hits;
+        }
+        let mut seen = std::collections::HashSet::new();
+        hits.into_iter().filter(|h| seen.insert(h.file.clone())).collect()
+    }
 }
 
 pub fn grep_command(opts: GrepOptions) {
@@ -21,7 +60,8 @@ pub fn grep_command(opts: GrepOptions) {
             Ok(parts) => parts,
             Err(e) => fail(&e),
         };
-    render(&hits, origin, candidate_files, total_files, opts.json);
+    let hits = opts.scope.apply(&opts.cwd, hits);
+    render(&hits, origin, candidate_files, total_files, opts.json, opts.scope.files_with_matches);
 }
 
 /// `sem grep -e p1 -e p2 …` — several patterns in one invocation, each
@@ -30,11 +70,19 @@ pub fn grep_command(opts: GrepOptions) {
 /// same index/full-scan tiers as a single `sem grep`. Exit codes match the
 /// single form's conventions extended to the batch: 2 on the first invalid
 /// pattern, 1 when every pattern produced zero hits, 0 otherwise.
-pub fn grep_multi_command(cwd: String, patterns: Vec<String>, case_insensitive: bool, json: bool) {
+pub fn grep_multi_command(
+    cwd: String,
+    patterns: Vec<String>,
+    case_insensitive: bool,
+    json: bool,
+    scope: &Scope,
+) {
     let mut per_pattern = Vec::with_capacity(patterns.len());
     for pattern in &patterns {
         match search_one(&cwd, pattern, case_insensitive) {
-            Ok(parts) => per_pattern.push(parts),
+            Ok((hits, origin, candidates, total)) => {
+                per_pattern.push((scope.apply(&cwd, hits), origin, candidates, total))
+            }
             Err(e) => fail(&e),
         }
     }
@@ -70,14 +118,7 @@ pub fn grep_multi_command(cwd: String, patterns: Vec<String>, case_insensitive: 
             }
             println!("{}", format!("pattern \"{pattern}\":").dimmed());
             for hit in hits {
-                println!(
-                    "{}{}{}{}{}",
-                    hit.file.magenta(),
-                    ":".dimmed(),
-                    hit.line.to_string().green(),
-                    ":".dimmed(),
-                    hit.text
-                );
+                print_hit(hit, scope.files_with_matches);
             }
             if hits.is_empty() {
                 println!("{}", "  (no hits)".dimmed());
@@ -186,12 +227,28 @@ fn origin_label(origin: CandidateOrigin) -> &'static str {
     }
 }
 
+fn print_hit(hit: &GrepHit, file_only: bool) {
+    if file_only {
+        println!("{}", hit.file.magenta());
+        return;
+    }
+    println!(
+        "{}{}{}{}{}",
+        hit.file.magenta(),
+        ":".dimmed(),
+        hit.line.to_string().green(),
+        ":".dimmed(),
+        hit.text
+    );
+}
+
 fn render(
     hits: &[GrepHit],
     origin: CandidateOrigin,
     candidate_files: usize,
     total_files: usize,
     json: bool,
+    file_only: bool,
 ) {
     if json {
         let report = Report {
@@ -212,14 +269,7 @@ fn render(
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
     } else {
         for hit in hits {
-            println!(
-                "{}{}{}{}{}",
-                hit.file.magenta(),
-                ":".dimmed(),
-                hit.line.to_string().green(),
-                ":".dimmed(),
-                hit.text
-            );
+            print_hit(hit, file_only);
         }
         if let Ok(val) = std::env::var("SEM_GREP_STATS") {
             if val == "1" {

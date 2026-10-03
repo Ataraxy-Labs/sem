@@ -224,11 +224,13 @@ fn render_context(
                 println!("  {}:", role_label);
             }
 
+            // `file:start-end` so a follow-up read or edit can go straight to
+            // the lines instead of re-searching the file.
             println!(
                 "    {} {} ({}, ~{} tokens)",
                 entry.entity_type.dimmed(),
                 entry.entity_name.bold(),
-                entry.file_path.dimmed(),
+                format!("{}:{}-{}", entry.file_path, entry.start_line, entry.end_line).dimmed(),
                 entry.estimated_tokens,
             );
             // The target is what you asked to read: print its full body. Related
@@ -571,6 +573,7 @@ fn find_entity<'a>(
 
     if matching.is_empty() {
         eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
+        super::print_name_suggestions(graph, name, "context");
         std::process::exit(1);
     }
 
@@ -590,6 +593,7 @@ fn find_entity<'a>(
                 name,
                 file
             );
+            super::print_name_suggestions(graph, name, "context");
             std::process::exit(1);
         }
         matching = filtered;

@@ -208,7 +208,9 @@ macro_rules! maybe_par_iter {
 /// 4 -> 5: Dart call/scope extraction and language/owner-aware member
 /// resolution changed. Invalidate persisted edges and query indexes even
 /// when source bytes and the development package version are unchanged.
-pub const FACTS_SCHEMA_VERSION: u32 = 5;
+/// 5 -> 6: members of decorated Python classes (`@deco class A:`) are now
+/// extracted; unchanged files must re-extract to gain them.
+pub const FACTS_SCHEMA_VERSION: u32 = 6;
 
 const MAGIC: &[u8; 8] = b"SEMFACT1";
 

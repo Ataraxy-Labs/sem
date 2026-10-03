@@ -639,8 +639,16 @@ fn visit_node(
 
                     // Visit children for nested entities (methods inside classes, etc.)
                     let next_suppression = Some(node_type.to_string());
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
+                    // A decorated definition (Python `@deco class A:`) wraps the
+                    // real definition; its body lives one level down, so walk
+                    // the wrapped definition's children, not the wrapper's.
+                    let body_owner = if node_type == "decorated_definition" {
+                        node.child_by_field_name("definition").unwrap_or(node)
+                    } else {
+                        node
+                    };
+                    let mut cursor = body_owner.walk();
+                    for child in body_owner.named_children(&mut cursor) {
                         if config.container_node_types.contains(&child.kind()) {
                             let mut inner_cursor = child.walk();
                             let nested: Vec<_> = child.named_children(&mut inner_cursor).collect();
@@ -3693,6 +3701,19 @@ mod modifier_span_tests {
         let entities = entities_for(source, ".py");
         let foo = find(&entities, "foo");
         assert_span_includes_modifier(source, foo, "@staticmethod");
+    }
+
+    #[test]
+    fn python_decorated_class_members_are_extracted() {
+        // `@deco class A:` is a decorated_definition wrapping the class; its
+        // methods live under the wrapped class_definition's body and used to
+        // be skipped entirely (django's @deconstructible, sympy's
+        // @sympify_method_args, dataclasses, ...).
+        let source = "@deco\nclass A:\n    def m(self):\n        return 1\n";
+        let entities = entities_for(source, ".py");
+        let class_a = find(&entities, "A");
+        let m = find(&entities, "m");
+        assert_eq!(m.parent_id.as_deref(), Some(class_a.id.as_str()));
     }
 
     #[test]
