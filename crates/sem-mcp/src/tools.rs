@@ -189,7 +189,7 @@ pub struct FindParams {
     pub in_path: Option<String>,
     #[schemars(description = "Restrict to entities defined in this file (same as `in`).")]
     pub file: Option<String>,
-    #[schemars(description = "Mode \"callers\": return at most this many callers.")]
+    #[schemars(description = "Mode \"callers\": return at most this many callers. With `intent`: at most this many results.")]
     pub limit: Option<usize>,
     #[schemars(description = "Mode \"context\": token budget (default 8000).")]
     pub token_budget: Option<usize>,
@@ -201,6 +201,10 @@ pub struct FindParams {
         description = "With no query: exact substring to search for inside entity bodies; hits name the entity that holds them."
     )]
     pub text: Option<String>,
+    #[schemars(
+        description = "When you don't know the name: a free-text description (e.g. \"where retries are scheduled\"), ranked by name/signature relevance and graph centrality. `limit` caps the results (default 10)."
+    )]
+    pub intent: Option<String>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }

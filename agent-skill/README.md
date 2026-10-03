@@ -10,10 +10,10 @@ npx @ataraxy-labs/sem-skill
 This:
 
 1. Installs the **sem skill** into `~/.claude/skills/sem/` so the agent knows
-   when and how to reach for sem (impact, context, diff, blame, log)
+   when and how to reach for sem (find, grep, impact, check, certify)
    instead of grep for structural code questions.
 2. Registers the **sem MCP server** (`sem mcp`) at user scope, so the
-   `sem_impact` / `sem_context` / `sem_entities` / ... tools are available in
+   `sem_find` / `sem_impact` / `sem_check` / `sem_certify` / ... tools are available in
    every session.
 
 ### Optional: a live sem badge in your statusline
@@ -60,8 +60,8 @@ npx @ataraxy-labs/sem-skill --guard
 The skill makes sem the agent's *preference*; the guard makes it the *rule*.
 It installs a PreToolUse hook that denies grep, file reads, and sed/cat on
 code files, with a reason that redirects the agent to the right sem tool
-(`sem_context` to read an entity, `sem_entities` with `text=` or `query=` to
-search, `sem_impact` for blast radius). The agent can't fall back out of habit.
+(`sem_find` with `mode=context` to read an entity, `sem_find` with `text=` or
+`intent=` to search, `sem_impact` for blast radius). The agent can't fall back out of habit.
 
 It is calibrated, not a wall:
 

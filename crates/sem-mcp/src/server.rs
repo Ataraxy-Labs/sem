@@ -2543,7 +2543,7 @@ impl SemServer {
     // ── Find ──
 
     #[tool(
-        description = "Where is it? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies)."
+        description = "Where is it? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
     )]
     async fn sem_find(
         &self,
@@ -2596,6 +2596,19 @@ impl SemServer {
             Some(other) => {
                 return Ok(tool_error(format!("unknown mode \"{other}\": omit it, or use callers, refs or context")));
             }
+        }
+        if let Some(intent) = params.intent.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+            return self
+                .sem_entities(Parameters(EntitiesParams {
+                    path: None,
+                    no_default_excludes: None,
+                    query: Some(intent.to_string()),
+                    limit: params.limit,
+                    text: None,
+                    signatures: None,
+                    format: params.format.clone(),
+                }))
+                .await;
         }
         if query.is_none() && queries.is_none() && (params.in_path.is_some() || params.text.is_some()) {
             return self

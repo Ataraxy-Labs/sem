@@ -4,8 +4,21 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A smaller command line: eight verbs, variations as flags.** `sem --help` now lists `find`, `grep`, `impact`, `check`, `certify`, `diff`, `graph` and `history`, the `cloud` and `config` groups, and `mcp`, one line each saying which question the verb answers, with a QUICKSTART for the four agent questions (where is it, what does my change touch, is it correct, what should a human review).
+  - `sem find X --callers | --refs | --context` and `sem find --in PATH` replace `callers`, `refs`, `context` and `entities`.
+  - `sem impact --diff <range>` takes a whole change; with `--tests` in a JS/TS workspace it uses the module graph's affected-test selection.
+  - `sem certify <range> --arch` (with `--html`, `--view`, `--md`) replaces `arch-diff`.
+  - `sem graph --modules | --dataflow [--witness] | --system` replaces `topology`, `dataflow` and `system`.
+  - `sem history X` and `sem history --blame FILE` replace `log` and `blame`.
+  - `sem cloud login|logout|whoami|review|xref|repos|enable|disable` and `sem config setup|unsetup|telemetry|completions|update|stats` group the account and setup commands.
+  - Every old command name and flag still works with identical output, JSON included. At a terminal it prints a one-line note on stderr naming the new spelling; in `--json` mode or when stdout is not a terminal it prints nothing extra.
+- **`sem mcp` lists the core verbs only:** `sem_find` (with `mode` callers, refs or context, `in`, `text` and `intent`), `sem_grep`, `sem_impact`, `sem_check`, `sem_certify`, `sem_diff`, `sem_graph` and `sem_history`. The earlier tools (`sem_entities`, `sem_context`, `sem_callers`, `sem_log`, `sem_blame`) still answer when called by name. The review-listener tools are listed for `sem mcp --review`, which the review-listener plugin now passes.
+
 ### Added
 
+- **`sem check`.** Runs the project's checks and prints one verdict: exit 0 pass, 1 fail, 2 could not decide (nothing to check is 2, never a pass). This version checks the promises in `.sem/promises` (`--base REV` for files changed since a revision, `--promises` to prove each promise can fail); the compiler, type checker, linter and test checkers (`--checkers`) are not in it yet.
 - **`sem dataflow --witness` and an experimental execution-witness runner (`witness/`).** `--witness` emits one instrumentation task per static source -> sink flow (Python, TS/JS). The runner has a model propose a harness, runs it in a network-less docker sandbox with a runtime that injects a secret canary at the source, and marks a flow CONFIRMED only when the canary reaches the sink along the claimed path in 3 of 3 runs. See `witness/DESIGN.md`.
 - **More Python data-flow sources:** typer/click command parameters, FastAPI route parameters, framework base-class handlers, functions run through `asyncio.to_thread` and executors, typed `*args`/`**kwargs`, and `getattr(self, name)` dispatch.
 - **`sem arch-diff --view`, `--html` and `--from-json`.** A ranked, collapsed view of an arch-diff report (at most 10 items that need a human decision, each with what changed and why it matters), a self-contained HTML page with the module graph around the change, and rendering of a saved `--json` report.

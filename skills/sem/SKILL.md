@@ -1,54 +1,103 @@
 ---
 name: sem
-description: Use sem to get entity-level (function/class/method) semantic diffs, impact analysis, blame, and dependency context from any Git repo. Trigger this skill whenever the user asks what changed in a commit or PR, wants to understand the blast radius of a change, needs to know who last modified a function, wants to trace how a function evolved, or needs structured code context for an LLM task. Also use it proactively when reviewing code, planning refactors, or any time line-level git diff output would be noisy or hard to interpret.
+description: Use sem for entity-level (function/class/method) code questions in any Git repo. Four questions, four verbs - where is it (sem find, sem grep), what does my change touch (sem impact), is it correct (sem check), what should a human review (sem certify). Trigger whenever the user asks where something is defined or called, what a change breaks or which tests to run, whether a change is correct, what changed in a commit or PR, or what to review; also use it proactively before refactors and in code review, where line-level git output is noisy.
 license: MIT OR Apache-2.0
 compatibility: Requires the sem CLI (https://github.com/Ataraxy-Labs/sem) on PATH and a Git repository
 metadata:
   homepage: https://github.com/Ataraxy-Labs/sem
 ---
 
-# sem — Semantic Version Control
+# sem
 
-sem extends Git with entity-level operations. Instead of "lines 43-51 changed",
-it tells you "function `validateToken` was modified in `src/auth.ts`". It parses
-30+ languages via tree-sitter and works in any Git repo with no setup.
+sem parses 30+ languages with tree-sitter and answers questions about entities
+(functions, classes, methods) and the calls between them. Instead of "lines
+43-51 changed" it says "function `validateToken` in `src/auth.ts` was
+modified, and these 3 callers and 2 tests reach it". It works in any Git repo
+with no setup. Answers are deterministic; when a caller set may be incomplete,
+sem says so.
 
-## FIRST: use the MCP tools, not the CLI
+## Four questions, four verbs
 
-If the agent has the sem MCP server (tools named `mcp__sem__*` — `sem_diff`,
-`sem_impact`, `sem_context`, `sem_blame`, `sem_log`, `sem_entities`), **always
-call those instead of running `sem` in a shell**. They render as proper tool
-calls in the UI, return compact entity trees, and carry `elapsed_ms`. If they
-are deferred, load them first (e.g. ToolSearch) — do not fall back to Bash just
-because the shell is already open. Map:
+| Question | CLI | MCP tool |
+|---|---|---|
+| Where is it? | `sem find NAME`, `sem grep TEXT` | `sem_find`, `sem_grep` |
+| What does my change touch? | `sem impact NAME`, `sem impact --diff HEAD --tests` | `sem_impact` |
+| Is it correct? | `sem check` | `sem_check` |
+| What should a human review? | `sem certify main..HEAD` | `sem_certify` |
 
-| task | MCP tool |
-|------|----------|
+Also: `sem diff` (which entities changed), `sem graph` (how the code is
+connected), `sem history` (how an entity changed; `--blame` for a file).
+Every verb takes `--json`.
+
+## Use the MCP tools first
+
+If the agent has the sem MCP server (tools named `mcp__sem__*`), call those
+instead of running `sem` in a shell. They return compact results and carry
+`elapsed_ms`. If they are deferred, load them first rather than falling back
+to Bash.
+
+| Task | MCP call |
+|---|---|
+| where is `X` defined | `sem_find` with `query: "X"` |
+| read and understand `X` | `sem_find` with `query: "X", mode: "context"`: body plus callers and callees, one call, no file needed |
+| who calls `X` | `sem_find` with `mode: "callers"` |
+| what `X` calls | `sem_find` with `mode: "refs"` |
+| what is in this file or directory | `sem_find` with `in: "src/auth.ts"` |
+| find code by intent, name unknown | `sem_find` with `intent: "where retries are scheduled"` |
+| a string, error message, config key | `sem_grep`, or `sem_find` with `text` (hits named by entity) |
+| what breaks / which tests to run | `sem_impact` (`mode: "tests"` for tests only) |
+| is the change correct | `sem_check` |
+| what to review in a range | `sem_certify` with `range: "main..HEAD"` |
 | what changed | `sem_diff` |
-| blast radius / what breaks | `sem_impact` |
-| read/understand an entity + its callers | `sem_context` with just `entity_name` — ONE call, no file needed |
-| find code by intent ("where is X done") | `sem_entities` with `query` |
-| find a string / error message / config key | `sem_entities` with `text` — entity-addressed grep, no files read |
-| who last touched it | `sem_blame` |
-| how it evolved | `sem_log` with `entity_name` |
-| repo hotspots + co-change pairs | `sem_log` with no `entity_name` |
+| how `X` evolved / who changed it | `sem_history` (`blame: true` with `file_path` for a file) |
 
-**One-call lookup:** when you know (or can guess) the entity name, call
-`sem_context` with only `entity_name` — it resolves across the whole repo and
-returns the body plus callers/callees in one round-trip (grep needs two: search,
-then read). Ambiguous names return a compact candidate list; pass `file_path`
-only then. Do not call `sem_entities` first unless you are searching by intent
-with a free-text `query`.
+When you know or can guess the name, one `sem_find` call with mode
+`context` replaces a grep followed by a file read. Ambiguous names return a
+short candidate list; pass `in` only then.
 
-Use the CLI below only in a real terminal, in scripts, or for commands the MCP
-server doesn't expose (`sem graph`, `sem setup`, exotic flags) — and then as a
-single clean one-liner.
+## CLI
+
+```bash
+# where is it?
+sem find validateToken                  # definition: type name file:line
+sem find validateToken --callers        # who calls it
+sem find validateToken --refs           # what it calls
+sem find validateToken --context        # its code plus callers and callees, token-budgeted
+sem find validateToken --context --budget 4000 --hops 1
+sem find --in src/auth.ts               # every entity in a file or directory
+sem grep "token expired"                # text, rg-style file:line:text
+
+# what does my change touch?
+sem impact validateToken                # dependents, deps, transitive impact, tests
+sem impact validateToken --tests        # only the tests to run
+sem impact --diff HEAD --tests          # tests for the uncommitted change
+sem impact --diff main..HEAD --json     # one report per changed entity
+
+# is it correct?
+sem check                               # exit 0 pass, 1 fail, 2 could not decide
+sem check --base origin/main            # only what changed since origin/main
+
+# what should a human review?
+sem certify main..HEAD                  # review certificate (markdown)
+sem certify main..HEAD --arch           # the architecture view
+sem certify main..HEAD --json
+
+# more
+sem diff                                # working tree changes, by entity
+sem diff --from HEAD~5 --to HEAD --format json
+sem graph --json                        # entity graph; --modules, --dataflow, --system for other layers
+sem history validateToken               # how it evolved
+sem history --blame src/auth.ts         # who last changed each entity
+```
+
+Older names (`sem callers`, `sem context`, `sem entities`, `sem log`,
+`sem blame`, `sem arch-diff`, `sem topology`, ...) still work with the same
+output.
 
 ## Draw the blast radius in your reply
 
-When an impact result drives your answer (a refactor decision, a "what breaks"
-question), render it as a small ASCII tree in the response — the user should
-see the graph without opening anything:
+When an impact result drives your answer (a refactor decision, a "what
+breaks" question), render it as a small ASCII tree in the response:
 
 ```
 ◉ validateToken · src/auth.ts
@@ -59,169 +108,17 @@ see the graph without opening anything:
 ╰─▶ … +5 more (12 tests)
 ```
 
-Real callers first, tests collapsed into a count, no invented entries — draw
-only what the tool returned. Skip the drawing when impact was incidental to
-the task.
-
-## When to reach for sem
-
-- User asks "what changed in this commit / PR / branch?"
-- User wants to know what will break if they change a function
-- User asks who last touched a function or class
-- User wants to trace how a function evolved over time
-- User asks what's risky/hot in the repo, or what tends to change together
-- You need structured, token-efficient code context for an LLM subtask
-- You're doing a code review and want entity-level signal, not line noise
-
-## Commands (CLI — for terminals and scripts; in-agent, prefer the MCP tools above)
-
-### sem diff — what changed?
-
-```bash
-sem diff                          # working tree changes
-sem diff --staged                 # staged only
-sem diff --commit abc1234         # specific commit
-sem diff --from HEAD~5 --to HEAD  # commit range
-sem diff file1.ts file2.ts        # compare two files (no git needed)
-sem diff --format json            # structured output for further processing
-sem diff --format markdown        # for PRs / reports
-sem diff -v                       # verbose: word-level inline diffs
-sem diff --file-exts .py .rs      # filter by extension
-```
-
-Change types: `added`, `modified` (structural vs cosmetic), `deleted`,
-`renamed`/`moved`.
-
-### sem impact — blast radius
-
-```bash
-sem impact validateToken          # everything affected if this changes
-sem impact validateToken --deps   # direct dependencies only
-sem impact validateToken --dependents  # direct dependents only
-sem impact validateToken --tests  # affected tests only
-sem impact validateToken --json
-sem impact validateToken --file src/auth.ts  # disambiguate
-```
-
-Use this before refactoring or deleting a function to understand scope.
-
-### sem blame — who last touched this?
-
-```bash
-sem blame src/auth.ts             # entity-level blame for a file
-sem blame src/auth.ts --json
-```
-
-Unlike `git blame`, this shows who last modified each *function*, not each line.
-
-### sem log — how did this evolve?
-
-```bash
-sem log                           # repo hotspots + co-change pairs (no entity)
-sem log validateToken             # history of a single entity
-sem log validateToken -v          # with content diffs between versions
-sem log validateToken --limit 20
-sem log validateToken --json
-```
-
-### sem context — token-budgeted LLM context
-
-```bash
-sem context validateToken         # entity + its deps + dependents
-sem context validateToken --budget 4000
-sem context validateToken --json
-```
-
-Use this when you need to load a function and its call graph into context
-without blowing the token budget.
-
-### sem entities — list all entities
-
-```bash
-sem entities                      # all entities in repo
-sem entities src/auth.ts          # entities in one file
-sem entities --json
-```
-
-### sem graph — dependency visualization
-
-```bash
-sem graph                         # full cross-file dependency graph
-sem graph src/                    # graph for a specific path
-sem graph --format json
-sem graph --file-exts .py .rs     # filter by extension
-```
-
-For a single entity's dependencies/dependents, use `sem impact` or
-`sem context` instead.
-
-## JSON output
-
-All commands support `--format json` / `--json`. Prefer JSON when you need to
-process results programmatically or pass them to another tool.
-
-```json
-{
-  "summary": { "fileCount": 2, "added": 1, "modified": 1, "deleted": 1 },
-  "changes": [
-    {
-      "entityId": "src/auth.ts::function::validateToken",
-      "changeType": "modified",
-      "entityType": "function",
-      "entityName": "validateToken",
-      "filePath": "src/auth.ts"
-    }
-  ]
-}
-```
-
-## MCP server
-
-Run `sem mcp` to start the MCP server (stdin/stdout transport). It exposes the
-same operations as 6 MCP tools: `sem_entities`, `sem_diff`, `sem_blame`,
-`sem_impact`, `sem_log`, `sem_context`. These mirror the CLI exactly. When sem
-is configured as an MCP server in the agent, prefer these tools over shelling
-out.
-
-## Find code you don't know the name of
-
-sem is deterministic by design — no fuzzy ranking. Locate a candidate name with
-a plain text search (cheap, one pass), then hand it to sem for the structure
-grep can't give:
-
-```bash
-grep -rn "retry" src/         # find where the concept appears
-sem context retry_handler     # then: full body + callers + callees, by name
-```
-
-The `sem_entities` MCP tool also takes a `query` argument for the same ranked
-search, and `sem context <entity> --hops N` bounds the context to N graph hops
-(use 1-2 for just the immediate neighborhood). Prefer these over grep for
-"where is the code that does X".
-
-**Never fall back to grep for strings either**: `sem_entities` with `text`
-searches entity bodies across the repo from the warm in-memory graph and
-returns hits addressed by the innermost enclosing entity (file, entity, line,
-matched text) — ready to chain straight into `sem_context`/`sem_impact`. The
-only remaining text-search cases outside sem are non-code files and comments
-between entities.
+Real callers first, tests collapsed into a count, no invented entries: draw
+only what the tool returned. Skip the drawing when impact was incidental.
 
 ## Make the leverage felt
 
-`sem_context` and `sem_impact` return `elapsed_ms` (and `source`: local or cloud)
-— the real latency you waited on. When a single sem call replaces several
-grep/read steps, or catches something text search can't (a transitive caller in
-another file, a cosmetic-vs-logic change), say so in ONE terse, factual clause:
-
-```
-(sem_impact: 9ms, 2 transitive callers grep would miss)
-(sem_context: 7ms, body + 3 deps, no files opened)
-```
-
-Once per non-obvious win, never a sales pitch. Default to sem for structural work;
-if you fall back to grep/read on a structural question, say why. The point is the
-developer *sees*, in real time, why the agent is faster and more reliable with sem
-plugged in.
+`sem_find` (context mode) and `sem_impact` return `elapsed_ms`. When one sem
+call replaces several grep/read steps, or catches something text search
+cannot (a transitive caller in another file), say so in one terse clause,
+e.g. `(sem_impact: 9ms, 2 transitive callers grep would miss)`. Once per
+non-obvious win, never a sales pitch. If you fall back to grep or a file read
+on a structural question, say why.
 
 ## Install check
 

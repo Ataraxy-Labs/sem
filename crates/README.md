@@ -15,7 +15,7 @@ Git's line-based model doesn't match how developers think. You don't care that l
 sem diff
 
 # Entity-level blame (who last touched each function/class)
-sem blame src/auth.ts
+sem history --blame src/auth.ts
 
 # Cross-file dependency graph
 sem graph

@@ -2,13 +2,13 @@
 """PreToolUse hard gate: the agent always uses sem for code, never grep/read/sed.
 
 Denied (with a redirect reason the model acts on):
-  - Grep on code files            -> sem_entities text=/query=, sem_impact, sem_context
-  - Read of a code file           -> sem_context / sem_entities; retry lane stays open
+  - Grep on code files            -> sem_find (text= / intent= / mode=context), sem_impact
+  - Read of a code file           -> sem_find mode=context / in=; retry lane stays open
                                      for the mechanical Read-before-Edit requirement:
                                      the SECOND Read of the same path is allowed.
-  - Bash grep/rg/ag/ack on code   -> sem_entities (piped filters like `cargo test | grep` pass)
-  - Bash sed/awk touching code    -> Edit tool (after sem_context)
-  - Bash cat/head/tail on code    -> sem_context / sem_entities
+  - Bash grep/rg/ag/ack on code   -> sem_find text= / sem_grep (piped filters like `cargo test | grep` pass)
+  - Bash sed/awk touching code    -> Edit tool (after sem_find mode=context)
+  - Bash cat/head/tail on code    -> sem_find mode=context / in=
 
 Always allowed: non-code files (md/toml/json/yaml/...), files outside a git repo
 (sem needs git), pipe filtering, and anything when SEM_GUARD=0 is set.
@@ -81,14 +81,14 @@ def grep_redirect(pattern):
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,}", pattern or ""):
         return (
             f'"{pattern}" is a code symbol; grep on code is disabled. Use:\n'
-            f"  - mcp__sem__sem_context entity_name=\"{pattern}\" (body + callers/callees, one call)\n"
+            f"  - mcp__sem__sem_find query=\"{pattern}\" mode=\"context\" (body + callers/callees, one call)\n"
             f"  - mcp__sem__sem_impact (blast radius)\n"
-            f"  - mcp__sem__sem_entities query=\"...\" (find by intent)"
+            f"  - mcp__sem__sem_find intent=\"...\" (find by intent)"
         )
     return (
-        "grep on code files is disabled. Use mcp__sem__sem_entities with "
-        f"text=\"{pattern}\" (exact substring, entity-addressed hits) or query=\"...\" "
-        "(intent search). For regex, pass a distinctive literal chunk as text=. "
+        "grep on code files is disabled. Use mcp__sem__sem_find with "
+        f"text=\"{pattern}\" (exact substring, entity-addressed hits) or intent=\"...\" "
+        "(intent search), or mcp__sem__sem_grep for a regex. For regex, pass a distinctive literal chunk as text=. "
         "If you are genuinely searching non-code files, re-run scoped to them "
         "(e.g. glob *.md)."
     )
@@ -126,8 +126,8 @@ def handle_read(inp):
     save_state(state)
     deny(
         f"Reading {os.path.basename(fp)} directly is disabled. To understand code use "
-        f"mcp__sem__sem_context (entity_name, one call, body + callers) or "
-        f"mcp__sem__sem_entities (path=\"{fp}\") to list what's inside. "
+        f"mcp__sem__sem_find (query, mode=\"context\": one call, body + callers) or "
+        f"mcp__sem__sem_find (in=\"{fp}\") to list what's inside. "
         f"ONLY if you are about to Edit this exact file (Edit requires a prior Read): "
         f"call Read again with the same path and it will be allowed."
     )
@@ -208,14 +208,14 @@ def handle_bash(inp, cwd):
         elif c in {"sed", "awk"} and code_file_args(seg, cwd):
             deny(
                 "sed/awk on code files is disabled. To modify code use the Edit tool "
-                "(after mcp__sem__sem_context to understand it); to extract code use "
-                "mcp__sem__sem_context or mcp__sem__sem_entities."
+                "(after mcp__sem__sem_find mode=context to understand it); to extract code use "
+                "mcp__sem__sem_find (mode=context, or in= to list a file)."
             )
         elif c in READERS and code_file_args(seg, cwd):
             deny(
                 "Dumping code files via cat/head/tail is disabled. Use "
-                "mcp__sem__sem_context (entity body + callers in one call) or "
-                "mcp__sem__sem_entities (path=...) instead."
+                "mcp__sem__sem_find mode=context (entity body + callers in one call) or "
+                "mcp__sem__sem_find in=... instead."
             )
 
 

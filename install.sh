@@ -287,11 +287,11 @@ main() {
     path_guidance
 
     if [ "$USE_COLOR" -eq 1 ]; then
-        printf '  Run \033[1msem setup\033[0m to replace git diff globally.\n'
-        printf '  Run \033[1msem login\033[0m to connect to sem cloud.\n'
+        printf '  Run \033[1msem config setup\033[0m to replace git diff globally.\n'
+        printf '  Run \033[1msem cloud login\033[0m to connect to sem cloud.\n'
     else
-        printf '  Run "sem setup" to replace git diff globally.\n'
-        printf '  Run "sem login" to connect to sem cloud.\n'
+        printf '  Run "sem config setup" to replace git diff globally.\n'
+        printf '  Run "sem cloud login" to connect to sem cloud.\n'
     fi
     printf '\n  To uninstall: curl -fsSL https://raw.githubusercontent.com/%s/main/uninstall.sh | sh\n\n' "$REPO"
 }

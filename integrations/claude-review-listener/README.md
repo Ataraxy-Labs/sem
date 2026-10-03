@@ -16,7 +16,7 @@ is a backstop only — see "How it stays alive" below.
 claude-review-listener/
 ├── .claude-plugin/
 │   └── plugin.json        # plugin identity: name "sem-review-listener"
-├── .mcp.json               # declares the "sem-review" MCP server (the sem binary, `mcp` subcommand)
+├── .mcp.json               # declares the "sem-review" MCP server (the sem binary, `mcp --review`)
 ├── hooks/
 │   ├── hooks.json           # registers the Stop-hook backstop
 │   └── keep-listening.sh    # the backstop script (read-only against sem-cloud)
@@ -40,7 +40,7 @@ From the repo root (`/path/to/sem`), with sem-cloud running locally:
 
 ```bash
 # Point the listener at your local sem-cloud + demo credentials, NOT your
-# real `sem login` account (the plugin's .mcp.json reads these two first,
+# real `sem cloud login` account (the plugin's .mcp.json reads these two first,
 # falling back to ~/.sem/credentials.json only if unset — see sem-mcp's
 # agent_review::AgentReviewConfig::from_env_or_credentials).
 export SEM_CLOUD_URL="http://127.0.0.1:8080"

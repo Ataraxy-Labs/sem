@@ -32,8 +32,8 @@ if tool == "Grep" and is_symbol:
     reason = (
         f'"{pattern}" looks like a code symbol. Prefer sem (the entity graph) over grep here:\n'
         f'  - sem_impact  — what depends on / calls "{pattern}" (blast radius, cross-file, no false positives)\n'
-        f'  - sem_context — pull "{pattern}" plus its real callers and callees, token-budgeted\n'
-        f'  - sem_entities — locate "{pattern}" and its definition (file:line)\n'
+        f'  - sem_find mode=context — pull "{pattern}" plus its real callers and callees, token-budgeted\n'
+        f'  - sem_find — locate "{pattern}" and its definition (file:line)\n'
         "Grep is still the right tool for text/string search, error messages, config keys, "
         "discovery by an unknown name, and non-code files. If this is genuinely a text search, "
         "re-run it with Bash `grep` (not intercepted)."

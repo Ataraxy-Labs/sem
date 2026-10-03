@@ -16,7 +16,7 @@ import sys
 import time
 
 ACT = os.path.expanduser("~/.claude/sem-activity.jsonl")
-SUBCMDS = "diff|impact|context|entities|graph|blame|log|orient|xref|mcp|whoami"
+SUBCMDS = "find|grep|check|certify|history|diff|impact|context|entities|graph|blame|log|orient|xref|mcp|whoami"
 # `sem` must be in command position (start of line, or right after a shell
 # separator), not merely after whitespace — otherwise prose inside quoted
 # commit messages ("... sem impact recall, ...") logs garbage events.

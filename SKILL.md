@@ -6,7 +6,7 @@ Semantic version control CLI. Entity-level diffs for Git (functions, classes, me
 
 Cargo workspace at `crates/`:
 - `sem-core` — entity extraction engine, tree-sitter parsers, dependency graph
-- `sem-cli` — CLI binary (`sem diff`, `sem graph`, `sem impact`, `sem blame`)
+- `sem-cli` — CLI binary (`sem find`, `sem grep`, `sem impact`, `sem check`, `sem certify`, `sem diff`, `sem graph`, `sem history`)
 
 ## Build & Test
 
