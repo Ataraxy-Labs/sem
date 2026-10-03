@@ -1,5 +1,7 @@
 target/
 .sem/
+.ota/
+ota-pressure/
 *.db
 .DS_Store
 node_modules/
