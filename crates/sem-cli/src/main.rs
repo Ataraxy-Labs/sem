@@ -86,47 +86,47 @@ enum Commands {
         #[arg(long, hide = true)]
         label: Option<String>,
 
-        /// Git refs, files, or pathspecs (supports ref1..ref2, ref1...ref2, -- paths)
+        /// Git refs, files, or pathspecs (supports ref1..ref2, ref1...ref2, -- paths). Example: sem diff main..HEAD
         #[arg(num_args = 0.., value_name = "ARG")]
         args: Vec<String>,
 
-        /// Show only staged changes (alias: --cached)
+        /// Show only staged changes (alias: --cached). Example: sem diff --staged
         #[arg(long)]
         staged: bool,
 
-        /// Show only staged changes (alias for --staged)
+        /// Show only staged changes (alias for --staged). Example: sem diff --cached
         #[arg(long)]
         cached: bool,
 
-        /// Show changes from a specific commit
+        /// Show changes from a specific commit. Example: sem diff --commit abc1234
         #[arg(long)]
         commit: Option<String>,
 
-        /// Start of commit range
+        /// Start of commit range. Example: sem diff --from HEAD~5 --to HEAD
         #[arg(long)]
         from: Option<String>,
 
-        /// End of commit range
+        /// End of commit range. Example: sem diff --from HEAD~5 --to HEAD
         #[arg(long)]
         to: Option<String>,
 
-        /// Read FileChange[] JSON from stdin instead of git
+        /// Read FileChange[] JSON from stdin instead of git. Example: cat changes.json | sem diff --stdin
         #[arg(long)]
         stdin: bool,
 
-        /// Read unified diff from stdin (e.g. git diff | sem diff --patch)
+        /// Read unified diff from stdin. Example: git diff | sem diff --patch
         #[arg(long)]
         patch: bool,
 
-        /// Output format
+        /// Output format: terminal, json, plain, markdown. Example: sem diff --format markdown
         #[arg(long, default_value = "terminal")]
         format: OutputFormat,
 
-        /// Shorthand for --format json
+        /// Shorthand for --format json. Example: sem diff --json
         #[arg(long)]
         json: bool,
 
-        /// Show inline content diffs for each entity
+        /// Show inline content diffs for each entity. Example: sem diff -v
         #[arg(long, short = 'v')]
         verbose: bool,
 
@@ -134,23 +134,23 @@ enum Commands {
         #[arg(long, hide = true)]
         profile: bool,
 
-        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        /// Only include files with these extensions. Example: sem diff --file-exts .py .rs
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
-        /// Hide cosmetic changes (formatting, whitespace, comments only)
+        /// Hide cosmetic changes (formatting, whitespace, comments only). Example: sem diff --no-cosmetics
         #[arg(long)]
         no_cosmetics: bool,
 
-        /// When to use colors
+        /// When to use colors. Example: sem diff --color never
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
-        /// Run as if started in this directory (like git -C)
+        /// Run as if started in this directory (like git -C). Example: sem diff -C ../other-repo
         #[arg(short = 'C', long = "cwd")]
         directory: Option<String>,
 
-        /// Pathspecs for filtering, passed after --
+        /// Pathspecs for filtering, passed after --. Example: sem diff HEAD -- src/
         #[arg(last = true, allow_hyphen_values = true, value_name = "PATHSPEC")]
         pathspecs: Vec<String>,
     },
@@ -196,27 +196,27 @@ enum Commands {
         #[arg(long)]
         tests: bool,
 
-        /// Output format
+        /// Output format (terminal or json). Example: --format json
         #[arg(long, value_parser = ["terminal", "json"])]
         format: Option<String>,
 
-        /// Output as JSON (shorthand for --format json)
+        /// Output as JSON (shorthand for --format json). Example: sem impact parseConfig --json
         #[arg(long)]
         json: bool,
 
-        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        /// Only include files with these extensions. Example: --file-exts .py .rs
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
-        /// Max traversal depth for transitive impact (default 2, 0 = unlimited)
+        /// Max traversal depth for transitive impact (default 2, 0 = unlimited). Example: --depth 0
         #[arg(long, default_value = "2")]
         depth: usize,
 
-        /// Skip the SQLite entity cache (rebuild from scratch)
+        /// Skip the SQLite entity cache (rebuild from scratch). Example: --no-cache
         #[arg(long)]
         no_cache: bool,
 
-        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks). Example: --no-default-excludes
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -373,25 +373,25 @@ enum Commands {
     /// a wrong answer.
     #[command(display_order = 2)]
     Grep {
-        /// Regex or literal pattern
+        /// Regex or literal pattern. Example: sem grep 'retry budget'
         #[arg(required_unless_present = "patterns")]
         pattern: Option<String>,
 
         /// Pattern to search for, repeatable (rg-style `-e p1 -e p2`); each
-        /// pattern's hits are reported separately rather than merged
+        /// pattern's hits are reported separately rather than merged. Example: sem grep -e foo -e bar
         #[arg(long = "regexp", short = 'e')]
         patterns: Vec<String>,
 
-        /// Case-insensitive match (disables the trigram prefilter)
+        /// Case-insensitive match (disables the trigram prefilter). Example: sem grep -i todo
         #[arg(long, short = 'i')]
         ignore_case: bool,
 
         /// Only report hits under these files or directories (rg-style
-        /// trailing paths, relative to the current directory)
+        /// trailing paths, relative to the current directory). Example: sem grep todo src/ tests/
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
 
-        /// Print only the paths of files with at least one hit (rg -l)
+        /// Print only the paths of files with at least one hit (rg -l). Example: sem grep -l todo
         #[arg(long = "files-with-matches", short = 'l')]
         files_with_matches: bool,
 
@@ -399,7 +399,7 @@ enum Commands {
         #[arg(long = "line-number", short = 'n', hide = true)]
         line_number: bool,
 
-        /// Output as JSON (one object: hits, candidate_files, total_files, origin)
+        /// Output as JSON (one object: hits, candidate_files, total_files, origin). Example: sem grep todo --json
         #[arg(long)]
         json: bool,
     },
@@ -635,7 +635,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Only include files with these extensions (e.g. --file-exts .py .rs)
+        /// Only include files with these extensions. Example: sem graph --json --file-exts .py .rs
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
@@ -643,7 +643,8 @@ enum Commands {
         #[arg(long, hide = true)]
         no_cache: bool,
 
-        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks).
+        /// Example: sem graph --json --no-default-excludes
         #[arg(long)]
         no_default_excludes: bool,
 
@@ -880,7 +881,7 @@ enum Commands {
     /// Run sem as an MCP server for agents (stdin/stdout): find, grep, impact, check, certify, diff, graph, history
     #[command(display_order = 11)]
     Mcp {
-        /// Check shared MCP daemon health without starting it (JSON).
+        /// Check shared MCP daemon health without starting it (JSON). Example: sem mcp --status
         #[arg(long, conflicts_with = "resident")]
         status: bool,
         /// Also list the cloud review-listener tools (join_review, wait_for_branch, ...);
@@ -972,7 +973,7 @@ enum Commands {
 enum CloudAction {
     /// Log in to sem cloud (an API key, or GitHub when omitted). Example: sem cloud login
     Login {
-        /// API key (omit to log in with GitHub)
+        /// API key (omit to log in with GitHub). Example: sem cloud login sem_live_abc123
         #[arg()]
         key: Option<String>,
         /// API endpoint. Example: --endpoint https://sem.example.org
@@ -990,13 +991,13 @@ enum CloudAction {
     },
     /// What depends on what across my indexed repos? Example: sem cloud xref --json
     Xref {
-        /// JSON output
+        /// JSON output. Example: --json
         #[arg(long)]
         json: bool,
     },
     /// Where is my code stored? Repos indexed on the account and local caches. Example: sem cloud repos
     Repos {
-        /// JSON output
+        /// JSON output. Example: --json
         #[arg(long)]
         json: bool,
     },
@@ -1041,7 +1042,7 @@ enum ConfigCmd {
     },
     /// Print shell completions. Example: sem config completions zsh
     Completions {
-        /// The shell to generate the completions for
+        /// The shell to generate the completions for: bash, zsh, fish, elvish, powershell. Example: sem config completions fish
         #[arg(value_enum)]
         shell: clap_complete_command::Shell,
     },
