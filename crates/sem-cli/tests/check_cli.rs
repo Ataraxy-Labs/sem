@@ -166,6 +166,8 @@ const TS_FILES: &[(&str, &str)] = &[
     ("packages/app/src/useWin.ts", "export const r: void = appInstance.run();\n"),
     ("packages/app/src/res.ts", "import { k } from \"./dir\";\nexport const kk: number = k;\n"),
     ("packages/app/src/dir/index.ts", "export const k = 1;\n"),
+    ("packages/app/src/pwa.ts", "export const helper = (n: number): number => n;\ndeclare global {\n  interface PromptChoice {\n    outcome: \"accepted\" | \"dismissed\";\n  }\n}\n"),
+    ("packages/app/src/usePwa.ts", "export const c: PromptChoice = { outcome: \"accepted\" };\n"),
 ];
 
 #[test]
@@ -284,6 +286,22 @@ fn typescript_verdicts_equal_tsc_in_every_case() {
     assert!(strs(&c["reasons"]).iter().any(|r| r.starts_with("global-interface: packages/app/src/win.ts")), "{c:#}");
     assert_eq!(c["verdict"], "fail");
 
+    // a module's exports change but its `declare global` block does not: no
+    // global change, so no full check...
+    repo.write("packages/app/src/pwa.ts", "export const helper = (n: string): string => n;\ndeclare global {\n  interface PromptChoice {\n    outcome: \"accepted\" | \"dismissed\";\n  }\n}\n");
+    let c12a = repo.commit("pwa export");
+    let c = ts_case(&repo, Some(&c12), "global module, export only");
+    assert_eq!(c["mode"], "incremental", "{c:#}");
+    assert_eq!(strs(&c["filesRechecked"]), vec!["packages/app/src/pwa.ts"]);
+    // ...while a change inside the block, with no export changing, is one
+    repo.write("packages/app/src/pwa.ts", "export const helper = (n: string): string => n;\ndeclare global {\n  interface PromptChoice {\n    outcome: \"yes\" | \"no\";\n  }\n}\n");
+    let c12b = repo.commit("pwa global block");
+    let c = ts_case(&repo, Some(&c12a), "global block only");
+    assert_eq!(c["mode"], "full", "{c:#}");
+    assert!(strs(&c["reasons"]).iter().any(|r| r.starts_with("global-interface: packages/app/src/pwa.ts")), "{c:#}");
+    assert_eq!(c["verdict"], "fail");
+    let c12 = c12b;
+
     // an unchanged file whose import now resolves to a new file is rechecked
     repo.write("packages/app/src/dir.ts", "export const k = \"s\";\n");
     let _c13 = repo.commit("shadowing file");
@@ -295,6 +313,7 @@ fn typescript_verdicts_equal_tsc_in_every_case() {
     // uncommitted edits are what is checked (base = HEAD)
     repo.write("packages/core/src/greet.ts", "export function greet(name: string): string {\n  return \"hi \" + name;\n}\n");
     repo.remove("packages/app/src/dir.ts");
+    repo.write("packages/app/src/pwa.ts", "export const helper = (n: string): string => n;\ndeclare global {\n  interface PromptChoice {\n    outcome: \"accepted\" | \"dismissed\";\n  }\n}\n");
     repo.write("packages/app/src/win.ts", "export class App {\n  run(): void {}\n}\ndeclare global {\n  var appInstance: App;\n}\n");
     let c = ts_case(&repo, None, "dirty tree");
     assert_eq!(c["verdict"], "pass");

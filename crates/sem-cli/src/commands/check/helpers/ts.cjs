@@ -260,21 +260,22 @@ function resolveFrom(fromFile, spec) {
 
 function dtsTable(file, entry) {
   const text = entry.sig;
-  const t = { text, err: !!entry.dtsErr, locals: new Map(), imports: new Map(), exports: new Map(), stars: [], modules: new Set(), opaque: false };
+  const t = { text, err: !!entry.dtsErr, global: !!entry.global, locals: new Map(), imports: new Map(), exports: new Map(), stars: [], modules: new Set(), opaque: false };
   if (text == null || entry.dtsErr) {
     t.opaque = true;
     return t;
   }
-  // A file that reaches the global scope (script file, `declare global`,
-  // module augmentation) is compared as a whole: any declaration in it, not
-  // only its exports, is visible to every file of the program.
-  if (entry.global) t.opaque = true;
   if (file.endsWith(".json")) {
     t.locals.set("<json>", { text, ids: new Set(), itypes: [] });
     t.opaque = true;
     return t;
   }
   const sf = ts.createSourceFile("t.d.ts", text, ts.ScriptTarget.Latest, true);
+  // A script file reaches the global scope with every declaration: it is
+  // compared as a whole. A module reaches it only through `declare global`
+  // and `declare module "x"` blocks: those become the local `<global>`, whose
+  // change (closed over what the blocks refer to) is a global change.
+  if (entry.global && !ts.isExternalModule(sf)) t.opaque = true;
   const mod = (spec) => {
     const m = resolveFrom(file, spec);
     t.modules.add(m);
@@ -364,8 +365,8 @@ function dtsTable(file, entry) {
       ts.isEnumDeclaration(st) ||
       ts.isModuleDeclaration(st)
     ) {
-      if (ts.isModuleDeclaration(st) && !ts.isIdentifier(st.name)) {
-        t.opaque = true; // declare module "x" / declare global
+      if (ts.isModuleDeclaration(st) && (!ts.isIdentifier(st.name) || st.flags & ts.NodeFlags.GlobalAugmentation)) {
+        addLocal("<global>", st); // declare module "x" / declare global
         continue;
       }
       const name = st.name ? st.name.text : "<anon-default>";
@@ -378,24 +379,25 @@ function dtsTable(file, entry) {
   return t;
 }
 
-// Exported names whose declaration differs between the two tables, closing
-// over local references and over imported names changed in their module.
+// {names, global}: the exported names whose declaration differs between the
+// two tables (closed over local references and over imported names changed in
+// their module), and whether what the file contributes to the global scope
+// changed.
 function changedExports(nw, od, ceOf) {
-  if (!od) return ALL;
+  if (!od) return { names: ALL, global: nw.global };
   if (nw.opaque || od.opaque) {
     // compared as a whole: unchanged iff the same d.ts text, emitted without
     // errors, referring to no module whose interface changed
-    if (nw.text == null || nw.err || od.err || nw.text !== od.text) return ALL;
+    const whole = { names: ALL, global: nw.global || od.global };
+    if (nw.text == null || nw.err || od.err || nw.text !== od.text) return whole;
     for (const m of new Set([...nw.modules, ...od.modules])) {
-      if (m.startsWith("UNRESOLVED:")) return ALL;
+      if (m.startsWith("UNRESOLVED:")) return whole;
       if (m.startsWith("EXT:")) continue;
       const c = ceOf(m);
-      if (c === ALL || c.size > 0) return ALL;
+      if (c === ALL || c.size > 0) return whole;
     }
-    return new Set();
+    return { names: new Set(), global: false };
   }
-  const starsKey = (x) => x.stars.slice().sort().join("|");
-  if (starsKey(nw) !== starsKey(od)) return ALL;
   const modChanged = (ref) => {
     const i = ref.lastIndexOf("#");
     const m = ref.slice(0, i),
@@ -451,6 +453,9 @@ function changedExports(nw, od, ceOf) {
     const after = [...memo].filter(([, v]) => v).length;
     if (after === before && round > 0) break;
   }
+  const global = nw.locals.has("<global>") || od.locals.has("<global>") ? localChanged("<global>") : false;
+  const starsKey = (x) => x.stars.slice().sort().join("|");
+  if (starsKey(nw) !== starsKey(od)) return { names: ALL, global };
   const out = new Set();
   const exportChanged = (e) => {
     if (e.startsWith("R:")) return modChanged(e.slice(2));
@@ -468,10 +473,10 @@ function changedExports(nw, od, ceOf) {
   }
   for (const m of nw.stars) {
     const c = ceOf(m);
-    if (c === ALL) return ALL;
+    if (c === ALL) return { names: ALL, global };
     for (const n of c) if (!nw.exports.has(n)) out.add(n);
   }
-  return out;
+  return { names: out, global };
 }
 
 // The names `sf` uses from module `target` (Set, or ALL).
@@ -716,13 +721,14 @@ function sliceByName() {
   };
   const evaluate = (x) => {
     const tb = tables.get(x);
-    const next = changedExports(tb.nw, tb.od, ceOf);
+    const r = changedExports(tb.nw, tb.od, ceOf);
+    if (r.global) escalate.push(x);
+    const next = r.names;
     const prev = CE.get(x);
     const grew = next === ALL ? prev !== ALL : prev !== ALL && [...next].some((n) => !(prev || EMPTY).has(n));
     if (!prev || grew) {
       const merged = next === ALL || prev === ALL ? ALL : new Set([...(prev || []), ...next]);
       CE.set(x, merged);
-      if (nonEmpty(merged) && ((newFiles[x] && newFiles[x].global) || (oldFiles[x] && oldFiles[x].global))) escalate.push(x);
       if (grew || (!prev && nonEmpty(merged))) {
         importerCheck(x);
         for (const d of dependents.get(x) || []) evaluate(d);
