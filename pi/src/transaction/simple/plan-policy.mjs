@@ -1,8 +1,10 @@
 export const MAX_PLAN_CALLS = 8;
 export function boundedInteger(value, fallback, minimum, maximum) {
   if (value === undefined) return fallback;
-  if (!Number.isInteger(value) || value < minimum) throw new Error(`expected integer >= ${minimum}`);
-  return Math.min(value, maximum);
+  // Clamp out-of-range numbers (for example max_entities: 0) instead of
+  // failing the call; models send them often and a retry costs a full turn.
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`expected integer >= ${minimum}`);
+  return Math.min(Math.max(Math.round(value), minimum), maximum);
 }
 export function inScope(file, scope) {
   if (!scope || scope === ".") return true;

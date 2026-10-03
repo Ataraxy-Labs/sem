@@ -7,6 +7,7 @@ All notable changes to sem are documented in this file.
 ### Changed
 
 - Experimental simple agent sessions now support explicitly acknowledged exact-source reuse and content-only diff reviews since a captured review. Cold file parses run with bounded concurrency, and batch-edit preflight avoids repeated reads of the same file. Validation result reuse is opt-in and requires an operator-owned complete-input fingerprint provider; ordinary checks continue to execute by default.
+- **Signature changes and deletions now report the callers a batch left behind.** Before `weave_transaction` deletes an entity or applies an edit with `allow_signature_change`, it asks sem's graph for that entity's dependents and returns the ones the batch did not edit as `caller_review.unedited_dependents`, so a missed caller shows up before the build. The list comes from the syntax-level graph and is a review aid, not a compile check. Out-of-range integer arguments such as `max_entities: 0` are now clamped instead of failing the call, and the pi package README documents the transaction mode as it runs today.
 
 ## [0.26.0] - 2026-10-02
 

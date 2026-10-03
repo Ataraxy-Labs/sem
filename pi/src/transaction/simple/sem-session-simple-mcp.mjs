@@ -28,6 +28,7 @@ import { EntityInterface } from './entity-interface.mjs';
 import {RequestScheduler, requestKind} from './request-scheduler.mjs';
 import {rememberExactSource} from './exact-program-cache.mjs';
 import { pythonModuleHint } from "./import-hints.mjs";
+import { dependentsBeforeEdit, callerReview } from "./caller-check.mjs";
 import {prepareScopedProgram} from './scoped-program.mjs';
 import {formatFiles} from './format-files.mjs';
 import {ReviewDiff} from './review-diff.mjs';
@@ -833,7 +834,10 @@ const tools = new Map([
       }
       const createdAt = performance.now();
       let outcome = { text: "no existing entities edited", details: { applied: 0 } };
+      let dependentsBefore = null;
       if (normalized.edits.length > 0) {
+        // Informational only: a failed graph query must never block the edit.
+        dependentsBefore = await dependentsBeforeEdit(normalized.edits, cwd).catch(() => null);
         try {
           outcome = await performWeaveEdit(
             { edits: normalized.edits, atomic: true },
@@ -877,11 +881,13 @@ const tools = new Map([
         check = await focusedCheck(api, validationCmd);
       }
       const checkedAt = performance.now();
+      const callers = callerReview(dependentsBefore, normalized.edits);
       return {
         created,
         imported: [...importSnapshots.keys()],
         exact_text_edits: normalized.textEdits.length,
         edit: compactEditReceipt(outcome),
+        ...(callers ? { caller_review: callers } : {}),
         ...(formatting?{formatting}:{}),
         check,
         timings_ms: {
