@@ -254,8 +254,6 @@ const SCOPE_RESOLVE_BYTE_BUDGET: u64 = 150;
 /// chunked path, whose peak is bounded by `SCOPE_RESOLVE_BYTE_BUDGET`.
 #[cfg(not(test))]
 const PARSED_FILE_REUSE_BYTE_LIMIT: u64 = 24 * 1024 * 1024;
-#[cfg(test)]
-const PARSED_FILE_REUSE_BYTE_LIMIT: u64 = u64::MAX;
 
 /// Total on-disk size of `file_paths` under `root` (`stat` only).
 pub fn source_bytes(root: &Path, file_paths: &[String]) -> u64 {
@@ -268,9 +266,18 @@ pub fn source_bytes(root: &Path, file_paths: &[String]) -> u64 {
 /// Whether a build over `file_paths` keeps all parse trees (see
 /// `PARSED_FILE_REUSE_LIMIT` and `PARSED_FILE_REUSE_BYTE_LIMIT`).
 pub(crate) fn retain_parsed_files(root: &Path, file_paths: &[String]) -> bool {
-    file_paths.len() <= PARSED_FILE_REUSE_LIMIT
-        && (PARSED_FILE_REUSE_BYTE_LIMIT == u64::MAX
-            || source_bytes(root, file_paths) <= PARSED_FILE_REUSE_BYTE_LIMIT)
+    file_paths.len() <= PARSED_FILE_REUSE_LIMIT && within_reuse_byte_limit(root, file_paths)
+}
+
+#[cfg(not(test))]
+fn within_reuse_byte_limit(root: &Path, file_paths: &[String]) -> bool {
+    source_bytes(root, file_paths) <= PARSED_FILE_REUSE_BYTE_LIMIT
+}
+
+/// Unit tests keep every parse tree, whatever the size.
+#[cfg(test)]
+fn within_reuse_byte_limit(_root: &Path, _file_paths: &[String]) -> bool {
+    true
 }
 
 /// Partition `file_paths` (assumed already in a stable, deterministic order —
