@@ -269,9 +269,10 @@ function signatureOf(sf) {
 const ALL = Symbol("ALL");
 const EMPTY = new Set();
 let nameResCache;
-function resolveFrom(fromFile, spec) {
+// `mode`: the resolution mode (node16/nodenext ESM vs CJS) of the importing file
+function resolveFrom(fromFile, spec, mode) {
   nameResCache = nameResCache || ts.createModuleResolutionCache(cwd, (f) => f, opts);
-  const r = ts.resolveModuleName(spec, path.join(cwd, fromFile), opts, ts.sys, nameResCache);
+  const r = ts.resolveModuleName(spec, path.join(cwd, fromFile), opts, ts.sys, nameResCache, undefined, mode);
   const f = r.resolvedModule && r.resolvedModule.resolvedFileName;
   if (!f) return "UNRESOLVED:" + spec;
   const rf = rel(f);
@@ -296,8 +297,10 @@ function dtsTable(file, entry) {
   // and `declare module "x"` blocks: those become the local `<global>`, whose
   // change (closed over what the blocks refer to) is a global change.
   if (entry.global && !ts.isExternalModule(sf)) t.opaque = true;
+  // a declaration file's imports resolve in its source file's module format
+  const fileMode = bySrc.has(file) ? bySrc.get(file).impliedNodeFormat : undefined;
   const mod = (spec) => {
-    const m = resolveFrom(file, spec);
+    const m = resolveFrom(file, spec, fileMode);
     t.modules.add(m);
     return m;
   };
@@ -506,10 +509,14 @@ function usedNames(sf, target) {
   const used = new Set();
   let all = false,
     found = false;
-  const hit = (spec) => resolveFrom(from, spec) === target;
+  // the program's own resolution of this very import (its resolution mode included)
+  const hit = (spec, lit) => {
+    const f = resolveSpec(sf, spec, lit ? modeOf(sf, lit) : undefined);
+    return !!f && keyOf(f) === target;
+  };
   const visit = (n) => {
     if (all) return;
-    if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) && hit(n.moduleSpecifier.text)) {
+    if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) && hit(n.moduleSpecifier.text, n.moduleSpecifier)) {
       found = true;
       const c = n.importClause;
       if (c) {
@@ -519,7 +526,7 @@ function usedNames(sf, target) {
           else for (const el of c.namedBindings.elements) used.add((el.propertyName || el.name).text);
         }
       }
-    } else if (ts.isExportDeclaration(n) && n.moduleSpecifier && ts.isStringLiteral(n.moduleSpecifier) && hit(n.moduleSpecifier.text)) {
+    } else if (ts.isExportDeclaration(n) && n.moduleSpecifier && ts.isStringLiteral(n.moduleSpecifier) && hit(n.moduleSpecifier.text, n.moduleSpecifier)) {
       found = true;
       if (!n.exportClause || ts.isNamespaceExport(n.exportClause)) all = true;
       else for (const el of n.exportClause.elements) used.add((el.propertyName || el.name).text);
@@ -527,20 +534,20 @@ function usedNames(sf, target) {
       ts.isImportEqualsDeclaration(n) &&
       ts.isExternalModuleReference(n.moduleReference) &&
       ts.isStringLiteral(n.moduleReference.expression) &&
-      hit(n.moduleReference.expression.text)
+      hit(n.moduleReference.expression.text, n.moduleReference.expression)
     ) {
       found = all = true;
-    } else if (ts.isImportTypeNode(n) && ts.isLiteralTypeNode(n.argument) && ts.isStringLiteral(n.argument.literal) && hit(n.argument.literal.text)) {
+    } else if (ts.isImportTypeNode(n) && ts.isLiteralTypeNode(n.argument) && ts.isStringLiteral(n.argument.literal) && hit(n.argument.literal.text, n.argument.literal)) {
       found = all = true;
     } else if (
       ts.isCallExpression(n) &&
       n.arguments.length &&
       ts.isStringLiteral(n.arguments[0]) &&
       (n.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(n.expression) && n.expression.text === "require")) &&
-      hit(n.arguments[0].text)
+      hit(n.arguments[0].text, n.arguments[0])
     ) {
       found = all = true;
-    } else if (ts.isModuleDeclaration(n) && ts.isStringLiteral(n.name) && hit(n.name.text)) {
+    } else if (ts.isModuleDeclaration(n) && ts.isStringLiteral(n.name) && hit(n.name.text, null)) {
       found = all = true;
     }
     ts.forEachChild(n, visit);

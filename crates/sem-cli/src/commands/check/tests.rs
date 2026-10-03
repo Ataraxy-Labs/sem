@@ -249,6 +249,21 @@ struct State {
     exit_ok: bool,
     /// value edges of the base's runtime graph, as paths
     edges: Vec<(String, String)>,
+    /// what the package manager last installed (its node_modules marker file)
+    #[serde(default)]
+    deps: Option<String>,
+}
+
+/// The package manager's own record of what node_modules holds, digested:
+/// it changes with every install, lockfile change or not.
+fn deps_marker(root: &Path) -> Option<String> {
+    let dir = root.ancestors().map(|d| d.join("node_modules")).find(|d| d.is_dir())?;
+    for f in [".yarn-integrity", ".package-lock.json", ".modules.yaml", ".yarn-state.yml"] {
+        if let Ok(t) = std::fs::read_to_string(dir.join(f)) {
+            return Some(format!("{f}:{}", util::digest(&t)));
+        }
+    }
+    None
 }
 
 fn read_state(p: &Path) -> Option<(State, String)> {
@@ -295,6 +310,9 @@ pub(crate) fn run(ctx: &Ctx) -> Outcome {
     if let (Some((st, _)), Some(changed)) = (&base_state, &changed) {
         if st.version != o.tool_version {
             reasons.push(format!("version: {} {:?} -> {:?}", runner.name(), st.version, o.tool_version));
+        }
+        if st.deps != deps_marker(&ctx.root) {
+            reasons.push("dependencies: node_modules was installed differently since the base".into());
         }
         if !st.exit_ok && st.files.values().all(|f| f.ok) {
             reasons.push("the base run failed outside any test file".into());
@@ -500,6 +518,7 @@ fn finish(
         files,
         exit_ok,
         edges,
+        deps: deps_marker(&ctx.root),
     };
     if ctx.args.no_cache {
         return;
