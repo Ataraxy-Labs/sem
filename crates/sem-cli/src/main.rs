@@ -393,6 +393,11 @@ enum Commands {
         /// Paths listed
         #[arg(long, default_value_t = 20)]
         max_items: usize,
+        /// Emit witness-generation tasks (JSON): per static source -> sink
+        /// flow, the source and sink contracts (exact spans) and the path
+        /// functions a runner instruments to demonstrate it by execution
+        #[arg(long)]
+        witness: bool,
     },
     /// Show the full entity dependency graph
     Graph {
@@ -875,8 +880,8 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        Some(Commands::Dataflow { path, json, models, max_items }) => {
-            if let Err(e) = commands::arch_diff::dataflow_command(&path, json, &models, max_items) {
+        Some(Commands::Dataflow { path, json, models, max_items, witness }) => {
+            if let Err(e) = commands::arch_diff::dataflow_command(&path, json, &models, max_items, witness) {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }

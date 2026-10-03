@@ -1418,13 +1418,17 @@ pub fn render_md(r: &Value, max: usize) -> String {
 }
 
 /// `sem dataflow [path]`: facts and flows of the working tree.
-pub fn dataflow_command(path: &str, json_out: bool, models: &[PathBuf], max: usize) -> Result<(), Box<dyn std::error::Error>> {
+pub fn dataflow_command(path: &str, json_out: bool, models: &[PathBuf], max: usize, witness: bool) -> Result<(), Box<dyn std::error::Error>> {
     let root = super::repo_root_or_cwd(path);
     let registry = super::create_registry(&root.to_string_lossy());
     let files = super::graph::find_supported_files_public(&root, &registry, &[]);
     let (_, entities) = EntityGraph::build(&root, &files, &registry);
     let models = load_models(&[&root], models)?;
     let a = analyze_tree(&root, &files, &entities, &models, dataflow::Limits::default(), None);
+    if witness {
+        println!("{}", serde_json::to_string_pretty(&a.witness_json(&root))?);
+        return Ok(());
+    }
     let j = a.to_json();
     if json_out {
         println!("{}", serde_json::to_string_pretty(&j)?);

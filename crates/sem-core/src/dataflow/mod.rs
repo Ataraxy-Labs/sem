@@ -23,6 +23,7 @@ pub mod engine;
 pub mod ir;
 pub mod lower;
 pub mod models;
+pub mod witness;
 #[cfg(test)]
 mod tests;
 
