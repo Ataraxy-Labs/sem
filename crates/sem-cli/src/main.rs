@@ -323,13 +323,25 @@ enum Commands {
     #[command(name = "arch-diff")]
     ArchDiff {
         /// Commit range `<base>..<head>` (`<base>...<head>` uses the merge base; a single ref means `<ref>..HEAD`)
-        range: String,
-        /// Output the full report as JSON
-        #[arg(long, conflicts_with = "md")]
+        #[arg(required_unless_present = "from_json")]
+        range: Option<String>,
+        /// Output the full report as JSON (with --view: the view model as JSON)
+        #[arg(long, conflicts_with_all = ["md", "html"])]
         json: bool,
         /// Output a compact markdown summary
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["view", "html"])]
         md: bool,
+        /// Output the architecture view: at most 10 ranked items, each with what changed
+        /// and why it matters; the rest counted; what did not change; what sem could not resolve
+        #[arg(long, conflicts_with = "html")]
+        view: bool,
+        /// Output the architecture view as one self-contained HTML page (module graph
+        /// with new/removed edges, ranked list, evidence on click); no network assets
+        #[arg(long)]
+        html: bool,
+        /// Render a report saved with `--json` instead of analysing a range
+        #[arg(long, value_name = "REPORT_JSON")]
+        from_json: Option<std::path::PathBuf>,
         /// Extra laws files (the `sem topology check` format), besides `.sem/promises/*.json` at head
         #[arg(long, num_args = 1..)]
         laws: Vec<std::path::PathBuf>,
@@ -817,10 +829,17 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        Some(Commands::ArchDiff { range, json, md, laws, models, max_items, budget, max_memory, include_examples, scope, region_mb }) => {
+        Some(Commands::ArchDiff { range, json, md, view, html, from_json, laws, models, max_items, budget, max_memory, include_examples, scope, region_mb }) => {
             let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
-            let format = if json {
+            let range = range.unwrap_or_default();
+            let format = if json && view {
+                commands::arch_diff::Format::ViewJson
+            } else if json {
                 commands::arch_diff::Format::Json
+            } else if view {
+                commands::arch_diff::Format::View
+            } else if html {
+                commands::arch_diff::Format::Html
             } else if md {
                 commands::arch_diff::Format::Markdown
             } else {
@@ -837,6 +856,7 @@ fn main() {
                 max_memory: (max_memory > 0).then(|| max_memory as usize * 1024 * 1024),
                 include_examples,
                 scope: commands::arch_diff::scope_of(&scope, max_memory, region_mb),
+                from_json,
             }) {
                 eprintln!("error: {e}");
                 std::process::exit(2);

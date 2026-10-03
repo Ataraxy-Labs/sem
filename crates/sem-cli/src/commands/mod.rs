@@ -1,5 +1,6 @@
 pub mod blame;
 pub mod arch_diff;
+pub mod arch_view;
 pub mod certify;
 pub mod cloud;
 pub mod consent;

@@ -33,6 +33,12 @@ pub enum Format {
     Text,
     Json,
     Markdown,
+    /// the architecture view (`--view`): ranked, collapsed, explained
+    View,
+    /// the architecture view as one self-contained HTML page (`--html`)
+    Html,
+    /// the architecture view's model as JSON (`--view --json`)
+    ViewJson,
 }
 
 pub struct ArchDiffOptions {
@@ -50,6 +56,8 @@ pub struct ArchDiffOptions {
     pub include_examples: bool,
     /// Whole trees, or the diff's region (see `region`).
     pub scope: certify::Scope,
+    /// render a saved `--json` report instead of analysing a range
+    pub from_json: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -128,7 +136,7 @@ pub(crate) fn analyze_tree(dir: &Path, files: &[String], entities: &[sem_core::m
     dataflow::analyze_until(dir, files, entities, &resolve, models, limits)
 }
 
-fn is_test_file(p: &str) -> bool {
+pub(crate) fn is_test_file(p: &str) -> bool {
     let l = p.to_ascii_lowercase();
     let leaf = l.rsplit('/').next().unwrap_or(&l);
     l.contains("/test/") || l.contains("/tests/") || l.contains("__tests__") || l.starts_with("test/") || l.starts_with("tests/")
@@ -165,7 +173,7 @@ fn crate_of(dir: &Path, file: &str) -> Option<String> {
     Some(String::new())
 }
 
-fn package_of(file: &str) -> String {
+pub(crate) fn package_of(file: &str) -> String {
     match file.rsplit_once('/') {
         Some((d, _)) => d.to_string(),
         None => ".".to_string(),
@@ -174,10 +182,10 @@ fn package_of(file: &str) -> String {
 
 /// File- and package-level dependency graph of production code: resolved
 /// entity references between files, plus JS/TS module imports.
-struct Deps {
-    files: Vec<String>,
-    edges: BTreeSet<(String, String)>,
-    pkg_edges: BTreeMap<(String, String), (String, String)>,
+pub(crate) struct Deps {
+    pub(crate) files: Vec<String>,
+    pub(crate) edges: BTreeSet<(String, String)>,
+    pub(crate) pkg_edges: BTreeMap<(String, String), (String, String)>,
     /// Rust file -> its crate. Cargo forbids dependency cycles between
     /// crates, so a cycle crossing crates is an artifact (a dev-dependency,
     /// a mis-resolved name): cycles are computed within a crate only.
@@ -344,7 +352,7 @@ impl Deps {
         Deps { files: files.into_iter().collect(), edges, pkg_edges, krate }
     }
 
-    fn adj(nodes: &[String], edges: impl Iterator<Item = (String, String)>) -> algo::Adj {
+    pub(crate) fn adj(nodes: &[String], edges: impl Iterator<Item = (String, String)>) -> algo::Adj {
         let idx: HashMap<&str, usize> = nodes.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
         let mut adj = vec![Vec::new(); nodes.len()];
         for (a, b) in edges {
@@ -359,7 +367,7 @@ impl Deps {
         adj
     }
 
-    fn packages(&self) -> Vec<String> {
+    pub(crate) fn packages(&self) -> Vec<String> {
         let s: BTreeSet<String> = self.files.iter().map(|f| package_of(f)).collect();
         s.into_iter().collect()
     }
@@ -480,6 +488,10 @@ pub(crate) fn dataflow_deadline(now: std::time::Instant, end: std::time::Instant
 }
 
 pub fn arch_diff_command(opts: ArchDiffOptions) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(p) = &opts.from_json {
+        let report: Value = serde_json::from_str(&std::fs::read_to_string(p)?)?;
+        return emit(&report, opts.format, opts.max_items);
+    }
     let t0 = std::time::Instant::now();
     let end = opts.budget.map(|b| t0 + b);
     let root = super::repo_root_or_cwd(&opts.cwd);
@@ -511,13 +523,26 @@ pub fn arch_diff_command(opts: ArchDiffOptions) -> Result<(), Box<dyn std::error
     mark(&mut timings, "deps");
     let (bm, hm) = (measure(&bd), measure(&hd));
     mark(&mut timings, "measure");
-    let report = compose(&cert, &bj, &hj, &bd, &hd, &bm, &hm, &bt, &ht, region.as_ref(), opts.max_items, t0, end);
+    let mut report = compose(&cert, &bj, &hj, &bd, &hd, &bm, &hm, &bt, &ht, region.as_ref(), opts.max_items, t0, end);
+    // for the view: what changed, and the package graph around it
+    let changed_files: BTreeSet<String> = arr(&cert["entities"]).iter().map(|e| s(&e["file"])).collect();
+    if let Some(o) = report.as_object_mut() {
+        o.insert("changed".into(), cert["entities"].clone());
+        o.insert("moduleGraph".into(), super::arch_view::module_graph(&bd, &hd, &changed_files));
+    }
     mark(&mut timings, "compose");
     timings.finish();
-    match opts.format {
-        Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        Format::Markdown => print!("{}", render_md(&report, opts.max_items)),
-        Format::Text => print!("{}", render_text(&report, opts.max_items)),
+    emit(&report, opts.format, opts.max_items)
+}
+
+fn emit(report: &Value, format: Format, max: usize) -> Result<(), Box<dyn std::error::Error>> {
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        Format::Markdown => print!("{}", render_md(report, max)),
+        Format::Text => print!("{}", render_text(report, max)),
+        Format::View => print!("{}", super::arch_view::render_view_text(&super::arch_view::build_view(report))),
+        Format::Html => print!("{}", super::arch_view::render_view_html(&super::arch_view::build_view(report))),
+        Format::ViewJson => println!("{}", serde_json::to_string_pretty(&super::arch_view::build_view(report))?),
     }
     Ok(())
 }

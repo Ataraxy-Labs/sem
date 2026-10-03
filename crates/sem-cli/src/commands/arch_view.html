@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root {
+  --bg: #fbfaf8; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e3e1dc;
+  --decide: #b3261e; --decide-bg: #fdecea; --fyi: #5a5a60; --fyi-bg: #efeee9;
+  --new: #1a7f37; --removed: #c4302b; --flow: #b35c00; --kept: #c9c6bf; --focus: #0b57d0;
+  --node: #ffffff; --node-touched: #fff7e0; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161618; --panel: #1f1f22; --ink: #ececef; --muted: #a0a0a8; --line: #34343a;
+    --decide: #ff8a80; --decide-bg: #3a1d1b; --fyi: #c4c4cc; --fyi-bg: #2a2a2f;
+    --new: #4ac26b; --removed: #ff6b64; --flow: #f0a040; --kept: #4a4a52; --focus: #8ab4f8;
+    --node: #26262a; --node-touched: #3a3320; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161618; --panel: #1f1f22; --ink: #ececef; --muted: #a0a0a8; --line: #34343a;
+  --decide: #ff8a80; --decide-bg: #3a1d1b; --fyi: #c4c4cc; --fyi-bg: #2a2a2f;
+  --new: #4ac26b; --removed: #ff6b64; --flow: #f0a040; --kept: #4a4a52; --focus: #8ab4f8;
+  --node: #26262a; --node-touched: #3a3320; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+header, main, footer { padding-inline: max(16px, 2vw); }
+header { padding-block: 18px 8px; }
+h1 { font-size: 18px; margin: 0 0 4px; font-weight: 650; }
+.sub { color: var(--muted); }
+.sub b { color: var(--ink); }
+main { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 16px; padding-block: 8px 16px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
+.card.sel { border-color: var(--focus); box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 25%, transparent); }
+.row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.rank { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1.4em; }
+.tag { font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 1px 6px; border-radius: 4px; background: var(--fyi-bg); color: var(--fyi); }
+.decision .tag { background: var(--decide-bg); color: var(--decide); }
+.badge { font-size: 11px; color: var(--decide); font-weight: 600; }
+.chain { font-family: var(--mono); font-size: 12.5px; margin: 6px 0 2px; overflow-wrap: anywhere; }
+.what { margin: 4px 0 2px; overflow-wrap: anywhere; }
+.why { color: var(--muted); overflow-wrap: anywhere; }
+.loc { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+.ev { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 6px; font-size: 12.5px; cursor: auto; }
+.ev ol { margin: 4px 0 8px 18px; padding: 0; font-family: var(--mono); font-size: 12px; }
+.ev .wt { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+button.more { background: none; border: 0; color: var(--focus); padding: 0; margin-top: 6px; cursor: pointer; font: inherit; font-size: 12.5px; }
+.graphcol { position: sticky; top: calc(8px + env(safe-area-inset-top, 0px)); align-self: start; min-width: 0; }
+@media (max-width: 900px) { .graphcol { position: static; } }
+.graphbox { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: auto; max-height: 70vh; position: relative; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--line); position: sticky; left: 0; top: 0; background: var(--panel); z-index: 1; }
+.sw { display: inline-block; width: 18px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+svg text { font-size: 12px; fill: var(--ink); }
+svg .role { font-size: 10px; fill: var(--muted); }
+.node rect { fill: var(--node); stroke: var(--line); stroke-width: 1; }
+.node.touched rect { fill: var(--node-touched); stroke: var(--ink); stroke-width: 1.4; }
+.node.added rect { stroke: var(--new); stroke-dasharray: 4 3; stroke-width: 1.6; }
+.node.hot rect { stroke: var(--decide); stroke-width: 2; }
+.node { cursor: pointer; }
+.edge { fill: none; stroke-width: 1.2; }
+.edge.kept { stroke: var(--kept); }
+.edge.new { stroke: var(--new); stroke-width: 2.4; }
+.edge.removed { stroke: var(--removed); stroke-width: 2; stroke-dasharray: 6 4; }
+.edge.flow { stroke: var(--flow); stroke-width: 2.4; stroke-dasharray: 2 4; stroke-linecap: round; }
+.dim { opacity: .15; }
+.detail { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-top: 10px; min-height: 3em; }
+.detail h3 { margin: 0 0 4px; font-size: 14px; font-family: var(--mono); overflow-wrap: anywhere; }
+.detail a { color: var(--focus); cursor: pointer; text-decoration: underline; }
+footer { padding-block: 0 24px; color: var(--muted); }
+footer p { margin: 4px 0; }
+footer .unc { color: var(--decide); }
+.empty { color: var(--muted); padding: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="sub" id="summary"></div>
+</header>
+<main>
+  <section aria-label="Ranked changes" id="list"></section>
+  <section aria-label="Module graph" class="graphcol">
+    <div class="graphbox" id="graphbox">
+      <div class="legend">
+        <span><span class="sw" style="border-color:var(--new)"></span>new dependency</span>
+        <span><span class="sw" style="border-color:var(--removed);border-top-style:dashed"></span>removed</span>
+        <span><span class="sw" style="border-color:var(--flow);border-top-style:dotted"></span>new data flow</span>
+        <span><span class="sw" style="border-color:var(--kept)"></span>unchanged</span>
+        <span>shaded box: module this change touches</span>
+      </div>
+      <svg id="graph" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="module dependency graph"></svg>
+    </div>
+    <div class="detail" id="detail"><span class="sub">Click an item or a module to see its evidence.</span></div>
+  </section>
+</main>
+<footer id="foot"></footer>
+<script type="application/json" id="view-data">{{DATA}}</script>
+<script>
+(function () {
+  "use strict";
+  var V = JSON.parse(document.getElementById("view-data").textContent);
+  var NS = "http://www.w3.org/2000/svg";
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function sv(tag, attrs) { var e = document.createElementNS(NS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
+  function short(x) { return (x || "").slice(0, 12); }
+
+  document.getElementById("title").textContent = "Architecture view " + short(V.base) + ".." + short(V.head);
+  var sm = V.summary || {};
+  var sub = document.getElementById("summary");
+  sub.innerHTML = "";
+  sub.append(sm.files + " files, " + sm.entities + " entities changed" + (sm.modulesTouched != null ? ", " + sm.modulesTouched + " modules touched" : "") + ". " +
+    sm.findings + " findings collapsed to " + sm.facts + " facts; ");
+  var b = el("b", null, (sm.decisions || 0) + (sm.decisions === 1 ? " needs" : " need") + " a human decision");
+  sub.append(b, ".");
+
+  var items = V.items || [];
+  var list = document.getElementById("list");
+  var cards = [];
+  if (!items.length) list.append(el("div", "empty", "No architectural change that needs a decision."));
+  items.forEach(function (it, i) {
+    var c = el("article", "card" + (it.decision ? " decision" : ""));
+    c.tabIndex = 0;
+    var r = el("div", "row");
+    r.append(el("span", "rank", it.rank + "."), el("span", "tag", it.tag));
+    if (it.decision) r.append(el("span", "badge", "needs a human decision"));
+    c.append(r);
+    if (it.chain && it.chain.length >= 2) c.append(el("div", "chain", it.chain.join(" ─▶ ")));
+    c.append(el("div", "what", it.what), el("div", "why", it.why));
+    if (it.location) c.append(el("div", "loc", "at " + it.location));
+    var ws = it.witnesses || [];
+    if (ws.length) {
+      var btn = el("button", "more", "Show evidence (" + (it.merged > ws.length ? ws.length + " of " + it.merged : ws.length) + ")");
+      var ev = el("div", "ev"); ev.hidden = true;
+      ws.forEach(function (w) {
+        ev.append(el("div", "wt", w.text));
+        if (w.steps && w.steps.length) { var ol = el("ol"); w.steps.forEach(function (s) { ol.append(el("li", null, s)); }); ev.append(ol); }
+      });
+      btn.addEventListener("click", function (e) { e.stopPropagation(); ev.hidden = !ev.hidden; btn.textContent = (ev.hidden ? "Show" : "Hide") + " evidence (" + ws.length + ")"; });
+      ev.addEventListener("click", function (e) { e.stopPropagation(); });
+      c.append(btn, ev);
+    }
+    c.addEventListener("click", function () { select(i); });
+    c.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(i); } });
+    list.append(c); cards.push(c);
+  });
+
+  var foot = document.getElementById("foot");
+  if (V.uncertainty) foot.append(el("p", "unc", V.uncertainty));
+  ["also", "unchanged"].forEach(function (k) { if (V[k]) foot.append(el("p", null, V[k])); });
+  if (V.precision) foot.append(el("p", null, "Precision: " + V.precision));
+
+  // ---- graph layout: layers by dependency depth, order by barycentre ----
+  var G = V.graph || { nodes: [], edges: [] };
+  var nodes = G.nodes || [], edges = G.edges || [];
+  var byId = {};
+  nodes.forEach(function (n) { byId[n.id] = n; });
+  edges = edges.filter(function (e) { return byId[e.from] && byId[e.to] && e.from !== e.to; });
+  var out = {};
+  edges.forEach(function (e) { if (e.status !== "flow") (out[e.from] = out[e.from] || []).push(e.to); });
+  var memo = {}, onStack = {};
+  function depth(id) {
+    var n = byId[id];
+    if (n.depth != null) return n.depth;
+    if (memo[id] != null) return memo[id];
+    if (onStack[id]) return 0;
+    onStack[id] = true;
+    var d = 0; (out[id] || []).forEach(function (t) { d = Math.max(d, depth(t) + 1); });
+    onStack[id] = false; memo[id] = d; return d;
+  }
+  var ds = {};
+  nodes.forEach(function (n) { n._d = depth(n.id); ds[n._d] = true; });
+  var levels = Object.keys(ds).map(Number).sort(function (a, b) { return b - a; });
+  // at most 6 layers: depths are bucketed so the graph stays about one screen wide
+  var MAXR = 16, MAXC = 6, cols = [], bucket = {};
+  levels.forEach(function (lv, i) { bucket[lv] = Math.floor(i * Math.min(MAXC, levels.length) / levels.length); });
+  var nb = levels.length ? Math.min(MAXC, levels.length) : 0;
+  for (var bi = 0; bi < nb; bi++) {
+    var col = nodes.filter(function (n) { return bucket[n._d] === bi; });
+    col.sort(function (a, b) { return (b.touched - a.touched) || ((b.items || []).length - (a.items || []).length) || (a.label < b.label ? -1 : 1); });
+    for (var i = 0; i < col.length; i += MAXR) cols.push(col.slice(i, i + MAXR));
+  }
+  var adj = {};
+  edges.forEach(function (e) { (adj[e.from] = adj[e.from] || []).push(e.to); (adj[e.to] = adj[e.to] || []).push(e.from); });
+  function place() { cols.forEach(function (col, ci) { col.forEach(function (n, ri) { n._c = ci; n._r = ri; }); }); }
+  place();
+  for (var pass = 0; pass < 6; pass++) {
+    cols.forEach(function (col) {
+      col.forEach(function (n) {
+        var nb = (adj[n.id] || []).map(function (id) { return byId[id]._r; });
+        n._b = nb.length ? nb.reduce(function (a, b) { return a + b; }, 0) / nb.length : n._r;
+      });
+      col.sort(function (a, b) { return a._b - b._b; });
+    });
+    place();
+  }
+  var W = 176, H = 30, CW = 226, RH = 44, PAD = 24;
+  var svg = document.getElementById("graph");
+  var rows = cols.reduce(function (m, c) { return Math.max(m, c.length); }, 0);
+  var width = Math.max(1, cols.length) * CW + PAD, height = Math.max(1, rows) * RH + PAD * 2;
+  svg.setAttribute("width", width); svg.setAttribute("height", height); svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  nodes.forEach(function (n) { n._x = PAD + n._c * CW; n._y = PAD + n._r * RH; });
+  var defs = sv("defs", {});
+  ["new", "removed", "flow", "kept"].forEach(function (k) {
+    var m = sv("marker", { id: "arrow-" + k, viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+    var p = sv("path", { d: "M0,0 L10,5 L0,10 z" }); p.style.fill = "var(--" + k + ")"; m.append(p); defs.append(m);
+  });
+  svg.append(defs);
+  var eg = sv("g", {}), ng = sv("g", {});
+  svg.append(eg, ng);
+  var edgeEls = [], nodeEls = {};
+  var order = { kept: 0, removed: 1, new: 2, flow: 3 };
+  edges.slice().sort(function (a, b) { return order[a.status] - order[b.status]; }).forEach(function (e) {
+    var a = byId[e.from], b = byId[e.to], d;
+    if (b._x > a._x) {
+      var x1 = a._x + W, y1 = a._y + H / 2, x2 = b._x - 2, y2 = b._y + H / 2, mx = (x1 + x2) / 2;
+      d = "M" + x1 + "," + y1 + " C" + mx + "," + y1 + " " + mx + "," + y2 + " " + x2 + "," + y2;
+    } else {
+      var sx = a._x + W / 2, sy = a._y + H, tx = b._x + W / 2 + 6, ty = b._y + H + 2, low = Math.max(sy, ty) + 26 + Math.abs(a._c - b._c) * 4;
+      if (a._c === b._c && a._r === b._r) return;
+      d = "M" + sx + "," + sy + " C" + sx + "," + low + " " + tx + "," + low + " " + tx + "," + ty;
+    }
+    var p = sv("path", { d: d, class: "edge " + e.status });
+    p.setAttribute("marker-end", "url(#arrow-" + e.status + ")");
+    var t = sv("title", {}); t.textContent = e.from + " → " + e.to + " (" + (e.status === "flow" ? "new data flow" : e.status) + ")"; p.append(t);
+    p.addEventListener("click", function () { showEdge(e); });
+    p.style.cursor = "pointer";
+    eg.append(p); edgeEls.push({ e: e, el: p });
+  });
+  nodes.forEach(function (n) {
+    var g = sv("g", { class: "node" + (n.touched ? " touched" : "") + (n.added ? " added" : "") + ((n.items || []).some(function (k) { return items[k - 1] && items[k - 1].decision; }) ? " hot" : ""), transform: "translate(" + n._x + "," + n._y + ")" });
+    g.append(sv("rect", { width: W, height: H, rx: 6 }));
+    var lab = n.label.length > 24 ? n.label.slice(0, 23) + "…" : n.label;
+    var t = sv("text", { x: 8, y: n.role ? 13 : 19 }); t.textContent = lab; g.append(t);
+    if (n.role) { var r = sv("text", { x: 8, y: 25, class: "role" }); r.textContent = n.role; g.append(r); }
+    if ((n.items || []).length) { var c = sv("text", { x: W - 8, y: 19, "text-anchor": "end", class: "role" }); c.textContent = "#" + n.items.join(",#"); g.append(c); }
+    var tt = sv("title", {}); tt.textContent = n.id; g.append(tt);
+    g.addEventListener("click", function () { showNode(n); });
+    ng.append(g); nodeEls[n.id] = g;
+  });
+  if (!nodes.length) { var t0 = sv("text", { x: 16, y: 30 }); t0.textContent = "No module-level change to draw."; svg.append(t0); }
+  if (G.hiddenNeighbors) { var h = sv("text", { x: PAD, y: height - 6, class: "role" }); h.textContent = "+" + G.hiddenNeighbors + " more neighbouring modules not shown"; svg.append(h); }
+
+  var detail = document.getElementById("detail");
+  function clearDim() {
+    Object.keys(nodeEls).forEach(function (k) { nodeEls[k].classList.remove("dim"); });
+    edgeEls.forEach(function (x) { x.el.classList.remove("dim"); });
+  }
+  function focus(mods, itemNo) {
+    clearDim();
+    if (!mods) return;
+    Object.keys(nodeEls).forEach(function (k) { if (!mods[k]) nodeEls[k].classList.add("dim"); });
+    edgeEls.forEach(function (x) {
+      var hit = itemNo != null ? (x.e.items || []).indexOf(itemNo) >= 0 : (mods[x.e.from] && mods[x.e.to]);
+      if (!hit) x.el.classList.add("dim");
+    });
+    var first = Object.keys(mods).map(function (k) { return byId[k]; }).filter(Boolean)[0];
+    if (first) { var box = document.getElementById("graphbox"); box.scrollTo({ left: Math.max(0, first._x + W / 2 - box.clientWidth / 2), top: Math.max(0, first._y - box.clientHeight / 3), behavior: "smooth" }); }
+  }
+  function select(i) {
+    cards.forEach(function (c, k) { c.classList.toggle("sel", k === i); });
+    var it = items[i], mods = {};
+    (it.modules || []).forEach(function (m) { mods[m] = true; });
+    (it.edges || []).forEach(function (e) { mods[e.from] = true; mods[e.to] = true; });
+    focus(mods, it.rank);
+    detail.innerHTML = "";
+    detail.append(el("h3", null, "#" + it.rank + " " + it.tag));
+    detail.append(el("div", null, it.what));
+    if ((it.files || []).length) detail.append(el("div", "loc", "files: " + it.files.slice(0, 12).join(", ") + (it.files.length > 12 ? " …" : "")));
+  }
+  function showNode(n) {
+    cards.forEach(function (c) { c.classList.remove("sel"); });
+    var mods = {}; mods[n.id] = true; (adj[n.id] || []).forEach(function (m) { mods[m] = true; });
+    focus(mods, null);
+    detail.innerHTML = "";
+    detail.append(el("h3", null, n.id + "/"));
+    detail.append(el("div", "sub", [n.role ? "role: " + n.role : null, n.touched ? "changed by this PR" : "not changed", n.added ? "new module" : null].filter(Boolean).join(" · ")));
+    (n.items || []).forEach(function (k) {
+      var a = el("a", null, "#" + k + " " + items[k - 1].tag + ": " + items[k - 1].what);
+      a.addEventListener("click", function () { select(k - 1); cards[k - 1].scrollIntoView({ behavior: "smooth", block: "center" }); });
+      var d = el("div"); d.append(a); detail.append(d);
+    });
+  }
+  function showEdge(e) {
+    detail.innerHTML = "";
+    detail.append(el("h3", null, e.from + "/ → " + e.to + "/"));
+    detail.append(el("div", "sub", e.status === "flow" ? "new data flow between these modules" : e.status + " dependency"));
+    (e.items || []).forEach(function (k) {
+      var a = el("a", null, "#" + k + " " + items[k - 1].what);
+      a.addEventListener("click", function () { select(k - 1); });
+      var d = el("div"); d.append(a); detail.append(d);
+    });
+  }
+})();
+</script>
+</body>
+</html>
