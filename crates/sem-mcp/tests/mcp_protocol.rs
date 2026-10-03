@@ -204,10 +204,10 @@ fn agy_empty_discovery_probe_keeps_session_usable() {
 fn copilot_discovery_falls_back_to_initialize_and_tools_work() {
     let repo = fixture_repo();
     let mut client = McpClient::spawn_with_discovery(repo.path(), true);
-    assert!(client
-        .tools_list()
-        .iter()
-        .any(|tool| tool["name"] == "sem_entities"));
+    let tools = client.tools_list();
+    assert!(tools.iter().any(|tool| tool["name"] == "sem_find"));
+    // sem_entities is no longer listed (sem_find covers it), but still answers.
+    assert!(!tools.iter().any(|tool| tool["name"] == "sem_entities"));
     let response = client.call_tool("sem_entities", json!({"path": "src/needle.py"}));
     assert!(tool_text(&response).contains("needle_target_fn"));
     // Unknown methods must also leave an initialized session usable.

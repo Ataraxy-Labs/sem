@@ -138,7 +138,13 @@ fn normalize(out: &[u8], repo: &Path) -> String {
 }
 
 /// (golden name, old invocation, new spellings that must print the same)
-const CASES: &[(&str, &[&str], &[&[&str]])] = &[
+type Case = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static [&'static str]],
+);
+
+const CASES: &[Case] = &[
     ("find_json", &["find", "parse_config", "--json"], &[]),
     ("find_text", &["find", "parse_config"], &[]),
     (
@@ -1018,8 +1024,14 @@ fn mcp_lists_the_core_verbs_and_still_answers_old_tool_names() {
                 "sem_context",
                 serde_json::json!({"entity_name": "parse_config", "token_budget": 500, "fresh": true}),
             ),
-            call("sem_find", serde_json::json!({"intent": "parse config text"})),
-            call("sem_entities", serde_json::json!({"query": "parse config text"})),
+            call(
+                "sem_find",
+                serde_json::json!({"intent": "parse config text"}),
+            ),
+            call(
+                "sem_entities",
+                serde_json::json!({"query": "parse config text"}),
+            ),
         ],
     );
     let names: Vec<&str> = replies[0]["result"]["tools"]
@@ -1096,7 +1108,12 @@ fn mcp_lists_the_core_verbs_and_still_answers_old_tool_names() {
         strip(tool_text(&replies[12])),
         "mode context is sem_context"
     );
-    let strip_ms = |s: String| s.lines().filter(|l| !l.contains("ms")).collect::<Vec<_>>().join("\n");
+    let strip_ms = |s: String| {
+        s.lines()
+            .filter(|l| !l.contains("ms"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert_eq!(
         strip_ms(tool_text(&replies[13])),
         strip_ms(tool_text(&replies[14])),
