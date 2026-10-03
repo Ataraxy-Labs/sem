@@ -522,10 +522,19 @@ fn eslint_verdicts_equal_eslint_in_every_case() {
 
     // a new file is found and linted
     repo.write("src/d.js", "const y = 3;\n");
-    let _c4 = repo.commit("new file");
+    let c4 = repo.commit("new file");
     let c = lint_case(&repo, Some(&c3), "new file");
     assert_eq!(c["mode"], "incremental", "{c:#}");
     assert!(strs(&c["filesRechecked"]).contains(&"src/d.js".to_string()));
+
+    // new files no config matches (docs, data) are neither linted nor a reason
+    // to give up: the flat config decides which files are lint targets
+    repo.write("README.md", "# lint fixture\n");
+    repo.write("src/data.json", "{\"a\": 1}\n");
+    let _c5 = repo.commit("non-js files");
+    let c = lint_case(&repo, Some(&c4), "non-js files");
+    assert_eq!(c["mode"], "incremental", "{c:#}");
+    assert_eq!(c["filesRecheckedCount"], 0, "{c:#}");
 }
 
 #[test]
