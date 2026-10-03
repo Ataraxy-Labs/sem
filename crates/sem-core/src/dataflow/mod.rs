@@ -41,6 +41,17 @@ use models::Models;
 
 pub const PRECISION: &str = "may-flow: flow-insensitive within a function, field-insensitive (a write to any field taints the object), one summary per function (context-insensitive), no alias analysis; sources and sinks only where a model names them. Over-approximates within what was resolved; unresolved calls are reported as unknown, not dropped";
 
+/// How much of an [`Analysis`] to render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonDetail {
+    /// Everything: witness paths of escapes and unknown-origin flows, and
+    /// per-function transitive facts.
+    Full,
+    /// Without those (they grow with sources x unresolved calls and with
+    /// functions x reachable functions); flows keep their paths.
+    Compact,
+}
+
 /// Everything the engine computed, with enough context to render it.
 pub struct Analysis {
     pub files: Vec<DfFile>,
@@ -58,10 +69,53 @@ pub fn analyze(
     resolve_spec: &(dyn Fn(&str, &str) -> Option<String> + Sync),
     models: &Models,
 ) -> Analysis {
+    analyze_until(root, file_paths, entities, resolve_spec, models, Limits::default())
+}
+
+/// Resource limits of one analysis. Past either, propagation stops and
+/// the result is marked `incomplete`: a partial under-approximation of
+/// the flows (facts of functions the final pass did not reach are empty).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Limits {
+    /// Wall-clock deadline.
+    pub deadline: Option<std::time::Instant>,
+    /// Resident memory of the whole process, in bytes.
+    pub max_rss_bytes: Option<usize>,
+}
+
+/// [`analyze`] within [`Limits`].
+pub fn analyze_until(
+    root: &Path,
+    file_paths: &[String],
+    entities: &[SemanticEntity],
+    resolve_spec: &(dyn Fn(&str, &str) -> Option<String> + Sync),
+    models: &Models,
+    limits: Limits,
+) -> Analysis {
     let paths: Vec<&String> = file_paths.iter().filter(|p| Lang::for_path(p).is_some()).collect();
+    // --max-memory holds during lowering too (every file's IR is kept for
+    // the fixpoint): past it, no further file is lowered and the result is
+    // incomplete
+    let lowered_count = std::sync::atomic::AtomicUsize::new(0);
+    let cut = std::sync::atomic::AtomicBool::new(false);
     let lowered = |p: &&String| -> Option<(DfFile, Option<FileFacts>)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if cut.load(Relaxed) {
+            return None;
+        }
+        if let Some(max) = limits.max_rss_bytes {
+            if lowered_count.fetch_add(1, Relaxed) % 256 == 255 && crate::parser::mem_profile::current_rss_bytes().is_some_and(|r| r > max) {
+                cut.store(true, Relaxed);
+                return None;
+            }
+        }
         let src = std::fs::read_to_string(root.join(p.as_str())).ok()?;
         let lang = Lang::for_path(p)?;
+        // bundled / minified JS (`.min.js`, a line over 1000 chars) is a
+        // shipped asset, not the repo's code
+        if lang == Lang::Ts && (p.ends_with(".min.js") || src.lines().any(|l| l.len() > 1000)) {
+            return None;
+        }
         let tree = lower::parse(p, &src)?;
         let mut df = lower::lower(lang, p, &tree, &src);
         let facts = calls::lower_file(p, &tree, &src);
@@ -87,6 +141,7 @@ pub fn analyze(
 
     // stage 2: the call-graph pipeline's answers, per language
     let mut answers: Vec<HashMap<u32, (bool, SiteAnswer)>> = vec![HashMap::new(); files.len()];
+    let mut dispatch: HashMap<String, Vec<String>> = HashMap::new();
     let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, f) in facts.iter().enumerate() {
         if f.is_some() {
@@ -100,6 +155,9 @@ pub fn analyze(
         let res = calls::site_answers(root, lang, &group, entities);
         for (k, per_file) in res.into_iter().enumerate() {
             answers[idx[k]] = per_file.into_iter().map(|(at, call, a)| (at, (call, a))).collect();
+        }
+        for (d, i) in calls::dispatch_answers(root, lang, &group, entities) {
+            dispatch.entry(d).or_default().push(i);
         }
     }
     drop(facts);
@@ -157,9 +215,16 @@ pub fn analyze(
         fn_entity: &fn_entity,
         type_entity: &type_entity,
         spec_file: &spec_file,
+        dispatch: &dispatch,
         models,
+        limits,
     })
     .run();
+    let mut out = out;
+    if cut.into_inner() {
+        out.incomplete = true;
+        out.incomplete_why = Some("memory budget");
+    }
     Analysis { files, fn_entity, out }
 }
 
@@ -212,6 +277,9 @@ impl Analysis {
             "source": src,
             "sink": sink,
             "throughState": f.through_state.map(|r| self.out.states[r as usize].show()),
+            // the call's own result reaching its own argument (`q = read(q)`
+            // seen flow-insensitively): not a path between two sites
+            "selfPath": s.at_fn == k.at_fn && s.at == k.at,
             "interprocedural": s.at_fn != k.at_fn,
             "path": f.path.iter().map(|s| self.step(s)).collect::<Vec<_>>(),
         })
@@ -219,6 +287,12 @@ impl Analysis {
 
     /// Per-function facts, direct and transitive (through resolved calls).
     pub fn entities_json(&self) -> Vec<Value> {
+        self.entities_json_with(true)
+    }
+
+    /// Per-function facts; the transitive closure (a walk per function)
+    /// only with `transitive`.
+    pub fn entities_json_with(&self, transitive: bool) -> Vec<Value> {
         let facts = &self.out.facts;
         let mut out = Vec::new();
         for (fi, f) in self.files.iter().enumerate() {
@@ -231,6 +305,9 @@ impl Analysis {
                 let mut unknown = 0usize;
                 let mut seen = std::collections::HashSet::new();
                 let mut q = VecDeque::from([fr]);
+                if !transitive {
+                    q.clear();
+                }
                 while let Some(u) = q.pop_front() {
                     if !seen.insert(u) || seen.len() > 5000 {
                         continue;
@@ -256,15 +333,74 @@ impl Analysis {
                     "reads": x.reads,
                     "writes": x.writes,
                     "unknownCalls": x.unknown_calls.len(),
+                    "unknownCallees": x.unknown_callees.iter().map(|(r, n)| json!([r + 1, n])).collect::<Vec<_>>(),
                     "dynamic": x.dynamic.iter().map(|(r, w)| format!("{}: {w}", r + 1)).collect::<Vec<_>>(),
-                    "transitive": { "reads": reads, "writes": writes, "unknownCallsReachable": unknown, "functionsReachable": seen.len() },
                 }));
+                if transitive {
+                    out.last_mut().unwrap()["transitive"] = json!({ "reads": reads, "writes": writes, "unknownCallsReachable": unknown, "functionsReachable": seen.len() });
+                }
             }
         }
         out
     }
 
     pub fn to_json(&self) -> Value {
+        self.to_json_with(JsonDetail::Full)
+    }
+
+    /// An escape's identity across trees.
+    pub fn escape_key(&self, e: &engine::Escape) -> String {
+        let s = &self.out.srcs[e.src as usize];
+        let uo = &self.out.unks[e.unk as usize];
+        format!("{} {} [{}] -> unknown {}", s.class, self.fn_key(s.at_fn), s.via, self.fn_key(uo.at_fn))
+    }
+
+    /// Hashes of every escape's key, to compare two trees without
+    /// rendering hundreds of thousands of escapes.
+    pub fn escape_keys(&self) -> std::collections::HashSet<u64> {
+        use std::hash::{Hash, Hasher};
+        self.out
+            .escapes
+            .iter()
+            .map(|e| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                self.escape_key(e).hash(&mut h);
+                h.finish()
+            })
+            .collect()
+    }
+
+    /// The escapes whose key hash is not in `known`, rendered with paths.
+    pub fn escapes_not_in(&self, known: &std::collections::HashSet<u64>) -> Vec<Value> {
+        use std::hash::{Hash, Hasher};
+        let mut seen = BTreeSet::new();
+        self.out
+            .escapes
+            .iter()
+            .filter(|e| {
+                let k = self.escape_key(e);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                k.hash(&mut h);
+                !known.contains(&h.finish()) && seen.insert(k)
+            })
+            .map(|e| self.escape_json(e, true))
+            .collect()
+    }
+
+    fn escape_json(&self, e: &engine::Escape, path: bool) -> Value {
+        let o = &self.out;
+        let s = &o.srcs[e.src as usize];
+        let uo = &o.unks[e.unk as usize];
+        json!({
+            "key": self.escape_key(e),
+            "source": { "class": s.class, "file": self.files[s.at_fn.0 as usize].path, "line": s.row + 1, "entity": self.fn_name(s.at_fn), "via": s.via },
+            "unknown": { "file": self.files[uo.at_fn.0 as usize].path, "line": uo.row + 1, "entity": self.fn_name(uo.at_fn), "why": uo.why },
+            "path": if path { o.escape_path(e).iter().map(|s| self.step(s)).collect::<Vec<_>>() } else { Vec::new() },
+        })
+    }
+
+    pub fn to_json_with(&self, detail: JsonDetail) -> Value {
+        let full = detail == JsonDetail::Full;
         let o = &self.out;
         let cov = &o.coverage;
         let rate = if cov.call_sites > 0 { cov.unknown as f64 / cov.call_sites as f64 } else { 0.0 };
@@ -282,27 +418,17 @@ impl Analysis {
                     "key": format!("unknown {} -> {} {} [{}]", self.fn_key(uo.at_fn), k.class, self.fn_key(k.at_fn), k.via),
                     "unknown": { "file": self.files[uo.at_fn.0 as usize].path, "line": uo.row + 1, "entity": self.fn_name(uo.at_fn), "why": uo.why },
                     "sink": { "class": k.class, "file": self.files[k.at_fn.0 as usize].path, "line": k.row + 1, "entity": self.fn_name(k.at_fn), "via": k.via },
-                    "path": p.iter().map(|s| self.step(s)).collect::<Vec<_>>(),
+                    "path": if full { p.iter().map(|s| self.step(s)).collect::<Vec<_>>() } else { Vec::new() },
                 })
             })
             .collect();
-        let escapes: Vec<Value> = o
-            .escapes
-            .iter()
-            .map(|e| {
-                let s = &o.srcs[e.src as usize];
-                let uo = &o.unks[e.unk as usize];
-                json!({
-                    "key": format!("{} {} [{}] -> unknown {}", s.class, self.fn_key(s.at_fn), s.via, self.fn_key(uo.at_fn)),
-                    "source": { "class": s.class, "file": self.files[s.at_fn.0 as usize].path, "line": s.row + 1, "entity": self.fn_name(s.at_fn), "via": s.via },
-                    "unknown": { "file": self.files[uo.at_fn.0 as usize].path, "line": uo.row + 1, "entity": self.fn_name(uo.at_fn), "why": uo.why },
-                    "path": e.path.iter().map(|s| self.step(s)).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
+        // compact: escapes are only counted (see `escape_keys`); they number
+        // sources x unresolved calls
+        let escapes: Vec<Value> = if full { o.escapes.iter().map(|e| self.escape_json(e, true)).collect() } else { Vec::new() };
         json!({
             "precision": PRECISION,
             "incomplete": o.incomplete,
+            "incompleteWhy": o.incomplete_why,
             "coverage": {
                 "files": self.files.len(),
                 "functions": self.files.iter().map(|f| f.fns.len()).sum::<usize>(),
@@ -320,9 +446,15 @@ impl Analysis {
             },
             "flows": flows,
             "unknownFlows": unknown_flows,
+            // a state holding values from unresolved calls that reaches a sink
+            "unknownThroughState": o.unknown_through_state.iter().map(|(r, s)| {
+                let k = &o.sinks[*s as usize];
+                json!({ "state": o.states[*r as usize].show(), "sink": { "class": k.class, "file": self.files[k.at_fn.0 as usize].path, "line": k.row + 1, "entity": self.fn_name(k.at_fn), "via": k.via } })
+            }).collect::<Vec<_>>(),
             "escapes": escapes,
+            "escapeCount": o.escapes.len(),
             "possibleFlows": possible,
-            "entities": self.entities_json(),
+            "entities": self.entities_json_with(full),
         })
     }
 }

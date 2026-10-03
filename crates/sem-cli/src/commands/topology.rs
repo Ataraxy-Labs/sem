@@ -131,6 +131,14 @@ impl Common {
         let cmd = Common::augment_args(clap::Command::new("sem"));
         Common::from_arg_matches(&cmd.get_matches_from(["sem", "--repo-root", repo_root])).expect("defaults parse")
     }
+
+    /// Defaults, with the repository root as a package too: single-package
+    /// repos and apps nested without a workspaces entry get nodes.
+    pub fn whole_repo(repo_root: &str) -> Common {
+        use clap::FromArgMatches;
+        let cmd = Common::augment_args(clap::Command::new("sem"));
+        Common::from_arg_matches(&cmd.get_matches_from(["sem", "--repo-root", repo_root, "--root-package"])).expect("defaults parse")
+    }
 }
 
 /// What laws are checked against: the workspace extraction is loaded only
@@ -159,6 +167,11 @@ struct Loaded {
 
 impl Loaded {
     fn load(common: Common) -> Loaded {
+        Self::load_in(common, None)
+    }
+
+    /// Reads only the files in `scope` (see `Extraction::run_in`).
+    fn load_in(common: Common, scope: Option<&std::collections::HashSet<String>>) -> Loaded {
         let t0 = Instant::now();
         let root = PathBuf::from(&common.repo_root);
         let disc = Discovery {
@@ -169,7 +182,7 @@ impl Loaded {
         };
         let ws = Workspace::discover(&root, &disc);
         let paths = ws.source_files(&disc);
-        let ex = Extraction::run(&root, ws, &paths);
+        let ex = Extraction::run_in(&root, ws, &paths, scope);
         Loaded { ex, common, t_extract: t0.elapsed() }
     }
 
@@ -231,8 +244,9 @@ impl Loaded {
 /// Empty when the root holds no JS/TS workspace.
 /// JS/TS import resolution of the tree at `repo_root`: `(importing file,
 /// specifier) -> repo file`, for every specifier that lands on a source file.
-pub(crate) fn spec_targets(repo_root: &str) -> std::collections::HashMap<(String, String), String> {
-    let l = Loaded::load(Common::at(repo_root));
+/// `scope`: only those importing files (all when `None`).
+pub(crate) fn spec_targets(repo_root: &str, scope: Option<&std::collections::HashSet<String>>) -> std::collections::HashMap<(String, String), String> {
+    let l = Loaded::load_in(Common::whole_repo(repo_root), scope);
     let mut out = std::collections::HashMap::new();
     for f in &l.ex.files {
         for r in &f.refs {
@@ -246,9 +260,9 @@ pub(crate) fn spec_targets(repo_root: &str) -> std::collections::HashMap<(String
 
 /// Relative JS/TS imports that land on no file at all: `(importing file,
 /// specifier)`.
-pub(crate) fn broken_relative_imports(repo_root: &str) -> BTreeSet<(String, String)> {
+pub(crate) fn broken_relative_imports(repo_root: &str, scope: Option<&std::collections::HashSet<String>>) -> BTreeSet<(String, String)> {
     use sem_core::topology::resolve::Target;
-    let l = Loaded::load(Common::at(repo_root));
+    let l = Loaded::load_in(Common::whole_repo(repo_root), scope);
     let root = std::path::Path::new(repo_root);
     let mut out = BTreeSet::new();
     for f in &l.ex.files {
@@ -268,8 +282,9 @@ pub(crate) fn broken_relative_imports(repo_root: &str) -> BTreeSet<(String, Stri
     out
 }
 
-pub(crate) fn module_value_graph(repo_root: &str) -> (Vec<String>, algo::Adj) {
-    let l = Loaded::load(Common::at(repo_root));
+/// With `scope`, the edges out of those files only.
+pub(crate) fn module_value_graph(repo_root: &str, scope: Option<&std::collections::HashSet<String>>) -> (Vec<String>, algo::Adj) {
+    let l = Loaded::load_in(Common::whole_repo(repo_root), scope);
     let g = l.graph(Some(Granularity::Module), Some(Selector::Value), &[FileKind::Prod], false);
     let adj = g.adjacency();
     (g.nodes.iter().map(|n| n.id.clone()).collect(), adj)

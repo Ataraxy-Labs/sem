@@ -91,7 +91,15 @@ impl Workspace {
             ws.by_name.insert(pkg.name.clone(), ws.packages.len());
             ws.packages.push(pkg);
         }
-        let dirs: Vec<&str> = std::iter::once("").chain(ws.packages.iter().map(|p| p.dir.as_str())).collect();
+        let mut dirs: Vec<String> = std::iter::once(String::new()).chain(ws.packages.iter().map(|p| p.dir.clone())).collect();
+        if opt.root_package {
+            // an app nested in the repo without a workspaces entry (`web/`)
+            // still has its own tsconfig `paths`
+            nested_tsconfig_dirs(&root, "", 0, opt, &mut dirs);
+            dirs.sort();
+            dirs.dedup();
+        }
+        let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
         ws.ts_paths = super::tsconfig::discover(&ws.root, &dirs);
         ws
     }
@@ -152,6 +160,25 @@ pub fn bare_package_name_len(spec: &str) -> Option<usize> {
         }
     } else {
         Some(first.len())
+    }
+}
+
+/// Directories (up to 4 levels deep) holding a tsconfig.json.
+fn nested_tsconfig_dirs(root: &Path, dir: &str, depth: usize, opt: &Discovery, out: &mut Vec<String>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root.join(dir)) else { return };
+    for e in entries.flatten() {
+        let Ok(name) = e.file_name().into_string() else { continue };
+        if name.starts_with('.') || !e.file_type().is_ok_and(|t| t.is_dir()) || opt.skip_segments.iter().any(|s| s == &name) {
+            continue;
+        }
+        let rel = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+        if root.join(&rel).join("tsconfig.json").is_file() {
+            out.push(rel.clone());
+        }
+        nested_tsconfig_dirs(root, &rel, depth + 1, opt, out);
     }
 }
 

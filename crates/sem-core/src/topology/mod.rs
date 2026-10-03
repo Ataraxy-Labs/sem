@@ -10,6 +10,7 @@ pub mod graph;
 pub mod imports;
 pub mod metrics;
 pub mod pattern;
+pub mod pyimports;
 pub mod query_scope;
 pub mod resolve;
 pub mod tsconfig;

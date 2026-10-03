@@ -68,16 +68,27 @@ pub struct Extraction {
     pub ws: Workspace,
     pub files: Vec<SourceFile>,
     by_path: HashMap<String, usize>,
+    /// Every source path, when only some were scanned (`run_in`): a scanned
+    /// file's import of an unscanned one is still an edge.
+    all_paths: Option<HashSet<String>>,
 }
 
 impl Extraction {
     /// `paths` are repo-relative source files (the caller decides the scan set).
     pub fn run(root: &Path, ws: Workspace, paths: &[String]) -> Extraction {
+        Self::run_in(root, ws, paths, None)
+    }
+
+    /// [`Self::run`], reading only the files in `scan` (all of `paths` when
+    /// `None`). Specifiers still resolve against every path, so a scanned
+    /// file's references are the same as in a full run.
+    pub fn run_in(root: &Path, ws: Workspace, paths: &[String], scan: Option<&HashSet<String>>) -> Extraction {
         let file_set: HashSet<String> = paths.iter().cloned().collect();
         let resolver = Resolver { ws: &ws, files: &file_set };
-        let files: Vec<SourceFile> = paths
+        let scanned: Vec<&String> = paths.iter().filter(|p| scan.is_none_or(|s| s.contains(p.as_str()))).collect();
+        let files: Vec<SourceFile> = scanned
             .par_iter()
-            .map(|p| {
+            .map(|&p| {
                 let content = std::fs::read_to_string(root.join(p)).unwrap_or_default();
                 let (refs, errs) = module_refs(p, &content);
                 let package = ws.owner_of(p);
@@ -104,7 +115,13 @@ impl Extraction {
             })
             .collect();
         let by_path = files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
-        Extraction { ws, files, by_path }
+        let all_paths = scan.map(|_| file_set);
+        Extraction { ws, files, by_path, all_paths }
+    }
+
+    /// A source file of the repo that was not scanned (`run_in`).
+    pub fn unscanned(&self, path: &str) -> bool {
+        self.all_paths.as_ref().is_some_and(|a| a.contains(path)) && !self.by_path.contains_key(path)
     }
 
     pub fn file(&self, path: &str) -> Option<&SourceFile> {
@@ -267,6 +284,27 @@ impl Graph {
                         let pkg = f.package.map(|p| ex.ws.packages[p].name.clone());
                         let id = add(&mut nodes, NodeKind::Module, f.path.clone(), pkg, Some(f.file_kind));
                         file_node.insert(f.path.as_str(), id);
+                    }
+                }
+                // files a scanned file imports but that were not scanned
+                // themselves: nodes too (their own imports are not known)
+                let mut extra: BTreeSet<&str> = BTreeSet::new();
+                for f in &files {
+                    for r in &f.refs {
+                        if let Target::File(p) = &r.target {
+                            if !file_node.contains_key(p.as_str()) && ex.unscanned(p) {
+                                extra.insert(p.as_str());
+                            }
+                        }
+                    }
+                }
+                for p in extra {
+                    let Some(o) = ex.ws.owner_of(p).filter(|&o| admitted[o]) else { continue };
+                    let rel = p.strip_prefix(&format!("{}/", ex.ws.packages[o].dir)).unwrap_or(p);
+                    let fk = classify(rel);
+                    if kind_ok(fk) {
+                        let id = add(&mut nodes, NodeKind::Module, p.to_string(), Some(ex.ws.packages[o].name.clone()), Some(fk));
+                        file_node.insert(p, id);
                     }
                 }
             }

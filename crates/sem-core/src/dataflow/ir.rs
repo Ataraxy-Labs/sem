@@ -158,6 +158,20 @@ pub struct Param {
     pub ty: Option<String>,
 }
 
+/// A parameter of a closure / nested function inlined into its enclosing
+/// function (its name is a local there), with what the front end saw of
+/// it: its declared type and the decorators of the nested definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosureParam {
+    pub name: String,
+    /// Position among the closure's parameters.
+    pub index: u32,
+    pub ty: Option<String>,
+    /// Decorators of the nested definition, as callee chains (`mcp.tool`).
+    pub decorators: Vec<String>,
+    pub row: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DfFn {
     pub name: String,
@@ -169,6 +183,11 @@ pub struct DfFn {
     /// The receiver name (`self`, `this`, a Go receiver) if a method.
     pub self_name: Option<String>,
     pub params: Vec<Param>,
+    /// Decorators of the definition, as callee chains without arguments
+    /// (`@mcp.tool()` -> `mcp.tool`, `@app.route("/x")` -> `app.route`).
+    pub decorators: Vec<String>,
+    /// Parameters of closures inlined into this function.
+    pub closure_params: Vec<ClosureParam>,
     pub calls: Vec<Call>,
     pub stmts: Vec<Stmt>,
     pub dynamic: Vec<Dynamic>,

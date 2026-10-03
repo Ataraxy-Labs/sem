@@ -246,6 +246,33 @@ const SCOPE_RESOLVE_BYTE_BUDGET: u64 = 20 * 1024 * 1024;
 #[cfg(test)]
 const SCOPE_RESOLVE_BYTE_BUDGET: u64 = 150;
 
+/// Source bytes up to which a build keeps every file's parse tree alive
+/// for the whole build (the retained path). A live tree costs 24.5x-40x
+/// its source bytes, so a file *count* alone does not bound it: 14.7k Go
+/// files of generated SDK code (242 MB) are under `PARSED_FILE_REUSE_LIMIT`
+/// and held ~6 GB of trees per tree built. Above this the build takes the
+/// chunked path, whose peak is bounded by `SCOPE_RESOLVE_BYTE_BUDGET`.
+#[cfg(not(test))]
+const PARSED_FILE_REUSE_BYTE_LIMIT: u64 = 24 * 1024 * 1024;
+#[cfg(test)]
+const PARSED_FILE_REUSE_BYTE_LIMIT: u64 = u64::MAX;
+
+/// Total on-disk size of `file_paths` under `root` (`stat` only).
+pub fn source_bytes(root: &Path, file_paths: &[String]) -> u64 {
+    file_paths
+        .iter()
+        .map(|f| std::fs::metadata(root.join(f)).map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
+/// Whether a build over `file_paths` keeps all parse trees (see
+/// `PARSED_FILE_REUSE_LIMIT` and `PARSED_FILE_REUSE_BYTE_LIMIT`).
+pub(crate) fn retain_parsed_files(root: &Path, file_paths: &[String]) -> bool {
+    file_paths.len() <= PARSED_FILE_REUSE_LIMIT
+        && (PARSED_FILE_REUSE_BYTE_LIMIT == u64::MAX
+            || source_bytes(root, file_paths) <= PARSED_FILE_REUSE_BYTE_LIMIT)
+}
+
 /// Partition `file_paths` (assumed already in a stable, deterministic order —
 /// every caller sorts its input) into contiguous chunks, each holding no more
 /// than `budget_bytes` of cumulative on-disk source size, except that a
@@ -2101,7 +2128,7 @@ impl EntityGraph {
         report_build_phase(BuildPhase::Parsing {
             files: file_paths.len(),
         });
-        let retain_parsed_files = file_paths.len() <= PARSED_FILE_REUSE_LIMIT;
+        let retain_parsed_files = retain_parsed_files(root, file_paths);
         // Pass 1: Extract all entities in parallel (file I/O + tree-sitter parsing)
         // Small and medium repos reuse parse trees in scope resolution; large repos
         // keep peak memory bounded by reparsing scope chunks.
@@ -3304,7 +3331,7 @@ impl EntityGraph {
     where
         F: FnMut(&EntityInfo) -> bool,
     {
-        let retain_parsed_files = file_paths.len() <= PARSED_FILE_REUSE_LIMIT;
+        let retain_parsed_files = retain_parsed_files(root, file_paths);
         let per_file: Vec<(
             Vec<SemanticEntity>,
             Option<(String, String, tree_sitter::Tree)>,
@@ -3469,7 +3496,7 @@ impl EntityGraph {
             );
         }
 
-        let scope_file_paths = if file_paths.len() > PARSED_FILE_REUSE_LIMIT {
+        let scope_file_paths = if !retain_parsed_files {
             let mut scoped = Vec::new();
             // same byte-budget partition as `resolve_scopes_in_file_chunks`
             // (no `scope_tag`/incremental state threaded through this path, so

@@ -5,12 +5,15 @@
     { "match": ["std::env::var", "std::env::var_os", "std::env::vars", "std::env::vars_os", "env!", "option_env!"], "kind": "source", "class": "env" },
     { "match": ["std::env::args", "std::env::args_os"], "kind": "source", "class": "cli-input" },
     { "match": ["axum::extract::Query", "axum::extract::Path", "axum::extract::Form", "axum::extract::Json", "axum::Json", "axum::Form", "axum::extract::RawQuery", "axum::body::Bytes", "actix_web::web::Query", "actix_web::web::Path", "actix_web::web::Form", "actix_web::web::Json", "actix_web::HttpRequest", "actix_web::web::Bytes", "rocket::Request"], "kind": "param-source", "class": "http-input" },
+    { "match": ["axum::extract::ws::WebSocket", "axum::extract::ws::Message", "actix_web::web::Payload"], "kind": "param-source", "class": "http-input" },
+    { "match": ["rmcp::handler::server::tool::Parameters", "rmcp::handler::server::wrapper::Parameters", "rmcp::handler::server::router::tool::Parameters", "rmcp::model::CallToolRequestParam", "rmcp::model::CallToolRequestParams"], "kind": "param-source", "class": "tool-input" },
 
     { "match": ["std::process::Command::new", "std::process::Command::arg", "std::process::Command::args", "tokio::process::Command::new", "tokio::process::Command::arg", "tokio::process::Command::args"], "kind": "sink", "class": "exec", "args": [0] },
     { "match": ["std::process::Command::new", "std::process::Command::arg", "std::process::Command::args", "std::process::Command::env", "std::process::Command::current_dir"], "kind": "returns", "type": "std::process::Command" },
     { "match": ["tokio::process::Command::new", "tokio::process::Command::arg", "tokio::process::Command::args"], "kind": "returns", "type": "tokio::process::Command" },
 
     { "match": ["std::fs::read_to_string", "std::fs::read", "std::fs::read_dir", "tokio::fs::read_to_string", "tokio::fs::read", "std::fs::File::open", "tokio::fs::File::open"], "kind": "source", "class": "file-read" },
+    { "match": ["std::fs::read_to_string", "std::fs::read", "std::fs::File::open", "std::fs::File::create", "std::fs::write", "std::fs::remove_file", "std::fs::remove_dir_all", "tokio::fs::read_to_string", "tokio::fs::File::open", "tokio::fs::write"], "kind": "sink", "class": "file-path", "args": [0] },
     { "match": ["std::fs::write", "std::fs::remove_file", "std::fs::remove_dir_all", "std::fs::create_dir_all", "std::fs::copy", "std::fs::rename", "tokio::fs::write", "std::fs::File::create", "tokio::fs::File::create"], "kind": "sink", "class": "file-write" },
 
     { "match": ["sqlx::query", "sqlx::query_as", "sqlx::query_scalar", "diesel::sql_query", "rusqlite::Connection::execute", "rusqlite::Connection::prepare", "rusqlite::Connection::query_row", "postgres::Client::query", "postgres::Client::execute", "tokio_postgres::Client::query", "tokio_postgres::Client::execute"], "kind": "sink", "class": "db", "args": [0] },

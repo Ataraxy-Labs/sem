@@ -14,6 +14,7 @@ pub mod impact;
 pub mod log;
 pub mod promises;
 pub mod query;
+pub(crate) mod region;
 pub mod repos;
 pub(crate) mod review;
 pub mod setup;

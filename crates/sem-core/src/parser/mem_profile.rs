@@ -49,6 +49,35 @@ pub(crate) fn entry(name: &'static str, bytes: usize) -> Entry {
 /// dotnet with no timer and no counter covering it, precisely because the
 /// boundaries either side of it are outside this crate. Sampling is still
 /// opt-in and still shells out at most a handful of times per build.
+/// The process's peak resident set size so far (`getrusage` `ru_maxrss`),
+/// in bytes. `None` where unavailable.
+pub fn peak_rss_bytes() -> Option<usize> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // struct rusage: two timevals, then ru_maxrss and 13 more longs
+        #[repr(C)]
+        struct RUsage {
+            times: [i64; 4],
+            maxrss: i64,
+            rest: [i64; 13],
+        }
+        extern "C" {
+            fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+        }
+        let mut u = RUsage { times: [0; 4], maxrss: 0, rest: [0; 13] };
+        // SAFETY: RUSAGE_SELF (0) with a buffer the size of `struct rusage`
+        if unsafe { getrusage(0, &mut u) } != 0 {
+            return None;
+        }
+        let scale = if cfg!(target_os = "macos") { 1 } else { 1024 };
+        Some(u.maxrss.max(0) as usize * scale)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 pub fn current_rss_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {

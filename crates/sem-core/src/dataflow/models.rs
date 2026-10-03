@@ -17,6 +17,13 @@
 //! - `callback` `{arg: "each"|"last"|<index>, params: [{index, source?,
 //!   type?}]}`: closures passed at `arg` get these parameter facts
 //!   (`app.get(path, (req, res) => ..)`).
+//! - `handler` `{class, params?, arg?, except_types?}`: a function
+//!   registered with this name receives `class` data in its parameters
+//!   (all, or the indices in `params`): one *decorated* with it
+//!   (`@mcp.tool()`, `@app.route(..)`), or, with `arg`, one passed by name
+//!   at argument `arg` of a call to it (`path("x/", views.show)`). A
+//!   parameter declared with a type in `except_types` is not input (an
+//!   injected framework context).
 //! - `dynamic`: the call defeats static tracking (reflection, `eval`): an
 //!   explicit unknown.
 //! - `sanitizer`: the result carries no data of its arguments (`int(x)`).
@@ -37,8 +44,11 @@ use serde_json::Value;
 
 use super::ir::Lang;
 
-pub const SOURCE_CLASSES: &[&str] = &["http-input", "env", "file-read", "db-read", "net-input", "cli-input"];
-pub const SINK_CLASSES: &[&str] = &["exec", "db", "net-send", "log", "template", "file-write", "http-response"];
+/// `tool-input`: arguments of a tool call from an agent / MCP client.
+pub const SOURCE_CLASSES: &[&str] = &["http-input", "tool-input", "env", "file-read", "db-read", "net-input", "cli-input"];
+/// `file-path`: data naming a file to open, read, serve or delete (path
+/// traversal); `file-write`: data written into a file.
+pub const SINK_CLASSES: &[&str] = &["exec", "db", "net-send", "log", "template", "file-write", "file-path", "http-response"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CbArg {
@@ -55,8 +65,17 @@ pub struct CbParam {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Handler {
+    pub class: String,
+    pub params: Option<Vec<u32>>,
+    pub arg: Option<u32>,
+    pub except_types: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Source(String),
+    Handler(Handler),
     Sink(String, Option<Vec<u32>>),
     Returns(String),
     ParamSource(String),
@@ -147,6 +166,19 @@ pub fn validate(v: &Value) -> Vec<String> {
                     }
                 }
             }
+            "handler" => {
+                if !class.is_some_and(|c| SOURCE_CLASSES.contains(&c)) {
+                    errs.push(format!("models[{i}]: handler class {class:?} is not one of {SOURCE_CLASSES:?}"));
+                }
+                if let Some(a) = m.get("params") {
+                    if !a.as_array().is_some_and(|a| a.iter().all(|x| x.as_u64().is_some())) {
+                        errs.push(format!("models[{i}]: handler `params` must be a list of parameter indices"));
+                    }
+                }
+                if m.get("arg").is_some_and(|a| a.as_u64().is_none()) {
+                    errs.push(format!("models[{i}]: handler `arg` must be an argument index"));
+                }
+            }
             "returns" => {
                 if m["type"].as_str().is_none_or(str::is_empty) {
                     errs.push(format!("models[{i}]: `returns` needs a `type`"));
@@ -191,6 +223,12 @@ fn parse_kind(m: &Value) -> Option<Kind> {
     Some(match m["kind"].as_str()? {
         "source" => Kind::Source(class()?),
         "param-source" => Kind::ParamSource(class()?),
+        "handler" => Kind::Handler(Handler {
+            class: class()?,
+            params: m["params"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()),
+            arg: m["arg"].as_u64().map(|x| x as u32),
+            except_types: m["except_types"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        }),
         "sink" => Kind::Sink(
             class()?,
             m["args"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()),
@@ -307,6 +345,12 @@ impl Models {
     pub fn sink_methods(&self, lang: Lang, method: &str) -> Vec<&Model> {
         let Some(idx) = self.langs.get(&lang) else { return Vec::new() };
         idx.sink_methods.get(method).into_iter().flatten().map(|&i| &idx.models[i]).collect()
+    }
+
+    /// Every `handler` model of a language.
+    pub fn handlers(&self, lang: Lang) -> Vec<&Model> {
+        let Some(idx) = self.langs.get(&lang) else { return Vec::new() };
+        idx.models.iter().filter(|m| matches!(m.kind, Kind::Handler(_))).collect()
     }
 
     pub fn count(&self) -> usize {

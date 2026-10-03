@@ -57,7 +57,6 @@ use crate::parser::facts_store::{
 };
 use crate::parser::graph::{
     BuildCarry, CachedImportScan, ClassMembers, EntityGraph, EntityRanges, OwnerMembers,
-    PARSED_FILE_REUSE_LIMIT,
 };
 use crate::parser::import_resolution::is_reuse_eligible_file;
 use crate::parser::incremental::{
@@ -213,8 +212,8 @@ impl GraphSession {
         // Chunked corpora resolve against chunk-scoped return-type and
         // instance-attribute maps, so an add or a delete shifts what every file
         // after it resolves against. Refuse reuse rather than reason about it.
-        let chunked = file_paths.len() > PARSED_FILE_REUSE_LIMIT
-            || self.file_paths.len() > PARSED_FILE_REUSE_LIMIT;
+        let chunked = !crate::parser::graph::retain_parsed_files(&self.root, file_paths)
+            || !crate::parser::graph::retain_parsed_files(&self.root, &self.file_paths);
         let file_list_changed = added > 0 || deleted > 0;
         let nothing_to_reuse = self.fingerprints.is_empty();
         let reuse = !(nothing_to_reuse || (chunked && file_list_changed));

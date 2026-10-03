@@ -824,6 +824,24 @@ pub fn site_answers(
     out
 }
 
+/// `(declaration or base method, implementation or override)` pairs as sem
+/// entity ids: a call answered with the first may run the second.
+pub fn dispatch_answers(root: &FsPath, lang: &dyn Lang, files: &[(&str, &FileFacts)], entities: &[SemanticEntity]) -> Vec<(String, String)> {
+    let facts: Vec<&FileFacts> = files.iter().map(|(_, f)| *f).collect();
+    let layout = lang.layout(root, files);
+    let tables = ScopeTables::build(&facts, &layout);
+    let impls = ImplTables::build(&facts, &tables.view(), lang);
+    let ids = EntityIds::build(files, entities);
+    let mut pairs = dispatch_pairs(lang, &facts, &impls);
+    if lang.virtual_methods() {
+        pairs.extend(override_pairs(&Resolver::new(lang, &facts, tables.view(), &impls), &facts, &impls));
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(d, i)| Some((ids.fns[d.0 as usize][d.1 as usize]?.to_string(), ids.fns[i.0 as usize][i.1 as usize]?.to_string())))
+        .collect()
+}
+
 /// Describe how every site in `target` resolves (debugging aid for the
 /// call-graph harness): one line per site, `row: expr => pick`.
 pub fn explain(root: &FsPath, files: &[(&str, &FileFacts)], target: &str) -> Vec<String> {

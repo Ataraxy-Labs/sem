@@ -50,7 +50,12 @@ pub(crate) struct Tree {
     pub(crate) dir: tempfile::TempDir,
     pub(crate) graph: EntityGraph,
     pub(crate) entities: Vec<SemanticEntity>,
+    /// The files analyzed: every supported file, or a diff-scoped region's.
     pub(crate) files: Vec<String>,
+    /// Every supported file of the tree.
+    pub(crate) all_files: Vec<String>,
+    /// The region `files` was restricted to (`None`: the whole tree).
+    pub(crate) scope: Option<HashSet<String>>,
 }
 
 pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -84,13 +89,104 @@ fn materialize(root: &Path, sha: &str) -> Result<tempfile::TempDir, String> {
     Ok(dir)
 }
 
-pub(crate) fn build_tree(root: &Path, sha: &str) -> Result<Tree, String> {
+/// A materialized tree and its supported source files.
+fn list_tree(root: &Path, sha: &str) -> Result<(tempfile::TempDir, Vec<String>), String> {
     let dir = materialize(root, sha)?;
     let registry = super::create_registry(&dir.path().to_string_lossy());
     let files = super::graph::find_supported_files_public(dir.path(), &registry, &[]);
-    let (graph, entities) = EntityGraph::build(dir.path(), &files, &registry);
-    Ok(Tree { dir, graph, entities, files })
+    Ok((dir, files))
 }
+
+fn graph_tree(dir: tempfile::TempDir, all_files: Vec<String>, scope: Option<&HashSet<String>>) -> Tree {
+    let registry = super::create_registry(&dir.path().to_string_lossy());
+    let files: Vec<String> = match scope {
+        Some(r) => all_files.iter().filter(|f| r.contains(f.as_str())).cloned().collect(),
+        None => all_files.clone(),
+    };
+    let (graph, entities) = EntityGraph::build(dir.path(), &files, &registry);
+    Tree { dir, graph, entities, files, all_files, scope: scope.cloned() }
+}
+
+/// How much of the two trees `arch-diff` analyzes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Scope {
+    /// Every file.
+    Full,
+    /// The diff's region (see `region`), within this many source bytes.
+    Diff { budget: u64 },
+    /// Full when the head tree has at most `full_max` bytes of code, else
+    /// diff-scoped.
+    Auto { full_max: u64, budget: u64 },
+}
+
+/// The paths a range touches and its semantic changes.
+pub(crate) fn semantic_changes(root: &Path, base: &str, head: &str) -> Result<(BTreeSet<String>, Vec<SemanticChange>), Box<dyn std::error::Error>> {
+    let bridge = GitBridge::open(root)?;
+    let file_changes = bridge.get_changed_files(&DiffScope::Range { from: base.to_string(), to: head.to_string() }, &[])?;
+    let registry = super::create_registry(&root.to_string_lossy());
+    let diff = compute_semantic_diff(&file_changes, &registry, None, None);
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for f in &file_changes {
+        paths.insert(f.file_path.clone());
+        if let Some(o) = &f.old_file_path {
+            paths.insert(o.clone());
+        }
+    }
+    Ok((paths, diff.changes))
+}
+
+/// Both trees of a range under `scope`, and the region when diff-scoped.
+pub(crate) fn build_trees_in(root: &Path, base: &str, head: &str, scope: Scope) -> Result<(Tree, Tree, Option<super::region::Region>), Box<dyn std::error::Error>> {
+    let (bl, hl) = std::thread::scope(|s| {
+        let b = s.spawn(|| list_tree(root, base));
+        let h = s.spawn(|| list_tree(root, head));
+        (b.join().expect("base materialize"), h.join().expect("head materialize"))
+    });
+    let ((bd, bf), (hd, hf)) = (bl?, hl?);
+    let head_bytes = sem_core::parser::graph::source_bytes(hd.path(), &hf);
+    // the whole-tree cost is that of code (data, markup and config files are cheap)
+    let code: Vec<String> = hf.iter().filter(|f| super::region::is_code(f)).cloned().collect();
+    let code_bytes = sem_core::parser::graph::source_bytes(hd.path(), &code);
+    let budget = match scope {
+        Scope::Full => None,
+        Scope::Diff { budget } => Some(budget),
+        Scope::Auto { full_max, budget } => (code_bytes > full_max).then_some(budget),
+    };
+    let region = match budget {
+        Some(budget) => {
+            let (changed, changes) = semantic_changes(root, base, head)?;
+            Some(super::region::select([(bd.path(), &bf), (hd.path(), &hf)], &changed, &changes, budget))
+        }
+        None => None,
+    };
+    if std::env::var_os("SEM_TIMINGS").is_some() {
+        match &region {
+            Some(r) => eprintln!("scope diff: head {head_bytes} source bytes, {code_bytes} code; region {} files, {} bytes of {} files; {} names not followed", r.files.len(), r.bytes, r.repo_files, r.unexplored.len()),
+            None => eprintln!("scope full: head {head_bytes} source bytes, {code_bytes} code"),
+        }
+    }
+    let r = region.as_ref().map(|r| &r.files);
+    let analyzed = match r {
+        Some(_) => region.as_ref().map_or(0, |r| r.bytes),
+        None => head_bytes,
+    };
+    if analyzed > PARALLEL_BUILD_MAX_BYTES {
+        let bt = graph_tree(bd, bf, r);
+        let ht = graph_tree(hd, hf, r);
+        return Ok((bt, ht, region));
+    }
+    let (bt, ht) = std::thread::scope(|s| {
+        let b = s.spawn(|| graph_tree(bd, bf, r));
+        let h = s.spawn(|| graph_tree(hd, hf, r));
+        (b.join().expect("base build"), h.join().expect("head build"))
+    });
+    Ok((bt, ht, region))
+}
+
+/// Source bytes above which the two trees' graphs are built one after the
+/// other: each build already uses every core, and two concurrent builds of a
+/// large tree double the peak.
+const PARALLEL_BUILD_MAX_BYTES: u64 = 24 * 1024 * 1024;
 
 /// The callable header of an entity: text up to the end of its first
 /// parameter list plus any return annotation, whitespace-normalized.
@@ -141,6 +237,80 @@ fn signature(content: &str) -> Option<String> {
     let norm = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let norm = norm.replace("( ", "(").replace(" )", ")").replace(",)", ")");
     Some(norm.chars().take(240).collect())
+}
+
+/// Entity types that declare a value, not a callable.
+const VALUE_TYPES: &[&str] = &["variable", "constant", "const", "var", "static", "field", "property"];
+
+/// Does a value declaration hold a function (`const f = (a) => ..`,
+/// `var h = func(..)`)? Then its parameter list is a contract.
+fn holds_callable(content: &str) -> bool {
+    let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let rhs = first.split_once('=').map(|x| x.1).unwrap_or("").trim_start();
+    content.contains("=>") || rhs.starts_with("func(") || rhs.starts_with("function") || rhs.starts_with("async") || rhs.starts_with("lambda")
+}
+
+/// The declared type of a value declaration, whitespace-normalized
+/// (`var (x T = e)`, `var x T = e`, `const x: T = e`, `static X: T = e`
+/// -> `T`); empty when none is written. The initializer is not part of
+/// the contract, nor is the `var ( .. )` grouping or a comment.
+fn declared_type(content: &str) -> String {
+    let code: String = content
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            let t = t.split_once("//").map(|x| x.0).unwrap_or(t);
+            if t.starts_with('#') { "" } else { t }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut t = code.trim();
+    loop {
+        let before = t;
+        for kw in ["export ", "declare ", "pub(crate) ", "pub ", "public ", "private ", "protected ", "readonly ", "static ", "var ", "let ", "const ", "mut "] {
+            t = t.strip_prefix(kw).unwrap_or(t).trim_start();
+        }
+        if let Some(x) = t.strip_prefix('(') {
+            t = x.trim_start();
+            t = t.strip_suffix(')').unwrap_or(t).trim_end();
+        }
+        if t == before {
+            break;
+        }
+    }
+    // up to the top-level `=` (not `=>`, `==`, `<=`, `>=`, `!=`, `:=`)
+    let b = t.as_bytes();
+    let mut depth = 0i32;
+    let mut end = t.len();
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b'=' if depth <= 0 => {
+                let next = b.get(i + 1).copied();
+                let prev = if i > 0 { b[i - 1] } else { b' ' };
+                if next != Some(b'=') && next != Some(b'>') && !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':') {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let decl = t[..end].trim();
+    // drop the name
+    let rest = decl.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '$').trim_start();
+    let rest = rest.trim_start_matches('?').trim_start_matches(':').trim();
+    rest.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The contract text of an entity for signature comparison: the callable
+/// header, or for a value declaration its declared type.
+fn contract(entity_type: &str, content: &str) -> Option<String> {
+    if VALUE_TYPES.contains(&entity_type) && !holds_callable(content) {
+        return Some(format!("type {}", declared_type(content)).trim_end().to_string());
+    }
+    signature(content)
 }
 
 fn kind_str(c: &ChangeType) -> &'static str {
@@ -237,14 +407,10 @@ pub(crate) fn resolve_range(root: &Path, range: &str) -> Result<(String, String)
     Ok((base, head))
 }
 
-/// Both trees of a range, built in parallel.
+/// Both trees of a range, whole.
 pub(crate) fn build_trees(root: &Path, base: &str, head: &str) -> Result<(Tree, Tree), Box<dyn std::error::Error>> {
-    let (bt, ht) = std::thread::scope(|s| {
-        let b = s.spawn(|| build_tree(root, base));
-        let h = s.spawn(|| build_tree(root, head));
-        (b.join().expect("base build"), h.join().expect("head build"))
-    });
-    Ok((bt?, ht?))
+    let (bt, ht, _) = build_trees_in(root, base, head, Scope::Full)?;
+    Ok((bt, ht))
 }
 
 pub fn certify_command(opts: CertifyOptions) -> Result<(), Box<dyn std::error::Error>> {
@@ -314,8 +480,8 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
     changes.sort_by(|a, b| (a.file_path.as_str(), a.start_line).cmp(&(b.file_path.as_str(), b.start_line)));
     for c in &changes {
         let id = c.entity_id.as_str();
-        let before_sig = c.before_content.as_deref().and_then(signature);
-        let after_sig = c.after_content.as_deref().and_then(signature);
+        let before_sig = c.before_content.as_deref().and_then(|b| contract(&c.entity_type, b));
+        let after_sig = c.after_content.as_deref().and_then(|a| contract(&c.entity_type, a));
         entities_out.push(json!({ "change": kind_str(&c.change_type), "type": c.entity_type, "name": c.entity_name,
             "file": c.file_path, "lines": [c.start_line, c.end_line], "oldName": c.old_entity_name, "oldFile": c.old_file_path }));
         let in_head = hg.entities.contains_key(id);
@@ -418,7 +584,7 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
         .iter()
         .filter_map(|id| hg.entities.get(*id).filter(|e| head_tests.contains(*id) || is_test_file(&e.file_path)).map(|e| e.file_path.clone()))
         .collect();
-    let total_files = ht.files.len();
+    let total_files = ht.all_files.len();
 
     // -- laws: base vs head ---------------------------------------------------
     let mut law_specs: Vec<Value> = Vec::new();
@@ -461,8 +627,8 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
     }
 
     // -- JS/TS module reachability delta --------------------------------------
-    let (bn, badj) = super::topology::module_value_graph(&bt.dir.path().to_string_lossy());
-    let (hn, hadj) = super::topology::module_value_graph(&ht.dir.path().to_string_lossy());
+    let (bn, badj) = super::topology::module_value_graph(&bt.dir.path().to_string_lossy(), bt.scope.as_ref());
+    let (hn, hadj) = super::topology::module_value_graph(&ht.dir.path().to_string_lossy(), ht.scope.as_ref());
     let mut module_out = Value::Null;
     if !hn.is_empty() {
         let edges = |n: &Vec<String>, adj: &sem_core::topology::algo::Adj| -> BTreeSet<(String, String)> {
@@ -712,7 +878,23 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::signature;
+    use super::{contract, signature};
+
+    #[test]
+    fn a_value_declaration_compares_by_declared_type() {
+        let grouped = "var (\n\tlogger = logging.DefaultLogger.WithField(\"k\", \"v\")\n)";
+        let flat = "var logger = logging.DefaultLogger.WithField(\"k\", \"v\")";
+        assert_eq!(contract("variable", grouped), contract("variable", flat));
+        let commented = "var (\n\t// retina-mode: basic, advanced\n\tretinaMode = flag.String(\"retina-mode\", \"basic\", \"x\")\n)";
+        assert_eq!(contract("variable", commented), contract("variable", "var retinaMode = flag.String(\"retina-mode\", \"basic\", \"x\")"));
+        // a new initializer is not a new contract
+        assert_eq!(contract("variable", "var errX = errors.New(\"a\")"), contract("variable", "var errX = errors.New(\"b\")"));
+        // a new declared type is
+        assert_ne!(contract("variable", "var n int = 1"), contract("variable", "var n int64 = 1"));
+        assert_ne!(contract("variable", "export const n: number = 1"), contract("variable", "export const n: string = '1'"));
+        // a value holding a function keeps its parameter list as the contract
+        assert_eq!(contract("variable", "export const f = (a: A, b?: B) => {\n};").as_deref(), Some("export const f = (a: A, b?: B)"));
+    }
 
     #[test]
     fn signature_of_python_def_with_decorator() {

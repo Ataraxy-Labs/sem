@@ -21,10 +21,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use super::ir::*;
-use super::models::{CbArg, Kind, Models};
+use super::models::{CbArg, Handler, Kind, Models};
 use crate::parser::calls::SiteAnswer;
 
 pub type FnRef = (u32, u32);
+/// Parameter `.1` of function `.0`.
+pub type ParamNode = (FnRef, u16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Label {
@@ -58,6 +60,8 @@ pub struct SrcOrigin {
     pub class: String,
     pub at_fn: FnRef,
     pub row: u32,
+    /// Byte offset of the site (a call, a read; synthetic for parameters).
+    pub at: u32,
     /// The qualified name that matched a model.
     pub via: String,
 }
@@ -85,6 +89,8 @@ pub struct SinkSite {
     pub class: String,
     pub at_fn: FnRef,
     pub row: u32,
+    /// Byte offset of the call.
+    pub at: u32,
     pub via: String,
     pub precision: Precision,
 }
@@ -103,8 +109,6 @@ struct Summary {
     sinks: BTreeMap<(u32, Label), Vec<Step>>,
     /// Parameters written into state.
     writes: BTreeSet<(u32, Label)>,
-    /// Parameters passed to calls with no known target.
-    escapes: BTreeMap<(u32, Label), Vec<Step>>,
     /// Parameters reaching name-only sink hints.
     possible: BTreeMap<(u32, Label), Vec<Step>>,
 }
@@ -114,7 +118,6 @@ impl Summary {
         self.ret == o.ret
             && self.writes == o.writes
             && self.sinks.keys().eq(o.sinks.keys())
-            && self.escapes.keys().eq(o.escapes.keys())
             && self.possible.keys().eq(o.possible.keys())
     }
 }
@@ -133,7 +136,28 @@ pub struct Flow {
 pub struct Escape {
     pub src: u32,
     pub unk: u32,
-    pub path: Vec<Step>,
+    /// How to rebuild the witness path ([`Output::escape_path`]): escapes
+    /// number sources x unresolved calls, so their paths are not stored.
+    pub witness: Witness,
+}
+
+/// A compact escape witness.
+#[derive(Clone, Debug)]
+pub enum Witness {
+    /// The path itself (an escape found inside one function's evaluation).
+    Path(Vec<Step>),
+    /// The source label, in `at`, passed at `step` into parameter `node`,
+    /// which reaches the unresolved call through parameters passed on.
+    Param { at: FnRef, step: Step, node: ParamNode },
+    /// The source written into `via_state` by `writer` at `row`, and that
+    /// state (or one holding it) reaching the unresolved call by `tail`.
+    State { writer: FnRef, row: u32, via_state: u32, tail: StateTail },
+}
+
+#[derive(Clone, Debug)]
+pub enum StateTail {
+    Path(std::sync::Arc<Vec<Step>>),
+    Param { step: Step, node: ParamNode },
 }
 
 /// Per-function facts: what it reads and writes, directly.
@@ -143,6 +167,8 @@ pub struct FnFacts {
     pub writes: BTreeSet<String>,
     pub calls_repo: BTreeSet<FnRef>,
     pub unknown_calls: Vec<(u32, String)>,
+    /// The called name (last segment) of each unresolved call: `(row, name)`.
+    pub unknown_callees: Vec<(u32, String)>,
     pub dynamic: Vec<(u32, String)>,
 }
 
@@ -169,7 +195,11 @@ pub struct Input<'a> {
     pub type_entity: &'a HashMap<String, (u32, String)>,
     /// Per file: JS/TS import specifier -> repo file index.
     pub spec_file: &'a [HashMap<String, u32>],
+    /// Entity id -> implementations / overrides a call to it may run.
+    pub dispatch: &'a HashMap<String, Vec<String>>,
     pub models: &'a Models,
+    /// Stop propagating past these (the output is then `incomplete`).
+    pub limits: super::Limits,
 }
 
 pub struct Output {
@@ -180,13 +210,25 @@ pub struct Output {
     pub flows: Vec<Flow>,
     /// Values produced by unresolved calls that reach a sink: `(unk, sink)`.
     pub unknown_flows: Vec<(u32, u32, Vec<Step>)>,
+    /// `(state, sink)`: a state holding values from unresolved calls
+    /// reaches the sink (not enumerated per unresolved call).
+    pub unknown_through_state: Vec<(u32, u32)>,
     pub escapes: Vec<Escape>,
+    /// What rebuilding escape witnesses needs.
+    pub arrive: HashMap<(FnRef, Label), (FnRef, u32)>,
+    pub param_edges: HashMap<ParamNode, BTreeMap<ParamNode, Step>>,
+    pub param_unk: HashMap<ParamNode, BTreeMap<u32, Vec<Step>>>,
+    /// `fn_label` of every function, by file and index.
+    pub labels: Vec<Vec<String>>,
     /// Name-only sink hints reached by source data.
     pub possible: Vec<Flow>,
     pub facts: Vec<Vec<FnFacts>>,
     pub coverage: Coverage,
-    /// The fixpoint hit its budget: results are a partial under-approximation.
+    /// The fixpoint hit its budget (work or time): results are a partial
+    /// under-approximation.
     pub incomplete: bool,
+    /// Why it is incomplete (`work budget`, `time budget`).
+    pub incomplete_why: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,7 +268,7 @@ pub struct Engine<'a> {
     state_ids: Interner<Resource>,
     sinks: Vec<SinkSite>,
     sink_ids: Interner<(FnRef, u32, String, Precision)>,
-    summaries: Vec<Vec<Summary>>,
+    summaries: Vec<Vec<std::rc::Rc<Summary>>>,
     callers: HashMap<FnRef, BTreeSet<FnRef>>,
     /// Labels written into each state, with the first writer.
     state_taint: HashMap<u32, BTreeMap<Label, (FnRef, u32)>>,
@@ -235,11 +277,29 @@ pub struct Engine<'a> {
     arrive: HashMap<(FnRef, Label), (FnRef, u32)>,
     flows: BTreeMap<(u32, u32), Flow>,
     unknown_flows: BTreeMap<(u32, u32), Vec<Step>>,
-    escapes: BTreeMap<(u32, u32), Escape>,
+    escapes: HashMap<(u32, u32), Escape>,
     possible: BTreeMap<(u32, u32), Flow>,
     /// State labels reaching sinks / unknown calls, resolved at the end.
     state_sinks: BTreeMap<(u32, u32), Vec<Step>>,
-    state_escapes: BTreeMap<(u32, u32), Vec<Step>>,
+    state_escapes: BTreeMap<(u32, u32), std::sync::Arc<Vec<Step>>>,
+    /// `(state, sink site)`: the state holds values from unresolved code
+    /// and reaches the sink (unknown-origin flows through state).
+    unknown_through_state: BTreeSet<(u32, u32)>,
+    /// Escapes are not carried in summaries (a hub function's set of
+    /// transitively reachable unresolved calls is large, and every caller
+    /// would copy it). Instead: a parameter reaching an unresolved call
+    /// directly (`param_unk`), a parameter passed on to a callee's parameter
+    /// (`param_edges`), and the source / state labels arriving at a callee
+    /// parameter; escapes are their reachability, resolved once at the end.
+    param_unk: HashMap<ParamNode, BTreeMap<u32, Vec<Step>>>,
+    /// Escapes and unknown-origin flows are kept per function holding the
+    /// unresolved call, not per call site: the first site seen in a
+    /// function stands for all of them (their count is per site in
+    /// `coverage`). Per-site pairs grow with sources x call sites.
+    unk_rep: HashMap<FnRef, u32>,
+    param_edges: HashMap<ParamNode, BTreeMap<ParamNode, Step>>,
+    src_at_param: BTreeMap<(u32, ParamNode), (FnRef, Step)>,
+    state_at_param: BTreeMap<(u32, ParamNode), Step>,
     state_possible: BTreeMap<(u32, u32), Vec<Step>>,
     /// Qualified types of module values, per file; of object fields.
     global_types: Vec<HashMap<String, String>>,
@@ -254,6 +314,9 @@ pub struct Engine<'a> {
     coverage: Coverage,
     collecting: bool,
     counting: bool,
+    /// Functions registered as handlers by a call (`path("x/", views.show)`):
+    /// the handler model and the qualified registering name.
+    registered: HashMap<FnRef, Vec<(Handler, String)>>,
 }
 
 /// Evaluation state of one function.
@@ -265,9 +328,51 @@ struct Cx {
     results: Vec<Labels>,
     targets: Vec<Option<Target>>,
     summary: Summary,
+    /// Per call: the input labels (args, kwargs, receiver) of its last
+    /// evaluation and its result. Within one analysis the callees'
+    /// summaries are fixed, so equal inputs give the same result and
+    /// the same (idempotent) effects: the call need not be re-evaluated.
+    memo: Vec<Option<CallMemo>>,
+}
+
+struct CallMemo {
+    args: Vec<Labels>,
+    kwargs: Vec<Labels>,
+    recv: Labels,
+    ret: Labels,
 }
 
 const MAX_FN_ITER: usize = 16;
+/// Largest call (input + result labels) whose evaluation is memoized.
+const MEMO_MAX_LABELS: usize = 64;
+
+/// Checks the process's resident memory against a limit, at most every
+/// quarter second (reading it is a system call or a `ps`).
+struct MemGuard {
+    max: Option<usize>,
+    next: std::time::Instant,
+    tripped: bool,
+}
+
+impl MemGuard {
+    fn new(max: Option<usize>) -> Self {
+        MemGuard { max, next: std::time::Instant::now(), tripped: false }
+    }
+
+    fn over(&mut self) -> bool {
+        let Some(max) = self.max else { return false };
+        if self.tripped {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now < self.next {
+            return false;
+        }
+        self.next = now + std::time::Duration::from_millis(250);
+        self.tripped = crate::parser::mem_profile::current_rss_bytes().is_some_and(|r| r > max);
+        self.tripped
+    }
+}
 /// Sink classes a name-only hint may report.
 const HINT_CLASSES: &[&str] = &["db", "exec", "template"];
 const MAX_WORK: usize = 400_000;
@@ -301,7 +406,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let summaries = inp.files.iter().map(|f| vec![Summary::default(); f.fns.len()]).collect();
+        let summaries = inp.files.iter().map(|f| vec![std::rc::Rc::new(Summary::default()); f.fns.len()]).collect();
         let facts = inp.files.iter().map(|f| vec![FnFacts::default(); f.fns.len()]).collect();
         Engine {
             srcs: Vec::new(),
@@ -318,10 +423,16 @@ impl<'a> Engine<'a> {
             arrive: HashMap::new(),
             flows: BTreeMap::new(),
             unknown_flows: BTreeMap::new(),
-            escapes: BTreeMap::new(),
+            escapes: HashMap::new(),
             possible: BTreeMap::new(),
             state_sinks: BTreeMap::new(),
             state_escapes: BTreeMap::new(),
+            unknown_through_state: BTreeSet::new(),
+            param_unk: HashMap::new(),
+            unk_rep: HashMap::new(),
+            param_edges: HashMap::new(),
+            src_at_param: BTreeMap::new(),
+            state_at_param: BTreeMap::new(),
             state_possible: BTreeMap::new(),
             global_types: vec![HashMap::new(); n],
             field_types: HashMap::new(),
@@ -333,6 +444,7 @@ impl<'a> Engine<'a> {
             coverage: Coverage::default(),
             collecting: false,
             counting: false,
+            registered: HashMap::new(),
             inp,
         }
     }
@@ -350,7 +462,9 @@ impl<'a> Engine<'a> {
     }
 
     pub fn run(mut self) -> Output {
+        let start = std::time::Instant::now();
         self.type_prepass();
+        self.handler_prepass();
         let all: Vec<FnRef> = self
             .inp
             .files
@@ -362,16 +476,30 @@ impl<'a> Engine<'a> {
         let mut queued: HashSet<FnRef> = all.iter().copied().collect();
         let mut work = 0usize;
         let mut incomplete = false;
+        let mut why = None;
+        let late = |d: Option<std::time::Instant>| d.is_some_and(|d| std::time::Instant::now() >= d);
+        let mut mem = MemGuard::new(self.inp.limits.max_rss_bytes);
         while let Some(fr) = queue.pop_front() {
             queued.remove(&fr);
             work += 1;
             if work > MAX_WORK {
                 incomplete = true;
+                why = Some("work budget");
+                break;
+            }
+            if work % 64 == 0 && late(self.inp.limits.deadline) {
+                incomplete = true;
+                why = Some("time budget");
+                break;
+            }
+            if mem.over() {
+                incomplete = true;
+                why = Some("memory budget");
                 break;
             }
             let s = self.analyze(fr);
             let changed = !self.summaries[fr.0 as usize][fr.1 as usize].same(&s);
-            self.summaries[fr.0 as usize][fr.1 as usize] = s;
+            self.summaries[fr.0 as usize][fr.1 as usize] = std::rc::Rc::new(s);
             if changed {
                 for c in self.callers.get(&fr).cloned().unwrap_or_default() {
                     if queued.insert(c) {
@@ -382,10 +510,28 @@ impl<'a> Engine<'a> {
         }
         // Final pass: facts and coverage, once per function.
         self.collecting = true;
-        for &fr in &all {
+        // the final pass gets a quarter of the budget again, then stops
+        let grace = self.inp.limits.deadline.map(|d| {
+            let now = std::time::Instant::now();
+            now.max(d) + (d.saturating_duration_since(start) / 4).max(std::time::Duration::from_secs(1))
+        });
+        for (k, &fr) in all.iter().enumerate() {
+            if k % 64 == 0 && late(grace) {
+                incomplete = true;
+                why = Some("time budget");
+                break;
+            }
+            if mem.over() {
+                incomplete = true;
+                why = Some("memory budget");
+                break;
+            }
             let _ = self.analyze(fr);
         }
-        self.resolve_state();
+        let mut reach_cache = HashMap::new();
+        self.resolve_escapes(&mut reach_cache);
+        self.resolve_state(&mut reach_cache);
+        let labels: Vec<Vec<String>> = self.inp.files.iter().enumerate().map(|(fi, f)| (0..f.fns.len()).map(|i| self.fn_label((fi as u32, i as u32))).collect()).collect();
         Output {
             srcs: self.srcs,
             unks: self.unks,
@@ -393,11 +539,21 @@ impl<'a> Engine<'a> {
             sinks: self.sinks,
             flows: self.flows.into_values().collect(),
             unknown_flows: self.unknown_flows.into_iter().map(|((u, s), p)| (u, s, p)).collect(),
-            escapes: self.escapes.into_values().collect(),
+            unknown_through_state: self.unknown_through_state.into_iter().collect(),
+            escapes: {
+                let mut v: Vec<((u32, u32), Escape)> = self.escapes.into_iter().collect();
+                v.sort_unstable_by_key(|(k, _)| *k);
+                v.into_iter().map(|(_, e)| e).collect()
+            },
+            labels,
+            arrive: self.arrive,
+            param_edges: self.param_edges,
+            param_unk: self.param_unk,
             possible: self.possible.into_values().collect(),
             facts: self.facts,
             coverage: self.coverage,
             incomplete,
+            incomplete_why: why,
         }
     }
 
@@ -436,6 +592,123 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Functions a `handler` model registers: decorated with its name
+    /// (`@mcp.tool()`), or passed by name at its `arg` (`path("x/",
+    /// views.show)`). Their parameters are input.
+    fn handler_prepass(&mut self) {
+        let mut names: HashSet<String> = HashSet::new();
+        for lang in [Lang::Python, Lang::Ts, Lang::Go, Lang::Rust] {
+            for m in self.inp.models.handlers(lang) {
+                if let Kind::Handler(h) = &m.kind {
+                    if h.arg.is_some() {
+                        names.insert(m.pattern.rsplit(['.', ':', '/']).next().unwrap_or(&m.pattern).to_string());
+                    }
+                }
+            }
+        }
+        let mut found: Vec<(FnRef, Handler, String)> = Vec::new();
+        // decorated definitions: the decorator is module (or class) code
+        for fi in 0..self.inp.files.len() {
+            let f = &self.inp.files[fi];
+            if !f.fns.iter().any(|d| !d.decorators.is_empty()) {
+                continue;
+            }
+            let module = (fi as u32, 0u32);
+            let mtypes = self.local_types(module);
+            for (i, d) in f.fns.iter().enumerate() {
+                for chain in &d.decorators {
+                    for (h, q) in self.decorator_handlers(module, chain, &mtypes) {
+                        found.push(((fi as u32, i as u32), h, q));
+                    }
+                }
+            }
+        }
+        for fi in 0..self.inp.files.len() {
+            if names.is_empty() {
+                break;
+            }
+            for (i, d) in self.inp.files[fi].fns.iter().enumerate() {
+                let fr = (fi as u32, i as u32);
+                let mut types: Option<HashMap<String, String>> = None;
+                for c in &d.calls {
+                    let last = match &c.callee {
+                        Callee::Path { chain, .. } => chain.rsplit(['.', ':']).next().unwrap_or(chain),
+                        Callee::Method { name, .. } => name.as_str(),
+                        Callee::Dynamic => continue,
+                    };
+                    if !names.contains(last) {
+                        continue;
+                    }
+                    let types = types.get_or_insert_with(|| self.local_types(fr));
+                    let Target::External(q, _) = self.qualify(fr, c, types) else { continue };
+                    let lang = self.lang(fr);
+                    for m in self.inp.models.lookup(lang, &q) {
+                        let Kind::Handler(h) = &m.kind else { continue };
+                        let Some(k) = h.arg else { continue };
+                        let Some(a) = c.args.get(k as usize) else { continue };
+                        for g in self.fns_named_by(fr, a) {
+                            found.push((g, h.clone(), q.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for (g, h, q) in found {
+            self.registered.entry(g).or_default().push((h, q));
+        }
+    }
+
+    /// The repo functions a value that is exactly one name denotes
+    /// (`views.show`, `show`), by the call-graph pipeline's answer.
+    fn fns_named_by(&self, fr: FnRef, v: &Val) -> Vec<FnRef> {
+        let ([r], []) = (v.reads.as_slice(), v.calls.as_slice()) else { return Vec::new() };
+        let last = r.chain.rfind(['.', ':']).map(|i| i as u32 + 1).unwrap_or(0);
+        for at in [r.at + last, r.at] {
+            if let Some(SiteAnswer::Defs(ids)) = self.answer(fr, at) {
+                return ids.iter().filter_map(|id| self.entity_fn.get(id).copied()).collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// A dotted name as written (`mcp.tool`, `app.route`) qualified
+    /// through a local's or module value's known type, or an import.
+    fn qualify_chain(&self, fr: FnRef, chain: &str, types: &HashMap<String, String>) -> Option<String> {
+        let lang = self.lang(fr);
+        let sep = lang.sep();
+        let (base, rest) = match chain.find(['.', ':']) {
+            Some(i) => (&chain[..i], &chain[i..]),
+            None => (chain, ""),
+        };
+        if let Some(t) = types.get(base).or_else(|| self.global_types[fr.0 as usize].get(base)) {
+            return Some(format!("{t}{}", rest.replace('.', sep)));
+        }
+        let i = self.import_of(fr, base)?;
+        Some(qualified(&i.path, rest, base, lang))
+    }
+
+    /// Handler models registering a function with this decorator.
+    fn decorator_handlers(&self, fr: FnRef, chain: &str, types: &HashMap<String, String>) -> Vec<(Handler, String)> {
+        let Some(q) = self.qualify_chain(fr, chain, types) else { return Vec::new() };
+        self.inp
+            .models
+            .lookup(self.lang(fr), &q)
+            .into_iter()
+            .filter_map(|m| match &m.kind {
+                Kind::Handler(h) if h.arg.is_none() => Some((h.clone(), q.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Is a parameter declared with one of a handler's injected types?
+    fn excepted(&self, fr: FnRef, ty: Option<&str>, h: &Handler) -> bool {
+        match ty.and_then(|t| self.qualify_type(fr, t)) {
+            Some(q) => h.except_types.iter().any(|e| *e == q),
+            None => false,
+        }
+    }
+
     /// Declared parameter types and assignment-derived local types.
     fn local_types(&self, fr: FnRef) -> HashMap<String, String> {
         let d = self.df(fr);
@@ -444,6 +717,13 @@ impl<'a> Engine<'a> {
             if let Some(t) = p.ty.as_deref().and_then(|t| self.qualify_type(fr, t)) {
                 for n in p.name.split(',') {
                     types.insert(n.to_string(), t.clone());
+                }
+            }
+        }
+        for cp in &d.closure_params {
+            if let Some(t) = cp.ty.as_deref().and_then(|t| self.qualify_type(fr, t)) {
+                for n in cp.name.split(',') {
+                    types.entry(n.to_string()).or_insert_with(|| t.clone());
                 }
             }
         }
@@ -527,7 +807,8 @@ impl<'a> Engine<'a> {
         let imp = self.file(fr).imports.iter().find(|i| i.local == base);
         match imp {
             Some(i) => Some(format!("{}{}", i.path, rest.replace(sep, lang.sep()))),
-            None if lang == Lang::Go || lang == Lang::Rust => None,
+            // a written-out crate path (`axum::extract::ws::WebSocket`)
+            None if lang == Lang::Rust && sep == "::" && !matches!(base, "crate" | "self" | "super" | "Self") => Some(t.to_string()),
             None => None,
         }
     }
@@ -541,7 +822,20 @@ impl<'a> Engine<'a> {
     fn repo_targets(&self, ids: &[String]) -> Target {
         let mut fns = Vec::new();
         let mut opaque = 0;
-        for id in ids {
+        // a call of a trait/interface method or of an overridable base
+        // method may run any implementation / override
+        let mut all: Vec<String> = ids.to_vec();
+        let mut seen: HashSet<String> = all.iter().cloned().collect();
+        let mut i = 0;
+        while i < all.len() && all.len() < 256 {
+            for x in self.inp.dispatch.get(&all[i]).into_iter().flatten() {
+                if seen.insert(x.clone()) {
+                    all.push(x.clone());
+                }
+            }
+            i += 1;
+        }
+        for id in &all {
             if let Some(&f) = self.entity_fn.get(id) {
                 fns.push(f);
                 continue;
@@ -636,7 +930,19 @@ impl<'a> Engine<'a> {
                 }
                 if pipeline && lang != Lang::Ts {
                     match ans {
-                        Some(SiteAnswer::Defs(ids)) => return self.repo_targets(ids),
+                        Some(SiteAnswer::Defs(ids)) => {
+                            // A declarative model names the library API: it wins
+                            // over resolving into the library's own source (with
+                            // dependency sources in the input, `flask.render_template`
+                            // resolves into flask's body, where no model applies).
+                            if let Some(i) = self.import_of(fr, base_plain) {
+                                let q = qualified(&i.path, rest, base, lang);
+                                if !self.inp.models.lookup(lang, &q).is_empty() {
+                                    return Target::External(q, Precision::Resolved);
+                                }
+                            }
+                            return self.repo_targets(ids);
+                        }
                         Some(SiteAnswer::Unknown(why)) => {
                             // an import the resolver could not follow into a
                             // library may still be a modeled name
@@ -784,7 +1090,7 @@ impl<'a> Engine<'a> {
     fn src(&mut self, fr: FnRef, at: u32, row: u32, class: &str, via: &str) -> Label {
         let key = (fr, at, class.to_string());
         let (class, via) = (class.to_string(), via.to_string());
-        Label::Src(self.src_ids.get(key, &mut self.srcs, || SrcOrigin { class, at_fn: fr, row, via }))
+        Label::Src(self.src_ids.get(key, &mut self.srcs, || SrcOrigin { class, at_fn: fr, row, at, via }))
     }
 
     fn unk(&mut self, fr: FnRef, at: u32, row: u32, why: &str) -> Label {
@@ -803,6 +1109,7 @@ impl<'a> Engine<'a> {
             class: c2,
             at_fn: fr,
             row,
+            at,
             via: v2,
             precision,
         })
@@ -811,29 +1118,7 @@ impl<'a> Engine<'a> {
     /// The path by which source/unknown label `l` reached `fr` through
     /// callee returns, starting at its origin.
     fn up_path(&self, fr: FnRef, l: Label) -> Vec<Step> {
-        let (origin_fn, origin_row, what) = match l {
-            Label::Src(o) => {
-                let s = &self.srcs[o as usize];
-                (s.at_fn, s.row, format!("source {} via {}", s.class, s.via))
-            }
-            Label::Unk(u) => {
-                let s = &self.unks[u as usize];
-                (s.at_fn, s.row, format!("unknown: {}", s.why))
-            }
-            _ => return Vec::new(),
-        };
-        let mut steps = Vec::new();
-        let mut cur = fr;
-        let mut guard = 0;
-        while cur != origin_fn && guard < 64 {
-            let Some(&(from, row)) = self.arrive.get(&(cur, l)) else { break };
-            steps.push(Step { at_fn: cur, row, what: format!("returned from {}", self.fn_label(from)) });
-            cur = from;
-            guard += 1;
-        }
-        steps.push(Step { at_fn: origin_fn, row: origin_row, what });
-        steps.reverse();
-        steps
+        up_path(&self.srcs, &self.unks, &self.arrive, &|f| self.fn_label(f), fr, l)
     }
 
     pub fn fn_label(&self, fr: FnRef) -> String {
@@ -858,6 +1143,7 @@ impl<'a> Engine<'a> {
             results: vec![Labels::new(); d.calls.len()],
             targets: vec![None; d.calls.len()],
             summary: Summary::default(),
+            memo: (0..d.calls.len()).map(|_| None).collect(),
         };
         for (i, p) in d.params.iter().enumerate() {
             for n in p.name.split(',') {
@@ -876,6 +1162,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        self.entry_sources(&mut cx);
         if let Some(s) = &d.self_name {
             cx.locals.insert(s.clone());
             if let Some(o) = &d.owner {
@@ -950,6 +1237,97 @@ impl<'a> Engine<'a> {
             self.collect_facts(&mut cx);
         }
         cx.summary
+    }
+
+    /// Parameters that are input because of how the function is entered:
+    /// a handler decorator or registration, a typed closure parameter, a
+    /// tRPC procedure's `input`, a Next.js route handler.
+    fn entry_sources(&mut self, cx: &mut Cx) {
+        let fr = cx.fr;
+        let d = self.df(fr);
+        let lang = self.lang(fr);
+        let bind = |eng: &mut Self, cx: &mut Cx, name: &str, at: u32, row: u32, class: &str, via: String| {
+            let l = eng.src(fr, at, row, class, &via);
+            for n in name.split(',') {
+                cx.env.entry(n.to_string()).or_default().insert(l);
+                cx.locals.insert(n.to_string());
+            }
+        };
+        // 1. decorators / registrations of this function
+        let handlers: Vec<(Handler, String)> = self.registered.get(&fr).cloned().unwrap_or_default();
+        for (h, q) in &handlers {
+            for (i, p) in d.params.iter().enumerate() {
+                if h.params.as_ref().is_some_and(|ps| !ps.contains(&(i as u32))) || self.excepted(fr, p.ty.as_deref(), h) {
+                    continue;
+                }
+                bind(self, cx, &p.name, u32::MAX - 256 - i as u32, d.row, &h.class, format!("parameter `{}` of a {q} handler", p.name));
+            }
+        }
+        // 2. closures inlined here: typed parameters, decorated nested defs
+        for (k, cp) in d.closure_params.iter().enumerate() {
+            let at = u32::MAX - 512 - k as u32;
+            if let Some(t) = cp.ty.as_deref().and_then(|t| self.qualify_type(fr, t)) {
+                for m in self.inp.models.lookup(lang, &t) {
+                    if let Kind::ParamSource(class) = &m.kind {
+                        bind(self, cx, &cp.name, at, cp.row, class, format!("parameter `{}: {t}`", cp.name));
+                    }
+                }
+            }
+            for chain in &cp.decorators {
+                for (h, q) in self.decorator_handlers(fr, chain, &cx.types.clone()) {
+                    if h.params.as_ref().is_some_and(|ps| !ps.contains(&cp.index)) || self.excepted(fr, cp.ty.as_deref(), &h) {
+                        continue;
+                    }
+                    bind(self, cx, &cp.name, at, cp.row, &h.class, format!("parameter `{}` of a {q} handler", cp.name));
+                }
+            }
+        }
+        if lang != Lang::Ts {
+            return;
+        }
+        // 3. tRPC: `procedure.input(schema).mutation|query|subscription(({ input }) => ..)`
+        for (ci, c) in d.calls.iter().enumerate() {
+            let Callee::Method { recv, name, .. } = &c.callee else { continue };
+            if !matches!(name.as_str(), "mutation" | "query" | "subscription") || !self.has_trpc_input(fr, recv, 0) {
+                continue;
+            }
+            let Some((_, names)) = c.callbacks.iter().find(|(i, _)| *i == 0) else { continue };
+            let target = if names.iter().any(|n| n == "input") {
+                Some("input")
+            } else if names.len() == 1 && names[0] != "ctx" {
+                Some(names[0].as_str())
+            } else {
+                None
+            };
+            if let Some(n) = target {
+                bind(self, cx, n, c.at.wrapping_add(7 + ci as u32 % 5), c.row, "http-input", format!("tRPC procedure `input` (.{name})"));
+            }
+        }
+        // 4. Next.js route handlers: `export async function GET(request)` in app/**/route.ts
+        let path = &self.file(fr).path;
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        let route_file = leaf.split('.').next() == Some("route") && (path.starts_with("app/") || path.contains("/app/"));
+        if route_file && d.owner.is_none() && !d.is_module && matches!(d.name.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS") {
+            if let Some(p) = d.params.first() {
+                bind(self, cx, &p.name, u32::MAX - 255, d.row, "http-input", format!("Next.js route handler parameter `{}`", p.name));
+            }
+        }
+    }
+
+    /// Does a receiver chain carry a tRPC `.input(..)` step?
+    fn has_trpc_input(&self, fr: FnRef, recv: &Val, depth: u32) -> bool {
+        if depth > 6 {
+            return false;
+        }
+        let d = self.df(fr);
+        recv.calls.iter().any(|&i| match d.calls.get(i as usize).map(|c| &c.callee) {
+            Some(Callee::Method { name, .. }) if name == "input" => true,
+            Some(Callee::Path { chain, .. }) if chain.ends_with(".input") => true,
+            Some(Callee::Method { recv, name, .. }) if matches!(name.as_str(), "use" | "meta" | "output" | "concat" | "unstable_concat") => {
+                self.has_trpc_input(fr, recv, depth + 1)
+            }
+            _ => false,
+        })
     }
 
     /// Labels of a value; with `facts`, record reads.
@@ -1103,44 +1481,61 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn record_sink(&mut self, cx: &mut Cx, site: u32, l: Label, path: Vec<Step>, possible: bool) {
+    /// The unresolved call standing for all of those in its function.
+    fn rep(&mut self, u: u32) -> u32 {
+        let f = self.unks[u as usize].at_fn;
+        *self.unk_rep.entry(f).or_insert(u)
+    }
+
+    /// Record that `l` reaches sink `site`; the witness `path` is built
+    /// only the first time (the first witness is kept).
+    fn record_sink(&mut self, cx: &mut Cx, site: u32, l: Label, path: impl FnOnce() -> Vec<Step>, possible: bool) {
         match l {
             Label::Src(o) => {
+                let seen = if possible { self.possible.contains_key(&(o, site)) } else { self.flows.contains_key(&(o, site)) };
+                if seen {
+                    return;
+                }
                 let mut full = self.up_path(cx.fr, l);
-                full.extend(path);
+                full.extend(path());
                 let map = if possible { &mut self.possible } else { &mut self.flows };
-                map.entry((o, site)).or_insert(Flow { src: o, sink: site, path: full, through_state: None });
+                map.insert((o, site), Flow { src: o, sink: site, path: full, through_state: None });
             }
             Label::Unk(u) => {
-                if !possible {
+                let u = self.rep(u);
+                if !possible && !self.unknown_flows.contains_key(&(u, site)) {
                     let mut full = self.up_path(cx.fr, l);
-                    full.extend(path);
-                    self.unknown_flows.entry((u, site)).or_insert(full);
+                    full.extend(path());
+                    self.unknown_flows.insert((u, site), full);
                 }
             }
             Label::State(r) => {
                 let map = if possible { &mut self.state_possible } else { &mut self.state_sinks };
-                map.entry((r, site)).or_insert(path);
+                map.entry((r, site)).or_insert_with(path);
             }
             Label::Param(_) => {
                 let map = if possible { &mut cx.summary.possible } else { &mut cx.summary.sinks };
-                map.entry((site, l)).or_insert(path);
+                map.entry((site, l)).or_insert_with(path);
             }
         }
     }
 
-    fn record_escape(&mut self, cx: &mut Cx, unk: u32, l: Label, path: Vec<Step>) {
+    fn record_escape(&mut self, cx: &mut Cx, unk: u32, l: Label, path: impl FnOnce() -> Vec<Step>) {
+        let unk = self.rep(unk);
         match l {
             Label::Src(o) => {
+                if self.escapes.contains_key(&(o, unk)) {
+                    return;
+                }
                 let mut full = self.up_path(cx.fr, l);
-                full.extend(path);
-                self.escapes.entry((o, unk)).or_insert(Escape { src: o, unk, path: full });
+                full.extend(path());
+                self.escapes.insert((o, unk), Escape { src: o, unk, witness: Witness::Path(full) });
             }
             Label::State(r) => {
-                self.state_escapes.entry((r, unk)).or_insert(path);
+                self.state_escapes.entry((r, unk)).or_insert_with(|| std::sync::Arc::new(path()));
             }
-            Label::Param(_) => {
-                cx.summary.escapes.entry((unk, l)).or_insert(path);
+            Label::Param(p) => {
+                self.param_unk.entry((cx.fr, p)).or_default().entry(unk).or_insert_with(path);
             }
             Label::Unk(_) => {}
         }
@@ -1149,7 +1544,6 @@ impl<'a> Engine<'a> {
     fn eval_call(&mut self, cx: &mut Cx, ci: u32) -> Labels {
         let d = self.df(cx.fr);
         let c = &d.calls[ci as usize];
-        let lang = self.lang(cx.fr);
         let args: Vec<Labels> = c.args.iter().map(|a| self.labels(cx, a, false)).collect();
         let kwargs: Vec<(String, Labels)> = c.kwargs.iter().map(|(k, a)| (k.clone(), self.labels(cx, a, false))).collect();
         // the receiver: the object whose method is called
@@ -1167,6 +1561,27 @@ impl<'a> Engine<'a> {
             Callee::Method { recv, .. } => self.labels(cx, recv, false),
             _ => Labels::new(),
         };
+        if !self.counting {
+            if let Some(m) = &cx.memo[ci as usize] {
+                if m.args == args && m.recv == recv && m.kwargs.iter().eq(kwargs.iter().map(|(_, l)| l)) {
+                    return m.ret.clone();
+                }
+            }
+        }
+        let ret = self.eval_call_with(cx, ci, &args, &kwargs, &recv);
+        // bounded: a huge function (a minified bundle's module code) has
+        // many calls with large label sets; those are recomputed instead
+        let size = args.iter().map(|l| l.len()).sum::<usize>() + kwargs.iter().map(|(_, l)| l.len()).sum::<usize>() + recv.len() + ret.len();
+        if !self.counting && size <= MEMO_MAX_LABELS {
+            cx.memo[ci as usize] = Some(CallMemo { args, kwargs: kwargs.into_iter().map(|(_, l)| l).collect(), recv, ret: ret.clone() });
+        }
+        ret
+    }
+
+    fn eval_call_with(&mut self, cx: &mut Cx, ci: u32, args: &[Labels], kwargs: &[(String, Labels)], recv: &Labels) -> Labels {
+        let d = self.df(cx.fr);
+        let c = &d.calls[ci as usize];
+        let lang = self.lang(cx.fr);
         let mut all: Labels = args.iter().flatten().copied().collect();
         all.extend(kwargs.iter().flat_map(|(_, l)| l.iter().copied()));
         all.extend(recv.iter().copied());
@@ -1191,7 +1606,7 @@ impl<'a> Engine<'a> {
                                 }
                                 let mut o = args.get(j as usize).cloned().unwrap_or_default();
                                 if let Some(p) = gd.params.get(j as usize) {
-                                    for (k, v) in &kwargs {
+                                    for (k, v) in kwargs {
                                         if p.name.split(',').any(|n| n == k) {
                                             o.extend(v.iter().copied());
                                         }
@@ -1213,23 +1628,39 @@ impl<'a> Engine<'a> {
                     }
                     for ((site, l), path) in &s.sinks {
                         for x in subst(*l) {
-                            let mut p = vec![step(format!("calls {callee}"))];
-                            p.extend(path.iter().cloned());
+                            let p = || {
+                                let mut p = vec![step(format!("calls {callee}"))];
+                                p.extend(path.iter().cloned());
+                                p
+                            };
                             self.record_sink(cx, *site, x, p, false);
                         }
                     }
                     for ((site, l), path) in &s.possible {
                         for x in subst(*l) {
-                            let mut p = vec![step(format!("calls {callee}"))];
-                            p.extend(path.iter().cloned());
+                            let p = || {
+                                let mut p = vec![step(format!("calls {callee}"))];
+                                p.extend(path.iter().cloned());
+                                p
+                            };
                             self.record_sink(cx, *site, x, p, true);
                         }
                     }
-                    for ((u, l), path) in &s.escapes {
-                        for x in subst(*l) {
-                            let mut p = vec![step(format!("calls {callee}"))];
-                            p.extend(path.iter().cloned());
-                            self.record_escape(cx, *u, x, p);
+                    for j in 0..gd.params.len() {
+                        let node = (g, j as u16);
+                        for x in subst(Label::Param(j as u16)) {
+                            match x {
+                                Label::Src(o) => {
+                                    self.src_at_param.entry((o, node)).or_insert_with(|| (here, step(format!("calls {callee}"))));
+                                }
+                                Label::Param(p) => {
+                                    self.param_edges.entry((here, p)).or_default().entry(node).or_insert_with(|| step(format!("calls {callee}")));
+                                }
+                                Label::State(r) => {
+                                    self.state_at_param.entry((r, node)).or_insert_with(|| step(format!("calls {callee}")));
+                                }
+                                Label::Unk(_) => {}
+                            }
                         }
                     }
                     for (st, l) in &s.writes {
@@ -1279,7 +1710,7 @@ impl<'a> Engine<'a> {
                                 Some(ix) => ix.iter().flat_map(|&i| args.get(i as usize).cloned().unwrap_or_default()).collect(),
                             };
                             for l in hit {
-                                self.record_sink(cx, site, l, vec![step(format!("sink {class} via {via}"))], false);
+                                self.record_sink(cx, site, l, || vec![step(format!("sink {class} via {via}"))], false);
                             }
                             if self.counting {
                                 self.facts[cx.fr.0 as usize][cx.fr.1 as usize].writes.insert(class.clone());
@@ -1291,7 +1722,7 @@ impl<'a> Engine<'a> {
                             ret.insert(u);
                             if let Label::Unk(uid) = u {
                                 for &l in &all {
-                                    self.record_escape(cx, uid, l, vec![step(format!("passed to {via}"))]);
+                                    self.record_escape(cx, uid, l, || vec![step(format!("passed to {via}"))]);
                                 }
                             }
                             if self.counting {
@@ -1301,6 +1732,7 @@ impl<'a> Engine<'a> {
                         }
                         Kind::Sanitizer | Kind::Returns(_) | Kind::Callback(..) => modeled = true,
                         Kind::ParamSource(_) => {}
+                        Kind::Handler(_) => modeled = true,
                     }
                 }
                 if self.counting {
@@ -1322,7 +1754,7 @@ impl<'a> Engine<'a> {
                 ret.insert(u);
                 if let Label::Unk(uid) = u {
                     for &l in &all {
-                        self.record_escape(cx, uid, l, vec![step(format!("passed to unresolved {text}()"))]);
+                        self.record_escape(cx, uid, l, || vec![step(format!("passed to unresolved {text}()"))]);
                     }
                 }
                 // name-only hint: an untyped receiver's method named like a sink
@@ -1345,7 +1777,7 @@ impl<'a> Engine<'a> {
                     for class in hints {
                         let site = self.sink_site(cx.fr, c.at, c.row, &class, &format!("?.{method}"), Precision::NameOnly);
                         for &l in &all {
-                            self.record_sink(cx, site, l, vec![step(format!("possible {class} sink: {text}() on an untyped receiver"))], true);
+                            self.record_sink(cx, site, l, || vec![step(format!("possible {class} sink: {text}() on an untyped receiver"))], true);
                         }
                     }
                 }
@@ -1353,6 +1785,9 @@ impl<'a> Engine<'a> {
                     self.coverage.unknown += 1;
                     *self.coverage.unknown_by_reason.entry(reason_key(&why)).or_default() += 1;
                     self.facts[cx.fr.0 as usize][cx.fr.1 as usize].unknown_calls.push((c.row, why.clone()));
+                    if !matches!(c.callee, Callee::Dynamic) {
+                        self.facts[cx.fr.0 as usize][cx.fr.1 as usize].unknown_callees.push((c.row, method.clone()));
+                    }
                 }
             }
         }
@@ -1407,25 +1842,154 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The unresolved calls a callee parameter reaches, through parameters
+    /// passed on: `(unk, path from the parameter)`, first path by BFS.
+    fn param_reach(&self, start: ParamNode, cache: &mut ReachCache) -> std::rc::Rc<Vec<u32>> {
+        if let Some(r) = cache.get(&start) {
+            return r.clone();
+        }
+        let mut out: BTreeSet<u32> = BTreeSet::new();
+        let mut seen: HashSet<ParamNode> = HashSet::from([start]);
+        let mut q: VecDeque<ParamNode> = VecDeque::from([start]);
+        while let Some(n) = q.pop_front() {
+            out.extend(self.param_unk.get(&n).into_iter().flatten().map(|(u, _)| *u));
+            for m in self.param_edges.get(&n).into_iter().flatten().map(|(m, _)| *m) {
+                if seen.insert(m) {
+                    q.push_back(m);
+                }
+            }
+        }
+        let r = std::rc::Rc::new(out.into_iter().collect::<Vec<_>>());
+        cache.insert(start, r.clone());
+        r
+    }
+
+    /// Escapes of source and state labels passed into repo calls whose
+    /// parameters reach unresolved calls.
+    fn resolve_escapes(&mut self, cache: &mut ReachCache) {
+        let srcs: Vec<((u32, ParamNode), (FnRef, Step))> = self.src_at_param.iter().map(|(k, v)| (*k, v.clone())).collect();
+        for ((o, node), (at, st)) in srcs {
+            for &u in self.param_reach(node, cache).iter() {
+                self.escapes.entry((o, u)).or_insert_with(|| Escape { src: o, unk: u, witness: Witness::Param { at, step: st.clone(), node } });
+            }
+        }
+    }
+
     /// State labels reaching sinks: every source ever written into that
     /// state (transitively through other state) reaches them.
-    fn resolve_state(&mut self) {
-        let closure = |eng: &Engine, r: u32| -> Vec<(Label, FnRef, u32, u32)> {
-            let mut out = Vec::new();
-            let mut seen = HashSet::new();
-            let mut stack = vec![r];
-            while let Some(s) = stack.pop() {
-                if !seen.insert(s) {
+    fn resolve_state(&mut self, cache: &mut ReachCache) {
+        // What each state holds, transitively through the states written
+        // into it: per strongly connected component of the "written into"
+        // graph, in reverse topological order, the sources (first writer of
+        // each) and whether any value from unresolved code is among them.
+        // Only sources are enumerated; unknown origins are a flag, since
+        // their number grows with every unresolved call stored in a field.
+        let n = self.states.len();
+        let succ = |eng: &Engine, s: u32| -> Vec<u32> {
+            eng.state_taint
+                .get(&s)
+                .into_iter()
+                .flatten()
+                .filter_map(|(l, _)| if let Label::State(s2) = l { (*s2 != s).then_some(*s2) } else { None })
+                .collect()
+        };
+        let (comp, order) = {
+            // iterative Tarjan
+            let mut index = vec![u32::MAX; n];
+            let mut low = vec![0u32; n];
+            let mut on = vec![false; n];
+            let mut comp = vec![u32::MAX; n];
+            let mut order: Vec<Vec<u32>> = Vec::new();
+            let mut stack: Vec<u32> = Vec::new();
+            let mut next = 0u32;
+            for root in 0..n as u32 {
+                if index[root as usize] != u32::MAX {
                     continue;
                 }
-                for (l, &(w, row)) in eng.state_taint.get(&s).into_iter().flatten() {
-                    match l {
-                        Label::State(s2) => stack.push(*s2),
-                        _ => out.push((*l, w, row, s)),
+                let mut work: Vec<(u32, Vec<u32>, usize)> = vec![(root, succ(self, root), 0)];
+                index[root as usize] = next;
+                low[root as usize] = next;
+                next += 1;
+                stack.push(root);
+                on[root as usize] = true;
+                while let Some((v, ss, i)) = work.last_mut() {
+                    let v = *v;
+                    if *i < ss.len() {
+                        let w = ss[*i];
+                        *i += 1;
+                        if index[w as usize] == u32::MAX {
+                            index[w as usize] = next;
+                            low[w as usize] = next;
+                            next += 1;
+                            stack.push(w);
+                            on[w as usize] = true;
+                            let sw = succ(self, w);
+                            work.push((w, sw, 0));
+                        } else if on[w as usize] {
+                            low[v as usize] = low[v as usize].min(index[w as usize]);
+                        }
+                        continue;
+                    }
+                    work.pop();
+                    if let Some((p, _, _)) = work.last() {
+                        low[*p as usize] = low[*p as usize].min(low[v as usize]);
+                    }
+                    if low[v as usize] == index[v as usize] {
+                        let id = order.len() as u32;
+                        let mut members = Vec::new();
+                        while let Some(w) = stack.pop() {
+                            on[w as usize] = false;
+                            comp[w as usize] = id;
+                            members.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        order.push(members);
                     }
                 }
             }
-            out
+            (comp, order)
+        };
+        // Tarjan emits a component after every component it reaches
+        type Writers = BTreeMap<u32, (FnRef, u32, u32)>;
+        let mut srcs: Vec<std::rc::Rc<Writers>> = Vec::with_capacity(order.len());
+        let mut unk: Vec<bool> = Vec::with_capacity(order.len());
+        for (id, members) in order.iter().enumerate() {
+            let mut own: Writers = BTreeMap::new();
+            let mut has_unk = false;
+            let mut from: BTreeSet<u32> = BTreeSet::new();
+            for &s in members {
+                for (l, &(w, row)) in self.state_taint.get(&s).into_iter().flatten() {
+                    match l {
+                        Label::Src(o) => {
+                            own.entry(*o).or_insert((w, row, s));
+                        }
+                        Label::Unk(_) => has_unk = true,
+                        Label::State(s2) => {
+                            let c = comp[*s2 as usize];
+                            if c != id as u32 {
+                                from.insert(c);
+                            }
+                        }
+                        Label::Param(_) => {}
+                    }
+                }
+            }
+            for c in from {
+                has_unk |= unk[c as usize];
+                for (o, v) in srcs[c as usize].iter() {
+                    own.entry(*o).or_insert(*v);
+                }
+            }
+            srcs.push(std::rc::Rc::new(own));
+            unk.push(has_unk);
+        }
+        let held = |r: u32| -> (std::rc::Rc<Writers>, bool) {
+            match comp.get(r as usize) {
+                Some(&c) if c != u32::MAX => (srcs[c as usize].clone(), unk[c as usize]),
+                _ => (std::rc::Rc::new(BTreeMap::new()), false),
+            }
         };
         let sinks: Vec<((u32, u32), Vec<Step>, bool)> = self
             .state_sinks
@@ -1434,31 +1998,139 @@ impl<'a> Engine<'a> {
             .chain(self.state_possible.iter().map(|(k, v)| (*k, v.clone(), true)))
             .collect();
         for ((r, site), path, possible) in sinks {
-            for (l, writer, row, via_state) in closure(self, r) {
-                let mut full = self.up_path(writer, l);
+            let (ws, has_unk) = held(r);
+            for (&o, &(writer, row, via_state)) in ws.iter() {
+                let seen = if possible { self.possible.contains_key(&(o, site)) } else { self.flows.contains_key(&(o, site)) };
+                if seen {
+                    continue;
+                }
+                let mut full = self.up_path(writer, Label::Src(o));
                 full.push(Step { at_fn: writer, row, what: format!("writes {}", self.states[via_state as usize].show()) });
                 full.extend(path.iter().cloned());
-                match l {
-                    Label::Src(o) => {
-                        let map = if possible { &mut self.possible } else { &mut self.flows };
-                        map.entry((o, site)).or_insert(Flow { src: o, sink: site, path: full, through_state: Some(r) });
-                    }
-                    Label::Unk(u) if !possible => {
-                        self.unknown_flows.entry((u, site)).or_insert(full);
-                    }
-                    _ => {}
+                let map = if possible { &mut self.possible } else { &mut self.flows };
+                map.insert((o, site), Flow { src: o, sink: site, path: full, through_state: Some(r) });
+            }
+            if has_unk && !possible {
+                self.unknown_through_state.insert((r, site));
+            }
+        }
+        let escapes: Vec<((u32, u32), std::sync::Arc<Vec<Step>>)> = self.state_escapes.iter().map(|(k, v)| (*k, v.clone())).collect();
+        for ((r, unk_site), path) in escapes {
+            let (ws, _) = held(r);
+            for (&o, &(writer, row, via_state)) in ws.iter() {
+                self.escapes.entry((o, unk_site)).or_insert_with(|| Escape {
+                    src: o,
+                    unk: unk_site,
+                    witness: Witness::State { writer, row, via_state, tail: StateTail::Path(path.clone()) },
+                });
+            }
+        }
+        // state passed into callee parameters that reach unresolved calls:
+        // expanded only for state some source was written into
+        let passed: Vec<((u32, ParamNode), Step)> = self.state_at_param.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut done: HashSet<(u32, ParamNode)> = HashSet::new();
+        for ((r, node), st) in passed {
+            let (ws, _) = held(r);
+            // states of one component hold the same sources
+            if ws.is_empty() || !done.insert((comp.get(r as usize).copied().unwrap_or(u32::MAX), node)) {
+                continue;
+            }
+            let reach = self.param_reach(node, cache);
+            for (&o, &(writer, row, via_state)) in ws.iter() {
+                for &u in reach.iter() {
+                    self.escapes.entry((o, u)).or_insert_with(|| Escape {
+                        src: o,
+                        unk: u,
+                        witness: Witness::State { writer, row, via_state, tail: StateTail::Param { step: st.clone(), node } },
+                    });
                 }
             }
         }
-        let escapes: Vec<((u32, u32), Vec<Step>)> = self.state_escapes.iter().map(|(k, v)| (*k, v.clone())).collect();
-        for ((r, unk), path) in escapes {
-            for (l, writer, row, via_state) in closure(self, r) {
-                if let Label::Src(o) = l {
-                    let mut full = self.up_path(writer, l);
-                    full.push(Step { at_fn: writer, row, what: format!("writes {}", self.states[via_state as usize].show()) });
-                    full.extend(path.iter().cloned());
-                    self.escapes.entry((o, unk)).or_insert(Escape { src: o, unk, path: full });
+    }
+}
+
+type ReachCache = HashMap<ParamNode, std::rc::Rc<Vec<u32>>>;
+
+/// The path by which source/unknown label `l` reached `fr` through callee
+/// returns, starting at its origin.
+fn up_path(srcs: &[SrcOrigin], unks: &[UnkOrigin], arrive: &HashMap<(FnRef, Label), (FnRef, u32)>, label: &dyn Fn(FnRef) -> String, fr: FnRef, l: Label) -> Vec<Step> {
+    let (origin_fn, origin_row, what) = match l {
+        Label::Src(o) => {
+            let s = &srcs[o as usize];
+            (s.at_fn, s.row, format!("source {} via {}", s.class, s.via))
+        }
+        Label::Unk(u) => {
+            let s = &unks[u as usize];
+            (s.at_fn, s.row, format!("unknown: {}", s.why))
+        }
+        _ => return Vec::new(),
+    };
+    let mut steps = Vec::new();
+    let mut cur = fr;
+    let mut guard = 0;
+    while cur != origin_fn && guard < 64 {
+        let Some(&(from, row)) = arrive.get(&(cur, l)) else { break };
+        steps.push(Step { at_fn: cur, row, what: format!("returned from {}", label(from)) });
+        cur = from;
+        guard += 1;
+    }
+    steps.push(Step { at_fn: origin_fn, row: origin_row, what });
+    steps.reverse();
+    steps
+}
+
+impl Output {
+    /// The steps from parameter `node` to unresolved call `unk` through
+    /// parameters passed on (shortest), ending with the call.
+    fn reach_path(&self, node: ParamNode, unk: u32) -> Vec<Step> {
+        let mut parent: HashMap<ParamNode, (ParamNode, &Step)> = HashMap::new();
+        let mut q = VecDeque::from([node]);
+        let mut seen: HashSet<ParamNode> = HashSet::from([node]);
+        while let Some(n) = q.pop_front() {
+            if let Some(tail) = self.param_unk.get(&n).and_then(|m| m.get(&unk)) {
+                let mut chain = Vec::new();
+                let mut cur = n;
+                while let Some((p, st)) = parent.get(&cur) {
+                    chain.push((*st).clone());
+                    cur = *p;
                 }
+                chain.reverse();
+                chain.extend(tail.iter().cloned());
+                return chain;
+            }
+            for (m, st) in self.param_edges.get(&n).into_iter().flatten() {
+                if seen.insert(*m) {
+                    parent.insert(*m, (n, st));
+                    q.push_back(*m);
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// An escape's witness path, rebuilt.
+    pub fn escape_path(&self, e: &Escape) -> Vec<Step> {
+        let label = |f: FnRef| self.labels[f.0 as usize][f.1 as usize].clone();
+        let up = |at: FnRef| up_path(&self.srcs, &self.unks, &self.arrive, &label, at, Label::Src(e.src));
+        match &e.witness {
+            Witness::Path(p) => p.clone(),
+            Witness::Param { at, step, node } => {
+                let mut p = up(*at);
+                p.push(step.clone());
+                p.extend(self.reach_path(*node, e.unk));
+                p
+            }
+            Witness::State { writer, row, via_state, tail } => {
+                let mut p = up(*writer);
+                p.push(Step { at_fn: *writer, row: *row, what: format!("writes {}", self.states[*via_state as usize].show()) });
+                match tail {
+                    StateTail::Path(t) => p.extend(t.iter().cloned()),
+                    StateTail::Param { step, node } => {
+                        p.push(step.clone());
+                        p.extend(self.reach_path(*node, e.unk));
+                    }
+                }
+                p
             }
         }
     }

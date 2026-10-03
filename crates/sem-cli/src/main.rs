@@ -339,6 +339,26 @@ enum Commands {
         /// Items listed per section
         #[arg(long, default_value_t = 8)]
         max_items: usize,
+        /// Seconds the data-flow analysis of each tree may take; past it the
+        /// data-path results are partial and the report says so (0 = no limit)
+        #[arg(long, default_value_t = 45)]
+        budget: u64,
+        /// Resident memory (MB) the process may reach during data flow; past it the
+        /// data-path results are partial and the report says so (0 = no limit)
+        #[arg(long, default_value_t = 4096)]
+        max_memory: u64,
+        /// Count examples/, benches/ and test code in the dependency graph and cycles
+        #[arg(long)]
+        include_examples: bool,
+        /// What is analyzed: `full` (both whole trees), `diff` (the changed
+        /// files, their callers, importers and the definitions they call), or
+        /// `auto` (diff when the whole trees would not fit in --max-memory)
+        #[arg(long, default_value = "auto", value_parser = ["auto", "full", "diff"])]
+        scope: String,
+        /// Source MB a diff-scoped region may hold; names mentioned in more
+        /// files than fit are reported as not analyzed
+        #[arg(long, default_value_t = 16)]
+        region_mb: u64,
     },
     /// Data flow of the working tree: per-function reads/writes (env, files, DB,
     /// network, subprocess, logs, module state, fields) and source -> sink paths
@@ -797,7 +817,7 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        Some(Commands::ArchDiff { range, json, md, laws, models, max_items }) => {
+        Some(Commands::ArchDiff { range, json, md, laws, models, max_items, budget, max_memory, include_examples, scope, region_mb }) => {
             let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
             let format = if json {
                 commands::arch_diff::Format::Json
@@ -806,7 +826,18 @@ fn main() {
             } else {
                 commands::arch_diff::Format::Text
             };
-            if let Err(e) = commands::arch_diff::arch_diff_command(commands::arch_diff::ArchDiffOptions { cwd, range, laws, models, format, max_items }) {
+            if let Err(e) = commands::arch_diff::arch_diff_command(commands::arch_diff::ArchDiffOptions {
+                cwd,
+                range,
+                laws,
+                models,
+                format,
+                max_items,
+                budget: (budget > 0).then(|| std::time::Duration::from_secs(budget)),
+                max_memory: (max_memory > 0).then(|| max_memory as usize * 1024 * 1024),
+                include_examples,
+                scope: commands::arch_diff::scope_of(&scope, max_memory, region_mb),
+            }) {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }

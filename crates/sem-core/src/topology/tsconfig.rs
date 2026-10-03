@@ -2,8 +2,10 @@
 //! package names to source (`"@acme/core": ["./packages/core/src/index.ts"]`)
 //! so imports resolve without building the packages first.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -18,7 +20,9 @@ pub struct TsPaths {
     /// else the directory of the tsconfig that declares `paths`).
     pub base: String,
     /// `(pattern, targets)`; a pattern holds at most one `*`.
-    pub paths: Vec<(String, Vec<String>)>,
+    /// Shared by every tsconfig that inherits the same table (a monorepo's
+    /// packages all extend one base with thousands of aliases).
+    pub paths: Arc<Vec<(String, Vec<String>)>>,
 }
 
 impl TsPaths {
@@ -30,7 +34,7 @@ impl TsPaths {
             return ts.iter().map(|t| join(t)).collect();
         }
         let mut best: Option<(usize, &str, &Vec<String>)> = None;
-        for (k, ts) in &self.paths {
+        for (k, ts) in self.paths.iter() {
             let Some(star) = k.find('*') else { continue };
             let (pre, post) = (&k[..star], &k[star + 1..]);
             if spec.len() >= pre.len() + post.len() && spec.starts_with(pre) && spec.ends_with(post) && best.is_none_or(|(l, _, _)| pre.len() > l) {
@@ -109,7 +113,18 @@ fn parent(p: &str) -> &str {
 
 /// `paths` and `baseUrl` of the tsconfig at repo-relative `rel`, following
 /// relative `extends` (a later config's own settings win).
-fn effective(root: &Path, rel: &str, depth: usize) -> (Option<(String, Vec<(String, Vec<String>)>)>, Option<String>) {
+type Effective = (Option<(String, Arc<Vec<(String, Vec<String>)>>)>, Option<String>);
+
+fn effective(root: &Path, rel: &str, depth: usize, memo: &mut HashMap<String, Effective>) -> Effective {
+    if let Some(e) = memo.get(rel) {
+        return e.clone();
+    }
+    let e = effective_uncached(root, rel, depth, memo);
+    memo.insert(rel.to_string(), e.clone());
+    e
+}
+
+fn effective_uncached(root: &Path, rel: &str, depth: usize, memo: &mut HashMap<String, Effective>) -> Effective {
     let Some(v) = read(root, rel) else { return (None, None) };
     let dir = parent(rel);
     let (mut paths, mut base_url) = (None, None);
@@ -124,7 +139,7 @@ fn effective(root: &Path, rel: &str, depth: usize) -> (Option<(String, Vec<(Stri
             if !target.ends_with(".json") {
                 target.push_str(".json");
             }
-            let (p, b) = effective(root, &target, depth + 1);
+            let (p, b) = effective(root, &target, depth + 1, memo);
             paths = p.or(paths);
             base_url = b.or(base_url);
         }
@@ -138,7 +153,7 @@ fn effective(root: &Path, rel: &str, depth: usize) -> (Option<(String, Vec<(Stri
             .iter()
             .map(|(k, t)| (k.clone(), t.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()))
             .collect();
-        paths = Some((dir.to_string(), table));
+        paths = Some((dir.to_string(), Arc::new(table)));
     }
     (paths, base_url)
 }
@@ -147,12 +162,13 @@ fn effective(root: &Path, rel: &str, depth: usize) -> (Option<(String, Vec<(Stri
 /// is the root) that declares or inherits `paths`.
 pub fn discover(root: &Path, dirs: &[&str]) -> Vec<TsPaths> {
     let mut out = Vec::new();
+    let mut memo = HashMap::new();
     for dir in dirs {
         let rel = if dir.is_empty() { "tsconfig.json".to_string() } else { format!("{dir}/tsconfig.json") };
         if !root.join(&rel).is_file() {
             continue;
         }
-        let (paths, base_url) = effective(root, &rel, 0);
+        let (paths, base_url) = effective(root, &rel, 0, &mut memo);
         let Some((decl_dir, table)) = paths else { continue };
         out.push(TsPaths { dir: dir.to_string(), base: base_url.unwrap_or(decl_dir), paths: table });
     }

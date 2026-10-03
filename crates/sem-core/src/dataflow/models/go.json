@@ -5,6 +5,8 @@
     { "match": ["os.Getenv", "os.LookupEnv", "os.Environ", "os.ExpandEnv", "syscall.Getenv"], "kind": "source", "class": "env" },
     { "match": ["os.Args", "flag.String", "flag.Int", "flag.Arg", "flag.Args"], "kind": "source", "class": "cli-input" },
     { "match": ["net/http.Request", "github.com/gin-gonic/gin.Context", "github.com/labstack/echo/v4.Context", "github.com/gofiber/fiber/v2.Ctx"], "kind": "param-source", "class": "http-input" },
+    { "match": ["github.com/valyala/fasthttp.RequestCtx", "github.com/valyala/fasthttp.Request", "github.com/valyala/fasthttp.Args"], "kind": "param-source", "class": "http-input" },
+    { "match": ["github.com/mark3labs/mcp-go/mcp.CallToolRequest", "github.com/mark3labs/mcp-go/mcp.ReadResourceRequest", "github.com/mark3labs/mcp-go/mcp.GetPromptRequest", "github.com/modelcontextprotocol/go-sdk/mcp.CallToolRequest", "github.com/modelcontextprotocol/go-sdk/mcp.CallToolParams"], "kind": "param-source", "class": "tool-input" },
     { "match": ["net/http.ResponseWriter.Write", "github.com/gin-gonic/gin.Context.JSON", "github.com/gin-gonic/gin.Context.String", "github.com/gin-gonic/gin.Context.HTML", "github.com/labstack/echo/v4.Context.JSON", "github.com/labstack/echo/v4.Context.String"], "kind": "sink", "class": "http-response" },
 
     { "match": ["os/exec.Command", "os/exec.CommandContext", "syscall.Exec", "os.StartProcess"], "kind": "sink", "class": "exec" },
@@ -16,6 +18,8 @@
     { "match": ["database/sql.DB.QueryContext", "database/sql.DB.QueryRowContext", "database/sql.DB.ExecContext", "database/sql.DB.PrepareContext", "database/sql.Tx.QueryContext", "database/sql.Tx.QueryRowContext", "database/sql.Tx.ExecContext"], "kind": "sink", "class": "db", "args": [1] },
     { "match": ["database/sql.Rows.Scan", "database/sql.Row.Scan"], "kind": "source", "class": "db-read" },
 
+    { "match": ["os.ReadFile", "io/ioutil.ReadFile", "os.Open", "os.OpenFile", "os.Create", "os.Remove", "os.RemoveAll", "os.WriteFile"], "kind": "sink", "class": "file-path", "args": [0] },
+    { "match": ["net/http.ServeFile"], "kind": "sink", "class": "file-path", "args": [2] },
     { "match": ["os.ReadFile", "io/ioutil.ReadFile", "os.Open", "io.ReadAll", "io/ioutil.ReadAll", "bufio.Scanner.Text"], "kind": "source", "class": "file-read" },
     { "match": ["os.WriteFile", "io/ioutil.WriteFile", "os.Create", "os.Remove", "os.RemoveAll", "os.File.Write", "os.File.WriteString"], "kind": "sink", "class": "file-write" },
 

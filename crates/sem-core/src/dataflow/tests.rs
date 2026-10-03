@@ -173,6 +173,16 @@ fn python_name_only_sink_hint_is_labeled() {
 }
 
 #[test]
+fn python_call_of_a_base_method_reaches_overrides() {
+    let v = run(&[(
+        "jobs.py",
+        "import os\nimport subprocess\n\nclass Step:\n    def run(self, arg):\n        return arg\n\nclass Shell(Step):\n    def run(self, arg):\n        subprocess.run(arg, shell=True)\n\ndef go(step: Step):\n    step.run(os.environ['CMD'])\n",
+    )]);
+    // `step` is declared a Step, but a Shell may be passed: its override runs
+    assert_eq!(flows(&v, "flows"), set(&["env go -> exec Shell.run"]), "{v:#}");
+}
+
+#[test]
 fn python_sanitizer_stops_a_flow() {
     let v = run(&[(
         "n.py",
@@ -257,4 +267,107 @@ fn complexity_counts_decisions_and_nesting() {
     assert_eq!(e["cyclomatic"], 6, "{e:#}");
     // for +1; if +2 (nested); elif +1; else +1; `and`/`or` runs +2 -> 7
     assert_eq!(e["cognitive"], 7, "{e:#}");
+}
+
+#[test]
+fn python_model_beats_a_vendored_library_body() {
+    // The library's own source is in the input (vendored, or dependency
+    // sources): `render_template_string` resolves into its body, where no model
+    // applies. The model still names the sink.
+    let v = run(&[
+        ("flask/__init__.py", "request = None\n\ndef render_template_string(source, **context):\n    return source\n"),
+        (
+            "app.py",
+            "from flask import request, render_template_string\n\ndef page():\n    return render_template_string(request.args.get('t'))\n",
+        ),
+    ]);
+    assert_eq!(flows(&v, "flows"), set(&["http-input page -> template page"]), "{v:#}");
+}
+
+// ---- entry points agent PRs add: MCP tools, tRPC, fasthttp, routes ----------
+
+#[test]
+fn python_fastmcp_tool_arguments_are_input() {
+    let v = run(&[
+        (
+            "notes/store.py",
+            "import os\n\nBASE = '/srv/notes'\n\ndef load(name):\n    with open(os.path.join(BASE, name)) as f:\n        return f.read()\n",
+        ),
+        (
+            "notes/server.py",
+            "import subprocess\nfrom mcp.server.fastmcp import FastMCP, Context\nfrom notes.store import load\n\nmcp = FastMCP('notes')\n\n@mcp.tool()\ndef read_note(name: str) -> str:\n    return load(name)\n\n@mcp.tool()\ndef status(ctx: Context) -> str:\n    subprocess.run(ctx.request_id, shell=True)\n    return 'ok'\n\ndef register(app: FastMCP):\n    @app.tool()\n    def shell(cmd: str) -> str:\n        subprocess.run(cmd, shell=True)\n        return 'done'\n",
+        ),
+    ]);
+    // `ctx: Context` is injected by the framework, not a tool argument
+    assert_eq!(
+        flows(&v, "flows"),
+        set(&["tool-input read_note -> file-path load", "tool-input register -> exec register"]),
+        "{v:#}"
+    );
+}
+
+#[test]
+fn python_flask_route_and_django_urlconf_parameters_are_input() {
+    let v = run(&[
+        (
+            "site/web.py",
+            "from flask import Flask\n\napp = Flask(__name__)\n\n@app.route('/files/<name>')\ndef show(name):\n    return open(name).read()\n\ndef helper(name):\n    return open(name).read()\n",
+        ),
+        ("shop/__init__.py", ""),
+        ("shop/views.py", "import os\n\ndef detail(request, slug):\n    os.system('render ' + slug)\n\ndef unrouted(request, slug):\n    os.system('render ' + slug)\n"),
+        ("shop/urls.py", "from django.urls import path\nfrom shop import views\n\nurlpatterns = [path('d/<slug>/', views.detail)]\n"),
+    ]);
+    // `helper` and `unrouted` are not registered: their parameters are not input
+    assert_eq!(flows(&v, "flows"), set(&["http-input show -> file-path show", "http-input detail -> exec detail"]), "{v:#}");
+}
+
+#[test]
+fn go_fasthttp_request_and_mcp_tool_request_are_input() {
+    let v = run(&[(
+        "main.go",
+        "package main\n\nimport (\n\t\"context\"\n\t\"os\"\n\t\"path/filepath\"\n\n\t\"github.com/mark3labs/mcp-go/mcp\"\n\t\"github.com/mark3labs/mcp-go/server\"\n\t\"github.com/valyala/fasthttp\"\n)\n\nfunc handle(ctx *fasthttp.RequestCtx) {\n\tid := string(ctx.Request.Header.Peek(\"X-Id\"))\n\tos.ReadFile(filepath.Join(\"threads\", id+\".json\"))\n}\n\nfunc register(s *server.MCPServer, t mcp.Tool) {\n\ts.AddTool(t, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {\n\t\tp := req.GetString(\"path\", \"\")\n\t\tos.ReadFile(p)\n\t\treturn nil, nil\n\t})\n}\n",
+    )]);
+    assert_eq!(flows(&v, "flows"), set(&["http-input handle -> file-path handle", "tool-input register -> file-path register"]), "{v:#}");
+}
+
+#[test]
+fn rust_rmcp_parameters_and_websocket_are_input() {
+    let v = run(&[(
+        "src/lib.rs",
+        "use rmcp::handler::server::tool::Parameters;\n\npub struct Files;\n\npub struct ReadArgs {\n    pub path: String,\n}\n\nimpl Files {\n    pub fn read(&self, Parameters(args): Parameters<ReadArgs>) -> String {\n        std::fs::read_to_string(&args.path).unwrap()\n    }\n}\n\npub async fn on_socket(socket: axum::extract::ws::WebSocket) {\n    let msg = socket.recv().await;\n    std::fs::remove_file(msg).unwrap();\n}\n",
+    )]);
+    let f = flows(&v, "flows");
+    assert!(f.contains("tool-input Files.read -> file-path Files.read"), "{v:#}");
+    assert!(f.contains("http-input on_socket -> file-path on_socket"), "{v:#}");
+}
+
+#[test]
+fn ts_trpc_input_remix_loader_and_next_route_are_input() {
+    let v = run(&[
+        (
+            "src/server/routers/box.ts",
+            "import { z } from 'zod';\nimport { router, publicProcedure } from '../trpc';\n\nasync function ping(id: string) {\n  return fetch(`https://${id}.example.com/health`);\n}\n\nexport const boxRouter = router({\n  start: publicProcedure\n    .input(z.object({ id: z.string() }))\n    .mutation(async ({ ctx, input }) => {\n      return ping(input.id);\n    }),\n  list: publicProcedure.query(async ({ ctx }) => {\n    return fetch(ctx.listUrl);\n  }),\n});\n",
+        ),
+        (
+            "app/routes/go.tsx",
+            "import type { LoaderFunctionArgs } from '@remix-run/node';\n\nexport async function loader({ request }: LoaderFunctionArgs) {\n  const next = new URL(request.url).searchParams.get('next');\n  return fetch(next);\n}\n",
+        ),
+        (
+            "app/api/run/route.ts",
+            "import { execSync } from 'child_process';\n\nexport async function POST(req: Request) {\n  const body = await req.text();\n  execSync(body);\n}\n",
+        ),
+    ]);
+    // `list` has no `.input(..)`: its `ctx` is not request input
+    assert_eq!(
+        flows(&v, "flows"),
+        set(&["http-input <module> -> net-send ping", "http-input loader -> net-send loader", "http-input POST -> exec POST"]),
+        "{v:#}"
+    );
+}
+
+#[test]
+fn minified_bundles_are_not_analyzed() {
+    let long = format!("var a=process.env.X;require('child_process').exec(a);{}\n", "var b=1;".repeat(200));
+    let v = run(&[("static/bundle.js", long.as_str()), ("static/app.min.js", "var a=process.env.X;require('child_process').exec(a);\n")]);
+    assert_eq!(v["coverage"]["files"], 0, "{v:#}");
 }

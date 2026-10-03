@@ -22,6 +22,7 @@ pub fn lower(lang: Lang, path: &str, tree: &tree_sitter::Tree, src: &str) -> DfF
         },
         ret_redirect: Vec::new(),
         declared_globals: Vec::new(),
+        pending_decorators: Vec::new(),
     };
     let root = tree.root_node();
     l.file.fns.push(DfFn {
@@ -72,6 +73,8 @@ struct Lower<'s> {
     ret_redirect: Vec<Val>,
     /// Python `global x` names of the function being lowered.
     declared_globals: Vec<String>,
+    /// Decorator chains of the definition about to be lowered.
+    pending_decorators: Vec<String>,
 }
 
 impl<'s> Lower<'s> {
@@ -105,7 +108,11 @@ impl<'s> Lower<'s> {
                 let names: Vec<String> = decos.iter().map(|d| self.text(*d).to_string()).collect();
                 if let Some(def) = k.child_by_field_name("definition") {
                     match def.kind() {
-                        "function_definition" => self.function(def, owner, &names),
+                        "function_definition" => {
+                            self.pending_decorators = self.decorator_chains(k);
+                            self.function(def, owner, &names);
+                            self.pending_decorators.clear();
+                        }
                         _ => self.top_item(def, owner),
                     }
                 }
@@ -296,6 +303,7 @@ impl<'s> Lower<'s> {
             row: row(span),
             end_row: span.end_position().row as u32,
             owner: owner.map(str::to_string),
+            decorators: std::mem::take(&mut self.pending_decorators),
             ..Default::default()
         };
         let mut params = self.params(f);
@@ -599,8 +607,13 @@ impl<'s> Lower<'s> {
                 }
             }
             (Python, "decorated_definition") => {
+                let chains = self.decorator_chains(n);
                 for k in kids(n) {
+                    if k.kind() == "function_definition" {
+                        self.pending_decorators = chains.clone();
+                    }
                     self.stmt(k, fi);
+                    self.pending_decorators.clear();
                 }
             }
             (Python, "class_definition") | (Ts, "class_declaration") => {
@@ -1239,8 +1252,13 @@ impl<'s> Lower<'s> {
     /// Inline a closure / nested function into `fi`: its parameters become
     /// locals, its body is lowered here, and its returns are its value.
     fn lambda(&mut self, n: Node, fi: usize) -> Val {
+        let decorators = std::mem::take(&mut self.pending_decorators);
         let params = self.params(n);
-        for p in &params {
+        for (index, p) in params.iter().enumerate() {
+            if p.ty.is_some() || !decorators.is_empty() {
+                let cp = ClosureParam { name: p.name.clone(), index: index as u32, ty: p.ty.clone(), decorators: decorators.clone(), row: row(n) };
+                self.fnm(fi).closure_params.push(cp);
+            }
             for nm in p.name.split(',') {
                 let place = self.decl_place(nm.to_string(), fi);
                 self.fnm(fi).stmts.push(Stmt::Assign { to: vec![place], from: Val::default(), row: row(n) });
@@ -1251,6 +1269,20 @@ impl<'s> Lower<'s> {
             self.body(b, fi);
         }
         self.ret_redirect.pop().unwrap_or_default()
+    }
+
+    /// A Python `decorated_definition`'s decorators as callee chains:
+    /// `@mcp.tool()` -> `mcp.tool`, `@app.route("/x")` -> `app.route`.
+    fn decorator_chains(&self, n: Node) -> Vec<String> {
+        kids(n)
+            .into_iter()
+            .filter(|d| d.kind() == "decorator")
+            .filter_map(|d| {
+                let e = kids(d).into_iter().next()?;
+                let callee = if e.kind() == "call" { e.child_by_field_name("function")? } else { e };
+                Some(self.text(callee).split_whitespace().collect::<String>())
+            })
+            .collect()
     }
 
     fn lambda_params(&mut self, n: Node) -> Vec<String> {

@@ -9,6 +9,7 @@
     { "match": ["express.Router"], "kind": "returns", "type": "express.Router" },
     { "match": ["express.Application.get", "express.Application.post", "express.Application.put", "express.Application.patch", "express.Application.delete", "express.Application.all", "express.Application.use", "express.Router.get", "express.Router.post", "express.Router.put", "express.Router.patch", "express.Router.delete", "express.Router.all", "express.Router.use"], "kind": "callback", "arg": "each", "params": [ { "index": 0, "source": "http-input", "type": "express.Request" }, { "index": 1, "type": "express.Response" } ] },
     { "match": ["express.Request", "next/server.NextRequest", "koa.Context", "fastify.FastifyRequest"], "kind": "param-source", "class": "http-input" },
+    { "match": ["@remix-run/node.LoaderFunctionArgs", "@remix-run/node.ActionFunctionArgs", "@remix-run/node.DataFunctionArgs", "@remix-run/cloudflare.LoaderFunctionArgs", "@remix-run/cloudflare.ActionFunctionArgs", "@remix-run/server-runtime.LoaderFunctionArgs", "@remix-run/server-runtime.ActionFunctionArgs", "react-router.LoaderFunctionArgs", "react-router.ActionFunctionArgs"], "kind": "param-source", "class": "http-input" },
     { "match": ["express.Response.send", "express.Response.json", "express.Response.write", "express.Response.end", "express.Response.render"], "kind": "sink", "class": "http-response" },
     { "match": ["express.Response.redirect"], "kind": "sink", "class": "http-response" },
 
@@ -17,6 +18,7 @@
 
     { "match": ["fs.readFileSync", "fs.readFile", "fs.promises.readFile", "fs/promises.readFile", "fs.readdirSync", "fs/promises.readdir", "fs.createReadStream"], "kind": "source", "class": "file-read" },
     { "match": ["fs.readFile"], "kind": "callback", "arg": "last", "params": [ { "index": 1, "source": "file-read" } ] },
+    { "match": ["fs.readFileSync", "fs.readFile", "fs.promises.readFile", "fs/promises.readFile", "fs.createReadStream", "fs.writeFileSync", "fs.writeFile", "fs.createWriteStream", "fs.rmSync", "fs.unlinkSync", "fs/promises.rm", "fs/promises.unlink", "fs.existsSync", "express.Response.sendFile", "express.Response.download"], "kind": "sink", "class": "file-path", "args": [0] },
     { "match": ["fs.writeFileSync", "fs.writeFile", "fs.appendFileSync", "fs.appendFile", "fs.promises.writeFile", "fs.promises.appendFile", "fs/promises.writeFile", "fs/promises.appendFile", "fs.createWriteStream", "fs.rmSync", "fs.unlinkSync", "fs/promises.rm", "fs/promises.unlink"], "kind": "sink", "class": "file-write" },
 
     { "match": ["pg.Client", "pg.default.Client"], "kind": "returns", "type": "pg.Client" },
