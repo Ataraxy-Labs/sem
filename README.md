@@ -96,14 +96,15 @@ sem impact parse_config --tests
 
 `sem impact --diff HEAD --tests` answers the same for your whole uncommitted change.
 
-**Is it correct?** Run the project's checks. Exit 0 means pass, 1 fail, 2 could not decide:
+**Is it correct?** Run the project's own compiler, type checker, linter and tests, rechecking only what the change can affect when that gives the same answer. Exit 0 means pass, 1 fail, 2 could not decide:
 
 ```bash
 sem check
 ```
 ```
-BROKEN 1 no-print  library code does not print
-  src/config.py:12:5  print  print(load("app.cfg"))
+cmd    FAIL      full        sh (0 rechecked, 279 ms)
+  `python3 -m pytest -q tests` exited 1:
+  E       AssertionError: assert {'a': '1'} == {'a': '2'}
 ```
 
 **What should a human review?** A review certificate for a commit range: what changed, which callers the change leaves behind, which tests reach it:
@@ -271,16 +272,17 @@ With `--diff` and `--tests` in a JS/TS workspace, the answer is the module graph
 
 ### sem check
 
-Runs the project's checks on the working tree and prints one verdict: exit 0 pass, 1 fail, 2 could not decide. Nothing to check is 2, never a pass.
+Runs the project's compiler, type checker, linter and tests on the working tree and prints one verdict: exit 0 pass, 1 fail, 2 could not decide. Each checker gives the verdict the real tool would give on the whole project; it rechecks only what the change can affect when that is provably the same answer, and otherwise runs the tool in full and says why. Nothing to check is 2, never a pass.
 
 ```bash
-sem check                               # every check this project has
-sem check --base origin/main            # only what changed since origin/main
-sem check --promises                    # prove every promise can fail
-sem check --json
+sem check                               # every checker the project has (TypeScript, lint, tests, Go, Cargo)
+sem check --checkers ts,lint,tests      # only these
+sem check --base origin/main            # against origin/main instead of HEAD
+sem check --promises                    # also prove every promise in .sem/promises can fail
+sem check --json                        # one JSON object with a verification certificate
 ```
 
-This version checks the promises in `.sem/promises` (below). Compiler, type checker, linter and test checkers (`--checkers ts,lint,tests`) are not in it yet.
+Commands of your own go in `.sem/check.json`, e.g. `{"commands": ["python3 -m pytest -q"]}`; they always run in full.
 
 ### sem certify
 
@@ -405,7 +407,7 @@ Every earlier command name and flag still works, with the same output. At a term
 
 ### Promises
 
-A promise is something an agent (or a person) claims about the codebase, written down as a check that either passes or fails. "Done" means the check passes; `sem check` runs them. Promises live in `.sem/promises/*.json`; each law may carry a human `"promise"`. Code-shape laws are tree-sitter queries that work in any language sem parses; every capture whose name does not start with `_` counts as a violation, and nested captures are reported once, at the outermost node. For example, `.sem/promises/jsx-no-logic.json`:
+A promise is something an agent (or a person) claims about the codebase, written down as a check that either passes or fails. "Done" means the check passes. Promises live in `.sem/promises/*.json`; each law may carry a human `"promise"`. Code-shape laws are tree-sitter queries that work in any language sem parses; every capture whose name does not start with `_` counts as a violation, and nested captures are reported once, at the outermost node. For example, `.sem/promises/jsx-no-logic.json`:
 
 ```json
 { "laws": [
@@ -421,12 +423,14 @@ A promise is something an agent (or a person) claims about the codebase, written
 ```
 
 ```bash
-sem check                                 # KEPT / BROKEN n per promise, then file:line:col  capture  snippet; exit 1 if any broken
-sem check --base main                     # only files changed since a ref, uncommitted and untracked included
+sem promises check                        # KEPT / BROKEN n per promise, then file:line:col  capture  snippet; exit 1 if any broken
+sem promises check --changed src/App.tsx  # only violations in these files (what an edit hook runs)
+sem promises check --since main           # only files changed since a ref, uncommitted and untracked included
+sem promises status --json                # id, kept, violation count per promise
 sem check --promises                      # prove every promise can fail (each needs a mutation)
 ```
 
-The finer-grained `sem promises check --changed <files>`, `--only <ids>` and `sem promises status` keep working. The same file also works with `sem graph --modules check --laws <file>`, which adds graph and import laws (`forbid`, `only`, `acyclic`, `layers`, `forbidImport`, `allowImports`) for JS/TS workspaces. With `--changed` or `--since`, those laws still run over the whole graph, but only violations that involve a changed file (or the package containing it) are reported.
+`sem promises` is not listed in `sem --help`; `sem certify` reports promises kept or broken for a range. The same file also works with `sem graph --modules check --laws <file>`, which adds graph and import laws (`forbid`, `only`, `acyclic`, `layers`, `forbidImport`, `allowImports`) for JS/TS workspaces. With `--changed` or `--since`, those laws still run over the whole graph, but only violations that involve a changed file (or the package containing it) are reported.
 
 To have an agent see a broken promise right after it makes an edit, run [`scripts/promises-hook.sh`](scripts/promises-hook.sh) after each edit. The script exits 2 and prints the violations to stderr when a promise breaks, and stays silent otherwise. In Claude Code, add it to your settings as a `PostToolUse` hook:
 

@@ -74,8 +74,8 @@ sem impact --diff HEAD --tests          # tests for the uncommitted change
 sem impact --diff main..HEAD --json     # one report per changed entity
 
 # is it correct?
-sem check                               # exit 0 pass, 1 fail, 2 could not decide
-sem check --base origin/main            # only what changed since origin/main
+sem check                               # the project's compiler, type checker, linter, tests: exit 0 pass, 1 fail, 2 could not decide
+sem check --checkers ts,tests           # only these checkers
 
 # what should a human review?
 sem certify main..HEAD                  # review certificate (markdown)

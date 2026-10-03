@@ -817,10 +817,10 @@ fn impact_diff_tests_in_a_js_workspace_is_the_module_graph_selection() {
 }
 
 #[test]
-fn check_verdicts_from_promises() {
+fn check_runs_the_checkers_and_promises_adds_the_proofs() {
     let repo = fixture();
     let cache = TempDir::new().unwrap();
-    // nothing to check is "could not decide", never a pass
+    // No checker applies to a plain Python repo: could not decide, never a pass.
     let out = sem(repo.path(), cache.path(), &["check"]);
     assert_eq!(
         out.status.code(),
@@ -828,11 +828,12 @@ fn check_verdicts_from_promises() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = sem(
-        repo.path(),
-        cache.path(),
-        &["check", "--checkers", "ts,lint"],
-    );
+    let out = sem(repo.path(), cache.path(), &["check", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["certificate"]["verdict"], "undecided");
+
+    // --promises with no promises: nothing proved, still undecided.
+    let out = sem(repo.path(), cache.path(), &["check", "--promises"]);
     assert_eq!(out.status.code(), Some(2));
 
     let p = repo.path().join(".sem/promises");
@@ -840,33 +841,24 @@ fn check_verdicts_from_promises() {
     fs::write(
         p.join("no-print.json"),
         r#"{"laws": [{"id": "no-print", "promise": "library code does not print",
-            "forbidPattern": {"from": "src/**/*.py", "query": "((call function: (identifier) @_f) @print (#eq? @_f \"print\"))"},
-            "mutation": {"file": "src/config.py", "append": "\nprint(1)\n"}}]}"#,
+            "forbidPattern": {"from": "src/**/*.py", "query": "((call function: (identifier) @_f) @print (#eq? @_f \"print\"))"}}]}"#,
     )
     .unwrap();
-    let out = sem(repo.path(), cache.path(), &["check", "--json"]);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "main() prints: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let old = sem(repo.path(), cache.path(), &["promises", "check", "--json"]);
-    assert_eq!(
-        out.stdout, old.stdout,
-        "sem check reports what promises check reports"
-    );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["broken"], 1);
-
-    let verify_new = sem(
+    let new = sem(
         repo.path(),
         cache.path(),
         &["check", "--promises", "--json"],
     );
-    let verify_old = sem(repo.path(), cache.path(), &["promises", "verify", "--json"]);
-    assert_eq!(verify_new.stdout, verify_old.stdout);
-    assert_eq!(verify_new.status.code(), verify_old.status.code());
+    let old = sem(repo.path(), cache.path(), &["promises", "verify", "--json"]);
+    let text = String::from_utf8_lossy(&new.stdout).to_string();
+    let old_text = String::from_utf8_lossy(&old.stdout).to_string();
+    assert!(
+        text.ends_with(&old_text),
+        "the promises verdict follows the checkers':\n{text}\n--- promises verify\n{old_text}"
+    );
+    // a promise without a mutation fails verification: fail beats undecided
+    assert_eq!(old.status.code(), Some(1));
+    assert_eq!(new.status.code(), Some(1));
 }
 
 #[test]
@@ -1099,7 +1091,7 @@ fn mcp_lists_the_core_verbs_and_still_answers_old_tool_names() {
     assert_eq!(cert["summary"]["filesChanged"], 1);
     let strip = |s: String| {
         s.lines()
-            .filter(|l| !l.contains("elapsed"))
+            .filter(|l| !l.contains("elapsed") && !l.contains("ms ·"))
             .collect::<Vec<_>>()
             .join("\n")
     };

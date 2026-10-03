@@ -427,7 +427,7 @@ pub struct HistoryParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckParams {
-    #[schemars(description = "Only report what changed since this revision (default: HEAD).")]
+    #[schemars(description = "Compare against this revision (default: HEAD); the working tree is what is checked.")]
     pub base: Option<String>,
     #[schemars(description = "Checkers to run, e.g. [\"ts\", \"lint\", \"tests\"] (default: every one the project has).")]
     pub checkers: Option<Vec<String>>,

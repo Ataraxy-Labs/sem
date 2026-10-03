@@ -26,7 +26,10 @@ pub fn verify(directory: Option<&str>, json: bool) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let root = super::repo_root_or_cwd(&cwd.to_string_lossy());
     if super::promises::discover(Path::new(&root)).is_empty() {
-        eprintln!("sem check --promises: no promises in {}/.sem/promises", root.display());
+        eprintln!(
+            "sem check --promises: no promises in {}/.sem/promises",
+            root.display()
+        );
         return 2;
     }
     let mut argv = vec!["sem promises", "verify"];
