@@ -50,6 +50,14 @@ pub struct Common {
     /// Drop world (outside-root) nodes and edges to them
     #[arg(long)]
     no_world: bool,
+    /// Module granularity: imports of existing non-source repo files (json,
+    /// css, fonts, images) become edges to asset nodes instead of unresolved
+    #[arg(long)]
+    assets: bool,
+    /// The repository root is a package too: files outside every workspace
+    /// package (root config, scripts, test setup) become nodes owned by it
+    #[arg(long)]
+    root_package: bool,
     /// Source extensions to scan
     #[arg(long = "ext", num_args = 1.., default_values = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"])]
     exts: Vec<String>,
@@ -153,7 +161,12 @@ impl Loaded {
     fn load(common: Common) -> Loaded {
         let t0 = Instant::now();
         let root = PathBuf::from(&common.repo_root);
-        let disc = Discovery { exclude_dirs: &common.exclude_dirs, skip_segments: &common.skip_dirs, extensions: &common.exts };
+        let disc = Discovery {
+            exclude_dirs: &common.exclude_dirs,
+            skip_segments: &common.skip_dirs,
+            extensions: &common.exts,
+            root_package: common.root_package,
+        };
         let ws = Workspace::discover(&root, &disc);
         let paths = ws.source_files(&disc);
         let ex = Extraction::run(&root, ws, &paths);
@@ -176,6 +189,17 @@ impl Loaded {
     }
 
     fn graph(&self, granularity: Option<Granularity>, reference: Option<Selector>, kinds: &[FileKind], no_world: bool) -> Graph {
+        self.graph_with(granularity, reference, kinds, no_world, self.common.assets)
+    }
+
+    fn graph_with(
+        &self,
+        granularity: Option<Granularity>,
+        reference: Option<Selector>,
+        kinds: &[FileKind],
+        no_world: bool,
+        assets: bool,
+    ) -> Graph {
         let c = &self.common;
         Graph::build(
             &self.ex,
@@ -192,6 +216,7 @@ impl Loaded {
                     KindArg::Type => Selector::Type,
                 }),
                 no_world,
+                assets,
             },
         )
     }
@@ -199,6 +224,55 @@ impl Loaded {
     fn default_graph(&self) -> Graph {
         self.graph(None, None, &self.kinds(false), self.common.no_world)
     }
+}
+
+/// The module-granularity runtime (value) reference graph of the JS/TS
+/// workspace at `repo_root`, production files only: node ids and adjacency.
+/// Empty when the root holds no JS/TS workspace.
+/// JS/TS import resolution of the tree at `repo_root`: `(importing file,
+/// specifier) -> repo file`, for every specifier that lands on a source file.
+pub(crate) fn spec_targets(repo_root: &str) -> std::collections::HashMap<(String, String), String> {
+    let l = Loaded::load(Common::at(repo_root));
+    let mut out = std::collections::HashMap::new();
+    for f in &l.ex.files {
+        for r in &f.refs {
+            if let sem_core::topology::resolve::Target::File(t) = &r.target {
+                out.insert((f.path.clone(), r.specifier.clone()), t.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Relative JS/TS imports that land on no file at all: `(importing file,
+/// specifier)`.
+pub(crate) fn broken_relative_imports(repo_root: &str) -> BTreeSet<(String, String)> {
+    use sem_core::topology::resolve::Target;
+    let l = Loaded::load(Common::at(repo_root));
+    let root = std::path::Path::new(repo_root);
+    let mut out = BTreeSet::new();
+    for f in &l.ex.files {
+        for r in &f.refs {
+            if !r.specifier.starts_with('.') {
+                continue;
+            }
+            if let Target::Path(p) = &r.target {
+                let exists = root.join(p).exists()
+                    || [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".d.ts", "/index.ts", "/index.js"].iter().any(|e| root.join(format!("{p}{e}")).exists());
+                if !exists {
+                    out.insert((f.path.clone(), r.specifier.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn module_value_graph(repo_root: &str) -> (Vec<String>, algo::Adj) {
+    let l = Loaded::load(Common::at(repo_root));
+    let g = l.graph(Some(Granularity::Module), Some(Selector::Value), &[FileKind::Prod], false);
+    let adj = g.adjacency();
+    (g.nodes.iter().map(|n| n.id.clone()).collect(), adj)
 }
 
 fn common_of(cmd: &TopologyCmd) -> Common {
@@ -253,7 +327,8 @@ pub fn run(cmd: TopologyCmd) -> Result<(), Box<dyn std::error::Error>> {
         TopologyCmd::CommonAncestors { nodes, .. } => common_ancestors(&l.default_graph(), &nodes)?,
         TopologyCmd::Path { from, to, .. } => path(&l.default_graph(), &from, &to)?,
         TopologyCmd::AffectedTests { changed, .. } => {
-            let g = l.graph(Some(Granularity::Module), None, &[FileKind::Prod, FileKind::Test], true);
+            // assets always: a changed json/css/font a module imports reaches the tests that load it
+            let g = l.graph_with(Some(Granularity::Module), None, &[FileKind::Prod, FileKind::Test], true, true);
             affected_tests(&l, &g, &changed)
         }
         TopologyCmd::Check { .. } => unreachable!("handled above"),
@@ -392,6 +467,11 @@ fn affected_tests(l: &Loaded, g: &Graph, changed: &[String]) -> Value {
     paths.sort();
     paths.dedup();
     for p in paths {
+        // a snapshot file belongs to the test beside it: `dir/__snapshots__/x.test.ts.snap` -> `dir/x.test.ts`
+        if let Some(t) = snapshot_owner(p).and_then(|t| g.find(&t)) {
+            matched.push(t);
+            continue;
+        }
         if !in_root(p) {
             out_of_scope.push(p.clone());
         } else if let Some(u) = g.find(p) {
@@ -433,6 +513,14 @@ fn affected_tests(l: &Loaded, g: &Graph, changed: &[String]) -> Value {
     }
     json!({ "query": "affected-tests", "changedPaths": changed, "affectedTests": tests, "directlyAffectedTests": direct,
             "unmatchedChangedPaths": unmatched, "outOfScopeChangedPaths": out_of_scope })
+}
+
+/// The test file a jest/vitest snapshot belongs to (`a/__snapshots__/b.test.tsx.snap` -> `a/b.test.tsx`).
+fn snapshot_owner(p: &str) -> Option<String> {
+    let stem = p.strip_suffix(".snap")?;
+    let (dir, leaf) = stem.rsplit_once('/').unwrap_or(("", stem));
+    let owner_dir = if dir == "__snapshots__" { "" } else { dir.strip_suffix("/__snapshots__")? };
+    Some(if owner_dir.is_empty() { leaf.to_string() } else { format!("{owner_dir}/{leaf}") })
 }
 
 // ---- laws ------------------------------------------------------------------
@@ -707,4 +795,17 @@ fn code_shapes(ctx: &Ctx, laws: &[Value], scope: Option<&BTreeSet<String>>) -> R
         .zip(hits)
         .map(|(i, hs)| (i, hs.into_iter().map(|(file, h)| json!({ "file": file, "line": h.line, "col": h.col, "capture": h.capture, "text": h.text })).collect()))
         .collect())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::snapshot_owner;
+
+    #[test]
+    fn snapshot_belongs_to_the_test_beside_its_directory() {
+        assert_eq!(snapshot_owner("pkg/tests/__snapshots__/a.test.tsx.snap").as_deref(), Some("pkg/tests/a.test.tsx"));
+        assert_eq!(snapshot_owner("__snapshots__/b.test.ts.snap").as_deref(), Some("b.test.ts"));
+        assert_eq!(snapshot_owner("pkg/a.test.tsx.snap"), None);
+        assert_eq!(snapshot_owner("pkg/__snapshots__/a.test.tsx"), None);
+    }
 }

@@ -296,6 +296,66 @@ enum Commands {
         #[command(subcommand)]
         cmd: commands::topology::TopologyCmd,
     },
+    /// Review certificate for a commit range: entities touched, signature changes and
+    /// the callers they leave behind, callee deltas, laws kept/broken with witnesses,
+    /// module reachability deltas (JS/TS), affected tests, and the static reference cone
+    Certify {
+        /// Commit range `<base>..<head>` (`<base>...<head>` uses the merge base; a single ref means `<ref>..HEAD`)
+        range: String,
+        /// Extra laws files (the `sem topology check` format), besides `.sem/promises/*.json` at head
+        #[arg(long, num_args = 1..)]
+        laws: Vec<std::path::PathBuf>,
+        /// Output the full certificate as JSON instead of the markdown render
+        #[arg(long)]
+        json: bool,
+        /// Items listed per section in the markdown render
+        #[arg(long, default_value_t = 8)]
+        max_items: usize,
+        /// Cap on the markdown render's size, in characters
+        #[arg(long, default_value_t = 9000)]
+        max_chars: usize,
+    },
+    /// Architecture delta of a commit range, for review instead of the line diff:
+    /// new/removed data paths (source -> sink) with witnesses, side-effect changes per
+    /// entity, package/file dependencies, cycles, propagation cost, centrality,
+    /// complexity deltas, signature changes and their callers, laws, what did NOT
+    /// change, and how much the analysis could not resolve — ranked by severity
+    #[command(name = "arch-diff")]
+    ArchDiff {
+        /// Commit range `<base>..<head>` (`<base>...<head>` uses the merge base; a single ref means `<ref>..HEAD`)
+        range: String,
+        /// Output the full report as JSON
+        #[arg(long, conflicts_with = "md")]
+        json: bool,
+        /// Output a compact markdown summary
+        #[arg(long)]
+        md: bool,
+        /// Extra laws files (the `sem topology check` format), besides `.sem/promises/*.json` at head
+        #[arg(long, num_args = 1..)]
+        laws: Vec<std::path::PathBuf>,
+        /// Extra source/sink model files (besides built-ins and `.sem/models/*.json` at head)
+        #[arg(long, num_args = 1..)]
+        models: Vec<std::path::PathBuf>,
+        /// Items listed per section
+        #[arg(long, default_value_t = 8)]
+        max_items: usize,
+    },
+    /// Data flow of the working tree: per-function reads/writes (env, files, DB,
+    /// network, subprocess, logs, module state, fields) and source -> sink paths
+    Dataflow {
+        /// Repository path (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: String,
+        /// Full report as JSON (facts per entity, flows, unknowns, coverage)
+        #[arg(long)]
+        json: bool,
+        /// Extra source/sink model files
+        #[arg(long, num_args = 1..)]
+        models: Vec<std::path::PathBuf>,
+        /// Paths listed
+        #[arg(long, default_value_t = 20)]
+        max_items: usize,
+    },
     /// Show the full entity dependency graph
     Graph {
         /// Repository path (defaults to current directory)
@@ -611,6 +671,9 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Graph { .. }) => "graph",
         Some(Commands::Promises { .. }) => "promises",
         Some(Commands::Topology { .. }) => "topology",
+        Some(Commands::Certify { .. }) => "certify",
+        Some(Commands::ArchDiff { .. }) => "arch-diff",
+        Some(Commands::Dataflow { .. }) => "dataflow",
         Some(Commands::Blame { .. }) => "blame",
         Some(Commands::Hook { .. }) => "hook",
         Some(Commands::Log { .. }) => "log",
@@ -730,6 +793,40 @@ fn main() {
         }
         Some(Commands::Topology { cmd }) => {
             if let Err(e) = commands::topology::run(cmd) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+        Some(Commands::ArchDiff { range, json, md, laws, models, max_items }) => {
+            let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
+            let format = if json {
+                commands::arch_diff::Format::Json
+            } else if md {
+                commands::arch_diff::Format::Markdown
+            } else {
+                commands::arch_diff::Format::Text
+            };
+            if let Err(e) = commands::arch_diff::arch_diff_command(commands::arch_diff::ArchDiffOptions { cwd, range, laws, models, format, max_items }) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+        Some(Commands::Dataflow { path, json, models, max_items }) => {
+            if let Err(e) = commands::arch_diff::dataflow_command(&path, json, &models, max_items) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+        Some(Commands::Certify { range, laws, json, max_items, max_chars }) => {
+            let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
+            if let Err(e) = commands::certify::certify_command(commands::certify::CertifyOptions {
+                cwd,
+                range,
+                laws,
+                json,
+                max_items,
+                max_chars,
+            }) {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }

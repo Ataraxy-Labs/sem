@@ -31,7 +31,7 @@ pub fn classify(rel: &str) -> FileKind {
     let dirs = &segs[..segs.len().saturating_sub(1)];
     let has = |names: &[&str]| dirs.iter().any(|s| names.contains(s));
     let tsx = |mid: &str| {
-        ["ts", "tsx", "mts", "cts", "mtsx", "ctsx"].iter().any(|e| leaf.ends_with(&format!("{mid}{e}")))
+        ["ts", "tsx", "mts", "cts", "mtsx", "ctsx", "js", "jsx", "mjs", "cjs"].iter().any(|e| leaf.ends_with(&format!("{mid}{e}")))
     };
     if tsx(".test.") || tsx(".spec.") || has(&["__tests__", "__mocks__", "test", "testing"]) {
         FileKind::Test
@@ -86,12 +86,18 @@ impl Extraction {
                     .unwrap_or(p);
                 let refs = refs
                     .into_iter()
-                    .map(|r| Reference {
-                        target: resolver.resolve(p, &r.specifier),
-                        kind: r.kind,
-                        form: r.form,
-                        line: r.line,
-                        specifier: r.specifier,
+                    .flat_map(|r| {
+                        let targets = match r.form {
+                            Form::DynamicPattern => resolver.expand_pattern(p, &r.specifier),
+                            _ => vec![resolver.resolve(p, &r.specifier)],
+                        };
+                        targets.into_iter().map(move |target| Reference {
+                            target,
+                            kind: r.kind,
+                            form: r.form,
+                            line: r.line,
+                            specifier: r.specifier.clone(),
+                        })
                     })
                     .collect();
                 SourceFile { path: p.clone(), package, file_kind: classify(rel_in_pkg), refs, parse_errors: errs }
@@ -134,6 +140,9 @@ pub enum NodeKind {
     Module,
     /// Outside the root: an opaque sink with no out-edges.
     World,
+    /// A repo file a module references that is not a scanned source file
+    /// (json, stylesheet, font, image): a sink. Only with `Options::assets`.
+    Asset,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -180,6 +189,10 @@ pub struct Options<'a> {
     pub reference: Selector,
     /// Drop world nodes and every edge to them.
     pub no_world: bool,
+    /// Module granularity: a reference to an existing repo file that is not a
+    /// source node (json, css, font, image) becomes an edge to an asset node
+    /// instead of an unresolved import.
+    pub assets: bool,
 }
 
 const NODE_BUILTINS: &[&str] = &[
@@ -293,6 +306,11 @@ impl Graph {
                     }
                     Granularity::Module => match &r.target {
                         Target::File(p) if file_node.contains_key(p.as_str()) => file_node[p.as_str()],
+                        Target::File(p) | Target::Path(p)
+                            if opt.assets && ex.file(p).is_none() && ex.ws.root.join(p).is_file() =>
+                        {
+                            add(&mut nodes, NodeKind::Asset, p.clone(), ex.ws.owner_of(p).map(|o| ex.ws.packages[o].name.clone()), None)
+                        }
                         Target::File(p) | Target::Path(p) => match ex.ws.owner_of(p) {
                             // in-root but not a node (excluded file kind) -> no edge; otherwise unresolved
                             Some(o) if admitted[o] => {
@@ -443,6 +461,8 @@ mod tests {
         assert_eq!(classify("examples/demo/x.ts"), FileKind::Example);
         assert_eq!(classify("vite.config.ts"), FileKind::Build);
         assert_eq!(classify("src/test.ts"), FileKind::Prod);
+        assert_eq!(classify("src/a.spec.jsx"), FileKind::Test);
+        assert_eq!(classify("src/a.test.mjs"), FileKind::Test);
     }
 
     #[test]

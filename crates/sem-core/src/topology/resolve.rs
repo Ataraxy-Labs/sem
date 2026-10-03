@@ -120,6 +120,29 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Repo files a relative dynamic-import pattern (`./locales/*.json`,
+    /// `*` within the last segment only) can load, resolved like any relative
+    /// specifier. Patterns with a `*` in a directory segment expand to nothing.
+    pub fn expand_pattern(&self, from_file: &str, pattern: &str) -> Vec<Target> {
+        let full = normalize(&format!("{}/{pattern}", parent(from_file)));
+        let (dir, leaf_pat) = (parent(&full), leaf(&full));
+        if dir.contains('*') || leaf_pat.is_empty() {
+            return Vec::new();
+        }
+        let Ok(rd) = std::fs::read_dir(self.ws.root.join(dir)) else { return Vec::new() };
+        let mut names: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| super::glob::matches(leaf_pat, n))
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|n| self.file_or_path(&if dir.is_empty() { n.clone() } else { format!("{dir}/{n}") }))
+            .collect()
+    }
+
     fn file_or_path(&self, base: &str) -> Target {
         if self.files.contains(base) {
             return Target::File(base.to_string());
@@ -273,7 +296,7 @@ mod tests {
             std::fs::write(f, text).unwrap();
         }
         let exts = vec![".ts".to_string()];
-        let w = Workspace::discover(d.path(), &Discovery { exclude_dirs: &[], skip_segments: &[], extensions: &exts });
+        let w = Workspace::discover(d.path(), &Discovery { exclude_dirs: &[], skip_segments: &[], extensions: &exts, root_package: false });
         (d, w)
     }
 

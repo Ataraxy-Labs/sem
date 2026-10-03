@@ -719,6 +719,111 @@ fn owner_index(entities: &[SemanticEntity]) -> HashMap<&str, OwnerIndex<'_>> {
     out
 }
 
+/// What one site resolved to, for consumers outside the graph build (the
+/// data-flow engine). Same answers as the edges, with the external and
+/// unknown outcomes kept instead of dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SiteAnswer {
+    /// Repo definitions, as sem entity ids (functions, or a type for a
+    /// constructor call). Several = the site reaches one of them.
+    Defs(Vec<String>),
+    /// A module-level value (`const`, `static`, Go `var`, a Python module
+    /// assignment): `(file, name)`.
+    Value(String, String),
+    /// Outside the repo. For a method call, the receiver's type as the
+    /// resolver knows it: its last path segment only (`DB`, `Session`).
+    External(Option<String>),
+    Unknown(&'static str),
+}
+
+/// Stages 2–4 for one language's files, answering every site: per file,
+/// `(byte offset of the site's name, is a call, answer)`.
+pub fn site_answers(
+    root: &FsPath,
+    lang: &dyn Lang,
+    files: &[(&str, &FileFacts)],
+    entities: &[SemanticEntity],
+) -> Vec<Vec<(u32, bool, SiteAnswer)>> {
+    use scope::Def;
+    let facts: Vec<&FileFacts> = files.iter().map(|(_, f)| *f).collect();
+    let layout = lang.layout(root, files);
+    let tables = ScopeTables::build(&facts, &layout);
+    let impls = ImplTables::build(&facts, &tables.view(), lang);
+    let ids = EntityIds::build(files, entities);
+    let hints = if lang.infer_params_from_calls() {
+        Some(param_hints(lang, &facts, &tables, &impls))
+    } else {
+        None
+    };
+    let per_file = |r: &mut Resolver, fi: usize| -> Vec<(u32, bool, SiteAnswer)> {
+        let f = facts[fi];
+        let mut cxs: HashMap<(Option<u32>, u32), infer::FnCx> = HashMap::default();
+        let mut out = Vec::with_capacity(f.sites.len());
+        for site in &f.sites {
+            let cx = cxs
+                .entry((site.func, site.scope))
+                .or_insert_with(|| r.fn_cx(fi as u32, site.func, site.scope));
+            let call = site.kind == SiteKind::Call;
+            let answer = match r.pick(site.expr, cx, site.at, 0) {
+                Pick::Defs(d, _) if call && !d.iter().any(|d| matches!(d, Def::Fn(..) | Def::Type(..))) => {
+                    SiteAnswer::Unknown("calls a value")
+                }
+                Pick::Defs(defs, _) => {
+                    let value = defs.iter().find_map(|d| match d {
+                        Def::Value(vf, vi) if !call => Some(SiteAnswer::Value(
+                            files[*vf as usize].0.to_string(),
+                            facts[*vf as usize].values[*vi as usize].name.to_string(),
+                        )),
+                        _ => None,
+                    });
+                    match value {
+                        Some(v) => v,
+                        None => {
+                            let targets: Vec<String> = defs
+                                .iter()
+                                .filter(|d| matches!(d, Def::Fn(..) | Def::Type(..)))
+                                .filter_map(|d| ids.of(*d).map(str::to_string))
+                                .collect();
+                            if targets.is_empty() {
+                                SiteAnswer::Unknown("repo definition without an entity")
+                            } else {
+                                SiteAnswer::Defs(targets)
+                            }
+                        }
+                    }
+                }
+                Pick::External(_) => {
+                    let recv = match f.expr(site.expr) {
+                        ir::Expr::Method(recv, _) => match r.type_of(recv, cx, site.at, 0) {
+                            infer::Ty::Ext(name, _) => Some(name.to_string()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    SiteAnswer::External(recv)
+                }
+                Pick::Unknown(why) => SiteAnswer::Unknown(why),
+            };
+            out.push((site.at, call, answer));
+        }
+        out
+    };
+    let indices: Vec<usize> = (0..files.len()).collect();
+    let make = || {
+        let mut r = Resolver::new(lang, &facts, tables.view(), &impls);
+        r.param_hints = hints.as_ref();
+        r
+    };
+    #[cfg(feature = "parallel")]
+    let out: Vec<Vec<(u32, bool, SiteAnswer)>> = indices.par_iter().map_init(make, |r, &fi| per_file(r, fi)).collect();
+    #[cfg(not(feature = "parallel"))]
+    let out: Vec<Vec<(u32, bool, SiteAnswer)>> = {
+        let mut r = make();
+        indices.iter().map(|&fi| per_file(&mut r, fi)).collect()
+    };
+    out
+}
+
 /// Describe how every site in `target` resolves (debugging aid for the
 /// call-graph harness): one line per site, `row: expr => pick`.
 pub fn explain(root: &FsPath, files: &[(&str, &FileFacts)], target: &str) -> Vec<String> {

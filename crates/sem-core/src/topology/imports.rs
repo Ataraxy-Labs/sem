@@ -32,6 +32,11 @@ pub enum Form {
     ImportEquals,
     /// `new Worker("./w")`, `new URL("./x", import.meta.url)`: a module loaded at runtime by URL.
     Worker,
+    /// ``import(`./locales/${code}.json`)``: a relative dynamic import whose
+    /// specifier is a template; the specifier is recorded as a pattern with
+    /// `*` for each substitution (bundler dynamic-import-vars convention: a
+    /// `*` never crosses a `/`).
+    DynamicPattern,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -121,8 +126,15 @@ impl<'a> Visit<'a> for Collector {
     }
 
     fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
-        if let Expression::StringLiteral(s) = &it.source {
-            self.push(s.value.as_str(), RefKind::Value, Form::Dynamic, it.span.start);
+        match &it.source {
+            Expression::StringLiteral(s) => self.push(s.value.as_str(), RefKind::Value, Form::Dynamic, it.span.start),
+            Expression::TemplateLiteral(t) if !t.expressions.is_empty() => {
+                let pattern = t.quasis.iter().map(|q| q.value.raw.as_str()).collect::<Vec<_>>().join("*");
+                if pattern.starts_with("./") || pattern.starts_with("../") {
+                    self.push(&pattern, RefKind::Value, Form::DynamicPattern, it.span.start);
+                }
+            }
+            _ => {}
         }
         walk::walk_import_expression(self, it);
     }
@@ -193,6 +205,8 @@ const l = require("./l");
 const w = new Worker("./w.ts");
 const u = new URL("./u.ts", import.meta.url);
 const v = new Worker(someVar);
+const x = await import(`./locales/${code}.json`);
+const y = await import(`${base}/x.js`);
 "#,
         );
         use Form::*;
@@ -214,6 +228,7 @@ const v = new Worker(someVar);
                 ("./l".into(), Value, Require),
                 ("./w.ts".into(), Value, Worker),
                 ("./u.ts".into(), Value, Worker),
+                ("./locales/*.json".into(), Value, DynamicPattern),
             ]
         );
     }

@@ -1,0 +1,37 @@
+{
+  "language": "ts",
+  "doc": "Qualified names: `<module specifier>.<member>` (`child_process.exec`, `node:` stripped); a default or namespace import is the specifier itself (`express`). Unimported globals are written as used (`process.env`, `console.log`, `fetch`). Methods of a type are `<qualified type>.<method>`.",
+  "models": [
+    { "match": ["process.env", "process.env.*"], "kind": "source", "class": "env" },
+    { "match": ["process.argv", "process.argv.*"], "kind": "source", "class": "cli-input" },
+
+    { "match": ["express", "express.default"], "kind": "returns", "type": "express.Application" },
+    { "match": ["express.Router"], "kind": "returns", "type": "express.Router" },
+    { "match": ["express.Application.get", "express.Application.post", "express.Application.put", "express.Application.patch", "express.Application.delete", "express.Application.all", "express.Application.use", "express.Router.get", "express.Router.post", "express.Router.put", "express.Router.patch", "express.Router.delete", "express.Router.all", "express.Router.use"], "kind": "callback", "arg": "each", "params": [ { "index": 0, "source": "http-input", "type": "express.Request" }, { "index": 1, "type": "express.Response" } ] },
+    { "match": ["express.Request", "next/server.NextRequest", "koa.Context", "fastify.FastifyRequest"], "kind": "param-source", "class": "http-input" },
+    { "match": ["express.Response.send", "express.Response.json", "express.Response.write", "express.Response.end", "express.Response.render"], "kind": "sink", "class": "http-response" },
+    { "match": ["express.Response.redirect"], "kind": "sink", "class": "http-response" },
+
+    { "match": ["child_process.exec", "child_process.execSync", "child_process.spawn", "child_process.spawnSync", "child_process.execFile", "child_process.execFileSync", "child_process.fork", "execa", "execa.execa", "execa.execaCommand", "eval"], "kind": "sink", "class": "exec" },
+    { "match": ["eval", "Function", "Reflect.apply", "Reflect.get", "Reflect.set"], "kind": "dynamic" },
+
+    { "match": ["fs.readFileSync", "fs.readFile", "fs.promises.readFile", "fs/promises.readFile", "fs.readdirSync", "fs/promises.readdir", "fs.createReadStream"], "kind": "source", "class": "file-read" },
+    { "match": ["fs.readFile"], "kind": "callback", "arg": "last", "params": [ { "index": 1, "source": "file-read" } ] },
+    { "match": ["fs.writeFileSync", "fs.writeFile", "fs.appendFileSync", "fs.appendFile", "fs.promises.writeFile", "fs.promises.appendFile", "fs/promises.writeFile", "fs/promises.appendFile", "fs.createWriteStream", "fs.rmSync", "fs.unlinkSync", "fs/promises.rm", "fs/promises.unlink"], "kind": "sink", "class": "file-write" },
+
+    { "match": ["pg.Client", "pg.default.Client"], "kind": "returns", "type": "pg.Client" },
+    { "match": ["pg.Pool", "pg.default.Pool"], "kind": "returns", "type": "pg.Pool" },
+    { "match": ["pg.Client.query", "pg.Pool.query", "mysql.Connection.query", "mysql2.Connection.query", "mysql2.Connection.execute", "better-sqlite3.Database.prepare", "better-sqlite3.Database.exec"], "kind": "sink", "class": "db", "args": [0] },
+    { "match": ["mysql.createConnection", "mysql2.createConnection", "mysql2/promise.createConnection"], "kind": "returns", "type": "mysql2.Connection" },
+    { "match": ["better-sqlite3"], "kind": "returns", "type": "better-sqlite3.Database" },
+
+    { "match": ["console.log", "console.info", "console.warn", "console.error", "console.debug", "console.trace"], "kind": "sink", "class": "log" },
+
+    { "match": ["fetch", "axios", "axios.get", "axios.post", "axios.put", "axios.patch", "axios.delete", "axios.request", "node-fetch", "http.request", "https.request", "http.get", "https.get"], "kind": "sink", "class": "net-send" },
+    { "match": ["fetch", "axios", "axios.get", "axios.post", "axios.request", "node-fetch"], "kind": "source", "class": "net-input" },
+
+    { "match": ["ejs.render", "handlebars.compile", "pug.render", "pug.compile", "mustache.render"], "kind": "sink", "class": "template", "args": [0] },
+
+    { "match": ["Number", "parseInt", "parseFloat", "Boolean", "Number.parseInt", "Number.parseFloat"], "kind": "sanitizer" }
+  ]
+}

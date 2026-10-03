@@ -1,0 +1,32 @@
+{
+  "language": "go",
+  "doc": "Qualified names: `<import path>.<name>` (`os/exec.Command`, `net/http.Request`). Methods of a type are `<import path>.<Type>.<method>`. Pointer and slice markers are stripped from parameter types.",
+  "models": [
+    { "match": ["os.Getenv", "os.LookupEnv", "os.Environ", "os.ExpandEnv", "syscall.Getenv"], "kind": "source", "class": "env" },
+    { "match": ["os.Args", "flag.String", "flag.Int", "flag.Arg", "flag.Args"], "kind": "source", "class": "cli-input" },
+    { "match": ["net/http.Request", "github.com/gin-gonic/gin.Context", "github.com/labstack/echo/v4.Context", "github.com/gofiber/fiber/v2.Ctx"], "kind": "param-source", "class": "http-input" },
+    { "match": ["net/http.ResponseWriter.Write", "github.com/gin-gonic/gin.Context.JSON", "github.com/gin-gonic/gin.Context.String", "github.com/gin-gonic/gin.Context.HTML", "github.com/labstack/echo/v4.Context.JSON", "github.com/labstack/echo/v4.Context.String"], "kind": "sink", "class": "http-response" },
+
+    { "match": ["os/exec.Command", "os/exec.CommandContext", "syscall.Exec", "os.StartProcess"], "kind": "sink", "class": "exec" },
+    { "match": ["os/exec.Command", "os/exec.CommandContext"], "kind": "returns", "type": "os/exec.Cmd" },
+    { "match": ["reflect.ValueOf", "reflect.Value.Call", "reflect.Value.MethodByName", "reflect.Value.FieldByName", "plugin.Open"], "kind": "dynamic" },
+
+    { "match": ["database/sql.Open", "github.com/jmoiron/sqlx.Open", "github.com/jmoiron/sqlx.Connect"], "kind": "returns", "type": "database/sql.DB" },
+    { "match": ["database/sql.DB.Query", "database/sql.DB.QueryRow", "database/sql.DB.Exec", "database/sql.DB.Prepare", "database/sql.Tx.Query", "database/sql.Tx.QueryRow", "database/sql.Tx.Exec", "database/sql.Tx.Prepare", "database/sql.Conn.QueryContext", "database/sql.Conn.ExecContext"], "kind": "sink", "class": "db", "args": [0] },
+    { "match": ["database/sql.DB.QueryContext", "database/sql.DB.QueryRowContext", "database/sql.DB.ExecContext", "database/sql.DB.PrepareContext", "database/sql.Tx.QueryContext", "database/sql.Tx.QueryRowContext", "database/sql.Tx.ExecContext"], "kind": "sink", "class": "db", "args": [1] },
+    { "match": ["database/sql.Rows.Scan", "database/sql.Row.Scan"], "kind": "source", "class": "db-read" },
+
+    { "match": ["os.ReadFile", "io/ioutil.ReadFile", "os.Open", "io.ReadAll", "io/ioutil.ReadAll", "bufio.Scanner.Text"], "kind": "source", "class": "file-read" },
+    { "match": ["os.WriteFile", "io/ioutil.WriteFile", "os.Create", "os.Remove", "os.RemoveAll", "os.File.Write", "os.File.WriteString"], "kind": "sink", "class": "file-write" },
+
+    { "match": ["net/http.Get", "net/http.Post", "net/http.PostForm", "net/http.Head", "net/http.NewRequest", "net/http.NewRequestWithContext", "net/http.Client.Do", "net/http.Client.Get", "net/http.Client.Post", "net.Dial", "net.Conn.Write"], "kind": "sink", "class": "net-send" },
+    { "match": ["net/http.Get", "net/http.Post", "net/http.Client.Do", "net/http.Client.Get"], "kind": "source", "class": "net-input" },
+
+    { "match": ["log.Print", "log.Printf", "log.Println", "log.Fatal", "log.Fatalf", "log.Fatalln", "log.Panic", "log.Panicf", "log.Logger.Printf", "log.Logger.Println", "log/slog.Info", "log/slog.Debug", "log/slog.Warn", "log/slog.Error", "log/slog.Logger.Info", "log/slog.Logger.Error", "fmt.Print", "fmt.Printf", "fmt.Println"], "kind": "sink", "class": "log" },
+
+    { "match": ["html/template.Template.Execute", "text/template.Template.Execute", "html/template.Template.ExecuteTemplate", "text/template.Template.ExecuteTemplate"], "kind": "sink", "class": "template" },
+    { "match": ["html/template.HTML"], "kind": "sink", "class": "template", "args": [0] },
+
+    { "match": ["strconv.Atoi", "strconv.ParseInt", "strconv.ParseFloat", "strconv.ParseBool", "len"], "kind": "sanitizer" }
+  ]
+}

@@ -1,3 +1,4 @@
+pub mod dataflow;
 pub mod format;
 pub mod git;
 pub mod index;

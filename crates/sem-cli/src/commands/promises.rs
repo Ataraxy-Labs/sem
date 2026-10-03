@@ -269,7 +269,7 @@ pub fn run(cmd: PromisesCmd) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `file:line:col  capture  snippet` for code-shape hits; `file:line  specifier`
 /// for imports; the raw violation for graph laws.
-fn detail_line(d: &Value) -> String {
+pub(crate) fn detail_line(d: &Value) -> String {
     let s = |k: &str| d[k].as_str().map(str::to_string).unwrap_or_else(|| d[k].to_string());
     if d.get("problem").is_some() {
         return format!("{}:{}:{}  {}  (defined at {})  {}", s("file"), d["line"], d["col"], s("problem"), s("target"), s("text"));

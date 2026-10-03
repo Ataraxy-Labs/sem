@@ -33,6 +33,9 @@ pub struct Discovery<'a> {
     pub skip_segments: &'a [String],
     /// Source extensions to scan.
     pub extensions: &'a [String],
+    /// The repository root is a package too: files outside every workspace
+    /// package (root config, scripts, test setup) are nodes owned by it.
+    pub root_package: bool,
 }
 
 #[derive(Debug, Default)]
@@ -69,6 +72,25 @@ impl Workspace {
             ws.by_name.insert(pkg.name.clone(), ws.packages.len());
             ws.packages.push(pkg);
         }
+        if opt.root_package && !ws.packages.iter().any(|p| p.dir.is_empty()) {
+            let mut pkg = read_package(&root, "").unwrap_or_else(|| Package {
+                name: "<root>".to_string(),
+                dir: String::new(),
+                exports: None,
+                imports: None,
+                main: None,
+                deps: BTreeSet::new(),
+                dev_deps: BTreeSet::new(),
+                peer_deps: BTreeSet::new(),
+                optional_deps: BTreeSet::new(),
+                inferred: true,
+            });
+            if ws.by_name.contains_key(&pkg.name) {
+                pkg.name = "<root>".to_string();
+            }
+            ws.by_name.insert(pkg.name.clone(), ws.packages.len());
+            ws.packages.push(pkg);
+        }
         let dirs: Vec<&str> = std::iter::once("").chain(ws.packages.iter().map(|p| p.dir.as_str())).collect();
         ws.ts_paths = super::tsconfig::discover(&ws.root, &dirs);
         ws
@@ -98,7 +120,9 @@ impl Workspace {
     pub fn owner_of(&self, rel_path: &str) -> Option<usize> {
         let mut best: Option<(usize, usize)> = None;
         for (i, p) in self.packages.iter().enumerate() {
-            let inside = rel_path == p.dir || (rel_path.len() > p.dir.len() && rel_path.starts_with(&p.dir) && rel_path.as_bytes()[p.dir.len()] == b'/');
+            let inside = p.dir.is_empty()
+                || rel_path == p.dir
+                || (rel_path.len() > p.dir.len() && rel_path.starts_with(&p.dir) && rel_path.as_bytes()[p.dir.len()] == b'/');
             if inside && best.is_none_or(|(_, len)| p.dir.len() > len) {
                 best = Some((i, p.dir.len()));
             }
@@ -142,7 +166,7 @@ fn walk(root: &Path, dir: &str, opt: &Discovery, out: &mut Vec<String>) {
         if ft.is_symlink() {
             continue;
         }
-        let rel = format!("{dir}/{name}");
+        let rel = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
         if ft.is_dir() {
             if !opt.skip_segments.iter().any(|s| s == &name) {
                 walk(root, &rel, opt, out);

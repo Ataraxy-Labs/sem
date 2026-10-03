@@ -15,6 +15,7 @@ name = "sem"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3.24.0"
 sem-core = { path = "../sem-core", version = "0.26.0", features = ["disk-cache", "topology"] }
 sem-mcp = { path = "../sem-mcp", version = "0.26.0" }
 sem-cloud-client = { path = "../sem-cloud-client", version = "0.26.0" }

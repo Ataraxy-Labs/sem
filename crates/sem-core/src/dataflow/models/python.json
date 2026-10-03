@@ -1,0 +1,49 @@
+{
+  "language": "python",
+  "doc": "Qualified names are as imported (`import os` -> `os.environ`); unimported builtins are `builtins.<name>`. Methods of a type are `<qualified type>.<method>`. A trailing `.*` matches any continuation.",
+  "models": [
+    { "match": ["os.environ", "os.environ.*", "os.getenv", "os.environb", "os.environb.*"], "kind": "source", "class": "env" },
+    { "match": ["sys.argv", "sys.argv.*"], "kind": "source", "class": "cli-input" },
+    { "match": ["flask.request", "flask.request.*"], "kind": "source", "class": "http-input" },
+    { "match": ["django.http.HttpRequest", "django.http.request.HttpRequest", "rest_framework.request.Request", "fastapi.Request", "starlette.requests.Request"], "kind": "param-source", "class": "http-input" },
+    { "match": ["builtins.input"], "kind": "source", "class": "cli-input" },
+
+    { "match": ["builtins.open", "io.open", "codecs.open"], "kind": "returns", "type": "io.TextIOWrapper" },
+    { "match": ["io.TextIOWrapper.read", "io.TextIOWrapper.readline", "io.TextIOWrapper.readlines", "pathlib.Path.read_text", "pathlib.Path.read_bytes"], "kind": "source", "class": "file-read" },
+    { "match": ["io.TextIOWrapper.write", "io.TextIOWrapper.writelines", "pathlib.Path.write_text", "pathlib.Path.write_bytes", "shutil.copy", "shutil.copyfile", "shutil.move"], "kind": "sink", "class": "file-write" },
+    { "match": ["pathlib.Path"], "kind": "returns", "type": "pathlib.Path" },
+    { "match": ["json.load", "yaml.safe_load", "yaml.load", "tomllib.load", "toml.load"], "kind": "source", "class": "file-read" },
+
+    { "match": ["subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.Popen", "subprocess.getoutput", "subprocess.getstatusoutput", "os.system", "os.popen", "os.execv", "os.execve", "os.execvp", "os.execl", "os.execlp", "os.spawnv", "os.spawnl", "asyncio.create_subprocess_shell", "asyncio.create_subprocess_exec"], "kind": "sink", "class": "exec" },
+    { "match": ["builtins.eval", "builtins.exec", "builtins.compile"], "kind": "sink", "class": "exec" },
+    { "match": ["builtins.eval", "builtins.exec", "builtins.getattr", "builtins.setattr", "builtins.delattr", "builtins.__import__", "builtins.globals", "builtins.locals", "builtins.vars", "importlib.import_module"], "kind": "dynamic" },
+
+    { "match": ["sqlite3.connect"], "kind": "returns", "type": "sqlite3.Connection" },
+    { "match": ["sqlite3.Connection.cursor"], "kind": "returns", "type": "sqlite3.Cursor" },
+    { "match": ["sqlite3.Connection.execute", "sqlite3.Connection.executemany", "sqlite3.Connection.executescript", "sqlite3.Cursor.execute", "sqlite3.Cursor.executemany", "sqlite3.Cursor.executescript"], "kind": "sink", "class": "db", "args": [0] },
+    { "match": ["psycopg2.connect"], "kind": "returns", "type": "psycopg2.extensions.connection" },
+    { "match": ["psycopg2.extensions.connection.cursor"], "kind": "returns", "type": "psycopg2.extensions.cursor" },
+    { "match": ["psycopg2.extensions.cursor.execute", "psycopg2.extensions.cursor.executemany"], "kind": "sink", "class": "db", "args": [0] },
+    { "match": ["psycopg.connect", "psycopg.Connection.connect"], "kind": "returns", "type": "psycopg.Connection" },
+    { "match": ["psycopg.Connection.cursor"], "kind": "returns", "type": "psycopg.Cursor" },
+    { "match": ["psycopg.Connection.execute", "psycopg.Cursor.execute", "psycopg.Cursor.executemany"], "kind": "sink", "class": "db", "args": [0] },
+    { "match": ["sqlalchemy.text", "sqlalchemy.sql.text"], "kind": "sink", "class": "db", "args": [0] },
+    { "match": ["sqlite3.Cursor.fetchone", "sqlite3.Cursor.fetchall", "sqlite3.Cursor.fetchmany", "psycopg2.extensions.cursor.fetchone", "psycopg2.extensions.cursor.fetchall", "psycopg.Cursor.fetchone", "psycopg.Cursor.fetchall"], "kind": "source", "class": "db-read" },
+
+    { "match": ["requests.get", "requests.post", "requests.put", "requests.patch", "requests.delete", "requests.head", "requests.request", "requests.Session.get", "requests.Session.post", "requests.Session.put", "requests.Session.patch", "requests.Session.delete", "requests.Session.request", "urllib.request.urlopen", "httpx.get", "httpx.post", "httpx.put", "httpx.patch", "httpx.delete", "httpx.request", "httpx.Client.get", "httpx.Client.post", "httpx.Client.put", "httpx.Client.request", "httpx.AsyncClient.get", "httpx.AsyncClient.post", "httpx.AsyncClient.put", "httpx.AsyncClient.request", "smtplib.SMTP.sendmail", "smtplib.SMTP.send_message"], "kind": "sink", "class": "net-send" },
+    { "match": ["requests.get", "requests.post", "requests.put", "requests.patch", "requests.delete", "requests.request", "requests.Session.get", "requests.Session.post", "requests.Session.request", "urllib.request.urlopen", "httpx.get", "httpx.post", "httpx.Client.get", "httpx.Client.post", "httpx.AsyncClient.get", "httpx.AsyncClient.post"], "kind": "source", "class": "net-input" },
+    { "match": ["requests.Session"], "kind": "returns", "type": "requests.Session" },
+    { "match": ["httpx.Client"], "kind": "returns", "type": "httpx.Client" },
+    { "match": ["httpx.AsyncClient"], "kind": "returns", "type": "httpx.AsyncClient" },
+    { "match": ["smtplib.SMTP", "smtplib.SMTP_SSL"], "kind": "returns", "type": "smtplib.SMTP" },
+
+    { "match": ["logging.debug", "logging.info", "logging.warning", "logging.warn", "logging.error", "logging.exception", "logging.critical", "logging.log", "logging.Logger.debug", "logging.Logger.info", "logging.Logger.warning", "logging.Logger.warn", "logging.Logger.error", "logging.Logger.exception", "logging.Logger.critical", "logging.Logger.log", "builtins.print"], "kind": "sink", "class": "log" },
+    { "match": ["logging.getLogger", "structlog.get_logger", "loguru.logger"], "kind": "returns", "type": "logging.Logger" },
+
+    { "match": ["flask.render_template_string", "jinja2.Template", "jinja2.Environment.from_string", "markupsafe.Markup", "django.utils.safestring.mark_safe"], "kind": "sink", "class": "template", "args": [0] },
+    { "match": ["flask.render_template", "django.shortcuts.render", "django.template.loader.render_to_string"], "kind": "sink", "class": "template" },
+    { "match": ["flask.make_response", "flask.jsonify", "django.http.HttpResponse", "django.http.JsonResponse", "fastapi.responses.HTMLResponse", "starlette.responses.HTMLResponse"], "kind": "sink", "class": "http-response" },
+
+    { "match": ["builtins.int", "builtins.float", "builtins.bool", "builtins.len", "builtins.isinstance", "builtins.hash", "builtins.id", "builtins.type"], "kind": "sanitizer" }
+  ]
+}
