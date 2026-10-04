@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-04
+
 ### Changed
 
 - **A smaller command line: eight verbs, variations as flags.** `sem --help` now lists `find`, `grep`, `impact`, `check`, `certify`, `diff`, `graph` and `history`, the `cloud` and `config` groups, and `mcp`, one line each saying which question the verb answers, with a QUICKSTART for the four agent questions (where is it, what does my change touch, is it correct, what should a human review).
