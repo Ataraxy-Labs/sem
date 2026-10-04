@@ -522,6 +522,8 @@ fn old_names_print_no_notice_when_piped_or_in_json_mode() {
 
 /// Under a terminal (via `script`), a human gets the one-line notice on
 /// stderr, and still none in JSON mode.
+// Needs `script(1)` to give sem a terminal.
+#[cfg(unix)]
 #[test]
 fn old_names_note_the_new_spelling_at_a_terminal() {
     let repo = fixture();

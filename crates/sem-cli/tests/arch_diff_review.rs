@@ -80,6 +80,8 @@ fn findings(v: &Value) -> Vec<(String, String, String)> {
 const WEB_BASE: &str = "import subprocess\nfrom flask import request\n\ndef run():\n    return 'ok'\n";
 const WEB_HEAD: &str = "import subprocess\nfrom flask import request\n\ndef run():\n    subprocess.run(request.args['cmd'], shell=True)\n    return 'ok'\n";
 
+// RSS is only measured on Linux and macOS, so the memory budget cannot trip elsewhere.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_memory_budget_degrades_to_a_partial_report() {
     let dir = two_commits(&[("app/web.py", WEB_BASE)], &[("app/web.py", WEB_HEAD)], &[]);

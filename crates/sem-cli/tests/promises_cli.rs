@@ -80,6 +80,8 @@ fn since_scopes_to_changed_and_untracked_files() {
     assert_eq!(v["promises"][1]["details"][0]["file"], "src/lib/new.rs");
 }
 
+// The hook is a POSIX shell script and PATH is colon-separated.
+#[cfg(unix)]
 #[test]
 fn edit_hook_blocks_only_on_a_broken_promise() {
     let dir = fixture();
