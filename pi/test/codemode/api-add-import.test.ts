@@ -214,6 +214,52 @@ test("an unrelated import from another source is untouched by supersede", async 
   }
 });
 
+test("supersede stays inside the leading import block, not in a fixture string", async () => {
+  const original = [
+    'import { parse } from "./parser.js";',
+    "",
+    "export const FIXTURE = `",
+    'import { parse } from "./legacy.js";',
+    "export const value = parse();",
+    "`;",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.ts", 'import { parse } from "./parser-v2.js";')) as AddImportResult;
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    // The real import is superseded...
+    assert.deepEqual(r.superseded, [{ symbol: "parse", from: "./parser.js" }]);
+    assert.doesNotMatch(content, /"\.\/parser\.js"/);
+    // ...and the fixture's own source text is left exactly as it was.
+    assert.match(content, /export const FIXTURE = `\nimport \{ parse \} from "\.\/legacy\.js";\nexport const value = parse\(\);\n`;/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("supersede ignores an indented import inside an ambient module block", async () => {
+  const original = [
+    'import { parse } from "./parser.js";',
+    "",
+    'declare module "legacy" {',
+    '  import { parse } from "./legacy.js";',
+    "  export const value: typeof parse;",
+    "}",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.d.ts": original });
+  try {
+    const { sem } = api(dir);
+    await sem.addImport("a.d.ts", 'import { parse } from "./parser-v2.js";');
+    const content = readFileSync(join(dir, "a.d.ts"), "utf8");
+    assert.match(content, /^  import \{ parse \} from "\.\/legacy\.js";$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a missing file throws an actionable error instead of creating it", async () => {
   const dir = makeDir({});
   try {

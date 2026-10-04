@@ -3125,28 +3125,6 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
     }
   }
 
-  // ES supersede: remove these symbols from any named import off a DIFFERENT
-  // source; drop a line left empty.
-  const superseded: Array<{ symbol: string; from: string }> = [];
-  if (esImport) {
-    const newSymbols = esImport[2]!.split(",").map((s) => s.trim()).filter(Boolean);
-    const newSource = esImport[3]!;
-    for (let i = 0; i < lines.length; i++) {
-      const m = ES_IMPORT_RE.exec(lines[i]!.trim());
-      if (!m || m[3] === newSource) continue;
-      const existingSymbols = m[2]!.split(",").map((s) => s.trim()).filter(Boolean);
-      const kept = existingSymbols.filter((s) => !newSymbols.includes(s));
-      if (kept.length === existingSymbols.length) continue;
-      for (const s of existingSymbols) if (newSymbols.includes(s)) superseded.push({ symbol: s, from: m[3]! });
-      if (kept.length === 0) {
-        lines.splice(i, 1);
-        i--;
-      } else {
-        lines[i] = `import ${m[1] ?? ""}{ ${kept.join(", ")} } from "${m[3]}";`;
-      }
-    }
-  }
-
   // Placement: after the last declaration of the file's LEADING import
   // block -- scan from the top, skipping blanks/comments/attributes, and
   // stop at the first real code line. Scanning the whole file is wrong
@@ -3236,6 +3214,33 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
       i++;
     } while (i < lines.length && depth > 0);
   }
+  // ES supersede: remove these symbols from any named import off a DIFFERENT
+  // source; drop a line left empty. Confined to the leading import block the
+  // scan above just measured, for the reason stated there and one more: a
+  // match here REWRITES or DELETES the line, so a function-local declaration
+  // or an unindented import inside a raw-string fixture is not merely a bad
+  // insert point, it is source the caller never asked to touch.
+  const superseded: Array<{ symbol: string; from: string }> = [];
+  if (esImport) {
+    const newSymbols = esImport[2]!.split(",").map((s) => s.trim()).filter(Boolean);
+    const newSource = esImport[3]!;
+    for (let i = 0; i <= lastImportIdx; i++) {
+      const m = ES_IMPORT_RE.exec(lines[i]!.trim());
+      if (!m || m[3] === newSource) continue;
+      const existingSymbols = m[2]!.split(",").map((s) => s.trim()).filter(Boolean);
+      const kept = existingSymbols.filter((s) => !newSymbols.includes(s));
+      if (kept.length === existingSymbols.length) continue;
+      for (const s of existingSymbols) if (newSymbols.includes(s)) superseded.push({ symbol: s, from: m[3]! });
+      if (kept.length === 0) {
+        lines.splice(i, 1);
+        i--;
+        lastImportIdx--;
+      } else {
+        lines[i] = `import ${m[1] ?? ""}{ ${kept.join(", ")} } from "${m[3]}";`;
+      }
+    }
+  }
+
   const insertAt = goInsertAt >= 0 ? goInsertAt : lastImportIdx + 1;
   const inserted = goInsertAt >= 0
     ? (goImportBlock ? `\t${goSpec}` : `import ${goSpec}`)

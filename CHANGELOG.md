@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`sem.addImport` no longer edits import-shaped lines outside the leading import block.** Its ES supersede pass scanned the whole file, so an `import { x } from "..."` line inside a template-literal fixture, or indented inside a `declare module` block, was rewritten or deleted along with the real stale import. The pass is now confined to the same leading declaration block the insert point is measured from.
+
 ## [0.27.0] - 2026-10-04
 
 ### Changed
