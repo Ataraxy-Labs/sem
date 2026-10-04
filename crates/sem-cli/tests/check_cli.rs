@@ -8,6 +8,8 @@
 //! `scripts/check-fixture-tools.sh` installs into `crates/target/check-tools`
 //! (or `$SEM_CHECK_TOOLS`, a node_modules directory). Without them those cases
 //! are skipped with a message, unless `SEM_CHECK_REQUIRE_TOOLS=1`.
+// The fixtures link pinned Node toolchains in with symlinks; these tests run on Unix CI.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
