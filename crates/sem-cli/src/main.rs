@@ -1411,7 +1411,21 @@ fn run_completions(shell: clap_complete_command::Shell) {
     shell.generate(&mut Cli::command(), &mut std::io::stdout());
 }
 
+/// Windows gives the main thread a 1 MB stack, against 8 MB on Linux and macOS.
+/// Parsing and dispatching this many commands in a debug build can exceed it,
+/// so the CLI runs on a thread with the stack it gets everywhere else.
 fn main() {
+    let worker = std::thread::Builder::new()
+        .name("sem".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(sem_main)
+        .expect("spawn the sem main thread");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn sem_main() {
     let cli = Cli::parse();
 
     if let Some(name) = telemetry_command_name(&cli.command) {
