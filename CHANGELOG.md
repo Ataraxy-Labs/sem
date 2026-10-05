@@ -7,6 +7,7 @@ All notable changes to sem are documented in this file.
 ### Changed
 
 - **Windows CI runs the test suite against release builds and reports every failure.** The wall-time and scale tests are calibrated for optimized binaries, so the debug build on the Windows runner overran them and failed main on four pushes in a row, each time on a different test because `cargo test` stopped at the first failing binary. Tests now build in release on the same target as the build step, and `--no-fail-fast` shows all failures at once.
+- **The CLI golden tests pass in every timezone and on Windows.** The fixture committed with a bare Unix timestamp, so git stamped the machine's local timezone into each commit and the SHAs in the goldens only matched machines set to +0530; the fixture now pins that offset. The comparison also ignores the CRLF line endings a Windows checkout gives the golden files. The 50k-file memory-bound test runs only on Unix, since it reads peak memory with `ps`, which Windows does not have.
 
 - TS/JS import edits preserve exact UTF-8 byte ranges and surrounding same-line code. Duplicate detection uses parsed declarations, and unavailable/invalid parsing refuses edits without changing the file rather than falling back to text matching.
 

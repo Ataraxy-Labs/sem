@@ -120,6 +120,9 @@ fn run_bounded(dir: &Path, max_mb: u64, max_secs: u64) -> Result<(u64, f64, Stri
     }
 }
 
+// Peak memory is read with ps(1), which Windows lacks, so the bound this test
+// exists to hold cannot be measured there.
+#[cfg(unix)]
 #[test]
 fn a_tiny_change_in_a_50k_file_repo_stays_under_a_gigabyte() {
     let tmp = tempfile::tempdir().unwrap();
