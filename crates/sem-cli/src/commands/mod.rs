@@ -15,6 +15,7 @@ pub mod graph;
 pub mod grep;
 pub mod hook;
 pub mod impact;
+pub mod imports;
 pub mod impact_diff;
 pub mod log;
 pub mod promises;

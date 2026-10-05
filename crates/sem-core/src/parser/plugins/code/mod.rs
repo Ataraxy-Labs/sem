@@ -55,6 +55,79 @@ pub fn parse_tree(
     parse_tree_incremental(config, content, None)
 }
 
+/// One top-level import statement located by the tree-sitter parser: a direct
+/// child of the syntax-tree root whose node kind is an import kind for the
+/// file's language. Line numbers are 1-based; byte offsets are into the file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopLevelImport {
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub text: String,
+}
+
+/// The file's top-level import statements, as the parser sees them.
+///
+/// Only direct children of the tree root are considered, so an import-shaped
+/// run of text inside a string or template literal (not a node at all), inside
+/// a comment, or nested in a block such as `declare module { ... }` (a child of
+/// that block, not of the root) never appears. A multi-line import is one node,
+/// returned with the line span of the whole statement. An import that follows
+/// other statements is still a top-level child, so it is returned too.
+///
+/// Returns an empty vec for a file this build cannot parse (unknown language,
+/// parse failure) or a language with no import kind registered here. Callers
+/// treat all of those the same: fall back to their own text scan.
+pub fn top_level_imports(file_path: &str, content: &str) -> Vec<TopLevelImport> {
+    let Some(config) = language_config_for_content(content, file_path) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_tree(config, content) else {
+        return Vec::new();
+    };
+    let src = content.as_bytes();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut out = Vec::new();
+    for child in root.children(&mut cursor) {
+        if !is_import_node_kind(config.id, child.kind()) {
+            continue;
+        }
+        let start = child.start_byte();
+        let end = child.end_byte();
+        out.push(TopLevelImport {
+            kind: child.kind().to_string(),
+            start_line: child.start_position().row + 1,
+            end_line: child.end_position().row + 1,
+            start_byte: start,
+            end_byte: end,
+            text: String::from_utf8_lossy(&src[start..end]).into_owned(),
+        });
+    }
+    out
+}
+
+/// Whether `kind` is the tree-sitter node kind of an import/use declaration for
+/// the language `lang_id`. Covers the languages `sem.addImport` reasons about;
+/// an unlisted language yields no parser-backed imports and the caller falls
+/// back to its text scan.
+fn is_import_node_kind(lang_id: &str, kind: &str) -> bool {
+    match lang_id {
+        "typescript" | "tsx" | "javascript" => kind == "import_statement",
+        "python" => matches!(
+            kind,
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        ),
+        "rust" => matches!(kind, "use_declaration" | "mod_item"),
+        "go" => kind == "import_declaration",
+        "java" => kind == "import_declaration",
+        "c" | "cpp" => kind == "preproc_include",
+        _ => false,
+    }
+}
+
 /// Hard wall-clock ceiling for a single-file parse. Healthy files parse in
 /// microseconds to low milliseconds, so this budget is far above the normal
 /// case and never fires for healthy input. It exists for the pathological
@@ -4010,5 +4083,37 @@ test "basic addition" {
 
         assert!(names.contains(&"foo"), "Should find foo, got: {:?}", names);
         assert!(names.contains(&"bar"), "Should find bar, got: {:?}", names);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-typescript")]
+    fn test_top_level_imports_excludes_strings_comments_and_nested() {
+        let code = concat!(
+            "import { parse } from \"./parser.js\";\n",
+            "\n",
+            "export const FIXTURE = `\n",
+            "import { parse } from \"./legacy.js\";\n",
+            "`;\n",
+            "\n",
+            "declare module \"m\" {\n",
+            "  import { x } from \"./nested.js\";\n",
+            "}\n",
+            "\n",
+            "const y = 1;\n",
+            "import {\n",
+            "  a,\n",
+            "  b\n",
+            "} from \"./ab.js\";\n",
+        );
+        let imports = top_level_imports("a.ts", code);
+        let texts: Vec<&str> = imports.iter().map(|i| i.text.as_str()).collect();
+        // Two real top-level imports: the leading one, and the one after `const y`.
+        assert_eq!(imports.len(), 2, "got: {texts:?}");
+        assert_eq!((imports[0].start_line, imports[0].end_line), (1, 1));
+        // The multi-line import comes back as one node spanning its full range.
+        assert_eq!((imports[1].start_line, imports[1].end_line), (12, 15));
+        // Never the import inside the template literal or the ambient module block.
+        assert!(imports.iter().all(|i| !i.text.contains("legacy.js")), "got: {texts:?}");
+        assert!(imports.iter().all(|i| !i.text.contains("nested.js")), "got: {texts:?}");
     }
 }

@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`sem.addImport` now locates imports with the tree-sitter parser instead of scanning lines.** A new internal `sem imports` command returns a file's real top-level import statements by position, and `addImport` uses it for TypeScript/JavaScript files to supersede and place imports. It only ever rewrites genuine top-level imports: import-shaped text inside a string or template literal, inside a comment, or nested in a block such as `declare module { ... }` is left untouched, a multi-line import is handled as one statement, and an import placed after other statements is found. It falls back to the previous line scan when the parser is unavailable.
+
 ## [0.27.0] - 2026-10-04
 
 ### Changed

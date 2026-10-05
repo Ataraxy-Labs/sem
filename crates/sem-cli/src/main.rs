@@ -22,6 +22,7 @@ use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::entities::{entities_command, EntitiesOptions};
 use commands::graph::{graph_command, GraphOptions};
 use commands::impact::{impact_command, ImpactMode, ImpactOptions};
+use commands::imports::{imports_command, ImportsOptions};
 use commands::log::{history_command, log_command, HistoryOptions, LogOptions};
 
 const ABOUT: &str = "sem: entity-level code intelligence for git repos (functions, classes and the calls between them)";
@@ -823,6 +824,24 @@ enum Commands {
         #[arg(long)]
         signatures: bool,
     },
+    /// List a file's top-level import statements as the parser sees them
+    /// (kind, line span, byte span, source text). Internal: pi's sem.addImport
+    /// uses it to place and supersede imports by parser position rather than
+    /// by a text scan, so import-shaped text in a string, comment, or nested
+    /// block is never mistaken for a real import.
+    #[command(hide = true)]
+    Imports {
+        /// File to list top-level imports for.
+        path: String,
+
+        /// Output format
+        #[arg(long, value_parser = ["terminal", "json"])]
+        format: Option<String>,
+
+        /// Output as JSON (shorthand for --format json)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show token-budgeted context for an entity
     #[command(hide = true)]
     Context {
@@ -1121,6 +1140,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Hook { .. }) => "hook",
         Some(Commands::Log { .. }) => "log",
         Some(Commands::Entities { .. }) => "entities",
+        Some(Commands::Imports { .. }) => "imports",
         Some(Commands::Find { .. }) => "find",
         Some(Commands::Callers { .. }) => "callers",
         Some(Commands::Refs { .. }) => "refs",
@@ -1835,6 +1855,10 @@ fn sem_main() {
                 text,
                 signatures,
             });
+        }
+        Some(Commands::Imports { path, format, json }) => {
+            let json = resolve_json(format, json);
+            imports_command(ImportsOptions { cwd: cwd_string(), path, json });
         }
         Some(Commands::Context {
             entity,

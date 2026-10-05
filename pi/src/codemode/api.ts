@@ -3083,6 +3083,41 @@ const IMPORT_LIKE_RE = /^(?:import\s|from\s+\S+\s+import\s|(?:pub(?:\(crate\))?\
 
 const normalizeDecl = (line: string): string => line.trim().replace(/;$/, "").replace(/\s+/g, " ");
 
+/** TS/JS file extensions whose imports addImport locates through the parser. */
+const TS_JS_EXT_RE = /\.(?:[mc]?tsx?|[mc]?jsx?)$/i;
+
+interface ParsedImport {
+  /** 1-based line of the import statement's first line. */
+  startLine: number;
+  /** 1-based line of its last line (equal to startLine unless multi-line). */
+  endLine: number;
+  /** The statement's own source text, exactly as written. */
+  text: string;
+}
+
+/**
+ * The file's top-level import statements, located by sem's tree-sitter parser
+ * (`sem imports --json`) rather than by scanning lines. Each entry is a REAL
+ * top-level `import ...` statement: never import-shaped text inside a string
+ * or template literal, inside a comment, or nested in a block such as
+ * `declare module { ... }`, and a multi-line import comes back as ONE entry
+ * spanning its whole line range. Returns null when the parse is unavailable
+ * (older/missing binary, non-zero exit, unparseable output) so the caller can
+ * fall back to its line scan; returns [] for a parseable file that genuinely
+ * has no top-level imports.
+ */
+async function topLevelImports(absPath: string, deps: SemApiDeps): Promise<ParsedImport[] | null> {
+  try {
+    const result = await runCommand(deps.semBin ?? "sem", ["imports", "--json", absPath], deps.cwd);
+    if (result.exitCode !== 0) return null;
+    const raw = JSON.parse(result.stdout) as Array<{ start_line: number; end_line: number; text: string }>;
+    if (!Array.isArray(raw)) return null;
+    return raw.map((r) => ({ startLine: r.start_line, endLine: r.end_line, text: r.text }));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Adds one import statement or module declaration LINE to an EXISTING file --
  * the gap sem.edit() can't fill, since import/mod lines aren't
@@ -3125,24 +3160,46 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
     }
   }
 
-  // ES supersede: remove these symbols from any named import off a DIFFERENT
-  // source; drop a line left empty.
+  // Supersede + placement for TS/JS are backed by the tree-sitter parser
+  // (`sem imports`), which returns the file's REAL top-level import statements
+  // by position -- never import-shaped text inside a string or template
+  // literal, inside a comment, or nested in a block such as
+  // `declare module { ... }`, and a multi-line import as a single node. That
+  // is what lets supersede rewrite or drop an import without ever touching
+  // source the caller never asked to change, and lets placement land after
+  // the last real import even when it follows other statements. Falls back to
+  // the line scan below when the parser is unavailable (older/missing binary)
+  // or the file is not a TS/JS file this path covers.
   const superseded: Array<{ symbol: string; from: string }> = [];
-  if (esImport) {
-    const newSymbols = esImport[2]!.split(",").map((s) => s.trim()).filter(Boolean);
-    const newSource = esImport[3]!;
-    for (let i = 0; i < lines.length; i++) {
-      const m = ES_IMPORT_RE.exec(lines[i]!.trim());
-      if (!m || m[3] === newSource) continue;
-      const existingSymbols = m[2]!.split(",").map((s) => s.trim()).filter(Boolean);
-      const kept = existingSymbols.filter((s) => !newSymbols.includes(s));
-      if (kept.length === existingSymbols.length) continue;
-      for (const s of existingSymbols) if (newSymbols.includes(s)) superseded.push({ symbol: s, from: m[3]! });
-      if (kept.length === 0) {
-        lines.splice(i, 1);
-        i--;
-      } else {
-        lines[i] = `import ${m[1] ?? ""}{ ${kept.join(", ")} } from "${m[3]}";`;
+  let parserInsertAt = -1;
+  if (TS_JS_EXT_RE.test(file)) {
+    const nodes = await topLevelImports(absPath, deps);
+    if (nodes && nodes.length > 0) {
+      // 0-based index of the line just after the last import's last line.
+      parserInsertAt = nodes[nodes.length - 1]!.endLine;
+      if (esImport) {
+        const newSymbols = esImport[2]!.split(",").map((s) => s.trim()).filter(Boolean);
+        const newSource = esImport[3]!;
+        // Bottom-up, so splicing one import never shifts an earlier one's line
+        // indices; `unshift` keeps the reported order top-to-bottom.
+        for (let k = nodes.length - 1; k >= 0; k--) {
+          const n = nodes[k]!;
+          const m = ES_IMPORT_RE.exec(n.text.trim());
+          if (!m || m[3] === newSource) continue;
+          const existingSymbols = m[2]!.split(",").map((s) => s.trim()).filter(Boolean);
+          const kept = existingSymbols.filter((s) => !newSymbols.includes(s));
+          if (kept.length === existingSymbols.length) continue;
+          for (const sym of existingSymbols) if (newSymbols.includes(sym)) superseded.unshift({ symbol: sym, from: m[3]! });
+          const startIdx = n.startLine - 1;
+          const removed = n.endLine - n.startLine + 1;
+          const added = kept.length === 0 ? 0 : 1;
+          if (added === 0) {
+            lines.splice(startIdx, removed);
+          } else {
+            lines.splice(startIdx, removed, `import ${m[1] ?? ""}{ ${kept.join(", ")} } from "${m[3]}";`);
+          }
+          if (startIdx < parserInsertAt) parserInsertAt += added - removed;
+        }
       }
     }
   }
@@ -3236,7 +3293,7 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
       i++;
     } while (i < lines.length && depth > 0);
   }
-  const insertAt = goInsertAt >= 0 ? goInsertAt : lastImportIdx + 1;
+  const insertAt = parserInsertAt >= 0 ? parserInsertAt : goInsertAt >= 0 ? goInsertAt : lastImportIdx + 1;
   const inserted = goInsertAt >= 0
     ? (goImportBlock ? `\t${goSpec}` : `import ${goSpec}`)
     : spec.trim().endsWith(";") || rustMod || esImport ? spec.trim().replace(/;?$/, ";") : spec.trim();
