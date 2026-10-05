@@ -6,6 +6,8 @@ All notable changes to sem are documented in this file.
 
 ### Changed
 
+- **Windows CI runs the test suite against release builds and reports every failure.** The wall-time and scale tests are calibrated for optimized binaries, so the debug build on the Windows runner overran them and failed main on four pushes in a row, each time on a different test because `cargo test` stopped at the first failing binary. Tests now build in release on the same target as the build step, and `--no-fail-fast` shows all failures at once.
+
 - TS/JS import edits preserve exact UTF-8 byte ranges and surrounding same-line code. Duplicate detection uses parsed declarations, and unavailable/invalid parsing refuses edits without changing the file rather than falling back to text matching.
 
 - **`sem.addImport` now locates imports with the tree-sitter parser instead of scanning lines.** A new internal `sem imports` command returns a file's real top-level import statements by position, and `addImport` uses it for TypeScript/JavaScript files to supersede and place imports. Strings, comments and nested declarations are not import targets. Multi-line and non-leading imports are supported. With no imports, insertion appends a top-level declaration to preserve directive prologues and shebangs. Other languages retain their existing behavior.
