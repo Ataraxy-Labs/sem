@@ -5,7 +5,6 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Semantic version control CLI. Shows what entities changed (functions, classes, methods) instead of lines."
 repository = "https://github.com/Ataraxy-Labs/sem"
-homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["diff", "semantic", "git", "cli", "code-review"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"

@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed redundant homepage metadata from the Rust packages where it duplicated the repository URL, avoiding Cargo's `redundant_homepage` warning (#510).
+
 ### Changed
 
 - **Windows CI runs the test suite against release builds and reports every failure.** The wall-time and scale tests are calibrated for optimized binaries, so the debug build on the Windows runner overran them and failed main on four pushes in a row, each time on a different test because `cargo test` stopped at the first failing binary. Tests now build in release on the same target as the build step, and `--no-fail-fast` shows all failures at once.

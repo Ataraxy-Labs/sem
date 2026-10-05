@@ -5,7 +5,6 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for entity-level semantic code intelligence. 6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context."
 repository = "https://github.com/Ataraxy-Labs/sem"
-homepage = "https://github.com/Ataraxy-Labs/sem"
 keywords = ["mcp", "semantic", "agent", "code-analysis", "impact"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
