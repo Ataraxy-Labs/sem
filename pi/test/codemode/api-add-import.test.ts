@@ -23,6 +23,64 @@ function makeDir(files: Record<string, string>): string {
 
 const api = (dir: string, changes = createChangeLog()) => ({ sem: buildSemApi({ cwd: dir, semBin: "sem", changes }), changes });
 
+test("parser edits preserve same-line code, comments and UTF-8 byte offsets", async () => {
+  const dir = makeDir({ "a.ts": '// café 😀\nimport { parse, keep } from "./old.js"; const important = "é"; // retained\n' });
+  try {
+    const { sem } = api(dir);
+    await sem.addImport("a.ts", 'import { parse } from "./new.js";');
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    assert.ok(content.startsWith('// café 😀\n'));
+    assert.ok(content.includes('const important = "é"; // retained'));
+    assert.ok(content.includes('import { keep } from "./old.js";'));
+    await sem.addImport("a.ts", 'import { keep } from "./other.js";');
+    assert.ok(readFileSync(join(dir, "a.ts"), "utf8").includes('const important = "é"; // retained'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("fixture text is not a duplicate when there are no top-level imports", async () => {
+  const original = '"use strict";\nexport const fixture = `\nimport { parse } from "./new.js";\n`;\n';
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    assert.equal((await sem.addImport("a.ts", 'import { parse } from "./new.js";')).added, true);
+    assert.ok(readFileSync(join(dir, "a.ts"), "utf8").startsWith(original));
+    assert.equal((await sem.addImport("a.ts", 'import { parse } from "./new.js";')).alreadyPresent, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("missing parser refuses mutation rather than unsafe fallback", async () => {
+  const original = 'import { parse } from "./old.js";\n';
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const sem = buildSemApi({ cwd: dir, semBin: join(dir, "missing-sem"), changes: createChangeLog() });
+    await assert.rejects(() => sem.addImport("a.ts", 'import { parse } from "./new.js";'), /parser unavailable/);
+    assert.equal(readFileSync(join(dir, "a.ts"), "utf8"), original);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("invalid syntax refuses mutation", async () => {
+  const original = 'import { broken';
+  const dir = makeDir({ "a.ts": original });
+  try {
+    await assert.rejects(() => api(dir).sem.addImport("a.ts", 'import { x } from "./x.js";'), /parser unavailable/);
+    assert.equal(readFileSync(join(dir, "a.ts"), "utf8"), original);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("multiple same-line imports and CRLF preserve all non-import source", async () => {
+  const dir = makeDir({ "a.ts": 'import { x } from "./x.js"; import { y } from "./y.js"; const keep = 1;\r\n' });
+  try {
+    const { sem } = api(dir);
+    await sem.addImport("a.ts", 'import { x, y } from "./new.js";');
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    assert.ok(content.includes('const keep = 1;\r\n'));
+    assert.ok(content.includes('import { x, y } from "./new.js";\r\n'));
+    assert.ok(!content.includes('from "./x.js"'));
+    assert.ok(!content.includes('from "./y.js"'));
+    assert.equal((await sem.addImport("a.ts", 'import { x, y } from "./new.js";')).alreadyPresent, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Go grouped and standalone imports are idempotent with either spec syntax", async () => {
   for (const declaration of ['import (\n\talias "example.com/lib"\n)', 'import alias "example.com/lib"']) {
     const original = `package shared\n\n${declaration}\n\nfunc f() {}\n`;

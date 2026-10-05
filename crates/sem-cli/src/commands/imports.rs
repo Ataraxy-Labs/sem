@@ -15,7 +15,7 @@ pub struct ImportsOptions {
 /// which uses it to supersede/place imports without ever touching
 /// import-shaped text inside a string, a comment, or a nested block. A file
 /// this build cannot parse, or a language with no import kind registered,
-/// yields an empty list, which the caller treats as "fall back to text".
+/// exits unsuccessfully rather than masquerading as a valid empty import list.
 pub fn imports_command(opts: ImportsOptions) {
     let root = Path::new(&opts.cwd);
     let candidate = Path::new(&opts.path);
@@ -33,7 +33,10 @@ pub fn imports_command(opts: ImportsOptions) {
         }
     };
 
-    let imports = top_level_imports(&full.to_string_lossy(), &content);
+    let Some(imports) = top_level_imports(&full.to_string_lossy(), &content) else {
+        eprintln!("error: imports unavailable: unsupported language or invalid syntax");
+        std::process::exit(2);
+    };
 
     if opts.json {
         match serde_json::to_string(&imports) {

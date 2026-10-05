@@ -77,18 +77,20 @@ pub struct TopLevelImport {
 /// returned with the line span of the whole statement. An import that follows
 /// other statements is still a top-level child, so it is returned too.
 ///
-/// Returns an empty vec for a file this build cannot parse (unknown language,
-/// parse failure) or a language with no import kind registered here. Callers
-/// treat all of those the same: fall back to their own text scan.
-pub fn top_level_imports(file_path: &str, content: &str) -> Vec<TopLevelImport> {
+/// Returns None for unsupported languages or invalid syntax. Some(empty)
+/// means a successful parse with no imports; callers must not confuse them.
+pub fn top_level_imports(file_path: &str, content: &str) -> Option<Vec<TopLevelImport>> {
     let Some(config) = language_config_for_content(content, file_path) else {
-        return Vec::new();
+        return None;
     };
     let Some(tree) = parse_tree(config, content) else {
-        return Vec::new();
+        return None;
     };
     let src = content.as_bytes();
     let root = tree.root_node();
+    if root.has_error() || !matches!(config.id, "typescript" | "tsx" | "javascript" | "python" | "rust" | "go" | "java" | "c" | "cpp") {
+        return None;
+    }
     let mut cursor = root.walk();
     let mut out = Vec::new();
     for child in root.children(&mut cursor) {
@@ -106,7 +108,7 @@ pub fn top_level_imports(file_path: &str, content: &str) -> Vec<TopLevelImport> 
             text: String::from_utf8_lossy(&src[start..end]).into_owned(),
         });
     }
-    out
+    Some(out)
 }
 
 /// Whether `kind` is the tree-sitter node kind of an import/use declaration for
@@ -4088,6 +4090,9 @@ test "basic addition" {
     #[test]
     #[cfg(feature = "lang-typescript")]
     fn test_top_level_imports_excludes_strings_comments_and_nested() {
+        assert!(top_level_imports("a.ts", "const x = 1;").unwrap().is_empty());
+        assert!(top_level_imports("a.ts", "import { broken").is_none());
+        assert!(top_level_imports("a.unknown", "something").is_none());
         let code = concat!(
             "import { parse } from \"./parser.js\";\n",
             "\n",
@@ -4105,7 +4110,7 @@ test "basic addition" {
             "  b\n",
             "} from \"./ab.js\";\n",
         );
-        let imports = top_level_imports("a.ts", code);
+        let imports = top_level_imports("a.ts", code).expect("valid TypeScript");
         let texts: Vec<&str> = imports.iter().map(|i| i.text.as_str()).collect();
         // Two real top-level imports: the leading one, and the one after `const y`.
         assert_eq!(imports.len(), 2, "got: {texts:?}");
