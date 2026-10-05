@@ -23,6 +23,64 @@ function makeDir(files: Record<string, string>): string {
 
 const api = (dir: string, changes = createChangeLog()) => ({ sem: buildSemApi({ cwd: dir, semBin: "sem", changes }), changes });
 
+test("parser edits preserve same-line code, comments and UTF-8 byte offsets", async () => {
+  const dir = makeDir({ "a.ts": '// café 😀\nimport { parse, keep } from "./old.js"; const important = "é"; // retained\n' });
+  try {
+    const { sem } = api(dir);
+    await sem.addImport("a.ts", 'import { parse } from "./new.js";');
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    assert.ok(content.startsWith('// café 😀\n'));
+    assert.ok(content.includes('const important = "é"; // retained'));
+    assert.ok(content.includes('import { keep } from "./old.js";'));
+    await sem.addImport("a.ts", 'import { keep } from "./other.js";');
+    assert.ok(readFileSync(join(dir, "a.ts"), "utf8").includes('const important = "é"; // retained'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("fixture text is not a duplicate when there are no top-level imports", async () => {
+  const original = '"use strict";\nexport const fixture = `\nimport { parse } from "./new.js";\n`;\n';
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    assert.equal((await sem.addImport("a.ts", 'import { parse } from "./new.js";')).added, true);
+    assert.ok(readFileSync(join(dir, "a.ts"), "utf8").startsWith(original));
+    assert.equal((await sem.addImport("a.ts", 'import { parse } from "./new.js";')).alreadyPresent, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("missing parser refuses mutation rather than unsafe fallback", async () => {
+  const original = 'import { parse } from "./old.js";\n';
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const sem = buildSemApi({ cwd: dir, semBin: join(dir, "missing-sem"), changes: createChangeLog() });
+    await assert.rejects(() => sem.addImport("a.ts", 'import { parse } from "./new.js";'), /parser unavailable/);
+    assert.equal(readFileSync(join(dir, "a.ts"), "utf8"), original);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("invalid syntax refuses mutation", async () => {
+  const original = 'import { broken';
+  const dir = makeDir({ "a.ts": original });
+  try {
+    await assert.rejects(() => api(dir).sem.addImport("a.ts", 'import { x } from "./x.js";'), /parser unavailable/);
+    assert.equal(readFileSync(join(dir, "a.ts"), "utf8"), original);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("multiple same-line imports and CRLF preserve all non-import source", async () => {
+  const dir = makeDir({ "a.ts": 'import { x } from "./x.js"; import { y } from "./y.js"; const keep = 1;\r\n' });
+  try {
+    const { sem } = api(dir);
+    await sem.addImport("a.ts", 'import { x, y } from "./new.js";');
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    assert.ok(content.includes('const keep = 1;\r\n'));
+    assert.ok(content.includes('import { x, y } from "./new.js";\r\n'));
+    assert.ok(!content.includes('from "./x.js"'));
+    assert.ok(!content.includes('from "./y.js"'));
+    assert.equal((await sem.addImport("a.ts", 'import { x, y } from "./new.js";')).alreadyPresent, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Go grouped and standalone imports are idempotent with either spec syntax", async () => {
   for (const declaration of ['import (\n\talias "example.com/lib"\n)', 'import alias "example.com/lib"']) {
     const original = `package shared\n\n${declaration}\n\nfunc f() {}\n`;
@@ -209,6 +267,143 @@ test("an unrelated import from another source is untouched by supersede", async 
     const { sem } = api(dir);
     await sem.addImport("a.ts", 'import { moved } from "./new.js";');
     assert.match(readFileSync(join(dir, "a.ts"), "utf8"), /import \{ other \} from "\.\/other\.js";/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("supersede stays inside the leading import block, not in a fixture string", async () => {
+  const original = [
+    'import { parse } from "./parser.js";',
+    "",
+    "export const FIXTURE = `",
+    'import { parse } from "./legacy.js";',
+    "export const value = parse();",
+    "`;",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.ts", 'import { parse } from "./parser-v2.js";')) as AddImportResult;
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    // The real import is superseded...
+    assert.deepEqual(r.superseded, [{ symbol: "parse", from: "./parser.js" }]);
+    assert.doesNotMatch(content, /"\.\/parser\.js"/);
+    // ...and the fixture's own source text is left exactly as it was.
+    assert.match(content, /export const FIXTURE = `\nimport \{ parse \} from "\.\/legacy\.js";\nexport const value = parse\(\);\n`;/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("supersede ignores an indented import inside an ambient module block", async () => {
+  const original = [
+    'import { parse } from "./parser.js";',
+    "",
+    'declare module "legacy" {',
+    '  import { parse } from "./legacy.js";',
+    "  export const value: typeof parse;",
+    "}",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.d.ts": original });
+  try {
+    const { sem } = api(dir);
+    await sem.addImport("a.d.ts", 'import { parse } from "./parser-v2.js";');
+    const content = readFileSync(join(dir, "a.d.ts"), "utf8");
+    assert.match(content, /^  import \{ parse \} from "\.\/legacy\.js";$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an import-shaped line inside a block comment is never superseded", async () => {
+  const original = [
+    "/*",
+    'import { parse } from "./inside-comment.js";',
+    "*/",
+    'import { parse } from "./real.js";',
+    "export const v = parse;",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.ts", 'import { parse } from "./new.js";')) as AddImportResult;
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    // Only the real import is reported and rewritten; the commented one is not.
+    assert.deepEqual(r.superseded, [{ symbol: "parse", from: "./real.js" }]);
+    assert.doesNotMatch(content, /"\.\/real\.js"/);
+    assert.match(content, /import \{ parse \} from "\.\/new\.js";/);
+    // The comment's text is left untouched.
+    assert.match(content, /\/\*\nimport \{ parse \} from "\.\/inside-comment\.js";\n\*\//);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a new import lands after a multi-line import, not inside its braces", async () => {
+  const original = [
+    "import {",
+    "  a,",
+    "  b",
+    '} from "./ab.js";',
+    "",
+    "export const v = a;",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.ts", 'import { c } from "./c.js";')) as AddImportResult;
+    assert.equal(r.added, true);
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    assert.match(content, /\} from "\.\/ab\.js";\nimport \{ c \} from "\.\/c\.js";\n/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("supersede rewrites a multi-line import, collapsing it to one line", async () => {
+  const original = [
+    "import {",
+    "  parse,",
+    "  stringify",
+    '} from "./old.js";',
+    "export const v = parse;",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.ts", 'import { parse } from "./new.js";')) as AddImportResult;
+    assert.deepEqual(r.superseded, [{ symbol: "parse", from: "./old.js" }]);
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    assert.match(content, /^import \{ stringify \} from "\.\/old\.js";$/m);
+    assert.match(content, /^import \{ parse \} from "\.\/new\.js";$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a new import follows an import placed after other statements", async () => {
+  const original = [
+    "const x = 1;",
+    'import { y } from "./y.js";',
+    "export const z = y;",
+    "",
+  ].join("\n");
+  const dir = makeDir({ "a.ts": original });
+  try {
+    const { sem } = api(dir);
+    const r = (await sem.addImport("a.ts", 'import { w } from "./w.js";')) as AddImportResult;
+    assert.equal(r.added, true);
+    const content = readFileSync(join(dir, "a.ts"), "utf8");
+    // The new import follows the existing import, even though that import
+    // itself follows a statement -- it is not hoisted above `const x`.
+    assert.match(content, /import \{ y \} from "\.\/y\.js";\nimport \{ w \} from "\.\/w\.js";/);
+    assert.match(content, /^const x = 1;/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

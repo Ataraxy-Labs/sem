@@ -3083,6 +3083,43 @@ const IMPORT_LIKE_RE = /^(?:import\s|from\s+\S+\s+import\s|(?:pub(?:\(crate\))?\
 
 const normalizeDecl = (line: string): string => line.trim().replace(/;$/, "").replace(/\s+/g, " ");
 
+/** TS/JS file extensions whose imports addImport locates through the parser. */
+const TS_JS_EXT_RE = /\.(?:[mc]?tsx?|[mc]?jsx?)$/i;
+
+interface ParsedImport {
+  startByte: number;
+  endByte: number;
+  /** 1-based line of the import statement's first line. */
+  startLine: number;
+  /** 1-based line of its last line (equal to startLine unless multi-line). */
+  endLine: number;
+  /** The statement's own source text, exactly as written. */
+  text: string;
+}
+
+/**
+ * The file's top-level import statements, located by sem's tree-sitter parser
+ * (`sem imports --json`) rather than by scanning lines. Each entry is a REAL
+ * top-level `import ...` statement: never import-shaped text inside a string
+ * or template literal, inside a comment, or nested in a block such as
+ * `declare module { ... }`, and a multi-line import comes back as ONE entry
+ * spanning its whole line range. Returns null when the parse is unavailable
+ * (older/missing binary, non-zero exit, unparseable output) so the caller can
+ * refuse unsafe mutation; returns [] for a parseable file that genuinely
+ * has no top-level imports.
+ */
+async function topLevelImports(absPath: string, deps: SemApiDeps): Promise<ParsedImport[] | null> {
+  try {
+    const result = await runCommand(deps.semBin ?? "sem", ["imports", "--json", absPath], deps.cwd);
+    if (result.exitCode !== 0) return null;
+    const raw = JSON.parse(result.stdout) as Array<{ start_byte: number; end_byte: number; start_line: number; end_line: number; text: string }>;
+    if (!Array.isArray(raw)) return null;
+    return raw.map((r) => ({ startByte: r.start_byte, endByte: r.end_byte, startLine: r.start_line, endLine: r.end_line, text: r.text }));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Adds one import statement or module declaration LINE to an EXISTING file --
  * the gap sem.edit() can't fill, since import/mod lines aren't
@@ -3110,6 +3147,53 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
   const rustMod = RUST_MOD_RE.exec(spec.trim());
   const esImport = ES_IMPORT_RE.exec(spec.trim());
 
+  if (TS_JS_EXT_RE.test(file)) {
+    const nodes = await topLevelImports(absPath, deps);
+    if (nodes === null) throw toCodeModeError("sem.addImport: parser unavailable or invalid syntax; update sem before editing TS/JS imports (file unchanged).");
+    let bytes = Buffer.from(original, "utf8");
+    let previousEnd = 0;
+    for (const n of nodes) {
+      if (!Number.isSafeInteger(n.startByte) || !Number.isSafeInteger(n.endByte) || n.startByte < previousEnd || n.endByte <= n.startByte || n.endByte > bytes.length || bytes.subarray(n.startByte, n.endByte).toString("utf8") !== n.text) {
+        throw toCodeModeError("sem.addImport: stale or invalid parser ranges; file unchanged.");
+      }
+      previousEnd = n.endByte;
+    }
+    const existing = nodes.find(n => normalizeDecl(n.text) === specNorm);
+    if (existing) return { file, line: existing.startLine, added: false, alreadyPresent: true };
+    const superseded: Array<{ symbol: string; from: string }> = [];
+    // After the last complete import; preserve same-line statements and comments.
+    // With no imports, preserve a shebang and JS directive prologue by appending.
+    let offset = nodes.length ? nodes[nodes.length - 1]!.endByte : bytes.length;
+    if (esImport) {
+      const wanted = esImport[2]!.split(",").map(s => s.trim()).filter(Boolean);
+      for (const n of [...nodes].reverse()) {
+        const m = ES_IMPORT_RE.exec(n.text.trim());
+        if (!m || m[3] === esImport[3]) continue;
+        const symbols = m[2]!.split(",").map(s => s.trim()).filter(Boolean);
+        const kept = symbols.filter(s => !wanted.includes(s));
+        if (kept.length === symbols.length) continue;
+        for (const symbol of symbols) if (wanted.includes(symbol)) superseded.unshift({ symbol, from: m[3]! });
+        const replacement = Buffer.from(kept.length ? `import ${m[1] ?? ""}{ ${kept.join(", ")} } from "${m[3]}";` : "", "utf8");
+        bytes = Buffer.concat([bytes.subarray(0, n.startByte), replacement, bytes.subarray(n.endByte)]);
+        offset += replacement.length - (n.endByte - n.startByte);
+      }
+    }
+    const newline = original.includes("\r\n") ? "\r\n" : "\n";
+    const prefix = bytes.subarray(0, offset).toString("utf8");
+    const suffix = bytes.subarray(offset).toString("utf8");
+    const separator = prefix && !prefix.endsWith("\n") ? newline : "";
+    const content = prefix + separator + spec.trim().replace(/;?$/, ";") + newline + suffix;
+    const line = (prefix + separator).split("\n").length;
+    const contentBytes = Buffer.byteLength(content, "utf8");
+    const classification = auditWriteCommand(file, contentBytes, true, process.env.PI_SEM_STRICT === "1");
+    deps.onWriteAudit?.({ path: file, bytes: contentBytes, isCodeFile: classification.entry.isCodeFile, targetExists: true, strict: process.env.PI_SEM_STRICT === "1", refused: false, forced: false });
+    assertNotRevoked(deps);
+    if (await readFile(absPath, "utf8") !== original) throw toCodeModeError("sem.addImport: source changed during parsing; retry.");
+    await writeFile(absPath, content, "utf8");
+    changes.record({ file, op: "addImport", at: Date.now() });
+    return { file, line, added: true, ...(superseded.length ? { superseded } : {}) };
+  }
+
   // Idempotency: the exact declaration (normalized), or -- for a Rust mod --
   // any visibility variant of the same module name, already present.
   // Top-level (unindented) lines only, same reason as placement below: an
@@ -3125,27 +3209,7 @@ async function addImport(file: string, spec: string, deps: SemApiDeps, changes: 
     }
   }
 
-  // ES supersede: remove these symbols from any named import off a DIFFERENT
-  // source; drop a line left empty.
   const superseded: Array<{ symbol: string; from: string }> = [];
-  if (esImport) {
-    const newSymbols = esImport[2]!.split(",").map((s) => s.trim()).filter(Boolean);
-    const newSource = esImport[3]!;
-    for (let i = 0; i < lines.length; i++) {
-      const m = ES_IMPORT_RE.exec(lines[i]!.trim());
-      if (!m || m[3] === newSource) continue;
-      const existingSymbols = m[2]!.split(",").map((s) => s.trim()).filter(Boolean);
-      const kept = existingSymbols.filter((s) => !newSymbols.includes(s));
-      if (kept.length === existingSymbols.length) continue;
-      for (const s of existingSymbols) if (newSymbols.includes(s)) superseded.push({ symbol: s, from: m[3]! });
-      if (kept.length === 0) {
-        lines.splice(i, 1);
-        i--;
-      } else {
-        lines[i] = `import ${m[1] ?? ""}{ ${kept.join(", ")} } from "${m[3]}";`;
-      }
-    }
-  }
 
   // Placement: after the last declaration of the file's LEADING import
   // block -- scan from the top, skipping blanks/comments/attributes, and
