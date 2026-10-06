@@ -53,14 +53,14 @@ fn fixture() -> TempDir {
     )
     .unwrap();
     git(r, &["add", "-A"], None);
-    git(r, &["commit", "-qm", "init"], Some("@1700000000"));
+    git(r, &["commit", "-qm", "init"], Some("@1700000000 +0530"));
     fs::write(
         r.join("src/config.py"),
         "def parse_config(text):\n    pairs = [line.split(\"=\", 1) for line in text.splitlines() if line]\n    return dict(pairs)\n\n\ndef load(path):\n    with open(path) as f:\n        return parse_config(f.read())\n\n\ndef main():\n    print(load(\"app.cfg\"))\n",
     )
     .unwrap();
     git(r, &["add", "-A"], None);
-    git(r, &["commit", "-qm", "change"], Some("@1700000100"));
+    git(r, &["commit", "-qm", "change"], Some("@1700000100 +0530"));
     dir
 }
 
@@ -389,8 +389,10 @@ fn goldens_old_invocations_and_their_new_spellings() {
             fs::write(&path, normalize(&out.stdout, repo.path())).unwrap();
             continue;
         }
+        // A Windows checkout may convert the goldens to CRLF; sem prints LF.
         let golden = fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("missing golden {}", path.display()));
+            .unwrap_or_else(|_| panic!("missing golden {}", path.display()))
+            .replace("\r\n", "\n");
         for argv in std::iter::once(*old).chain(news.iter().copied()) {
             let out = sem(repo.path(), cache.path(), argv);
             let got = normalize(&out.stdout, repo.path());
@@ -795,7 +797,7 @@ fn impact_diff_tests_in_a_js_workspace_is_the_module_graph_selection() {
     )
     .unwrap();
     git(r, &["add", "-A"], None);
-    git(r, &["commit", "-qm", "init"], Some("@1700000000"));
+    git(r, &["commit", "-qm", "init"], Some("@1700000000 +0530"));
     fs::write(
         r.join("src/math.ts"),
         "export function add(a: number, b: number) { return b + a; }\n",
