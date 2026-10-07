@@ -43,9 +43,42 @@ Cloud-backed queries are opt-in per repo: logging in does not upload a repo or s
   <img src="assets/terminal.svg" alt="sem diff" width="800" />
 </p>
 
+## Developer and agent interfaces
+
+Keep your Git workflow. Use Sem to understand code and [Weave](https://github.com/Ataraxy-Labs/weave) to handle entity-level patches and merges. An entity is a code unit such as a function, class, or method.
+
+| Interface | Purpose |
+|---|---|
+| For developers | Run commands in your terminal alongside Git. Keep setup, stats, history, and review tools. |
+| For agents | Search, read, edit, and check code through tools. Ask for additional analysis when needed. |
+
+We are designing a shared agent interface with eight operations. **These names are proposed, not new commands you can run today.** See [MCP tools](#use-with-ai-agents-mcp) for what is available now.
+
+| Operation | Responsibility |
+|---|---|
+| `search` | Find files, text, definitions, callers, or references. |
+| `read` | Read a function, a file, or requested surrounding code. |
+| `edit` | Add, change, delete, or move code, including several edits at once. |
+| `check` | Run checks and report what passed, failed, or could not be checked. |
+| `impact` | See what a change could affect, including tests. |
+| `graph` | See how code units connect. |
+| `diff` | See what changed. |
+| `certify` | Summarize evidence for review—not prove that the program is correct. |
+
+The idea is familiar operations with more precise targets: read a function instead of guessing its line range, or edit several known targets in one call. Ordinary source code and file access remain available. Extra context should be returned only when requested, and edits should detect if their target changed after it was read.
+
+### Developer commands stay available
+
+- Setup, stats, history, and cloud commands remain available to developers.
+- Weave's claim/release commands support optional coordination. Claims are experimental and do not prevent other people from editing.
+- Publishing changes stays separate from editing and checking.
+- [Older command names](#old-command-names) still work. No commands are removed by this documentation update.
+
+`sem check` runs project checkers. `weave check` looks for merge problems such as lost code or unresolved names. They check different things; neither guarantees that every behavior is correct.
+
 ## Using sem with agents
 
-Four questions, four verbs. Every verb takes `--json`.
+Start with these four questions. The commands below take `--json`; `diff`, `graph`, and `history` are also available.
 
 | Question | Verb |
 |---|---|
