@@ -1031,7 +1031,7 @@ enum CloudAction {
     /// Share this private repo's index with the cloud (extra confirmation)
     #[command(hide = true)]
     Share,
-    /// List every repo indexed under your account
+    /// Alias of `cloud repos`
     #[command(hide = true)]
     List,
     /// Show cloud + telemetry state for this repo (offline; sends nothing)
@@ -1941,7 +1941,10 @@ fn sem_main() {
                 CloudAction::Enable => commands::consent::enable(&cwd),
                 CloudAction::Disable => commands::consent::never(&cwd),
                 CloudAction::Share => commands::consent::share(&cwd),
-                CloudAction::List => commands::consent::list(&cwd),
+                CloudAction::List => {
+                    alias::note("cloud list", "cloud repos", false);
+                    or_exit_1(commands::repos::run(false))
+                }
                 CloudAction::Status => commands::consent::status(&cwd),
                 CloudAction::Preview => commands::consent::preview(&cwd),
                 CloudAction::Log => commands::consent::log(),
