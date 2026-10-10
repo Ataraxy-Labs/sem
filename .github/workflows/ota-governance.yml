@@ -1,0 +1,116 @@
+name: "Evidence: Ota local-index governance (non-blocking)"
+
+on:
+  push:
+    branches: [bobai/ota-governance]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract-ci-drift:
+    name: Contract-to-CI drift
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare the bounded contract with repository CI
+        id: drift
+        continue-on-error: true
+        uses: ota-run/action@8001070c0c9e54ca2b729282df40d1a9f40c8a79 # v1.0.16
+        with:
+          command: doctor
+          source: contract
+          fail-on-error: false
+          fail-on-ci-drift: true
+          comment-pr: false
+      - name: Preserve the drift-check outcome
+        if: always()
+        shell: bash
+        run: test "${{ steps.drift.outcome }}" = success
+
+  native:
+    name: Local index (Ubuntu native)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare retained evidence
+        shell: bash
+        run: mkdir -p ota-pressure/native
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Install contract-owned Ota
+        uses: ota-run/setup@493cba84bf7f7c11c9e8e996d832d93a89c62184 # v1.0.8
+        with:
+          source: contract
+          contract-path: ota.yaml
+      - name: Validate and diagnose the contract
+        shell: bash
+        run: |
+          ota validate . 2>&1 | tee ota-pressure/native/validate.txt
+          ota doctor . --json > ota-pressure/native/doctor.json
+          ota tasks --safe --use . --json > ota-pressure/native/safe-tasks.json
+      - name: Preview the selected native graph
+        shell: bash
+        run: ota up --workflow verify --native --agent --dry-run . --json > ota-pressure/native/up-dry-run.json
+      - name: Run the bounded native workflow
+        shell: bash
+        run: ota run verify --native --agent --stream . 2>&1 | tee ota-pressure/native/verify.txt
+      - name: Retain native evidence
+        if: always()
+        shell: bash
+        run: cp -R .ota/evidence/sem-stale-index ota-pressure/native/sem-stale-index 2>/dev/null || true
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sem-ota-native
+          path: ota-pressure/native/
+          if-no-files-found: error
+
+  container:
+    name: Local index (Linux container)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare retained evidence
+        shell: bash
+        run: mkdir -p ota-pressure/container
+      - name: Install contract-owned Ota
+        uses: ota-run/setup@493cba84bf7f7c11c9e8e996d832d93a89c62184 # v1.0.8
+        with:
+          source: contract
+          contract-path: ota.yaml
+      - name: Build the Ota-owned pressure image
+        run: docker build --pull --platform linux/amd64 -f .github/ota/Dockerfile -t sem-ota-pressure:1.0 .
+      - name: Preview the exact container tasks
+        shell: bash
+        run: |
+          ota run test --container --agent --dry-run . --json > ota-pressure/container/test-dry-run.json
+          ota run local-index:freshness --container --agent --dry-run . --json > ota-pressure/container/local-index-dry-run.json
+      - name: Run the repository-owned tests in the container
+        shell: bash
+        run: ota run test --container --agent --stream . 2>&1 | tee ota-pressure/container/test.txt
+      - name: Run the local-index revision proof in the container
+        shell: bash
+        run: >-
+          ota run local-index:freshness --container --agent --stream . 2>&1 |
+          tee ota-pressure/container/local-index-freshness.txt
+      - name: Retain container evidence
+        if: always()
+        shell: bash
+        run: cp -R .ota/evidence/sem-stale-index ota-pressure/container/sem-stale-index 2>/dev/null || true
+      - name: Upload container evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sem-ota-container
+          path: ota-pressure/container/
+          if-no-files-found: error
