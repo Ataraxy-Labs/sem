@@ -1,11 +1,19 @@
 //! `sem check`: an exact incremental verifier.
 //!
-//! Each checker (TypeScript, lint, tests, Go, Cargo, any command) returns the
+//! Each checker (TypeScript, lint, JS tests, Python, pytest, Go, Cargo,
+//! Gradle or Maven, dotnet, SwiftPM, C and C++, any command) returns the
 //! verdict the real tool would return on the whole project. A checker works
 //! incrementally — rechecking only what a change can affect, with every other
 //! result carried over from a state an earlier run recorded — only when that
 //! is provably the same verdict; otherwise it runs the full tool and says why.
 //! It never reports a sliced pass that the full tool might not.
+//!
+//! Two layers make that work for every language. The shared one (`carry`)
+//! skips a checker outright when no changed path is one of its inputs since
+//! its base passed. The per-language one scopes the real tool to what a change
+//! can reach: TypeScript's own program graph, the JS module graph for tests,
+//! Go packages, Python imports for pyright and pytest, and C/C++ includes over
+//! the compile database.
 //!
 //! States live in a content-addressed store under sem's cache root, keyed by
 //! the git tree id they were computed at (plus the checker's configuration),
@@ -17,8 +25,12 @@
 //! carrying a verification certificate: the input trees, tool versions, the
 //! mode of every checker and digests of the states it read and wrote.
 
+mod carry;
+mod cpp;
+mod deps;
 mod generic;
 mod lint;
+mod python;
 mod store;
 mod tests;
 mod tree;
@@ -43,7 +55,8 @@ pub struct CheckArgs {
     /// Print one JSON object (verdict, per-checker results, certificate)
     #[arg(long)]
     pub json: bool,
-    /// Checkers to run, comma-separated: ts, lint, tests, go, cargo, cmd
+    /// Checkers to run, comma-separated: ts, lint, tests, python, pytest, go,
+    /// cargo, jvm, dotnet, swift, cpp, cmd
     /// (default: `.sem/check.json`'s "checkers", else every one detected)
     #[arg(long, value_delimiter = ',')]
     pub checkers: Vec<String>,
@@ -257,11 +270,29 @@ fn detect(root: &Path, config: &Value) -> Vec<String> {
     if tests::detect(root, config).is_some() {
         v.push("tests".to_string());
     }
+    if python::detect(root) || config.get("python").is_some() {
+        v.push("python".to_string());
+    }
+    if python::detect_pytest(root) || config.get("pytest").is_some() {
+        v.push("pytest".to_string());
+    }
     if root.join("go.mod").exists() {
         v.push("go".to_string());
     }
     if root.join("Cargo.toml").exists() {
         v.push("cargo".to_string());
+    }
+    if generic::detect_jvm(root) {
+        v.push("jvm".to_string());
+    }
+    if generic::detect_dotnet(root) {
+        v.push("dotnet".to_string());
+    }
+    if generic::detect_swift(root) {
+        v.push("swift".to_string());
+    }
+    if cpp::detect(root, config) {
+        v.push("cpp".to_string());
     }
     if config.get("commands").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
         v.push("cmd".to_string());
@@ -353,10 +384,20 @@ fn evaluate(start: &Path, args: CheckArgs) -> Result<(Value, i32), String> {
             "ts" | "typescript" => ts::run(&ctx),
             "lint" | "eslint" | "biome" => lint::run(&ctx),
             "tests" | "test" => tests::run(&ctx),
+            "python" | "pyright" | "mypy" => python::run(&ctx),
+            "pytest" => python::pytest(&ctx),
             "go" => generic::go(&ctx),
             "cargo" | "rust" => generic::cargo(&ctx),
+            "jvm" | "java" | "kotlin" | "gradle" | "maven" => generic::jvm(&ctx),
+            "dotnet" | "csharp" => generic::dotnet(&ctx),
+            "swift" => generic::swift(&ctx),
+            "cpp" | "c" | "c++" => cpp::run(&ctx),
             "cmd" | "commands" => generic::commands(&ctx),
-            other => Outcome::undecided("unknown", other, format!("unknown checker `{other}` (known: ts, lint, tests, go, cargo, cmd)")),
+            other => Outcome::undecided(
+                "unknown",
+                other,
+                format!("unknown checker `{other}` (known: ts, lint, tests, python, pytest, go, cargo, jvm, dotnet, swift, cpp, cmd)"),
+            ),
         };
         o.duration = t.elapsed();
         outcomes.push(o);

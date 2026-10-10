@@ -2887,7 +2887,7 @@ impl SemServer {
     }
 
     #[tool(
-        description = "Is my change correct? Runs the project's compiler, type checker, linter and tests (only what the change can affect, when that gives the same answer) and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). checkers narrows them (ts, lint, tests, go, cargo, cmd); promises=true also proves every promise in .sem/promises can fail."
+        description = "Is my change correct? Runs the project's compiler, type checker, linter and tests (only what the change can affect, when that gives the same answer) and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). checkers narrows them (ts, lint, tests, python, pytest, go, cargo, jvm, dotnet, swift, cpp, cmd); promises=true also proves every promise in .sem/promises can fail."
     )]
     async fn sem_check(
         &self,

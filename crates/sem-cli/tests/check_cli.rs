@@ -714,3 +714,122 @@ fn go_scopes_to_affected_packages_and_matches_full() {
     assert!(strs(&g["reasons"]).iter().any(|r| r == "module input: go.mod"), "{g:#}");
     assert_eq!(g["verdict"] == "pass", full_ok(&repo));
 }
+
+#[test]
+fn commands_with_inputs_carry_when_none_changed() {
+    let repo = Repo::new(
+        &[
+            (".sem/check.json", r#"{"commands":[{"run":"test -s src/app.txt","inputs":["src/**"]},"true"]}"#),
+            ("src/app.txt", "x\n"),
+        ],
+        None,
+    );
+    let (_, v) = repo.sem(&["--checkers", "cmd"]);
+    assert_eq!(checker(&v, "cmd")["mode"], "full");
+    repo.write("README.md", "docs\n");
+    let (code, v) = repo.sem(&["--checkers", "cmd"]);
+    let c = checker(&v, "cmd");
+    assert_eq!((code, c["mode"].as_str()), (0, Some("incremental")), "{c:#}");
+    assert_eq!(strs(&c["filesRechecked"]), vec!["true"]);
+    repo.write("src/app.txt", "");
+    let (code, v) = repo.sem(&["--checkers", "cmd"]);
+    assert_eq!(code, 1, "{v:#}");
+}
+
+fn have(bin: &str, arg: &str) -> bool {
+    Command::new(bin).arg(arg).output().is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn cargo_carries_when_only_other_languages_changed() {
+    let repo = Repo::new(
+        &[
+            ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("web/app.ts", "export const x = 1;\n"),
+        ],
+        None,
+    );
+    repo.write(".gitignore", "node_modules\ntarget\n");
+    let (_, v) = repo.sem(&["--checkers", "cargo"]);
+    assert_eq!(checker(&v, "cargo")["verdict"], "pass", "{v:#}");
+    repo.commit("lock");
+    let (_, v) = repo.sem(&["--checkers", "cargo"]);
+    assert_eq!(checker(&v, "cargo")["verdict"], "pass");
+    repo.write("web/app.ts", "export const x = 2;\n");
+    let (_, v) = repo.sem(&["--checkers", "cargo"]);
+    assert_eq!(checker(&v, "cargo")["mode"], "incremental", "{v:#}");
+    repo.write("src/main.rs", "fn main() { let x: u8 = \"no\"; }\n");
+    let (code, v) = repo.sem(&["--checkers", "cargo"]);
+    let c = checker(&v, "cargo");
+    assert_eq!((code, c["mode"].as_str()), (1, Some("full")), "{c:#}");
+    assert!(strs(&c["reasons"]).iter().any(|r| r == "input changed: src/main.rs"), "{c:#}");
+}
+
+#[test]
+fn cpp_recompiles_units_that_include_a_change_and_matches_full() {
+    if !have("cc", "--version") {
+        eprintln!("SKIP: no C compiler");
+        return;
+    }
+    let repo = Repo::new(
+        &[
+            ("inc/math.h", "int add(int a, int b);\n"),
+            ("src/math.c", "#include \"math.h\"\nint add(int a, int b) { return a + b; }\n"),
+            ("src/main.c", "#include \"math.h\"\nint main(void) { return add(1, 2); }\n"),
+            ("src/other.c", "int other(void) { return 1; }\n"),
+        ],
+        None,
+    );
+    let db: Vec<Value> = ["math", "main", "other"]
+        .iter()
+        .map(|n| serde_json::json!({ "directory": repo.path(), "file": format!("src/{n}.c"), "arguments": ["cc", "-Iinc", "-c", format!("src/{n}.c"), "-o", format!("{n}.o")] }))
+        .collect();
+    repo.write("compile_commands.json", &serde_json::to_string(&db).unwrap());
+    repo.commit("db");
+    let (_, v) = repo.sem(&["--checkers", "cpp"]);
+    assert_eq!(checker(&v, "cpp")["verdict"], "pass", "{v:#}");
+    repo.write("src/other.c", "int other(void) { return 2; }\n");
+    let (_, v) = repo.sem(&["--checkers", "cpp"]);
+    let c = checker(&v, "cpp");
+    assert_eq!(c["mode"], "incremental");
+    assert_eq!(strs(&c["filesRechecked"]), vec!["src/other.c"]);
+    repo.write("src/other.c", "int other(void) { return 1; }\n");
+    repo.write("inc/math.h", "int add(int a, int b, int c);\n");
+    let (code, v) = repo.sem(&["--checkers", "cpp"]);
+    let c = checker(&v, "cpp").clone();
+    let mut got = strs(&c["filesRechecked"]);
+    got.sort();
+    assert_eq!(got, vec!["src/main.c", "src/math.c"], "{c:#}");
+    assert_eq!(code, 1);
+    let (_, full) = repo.sem(&["--checkers", "cpp", "--full"]);
+    assert_eq!(strs(&checker(&full, "cpp")["diagnostics"]), strs(&c["diagnostics"]));
+}
+
+#[test]
+fn pytest_reruns_only_tests_that_can_load_a_change() {
+    if !have("pytest", "--version") {
+        eprintln!("SKIP: no pytest");
+        return;
+    }
+    let repo = Repo::new(
+        &[
+            ("pytest.ini", "[pytest]\npythonpath = .\n"),
+            ("calc.py", "def add(a, b):\n    return a + b\n"),
+            ("words.py", "def shout(s):\n    return s.upper()\n"),
+            ("tests/test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"),
+            ("tests/test_words.py", "import words\n\ndef test_shout():\n    assert words.shout('a') == 'A'\n"),
+        ],
+        None,
+    );
+    repo.write(".gitignore", "node_modules\n__pycache__/\n.pytest_cache/\n");
+    repo.commit("ignore");
+    let (_, v) = repo.sem(&["--checkers", "pytest"]);
+    assert_eq!(checker(&v, "pytest")["verdict"], "pass", "{v:#}");
+    repo.write("calc.py", "def add(a, b):\n    return a - b\n");
+    let (code, v) = repo.sem(&["--checkers", "pytest"]);
+    let c = checker(&v, "pytest");
+    assert_eq!(c["mode"], "incremental", "{c:#}");
+    assert_eq!(strs(&c["filesRechecked"]), vec!["tests/test_calc.py"]);
+    assert_eq!(code, 1);
+}
