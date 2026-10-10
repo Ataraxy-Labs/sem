@@ -126,7 +126,7 @@ pub(crate) fn resolve_call_edges(
     file_paths: &[String],
     entities: &[SemanticEntity],
     entity_map: &EntityInfoMap,
-    mut facts: HashMap<String, FileFacts>,
+    mut facts: HashMap<String, std::sync::Arc<FileFacts>>,
     parsed: &[(String, String, tree_sitter::Tree)],
 ) -> Vec<ResolvedEdge> {
     let owned: Vec<&String> = file_paths
@@ -158,7 +158,11 @@ pub(crate) fn resolve_call_edges(
             Some((p.to_string(), facts))
         })
         .collect();
-    facts.extend(lowered);
+    facts.extend(
+        lowered
+            .into_iter()
+            .map(|(p, f)| (p, std::sync::Arc::new(f))),
+    );
     if report {
         eprintln!(
             "calls: lowered {} files late in {:?}",
@@ -172,7 +176,7 @@ pub(crate) fn resolve_call_edges(
         let files: Vec<(&str, &FileFacts)> = owned
             .iter()
             .filter(|p| exts.iter().any(|e| p.ends_with(e)))
-            .filter_map(|p| facts.get(p.as_str()).map(|f| (p.as_str(), f)))
+            .filter_map(|p| facts.get(p.as_str()).map(|f| (p.as_str(), &**f)))
             .collect();
         if files.is_empty() {
             continue;
