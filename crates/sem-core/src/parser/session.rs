@@ -100,6 +100,10 @@ pub struct GraphSession {
     stats: RebuildStats,
     /// Per-file cached import scans (JS/TS only) —.
     import_scans: HashMap<String, CachedImportScan>,
+    /// Each Rust/Go/Python file's lowered call-pipeline facts, kept so a warm
+    /// rebuild hands unchanged files their facts back instead of re-reading
+    /// and re-parsing them. A pure function of the file's content.
+    call_facts: HashMap<String, std::sync::Arc<crate::parser::calls::ir::FileFacts>>,
     /// The import table itself, maintained in place across rebuilds instead
     /// of rebuilt whole —.
     import_table: HashMap<(String, String), String>,
@@ -159,6 +163,7 @@ impl GraphSession {
             fingerprints: TableFingerprints::default(),
             stats: RebuildStats::default(),
             import_scans: HashMap::default(),
+            call_facts: HashMap::default(),
             import_table: HashMap::default(),
             import_keys: HashMap::default(),
             symbol_table: HashMap::default(),
@@ -277,6 +282,7 @@ impl GraphSession {
         let mut precomputed = std::mem::take(&mut self.precomputed);
         let mut content_hashes = std::mem::take(&mut self.content_hashes);
         let mut import_scans = std::mem::take(&mut self.import_scans);
+        let mut call_facts = std::mem::take(&mut self.call_facts);
         let mut import_table = std::mem::take(&mut self.import_table);
         let mut import_keys = std::mem::take(&mut self.import_keys);
         // `entity_map` round-trips through `self.graph.entities` —
@@ -316,6 +322,7 @@ impl GraphSession {
             content_hashes: &mut content_hashes,
             entity_spans: Vec::new(),
             import_scans: &mut import_scans,
+            call_facts: &mut call_facts,
             import_table: &mut import_table,
             import_keys: &mut import_keys,
             symbol_table: &mut symbol_table,
@@ -372,6 +379,7 @@ impl GraphSession {
         self.content_hashes = content_hashes;
         self.precomputed = precomputed;
         self.import_scans = import_scans;
+        self.call_facts = call_facts;
         self.import_table = import_table;
         self.import_keys = import_keys;
         self.symbol_table = symbol_table;
@@ -627,6 +635,7 @@ impl GraphSession {
             fingerprints: loaded.fingerprints,
             stats: RebuildStats::default(),
             import_scans: HashMap::default(),
+            call_facts: HashMap::default(),
             import_table: HashMap::default(),
             import_keys: HashMap::default(),
             // Not part of what `FactsStore` persists, same as `import_table`

@@ -64,6 +64,10 @@ pub(crate) struct BuildCarry<'a, 'i> {
     /// production consulted. Updated in place; see
     /// `build_import_table_incremental`.
     pub(crate) import_scans: &'a mut HashMap<String, CachedImportScan>,
+    /// Session-owned call-pipeline facts per Rust/Go/Python file. Files whose
+    /// entities were reused get their facts from here instead of being
+    /// re-read and re-parsed by `calls::resolve_call_edges`.
+    pub(crate) call_facts: &'a mut HashMap<String, std::sync::Arc<calls::ir::FileFacts>>,
     /// The import table itself, maintained in place across rebuilds rather
     /// than rebuilt whole: GREEN files' entries are left untouched, RED
     /// files' old entries are removed and their new ones inserted.
@@ -2358,9 +2362,11 @@ impl EntityGraph {
         // exactly those files' entities by slicing `all_entities` instead of
         // re-scanning the whole corpus to find them.
         let mut clean_gate_candidate_spans: Vec<(String, usize, usize)> = Vec::new();
-        let mut call_facts: HashMap<String, calls::ir::FileFacts> = HashMap::default();
+        let mut call_facts: HashMap<String, std::sync::Arc<calls::ir::FileFacts>> =
+            HashMap::default();
         for product in per_file {
             let start = all_entities.len();
+            let entities_reused = product.entities.is_none();
             match product.entities {
                 Some(entities) => all_entities.extend(entities),
                 None => {
@@ -2382,8 +2388,33 @@ impl EntityGraph {
                 }
                 let _ = c;
             }
-            if let Some(f) = product.call_facts {
-                call_facts.insert(product.file_path.to_string(), *f);
+            match product.call_facts {
+                Some(f) => {
+                    let f = std::sync::Arc::new(*f);
+                    if let Some(c) = carry.as_deref_mut() {
+                        c.call_facts
+                            .insert(product.file_path.to_string(), f.clone());
+                    }
+                    call_facts.insert(product.file_path.to_string(), f);
+                }
+                // Entities reused means the content is unchanged since the
+                // cached facts were lowered from it.
+                None if entities_reused => {
+                    if let Some(f) = carry
+                        .as_deref()
+                        .and_then(|c| c.call_facts.get(product.file_path))
+                    {
+                        call_facts.insert(product.file_path.to_string(), f.clone());
+                    }
+                }
+                // Re-extracted without facts and no tree kept to lower them
+                // from later: drop any stale entry.
+                None if product.parsed.is_none() => {
+                    if let Some(c) = carry.as_deref_mut() {
+                        c.call_facts.remove(product.file_path);
+                    }
+                }
+                None => {}
             }
             if let Some(p) = product.parsed {
                 parsed_files.push(p);
@@ -2473,6 +2504,7 @@ impl EntityGraph {
             }
             c.precomputed.retain(|path, _| c.known.contains(path));
             c.content_hashes.retain(|path, _| c.known.contains(path));
+            c.call_facts.retain(|path, _| c.known.contains(path));
             // Cloned, not moved: `maintain_entity_lookups_incremental`
             // needs its own read of these spans later in this function, after
             // `carry.entity_spans` has already been handed to the caller here.
@@ -2517,6 +2549,7 @@ impl EntityGraph {
             carry_corpus_fp,
             carry_wildcard_guard,
             carry_entity_lookups_primed,
+            carry_call_facts,
         ): (
             Option<&mut Incremental<'_>>,
             &HashSet<String>,
@@ -2535,6 +2568,7 @@ impl EntityGraph {
             &mut crate::parser::incremental::TableFingerprints,
             &mut u64,
             &mut bool,
+            Option<&mut HashMap<String, std::sync::Arc<calls::ir::FileFacts>>>,
         ) = match carry {
             Some(c) => (
                 Some(c.inc),
@@ -2554,6 +2588,7 @@ impl EntityGraph {
                 c.corpus_fp,
                 c.wildcard_guard,
                 c.entity_lookups_primed,
+                Some(c.call_facts),
             ),
             None => (
                 None,
@@ -2573,6 +2608,7 @@ impl EntityGraph {
                 &mut empty_corpus_fp,
                 &mut empty_wildcard_guard,
                 &mut empty_entity_lookups_primed,
+                None,
             ),
         };
 
@@ -3069,6 +3105,36 @@ impl EntityGraph {
                     ),
                 ],
             );
+        }
+
+        // Files the parse pass kept a tree for but did not lower: serve an
+        // unchanged file's facts from the session, lower the rest now so the
+        // session holds them for the next rebuild.
+        if let Some(cache) = carry_call_facts {
+            let mut misses = Vec::new();
+            for entry in &parsed_files {
+                let path = &entry.0;
+                if call_facts.contains_key(path) || calls::language_for(path).is_none() {
+                    continue;
+                }
+                match cache.get(path).filter(|_| !carry_dirty.contains(path)) {
+                    Some(f) => {
+                        call_facts.insert(path.clone(), f.clone());
+                    }
+                    None => misses.push(entry),
+                }
+            }
+            let lowered: Vec<(String, std::sync::Arc<calls::ir::FileFacts>)> =
+                maybe_par_iter!(misses)
+                    .filter_map(|(path, src, tree)| {
+                        calls::lower_file(path, tree, src)
+                            .map(|f| (path.clone(), std::sync::Arc::new(f)))
+                    })
+                    .collect();
+            for (path, f) in lowered {
+                cache.insert(path.clone(), f.clone());
+                call_facts.insert(path, f);
+            }
         }
 
         // Call edges for the languages `calls` owns, resolved now so its
