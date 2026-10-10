@@ -4,6 +4,15 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`sem check` covers every major language.** New checkers for Python (pyright or mypy), pytest, C and C++ (every unit in `compile_commands.json`), Gradle or Maven, dotnet and SwiftPM join TypeScript, lint, JS tests, Go and Cargo. Each still gives the verdict the full tool would.
+  - **Python** rechecks only the files whose imports can reach a change and carries every other file's errors from the base, so a project that already has errors still checks incrementally. On rich (213 files), an edit inside a widely imported annotated function rechecks 1 file in 0.9s instead of 3.5s, with the same 336 diagnostics as the full run.
+  - **pytest** reruns only the test files that can load a changed file and carries the rest, failures included.
+  - **C and C++** recompile only the units that include a changed header. On zlib, a broken `zutil.h` recompiles 18 of 34 units and reports the same errors as a full build.
+  - **Every build-system checker** (Cargo, Gradle or Maven, dotnet, SwiftPM) is skipped when no file it reads changed since the base passed. Docs edits and other languages' sources do not count, unless the build can read them (a Rust build script, a procedural macro or `include_str!`).
+  - **Configured commands** take `inputs`, and are skipped when none changed since they passed.
+
 ### Fixed
 
 - Removed redundant homepage metadata from the Rust packages where it duplicated the repository URL, avoiding Cargo's `redundant_homepage` warning (#510).

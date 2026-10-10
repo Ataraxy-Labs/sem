@@ -1,12 +1,17 @@
 //! Checkers for any language: Go (vet + test, scoped to affected packages
-//! when exact), Cargo (full: cargo's own fingerprints already rebuild only
-//! what changed), and arbitrary full commands from `.sem/check.json`.
+//! when exact); build-system checkers that run the project's own build in
+//! full (Cargo, Gradle or Maven, dotnet, SwiftPM, whose own fingerprints
+//! already rebuild only what changed), skipped outright when no input
+//! changed since the base passed; and commands from `.sem/check.json`, each
+//! skipped the same way when it declares its `inputs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::{json, Value};
 
+use super::carry;
+use super::tree;
 use super::util;
 use super::{Ctx, Mode, Outcome, Verdict};
 
@@ -42,6 +47,13 @@ fn run_steps(ctx: &Ctx, o: &mut Outcome, steps: &[String]) {
     o.extra["steps"] = json!(ran_steps);
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CmdState {
+    schema: String,
+    /// command -> it exited 0
+    results: BTreeMap<String, bool>,
+}
+
 pub(crate) fn commands(ctx: &Ctx) -> Outcome {
     let list = ctx.config.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
     if list.is_empty() {
@@ -49,40 +61,209 @@ pub(crate) fn commands(ctx: &Ctx) -> Outcome {
     }
     let mut o = Outcome::new("cmd", "sh");
     o.mode = Mode::Full;
-    o.reasons.push("configured commands run in full".into());
-    let steps: Vec<String> = list
-        .iter()
-        .filter_map(|c| c.as_str().map(String::from).or_else(|| c.get("run").and_then(Value::as_str).map(String::from)))
-        .collect();
-    o.extra = json!({});
-    run_steps(ctx, &mut o, &steps);
+    let fp = util::fingerprint(&["cmd"]);
+    let base: Option<(CmdState, String, String)> = if ctx.full {
+        None
+    } else {
+        ctx.state_candidates("cmd", &fp, false).into_iter().next().and_then(|(from, p)| {
+            std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str::<CmdState>(&t).ok().map(|s| (s, from, util::digest(&t))))
+        })
+    };
+    let mut results = BTreeMap::new();
+    let mut steps = Vec::new();
+    let mut carried = Vec::new();
+    for c in &list {
+        let Some(run) = c.as_str().map(String::from).or_else(|| c.get("run").and_then(Value::as_str).map(String::from)) else { continue };
+        let inputs = strs(&c["inputs"]);
+        let untouched = !inputs.is_empty()
+            && ctx.changed.as_ref().is_some_and(|ch| ch.iter().all(|c| !util::glob_any(&inputs, &c.path)))
+            && base.as_ref().is_some_and(|(b, _, _)| b.results.get(&run) == Some(&true));
+        if untouched {
+            carried.push(run.clone());
+            results.insert(run, true);
+        } else {
+            steps.push(run);
+        }
+    }
+    if carried.is_empty() {
+        o.reasons.push("configured commands run in full (a command that lists its \"inputs\" is skipped when none changed)".into());
+    } else {
+        let (_, from, digest) = base.as_ref().expect("a carried command implies a base state");
+        o.mode = Mode::Incremental;
+        o.state_from = Some(from.clone());
+        o.state_in = Some(digest.clone());
+        o.reasons.push(format!("{} of {} commands carried: none of their inputs changed since they passed at the base", carried.len(), carried.len() + steps.len()));
+    }
+    o.rechecked = steps.clone();
+    o.extra = json!({ "carried": carried });
+    let mut ran = Vec::new();
+    for s in &steps {
+        match util::run(util::sh(&ctx.root, s), ctx.timeout) {
+            Ok(r) => {
+                ran.push(json!({ "command": s, "exitCode": r.status.code() }));
+                results.insert(s.clone(), r.ok());
+                if !r.ok() {
+                    o.verdict = Verdict::Fail;
+                    o.errors += 1;
+                    o.diagnostics.push(format!("`{s}` exited {}:", r.status.code().map_or("on a signal".into(), |c| c.to_string())));
+                    o.diagnostics.extend(r.tail(200));
+                }
+            }
+            Err(e) => {
+                o.verdict = Verdict::Undecided;
+                o.diagnostics.push(e);
+                o.extra["steps"] = json!(ran);
+                return o;
+            }
+        }
+    }
+    if o.verdict != Verdict::Fail {
+        o.verdict = Verdict::Pass;
+    }
+    o.extra["steps"] = json!(ran);
+    if !ctx.args.no_cache {
+        let st = CmdState { schema: "sem-check-cmd/1".into(), results };
+        if let (Ok(scratch), Ok(text)) = (ctx.scratch(), serde_json::to_string(&st)) {
+            let p = scratch.path("state.json");
+            if std::fs::write(&p, &text).is_ok() && ctx.save_state("cmd", &fp, &p).is_some() {
+                o.state_out = Some(util::digest(&text));
+            }
+        }
+    }
     o
+}
+
+fn version_of(root: &Path, program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let out = if o.stdout.is_empty() { &o.stderr } else { &o.stdout };
+            String::from_utf8_lossy(out).lines().next().unwrap_or("").trim().to_string()
+        })
+}
+
+/// Run a build-system checker: carry the base's pass when no input changed,
+/// otherwise run its steps in full and record the verdict.
+fn build(ctx: &Ctx, mut o: Outcome, cfg: &Value, steps: Vec<String>, own: &'static [&'static str], why_full: &str, strict: bool) -> Outcome {
+    let steps = {
+        let s = strs(&cfg["commands"]);
+        if s.is_empty() {
+            steps
+        } else {
+            s
+        }
+    };
+    let fp = util::fingerprint(&[o.name, &steps.join("\n")]);
+    let foreign_inputs = strict || cfg["foreignInputs"].as_bool().unwrap_or(false);
+    let default = carry::default_inputs(cfg, own);
+    let extra: Vec<String> = strs(&cfg["inert"]);
+    let is_input = |p: &str| if foreign_inputs { !carry::inert(p, &extra) } else { default(p) };
+    if let Err(reasons) = carry::try_carry(ctx, &mut o, &fp, &is_input) {
+        o.mode = Mode::Full;
+        o.reasons = reasons;
+        o.reasons.push(why_full.to_string());
+        o.extra = json!({});
+        run_steps(ctx, &mut o, &steps);
+    }
+    carry::record(ctx, &mut o, &fp);
+    o
+}
+
+/// Can a Rust build read files other than Rust sources and Cargo manifests?
+/// Build scripts, procedural macros and `include*!` can read any path.
+fn cargo_reads_anything(ctx: &Ctx) -> bool {
+    let Some(h) = &ctx.head else { return true };
+    let Ok(files) = tree::files(&ctx.root, &h.tree) else { return true };
+    let build_key = regex::Regex::new(r"(?m)^\s*build\s*=").unwrap();
+    files.iter().any(|f| {
+        let leaf = f.rsplit('/').next().unwrap_or(f);
+        if leaf == "build.rs" {
+            return true;
+        }
+        let read = || std::fs::read_to_string(ctx.root.join(f)).unwrap_or_default();
+        if leaf == "Cargo.toml" {
+            let t = read();
+            return t.contains("proc-macro") || t.contains("proc_macro") || build_key.is_match(&t);
+        }
+        f.ends_with(".rs") && {
+            let t = read();
+            t.contains("include_str!") || t.contains("include_bytes!") || t.contains("include!")
+        }
+    })
 }
 
 pub(crate) fn cargo(ctx: &Ctx) -> Outcome {
     let cfg = ctx.cfg("cargo");
     let mut o = Outcome::new("cargo", "cargo");
-    o.tool_version = std::process::Command::new("cargo")
-        .arg("--version")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    o.mode = Mode::Full;
-    o.reasons.push(
-        "cargo: full workspace check — cargo's own fingerprints recompile only crates a change reaches; checking a subset with -p would change feature unification, so its verdict could differ"
-            .into(),
-    );
-    let steps = {
-        let s = strs(&cfg["commands"]);
-        if s.is_empty() {
-            vec!["cargo check --workspace --all-targets --quiet --message-format short".to_string()]
-        } else {
-            s
-        }
+    o.tool_version = version_of(&ctx.root, "cargo", &["--version"]);
+    // only worth scanning the workspace when another language's source changed
+    let strict = ctx.changed.as_ref().is_some_and(|c| c.iter().any(|c| carry::foreign(&c.path, &["rust"]))) && cargo_reads_anything(ctx);
+    build(
+        ctx,
+        o,
+        &cfg,
+        vec!["cargo check --workspace --all-targets --quiet --message-format short".to_string()],
+        &["rust"],
+        "cargo: full workspace check, since cargo's own fingerprints recompile only crates a change reaches; checking a subset with -p would change feature unification, so its verdict could differ",
+        strict,
+    )
+}
+
+pub(crate) fn detect_jvm(root: &Path) -> bool {
+    ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "pom.xml"].iter().any(|f| root.join(f).exists())
+}
+
+pub(crate) fn jvm(ctx: &Ctx) -> Outcome {
+    let cfg = ctx.cfg("jvm");
+    let test = cfg["test"].as_bool().unwrap_or(false);
+    let gradle = !ctx.root.join("pom.xml").exists();
+    let (tool, steps) = if gradle {
+        let bin = if ctx.root.join("gradlew").exists() { "./gradlew" } else { "gradle" };
+        ("gradle", vec![format!("{bin} --quiet {}", if test { "test" } else { "classes testClasses" })])
+    } else {
+        let bin = if ctx.root.join("mvnw").exists() { "./mvnw" } else { "mvn" };
+        ("maven", vec![format!("{bin} -q -B {}", if test { "test" } else { "test-compile" })])
     };
-    o.extra = json!({});
-    run_steps(ctx, &mut o, &steps);
-    o
+    let mut o = Outcome::new("jvm", tool);
+    let wrapper: String = ["gradle/wrapper/gradle-wrapper.properties", ".mvn/wrapper/maven-wrapper.properties"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(ctx.root.join(f)).ok())
+        .collect();
+    o.tool_version = Some(format!("{} wrapper:{}", version_of(&ctx.root, "java", &["-version"]).unwrap_or_default(), util::fingerprint(&[&wrapper])));
+    build(ctx, o, &cfg, steps, &["jvm"], "the build runs in full; its own up-to-date checks skip what a change cannot reach", false)
+}
+
+pub(crate) fn detect_dotnet(root: &Path) -> bool {
+    std::fs::read_dir(root).into_iter().flatten().flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        n.ends_with(".sln") || n.ends_with(".slnx") || n.ends_with(".csproj") || n.ends_with(".fsproj")
+    })
+}
+
+pub(crate) fn dotnet(ctx: &Ctx) -> Outcome {
+    let cfg = ctx.cfg("dotnet");
+    let test = cfg["test"].as_bool().unwrap_or(false);
+    let mut o = Outcome::new("dotnet", "dotnet");
+    o.tool_version = version_of(&ctx.root, "dotnet", &["--version"]);
+    let step = if test { "dotnet test --nologo -v q" } else { "dotnet build --nologo -v q" };
+    build(ctx, o, &cfg, vec![step.to_string()], &["dotnet"], "the build runs in full; MSBuild's own incremental build skips what a change cannot reach", false)
+}
+
+pub(crate) fn detect_swift(root: &Path) -> bool {
+    root.join("Package.swift").exists()
+}
+
+pub(crate) fn swift(ctx: &Ctx) -> Outcome {
+    let cfg = ctx.cfg("swift");
+    let test = cfg["test"].as_bool().unwrap_or(false);
+    let mut o = Outcome::new("swift", "swift");
+    o.tool_version = version_of(&ctx.root, "swift", &["--version"]);
+    let step = if test { "swift test" } else { "swift build --build-tests" };
+    build(ctx, o, &cfg, vec![step.to_string()], &["swift"], "the build runs in full; SwiftPM's own incremental build skips what a change cannot reach", false)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

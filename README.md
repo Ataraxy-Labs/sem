@@ -275,14 +275,18 @@ With `--diff` and `--tests` in a JS/TS workspace, the answer is the module graph
 Runs the project's compiler, type checker, linter and tests on the working tree and prints one verdict: exit 0 pass, 1 fail, 2 could not decide. Each checker gives the verdict the real tool would give on the whole project; it rechecks only what the change can affect when that is provably the same answer, and otherwise runs the tool in full and says why. Nothing to check is 2, never a pass.
 
 ```bash
-sem check                               # every checker the project has (TypeScript, lint, tests, Go, Cargo)
+sem check                               # every checker the project has
 sem check --checkers ts,lint,tests      # only these
 sem check --base origin/main            # against origin/main instead of HEAD
 sem check --promises                    # also prove every promise in .sem/promises can fail
 sem check --json                        # one JSON object with a verification certificate
 ```
 
-Commands of your own go in `.sem/check.json`, e.g. `{"commands": ["python3 -m pytest -q"]}`; they always run in full.
+Checkers are detected from the project. TypeScript, lint and JS tests (vitest, jest) follow the module graph, Go rechecks affected packages, Python type checking (pyright scoped by imports, or mypy) and pytest rerun only the files a change can reach, and C and C++ recompile only the translation units in `compile_commands.json` that include a changed file. Cargo, Gradle or Maven, dotnet and SwiftPM run their own build, which already rebuilds only what changed, and are skipped outright when no input changed since the base passed (a TypeScript edit never reruns the Rust build).
+
+An edit inside the body of a Python function that declares its return type cannot change what other files see, so only that file is rechecked.
+
+Commands of your own go in `.sem/check.json`, e.g. `{"commands": [{"run": "make lint", "inputs": ["src/**"]}]}`. A command that lists its `inputs` is skipped when none of them changed since it passed; one without runs every time.
 
 ### sem certify
 

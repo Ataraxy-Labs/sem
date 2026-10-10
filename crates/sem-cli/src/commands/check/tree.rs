@@ -126,6 +126,17 @@ pub(crate) fn head(root: &Path) -> Result<Head, String> {
     Ok(Head { commit, tree: tree.trim().to_string(), dirty: true })
 }
 
+/// Every file path in `tree`.
+pub(crate) fn files(root: &Path, tree: &str) -> Result<Vec<String>, String> {
+    let out = git_bytes(root, &["ls-tree", "-r", "-z", "--name-only", tree])?;
+    Ok(out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect())
+}
+
+/// The content of `path` in `tree`.
+pub(crate) fn blob(root: &Path, tree: &str, path: &str) -> Result<String, String> {
+    git_bytes(root, &["cat-file", "-p", &format!("{tree}:{path}")]).map(|b| String::from_utf8_lossy(&b).to_string())
+}
+
 /// Paths that differ between two trees.
 pub(crate) fn diff(root: &Path, a: &str, b: &str) -> Result<Vec<Change>, String> {
     if a == b {
