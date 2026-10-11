@@ -6,8 +6,16 @@
 //! of lines read back into the model. The command runs in its own process
 //! group under a watchdog that stops it once it has printed nothing for
 //! `idle` seconds, and the answer is the lines that say what went wrong plus
-//! the end of the output, not the whole log. The exit code is the command's;
-//! a stopped command exits 124.
+//! the end of the output, not the whole log. The exit code is the command's
+//! (pipes included: a failing test piped through `tail` still fails); a
+//! stopped command exits 124.
+//!
+//! Runs are keyed by the working tree's content (a git tree id, untracked
+//! files included) and the command. The same command on the same tree is
+//! answered from the first run, and a run already in progress for that key,
+//! such as one weave started speculatively right after an edit, is joined
+//! instead of started again. That is how test time overlaps the model's
+//! thinking: the run starts when the edit lands, not when the agent asks.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -23,8 +31,11 @@ const SIGNAL: &[&str] = &[
 const TAIL: usize = 40;
 const SIGNAL_MAX: usize = 80;
 
-pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> i32 {
-    let (code, text) = execute(root, cmd, idle, timeout, json);
+pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cache: bool, quiet: bool) -> i32 {
+    let (code, text) = memoized(root, cmd, idle, timeout, json, no_cache, quiet);
+    if quiet {
+        return code;
+    }
     print!("{text}");
     if !json {
         if let Some(hint) = scope_hint(root, cmd) {
@@ -32,6 +43,65 @@ pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -
         }
     }
     code
+}
+
+/// `<git common dir>/sem-run`: run results, runs in progress, the last command.
+pub(crate) fn run_dir(root: &Path) -> Option<std::path::PathBuf> {
+    let o = Command::new("git").args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).current_dir(root).stderr(Stdio::null()).output().ok()?;
+    o.status.success().then(|| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("sem-run"))
+}
+
+fn alive(pid: &str) -> bool {
+    Command::new("kill").args(["-0", pid]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+/// Answer from a finished run on this exact tree, join one in progress, or
+/// run the command and remember the answer.
+fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cache: bool, quiet: bool) -> (i32, String) {
+    let root = super::tree::toplevel(start);
+    let dir = root.as_deref().and_then(run_dir);
+    let tree = root.as_deref().and_then(|r| super::tree::head(r).ok()).map(|h| h.tree);
+    let (Some(root), Some(dir), Some(tree)) = (root, dir, tree) else {
+        return execute(start, cmd, idle, timeout, json);
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let rel = start.strip_prefix(&root).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    if !quiet {
+        let _ = std::fs::write(dir.join("last"), format!("{rel}\n{cmd}"));
+    }
+    let key = super::util::digest(&format!("{tree}\0{rel}\0{json}\0{cmd}"));
+    let (done, lock) = (dir.join(format!("{key}.done")), dir.join(format!("{key}.lock")));
+    if !no_cache {
+        // a run of this command on this tree is in progress: join it
+        let waited = Instant::now();
+        while let Ok(pid) = std::fs::read_to_string(&lock) {
+            if !alive(pid.trim()) || waited.elapsed().as_secs() > timeout.max(1) {
+                let _ = std::fs::remove_file(&lock);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Ok(saved) = std::fs::read_to_string(&done) {
+            if let Some((code, text)) = saved.split_once('\n') {
+                let joined = waited.elapsed().as_millis() > 150;
+                let note = if joined {
+                    "(this exact tree was already being checked, started when the last edit landed; waited for it)\n"
+                } else {
+                    "(answered from an earlier run of this command on this exact tree; --no-cache reruns it)\n"
+                };
+                return (code.parse().unwrap_or(1), format!("{text}{note}"));
+            }
+        }
+    }
+    let _ = std::fs::write(&lock, std::process::id().to_string());
+    let (code, text) = execute(start, cmd, idle, timeout, json);
+    // remember it only if the tree did not change while it ran, and it ended
+    let same = super::tree::head(&root).ok().is_some_and(|h| h.tree == tree);
+    if same && code != 124 {
+        let _ = std::fs::write(&done, format!("{code}\n{text}"));
+    }
+    let _ = std::fs::remove_file(&lock);
+    (code, text)
 }
 
 /// When `cmd` builds a whole multi-module project but only some modules
@@ -182,8 +252,21 @@ fn warm(root: &Path, dir: &Path) {
 fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32, String) {
     use std::fmt::Write;
     let start = Instant::now();
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(cmd).current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // bash with pipefail when there is one, so `cmd | tail` keeps cmd's failure
+    let bash = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"].into_iter().find(|b| Path::new(b).exists());
+    let mut command = match bash {
+        Some(b) => {
+            let mut c = Command::new(b);
+            c.args(["-o", "pipefail", "-c", cmd]);
+            c
+        }
+        None => {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(cmd);
+            c
+        }
+    };
+    command.current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

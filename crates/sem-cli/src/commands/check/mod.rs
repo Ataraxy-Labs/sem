@@ -92,6 +92,9 @@ pub struct CheckArgs {
     /// Example: sem check --run 'cargo test -p core' --at base
     #[arg(long, value_name = "base|head", requires = "run")]
     pub at: Option<String>,
+    /// With --run: print nothing (a speculative run started by an edit)
+    #[arg(long, hide = true, requires = "run")]
+    pub quiet: bool,
     /// With --run: stop the command after this many seconds without output (0: never)
     #[arg(long, default_value = "180")]
     pub idle: u64,
@@ -325,7 +328,7 @@ pub fn run(args: CheckArgs) -> i32 {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if let Some(cmd) = args.run.as_deref() {
         return match args.at.as_deref() {
-            None | Some("head") => run::run(&start, cmd, args.idle, args.timeout, args.json),
+            None | Some("head") => run::run(&start, cmd, args.idle, args.timeout, args.json, args.no_cache, args.quiet),
             Some("base") => run::run_at_base(&start, args.base.as_deref().unwrap_or("HEAD"), cmd, args.idle, args.timeout, args.json, args.no_cache),
             Some(other) => {
                 eprintln!("sem check --at {other}: use base or head");
