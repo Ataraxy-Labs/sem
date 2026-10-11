@@ -31,6 +31,7 @@ mod deps;
 mod generic;
 mod lint;
 mod python;
+mod run;
 mod store;
 mod tests;
 mod tree;
@@ -79,6 +80,15 @@ pub struct CheckArgs {
     /// Run as if started in this directory
     #[arg(short = 'C', long = "cwd")]
     pub directory: Option<String>,
+    /// Run this one command (a build or test suite) instead of the checkers:
+    /// stopped once it prints nothing for --idle seconds, answered with the
+    /// lines that say what went wrong plus the end of the output.
+    /// Example: sem check --run 'cargo test -p core'
+    #[arg(long, value_name = "CMD")]
+    pub run: Option<String>,
+    /// With --run: stop the command after this many seconds without output (0: never)
+    #[arg(long, default_value = "180")]
+    pub idle: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +317,9 @@ pub fn run(args: CheckArgs) -> i32 {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if let Some(cmd) = args.run.as_deref() {
+        return run::run(&start, cmd, args.idle, args.timeout, args.json);
+    }
     let (doc, code) = match evaluate(&start, args.clone()) {
         Ok((mut doc, code)) => {
             doc["durationMs"] = json!(t0.elapsed().as_millis() as u64);
