@@ -1,13 +1,10 @@
 //! `sem hook prompt-submit` — the prompt-time prefetch, compiled.
 //!
-//! Reads a Claude Code UserPromptSubmit event from stdin and extracts
-//! identifier-shaped tokens from the prompt. Used to resolve them against
-//! the resident sem MCP server's socket sidecar; that sidecar is deleted
-//! (GREP-KILLER S4, — measured it
-//! at 0% availability in production, so this path was already always a
-//! silent no-op in practice) and `socket_lookup` now always returns `None`.
-//! Kept registered rather than removed: its own documented contract already
-//! covers this exact case.
+//! Reads a Claude Code UserPromptSubmit event from stdin, extracts the
+//! identifier-shaped tokens the prompt names, and answers them with `sem find
+//! --context` from the query index (tens of milliseconds) before the model's
+//! first turn, so a task that names its code starts with that code in hand
+//! instead of spending a turn finding it.
 //!
 //! Silent by design: no candidates, no repo, no socket, any error — print
 //! nothing and exit 0. The hook must never disturb a prompt.
@@ -15,7 +12,9 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const MAX_ENTITIES: usize = 2;
+const MAX_ENTITIES: usize = 4;
+/// Token budget for everything the prefetch injects.
+const BUDGET: &str = "1500";
 
 pub fn prompt_submit() {
     let mut input = String::new();
@@ -39,10 +38,9 @@ pub fn prompt_submit() {
     // cheapest and sharpest when the caller already knows the identifier.
     let names = candidates(prompt);
     let mut blocks: Vec<String> = Vec::new();
-    for name in &names {
-        if let Some(text) = socket_lookup(&repo_root, name) {
-            blocks.push(text);
-        }
+    let paths = mentioned_paths(prompt, &repo_root);
+    if let Some(text) = index_lookup(&repo_root, &names, &paths) {
+        blocks.push(text);
     }
     if !blocks.is_empty() {
         println!(
@@ -107,17 +105,90 @@ fn candidates(prompt: &str) -> Vec<String> {
     out
 }
 
-/// Used to be a one-call context lookup against the resident server's socket
-/// sidecar (GREP-KILLER S4, — deleted:
-/// see sem-mcp/src/lib.rs). own measurement found that socket never
-/// answered in production (0% availability), so this always returned `None`
-/// in practice already — deleting the dead connection attempt changes no
-/// observable behavior. `sem hook prompt-submit` stays registered (its
-/// documented contract is "silent by design... any error — print nothing
-/// and exit 0"), it just now honestly never has a data source to try,
-/// instead of unconditionally failing a connection it made.
-fn socket_lookup(_repo_root: &Path, _name: &str) -> Option<String> {
-    None
+/// `sem find <name> --context` against the repository's query index, one
+/// child process per name, all in parallel and bounded to two seconds. A
+/// name that is ambiguous is retried inside each file the prompt mentions.
+/// Only names that resolve to one definition are kept; the hook adds only
+/// what is certain.
+fn index_lookup(repo_root: &Path, names: &[String], paths: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let budget = (1500 / names.len()).max(300).to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let run = |name: &str, scope: Option<&str>| -> Option<String> {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["find", name, "--context", "--budget", &budget]);
+        if let Some(p) = scope {
+            cmd.args(["--in", p]);
+        }
+        let mut child = cmd
+            .current_dir(repo_root)
+            .env("SEM_NO_TELEMETRY", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {
+                    let _ = child.kill();
+                    return None;
+                }
+            }
+        }
+        let mut out = String::new();
+        child.stdout.take()?.read_to_string(&mut out).ok()?;
+        (out.starts_with("context for ") && out.contains("target:")).then(|| out.trim_end().to_string())
+    };
+    let found: Vec<String> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = names
+            .iter()
+            .map(|n| scope.spawn(move || run(n, None).or_else(|| paths.iter().find_map(|p| run(n, Some(p))))))
+            .collect();
+        jobs.into_iter().filter_map(|j| j.join().ok().flatten()).collect()
+    });
+    // one block per entity (a qualified and a bare name can find the same
+    // one), within the overall budget at about four bytes a token
+    let mut seen = std::collections::HashSet::new();
+    let mut out = String::new();
+    for block in found {
+        let head = block.lines().next().unwrap_or("").split(" (budget").next().unwrap_or("").to_string();
+        if !seen.insert(head) {
+            continue;
+        }
+        let room = 6000usize.saturating_sub(out.len());
+        if room < 400 {
+            break;
+        }
+        let mut cut = block.len().min(room);
+        while !block.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&block[..cut]);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Repository files the prompt names (`rich/text.py`), which disambiguate
+/// a name defined in several places.
+fn mentioned_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
+    let rx = regex::Regex::new(r"[\w./-]+/[\w.-]+\.\w{1,6}").unwrap();
+    let mut out: Vec<String> = Vec::new();
+    for m in rx.find_iter(prompt) {
+        let p = m.as_str().trim_start_matches("./").to_string();
+        if repo_root.join(&p).is_file() && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -138,8 +209,8 @@ mod tests {
     }
 
     #[test]
-    fn candidates_cap_at_two() {
-        let c = candidates("`alpha_one` `beta_two` `gamma_three`");
-        assert_eq!(c.len(), 2);
+    fn candidates_cap() {
+        let c = candidates("`alpha_one` `beta_two` `gamma_three` `delta_four` `eps_five`");
+        assert_eq!(c.len(), MAX_ENTITIES);
     }
 }
