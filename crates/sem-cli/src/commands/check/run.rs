@@ -55,22 +55,91 @@ fn alive(pid: &str) -> bool {
     Command::new("kill").args(["-0", pid]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+/// Commands that only filter the output piped into them.
+const FILTERS: &[&str] = &["head", "tail", "grep", "egrep", "fgrep", "rg", "sed", "awk", "cut", "sort", "uniq", "wc", "tr", "cat", "less", "more", "column", "tee"];
+
+/// `cmd` as (core command, output filters piped after it). `go test ./...
+/// 2>&1 | grep FAIL | head` is `go test ./...` filtered by `grep FAIL |
+/// head`: the core is what runs and is remembered, and each request applies
+/// its own filters to the remembered output. A compound command (`;`, `&&`,
+/// `||`, `&`, newlines) is its own core.
+pub(crate) fn split_filters(cmd: &str) -> (String, Option<String>) {
+    let b = cmd.as_bytes();
+    let (mut quote, mut pipes, mut compound) = (None::<u8>, Vec::new(), false);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(b'"') if c == b'\\' => i += 1,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'\\' => i += 1,
+                b'|' if b.get(i + 1) == Some(&b'|') => {
+                    compound = true;
+                    i += 1;
+                }
+                b'|' => pipes.push(i),
+                b';' | b'\n' => compound = true,
+                b'&' if b.get(i + 1) == Some(&b'&') => {
+                    compound = true;
+                    i += 1;
+                }
+                b'&' if i > 0 && b[i - 1] != b'>' && b.get(i + 1) != Some(&b'>') => compound = true,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    let strip = |s: &str| s.trim().trim_end_matches("2>&1").trim().to_string();
+    if compound || pipes.is_empty() {
+        return (if compound { cmd.trim().to_string() } else { strip(cmd) }, None);
+    }
+    let mut bounds = vec![0];
+    bounds.extend(pipes.iter().map(|p| p + 1));
+    let stages: Vec<&str> = bounds.iter().enumerate().map(|(k, &s)| &cmd[s..pipes.get(k).copied().unwrap_or(cmd.len())]).collect();
+    let is_filter = |st: &str| st.split_whitespace().next().is_some_and(|w| FILTERS.contains(&w));
+    let mut first = stages.len();
+    while first > 1 && is_filter(stages[first - 1]) {
+        first -= 1;
+    }
+    if first == stages.len() {
+        return (cmd.trim().to_string(), None);
+    }
+    let core = stages[..first].join("|");
+    let filters = stages[first..].iter().map(|s| s.trim()).collect::<Vec<_>>().join(" | ");
+    (strip(&core), Some(filters))
+}
+
+/// One finished run of a core command: what is remembered per tree.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Raw {
+    code: i32,
+    stopped: Option<String>,
+    secs: f64,
+    lines: Vec<String>,
+}
+
 /// Answer from a finished run on this exact tree, join one in progress, or
-/// run the command and remember the answer.
+/// run the core command and remember its whole output; then apply this
+/// request's own filters to it.
 fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cache: bool, quiet: bool) -> (i32, String) {
+    let (core, filters) = split_filters(cmd);
     let root = super::tree::toplevel(start);
     let dir = root.as_deref().and_then(run_dir);
     let tree = root.as_deref().and_then(|r| super::tree::head(r).ok()).map(|h| h.tree);
     let (Some(root), Some(dir), Some(tree)) = (root, dir, tree) else {
-        return execute(start, cmd, idle, timeout, json);
+        let raw = execute(start, &core, idle, timeout);
+        return render(&raw, cmd, filters.as_deref(), json, None);
     };
     let _ = std::fs::create_dir_all(&dir);
     let rel = start.strip_prefix(&root).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     if !quiet {
-        let _ = std::fs::write(dir.join("last"), format!("{rel}\n{cmd}"));
+        let _ = std::fs::write(dir.join("last"), format!("{rel}\n{core}"));
     }
-    let key = super::util::digest(&format!("{tree}\0{rel}\0{json}\0{cmd}"));
-    let (done, lock) = (dir.join(format!("{key}.done")), dir.join(format!("{key}.lock")));
+    let key = super::util::digest(&format!("{tree}\0{rel}\0{core}"));
+    let (done, lock) = (dir.join(format!("{key}.json")), dir.join(format!("{key}.lock")));
     if !no_cache {
         // a run of this command on this tree is in progress: join it
         let waited = Instant::now();
@@ -79,29 +148,28 @@ fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cac
                 let _ = std::fs::remove_file(&lock);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        if let Ok(saved) = std::fs::read_to_string(&done) {
-            if let Some((code, text)) = saved.split_once('\n') {
-                let joined = waited.elapsed().as_millis() > 150;
-                let note = if joined {
-                    "(this exact tree was already being checked, started when the last edit landed; waited for it)\n"
-                } else {
-                    "(answered from an earlier run of this command on this exact tree; --no-cache reruns it)\n"
-                };
-                return (code.parse().unwrap_or(1), format!("{text}{note}"));
-            }
+        if let Some(raw) = std::fs::read_to_string(&done).ok().and_then(|t| serde_json::from_str::<Raw>(&t).ok()) {
+            let note = if waited.elapsed().as_millis() > 100 {
+                format!("(`{core}` was already running on this exact tree, started when the last edit landed; waited {:.1}s for it)", waited.elapsed().as_secs_f64())
+            } else {
+                format!("(`{core}` already ran on this exact tree; answered from that run. --no-cache reruns it)")
+            };
+            return render(&raw, cmd, filters.as_deref(), json, Some(&note));
         }
     }
     let _ = std::fs::write(&lock, std::process::id().to_string());
-    let (code, text) = execute(start, cmd, idle, timeout, json);
+    let raw = execute(start, &core, idle, timeout);
     // remember it only if the tree did not change while it ran, and it ended
     let same = super::tree::head(&root).ok().is_some_and(|h| h.tree == tree);
-    if same && code != 124 {
-        let _ = std::fs::write(&done, format!("{code}\n{text}"));
+    if same && raw.stopped.is_none() {
+        if let Ok(t) = serde_json::to_string(&raw) {
+            let _ = std::fs::write(&done, t);
+        }
     }
     let _ = std::fs::remove_file(&lock);
-    (code, text)
+    render(&raw, cmd, filters.as_deref(), json, None)
 }
 
 /// When `cmd` builds a whole multi-module project but only some modules
@@ -219,7 +287,9 @@ pub(crate) fn run_at_base(start: &Path, base: &str, cmd: &str, idle: u64, timeou
             }
         }
     }
-    let (code, text) = execute(&dir, cmd, idle, timeout, json);
+    let (core, filters) = split_filters(cmd);
+    let raw = execute(&dir, &core, idle, timeout);
+    let (code, text) = render(&raw, cmd, filters.as_deref(), json, None);
     print!("{header}{text}");
     if code != 124 && !no_cache {
         let _ = std::fs::create_dir_all(cache.parent().unwrap_or(&dir));
@@ -248,25 +318,13 @@ fn warm(root: &Path, dir: &Path) {
     }
 }
 
-/// Run `cmd` under the watchdog: (exit code, the answer to print).
-fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32, String) {
-    use std::fmt::Write;
+/// Run `core` under the watchdog, keeping its whole output (both streams).
+fn execute(root: &Path, core: &str, idle: u64, timeout: u64) -> Raw {
+    const KEEP: usize = 20_000;
     let start = Instant::now();
-    // bash with pipefail when there is one, so `cmd | tail` keeps cmd's failure
     let bash = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"].into_iter().find(|b| Path::new(b).exists());
-    let mut command = match bash {
-        Some(b) => {
-            let mut c = Command::new(b);
-            c.args(["-o", "pipefail", "-c", cmd]);
-            c
-        }
-        None => {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(cmd);
-            c
-        }
-    };
-    command.current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut command = Command::new(bash.unwrap_or("sh"));
+    command.arg("-c").arg(core).current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -274,7 +332,7 @@ fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32,
     }
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => return (2, format!("sem check --run: {e}\n")),
+        Err(e) => return Raw { code: 2, stopped: None, secs: 0.0, lines: vec![format!("sem check --run: {e}")] },
     };
     let (tx, rx) = mpsc::channel::<String>();
     for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten() {
@@ -288,25 +346,21 @@ fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32,
         });
     }
     drop(tx);
-
-    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let mut signal: Vec<(usize, String)> = Vec::new();
-    let mut lines = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
     let mut last = Instant::now();
     let mut stopped: Option<String> = None;
     let mut closed = false;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) => {
-                lines += 1;
                 last = Instant::now();
-                if SIGNAL.iter().any(|s| line.contains(s)) && signal.len() < SIGNAL_MAX && signal.last().is_none_or(|(_, l)| *l != line) {
-                    signal.push((lines, line.clone()));
+                if lines.len() >= KEEP {
+                    // keep the first half and a rolling end
+                    lines.remove(KEEP / 2);
+                    dropped += 1;
                 }
-                tail.push_back(line);
-                if tail.len() > TAIL {
-                    tail.pop_front();
-                }
+                lines.push(line);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -333,33 +387,75 @@ fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32,
     }
     let status = child.wait().ok();
     let code = if stopped.is_some() { 124 } else { status.and_then(|s| s.code()).unwrap_or(1) };
-    let secs = start.elapsed().as_secs_f64();
+    if dropped > 0 {
+        lines.insert(KEEP / 2, format!("... {dropped} lines not kept ..."));
+    }
+    Raw { code, stopped, secs: start.elapsed().as_secs_f64(), lines }
+}
 
-    // the signal lines not already in the tail, then the tail
-    let tail_start = lines.saturating_sub(tail.len()) + 1;
-    let early: Vec<&String> = signal.iter().filter(|(n, _)| *n < tail_start).map(|(_, l)| l).collect();
-    let verdict = match (&stopped, code) {
+/// The answer to print: the request's own filters applied to the output, or
+/// the lines that say what went wrong plus the end; then the verdict, which
+/// is always the core command's.
+fn render(raw: &Raw, cmd: &str, filters: Option<&str>, json: bool, note: Option<&str>) -> (i32, String) {
+    use std::fmt::Write;
+    let verdict = match (&raw.stopped, raw.code) {
         (Some(why), _) => why.clone(),
         (None, 0) => "pass".to_string(),
         (None, c) => format!("fail (exit {c})"),
     };
     let mut text = String::new();
+    let shown: Vec<String> = match filters {
+        Some(f) => {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c").arg(f).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+            match c.spawn() {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write as _;
+                        let body = raw.lines.join("\n") + "\n";
+                        std::thread::spawn(move || {
+                            let _ = stdin.write_all(body.as_bytes());
+                        });
+                    }
+                    child.wait_with_output().map(|o| String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect()).unwrap_or_default()
+                }
+                Err(_) => raw.lines.clone(),
+            }
+        }
+        None => Vec::new(),
+    };
+    let tail: Vec<&String> = raw.lines.iter().rev().take(TAIL).rev().collect();
+    let tail_start = raw.lines.len().saturating_sub(tail.len());
+    let mut problems: Vec<&String> = Vec::new();
+    for l in &raw.lines[..tail_start] {
+        if problems.len() < SIGNAL_MAX && SIGNAL.iter().any(|s| l.contains(s)) && problems.last().is_none_or(|p| *p != l) {
+            problems.push(l);
+        }
+    }
     if json {
         let out = serde_json::json!({
             "command": cmd,
-            "verdict": if stopped.is_some() { "stopped" } else if code == 0 { "pass" } else { "fail" },
-            "exit": code,
-            "seconds": (secs * 10.0).round() / 10.0,
-            "lines": lines,
-            "problems": early,
-            "tail": tail,
-            "note": stopped,
+            "verdict": if raw.stopped.is_some() { "stopped" } else if raw.code == 0 { "pass" } else { "fail" },
+            "exit": raw.code,
+            "seconds": (raw.secs * 10.0).round() / 10.0,
+            "lines": raw.lines.len(),
+            "output": if filters.is_some() { serde_json::json!(shown) } else { serde_json::json!({"problems": problems, "tail": tail}) },
+            "note": note.or(raw.stopped.as_deref()),
         });
         let _ = writeln!(text, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return (raw.code, text);
+    }
+    if filters.is_some() {
+        for l in &shown {
+            let _ = writeln!(text, "{l}");
+        }
+        if !shown.is_empty() {
+            text.push('\n');
+        }
     } else {
-        if !early.is_empty() {
-            let _ = writeln!(text, "── what went wrong ({} of {} lines):", early.len(), lines);
-            for l in &early {
+        if !problems.is_empty() {
+            let _ = writeln!(text, "── what went wrong ({} of {} lines):", problems.len(), raw.lines.len());
+            for l in &problems {
                 let _ = writeln!(text, "{l}");
             }
             text.push('\n');
@@ -371,9 +467,12 @@ fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32,
             }
             text.push('\n');
         }
-        let _ = writeln!(text, "{verdict} · {secs:.1}s · {lines} lines of output");
     }
-    (code, text)
+    let _ = writeln!(text, "{verdict} · {:.1}s · {} lines of output", raw.secs, raw.lines.len());
+    if let Some(n) = note {
+        let _ = writeln!(text, "{n}");
+    }
+    (raw.code, text)
 }
 
 fn kill_group(child: &mut std::process::Child) {
@@ -386,4 +485,19 @@ fn kill_group(child: &mut std::process::Child) {
         let _ = quiet("-KILL");
     }
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_filters;
+
+    #[test]
+    fn filters_split_from_the_command_they_filter() {
+        let s = |c: &str| split_filters(c);
+        assert_eq!(s("go test ./... 2>&1 | tail -15"), ("go test ./...".into(), Some("tail -15".into())));
+        assert_eq!(s("cargo test | grep -E 'FAIL|panic' | head -20"), ("cargo test".into(), Some("grep -E 'FAIL|panic' | head -20".into())));
+        assert_eq!(s("npx vitest run"), ("npx vitest run".into(), None));
+        assert_eq!(s("go vet ./... && go test ./... | tail"), ("go vet ./... && go test ./... | tail".into(), None));
+        assert_eq!(s("make 2>&1 | python3 parse.py"), ("make 2>&1 | python3 parse.py".into(), None));
+    }
 }
