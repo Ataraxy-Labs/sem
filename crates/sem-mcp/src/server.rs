@@ -668,17 +668,22 @@ impl SemServer {
     ) -> Result<&'a str, String> {
         // Match the bare name, or `Class.method` addressing (a child entity
         // whose parent is named by the qualifier before the final dot). Agents
-        // reach for `Class.method` naturally.
+        // reach for `Class.method` naturally, and for "function name".
+        let (kind, entity_name) = match entity_name.trim().split_once(' ') {
+            Some((k, rest)) if !rest.trim().is_empty() && !k.contains(['.', ':']) => (Some(k), rest.trim()),
+            _ => (None, entity_name.trim()),
+        };
         let qualified = entity_name.rsplit_once('.');
         let matches = |e: &sem_core::parser::graph::EntityInfo| {
-            e.name == entity_name
+            kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
+            && (e.name == entity_name
                 || qualified.is_some_and(|(parent_part, child_part)| {
                     e.name == child_part
                         && e.parent_id
                             .as_ref()
                             .and_then(|pid| graph.entities.get(pid))
                             .is_some_and(|p| p.name == parent_part)
-                })
+                }))
         };
 
         if let Some(entity) = graph
