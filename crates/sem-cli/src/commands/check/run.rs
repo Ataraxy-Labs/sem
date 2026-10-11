@@ -26,7 +26,80 @@ const SIGNAL_MAX: usize = 80;
 pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> i32 {
     let (code, text) = execute(root, cmd, idle, timeout, json);
     print!("{text}");
+    if !json {
+        if let Some(hint) = scope_hint(root, cmd) {
+            println!("{hint}");
+        }
+    }
     code
+}
+
+/// When `cmd` builds a whole multi-module project but only some modules
+/// changed (against HEAD, untracked files included), the command that
+/// builds just those: the next build cycle costs a module, not the project.
+fn scope_hint(start: &Path, cmd: &str) -> Option<String> {
+    let root = super::tree::toplevel(start)?;
+    let out = Command::new("git").args(["status", "--porcelain=v1", "--untracked-files=all", "--no-renames"]).current_dir(&root).output().ok()?;
+    let changed: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.get(3..)).map(|p| p.trim_matches('"').to_string()).collect();
+    if changed.is_empty() {
+        return None;
+    }
+    let files = super::tree::files(&root, "HEAD").unwrap_or_default();
+    // the nearest ancestor directory holding `manifest`, for every changed file
+    let modules_of = |manifest: &[&str]| -> (Vec<String>, usize) {
+        let dirs: std::collections::BTreeSet<String> = files
+            .iter()
+            .filter(|f| manifest.iter().any(|m| f.rsplit('/').next() == Some(m)))
+            .map(|f| f.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default())
+            .collect();
+        let mut hit = std::collections::BTreeSet::new();
+        for c in &changed {
+            let mut d = c.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+            loop {
+                if dirs.contains(&d) {
+                    if !d.is_empty() {
+                        hit.insert(d.clone());
+                    }
+                    break;
+                }
+                match d.rsplit_once('/') {
+                    Some((p, _)) => d = p.to_string(),
+                    None if !d.is_empty() => d = String::new(),
+                    None => break,
+                }
+            }
+        }
+        (hit.into_iter().collect(), dirs.len())
+    };
+    let words: Vec<&str> = cmd.split(|c: char| c.is_whitespace() || c == '\'' || c == '"').collect();
+    let has = |w: &str| words.contains(&w);
+    let pick = |mods: &[String], total: usize, render: &dyn Fn(&[String]) -> String| -> Option<String> {
+        (!mods.is_empty() && total > 2 && mods.len() * 2 <= total).then(|| {
+            format!("hint: only {} of {total} modules changed ({}); `{}` rebuilds just those", mods.len(), mods.join(", "), render(mods))
+        })
+    };
+    if (has("mvn") || has("./mvnw") || has("mvnw")) && !has("-pl") && !has("--projects") {
+        let (mods, total) = modules_of(&["pom.xml"]);
+        return pick(&mods, total, &|m| format!("{} -pl {}", cmd.trim(), m.join(",")));
+    }
+    if (has("gradle") || has("./gradlew") || has("gradlew")) && !words.iter().any(|w| w.starts_with(':')) {
+        let (mods, total) = modules_of(&["build.gradle", "build.gradle.kts"]);
+        return pick(&mods, total, &|m| m.iter().map(|d| format!(":{}:build", d.replace('/', ":"))).collect::<Vec<_>>().join(" "));
+    }
+    if has("cargo") && !has("-p") && !has("--package") && !has("--workspace") {
+        let (mods, total) = modules_of(&["Cargo.toml"]);
+        let names: Vec<String> = mods
+            .iter()
+            .filter_map(|d| {
+                let toml = std::fs::read_to_string(root.join(d).join("Cargo.toml")).ok()?;
+                let pkg = toml.split("[package]").nth(1)?;
+                let line = pkg.lines().find(|l| l.trim_start().starts_with("name"))?;
+                Some(line.split('=').nth(1)?.trim().trim_matches('"').to_string())
+            })
+            .collect();
+        return pick(&names, total, &|m| format!("{} {}", cmd.trim(), m.iter().map(|n| format!("-p {n}")).collect::<Vec<_>>().join(" ")));
+    }
+    None
 }
 
 /// Run `cmd` on the base revision instead of the working tree, in a side
