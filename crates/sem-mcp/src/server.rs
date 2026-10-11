@@ -3426,7 +3426,7 @@ struct LedgerFill {
 /// "40-120", "300-" or "7" as 1-based inclusive (from, to).
 fn parse_line_range(s: &str) -> Result<(usize, Option<usize>), String> {
     let bad = || format!("lines {s:?}: use a range like \"40-120\" or \"300-\"");
-    let s = s.trim();
+    let s = s.trim().trim_matches(['"', '\'']).trim();
     match s.split_once('-') {
         Some((a, b)) => {
             let a: usize = a.trim().parse().map_err(|_| bad())?;
