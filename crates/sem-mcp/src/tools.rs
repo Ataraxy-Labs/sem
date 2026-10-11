@@ -250,6 +250,15 @@ pub struct GrepParams {
     pub patterns: Option<Vec<String>>,
     #[schemars(description = "Case-insensitive match.")]
     pub case_insensitive: Option<bool>,
+    #[schemars(description = "Only search under this directory or file, or files matching this glob (e.g. \"rich/\", \"src/**/*.ts\").")]
+    #[serde(rename = "in")]
+    pub in_path: Option<String>,
+    #[schemars(
+        description = "Also return the source of each function, method or class that contains a hit (each once), so one call finds and reads; capped by token_budget."
+    )]
+    pub bodies: Option<bool>,
+    #[schemars(description = "With bodies: token budget for the returned source (default 4000).")]
+    pub token_budget: Option<usize>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }

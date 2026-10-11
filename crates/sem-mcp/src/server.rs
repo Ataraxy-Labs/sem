@@ -3089,6 +3089,17 @@ impl SemServer {
             Ok(file_paths) => file_paths,
             Err(err) => return Ok(tool_error(err)),
         };
+        let file_paths: Vec<String> = match params.in_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(scope) => {
+                let scope = scope.trim_start_matches("./");
+                let glob = scope.contains(['*', '?']);
+                file_paths
+                    .into_iter()
+                    .filter(|f| if glob { glob_match(scope, f) } else { f == scope || f.starts_with(&format!("{}/", scope.trim_end_matches('/'))) })
+                    .collect()
+            }
+            None => file_paths,
+        };
         let opts = sem_core::index::grep::GrepOptions {
             case_insensitive: params.case_insensitive(),
         };
@@ -3187,7 +3198,51 @@ impl SemServer {
         for hit in &hits {
             out.push_str(&format!("{}:{}:{}\n", hit.file, hit.line, hit.text));
         }
+        if params.bodies.unwrap_or(false) && !hits.is_empty() {
+            out.push_str(&self.enclosing_bodies(&ctx.repo_root, &hits, params.token_budget.unwrap_or(4000)));
+        }
         Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    /// The innermost entity around each hit, each once, numbered like a read,
+    /// until `budget` tokens (4 bytes each) are spent.
+    fn enclosing_bodies(&self, root: &Path, hits: &[sem_core::index::grep::GrepHit], budget: usize) -> String {
+        let mut by_file: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+        for h in hits {
+            by_file.entry(h.file.as_str()).or_default().push(h.line);
+        }
+        let mut picked: Vec<(String, String, usize, usize, String)> = Vec::new();
+        for (file, lines) in by_file {
+            let Ok(text) = std::fs::read_to_string(root.join(file)) else { continue };
+            let Some(plugin) = self.registry.get_plugin(file) else { continue };
+            let ents = plugin.extract_entities(&text, file);
+            let mut seen = std::collections::BTreeSet::new();
+            for line in lines {
+                let inner = ents.iter().filter(|e| e.start_line <= line && line <= e.end_line && !e.name.is_empty()).min_by_key(|e| e.end_line - e.start_line);
+                if let Some(e) = inner {
+                    if seen.insert(e.start_line) {
+                        let parent = e.parent_id.as_ref().and_then(|id| ents.iter().find(|p| &p.id == id)).map(|p| format!("{}.", p.name)).unwrap_or_default();
+                        let body: String = text.lines().skip(e.start_line - 1).take(e.end_line - e.start_line + 1).enumerate().map(|(i, l)| format!("{:>6}\t{l}\n", e.start_line + i)).collect();
+                        picked.push((file.to_string(), format!("{} {parent}{}", e.entity_type, e.name), e.start_line, e.end_line, body));
+                    }
+                }
+            }
+        }
+        let mut out = String::from("\n");
+        let mut spent = 0;
+        let mut omitted = Vec::new();
+        for (file, label, a, b, body) in picked {
+            if spent + body.len() / 4 > budget {
+                omitted.push(format!("{label} ({file}:{a})"));
+                continue;
+            }
+            spent += body.len() / 4;
+            out.push_str(&format!("── {file} · {label} · lines {a}-{b}\n{body}\n"));
+        }
+        if !omitted.is_empty() {
+            out.push_str(&format!("(over token_budget, not shown: {})\n", omitted.join(", ")));
+        }
+        out
     }
 
     // ── Tool 7: Join review (agent listener) ──
@@ -3421,6 +3476,26 @@ async fn list_open_branches_impl(
 struct LedgerFill {
     fingerprint: String,
     content: String,
+}
+
+/// `*` (within a path segment), `**` (any depth) and `?` against a
+/// repo-relative path.
+fn glob_match(pat: &str, path: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(b'*'), _) if p.get(1) == Some(&b'*') => {
+                let rest = if p.get(2) == Some(&b'/') { &p[3..] } else { &p[2..] };
+                rest.is_empty() || (0..=s.len()).any(|i| (i == 0 || s[i - 1] == b'/') && go(rest, &s[i..])) || go(rest, s)
+            }
+            (Some(b'*'), _) => (0..=s.len()).take_while(|&i| i == 0 || s[i - 1] != b'/').any(|i| go(&p[1..], &s[i..])),
+            (Some(b'?'), Some(c)) if *c != b'/' => go(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(pat.as_bytes(), path.as_bytes())
 }
 
 /// "40-120", "300-" or "7" as 1-based inclusive (from, to).
@@ -3658,6 +3733,14 @@ mod tests {
         let repo_root = git.repo_root().to_path_buf();
         *server.context.lock().await = Some(RepoContext { git, repo_root });
         server
+    }
+
+    #[test]
+    fn grep_scope_globs() {
+        assert!(glob_match("rich/**", "rich/a/b.py"));
+        assert!(glob_match("src/**/*.ts", "src/a/b/c.ts") && glob_match("src/**/*.ts", "src/c.ts"));
+        assert!(glob_match("*.py", "x.py") && !glob_match("*.py", "a/x.py"));
+        assert!(glob_match("tests/test_?.py", "tests/test_a.py"));
     }
 
     #[test]
