@@ -24,6 +24,7 @@
     "@earendil-works/pi-ai": "0.84.2",
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@types/node": "^26.2.0",
+    "mcp-remote": "0.14.3",
     "typebox": "^1.3.7",
     "typescript": "^5.7.0"
   },
