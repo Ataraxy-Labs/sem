@@ -721,16 +721,22 @@ impl SemServer {
         graph: &'a EntityGraph,
         entity_name: &str,
     ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
+        // "method Text.count" names the kind too, as plain lookup accepts
+        let (kind, entity_name) = match entity_name.trim().split_once(' ') {
+            Some((k, rest)) if !rest.trim().is_empty() && !k.contains(['.', ':']) => (Some(k), rest.trim()),
+            _ => (None, entity_name.trim()),
+        };
         let qualified = entity_name.rsplit_once('.');
         let matches = |e: &sem_core::parser::graph::EntityInfo| {
-            e.name == entity_name
+            kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
+            && (e.name == entity_name
                 || qualified.is_some_and(|(parent_part, child_part)| {
                     e.name == child_part
                         && e.parent_id
                             .as_ref()
                             .and_then(|pid| graph.entities.get(pid))
                             .is_some_and(|p| p.name == parent_part)
-                })
+                }))
         };
         let mut hits: Vec<&sem_core::parser::graph::EntityInfo> =
             graph.entities.values().filter(|e| matches(e)).collect();
@@ -2551,7 +2557,10 @@ impl SemServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let query = params.query.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
         let queries = params.queries().map(<[String]>::to_vec);
-        match params.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        // `files` or `lines` with no entity named can only mean "read these"
+        let reading = query.is_none() && queries.is_none() && (params.files.as_ref().is_some_and(|f| !f.is_empty()) || params.lines.is_some());
+        let mode = if reading { Some("context") } else { params.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) };
+        match mode {
             None | Some("definitions") => {}
             Some("callers") => {
                 let Some(q) = query else {

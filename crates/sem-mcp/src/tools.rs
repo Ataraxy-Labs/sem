@@ -206,7 +206,7 @@ pub struct FindParams {
     )]
     pub intent: Option<String>,
     #[schemars(
-        description = "Mode \"context\" with no query: read these whole files (any text file, code or not) in one call, with line numbers. `in` alone reads one file the same way."
+        description = "Read these whole files (any text file, code or not) in one call, with line numbers; no mode needed. With mode \"context\" and no query, `in` reads one file the same way."
     )]
     pub files: Option<Vec<String>>,
     #[schemars(description = "Reading files: only these lines, e.g. \"40-120\" or \"300-\".")]

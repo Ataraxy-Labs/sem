@@ -7,6 +7,7 @@ All notable changes to sem are documented in this file.
 ### Added
 
 - **`sem_find` reads whole files, so an agent never needs Read, `cat` or `sed` to look at code or config.** With mode `context` and no query, it reads `files: [...]` (or the file in `in`) in one call, in parallel, numbered like `cat -n`, with an optional `lines` range. A file the session already read answers in one line when it is unchanged, and with a line diff against the version the agent saw when it changed; `fresh: true` resends it whole.
+- **`sem_find` reads whenever it is given `files` or `lines`, and context lookups accept a kind prefix (`method Text.count`).** Both used to cost agents a retry.
 
 ### Added
 
