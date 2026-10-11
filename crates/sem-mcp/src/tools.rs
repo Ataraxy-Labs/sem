@@ -254,7 +254,7 @@ pub struct GrepParams {
     #[serde(rename = "in")]
     pub in_path: Option<String>,
     #[schemars(
-        description = "Also return the source of each function, method or class that contains a hit (each once), so one call finds and reads; capped by token_budget."
+        description = "Return the source of each function, method or class that contains a hit (each once), so one call finds and reads; capped by token_budget. Default: on when there are at most 6 hits."
     )]
     pub bodies: Option<bool>,
     #[schemars(description = "With bodies: token budget for the returned source (default 4000).")]

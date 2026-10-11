@@ -3175,6 +3175,10 @@ impl SemServer {
                     Err(e) => out.push_str(&format!("  {e}\n")),
                 }
             }
+            let all: Vec<sem_core::index::grep::GrepHit> = per_pattern.iter().filter_map(|(_, o)| o.as_ref().ok()).flatten().cloned().collect();
+            if params.bodies.unwrap_or(all.len() <= AUTO_BODIES) && !all.is_empty() {
+                out.push_str(&self.enclosing_bodies(&ctx.repo_root, &all, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
+            }
             return Ok(CallToolResult::success(vec![Content::text(out)]));
         }
 
@@ -3203,8 +3207,10 @@ impl SemServer {
         for hit in &hits {
             out.push_str(&format!("{}:{}:{}\n", hit.file, hit.line, hit.text));
         }
-        if params.bodies.unwrap_or(false) && !hits.is_empty() {
-            out.push_str(&self.enclosing_bodies(&ctx.repo_root, &hits, params.token_budget.unwrap_or(4000)));
+        // a handful of hits: show the code around them too, since the next
+        // turn would read it anyway
+        if params.bodies.unwrap_or(hits.len() <= AUTO_BODIES) && !hits.is_empty() {
+            out.push_str(&self.enclosing_bodies(&ctx.repo_root, &hits, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
         }
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
@@ -3482,6 +3488,9 @@ struct LedgerFill {
     fingerprint: String,
     content: String,
 }
+
+/// At most this many hits and sem_grep returns the code around them unasked.
+const AUTO_BODIES: usize = 6;
 
 /// `*` (within a path segment), `**` (any depth) and `?` against a
 /// repo-relative path.
