@@ -322,6 +322,17 @@ enum Commands {
         /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long, hide = true)]
         no_default_excludes: bool,
+        /// Read these files instead of finding entities: numbered like `cat -n`,
+        /// any text file. A file read before in this repository answers with
+        /// "unchanged" or a diff against that read. Example: sem find --read src/a.rs src/b.rs
+        #[arg(long, num_args = 1.., value_name = "FILE", conflicts_with_all = ["callers", "refs", "context"])]
+        read: Vec<String>,
+        /// With --read: only these lines. Example: --lines 40-120
+        #[arg(long, requires = "read")]
+        lines: Option<String>,
+        /// With --read: print the whole file even if it was read before unchanged
+        #[arg(long, requires = "read")]
+        fresh: bool,
     },
     /// Show direct callers of an entity (who calls/references it) — the
     /// index's reverse postings, same freshness/fallback discipline as `find`.
@@ -1677,7 +1688,13 @@ fn sem_main() {
             file_exts,
             no_cache,
             no_default_excludes,
+            read,
+            lines,
+            fresh,
         }) => {
+            if !read.is_empty() {
+                std::process::exit(commands::read::run(&read, lines.as_deref(), fresh));
+            }
             let json = resolve_json(format, json);
             // --file is the old spelling of a single --in.
             let mut in_paths = in_paths;
