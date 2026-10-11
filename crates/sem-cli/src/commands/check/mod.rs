@@ -86,6 +86,12 @@ pub struct CheckArgs {
     /// Example: sem check --run 'cargo test -p core'
     #[arg(long, value_name = "CMD")]
     pub run: Option<String>,
+    /// With --run: run it on the --base revision (default HEAD) instead of the
+    /// working tree, in a side checkout with a warm build, without touching
+    /// the working tree; answers are cached. Replaces stash, rebuild, compare.
+    /// Example: sem check --run 'cargo test -p core' --at base
+    #[arg(long, value_name = "base|head", requires = "run")]
+    pub at: Option<String>,
     /// With --run: stop the command after this many seconds without output (0: never)
     #[arg(long, default_value = "180")]
     pub idle: u64,
@@ -318,7 +324,14 @@ pub fn run(args: CheckArgs) -> i32 {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if let Some(cmd) = args.run.as_deref() {
-        return run::run(&start, cmd, args.idle, args.timeout, args.json);
+        return match args.at.as_deref() {
+            None | Some("head") => run::run(&start, cmd, args.idle, args.timeout, args.json),
+            Some("base") => run::run_at_base(&start, args.base.as_deref().unwrap_or("HEAD"), cmd, args.idle, args.timeout, args.json, args.no_cache),
+            Some(other) => {
+                eprintln!("sem check --at {other}: use base or head");
+                2
+            }
+        };
     }
     let (doc, code) = match evaluate(&start, args.clone()) {
         Ok((mut doc, code)) => {

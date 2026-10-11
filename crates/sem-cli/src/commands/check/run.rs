@@ -24,6 +24,90 @@ const TAIL: usize = 40;
 const SIGNAL_MAX: usize = 80;
 
 pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> i32 {
+    let (code, text) = execute(root, cmd, idle, timeout, json);
+    print!("{text}");
+    code
+}
+
+/// Run `cmd` on the base revision instead of the working tree, in a side
+/// checkout that persists between calls (`<git dir>/sem-base/<commit>`), so
+/// the working tree and its build stay as they are. Its build directories
+/// start as copy-on-write clones of the working tree's (instant on APFS,
+/// btrfs and XFS), so the base build is incremental, and its answers are
+/// cached per (base commit, command).
+pub(crate) fn run_at_base(start: &Path, base: &str, cmd: &str, idle: u64, timeout: u64, json: bool, no_cache: bool) -> i32 {
+    let Some(root) = super::tree::toplevel(start) else {
+        eprintln!("sem check --at base: not in a git repository");
+        return 2;
+    };
+    let Some(rev) = super::tree::rev(&root, base) else {
+        eprintln!("sem check --at base: {base} is not a revision");
+        return 2;
+    };
+    let git = |args: &[&str], dir: &Path| Command::new("git").args(args).current_dir(dir).stdin(Stdio::null()).output();
+    let common = match git(&["rev-parse", "--path-format=absolute", "--git-common-dir"], &root) {
+        Ok(o) if o.status.success() => std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()),
+        _ => root.join(".git"),
+    };
+    let short = &rev.commit[..rev.commit.len().min(12)];
+    let dir = common.join("sem-base").join(short);
+    if !dir.join(".git").exists() {
+        let _ = std::fs::create_dir_all(dir.parent().unwrap_or(&dir));
+        match git(&["worktree", "add", "--detach", "--force", &dir.to_string_lossy(), &rev.commit], &root) {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                eprintln!("sem check --at base: {}", String::from_utf8_lossy(&o.stderr).trim());
+                return 2;
+            }
+            Err(e) => {
+                eprintln!("sem check --at base: {e}");
+                return 2;
+            }
+        }
+        warm(&root, &dir);
+    }
+    let cache = dir.join(".git-sem-run").join(format!("{}.txt", super::util::digest(&format!("{json}\0{cmd}"))));
+    let header = format!("at base {short} ({}):\n", dir.display());
+    if !no_cache {
+        if let Ok(saved) = std::fs::read_to_string(&cache) {
+            if let Some((code, text)) = saved.split_once('\n') {
+                print!("{header}{text}(cached: this command already ran on this base)\n");
+                return code.parse().unwrap_or(1);
+            }
+        }
+    }
+    let (code, text) = execute(&dir, cmd, idle, timeout, json);
+    print!("{header}{text}");
+    if code != 124 && !no_cache {
+        let _ = std::fs::create_dir_all(cache.parent().unwrap_or(&dir));
+        let _ = std::fs::write(&cache, format!("{code}\n{text}"));
+    }
+    code
+}
+
+/// Clone the working tree's build directories into the base checkout, so
+/// the first base build reuses what is already built.
+fn warm(root: &Path, dir: &Path) {
+    const BUILD: &[&str] = &["target", "build", "node_modules", ".gradle", "out", "dist", ".venv", "venv", "vendor", "bin", "obj"];
+    for name in BUILD {
+        let (from, to) = (root.join(name), dir.join(name));
+        if !from.is_dir() || to.exists() {
+            continue;
+        }
+        let ok = if cfg!(target_os = "macos") {
+            Command::new("cp").arg("-c").arg("-R").arg(&from).arg(&to).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+        } else {
+            Command::new("cp").args(["--reflink=auto", "-a"]).arg(&from).arg(&to).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+        };
+        if !ok {
+            let _ = std::fs::remove_dir_all(&to);
+        }
+    }
+}
+
+/// Run `cmd` under the watchdog: (exit code, the answer to print).
+fn execute(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -> (i32, String) {
+    use std::fmt::Write;
     let start = Instant::now();
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd).current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -34,10 +118,7 @@ pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -
     }
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("sem check --run: {e}");
-            return 2;
-        }
+        Err(e) => return (2, format!("sem check --run: {e}\n")),
     };
     let (tx, rx) = mpsc::channel::<String>();
     for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten() {
@@ -106,6 +187,7 @@ pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -
         (None, 0) => "pass".to_string(),
         (None, c) => format!("fail (exit {c})"),
     };
+    let mut text = String::new();
     if json {
         let out = serde_json::json!({
             "command": cmd,
@@ -117,25 +199,25 @@ pub(crate) fn run(root: &Path, cmd: &str, idle: u64, timeout: u64, json: bool) -
             "tail": tail,
             "note": stopped,
         });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        let _ = writeln!(text, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     } else {
         if !early.is_empty() {
-            println!("── what went wrong ({} of {} lines):", early.len(), lines);
+            let _ = writeln!(text, "── what went wrong ({} of {} lines):", early.len(), lines);
             for l in &early {
-                println!("{l}");
+                let _ = writeln!(text, "{l}");
             }
-            println!();
+            text.push('\n');
         }
         if !tail.is_empty() {
-            println!("── last {} lines:", tail.len());
+            let _ = writeln!(text, "── last {} lines:", tail.len());
             for l in &tail {
-                println!("{l}");
+                let _ = writeln!(text, "{l}");
             }
-            println!();
+            text.push('\n');
         }
-        println!("{verdict} · {secs:.1}s · {lines} lines of output");
+        let _ = writeln!(text, "{verdict} · {secs:.1}s · {lines} lines of output");
     }
-    code
+    (code, text)
 }
 
 fn kill_group(child: &mut std::process::Child) {
