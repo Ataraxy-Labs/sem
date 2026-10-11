@@ -205,6 +205,16 @@ pub struct FindParams {
         description = "When you don't know the name: a free-text description (e.g. \"where retries are scheduled\"), ranked by name/signature relevance and graph centrality. `limit` caps the results (default 10)."
     )]
     pub intent: Option<String>,
+    #[schemars(
+        description = "Mode \"context\" with no query: read these whole files (any text file, code or not) in one call, with line numbers. `in` alone reads one file the same way."
+    )]
+    pub files: Option<Vec<String>>,
+    #[schemars(description = "Reading files: only these lines, e.g. \"40-120\" or \"300-\".")]
+    pub lines: Option<String>,
+    #[schemars(
+        description = "Reading files: resend a file even when this session already read it unchanged (by default a repeat read answers in one line, and a changed file answers with what changed)."
+    )]
+    pub fresh: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }

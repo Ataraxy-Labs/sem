@@ -6,6 +6,10 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- **`sem_find` reads whole files, so an agent never needs Read, `cat` or `sed` to look at code or config.** With mode `context` and no query, it reads `files: [...]` (or the file in `in`) in one call, in parallel, numbered like `cat -n`, with an optional `lines` range. A file the session already read answers in one line when it is unchanged, and with a line diff against the version the agent saw when it changed; `fresh: true` resends it whole.
+
+### Added
+
 - **`sem check` covers every major language.** New checkers for Python (pyright or mypy), pytest, C and C++ (every unit in `compile_commands.json`), Gradle or Maven, dotnet and SwiftPM join TypeScript, lint, JS tests, Go and Cargo. Each still gives the verdict the full tool would.
   - **Python** rechecks only the files whose imports can reach a change and carries every other file's errors from the base, so a project that already has errors still checks incrementally. On rich (213 files), an edit inside a widely imported annotated function rechecks 1 file in 0.9s instead of 3.5s, with the same 336 diagnostics as the full run.
   - **pytest** reruns only the test files that can load a changed file and carries the rest, failures included.

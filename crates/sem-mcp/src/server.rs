@@ -2543,7 +2543,7 @@ impl SemServer {
     // ── Find ──
 
     #[tool(
-        description = "Where is it? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
+        description = "Where is it, and what does it say? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file; with no query, mode \"context\" reads whole files instead (`files` = [...] or `in`, optional `lines`), numbered, any text file, and a re-read answers with only what changed. Use it instead of Read, cat or sed for every read. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
     )]
     async fn sem_find(
         &self,
@@ -2577,6 +2577,16 @@ impl SemServer {
                     args.push("--json".to_string());
                 }
                 return Ok(run_sem(&ctx.repo_root, args, no_verdict).await);
+            }
+            Some("context") if query.is_none() && queries.is_none() => {
+                let mut paths: Vec<String> = params.files.clone().unwrap_or_default();
+                if let Some(p) = params.file() {
+                    paths.insert(0, p.to_string());
+                }
+                if paths.is_empty() {
+                    return Ok(tool_error("mode \"context\" needs a query (an entity), or files / in (files to read)"));
+                }
+                return Ok(self.read_files(paths, params.lines.clone(), params.fresh.unwrap_or(false)).await);
             }
             Some("context") => {
                 return self
@@ -2624,6 +2634,86 @@ impl SemServer {
                 .await;
         }
         self.find_definitions(params).await
+    }
+
+    /// Whole files (or a line range of each), numbered like `cat -n`. A file
+    /// this session already read is answered in one line when unchanged, and
+    /// with a line diff against the version it saw when changed, unless
+    /// `fresh`. Files are read in parallel.
+    async fn read_files(&self, paths: Vec<String>, lines: Option<String>, fresh: bool) -> CallToolResult {
+        let ctx = match self.get_context(paths.first().map(String::as_str)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return tool_error(err),
+        };
+        let range = match lines.as_deref().map(parse_line_range).transpose() {
+            Ok(r) => r,
+            Err(e) => return tool_error(e),
+        };
+        let root = ctx.repo_root.clone();
+        let read: Vec<(String, Result<String, String>)> = tokio::task::spawn_blocking(move || {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = paths
+                    .iter()
+                    .map(|p| {
+                        let root = &root;
+                        scope.spawn(move || {
+                            let (rel, abs) = Self::resolve_file_path(root, p);
+                            let text = match std::fs::read(&abs) {
+                                Ok(b) if b.contains(&0) => Err(format!("binary file, {} bytes", b.len())),
+                                Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+                                Err(e) if abs.is_dir() => Err(format!("a directory ({e}); list it with `in` and no mode")),
+                                Err(e) => Err(e.to_string()),
+                            };
+                            (rel, text)
+                        })
+                    })
+                    .collect();
+                jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+            })
+        })
+        .await
+        .unwrap_or_default();
+
+        let mut out = String::new();
+        let mut ledger = self.fill_ledger.lock().await;
+        for (rel, text) in read {
+            let text = match text {
+                Ok(t) => t,
+                Err(e) => {
+                    out.push_str(&format!("── {rel}: {e}\n\n"));
+                    continue;
+                }
+            };
+            let total = text.lines().count();
+            let (from, to) = range.map(|(a, b)| (a.max(1), b.unwrap_or(total).min(total))).unwrap_or((1, total));
+            let slice: String = text.lines().skip(from.saturating_sub(1)).take(to.saturating_sub(from) + 1).map(|l| format!("{l}\n")).collect();
+            let receipt = format!("r:{:08x}", fnv1a_hash(&slice) as u32);
+            let key = format!("file\0{rel}\0{}", lines.as_deref().unwrap_or("all"));
+            let span = if (from, to) == (1, total) { format!("{total} lines") } else { format!("lines {from}-{to} of {total}") };
+            match ledger.get(&key) {
+                Some(prev) if !fresh && prev.fingerprint == receipt => {
+                    out.push_str(&format!("── {rel} · {span} · {receipt} · unchanged since you read it (fresh: true resends it)\n\n"));
+                    continue;
+                }
+                Some(prev) if !fresh => {
+                    let diff = similar::TextDiff::from_lines(prev.content.as_str(), slice.as_str());
+                    let udiff = diff.unified_diff().context_radius(2).header("as you read it", "now").to_string();
+                    if udiff.len() < slice.len() / 2 {
+                        out.push_str(&format!("── {rel} · {span} · {receipt} · changed since you read it ({}):\n{udiff}\n", prev.fingerprint));
+                        ledger.put(key, LedgerFill { fingerprint: receipt, content: slice });
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            out.push_str(&format!("── {rel} · {span} · {receipt}\n"));
+            for (i, l) in slice.lines().enumerate() {
+                out.push_str(&format!("{:>6}\t{l}\n", from + i));
+            }
+            out.push('\n');
+            ledger.put(key, LedgerFill { fingerprint: receipt, content: slice });
+        }
+        CallToolResult::success(vec![Content::text(out.trim_end().to_string())])
     }
 
     /// Definitions by exact name: `sem_find` with no mode.
@@ -3322,6 +3412,21 @@ async fn list_open_branches_impl(
 struct LedgerFill {
     fingerprint: String,
     content: String,
+}
+
+/// "40-120", "300-" or "7" as 1-based inclusive (from, to).
+fn parse_line_range(s: &str) -> Result<(usize, Option<usize>), String> {
+    let bad = || format!("lines {s:?}: use a range like \"40-120\" or \"300-\"");
+    let s = s.trim();
+    match s.split_once('-') {
+        Some((a, b)) => {
+            let a: usize = a.trim().parse().map_err(|_| bad())?;
+            let b = b.trim();
+            let b = if b.is_empty() { None } else { Some(b.parse::<usize>().map_err(|_| bad())?) };
+            Ok((a, b))
+        }
+        None => s.parse::<usize>().map(|n| (n, Some(n))).map_err(|_| bad()),
+    }
 }
 
 fn fnv1a_hash(s: &str) -> u64 {
