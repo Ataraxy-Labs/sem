@@ -2991,7 +2991,7 @@ impl SemServer {
     }
 
     #[tool(
-        description = "Is my change correct? Runs the project's compiler, type checker, linter and tests (only what the change can affect, when that gives the same answer) and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). checkers narrows them (ts, lint, tests, python, pytest, go, cargo, jvm, dotnet, swift, cpp, cmd); promises=true also proves every promise in .sem/promises can fail."
+        description = "Is my change correct? run: \"<build or test command>\" runs that command and waits for it (use it for every build and test: it stops a hung command, returns only the lines that matter, and answers a rerun on an unchanged tree at once). Without run: runs the project's compiler, type checker, linter and tests (only what the change can affect, when that gives the same answer) and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). checkers narrows them (ts, lint, tests, python, pytest, go, cargo, jvm, dotnet, swift, cpp, cmd); promises=true also proves every promise in .sem/promises can fail."
     )]
     async fn sem_check(
         &self,
@@ -3001,6 +3001,16 @@ impl SemServer {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
+        if let Some(cmd) = params.run.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            let mut args = vec!["check".to_string(), "--run".to_string(), cmd.to_string()];
+            if params.at_base.unwrap_or(false) {
+                args.extend(["--at".to_string(), "base".to_string()]);
+                if let Some(base) = params.base {
+                    args.extend(["--base".to_string(), base]);
+                }
+            }
+            return Ok(run_sem(&ctx.repo_root, args, check_verdict).await);
+        }
         let mut args = vec!["check".to_string(), "--json".to_string()];
         if let Some(base) = params.base {
             args.extend(["--base".to_string(), base]);

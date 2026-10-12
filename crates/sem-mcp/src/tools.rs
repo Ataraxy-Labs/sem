@@ -452,6 +452,10 @@ pub struct CheckParams {
     pub checkers: Option<Vec<String>>,
     #[schemars(description = "Prove every promise in .sem/promises can fail (apply its mutation, expect it broken).")]
     pub promises: Option<bool>,
+    #[schemars(description = "Run this one build or test command instead of the checkers, e.g. \"pytest -q tests/x.py\". Waits for it to finish (no polling), stops it if it hangs, returns the lines that say what went wrong plus the end of the output, and answers a rerun on an unchanged tree at once.")]
+    pub run: Option<String>,
+    #[schemars(description = "With run: run it on the base revision (in a side checkout with a warm build) to see whether a failure predates the change.")]
+    pub at_base: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

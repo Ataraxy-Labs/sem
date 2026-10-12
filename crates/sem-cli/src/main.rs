@@ -759,7 +759,8 @@ enum Commands {
     /// Internal plumbing for agent-harness hooks (hidden)
     #[command(hide = true)]
     Hook {
-        /// Hook kind, e.g. prompt-submit
+        /// Hook kind: prompt-submit, or tool (pre-tool routing of reads, searches,
+        /// edits and builds through sem and weave)
         kind: String,
     },
     /// Show evolution of an entity through git history, or, with no entity,
@@ -1833,8 +1834,11 @@ fn sem_main() {
             ConfigCmd::Stats => commands::stats::run(),
         },
         Some(Commands::Hook { kind }) => {
-            if kind == "prompt-submit" {
-                commands::hook::prompt_submit();
+            match kind.as_str() {
+                "prompt-submit" => commands::hook::prompt_submit(),
+                // the sem+weave workflow as a pre-tool hook (Claude Code, Codex, pi)
+                "tool" => commands::tool_hook::tool(),
+                _ => {}
             }
         }
         Some(Commands::Log {

@@ -22,6 +22,7 @@ pub mod promises;
 pub mod qualified;
 pub mod query;
 pub mod read;
+pub mod tool_hook;
 pub(crate) mod region;
 pub mod repos;
 pub(crate) mod review;
