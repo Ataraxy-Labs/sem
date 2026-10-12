@@ -104,9 +104,11 @@ fn run_dir(cwd: &Path) -> Option<PathBuf> {
 /// On a session's first tool call, start the project's build in the
 /// background (compile everything, compile the tests without running them),
 /// so the cold build overlaps the agent's reading instead of its first test
-/// run. Once per session; `SEM_PREWARM=0` turns it off.
+/// run. Once per session, and only with `SEM_PREWARM=1`.
 fn prewarm_once(ctx: &Ctx) {
-    if std::env::var("SEM_PREWARM").is_ok_and(|v| v == "0") || ctx.session.is_empty() {
+    // opt-in: a background build sharing a constrained machine (or a
+    // container) with the agent can hold build locks and slow its own runs
+    if !std::env::var("SEM_PREWARM").is_ok_and(|v| v == "1") || ctx.session.is_empty() {
         return;
     }
     let Some(dir) = run_dir(&ctx.cwd).map(|d| d.join("prewarm")) else { return };
