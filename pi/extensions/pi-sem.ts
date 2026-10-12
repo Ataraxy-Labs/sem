@@ -1,5 +1,6 @@
 import { createBashToolDefinition, createWriteToolDefinition, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
 import { loadConfig } from "../src/config/load.ts";
 import { FAIL_CLOSED_CONFIG } from "../src/config/default.ts";
@@ -364,6 +365,13 @@ export default function piSemExtension(pi: ExtensionAPI) {
           });
         }
         if (decision.refuse) throw new Error(decision.refusalMessage ?? "pi-sem: bash command refused by policy.");
+        // The sem+weave router every harness shares (`sem hook tool`, the same
+        // input Claude Code and Codex hooks send): shell reads become sem
+        // reads, searches sem grep, literal edits weave edits, builds and
+        // tests run under sem's watchdog; other shell writes are refused.
+        const hook = routeThroughSem(params.command, ctx.cwd, sessionId);
+        if (hook?.deny) throw new Error(hook.deny);
+        if (hook?.command) params = { ...params, command: hook.command };
         return realBash.execute(toolCallId, params, signal, onUpdate, execCtx);
       },
       // renderCall/renderResult deliberately omitted: with both absent, a tool
@@ -511,4 +519,28 @@ export default function piSemExtension(pi: ExtensionAPI) {
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
+}
+
+/** One id per pi process, so sem remembers reads within this session only. */
+const sessionId = `pi-${process.pid}-${Date.now()}`;
+
+/**
+ * Ask `sem hook tool` what to do with a bash command (PI_SEM_HOOK=0 turns it
+ * off; SEM_BIN picks the binary). Any failure leaves the command untouched:
+ * the router must never break a tool call.
+ */
+function routeThroughSem(command: string, cwd: string, session: string): { deny?: string; command?: string } | undefined {
+  if (process.env.PI_SEM_HOOK === "0") return undefined;
+  const sem = process.env.SEM_BIN || "sem";
+  const input = JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, cwd, session_id: session });
+  const r = spawnSync(sem, ["hook", "tool"], { input, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0 || !r.stdout?.trim()) return undefined;
+  try {
+    const out = JSON.parse(r.stdout).hookSpecificOutput ?? {};
+    if (out.permissionDecision === "deny") return { deny: String(out.permissionDecisionReason ?? "refused by sem") };
+    const next = out.updatedInput?.command;
+    return typeof next === "string" && next !== command ? { command: next } : undefined;
+  } catch {
+    return undefined;
+  }
 }
