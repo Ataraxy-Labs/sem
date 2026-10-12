@@ -160,7 +160,11 @@ fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cac
         }
     }
     let _ = std::fs::write(&lock, std::process::id().to_string());
-    let raw = execute(start, &core, idle, timeout);
+    let (run_core, narrowed) = match narrow_pytest(&root, start, &core) {
+        Some((c, n)) => (c, Some(n)),
+        None => (core.clone(), None),
+    };
+    let raw = execute(start, &run_core, idle, timeout);
     // remember it only if the tree did not change while it ran, and it ended
     let same = super::tree::head(&root).ok().is_some_and(|h| h.tree == tree);
     if same && raw.stopped.is_none() {
@@ -169,7 +173,113 @@ fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cac
         }
     }
     let _ = std::fs::remove_file(&lock);
-    render(&raw, cmd, filters.as_deref(), json, None)
+    render(&raw, cmd, filters.as_deref(), json, narrowed.as_deref())
+}
+
+/// A pytest run over directories, narrowed to the test files that can load
+/// what changed (the import closure sem's pytest checker uses: any name a
+/// file mentions, so it over-approximates every real import). Returns the
+/// command to run instead and a note saying so. None, and the command runs
+/// as asked, when anything other than Python source changed (a conftest,
+/// config, data), when the agent named specific tests, when the narrowing
+/// would keep (nearly) everything, or when it cannot be worked out.
+fn narrow_pytest(root: &Path, start: &Path, core: &str) -> Option<(String, String)> {
+    if std::env::var("SEM_RUN_NO_NARROW").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?:\bpython3?\s+-m\s+)?\bpytest\b").unwrap());
+    let m = RE.find(core)?;
+    let rest = &core[m.end()..];
+    let mut stop = rest.find(['|', ';', '&', '\'', '"', '\n', '>']).unwrap_or(rest.len());
+    // `2>&1` and `1>/dev/null`: the descriptor digit belongs to the redirection
+    if rest[stop..].starts_with('>') && rest[..stop].ends_with(|c: char| c.is_ascii_digit()) {
+        stop -= 1;
+    }
+    let region = &rest[..stop];
+    const VALUE: &[&str] = &["-k", "-m", "-p", "-c", "-o", "-W", "-n", "--rootdir", "--deselect", "--ignore", "--ignore-glob", "--maxfail", "--tb", "--durations", "--junitxml", "--basetemp", "--cov", "--cov-report", "--log-level", "--timeout"];
+    let toks: Vec<&str> = region.split_whitespace().collect();
+    let (mut opts, mut paths) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if VALUE.contains(&t) && i + 1 < toks.len() {
+            opts.push(t);
+            opts.push(toks[i + 1]);
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            opts.push(t);
+        } else {
+            paths.push(t);
+        }
+        i += 1;
+    }
+    if paths.is_empty() || paths.iter().any(|p| p.contains("::") || p.contains(['*', '?', '$'])) {
+        return None;
+    }
+    let out = Command::new("git").args(["status", "--porcelain=v1", "--untracked-files=all", "--no-renames"]).current_dir(root).output().ok()?;
+    let status = String::from_utf8_lossy(&out.stdout).into_owned();
+    let changed: Vec<(char, String)> = status
+        .lines()
+        .filter_map(|l| Some((if l.starts_with("??") { 'A' } else { 'M' }, l.get(3..)?.trim_matches('"').to_string())))
+        .collect();
+    if changed.is_empty() || changed.iter().any(|(_, p)| !(p.ends_with(".py") || p.ends_with(".pyi")) || p.ends_with("conftest.py")) {
+        return None;
+    }
+    let mut files = super::tree::files(root, "HEAD").ok()?;
+    files.extend(changed.iter().filter(|(c, _)| *c == 'A').map(|(_, p)| p.clone()));
+    let here = start.strip_prefix(root).ok()?.to_path_buf();
+    let norm = |p: &str| -> String {
+        let mut parts: Vec<String> = here.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        for c in Path::new(p).components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    parts.pop();
+                }
+                std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+                _ => {}
+            }
+        }
+        parts.join("/")
+    };
+    let roots: Vec<String> = paths.iter().map(|p| norm(p)).collect();
+    let is_test = |f: &str| {
+        let leaf = f.rsplit('/').next().unwrap_or(f);
+        leaf.ends_with(".py") && (leaf.starts_with("test_") || leaf.ends_with("_test.py"))
+    };
+    let candidates: Vec<&String> = files.iter().filter(|f| is_test(f) && roots.iter().any(|r| *f == r || f.starts_with(&format!("{r}/")) || r.is_empty())).collect();
+    if candidates.len() < 4 {
+        return None;
+    }
+    let py: Vec<String> = files.iter().filter(|f| f.ends_with(".py") || f.ends_with(".pyi")).cloned().collect();
+    let reach = super::deps::closure(root, &py, &changed, &super::deps::PYTHON_RUNTIME);
+    let selected: Vec<&String> = candidates.iter().copied().filter(|f| reach.contains(*f)).collect();
+    if std::env::var("SEM_RUN_DEBUG").is_ok() {
+        eprintln!("narrow: {} of {} test files can load the change", selected.len(), candidates.len());
+    }
+    if selected.is_empty() || selected.len() * 10 > candidates.len() * 9 {
+        return None;
+    }
+    // back to paths relative to where the command runs
+    let prefix = here.to_string_lossy().into_owned();
+    let rel = |f: &str| -> String {
+        if prefix.is_empty() {
+            f.to_string()
+        } else {
+            f.strip_prefix(&format!("{prefix}/")).map(String::from).unwrap_or_else(|| f.to_string())
+        }
+    };
+    let mut region_new: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
+    region_new.extend(selected.iter().map(|f| rel(f)));
+    let new = format!("{} {}{}", &core[..m.end()], region_new.join(" "), if stop < rest.len() { format!(" {}", rest[stop..].trim_start()) } else { String::new() });
+    let note = format!(
+        "(sem ran {} of the {} test files under {}: the others cannot load what changed. SEM_RUN_NO_NARROW=1 runs them all)",
+        selected.len(),
+        candidates.len(),
+        paths.join(" ")
+    );
+    Some((new, note))
 }
 
 /// When `cmd` builds a whole multi-module project but only some modules
