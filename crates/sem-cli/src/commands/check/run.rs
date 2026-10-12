@@ -597,6 +597,41 @@ fn kill_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// The build commands that warm each language found at the repository root,
+/// run one after another through `$SEM_EXEC_PREFIX` when it is set. Output
+/// is discarded: this only fills caches.
+pub(crate) fn prewarm(start: &Path) -> i32 {
+    let Some(root) = super::tree::toplevel(start) else { return 0 };
+    let has = |f: &str| root.join(f).exists();
+    let mut cmds: Vec<&str> = Vec::new();
+    if has("go.mod") {
+        cmds.push("go build ./... && go vet ./... ; go test -count=1 -run '^$' ./...");
+    }
+    if has("Cargo.toml") {
+        cmds.push("cargo test --no-run --offline -q || cargo test --no-run -q");
+    }
+    if has("tsconfig.json") && has("node_modules") {
+        cmds.push("npx --no-install tsc --noEmit -p .");
+    }
+    if has("pyproject.toml") || has("setup.py") || has("setup.cfg") || has("pytest.ini") {
+        cmds.push("python -m pytest --collect-only -q -p no:cacheprovider");
+    }
+    if has("pom.xml") {
+        cmds.push("mvn -o -q -DskipTests test-compile");
+    } else if has("gradlew") {
+        cmds.push("./gradlew --offline -q testClasses");
+    }
+    let prefix = std::env::var("SEM_EXEC_PREFIX").ok().filter(|p| !p.trim().is_empty());
+    for c in cmds {
+        let line = match &prefix {
+            Some(p) => format!("{p} '{}'", c.replace('\'', "'\\''")),
+            None => c.to_string(),
+        };
+        let _ = Command::new("sh").arg("-c").arg(&line).current_dir(&root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::split_filters;

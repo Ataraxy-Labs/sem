@@ -92,6 +92,12 @@ pub struct CheckArgs {
     /// Example: sem check --run 'cargo test -p core' --at base
     #[arg(long, value_name = "base|head", requires = "run")]
     pub at: Option<String>,
+    /// Warm the project's build: compile everything and compile the tests
+    /// without running them (go, cargo, tsc, pytest --collect-only, maven or
+    /// gradle), through $SEM_EXEC_PREFIX when commands run elsewhere (a
+    /// container). Started in the background by `sem hook tool`.
+    #[arg(long, hide = true)]
+    pub prewarm: bool,
     /// With --run: print nothing (a speculative run started by an edit)
     #[arg(long, hide = true, requires = "run")]
     pub quiet: bool,
@@ -326,6 +332,9 @@ pub fn run(args: CheckArgs) -> i32 {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if args.prewarm {
+        return run::prewarm(&start);
+    }
     if let Some(cmd) = args.run.as_deref() {
         return match args.at.as_deref() {
             None | Some("head") => run::run(&start, cmd, args.idle, args.timeout, args.json, args.no_cache, args.quiet),

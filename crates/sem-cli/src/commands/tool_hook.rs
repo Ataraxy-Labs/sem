@@ -47,6 +47,7 @@ pub fn tool() {
         codex: event["transcript_path"].as_str().is_some_and(|p| p.contains("/.codex/")) || event["turn_id"].is_string(),
         cwd,
     };
+    prewarm_once(&ctx);
     let name = event["tool_name"].as_str().unwrap_or("");
     let input = &event["tool_input"];
     let out = match name {
@@ -98,6 +99,25 @@ impl Ctx {
 fn run_dir(cwd: &Path) -> Option<PathBuf> {
     let o = std::process::Command::new("git").args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).current_dir(cwd).output().ok()?;
     o.status.success().then(|| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("sem-run"))
+}
+
+/// On a session's first tool call, start the project's build in the
+/// background (compile everything, compile the tests without running them),
+/// so the cold build overlaps the agent's reading instead of its first test
+/// run. Once per session; `SEM_PREWARM=0` turns it off.
+fn prewarm_once(ctx: &Ctx) {
+    if std::env::var("SEM_PREWARM").is_ok_and(|v| v == "0") || ctx.session.is_empty() {
+        return;
+    }
+    let Some(dir) = run_dir(&ctx.cwd).map(|d| d.join("prewarm")) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let marker = dir.join(ctx.session.replace(['/', '\\'], "_"));
+    if std::fs::OpenOptions::new().write(true).create_new(true).open(&marker).is_err() {
+        return; // already started for this session
+    }
+    let quoted = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let line = format!("{} check --prewarm >/dev/null 2>&1 &", quoted(&ctx.sem));
+    let _ = std::process::Command::new("sh").arg("-c").arg(line).current_dir(&ctx.cwd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 }
 
 fn allow(input: &Value, command: String) -> Value {
