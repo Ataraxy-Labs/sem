@@ -484,13 +484,9 @@ fn bash(ctx: &Ctx, input: &Value) -> Option<Value> {
     }
     if heavy(cmd) && !cmd.contains("check --run") && !input["run_in_background"].as_bool().unwrap_or(false) {
         ctx.log("check", true, cmd);
-        if ctx.codex {
-            // Codex's shell returns before a long command ends and polls it a
-            // turn at a time; the sem_check tool waits for the result instead
-            return Some(deny(format!(
-                "Run builds and tests with the sem_check tool, which waits for the result: sem_check(run: {cmd:?}). It stops a hung command, returns the lines that matter, and answers a rerun on an unchanged tree at once."
-            )));
-        }
+        // run in the agent's own shell, where its environment is (an MCP server
+        // is started with a stripped environment: virtualenvs, project
+        // variables and PATH additions would be missing there)
         let idle = if Regex::new(r"\s(-q|--quiet|-qq)\b").unwrap().is_match(cmd) { 0 } else { 300 };
         return Some(allow(input, format!("{} check --run {} --idle {idle}", quote(&ctx.sem), quote(cmd))));
     }
