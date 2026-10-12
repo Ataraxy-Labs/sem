@@ -160,6 +160,9 @@ fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cac
         }
     }
     let _ = std::fs::write(&lock, std::process::id().to_string());
+    if !quiet {
+        stop_prewarm(&root);
+    }
     let (run_core, narrowed) = match narrow_pytest(&root, start, &core) {
         Some((c, n)) => (c, Some(n)),
         None => (core.clone(), None),
@@ -622,14 +625,46 @@ pub(crate) fn prewarm(start: &Path) -> i32 {
         cmds.push("./gradlew --offline -q testClasses");
     }
     let prefix = std::env::var("SEM_EXEC_PREFIX").ok().filter(|p| !p.trim().is_empty());
+    // lowest priority, and recorded, so the agent's own first build can stop
+    // it: a background build must never compete with the agent's (or show up
+    // as a stray process it goes looking into)
+    let pid_file = run_dir(&root).map(|d| d.join("prewarm").join("active.pid"));
     for c in cmds {
+        let inner = format!("nice -n 19 sh -c '{}'", c.replace('\'', "'\\''"));
         let line = match &prefix {
-            Some(p) => format!("{p} '{}'", c.replace('\'', "'\\''")),
-            None => c.to_string(),
+            Some(p) => format!("{p} '{}'", inner.replace('\'', "'\\''")),
+            None => inner,
         };
-        let _ = Command::new("sh").arg("-c").arg(&line).current_dir(&root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let mut cmd = Command::new("nice");
+        cmd.args(["-n", "19", "sh", "-c", &line]).current_dir(&root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let Ok(mut child) = cmd.spawn() else { continue };
+        if let Some(f) = &pid_file {
+            let _ = std::fs::write(f, child.id().to_string());
+        }
+        let _ = child.wait();
+        if pid_file.as_ref().is_some_and(|f| !f.exists()) {
+            break; // stopped by the agent's own build
+        }
+    }
+    if let Some(f) = &pid_file {
+        let _ = std::fs::remove_file(f);
     }
     0
+}
+
+/// Stop a running prewarm (the agent is starting its own build or test).
+fn stop_prewarm(root: &Path) {
+    let Some(f) = run_dir(root).map(|d| d.join("prewarm").join("active.pid")) else { return };
+    let Ok(pid) = std::fs::read_to_string(&f) else { return };
+    let _ = std::fs::remove_file(&f);
+    let pid = pid.trim();
+    let quiet = |sig: &str| Command::new("kill").args([sig, &format!("-{pid}")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = quiet("-TERM");
 }
 
 #[cfg(test)]
