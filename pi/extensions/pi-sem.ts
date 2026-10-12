@@ -49,6 +49,12 @@ const CODE_MODE = process.env.PI_SEM_MODE === "code" || process.env.PI_SEM_PURE 
 // script.  The only active tools are those explicitly allowlisted from the
 // transaction server (normally sem_plan + weave_transaction).
 const TRANSACTION_MODE = process.env.PI_SEM_MODE === "transaction";
+// Standard mode is the sem+weave standard every harness shares (Claude Code
+// and Codex get the same): only the configured MCP servers' allowlisted
+// tools (sem_find, sem_grep, sem_impact, sem_check, weave_edit), no native
+// pi-sem tools, plus the builtins the config keeps (bash, routed through
+// `sem hook tool` below).
+const STANDARD_MODE = process.env.PI_SEM_MODE === "standard";
 // Pure codespace is code mode's DEFAULT identity: no active builtins at
 // all, [sem_code] is the entire tool set. The agent lives in the code
 // space with one tool: ask (blast/why/where/explain), act
@@ -187,7 +193,7 @@ export async function startServersAndRegisterTools(
     // the tool surface (activeBuiltins above) and sem.write's behavior can
     // never disagree about which mode this session is in.
     registerSemCode(pi, { pure: PURE_MODE, weaveMcpCommand: weaveServer?.command, weaveMcpArgs: weaveServer?.args, onWriteAudit: onCodeModeWriteAudit });
-  } else if (!TRANSACTION_MODE) {
+  } else if (!TRANSACTION_MODE && !STANDARD_MODE) {
     registerWeaveEdit(pi, {
       weaveMcpCommand: weaveServer?.command,
       weaveMcpArgs: weaveServer?.args,
@@ -209,7 +215,7 @@ export async function startServersAndRegisterTools(
     // [sem_code].
     PURE_MODE || TRANSACTION_MODE ? { ...config.sessionPolicy, activeBuiltins: [] } : config.sessionPolicy,
     statuses,
-    TRANSACTION_MODE
+    TRANSACTION_MODE || STANDARD_MODE
       ? []
       : CODE_MODE
       ? [SEM_CODE_TOOL_NAME]
@@ -522,7 +528,7 @@ export default function piSemExtension(pi: ExtensionAPI) {
 }
 
 /** One id per pi process, so sem remembers reads within this session only. */
-const sessionId = `pi-${process.pid}-${Date.now()}`;
+const sessionId = process.env.PI_SEM_SESSION_ID || `pi-${process.pid}-${Date.now()}`;
 
 /**
  * Ask `sem hook tool` what to do with a bash command (PI_SEM_HOOK=0 turns it
