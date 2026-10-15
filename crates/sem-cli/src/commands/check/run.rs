@@ -16,6 +16,10 @@
 //! such as one weave started speculatively right after an edit, is joined
 //! instead of started again. That is how test time overlaps the model's
 //! thinking: the run starts when the edit lands, not when the agent asks.
+//!
+//! A targeted pytest run has a second key: the content of everything it can
+//! load ([`closure_key`]). Another branch, or an edit to an unrelated file,
+//! changes the tree but not that, and the earlier verdict is reused.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -113,12 +117,121 @@ pub(crate) fn split_filters(cmd: &str) -> (String, Option<String>) {
 }
 
 /// One finished run of a core command: what is remembered per tree.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Raw {
     code: i32,
     stopped: Option<String>,
     secs: f64,
     lines: Vec<String>,
+}
+
+/// A run remembered by the code it reached rather than by the whole tree,
+/// with the tree it ran on, for saying where an answer came from.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Reached {
+    tree: String,
+    raw: Raw,
+}
+
+/// The second memo key: what one pytest run can load, as content.
+///
+/// The tree-id key misses whenever anything in the repository changes, an
+/// unrelated module, a README, another branch's work. But a test run can only
+/// be affected by what it loads: the test files it was given, every
+/// `conftest.py`, everything those can import, and any non-Python file
+/// (fixtures, configs, lockfiles: none of which sem can trace, so all of them
+/// count). If all of that is byte-for-byte what an earlier run of the same
+/// command saw, that run's verdict is this run's verdict.
+///
+/// Returns the key and how many files it covers, or `None` (so only the tree
+/// key applies) whenever the run's inputs are not fully known:
+/// - not a pytest command, or a whole-suite run (no paths given);
+/// - `--pyargs`, globs or shell expansions in its paths;
+/// - a config that sets `python_files`, which changes what is collected.
+///
+/// What is imported is over-approximated ([`super::deps::forward`] with every
+/// word a file mentions), so a file left out of the key cannot be loaded by
+/// the run through Python's import system. Not modeled: the environment
+/// (installed packages, interpreter, env vars), which the tree key ignores
+/// too.
+fn closure_key(root: &Path, start: &Path, rel: &str, core: &str, tree: &str) -> Option<(String, usize)> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?:\bpython3?\s+-m\s+)?\bpytest\b").unwrap());
+    let m = RE.find(core)?;
+    let rest = &core[m.end()..];
+    let region = &rest[..rest.find(['|', ';', '&', '\'', '"', '\n', '>', '<', '`']).unwrap_or(rest.len())];
+    const VALUE: &[&str] = &["-k", "-m", "-p", "-c", "-o", "-W", "-n", "--rootdir", "--deselect", "--ignore", "--ignore-glob", "--maxfail", "--tb", "--durations", "--junitxml", "--basetemp", "--cov", "--cov-report", "--log-level", "--timeout"];
+    let toks: Vec<&str> = region.split_whitespace().collect();
+    let mut args: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "--pyargs" || t.starts_with("--rootdir") || t == "-c" {
+            return None;
+        }
+        i += if VALUE.contains(&t) { 2 } else { 1 };
+        if !t.starts_with('-') && !VALUE.contains(&t) {
+            // trailing digit of a `2>&1`-style redirection is not a path
+            if !t.chars().all(|c| c.is_ascii_digit()) {
+                args.push(t.split("::").next().unwrap_or(t).to_string());
+            }
+        }
+    }
+    if args.is_empty() || args.iter().any(|a| a.contains(['*', '?', '$', '~', '{'])) {
+        return None;
+    }
+    for cfg in ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"] {
+        if std::fs::read_to_string(root.join(cfg)).is_ok_and(|t| t.contains("python_files")) {
+            return None;
+        }
+    }
+    // the working tree's content, path by path, from the tree id that keys it
+    let out = Command::new("git").args(["ls-tree", "-r", "-z", tree]).current_dir(root).stderr(Stdio::null()).output().ok()?;
+    let mut blobs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let e = String::from_utf8_lossy(entry);
+        let (meta, path) = e.split_once('\t')?;
+        let oid = meta.split_whitespace().nth(2)?;
+        // written by running the tests, never read as source
+        if path.contains("__pycache__/") || path.ends_with(".pyc") || path.contains(".pytest_cache/") {
+            continue;
+        }
+        blobs.insert(path.to_string(), oid.to_string());
+    }
+    let is_py = |p: &str| p.ends_with(".py") || p.ends_with(".pyi");
+    let py: Vec<String> = blobs.keys().filter(|p| is_py(p)).cloned().collect();
+    let here = start.strip_prefix(root).ok()?.to_path_buf();
+    let mut seeds: Vec<String> = Vec::new();
+    for a in &args {
+        let mut parts: Vec<String> = here.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        for c in Path::new(a).components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    parts.pop();
+                }
+                std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+                _ => {}
+            }
+        }
+        let p = parts.join("/");
+        let under: Vec<&String> = py.iter().filter(|f| **f == p || p.is_empty() || f.starts_with(&format!("{p}/"))).collect();
+        if under.is_empty() {
+            return None;
+        }
+        seeds.extend(under.into_iter().cloned());
+    }
+    seeds.extend(py.iter().filter(|f| f.rsplit('/').next() == Some("conftest.py")).cloned());
+    let reach = super::deps::forward(root, &py, &seeds, &super::deps::PYTHON_RUNTIME);
+    let mut body = String::new();
+    for (path, oid) in &blobs {
+        if !is_py(path) || reach.contains(path) {
+            body.push_str(path);
+            body.push(' ');
+            body.push_str(oid);
+            body.push('\n');
+        }
+    }
+    let files = reach.len() + blobs.keys().filter(|p| !is_py(p)).count();
+    Some((super::util::digest(&format!("closure\0{rel}\0{core}\0{body}")), files))
 }
 
 /// Answer from a finished run on this exact tree, join one in progress, or
@@ -167,12 +280,32 @@ fn memoized(start: &Path, cmd: &str, idle: u64, timeout: u64, json: bool, no_cac
         Some((c, n)) => (c, Some(n)),
         None => (core.clone(), None),
     };
+    // A different tree can still reach exactly the same code: answer from
+    // that run instead of repeating it.
+    let reach = closure_key(&root, start, &rel, &run_core, &tree);
+    let reached = reach.as_ref().map(|(k, _)| dir.join(format!("closure-{k}.json")));
+    if let (false, Some((_, files)), Some(saved)) = (no_cache, &reach, reached.as_ref().and_then(|p| std::fs::read_to_string(p).ok())) {
+        if let Ok(hit) = serde_json::from_str::<Reached>(&saved) {
+            let _ = std::fs::remove_file(&lock);
+            let note = format!(
+                "(reused: `{run_core}` reaches the same code ({files} files, byte for byte) as its run on tree {}; that run's verdict stands. --no-cache reruns it){}",
+                &hit.tree[..hit.tree.len().min(12)],
+                narrowed.as_deref().map(|n| format!("\n{n}")).unwrap_or_default()
+            );
+            return render(&hit.raw, cmd, filters.as_deref(), json, Some(&note));
+        }
+    }
     let raw = execute(start, &run_core, idle, timeout);
     // remember it only if the tree did not change while it ran, and it ended
     let same = super::tree::head(&root).ok().is_some_and(|h| h.tree == tree);
     if same && raw.stopped.is_none() {
         if let Ok(t) = serde_json::to_string(&raw) {
             let _ = std::fs::write(&done, t);
+        }
+        if let Some(p) = &reached {
+            if let Ok(t) = serde_json::to_string(&Reached { tree: tree.clone(), raw: raw.clone() }) {
+                let _ = std::fs::write(p, t);
+            }
         }
     }
     let _ = std::fs::remove_file(&lock);

@@ -78,6 +78,41 @@ pub(crate) fn closure_with_cutoff(root: &Path, files: &[String], changed: &[(cha
     out.into_iter().map(|i| files[i].clone()).collect()
 }
 
+/// The other direction: every file in `files` that `seeds` can load, the seeds
+/// included. A file joins when one of its names is mentioned by a file
+/// already in. With [`PYTHON_RUNTIME`] the mentions are every word a file
+/// holds, so this over-approximates what a run of the seeds can import: a file
+/// outside the result provably cannot affect it through Python imports. A file
+/// that cannot be read mentions `*`, and then every file is in.
+pub(crate) fn forward(root: &Path, files: &[String], seeds: &[String], lang: &Lang) -> BTreeSet<String> {
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        for n in (lang.names)(f) {
+            by_name.entry(n).or_default().push(i);
+        }
+    }
+    let pos: HashMap<&str, usize> = files.iter().enumerate().map(|(i, f)| (f.as_str(), i)).collect();
+    let mut out: BTreeSet<usize> = seeds.iter().filter_map(|s| pos.get(s.as_str()).copied()).collect();
+    let mut queue: Vec<usize> = out.iter().copied().collect();
+    while let Some(i) = queue.pop() {
+        let mentions = match std::fs::read(root.join(&files[i])) {
+            Ok(bytes) => (lang.mentions)(&files[i], &String::from_utf8_lossy(&bytes)),
+            Err(_) => [ANY.to_string()].into_iter().collect(),
+        };
+        if mentions.contains(ANY) {
+            return files.iter().cloned().collect();
+        }
+        for m in mentions {
+            for &j in by_name.get(&m).into_iter().flatten() {
+                if out.insert(j) {
+                    queue.push(j);
+                }
+            }
+        }
+    }
+    out.into_iter().map(|i| files[i].clone()).collect()
+}
+
 fn dirs(path: &str) -> impl Iterator<Item = String> + '_ {
     let mut parts: Vec<&str> = path.split('/').collect();
     parts.pop();
@@ -209,5 +244,24 @@ mod tests {
         let files: Vec<String> = ["pkg/__init__.py", "pkg/models.py", "app.py", "other.py"].iter().map(|s| s.to_string()).collect();
         let got = closure(d.path(), &files, &[('M', "pkg/models.py".to_string())], &PYTHON);
         assert_eq!(got, set(&["app.py", "pkg/__init__.py", "pkg/models.py"]));
+    }
+
+    #[test]
+    fn forward_is_what_a_run_can_load() {
+        let d = tempfile::tempdir().unwrap();
+        let w = |p: &str, t: &str| {
+            let f = d.path().join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, t).unwrap();
+        };
+        w("pkg/__init__.py", "");
+        w("pkg/models.py", "from pkg import helpers\n");
+        w("pkg/helpers.py", "X = 1\n");
+        w("pkg/billing.py", "X = 2\n");
+        w("tests/test_models.py", "from pkg.models import User\n");
+        let files: Vec<String> = ["pkg/__init__.py", "pkg/models.py", "pkg/helpers.py", "pkg/billing.py", "tests/test_models.py"].iter().map(|s| s.to_string()).collect();
+        let got = forward(d.path(), &files, &["tests/test_models.py".to_string()], &PYTHON_RUNTIME);
+        // transitive (models -> helpers) and the package's __init__, never billing
+        assert_eq!(got, set(&["pkg/__init__.py", "pkg/helpers.py", "pkg/models.py", "tests/test_models.py"]));
     }
 }
