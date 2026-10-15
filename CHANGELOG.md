@@ -14,8 +14,7 @@ All notable changes to sem are documented in this file.
 - **Every entity `sem_find` shows carries its version (`v:…`, a hash of its source).** Pass it to weave's `weave_edit` as `expect` and the edit is refused if someone changed that entity since the read, so agents working in parallel never overwrite each other's version of a function.
 - **`sem_grep` takes `in` (a directory, file or glob) and `bodies: true`**, which also returns each function, method or class around a hit, once, so one call finds and reads.
 - **`sem_find` reads whenever it is given `files` or `lines`, and context lookups accept a kind prefix (`method Text.count`).** Both used to cost agents a retry.
-
-### Added
+- Added an optional portable agent plugin with Sem code-navigation and diff-review skills plus Weave merge-preview guidance, without changing default tools or installing binaries.
 
 - **`sem check` covers every major language.** New checkers for Python (pyright or mypy), pytest, C and C++ (every unit in `compile_commands.json`), Gradle or Maven, dotnet and SwiftPM join TypeScript, lint, JS tests, Go and Cargo. Each still gives the verdict the full tool would.
   - **Python** rechecks only the files whose imports can reach a change and carries every other file's errors from the base, so a project that already has errors still checks incrementally. On rich (213 files), an edit inside a widely imported annotated function rechecks 1 file in 0.9s instead of 3.5s, with the same 336 diagnostics as the full run.

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "sem-weave",
+  "version": "0.1.0",
+  "description": "Local code discovery and change review with Sem; optional branch merge previews with Weave.",
+  "author": { "name": "Ataraxy Labs", "url": "https://ataraxy-labs.com" },
+  "repository": "https://github.com/Ataraxy-Labs/sem",
+  "license": "MIT",
+  "keywords": ["code-review", "git", "sem", "weave"]
+}
