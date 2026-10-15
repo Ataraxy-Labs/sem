@@ -2554,7 +2554,7 @@ impl SemServer {
     // ── Find ──
 
     #[tool(
-        description = "Where is it, and what does it say? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file; with no query, mode \"context\" reads whole files instead (`files` = [...] or `in`, optional `lines`), numbered, any text file, and a re-read answers with only what changed. Use it instead of Read, cat or sed for every read. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
+        description = "Where is it, and what does it say? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it. mode \"refs\": what it calls. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file; with no query, mode \"context\" reads whole files instead (`files` = [...] or `in`, optional `lines`), numbered, any text file; a re-read returns only what changed. Use it instead of Read, cat or sed. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
     )]
     async fn sem_find(
         &self,
