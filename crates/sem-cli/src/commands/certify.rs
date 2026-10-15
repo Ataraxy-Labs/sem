@@ -14,7 +14,9 @@
 //! - laws: kept, newly broken (with witness), or fixed, base vs head;
 //! - JS/TS: module edges added/removed and runtime reachability growth;
 //! - tests that statically reach a changed entity;
-//! - the static reference cone: what has no reference path to the change.
+//! - the static reference cone: what has no reference path to the change;
+//! - approvals: which `ENTITYOWNERS` owners must review which changed
+//!   entities (see [`super::owners`]), when the head tree keeps that file.
 //!
 //! Static only. Dynamic dispatch the resolver cannot pin, reflection,
 //! string-keyed lookups and non-code consumers are not modeled, and the
@@ -744,7 +746,9 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
             "modulesWithGrownReach": grown.len(), "newlyReachedTargets": witnesses, "changedModules": changed_modules });
     }
 
-    let cert = json!({
+    let owners_out = owners_section(&ht.dir.path().join("ENTITYOWNERS"), &changes, hg, &h_out);
+
+    let mut cert = json!({
         "base": base, "head": head,
         "summary": { "filesChanged": changed_files.len(), "entitiesChanged": diff.changes.len(),
             "added": diff.added_count, "modified": diff.modified_count, "deleted": diff.deleted_count,
@@ -764,7 +768,54 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
         "noTestReaches": affected_tests.is_empty(),
         "limits": "static reference graph only: calls the resolver cannot pin (dynamic dispatch, reflection, string-keyed lookup, callbacks registered at runtime) and non-code consumers are not modeled",
     });
+    // only when the repo keeps an ENTITYOWNERS file
+    if !owners_out.is_null() {
+        cert["owners"] = owners_out;
+    }
     Ok(cert)
+}
+
+/// The `owners` section: for each changed entity, the `ENTITYOWNERS` rules it
+/// falls under and the owners they require, plus the owner groups that must
+/// approve the change as a whole. `null` when the head tree has no
+/// `ENTITYOWNERS` file. See [`super::owners`] for the grammar.
+fn owners_section(path: &Path, changes: &[&SemanticChange], hg: &EntityGraph, h_out: &HashMap<&str, Vec<&str>>) -> Value {
+    let Ok(text) = std::fs::read_to_string(path) else { return Value::Null };
+    let (rules, warnings) = super::owners::parse(&text);
+    let parent_of = |e: &EntityInfo| e.parent_id.as_ref().and_then(|p| hg.entities.get(p.as_str())).map(|p| p.name.clone());
+    let mut required: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut per_entity: Vec<Value> = Vec::new();
+    for c in changes {
+        if c.entity_type == "orphan" || c.entity_type == "chunk" {
+            continue;
+        }
+        let mut hits: Vec<Value> = Vec::new();
+        for r in &rules {
+            let direct = r.matches(&c.entity_name, c.parent_name.as_deref(), &c.file_path)
+                || c.old_entity_name.as_deref().is_some_and(|n| r.matches(n, c.parent_name.as_deref(), c.old_file_path.as_deref().unwrap_or(&c.file_path)));
+            // `+callers`: the changed entity calls something the pattern names.
+            let via: Option<String> = if !direct && r.callers {
+                h_out.get(c.entity_id.as_str()).into_iter().flatten()
+                    .filter_map(|to| hg.entities.get(*to))
+                    .find(|t| r.matches(&t.name, parent_of(t).as_deref(), &t.file_path))
+                    .map(|t| t.name.clone())
+            } else {
+                None
+            };
+            if direct || via.is_some() {
+                for o in &r.owners {
+                    required.entry(o.clone()).or_default().insert(c.entity_name.clone());
+                }
+                hits.push(json!({ "rule": r.pattern, "line": r.line, "owners": r.owners, "calls": via }));
+            }
+        }
+        if !hits.is_empty() {
+            per_entity.push(json!({ "entity": c.entity_name, "type": c.entity_type, "file": c.file_path,
+                "change": kind_str(&c.change_type), "rules": hits }));
+        }
+    }
+    let approvals: Vec<Value> = required.iter().map(|(o, ents)| json!({ "owner": o, "entities": ents })).collect();
+    json!({ "rules": rules.len(), "warnings": warnings, "entities": per_entity, "approvalsRequired": approvals })
 }
 
 fn s(v: &Value) -> String {
@@ -795,6 +846,31 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
     o += &format!("{} files, {} entities changed ({} added, {} modified, {} deleted, {} renamed, {} moved).\n",
         sm["filesChanged"], sm["entitiesChanged"], sm["added"], sm["modified"], sm["deleted"], sm["renamed"], sm["moved"]);
     o += &format!("Limits: {}.\n", s(&c["limits"]));
+
+    // Approvals first: it decides who reviews, so it belongs above the facts.
+    if let Some(ow) = c.get("owners") {
+        o += "\n## Approvals required (ENTITYOWNERS)\n";
+        let need = arr(&ow["approvalsRequired"]);
+        if need.is_empty() {
+            o += &format!("none: no changed entity matches any of the {} rule(s)\n", ow["rules"]);
+        }
+        for a in &need {
+            let ents = arr(&a["entities"]);
+            o += &format!("- {}: {}{}\n", s(&a["owner"]), ents.iter().take(max).map(|e| format!("`{}`", s(e))).collect::<Vec<_>>().join(", "), more(ents.len()));
+        }
+        for e in arr(&ow["entities"]).iter().take(max * 2) {
+            for r in arr(&e["rules"]) {
+                let why = match r["calls"].as_str() {
+                    Some(t) => format!(" (calls `{t}`, +callers)"),
+                    None => String::new(),
+                };
+                o += &format!("    - `{}` {}: rule `{}` (line {}){}\n", s(&e["entity"]), s(&e["file"]), s(&r["rule"]), r["line"], why);
+            }
+        }
+        for w in arr(&ow["warnings"]) {
+            o += &format!("  warning: {}\n", s(&w));
+        }
+    }
 
     o += "\n## Entities changed\n";
     // Module-level fragments ("orphan" entities) are counted, not listed.

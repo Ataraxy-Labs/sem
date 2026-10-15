@@ -205,6 +205,16 @@ pub struct FindParams {
         description = "When you don't know the name: a free-text description (e.g. \"where retries are scheduled\"), ranked by name/signature relevance and graph centrality. `limit` caps the results (default 10)."
     )]
     pub intent: Option<String>,
+    #[schemars(
+        description = "Read these whole files (any text file, code or not) in one call, with line numbers; no mode needed. With mode \"context\" and no query, `in` reads one file the same way."
+    )]
+    pub files: Option<Vec<String>>,
+    #[schemars(description = "Reading files: only these lines, e.g. \"40-120\" or \"300-\".")]
+    pub lines: Option<String>,
+    #[schemars(
+        description = "Reading files: resend a file even when this session already read it unchanged (by default a repeat read answers in one line, and a changed file answers with what changed)."
+    )]
+    pub fresh: Option<bool>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }
@@ -240,6 +250,15 @@ pub struct GrepParams {
     pub patterns: Option<Vec<String>>,
     #[schemars(description = "Case-insensitive match.")]
     pub case_insensitive: Option<bool>,
+    #[schemars(description = "Only search under this directory or file, or files matching this glob (e.g. \"rich/\", \"src/**/*.ts\").")]
+    #[serde(rename = "in")]
+    pub in_path: Option<String>,
+    #[schemars(
+        description = "Return the source of each function, method or class that contains a hit (each once), so one call finds and reads; capped by token_budget. Default: on when there are at most 6 hits."
+    )]
+    pub bodies: Option<bool>,
+    #[schemars(description = "With bodies: token budget for the returned source (default 4000).")]
+    pub token_budget: Option<usize>,
     #[schemars(description = "Output format: \"text\" (default) or \"json\".")]
     pub format: Option<String>,
 }
@@ -433,6 +452,10 @@ pub struct CheckParams {
     pub checkers: Option<Vec<String>>,
     #[schemars(description = "Prove every promise in .sem/promises can fail (apply its mutation, expect it broken).")]
     pub promises: Option<bool>,
+    #[schemars(description = "Run this one build or test command instead of the checkers, e.g. \"pytest -q tests/x.py\". Waits for it to finish (no polling), stops it if it hangs, returns the lines that say what went wrong plus the end of the output, and answers a rerun on an unchanged tree at once.")]
+    pub run: Option<String>,
+    #[schemars(description = "With run: run it on the base revision (in a side checkout with a warm build) to see whether a failure predates the change.")]
+    pub at_base: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -668,17 +668,22 @@ impl SemServer {
     ) -> Result<&'a str, String> {
         // Match the bare name, or `Class.method` addressing (a child entity
         // whose parent is named by the qualifier before the final dot). Agents
-        // reach for `Class.method` naturally.
+        // reach for `Class.method` naturally, and for "function name".
+        let (kind, entity_name) = match entity_name.trim().split_once(' ') {
+            Some((k, rest)) if !rest.trim().is_empty() && !k.contains(['.', ':']) => (Some(k), rest.trim()),
+            _ => (None, entity_name.trim()),
+        };
         let qualified = entity_name.rsplit_once('.');
         let matches = |e: &sem_core::parser::graph::EntityInfo| {
-            e.name == entity_name
+            kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
+            && (e.name == entity_name
                 || qualified.is_some_and(|(parent_part, child_part)| {
                     e.name == child_part
                         && e.parent_id
                             .as_ref()
                             .and_then(|pid| graph.entities.get(pid))
                             .is_some_and(|p| p.name == parent_part)
-                })
+                }))
         };
 
         if let Some(entity) = graph
@@ -721,16 +726,22 @@ impl SemServer {
         graph: &'a EntityGraph,
         entity_name: &str,
     ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
+        // "method Text.count" names the kind too, as plain lookup accepts
+        let (kind, entity_name) = match entity_name.trim().split_once(' ') {
+            Some((k, rest)) if !rest.trim().is_empty() && !k.contains(['.', ':']) => (Some(k), rest.trim()),
+            _ => (None, entity_name.trim()),
+        };
         let qualified = entity_name.rsplit_once('.');
         let matches = |e: &sem_core::parser::graph::EntityInfo| {
-            e.name == entity_name
+            kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
+            && (e.name == entity_name
                 || qualified.is_some_and(|(parent_part, child_part)| {
                     e.name == child_part
                         && e.parent_id
                             .as_ref()
                             .and_then(|pid| graph.entities.get(pid))
                             .is_some_and(|p| p.name == parent_part)
-                })
+                }))
         };
         let mut hits: Vec<&sem_core::parser::graph::EntityInfo> =
             graph.entities.values().filter(|e| matches(e)).collect();
@@ -2543,7 +2554,7 @@ impl SemServer {
     // ── Find ──
 
     #[tool(
-        description = "Where is it? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it (exact, or marked incomplete). mode \"refs\": what it calls and references. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
+        description = "Where is it, and what does it say? Find entity definitions by exact name (\"type name\" disambiguates, e.g. \"function createProgram\"); queries=[...] batches. mode \"callers\": who calls it. mode \"refs\": what it calls. mode \"context\": its source plus callers and callees in token_budget, instead of reading the file; with no query, mode \"context\" reads whole files instead (`files` = [...] or `in`, optional `lines`), numbered, any text file; a re-read returns only what changed. Use it instead of Read, cat or sed. `in` restricts to a file or directory; with no query it lists the entities there (`text` searches entity bodies). `intent`: describe it when you don't know the name."
     )]
     async fn sem_find(
         &self,
@@ -2551,7 +2562,10 @@ impl SemServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let query = params.query.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
         let queries = params.queries().map(<[String]>::to_vec);
-        match params.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        // `files` or `lines` with no entity named can only mean "read these"
+        let reading = query.is_none() && queries.is_none() && (params.files.as_ref().is_some_and(|f| !f.is_empty()) || params.lines.is_some());
+        let mode = if reading { Some("context") } else { params.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) };
+        match mode {
             None | Some("definitions") => {}
             Some("callers") => {
                 let Some(q) = query else {
@@ -2577,6 +2591,16 @@ impl SemServer {
                     args.push("--json".to_string());
                 }
                 return Ok(run_sem(&ctx.repo_root, args, no_verdict).await);
+            }
+            Some("context") if query.is_none() && queries.is_none() => {
+                let mut paths: Vec<String> = params.files.clone().unwrap_or_default();
+                if let Some(p) = params.file() {
+                    paths.insert(0, p.to_string());
+                }
+                if paths.is_empty() {
+                    return Ok(tool_error("mode \"context\" needs a query (an entity), or files / in (files to read)"));
+                }
+                return Ok(self.read_files(paths, params.lines.clone(), params.fresh.unwrap_or(false)).await);
             }
             Some("context") => {
                 return self
@@ -2624,6 +2648,86 @@ impl SemServer {
                 .await;
         }
         self.find_definitions(params).await
+    }
+
+    /// Whole files (or a line range of each), numbered like `cat -n`. A file
+    /// this session already read is answered in one line when unchanged, and
+    /// with a line diff against the version it saw when changed, unless
+    /// `fresh`. Files are read in parallel.
+    async fn read_files(&self, paths: Vec<String>, lines: Option<String>, fresh: bool) -> CallToolResult {
+        let ctx = match self.get_context(paths.first().map(String::as_str)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return tool_error(err),
+        };
+        let range = match lines.as_deref().map(parse_line_range).transpose() {
+            Ok(r) => r,
+            Err(e) => return tool_error(e),
+        };
+        let root = ctx.repo_root.clone();
+        let read: Vec<(String, Result<String, String>)> = tokio::task::spawn_blocking(move || {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = paths
+                    .iter()
+                    .map(|p| {
+                        let root = &root;
+                        scope.spawn(move || {
+                            let (rel, abs) = Self::resolve_file_path(root, p);
+                            let text = match std::fs::read(&abs) {
+                                Ok(b) if b.contains(&0) => Err(format!("binary file, {} bytes", b.len())),
+                                Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+                                Err(e) if abs.is_dir() => Err(format!("a directory ({e}); list it with `in` and no mode")),
+                                Err(e) => Err(e.to_string()),
+                            };
+                            (rel, text)
+                        })
+                    })
+                    .collect();
+                jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+            })
+        })
+        .await
+        .unwrap_or_default();
+
+        let mut out = String::new();
+        let mut ledger = self.fill_ledger.lock().await;
+        for (rel, text) in read {
+            let text = match text {
+                Ok(t) => t,
+                Err(e) => {
+                    out.push_str(&format!("── {rel}: {e}\n\n"));
+                    continue;
+                }
+            };
+            let total = text.lines().count();
+            let (from, to) = range.map(|(a, b)| (a.max(1), b.unwrap_or(total).min(total))).unwrap_or((1, total));
+            let slice: String = text.lines().skip(from.saturating_sub(1)).take(to.saturating_sub(from) + 1).map(|l| format!("{l}\n")).collect();
+            let receipt = format!("r:{:08x}", fnv1a_hash(&slice) as u32);
+            let key = format!("file\0{rel}\0{}", lines.as_deref().unwrap_or("all"));
+            let span = if (from, to) == (1, total) { format!("{total} lines") } else { format!("lines {from}-{to} of {total}") };
+            match ledger.get(&key) {
+                Some(prev) if !fresh && prev.fingerprint == receipt => {
+                    out.push_str(&format!("── {rel} · {span} · {receipt} · unchanged since you read it (fresh: true resends it)\n\n"));
+                    continue;
+                }
+                Some(prev) if !fresh => {
+                    let diff = similar::TextDiff::from_lines(prev.content.as_str(), slice.as_str());
+                    let udiff = diff.unified_diff().context_radius(2).header("as you read it", "now").to_string();
+                    if udiff.len() < slice.len() / 2 {
+                        out.push_str(&format!("── {rel} · {span} · {receipt} · changed since you read it ({}):\n{udiff}\n", prev.fingerprint));
+                        ledger.put(key, LedgerFill { fingerprint: receipt, content: slice });
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            out.push_str(&format!("── {rel} · {span} · {receipt}\n"));
+            for (i, l) in slice.lines().enumerate() {
+                out.push_str(&format!("{:>6}\t{l}\n", from + i));
+            }
+            out.push('\n');
+            ledger.put(key, LedgerFill { fingerprint: receipt, content: slice });
+        }
+        CallToolResult::success(vec![Content::text(out.trim_end().to_string())])
     }
 
     /// Definitions by exact name: `sem_find` with no mode.
@@ -2887,7 +2991,7 @@ impl SemServer {
     }
 
     #[tool(
-        description = "Is my change correct? Runs the project's compiler, type checker, linter and tests (only what the change can affect, when that gives the same answer) and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). checkers narrows them (ts, lint, tests, python, pytest, go, cargo, jvm, dotnet, swift, cpp, cmd); promises=true also proves every promise in .sem/promises can fail."
+        description = "Is my change correct? run: \"<build or test command>\" runs that command and waits for it (use it for every build and test: it stops a hung command, returns only the lines that matter, and answers a rerun on an unchanged tree at once). Without run: runs the project's compiler, type checker, linter and tests (only what the change can affect, when that gives the same answer) and returns their JSON report with a verdict: exit 0 pass, 1 fail, 2 could not decide (nothing ran is never a pass). checkers narrows them (ts, lint, tests, python, pytest, go, cargo, jvm, dotnet, swift, cpp, cmd); promises=true also proves every promise in .sem/promises can fail."
     )]
     async fn sem_check(
         &self,
@@ -2897,6 +3001,16 @@ impl SemServer {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
+        if let Some(cmd) = params.run.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            let mut args = vec!["check".to_string(), "--run".to_string(), cmd.to_string()];
+            if params.at_base.unwrap_or(false) {
+                args.extend(["--at".to_string(), "base".to_string()]);
+                if let Some(base) = params.base {
+                    args.extend(["--base".to_string(), base]);
+                }
+            }
+            return Ok(run_sem(&ctx.repo_root, args, check_verdict).await);
+        }
         let mut args = vec!["check".to_string(), "--json".to_string()];
         if let Some(base) = params.base {
             args.extend(["--base".to_string(), base]);
@@ -2990,6 +3104,17 @@ impl SemServer {
             Ok(file_paths) => file_paths,
             Err(err) => return Ok(tool_error(err)),
         };
+        let file_paths: Vec<String> = match params.in_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(scope) => {
+                let scope = scope.trim_start_matches("./");
+                let glob = scope.contains(['*', '?']);
+                file_paths
+                    .into_iter()
+                    .filter(|f| if glob { glob_match(scope, f) } else { f == scope || f.starts_with(&format!("{}/", scope.trim_end_matches('/'))) })
+                    .collect()
+            }
+            None => file_paths,
+        };
         let opts = sem_core::index::grep::GrepOptions {
             case_insensitive: params.case_insensitive(),
         };
@@ -3060,6 +3185,10 @@ impl SemServer {
                     Err(e) => out.push_str(&format!("  {e}\n")),
                 }
             }
+            let all: Vec<sem_core::index::grep::GrepHit> = per_pattern.iter().filter_map(|(_, o)| o.as_ref().ok()).flatten().cloned().collect();
+            if params.bodies.unwrap_or(all.len() <= AUTO_BODIES) && !all.is_empty() {
+                out.push_str(&self.enclosing_bodies(&ctx.repo_root, &all, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
+            }
             return Ok(CallToolResult::success(vec![Content::text(out)]));
         }
 
@@ -3088,7 +3217,53 @@ impl SemServer {
         for hit in &hits {
             out.push_str(&format!("{}:{}:{}\n", hit.file, hit.line, hit.text));
         }
+        // a handful of hits: show the code around them too, since the next
+        // turn would read it anyway
+        if params.bodies.unwrap_or(hits.len() <= AUTO_BODIES) && !hits.is_empty() {
+            out.push_str(&self.enclosing_bodies(&ctx.repo_root, &hits, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
+        }
         Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    /// The innermost entity around each hit, each once, numbered like a read,
+    /// until `budget` tokens (4 bytes each) are spent.
+    fn enclosing_bodies(&self, root: &Path, hits: &[sem_core::index::grep::GrepHit], budget: usize) -> String {
+        let mut by_file: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+        for h in hits {
+            by_file.entry(h.file.as_str()).or_default().push(h.line);
+        }
+        let mut picked: Vec<(String, String, usize, usize, String)> = Vec::new();
+        for (file, lines) in by_file {
+            let Ok(text) = std::fs::read_to_string(root.join(file)) else { continue };
+            let Some(plugin) = self.registry.get_plugin(file) else { continue };
+            let ents = plugin.extract_entities(&text, file);
+            let mut seen = std::collections::BTreeSet::new();
+            for line in lines {
+                let inner = ents.iter().filter(|e| e.start_line <= line && line <= e.end_line && !e.name.is_empty()).min_by_key(|e| e.end_line - e.start_line);
+                if let Some(e) = inner {
+                    if seen.insert(e.start_line) {
+                        let parent = e.parent_id.as_ref().and_then(|id| ents.iter().find(|p| &p.id == id)).map(|p| format!("{}.", p.name)).unwrap_or_default();
+                        let body: String = text.lines().skip(e.start_line - 1).take(e.end_line - e.start_line + 1).enumerate().map(|(i, l)| format!("{:>6}\t{l}\n", e.start_line + i)).collect();
+                        picked.push((file.to_string(), format!("{} {parent}{}", e.entity_type, e.name), e.start_line, e.end_line, body));
+                    }
+                }
+            }
+        }
+        let mut out = String::from("\n");
+        let mut spent = 0;
+        let mut omitted = Vec::new();
+        for (file, label, a, b, body) in picked {
+            if spent + body.len() / 4 > budget {
+                omitted.push(format!("{label} ({file}:{a})"));
+                continue;
+            }
+            spent += body.len() / 4;
+            out.push_str(&format!("── {file} · {label} · lines {a}-{b}\n{body}\n"));
+        }
+        if !omitted.is_empty() {
+            out.push_str(&format!("(over token_budget, not shown: {})\n", omitted.join(", ")));
+        }
+        out
     }
 
     // ── Tool 7: Join review (agent listener) ──
@@ -3324,6 +3499,44 @@ struct LedgerFill {
     content: String,
 }
 
+/// At most this many hits and sem_grep returns the code around them unasked.
+const AUTO_BODIES: usize = 6;
+
+/// `*` (within a path segment), `**` (any depth) and `?` against a
+/// repo-relative path.
+fn glob_match(pat: &str, path: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(b'*'), _) if p.get(1) == Some(&b'*') => {
+                let rest = if p.get(2) == Some(&b'/') { &p[3..] } else { &p[2..] };
+                rest.is_empty() || (0..=s.len()).any(|i| (i == 0 || s[i - 1] == b'/') && go(rest, &s[i..])) || go(rest, s)
+            }
+            (Some(b'*'), _) => (0..=s.len()).take_while(|&i| i == 0 || s[i - 1] != b'/').any(|i| go(&p[1..], &s[i..])),
+            (Some(b'?'), Some(c)) if *c != b'/' => go(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(pat.as_bytes(), path.as_bytes())
+}
+
+/// "40-120", "300-" or "7" as 1-based inclusive (from, to).
+fn parse_line_range(s: &str) -> Result<(usize, Option<usize>), String> {
+    let bad = || format!("lines {s:?}: use a range like \"40-120\" or \"300-\"");
+    let s = s.trim().trim_matches(['"', '\'']).trim();
+    match s.split_once('-') {
+        Some((a, b)) => {
+            let a: usize = a.trim().parse().map_err(|_| bad())?;
+            let b = b.trim();
+            let b = if b.is_empty() { None } else { Some(b.parse::<usize>().map_err(|_| bad())?) };
+            Ok((a, b))
+        }
+        None => s.parse::<usize>().map(|n| (n, Some(n))).map_err(|_| bad()),
+    }
+}
+
 fn fnv1a_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
@@ -3544,6 +3757,14 @@ mod tests {
         let repo_root = git.repo_root().to_path_buf();
         *server.context.lock().await = Some(RepoContext { git, repo_root });
         server
+    }
+
+    #[test]
+    fn grep_scope_globs() {
+        assert!(glob_match("rich/**", "rich/a/b.py"));
+        assert!(glob_match("src/**/*.ts", "src/a/b/c.ts") && glob_match("src/**/*.ts", "src/c.ts"));
+        assert!(glob_match("*.py", "x.py") && !glob_match("*.py", "a/x.py"));
+        assert!(glob_match("tests/test_?.py", "tests/test_a.py"));
     }
 
     #[test]

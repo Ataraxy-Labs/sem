@@ -232,14 +232,17 @@ pub fn context_text(v: &Value) -> String {
         let tokens = get_u64(e, "tokens")
             .map(|t| format!(" · {} tok", t))
             .unwrap_or_default();
+        let content = get_str(e, "content");
+        // the version weave_edit's `expect` checks: a hash of the source shown
+        let version = if content.is_empty() { String::new() } else { format!(" · {}", entity_version(content)) };
         out.push_str(&format!(
-            "\n── {} · {} · {}{}\n",
+            "\n── {} · {} · {}{}{}\n",
             get_str(e, "role"),
             entity_label(e),
             get_str(e, "file"),
-            tokens
+            tokens,
+            version
         ));
-        let content = get_str(e, "content");
         if !content.is_empty() {
             out.push_str(content);
             if !content.ends_with('\n') {
@@ -397,4 +400,15 @@ mod tests {
         assert!(text.contains("── dependency · helper · src/h.rs · 250 tok"));
         assert!(text.contains("fn helper() {}"));
     }
+}
+
+/// `v:` plus the FNV-1a hash (32 bits, hex) of an entity's source without
+/// trailing newlines. weave_edit computes the same over the entity on disk,
+/// so `expect` refuses an edit to an entity someone changed since this read.
+pub(crate) fn entity_version(source: &str) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in source.trim_end_matches('\n').bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x01000193);
+    }
+    format!("v:{h:08x}")
 }

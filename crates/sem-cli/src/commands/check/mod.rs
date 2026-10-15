@@ -31,6 +31,7 @@ mod deps;
 mod generic;
 mod lint;
 mod python;
+mod run;
 mod store;
 mod tests;
 mod tree;
@@ -79,6 +80,30 @@ pub struct CheckArgs {
     /// Run as if started in this directory
     #[arg(short = 'C', long = "cwd")]
     pub directory: Option<String>,
+    /// Run this one command (a build or test suite) instead of the checkers:
+    /// stopped once it prints nothing for --idle seconds, answered with the
+    /// lines that say what went wrong plus the end of the output.
+    /// Example: sem check --run 'cargo test -p core'
+    #[arg(long, value_name = "CMD")]
+    pub run: Option<String>,
+    /// With --run: run it on the --base revision (default HEAD) instead of the
+    /// working tree, in a side checkout with a warm build, without touching
+    /// the working tree; answers are cached. Replaces stash, rebuild, compare.
+    /// Example: sem check --run 'cargo test -p core' --at base
+    #[arg(long, value_name = "base|head", requires = "run")]
+    pub at: Option<String>,
+    /// Warm the project's build: compile everything and compile the tests
+    /// without running them (go, cargo, tsc, pytest --collect-only, maven or
+    /// gradle), through $SEM_EXEC_PREFIX when commands run elsewhere (a
+    /// container). Started in the background by `sem hook tool`.
+    #[arg(long, hide = true)]
+    pub prewarm: bool,
+    /// With --run: print nothing (a speculative run started by an edit)
+    #[arg(long, hide = true, requires = "run")]
+    pub quiet: bool,
+    /// With --run: stop the command after this many seconds without output (0: never)
+    #[arg(long, default_value = "180")]
+    pub idle: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +332,19 @@ pub fn run(args: CheckArgs) -> i32 {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if args.prewarm {
+        return run::prewarm(&start);
+    }
+    if let Some(cmd) = args.run.as_deref() {
+        return match args.at.as_deref() {
+            None | Some("head") => run::run(&start, cmd, args.idle, args.timeout, args.json, args.no_cache, args.quiet),
+            Some("base") => run::run_at_base(&start, args.base.as_deref().unwrap_or("HEAD"), cmd, args.idle, args.timeout, args.json, args.no_cache),
+            Some(other) => {
+                eprintln!("sem check --at {other}: use base or head");
+                2
+            }
+        };
+    }
     let (doc, code) = match evaluate(&start, args.clone()) {
         Ok((mut doc, code)) => {
             doc["durationMs"] = json!(t0.elapsed().as_millis() as u64);

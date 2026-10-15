@@ -1,5 +1,6 @@
 import { createBashToolDefinition, createWriteToolDefinition, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
 import { loadConfig } from "../src/config/load.ts";
 import { FAIL_CLOSED_CONFIG } from "../src/config/default.ts";
@@ -48,6 +49,12 @@ const CODE_MODE = process.env.PI_SEM_MODE === "code" || process.env.PI_SEM_PURE 
 // script.  The only active tools are those explicitly allowlisted from the
 // transaction server (normally sem_plan + weave_transaction).
 const TRANSACTION_MODE = process.env.PI_SEM_MODE === "transaction";
+// Standard mode is the sem+weave standard every harness shares (Claude Code
+// and Codex get the same): only the configured MCP servers' allowlisted
+// tools (sem_find, sem_grep, sem_impact, sem_check, weave_edit), no native
+// pi-sem tools, plus the builtins the config keeps (bash, routed through
+// `sem hook tool` below).
+const STANDARD_MODE = process.env.PI_SEM_MODE === "standard";
 // Pure codespace is code mode's DEFAULT identity: no active builtins at
 // all, [sem_code] is the entire tool set. The agent lives in the code
 // space with one tool: ask (blast/why/where/explain), act
@@ -186,7 +193,7 @@ export async function startServersAndRegisterTools(
     // the tool surface (activeBuiltins above) and sem.write's behavior can
     // never disagree about which mode this session is in.
     registerSemCode(pi, { pure: PURE_MODE, weaveMcpCommand: weaveServer?.command, weaveMcpArgs: weaveServer?.args, onWriteAudit: onCodeModeWriteAudit });
-  } else if (!TRANSACTION_MODE) {
+  } else if (!TRANSACTION_MODE && !STANDARD_MODE) {
     registerWeaveEdit(pi, {
       weaveMcpCommand: weaveServer?.command,
       weaveMcpArgs: weaveServer?.args,
@@ -208,7 +215,7 @@ export async function startServersAndRegisterTools(
     // [sem_code].
     PURE_MODE || TRANSACTION_MODE ? { ...config.sessionPolicy, activeBuiltins: [] } : config.sessionPolicy,
     statuses,
-    TRANSACTION_MODE
+    TRANSACTION_MODE || STANDARD_MODE
       ? []
       : CODE_MODE
       ? [SEM_CODE_TOOL_NAME]
@@ -364,6 +371,13 @@ export default function piSemExtension(pi: ExtensionAPI) {
           });
         }
         if (decision.refuse) throw new Error(decision.refusalMessage ?? "pi-sem: bash command refused by policy.");
+        // The sem+weave router every harness shares (`sem hook tool`, the same
+        // input Claude Code and Codex hooks send): shell reads become sem
+        // reads, searches sem grep, literal edits weave edits, builds and
+        // tests run under sem's watchdog; other shell writes are refused.
+        const hook = routeThroughSem(params.command, ctx.cwd, sessionId);
+        if (hook?.deny) throw new Error(hook.deny);
+        if (hook?.command) params = { ...params, command: hook.command };
         return realBash.execute(toolCallId, params, signal, onUpdate, execCtx);
       },
       // renderCall/renderResult deliberately omitted: with both absent, a tool
@@ -511,4 +525,28 @@ export default function piSemExtension(pi: ExtensionAPI) {
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
+}
+
+/** One id per pi process, so sem remembers reads within this session only. */
+const sessionId = process.env.PI_SEM_SESSION_ID || `pi-${process.pid}-${Date.now()}`;
+
+/**
+ * Ask `sem hook tool` what to do with a bash command (PI_SEM_HOOK=0 turns it
+ * off; SEM_BIN picks the binary). Any failure leaves the command untouched:
+ * the router must never break a tool call.
+ */
+function routeThroughSem(command: string, cwd: string, session: string): { deny?: string; command?: string } | undefined {
+  if (process.env.PI_SEM_HOOK === "0") return undefined;
+  const sem = process.env.SEM_BIN || "sem";
+  const input = JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, cwd, session_id: session });
+  const r = spawnSync(sem, ["hook", "tool"], { input, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0 || !r.stdout?.trim()) return undefined;
+  try {
+    const out = JSON.parse(r.stdout).hookSpecificOutput ?? {};
+    if (out.permissionDecision === "deny") return { deny: String(out.permissionDecisionReason ?? "refused by sem") };
+    const next = out.updatedInput?.command;
+    return typeof next === "string" && next !== command ? { command: next } : undefined;
+  } catch {
+    return undefined;
+  }
 }

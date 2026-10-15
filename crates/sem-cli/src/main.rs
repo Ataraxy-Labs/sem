@@ -322,6 +322,17 @@ enum Commands {
         /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long, hide = true)]
         no_default_excludes: bool,
+        /// Read these files instead of finding entities: numbered like `cat -n`,
+        /// any text file. A file read before in this repository answers with
+        /// "unchanged" or a diff against that read. Example: sem find --read src/a.rs src/b.rs
+        #[arg(long, num_args = 1.., value_name = "FILE", conflicts_with_all = ["callers", "refs", "context"])]
+        read: Vec<String>,
+        /// With --read: only these lines. Example: --lines 40-120
+        #[arg(long, requires = "read")]
+        lines: Option<String>,
+        /// With --read: print the whole file even if it was read before unchanged
+        #[arg(long, requires = "read")]
+        fresh: bool,
     },
     /// Show direct callers of an entity (who calls/references it) — the
     /// index's reverse postings, same freshness/fallback discipline as `find`.
@@ -442,7 +453,8 @@ enum Commands {
         long_about = "What should a human review in this commit range? The review certificate: \
         entities touched, signature changes and the callers they leave behind, callee deltas, \
         promises kept or broken (with witnesses), module reachability deltas (JS/TS), affected \
-        tests, and the static reference cone. --arch adds the architecture view: new or removed \
+        tests, the static reference cone, and the approvals an ENTITYOWNERS file at the repo root \
+        requires per changed entity. --arch adds the architecture view: new or removed \
         data paths, side effects, dependencies, cycles and what did not change, ranked.\n\n\
         Examples:\n  sem certify main..HEAD                    markdown certificate\n  \
         sem certify main..HEAD --json             the full certificate\n  \
@@ -748,7 +760,8 @@ enum Commands {
     /// Internal plumbing for agent-harness hooks (hidden)
     #[command(hide = true)]
     Hook {
-        /// Hook kind, e.g. prompt-submit
+        /// Hook kind: prompt-submit, or tool (pre-tool routing of reads, searches,
+        /// edits and builds through sem and weave)
         kind: String,
     },
     /// Show evolution of an entity through git history, or, with no entity,
@@ -1677,7 +1690,13 @@ fn sem_main() {
             file_exts,
             no_cache,
             no_default_excludes,
+            read,
+            lines,
+            fresh,
         }) => {
+            if !read.is_empty() {
+                std::process::exit(commands::read::run(&read, lines.as_deref(), fresh));
+            }
             let json = resolve_json(format, json);
             // --file is the old spelling of a single --in.
             let mut in_paths = in_paths;
@@ -1816,8 +1835,11 @@ fn sem_main() {
             ConfigCmd::Stats => commands::stats::run(),
         },
         Some(Commands::Hook { kind }) => {
-            if kind == "prompt-submit" {
-                commands::hook::prompt_submit();
+            match kind.as_str() {
+                "prompt-submit" => commands::hook::prompt_submit(),
+                // the sem+weave workflow as a pre-tool hook (Claude Code, Codex, pi)
+                "tool" => commands::tool_hook::tool(),
+                _ => {}
             }
         }
         Some(Commands::Log {
