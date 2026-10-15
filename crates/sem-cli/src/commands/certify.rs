@@ -748,9 +748,8 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
 
     let owners_out = owners_section(&ht.dir.path().join("ENTITYOWNERS"), &changes, hg, &h_out);
 
-    let cert = json!({
+    let mut cert = json!({
         "base": base, "head": head,
-        "owners": owners_out,
         "summary": { "filesChanged": changed_files.len(), "entitiesChanged": diff.changes.len(),
             "added": diff.added_count, "modified": diff.modified_count, "deleted": diff.deleted_count,
             "renamed": diff.renamed_count, "moved": diff.moved_count },
@@ -769,6 +768,10 @@ pub(crate) fn certificate(root: &Path, base: &str, head: &str, bt: &Tree, ht: &T
         "noTestReaches": affected_tests.is_empty(),
         "limits": "static reference graph only: calls the resolver cannot pin (dynamic dispatch, reflection, string-keyed lookup, callbacks registered at runtime) and non-code consumers are not modeled",
     });
+    // only when the repo keeps an ENTITYOWNERS file
+    if !owners_out.is_null() {
+        cert["owners"] = owners_out;
+    }
     Ok(cert)
 }
 
@@ -845,8 +848,7 @@ pub fn render(c: &Value, max: usize, max_chars: usize) -> String {
     o += &format!("Limits: {}.\n", s(&c["limits"]));
 
     // Approvals first: it decides who reviews, so it belongs above the facts.
-    if !c["owners"].is_null() {
-        let ow = &c["owners"];
+    if let Some(ow) = c.get("owners") {
         o += "\n## Approvals required (ENTITYOWNERS)\n";
         let need = arr(&ow["approvalsRequired"]);
         if need.is_empty() {
