@@ -453,7 +453,8 @@ enum Commands {
         long_about = "What should a human review in this commit range? The review certificate: \
         entities touched, signature changes and the callers they leave behind, callee deltas, \
         promises kept or broken (with witnesses), module reachability deltas (JS/TS), affected \
-        tests, and the static reference cone. --arch adds the architecture view: new or removed \
+        tests, the static reference cone, and the approvals an ENTITYOWNERS file at the repo root \
+        requires per changed entity. --arch adds the architecture view: new or removed \
         data paths, side effects, dependencies, cycles and what did not change, ranked.\n\n\
         Examples:\n  sem certify main..HEAD                    markdown certificate\n  \
         sem certify main..HEAD --json             the full certificate\n  \

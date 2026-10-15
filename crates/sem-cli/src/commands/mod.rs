@@ -2,6 +2,7 @@ pub mod blame;
 pub mod arch_diff;
 pub mod arch_view;
 pub mod certify;
+pub(crate) mod owners;
 pub mod check_promises;
 pub mod check;
 pub mod cloud;
