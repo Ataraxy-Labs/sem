@@ -602,6 +602,8 @@ This means sem detects renames and moves, not just additions and deletions. Stru
 
 ## Use with AI agents (MCP)
 
+Need a URL-based client? The [Streamable HTTP preview](docs/mcp-http.md) adds authenticated, local read-only access; stdio remains the default.
+
 On macOS and Linux, clients in the same checkout share a warm repository daemon.
 Run `sem mcp --status` to check it. See the [shared runtime contract and reproducible benchmark](docs/shared-mcp.md)
 for session isolation, fallback behavior, and current platform limits.

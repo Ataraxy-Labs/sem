@@ -917,6 +917,10 @@ enum Commands {
     /// Run sem as an MCP server for agents (stdin/stdout): find, grep, impact, check, certify, diff, graph, history
     #[command(display_order = 11)]
     Mcp {
+        /// Serve read-only discovery over authenticated Streamable HTTP on loopback.
+        /// Requires SEM_REPO and SEM_MCP_HTTP_TOKEN (at least 32 characters).
+        #[arg(long, conflicts_with_all = ["status", "resident", "review"])]
+        http: Option<std::net::SocketAddr>,
         /// Check shared MCP daemon health without starting it (JSON). Example: sem mcp --status
         #[arg(long, conflicts_with = "resident")]
         status: bool,
@@ -1916,7 +1920,7 @@ fn sem_main() {
             alias::note("stats", "config stats", false);
             commands::stats::run();
         }
-        Some(Commands::Mcp { resident, status, review }) => {
+        Some(Commands::Mcp { resident, status, review, http }) => {
             if status {
                 println!("{}", sem_mcp::shared_status());
                 return;
@@ -1925,7 +1929,9 @@ fn sem_main() {
                 // No-op: see the `resident` field's doc comment above.
                 return;
             }
-            let result = if review { sem_mcp::run_review() } else { sem_mcp::run() };
+            let result = if let Some(address) = http {
+                sem_mcp::http::run(address)
+            } else if review { sem_mcp::run_review() } else { sem_mcp::run() };
             if let Err(e) = result {
                 eprintln!("{} {}", "error:".red().bold(), e);
                 std::process::exit(1);

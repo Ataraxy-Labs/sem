@@ -1,6 +1,7 @@
 pub mod agent_review;
 pub mod cache;
 pub mod cloud;
+pub mod http;
 pub mod render;
 pub(crate) mod review_protocol;
 pub mod server;
