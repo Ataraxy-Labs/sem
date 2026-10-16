@@ -19,4 +19,5 @@ jobs:
           workspaces: crates
       - run: cargo build --manifest-path crates/Cargo.toml -p sem-mcp -p sem-cli
       - run: cargo test --manifest-path crates/Cargo.toml -p sem-mcp --lib --tests
+      - run: python3 crates/sem-mcp/tests/http_smoke.py crates/target/debug/sem-mcp
       - run: python3 benchmarks/shared-mcp/run.py --binary crates/target/debug/sem-mcp
