@@ -138,6 +138,32 @@ structural mode. Tasks that name a single source path, or that change data or
 the environment, route to native. If routing itself fails, the decision is
 native, so an adapter can always start the agent.
 
+## Optional web search in tools mode
+
+Use `config/parallel-search.mjs` to add free web search and page fetching with
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp).
+Search uses Fast mode, with no account or API key required. The config adds
+`parallel_web_search` and `parallel_web_fetch` alongside the default sem and
+weave tools, keeping the same builtins and structural guidance.
+
+With Node.js 22.19 or later, install the package dependencies (including the
+`mcp-remote` HTTP-to-stdio bridge), then start pi from your project:
+
+```bash
+cd /path/to/sem/pi && npm install
+cd /path/to/project
+PI_SEM_MODE=tools PI_SEM_PURE=0 \
+PI_SEM_CONFIG=/path/to/sem/pi/config/parallel-search.mjs \
+/path/to/sem/pi/node_modules/.bin/pi -e /path/to/sem/pi
+```
+
+The sem and weave requirements above still apply. Ask for current library
+documentation, then fetch a specific documentation URL when you need its exact
+contents. These tools send your search terms and requested URLs to Parallel;
+use sem's tools for local source. Anonymous access has lower rate limits and is
+suited to light use. This example is for tools mode; code mode does not start
+MCP servers, and transaction mode uses its own restricted configuration.
+
 ## Environment variables
 
 | Variable | Effect |
