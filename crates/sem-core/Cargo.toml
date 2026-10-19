@@ -100,7 +100,7 @@ lang-fish = ["dep:tree-sitter-fish"]
 lang-bsl = ["dep:tree-sitter-bsl"]
 
 [dependencies]
-git2 = { version = "0.20", optional = true }
+git2 = { version = "0.20", optional = true, default-features = false }
 tree-sitter = "0.26"
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-javascript = { version = "0.23", optional = true }

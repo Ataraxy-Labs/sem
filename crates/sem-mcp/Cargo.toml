@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 sem-core = { path = "../sem-core", version = "0.28.0", features = ["disk-cache"] }
 sem-cloud-client = { path = "../sem-cloud-client", version = "0.28.0" }
-git2 = "0.20"
+git2 = { version = "0.20", default-features = false }
 lru = "0.16"
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"] }
 axum = "0.8"

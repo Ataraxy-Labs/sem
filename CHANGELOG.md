@@ -8,6 +8,10 @@ All notable changes to sem are documented in this file.
 
 - **Bazel and Buck2 build files.** `BUILD`, `BUCK`, `WORKSPACE`, `PACKAGE` and files ending in `.bzl`, `.bazel`, `.bxl` or `.star` now parse as Starlark with the Python grammar. Each `rule(name = "...")` call in a build file is a `target` entity named after its target, so `sem diff` reports which targets changed, and functions in `.bzl` files are entities as in Python (#519).
 
+### Fixed
+
+- **The macOS binary no longer needs Homebrew's OpenSSL.** libgit2 was built with its HTTPS and SSH transports, which linked `/opt/homebrew/opt/openssl@3`, so `sem` aborted at launch on Macs without it. sem only reads local repositories, so `git2` now builds without those transports and the binary links only system libraries (#520).
+
 ## [0.28.0] - 2026-10-19
 
 ### Added
