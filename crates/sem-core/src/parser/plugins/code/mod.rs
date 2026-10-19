@@ -36,10 +36,17 @@ pub fn language_config_for_content(
     content: &str,
     file_path: &str,
 ) -> Option<&'static languages::LanguageConfig> {
-    let ext = std::path::Path::new(file_path)
+    let path = std::path::Path::new(file_path);
+    let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e.to_lowercase()))
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(languages::extensionless_build_file_ext)
+                .map(str::to_string)
+        })
         .unwrap_or_default();
 
     get_language_config(&ext).or_else(|| {
@@ -88,7 +95,12 @@ pub fn top_level_imports(file_path: &str, content: &str) -> Option<Vec<TopLevelI
     };
     let src = content.as_bytes();
     let root = tree.root_node();
-    if root.has_error() || !matches!(config.id, "typescript" | "tsx" | "javascript" | "python" | "rust" | "go" | "java" | "c" | "cpp") {
+    if root.has_error()
+        || !matches!(
+            config.id,
+            "typescript" | "tsx" | "javascript" | "python" | "rust" | "go" | "java" | "c" | "cpp"
+        )
+    {
         return None;
     }
     let mut cursor = root.walk();
@@ -4090,7 +4102,9 @@ test "basic addition" {
     #[test]
     #[cfg(feature = "lang-typescript")]
     fn test_top_level_imports_excludes_strings_comments_and_nested() {
-        assert!(top_level_imports("a.ts", "const x = 1;").unwrap().is_empty());
+        assert!(top_level_imports("a.ts", "const x = 1;")
+            .unwrap()
+            .is_empty());
         assert!(top_level_imports("a.ts", "import { broken").is_none());
         assert!(top_level_imports("a.unknown", "something").is_none());
         let code = concat!(
@@ -4118,7 +4132,13 @@ test "basic addition" {
         // The multi-line import comes back as one node spanning its full range.
         assert_eq!((imports[1].start_line, imports[1].end_line), (12, 15));
         // Never the import inside the template literal or the ambient module block.
-        assert!(imports.iter().all(|i| !i.text.contains("legacy.js")), "got: {texts:?}");
-        assert!(imports.iter().all(|i| !i.text.contains("nested.js")), "got: {texts:?}");
+        assert!(
+            imports.iter().all(|i| !i.text.contains("legacy.js")),
+            "got: {texts:?}"
+        );
+        assert!(
+            imports.iter().all(|i| !i.text.contains("nested.js")),
+            "got: {texts:?}"
+        );
     }
 }

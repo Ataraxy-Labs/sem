@@ -606,6 +606,34 @@ static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
     scope_resolve: None,
 };
 
+/// Starlark: Bazel and Buck2 build files. Starlark is a Python dialect, so it
+/// parses with the Python grammar; each `rule(name = "...")` call at the top of
+/// a build file is also an entity, named by its target (see the extractor).
+#[cfg(feature = "lang-python")]
+static STARLARK_CONFIG: LanguageConfig = LanguageConfig {
+    id: "starlark",
+    extensions: &[".bzl", ".bazel", ".bxl", ".star"],
+    entity_node_types: &["function_definition"],
+    container_node_types: &["block"],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_python,
+    scope_resolve: None,
+};
+
+/// Build files Bazel and Buck2 find by name alone, with no extension. They are
+/// Starlark, so they map to its `.bzl` extension.
+pub(crate) fn extensionless_build_file_ext(file_name: &str) -> Option<&'static str> {
+    if cfg!(feature = "lang-python")
+        && matches!(file_name, "BUILD" | "BUCK" | "WORKSPACE" | "PACKAGE")
+    {
+        Some(".bzl")
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "lang-go")]
 static GO_CONFIG: LanguageConfig = LanguageConfig {
     id: "go",
@@ -2289,6 +2317,8 @@ macro_rules! all_configs {
             &JAVASCRIPT_CONFIG,
             #[cfg(feature = "lang-python")]
             &PYTHON_CONFIG,
+            #[cfg(feature = "lang-python")]
+            &STARLARK_CONFIG,
             #[cfg(feature = "lang-go")]
             &GO_CONFIG,
             #[cfg(feature = "lang-rust")]
