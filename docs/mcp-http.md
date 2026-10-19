@@ -1,8 +1,8 @@
 # Streamable HTTP MCP (preview)
 
 Use HTTP when a trusted agent supports URL-based MCP but cannot launch stdio
-servers. Stdio remains the default. This preview requires a source build containing
-the HTTP change; **the published 0.27.0 binaries do not include it**.
+servers. Stdio remains the default. The preview ships in sem 0.28.0 and later;
+older published binaries do not include it.
 
 Build from this checkout:
 

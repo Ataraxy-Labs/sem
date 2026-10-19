@@ -4,11 +4,11 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
-### Added
-- Preview authenticated, loopback-only Streamable HTTP MCP via `sem mcp --http`, exposing read-only `sem_find` and `sem_grep` with shared repository caches. See `docs/mcp-http.md` for source-build instructions and deployment limits.
+## [0.28.0] - 2026-10-19
 
 ### Added
 
+- Preview authenticated, loopback-only Streamable HTTP MCP via `sem mcp --http`, exposing read-only `sem_find` and `sem_grep` with shared repository caches. See `docs/mcp-http.md` for setup and deployment limits.
 - **`sem_find` reads whole files, so an agent never needs Read, `cat` or `sed` to look at code or config.** With mode `context` and no query, it reads `files: [...]` (or the file in `in`) in one call, in parallel, numbered like `cat -n`, with an optional `lines` range. A file the session already read answers in one line when it is unchanged, and with a line diff against the version the agent saw when it changed; `fresh: true` resends it whole.
 - **`sem check --run '<cmd>'` runs one build or test command the way an agent should see it.** The command runs in its own process group under a watchdog that stops it after `--idle` seconds without output (default 180, `0` turns it off), so a hung test costs minutes, not the shell's whole timeout; the answer is the lines that say what went wrong plus the last 40 lines, not the whole log. In long benchmark sessions builds and tests were about 90% of the time, and one hung test alone took 600 of a session's 1,480 seconds.
 - **`sem check --run` names the scoped build when a whole-project build follows a small change.** For Maven, Gradle and Cargo, when at most half the modules changed it prints the command that builds only those (`-pl a,b`, `:a:build`, `-p a`). On an HBase task it was 5 of 55 modules, where each full `mvn install` took about eight minutes.
