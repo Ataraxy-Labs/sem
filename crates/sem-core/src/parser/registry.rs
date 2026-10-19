@@ -616,6 +616,12 @@ fn get_extensions(file_path: &str) -> Vec<String> {
         return Vec::new();
     };
 
+    if let Some(ext) =
+        crate::parser::plugins::code::languages::extensionless_build_file_ext(file_name)
+    {
+        return vec![ext.to_string()];
+    }
+
     let file_name = file_name.to_lowercase();
     let mut extensions = Vec::new();
 

@@ -99,6 +99,32 @@ fn visit_node(
         let suppression_context = sup_owned.as_deref();
         let node_type = node.kind();
 
+        // Starlark build targets: a top-level `rule(name = "x", ...)` call is the
+        // target `x`, whatever the rule or macro is called.
+        if config.id == "starlark" && node_type == "call" && parent_id.is_none() {
+            if let Some(name) = starlark_target_name(node, source) {
+                let content = node_text(node, source).to_string();
+                let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
+                entities.push(SemanticEntity {
+                    id: build_entity_id(file_path, "target", &name, None),
+                    file_path: file_path.to_string(),
+                    entity_type: "target".to_string(),
+                    name,
+                    parent_id: None,
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(struct_hash),
+                    kappa: Some(kappa_hash),
+                    content,
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
+                    start_byte: Some(node.start_byte()),
+                    end_byte: Some(node.end_byte()),
+                    metadata: None,
+                });
+                continue;
+            }
+        }
+
         // Handle call-based entities (Elixir: def, defmodule, etc.)
         if node_type == "call" && !config.call_entity_identifiers.is_empty() {
             if let Some((name, entity_type)) = extract_call_entity(node, config, source) {
@@ -2553,6 +2579,24 @@ fn clojure_sym_name<'a>(node: Node<'a>, source: &'a [u8]) -> &'a str {
         }
     }
     node_text(node, source)
+}
+
+/// The target a Starlark rule call declares: its `name = "..."` argument.
+fn starlark_target_name(node: Node, source: &[u8]) -> Option<String> {
+    let args = node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let arg = args.named_children(&mut cursor).find(|arg| {
+        arg.kind() == "keyword_argument"
+            && arg
+                .child_by_field_name("name")
+                .is_some_and(|key| node_text(key, source) == "name")
+    })?;
+    let value = arg.child_by_field_name("value")?;
+    if value.kind() != "string" {
+        return None;
+    }
+    let name = node_text(value, source).trim_matches(|c| c == '"' || c == '\'');
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Extract entity info from a call node (Elixir macros like def, defmodule, etc.)

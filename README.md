@@ -530,6 +530,7 @@ If your team runs code review through sem cloud, `sem cloud review listen <diff-
 | TypeScript | `.ts` `.tsx` `.mts` `.cts`  | functions, classes, interfaces, types, enums, exports |
 | JavaScript | `.js` `.jsx` `.mjs` `.cjs` `.es6` | functions, classes, variables, exports |
 | Python | `.py` `.pyi` | functions, classes, decorated definitions |
+| Starlark (Bazel, Buck2) | `BUILD` `BUCK` `WORKSPACE` `PACKAGE` `.bzl` `.bazel` `.bxl` `.star` | build targets, functions |
 | Go | `.go` | functions, methods, types, vars, consts |
 | Rust | `.rs` | functions, structs, enums, impls, traits, mods, consts |
 | Java | `.java` | classes, methods, interfaces, enums, fields, constructors |
