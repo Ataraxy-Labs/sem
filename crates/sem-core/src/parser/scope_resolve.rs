@@ -3452,6 +3452,13 @@ pub(crate) fn fingerprint_corpus_tables(
     entity_map: &EntityInfoMap,
     fp: &mut TableFingerprints,
 ) -> u64 {
+    fp.reserve(
+        lookups.symbol_table.len()
+            + lookups.class_members.len()
+            + lookups.owner_members.len()
+            + entity_map.len()
+            + 1,
+    );
     let mut sink = FingerprintSink::new(fp, 0);
     // `register_rust_module_import` (the module-alias `use` form) scans
     // every `(name, target file)` pair below looking for ones whose file
@@ -3461,20 +3468,32 @@ pub(crate) fn fingerprint_corpus_tables(
     // already visits them for the per-key `SymbolTable`/`EntityMap`
     // fingerprints, so the guard costs one extra `u64` XOR per pair, not a
     // second corpus scan.
+    //
+    // The value hashes are computed in parallel and then written in the
+    // tables' own iteration order, so the map (and the guard, an XOR fold)
+    // comes out exactly as a serial pass would leave it. On a 2.3M-entity
+    // corpus this pass was several seconds on the build's serial spine.
     let mut wildcard_import_guard: u64 = 0;
-    for (name, ids) in lookups.symbol_table.iter() {
-        let mut h = ValueHasher::new();
-        for id in ids {
-            h.s(id);
-            if let Some(info) = entity_map.get(id) {
-                wildcard_import_guard ^= {
-                    let mut wh = ValueHasher::new();
-                    wh.s(name).s(&info.file_path);
-                    wh.finish()
-                };
+    let symbol_rows: Vec<(&String, u64, u64)> = maybe_par_iter!(lookups.symbol_table)
+        .map(|(name, ids)| {
+            let mut h = ValueHasher::new();
+            let mut guard: u64 = 0;
+            for id in ids {
+                h.s(id);
+                if let Some(info) = entity_map.get(id) {
+                    guard ^= {
+                        let mut wh = ValueHasher::new();
+                        wh.s(name).s(&info.file_path);
+                        wh.finish()
+                    };
+                }
             }
-        }
-        sink.one(Table::SymbolTable, name, h.finish());
+            (name, h.finish(), guard)
+        })
+        .collect();
+    for (name, value, guard) in symbol_rows {
+        wildcard_import_guard ^= guard;
+        sink.one(Table::SymbolTable, name, value);
     }
     for (owner, members) in &lookups.class_members {
         sink.one(Table::ClassMembers, owner, hash_member_list(members));
@@ -3482,15 +3501,20 @@ pub(crate) fn fingerprint_corpus_tables(
     for (owner, members) in &lookups.owner_members {
         sink.one(Table::OwnerMembers, owner, hash_member_list(members));
     }
-    for (id, info) in entity_map {
-        let mut h = ValueHasher::new();
-        h.s(&info.name)
-            .s(&info.entity_type)
-            .s(&info.file_path)
-            .s(info.parent_id.as_deref().unwrap_or("\u{0}"))
-            .u(info.start_line)
-            .u(info.end_line);
-        sink.one(Table::EntityMap, id, h.finish());
+    let entity_rows: Vec<(&EntityId, u64)> = maybe_par_iter!(entity_map)
+        .map(|(id, info)| {
+            let mut h = ValueHasher::new();
+            h.s(&info.name)
+                .s(&info.entity_type)
+                .s(&info.file_path)
+                .s(info.parent_id.as_deref().unwrap_or("\u{0}"))
+                .u(info.start_line)
+                .u(info.end_line);
+            (id, h.finish())
+        })
+        .collect();
+    for (id, value) in entity_rows {
+        sink.one(Table::EntityMap, id, value);
     }
     sink.whole(Table::GuardRustModuleAlias, wildcard_import_guard);
     wildcard_import_guard

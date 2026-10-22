@@ -352,6 +352,12 @@ impl Serialize for TableFingerprints {
 }
 
 impl TableFingerprints {
+    /// Make room for `additional` more keys, so a whole-corpus pass does not
+    /// rehash the table over and over as it grows.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+    }
+
     #[inline]
     pub(crate) fn put(&mut self, key: u64, value: u64) {
         self.entries.insert(key, value);
