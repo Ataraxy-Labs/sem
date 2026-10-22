@@ -18,6 +18,7 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- MCP graph lookups accept nested qualified names and exact entity IDs, and reject ambiguous same-file names. Source-read receipts preserve line endings and final-newline state. Caller JSON reports `total`, `returned`, and `truncated` separately from its semantic completeness verdict (#527).
 - **webpki-roots is now 1.0.10**, picking up the fixed root store for the recently disclosed advisory. The 0.26.11 entry that ureq 2 depends on is a shim that re-exports the 1.x roots, so it uses 1.0.10 too (#525, #526).
 - **`sem_find` with an absolute or `./` path in `file` or `in` finds the entity.** Paths are made relative to the repository first, and a directory scopes callers as it already scoped definitions.
 - **A `sem_find` miss suggests near matches**, accepts `Class.method` and treats function and method as one kind; `text` search honors `in` and `limit`.
