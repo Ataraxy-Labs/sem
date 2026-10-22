@@ -165,6 +165,9 @@ pub fn callers_command(opts: QueryOptions, limit: Option<usize>) {
         let def = &answer.defs[0];
         let row = serde_json::json!({
             "entity": to_row(def),
+            "total": answer.related[0].len() + hidden,
+            "returned": answer.related[0].len(),
+            "truncated": hidden > 0,
             "related": answer.related[0].iter().map(to_row).collect::<Vec<_>>(),
             "complete": verdict.complete,
             "incomplete_because": verdict.incomplete_because,

@@ -712,16 +712,7 @@ impl SemServer {
     /// `Class.method` naturally, and for "function name". Every by-name
     /// lookup shares this so they never disagree about what a query names.
     fn entity_name_matches(graph: &EntityGraph, query: &str, e: &sem_core::parser::graph::EntityInfo) -> bool {
-        let (kind, name) = Self::split_kind(query);
-        kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
-            && (e.name == name
-                || name.rsplit_once('.').is_some_and(|(parent_part, child_part)| {
-                    e.name == child_part
-                        && e.parent_id
-                            .as_ref()
-                            .and_then(|pid| graph.entities.get(pid))
-                            .is_some_and(|p| p.name == parent_part)
-                }))
+        crate::selector::matches(&graph.entities, e, query)
     }
 
     /// Up to five entity names containing the query's bare name (its last
@@ -771,12 +762,18 @@ impl SemServer {
         let entity_name = Self::split_kind(query).1;
         let matches = |e: &sem_core::parser::graph::EntityInfo| Self::entity_name_matches(graph, query, e);
 
-        if let Some(entity) = graph
+        let mut local: Vec<_> = graph
             .entities
             .values()
-            .find(|e| matches(e) && e.file_path == rel_path)
-        {
-            return Ok(entity.id.as_str());
+            .filter(|e| matches(e) && e.file_path == rel_path)
+            .collect();
+        local.sort_by(|a, b| a.start_line.cmp(&b.start_line).then_with(|| a.id.cmp(&b.id)));
+        if local.len() == 1 {
+            return Ok(local[0].id.as_str());
+        }
+        if local.len() > 1 {
+            return Err(format!("Entity '{query}' is ambiguous in '{rel_path}'; use a qualified name or exact ID: {}",
+                local.iter().map(|e| format!("{} (line {})", e.id, e.start_line)).collect::<Vec<_>>().join(", ")));
         }
 
         let mut candidates: Vec<&str> = graph
@@ -2831,7 +2828,7 @@ impl SemServer {
             };
             let total = text.lines().count();
             let (from, to) = range.map(|(a, b)| (a.max(1), b.unwrap_or(total).min(total))).unwrap_or((1, total));
-            let slice: String = text.lines().skip(from.saturating_sub(1)).take(to.saturating_sub(from) + 1).map(|l| format!("{l}\n")).collect();
+            let slice: String = exact_source_lines(&text, from, to);
             let receipt = format!("r:{:08x}", fnv1a_hash(&slice) as u32);
             let key = format!("file\0{rel}\0{}", lines.as_deref().unwrap_or("all"));
             let span = if (from, to) == (1, total) { format!("{total} lines") } else { format!("lines {from}-{to} of {total}") };
@@ -3658,6 +3655,15 @@ impl ServerHandler for SemServer {
     }
 }
 
+/// Preserve exact source bytes for receipt identity, even without a parser.
+fn exact_source_lines(text: &str, from: usize, to: usize) -> String {
+    let from = from.max(1);
+    if to < from {
+        return String::new();
+    }
+    text.split_inclusive('\n').skip(from - 1).take(to - from + 1).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3666,6 +3672,42 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    #[test]
+    fn completeness_source_fallback_preserves_bytes() {
+        let text = "unsupported ☃ syntax\r\nsecond\r\nunterminated";
+        assert_eq!(exact_source_lines(text, 1, 3), text);
+        assert_eq!(exact_source_lines(text, 2, 2), "second\r\n");
+        assert_eq!(exact_source_lines(text, 3, 3), "unterminated");
+        assert_eq!(exact_source_lines(text, 3, 2), "");
+        assert_eq!(exact_source_lines(text, 9, 10), "");
+        assert_eq!(exact_source_lines("", 1, 1), "");
+        assert_ne!(fnv1a_hash(&exact_source_lines("a", 1, 1)), fnv1a_hash(&exact_source_lines("a\n", 1, 1)));
+        assert_ne!(fnv1a_hash(&exact_source_lines("a\n", 1, 1)), fnv1a_hash(&exact_source_lines("a\r\n", 1, 1)));
+    }
+
+    #[test]
+    fn completeness_python_qualified_lookup_and_same_file_ambiguity() {
+        let repo = TempDir::new().unwrap();
+        fs::write(repo.path().join("a.py"), "class Example:\n    def toDict(self):\n        return {}\n\nclass Other:\n    def toDict(self):\n        return {}\n").unwrap();
+        let (graph, _) = EntityGraph::build(repo.path(), &["a.py".into()], &create_default_registry());
+        let selected = SemServer::find_entity_repo_wide(&graph, "Example.toDict").unwrap();
+        assert_eq!(selected.name, "toDict");
+        assert_eq!(SemServer::find_entity_in_graph(&graph, "Example.toDict", "a.py").unwrap(), selected.id.as_str());
+        assert_eq!(SemServer::find_entity_in_graph(&graph, selected.id.as_str(), "a.py").unwrap(), selected.id.as_str());
+        assert!(SemServer::find_entity_in_graph(&graph, "toDict", "a.py").unwrap_err().contains("ambiguous"));
+        assert!(SemServer::find_entity_repo_wide(&graph, "Missing.toDict").is_err());
+    }
+
+    #[test]
+    fn completeness_nested_python_qualification() {
+        let repo = TempDir::new().unwrap();
+        fs::write(repo.path().join("a.py"), "class Outer:\n    class Inner:\n        async def run(self):\n            return 1\n").unwrap();
+        let (graph, _) = EntityGraph::build(repo.path(), &["a.py".into()], &create_default_registry());
+        let entity = SemServer::find_entity_repo_wide(&graph, "Outer.Inner.run").unwrap();
+        assert_eq!(entity.name, "run");
+        assert!(SemServer::find_entity_repo_wide(&graph, "Outer.run").is_err());
+    }
 
     fn git(repo: &TempDir, args: &[&str]) {
         let status = Command::new("git")

@@ -5,6 +5,7 @@ pub mod http;
 pub mod render;
 pub(crate) mod review_protocol;
 pub mod server;
+mod selector;
 #[cfg(unix)]
 mod shared;
 pub mod tools;
