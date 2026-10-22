@@ -2365,7 +2365,16 @@ impl EntityGraph {
         resolve_profile::add_pass1_wall_ns(__pass1_wall_t0.elapsed());
 
         let __assemble_t0 = std::time::Instant::now();
-        let mut all_entities: Vec<SemanticEntity> = Vec::new();
+        // Sized up front: growing by doubling re-copied every entity already
+        // gathered, which on a 2M-entity corpus is a lot of memmove on
+        // the serial spine. Reused entities (warm builds) are not counted, so
+        // this is a lower bound and the vector still grows when it must.
+        let mut all_entities: Vec<SemanticEntity> = Vec::with_capacity(
+            per_file
+                .iter()
+                .map(|product| product.entities.as_ref().map_or(0, Vec::len))
+                .sum(),
+        );
         let mut parsed_files: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
         let mut fresh_precomputed: HashMap<String, scope_resolve::PrecomputedFileFacts> =
             HashMap::default();
@@ -2771,50 +2780,78 @@ impl EntityGraph {
             ));
             symbol_table_plain = symbol_table_owned;
         } else {
-            // Unchanged from before: whole rebuild, single pass over
-            // all_entities for symbol_table/entity_map/entity_ranges, a
-            // second pass (needs entity_map complete) for class/owner
-            // members.
-            let mut symbol_table_owned: SymbolTable =
-                HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
-            let mut owned_entity_map: EntityInfoMap =
-                HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
-            let mut owned_entity_ranges: EntityRanges = HashMap::default();
-            for entity in &all_entities {
-                // No eager `entry(key.clone)`: `entry`
-                // demands an owned key up front, so the old spelling allocated
-                // `name`/`file_path` Strings that were immediately dropped on
-                // every hit — `file_path` once per entity in the file. Same
-                // get_mut/insert idiom `child_line_ranges` above already uses.
-                let interned_id = EntityId::from(entity.id.as_str());
-                match symbol_table_owned.get_mut(entity.name.as_str()) {
-                    Some(bucket) => bucket.push(interned_id.clone()),
-                    None => {
-                        symbol_table_owned.insert(entity.name.clone(), vec![interned_id.clone()]);
+            // Whole rebuild: one pass each over all_entities for
+            // symbol_table/entity_map/entity_ranges, then a second pass
+            // (needs entity_map complete) for class/owner members. The three
+            // first-pass tables are independent, so they are built on three
+            // tasks from ids interned once up front. Each table still sees
+            // entities in `all_entities` order, so bucket order and
+            // last-insert-wins on a colliding id are exactly what one serial
+            // pass produced.
+            let interned_ids: Vec<EntityId> = maybe_par_iter!(all_entities)
+                .map(|entity| EntityId::from(entity.id.as_str()))
+                .collect();
+            let build_symbol_table = || {
+                let mut table: SymbolTable =
+                    HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+                for (entity, interned_id) in all_entities.iter().zip(&interned_ids) {
+                    // No eager `entry(key.clone)`: `entry`
+                    // demands an owned key up front, so the old spelling allocated
+                    // `name`/`file_path` Strings that were immediately dropped on
+                    // every hit — `file_path` once per entity in the file. Same
+                    // get_mut/insert idiom `child_line_ranges` above already uses.
+                    match table.get_mut(entity.name.as_str()) {
+                        Some(bucket) => bucket.push(interned_id.clone()),
+                        None => {
+                            table.insert(entity.name.clone(), vec![interned_id.clone()]);
+                        }
                     }
                 }
-                owned_entity_map.insert(
-                    interned_id.clone(),
-                    EntityInfo {
-                        id: interned_id.clone(),
-                        name: entity.name.clone(),
-                        entity_type: entity.entity_type.clone(),
-                        file_path: entity.file_path.clone(),
-                        parent_id: entity.parent_id.as_ref().map(Into::into),
-                        start_line: entity.start_line,
-                        end_line: entity.end_line,
-                    },
-                );
-                match owned_entity_ranges.get_mut(entity.file_path.as_str()) {
-                    Some(bucket) => bucket.push((entity.start_line, entity.end_line, interned_id)),
-                    None => {
-                        owned_entity_ranges.insert(
-                            entity.file_path.clone(),
-                            vec![(entity.start_line, entity.end_line, interned_id)],
-                        );
+                table
+            };
+            let build_entity_map = || {
+                let mut map: EntityInfoMap =
+                    HashMap::with_capacity_and_hasher(all_entities.len(), Default::default());
+                for (entity, interned_id) in all_entities.iter().zip(&interned_ids) {
+                    map.insert(
+                        interned_id.clone(),
+                        EntityInfo {
+                            id: interned_id.clone(),
+                            name: entity.name.clone(),
+                            entity_type: entity.entity_type.clone(),
+                            file_path: entity.file_path.clone(),
+                            parent_id: entity.parent_id.as_ref().map(Into::into),
+                            start_line: entity.start_line,
+                            end_line: entity.end_line,
+                        },
+                    );
+                }
+                map
+            };
+            let build_entity_ranges = || {
+                let mut ranges: EntityRanges = HashMap::default();
+                for (entity, interned_id) in all_entities.iter().zip(&interned_ids) {
+                    let range = (entity.start_line, entity.end_line, interned_id.clone());
+                    match ranges.get_mut(entity.file_path.as_str()) {
+                        Some(bucket) => bucket.push(range),
+                        None => {
+                            ranges.insert(entity.file_path.clone(), vec![range]);
+                        }
                     }
                 }
-            }
+                ranges
+            };
+            #[cfg(feature = "parallel")]
+            let (mut symbol_table_owned, (owned_entity_map, mut owned_entity_ranges)) =
+                rayon::join(build_symbol_table, || {
+                    rayon::join(build_entity_map, build_entity_ranges)
+                });
+            #[cfg(not(feature = "parallel"))]
+            let (mut symbol_table_owned, (owned_entity_map, mut owned_entity_ranges)) = (
+                build_symbol_table(),
+                (build_entity_map(), build_entity_ranges()),
+            );
+            drop(interned_ids);
             let mut owned_class_members: ClassMembers = HashMap::default();
             let mut owned_owner_members: OwnerMembers = HashMap::default();
             for entity in &all_entities {
