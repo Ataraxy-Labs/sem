@@ -263,7 +263,11 @@ const PARSED_FILE_REUSE_BYTE_LIMIT: u64 = 24 * 1024 * 1024;
 pub fn source_bytes(root: &Path, file_paths: &[String]) -> u64 {
     file_paths
         .iter()
-        .map(|f| std::fs::metadata(root.join(f)).map(|m| m.len()).unwrap_or(0))
+        .map(|f| {
+            std::fs::metadata(root.join(f))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
         .sum()
 }
 
@@ -2846,9 +2850,8 @@ impl EntityGraph {
             // instead of one after another on the build's serial spine.
             // Every bucket is sorted by a total order (or stably, from the
             // same push order), so the result does not depend on scheduling.
-            let sort_symbols = || {
-                sort_symbol_table_targets_by_source(&mut symbol_table_owned, &owned_entity_map)
-            };
+            let sort_symbols =
+                || sort_symbol_table_targets_by_source(&mut symbol_table_owned, &owned_entity_map);
             // same canonical (file_path, start_line, end_line, id)
             // tie-break as `symbol_table`, made explicit here instead of
             // relying on `all_entities` already being in file-path order
@@ -2873,7 +2876,11 @@ impl EntityGraph {
             let (owned_child_ranges, _) =
                 rayon::join(child_ranges, || rayon::join(sort_symbols, sort_members));
             #[cfg(not(feature = "parallel"))]
-            let (owned_child_ranges, _) = (child_ranges(), (sort_symbols(), sort_members()));
+            let (owned_child_ranges, _) = {
+                let mut sort_symbols = sort_symbols;
+                let mut sort_members = sort_members;
+                (child_ranges(), (sort_symbols(), sort_members()))
+            };
             // Prime the carry for a future non-retain build to maintain
             // incrementally, if this build is itself a non-retain session
             // build that took the whole-rebuild path (unprimed carry, first

@@ -14,6 +14,8 @@ All notable changes to sem are documented in this file.
 
 ### Changed
 
+- Cold graph builds move reusable lookup tables instead of cloning them and sort independent lookup buckets in parallel. Sequential builds retain the same behavior without requiring Rayon.
+
 - **`sem_find` with mode `callers` gives the CLI's answer.** It says when the static graph cannot prove the caller set is complete, lists possible callers, and merges dispatch groups, where it used to print `callers: none` either way. Its JSON is now the shape `sem callers --json` prints (`entity`, `related`, `complete`, `incomplete_because`).
 
 ### Fixed

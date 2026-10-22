@@ -115,9 +115,15 @@ pub fn search(
     // Trigram candidate derivation and the membership sweep touch disjoint
     // sections (NAMES-adjacent TRIGRAM postings vs. FILES/DIRS), so they run
     // concurrently — same discipline `commands::query::index_answer` uses.
+    #[cfg(feature = "parallel")]
     let ((candidates, origin), complete) = rayon::join(
         || candidate_files(idx, pattern, opts.case_insensitive),
         || complete_check(idx, root, walk_subtree),
+    );
+    #[cfg(not(feature = "parallel"))]
+    let ((candidates, origin), complete) = (
+        candidate_files(idx, pattern, opts.case_insensitive),
+        complete_check(idx, root, walk_subtree),
     );
 
     // Unlike `commands::query`'s entity verbs, grep has no cheaper
