@@ -612,11 +612,32 @@ fn callers_lists_direct_callers_and_honors_limit() {
         json!({"query": "target_fn", "format": "json", "limit": 1}),
     );
     let out: Value = serde_json::from_str(&tool_text(&resp)).expect("capped callers json");
+    assert_eq!(out[0]["total"], 2);
+    assert_eq!(out[0]["returned"], 1);
+    assert_eq!(out[0]["truncated"], true);
     assert_eq!(
         out[0]["related"].as_array().unwrap().len(),
         1,
         "limit caps the caller rows: {out}"
     );
+}
+
+#[test]
+fn completeness_find_and_callers_share_qualified_selector() {
+    let repo = callers_fixture();
+    std::fs::write(repo.path().join("src/classes.py"),
+        "class Example:\n    def toDict(self):\n        return {}\n\nclass Other:\n    def toDict(self):\n        return {}\n").unwrap();
+    git(repo.path(), &["add", "src/classes.py"]);
+    let mut client = McpClient::spawn(repo.path());
+    let resp = client.call_tool("sem_find", json!({"query":"Example.toDict", "format":"json"}));
+    let defs: Value = serde_json::from_str(&tool_text(&resp)).unwrap();
+    assert_eq!(defs.as_array().unwrap().len(), 1);
+    let resp = client.call_tool("sem_callers", json!({"query":"Example.toDict", "format":"json"}));
+    let callers: Value = serde_json::from_str(&tool_text(&resp)).unwrap();
+    assert_eq!(callers[0]["entity"]["id"], defs[0]["id"]);
+    let resp = client.call_tool("sem_find", json!({"query":defs[0]["id"], "format":"json"}));
+    let exact: Value = serde_json::from_str(&tool_text(&resp)).unwrap();
+    assert_eq!(exact[0]["id"], defs[0]["id"]);
 }
 
 #[test]
