@@ -15,7 +15,7 @@ All notable changes to sem are documented in this file.
 ### Changed
 
 - Cold graph builds move reusable lookup tables instead of cloning them and sort independent lookup buckets in parallel. Sequential builds retain the same behavior without requiring Rayon.
-
+- **Cold index builds on large repos are about a fifth faster.** A first `sem graph` on the Linux kernel (2.35M entities) went from 49.5 s to 38.6 s, and on kubernetes (545k entities) from 12.5 s to 10.0 s, on an 8 vCPU machine, with peak memory within 2%. The build had long single-threaded stretches. Along with the lookup-table change above, corpus fingerprints are hashed in parallel, independent index sections and lookup tables are built side by side, and large frees and the two facts saves no longer hold up the command. The graph and the index file are byte-identical to before.
 - **`sem_find` with mode `callers` gives the CLI's answer.** It says when the static graph cannot prove the caller set is complete, lists possible callers, and merges dispatch groups, where it used to print `callers: none` either way. Its JSON is now the shape `sem callers --json` prints (`entity`, `related`, `complete`, `incomplete_because`).
 
 ### Fixed
