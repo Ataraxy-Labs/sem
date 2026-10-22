@@ -796,6 +796,11 @@ pub type EntityAdjacencyMap = HashMap<EntityId, Vec<EntityId>>;
 pub type SymbolTable = HashMap<String, Vec<EntityId>>;
 
 fn sort_symbol_table_targets_by_source(symbol_table: &mut SymbolTable, entity_map: &EntityInfoMap) {
+    #[cfg(feature = "parallel")]
+    symbol_table
+        .par_iter_mut()
+        .for_each(|(_, target_ids)| sort_one_symbol_table_bucket(target_ids, entity_map));
+    #[cfg(not(feature = "parallel"))]
     for target_ids in symbol_table.values_mut() {
         sort_one_symbol_table_bucket(target_ids, entity_map);
     }
@@ -916,10 +921,15 @@ fn sort_members_bucket_by_source(members: &mut Vec<MemberTarget>, entity_map: &E
 /// neither was a *stated*, enforced invariant — see
 /// "Resolver tie-break contract" section for the measured effect of making
 /// it one.
-fn sort_all_member_buckets_by_source<K>(
+fn sort_all_member_buckets_by_source<K: Eq + std::hash::Hash + Sync>(
     buckets: &mut HashMap<K, Vec<MemberTarget>>,
     entity_map: &EntityInfoMap,
 ) {
+    #[cfg(feature = "parallel")]
+    buckets
+        .par_iter_mut()
+        .for_each(|(_, members)| sort_members_bucket_by_source(members, entity_map));
+    #[cfg(not(feature = "parallel"))]
     for members in buckets.values_mut() {
         sort_members_bucket_by_source(members, entity_map);
     }
@@ -940,6 +950,11 @@ fn sort_all_member_buckets_by_source<K>(
 /// this sorted order wins) instead of an unstated by-product of whichever
 /// order entities happened to be discovered in.
 fn sort_all_entity_ranges_by_source(ranges_by_file: &mut EntityRanges) {
+    #[cfg(feature = "parallel")]
+    ranges_by_file
+        .par_iter_mut()
+        .for_each(|(_, ranges)| ranges.sort_unstable());
+    #[cfg(not(feature = "parallel"))]
     for ranges in ranges_by_file.values_mut() {
         ranges.sort_unstable();
     }
@@ -2635,6 +2650,10 @@ impl EntityGraph {
         // corpus — see `maintain_entity_lookups_incremental`'s doc comment.
         let use_incremental_lookups =
             inc.is_some() && !retain_parsed_files && *carry_entity_lookups_primed;
+        // Whether the tables built below end up in the carry after this build:
+        // always on the incremental path, and on a non-retain session build's
+        // whole rebuild, which primes the carry for the next one.
+        let reclaim_lookups = inc.is_some() && !retain_parsed_files;
 
         // Pass A (borrowed half): lookups that borrow `&str` out of
         // `all_entities` and so must be rebuilt every build regardless of
@@ -2821,7 +2840,15 @@ impl EntityGraph {
                     }
                 }
             }
-            sort_symbol_table_targets_by_source(&mut symbol_table_owned, &owned_entity_map);
+            // The four bucket sorts below and the child-range index are
+            // independent of each other (each writes one table and reads only
+            // `owned_entity_map`/`all_entities`), so they run side by side
+            // instead of one after another on the build's serial spine.
+            // Every bucket is sorted by a total order (or stably, from the
+            // same push order), so the result does not depend on scheduling.
+            let sort_symbols = || {
+                sort_symbol_table_targets_by_source(&mut symbol_table_owned, &owned_entity_map)
+            };
             // same canonical (file_path, start_line, end_line, id)
             // tie-break as `symbol_table`, made explicit here instead of
             // relying on `all_entities` already being in file-path order
@@ -2831,25 +2858,34 @@ impl EntityGraph {
             // build's `maintain_entity_lookups_incremental` (which re-sorts
             // only the buckets it touches) starts from an already-canonical
             // baseline.
-            sort_all_member_buckets_by_source(&mut owned_class_members, &owned_entity_map);
-            sort_all_member_buckets_by_source(&mut owned_owner_members, &owned_entity_map);
-            sort_all_entity_ranges_by_source(&mut owned_entity_ranges);
+            let sort_members = || {
+                sort_all_member_buckets_by_source(&mut owned_class_members, &owned_entity_map);
+                sort_all_member_buckets_by_source(&mut owned_owner_members, &owned_entity_map);
+                sort_all_entity_ranges_by_source(&mut owned_entity_ranges);
+            };
+            let child_ranges = || {
+                let __lookup_child_ranges_t0 = std::time::Instant::now();
+                let ranges = build_child_ranges_by_parent(&all_entities);
+                resolve_profile::add_lookup_child_ranges_ns(__lookup_child_ranges_t0.elapsed());
+                ranges
+            };
+            #[cfg(feature = "parallel")]
+            let (owned_child_ranges, _) =
+                rayon::join(child_ranges, || rayon::join(sort_symbols, sort_members));
+            #[cfg(not(feature = "parallel"))]
+            let (owned_child_ranges, _) = (child_ranges(), (sort_symbols(), sort_members()));
             // Prime the carry for a future non-retain build to maintain
             // incrementally, if this build is itself a non-retain session
             // build that took the whole-rebuild path (unprimed carry, first
-            // non-retain build, or a coarse guard). One `O(corpus)` clone —
-            // the same order of cost this whole rebuild already paid — not
-            // paid again until the next un-priming event (see above).
-            let __lookup_child_ranges_t0 = std::time::Instant::now();
-            let owned_child_ranges = build_child_ranges_by_parent(&all_entities);
-            resolve_profile::add_lookup_child_ranges_ns(__lookup_child_ranges_t0.elapsed());
-            if inc.is_some() && !retain_parsed_files {
-                *carry_symbol_table = symbol_table_owned.clone();
-                *carry_entity_map = owned_entity_map.clone();
-                *carry_class_members = owned_class_members.clone();
-                *carry_owner_members = owned_owner_members.clone();
-                *carry_entity_ranges = owned_entity_ranges.clone();
-                *carry_child_ranges = owned_child_ranges.clone();
+            // non-retain build, or a coarse guard). Nothing below mutates
+            // these tables, so instead of cloning them here they are moved
+            // into the carry once resolution is done with them (the same
+            // reclaim the incremental path uses, below). `entity_map` needs
+            // no copy at all: the session takes it back from `graph.entities`.
+            // The clones this replaces were six whole-corpus copies on the
+            // serial critical path of every large cold build.
+            if reclaim_lookups {
+                *carry_entity_map = HashMap::default();
                 *carry_entity_lookups_primed = true;
             }
             symbol_table_plain = symbol_table_owned;
@@ -3224,15 +3260,18 @@ impl EntityGraph {
         // fields back into the session so the *next* build's incremental
         // maintenance has them, instead of letting them drop with the
         // struct. Only meaningful when this build itself used the
-        // incremental path — the whole-rebuild branch already wrote a copy
-        // into carry directly, before `pre_built` ever took ownership.
-        if use_incremental_lookups {
+        // incremental path or primed the carry on a whole rebuild.
+        if reclaim_lookups {
             let scope_resolve::PreBuiltLookups {
+                symbol_table: pre_built_symbol_table,
                 class_members: reclaimed_class_members,
                 owner_members: reclaimed_owner_members,
                 entity_ranges: reclaimed_entity_ranges,
                 ..
             } = pre_built;
+            // Drop the second `Arc` handle now, not at the end of scope, so
+            // the `try_unwrap` below gets the table without a clone.
+            drop(pre_built_symbol_table);
             *carry_class_members = reclaimed_class_members;
             *carry_owner_members = reclaimed_owner_members;
             *carry_entity_ranges = reclaimed_entity_ranges;
@@ -3289,7 +3328,7 @@ impl EntityGraph {
         // is a conservative safety net only, so a bug that adds another
         // clone somewhere between here and the top of this function
         // degrades to "as slow as before" rather than a panic.
-        if use_incremental_lookups {
+        if reclaim_lookups {
             *carry_symbol_table = match Arc::try_unwrap(symbol_table) {
                 Ok(map) => map,
                 Err(arc) => (*arc).clone(),
