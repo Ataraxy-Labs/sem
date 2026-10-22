@@ -90,6 +90,7 @@ pub fn graph_command(opts: GraphOptions) {
         );
     }
     timings.finish();
+    drop_in_background(graph);
 }
 
 /// Format a count with thousands separators (1234 -> "1,234"), uv-style.
@@ -419,14 +420,25 @@ fn build_graph_with_facts_store(
     // Best-effort: a save failure (permissions, disk full, read-only cache
     // dir) must never fail the build this function exists to produce. The
     // store is a pure speed optimization — the next process just stays cold.
-    let __facts_save_t0 = std::time::Instant::now();
-    let _ = store.save(root, &exported);
-    crate::build_cache::cache_profile_mark("facts_store_save", __facts_save_t0);
-    let __facts_corpus_t0 = std::time::Instant::now();
-    if let Some(corpus) = &corpus {
-        let _ = corpus.populate_delta(local_hashes.as_ref(), &exported, registry);
-    }
-    crate::build_cache::cache_profile_mark("facts_corpus_populate_delta", __facts_corpus_t0);
+    //
+    // The per-repo store and the machine-global corpus are separate
+    // directories written from the same read-only snapshot, so the two saves
+    // run side by side rather than one after the other.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let __facts_corpus_t0 = std::time::Instant::now();
+            if let Some(corpus) = &corpus {
+                let _ = corpus.populate_delta(local_hashes.as_ref(), &exported, registry);
+            }
+            crate::build_cache::cache_profile_mark(
+                "facts_corpus_populate_delta",
+                __facts_corpus_t0,
+            );
+        });
+        let __facts_save_t0 = std::time::Instant::now();
+        let _ = store.save(root, &exported);
+        crate::build_cache::cache_profile_mark("facts_store_save", __facts_save_t0);
+    });
     facts_rss_mark("after_populate_delta");
     session.into_parts()
 }
@@ -876,7 +888,7 @@ pub fn get_or_build_graph_topology_with_timings(
     } else {
         CacheMissSavePolicy::IndexOnly
     };
-    let (graph, _entities) = get_or_build_graph_with_cache_policy(
+    let (graph, entities) = get_or_build_graph_with_cache_policy(
         root,
         file_paths,
         registry,
@@ -885,7 +897,20 @@ pub fn get_or_build_graph_topology_with_timings(
         source_scope,
         timings,
     );
+    drop_in_background(entities);
     graph
+}
+
+/// Free a large build product on a detached thread. Dropping millions of
+/// entities (every one owning several strings) takes seconds on a giant repo,
+/// and nothing waits on the memory coming back; a short-lived CLI process
+/// simply exits around the thread.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    // If the thread cannot be spawned the closure, and the value with it, is
+    // dropped right here, exactly as before.
+    let _ = std::thread::Builder::new()
+        .name("sem-drop".into())
+        .spawn(move || drop(value));
 }
 
 pub fn get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
