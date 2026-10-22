@@ -24,6 +24,7 @@ pub mod qualified;
 pub mod query;
 pub mod read;
 pub mod tool_hook;
+pub mod follow_through;
 pub(crate) mod region;
 pub mod repos;
 pub(crate) mod review;
@@ -604,4 +605,29 @@ mod tests {
         assert_eq!(normalized, "missing/foo.py");
         fs::remove_dir_all(temp).expect("remove temp dir");
     }
+}
+
+/// Environment variables that set per-command defaults for CLI flags
+/// (`SEM_DIFF_FORMAT=markdown` acts like `sem diff --format markdown`). sem
+/// clears them when it runs itself, so its own output stays the shape it parses.
+pub(crate) const CLI_DEFAULT_ENV: &[&str] = &[
+    "SEM_DIFF_FORMAT",
+    "SEM_DIFF_VERBOSE",
+    "SEM_DIFF_NO_COSMETICS",
+    "SEM_DIFF_COLOR",
+    "SEM_DIFF_FILE_EXTS",
+    "SEM_IMPACT_FORMAT",
+    "SEM_IMPACT_DEPTH",
+    "SEM_IMPACT_FILE_EXTS",
+    "SEM_FIND_JSON",
+    "SEM_GREP_JSON",
+    "SEM_GREP_IGNORE_CASE",
+];
+
+/// Clears [`CLI_DEFAULT_ENV`] from a command that runs sem itself.
+pub(crate) fn without_cli_defaults(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for var in CLI_DEFAULT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
 }

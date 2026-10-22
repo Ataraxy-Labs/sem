@@ -51,8 +51,15 @@ impl McpClient {
     }
 
     fn spawn_with_probe(repo: &Path, probe: Option<Value>) -> Self {
+        // Verbs the server answers by running `sem` find this build's CLI.
+        let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_sem-mcp")).parent().unwrap().to_path_buf();
+        let path = std::env::join_paths(
+            std::iter::once(bin_dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )
+        .unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_sem-mcp"))
             .current_dir(repo)
+            .env("PATH", path)
             // These tests exercise one isolated stdio server each.
             .env("SEM_MCP_NO_SHARED", "1")
             .stdin(Stdio::piped())
@@ -542,10 +549,13 @@ fn tool_error_text(resp: &Value) -> String {
         Some(&Value::Bool(true)),
         "expected a tool-level error: {result}"
     );
-    result["content"][0]["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("tool result content[0] is not text: {result}"))
-        .to_string()
+    result["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tool result has no content: {result}"))
+        .iter()
+        .filter_map(|c| c["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A repo where `target_fn` has exactly two same-file callers and
@@ -588,12 +598,14 @@ fn callers_lists_direct_callers_and_honors_limit() {
         json!({"query": "target_fn", "format": "json"}),
     );
     let out: Value = serde_json::from_str(&tool_text(&resp)).expect("callers json");
+    let out = &out[0];
     assert_eq!(out["entity"]["name"], "target_fn");
     assert_eq!(
-        out["callers"].as_array().unwrap().len(),
+        out["related"].as_array().unwrap().len(),
         2,
         "both direct callers listed: {out}"
     );
+    assert!(out.get("complete").is_some(), "the CLI's completeness verdict: {out}");
 
     let resp = client.call_tool(
         "sem_callers",
@@ -601,7 +613,7 @@ fn callers_lists_direct_callers_and_honors_limit() {
     );
     let out: Value = serde_json::from_str(&tool_text(&resp)).expect("capped callers json");
     assert_eq!(
-        out["callers"].as_array().unwrap().len(),
+        out[0]["related"].as_array().unwrap().len(),
         1,
         "limit caps the caller rows: {out}"
     );
@@ -625,7 +637,7 @@ fn callers_refuses_ambiguous_names_with_the_candidate_list() {
         json!({"query": "dup_name", "file": "src/dup.py", "format": "json"}),
     );
     let out: Value = serde_json::from_str(&tool_text(&resp)).expect("disambiguated json");
-    assert_eq!(out["entity"]["file"], "src/dup.py");
+    assert_eq!(out[0]["entity"]["file"], "src/dup.py");
 }
 
 // ── format:"json" on the entities text-search and query-ranking shapes ──

@@ -863,7 +863,7 @@ fn try_index_impact_transitive(opts: &ImpactOptions, timings: &mut Timings) -> b
 /// only representational change is that `visited` keys on the entity's index
 /// rather than its id string, which cannot affect ordering: it is the same
 /// set membership test, just cheaper.
-fn index_impact_ids(
+pub(crate) fn index_impact_ids(
     idx: &index::QueryIndex,
     at: usize,
     max_depth: usize,

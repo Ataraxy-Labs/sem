@@ -1698,8 +1698,14 @@ fn run_diff_pipeline(
             OutputFormat::Json => {
                 println!("{}", format_json(&DiffResult::default(), &[]));
             }
-            _ => {
-                println!("\x1b[2mNo semantic changes detected.\x1b[0m");
+            // Dimmed only where color is on, like every other terminal line;
+            // plain and markdown output never carry escape codes.
+            OutputFormat::Terminal => {
+                use colored::Colorize;
+                println!("{}", "No semantic changes detected.".dimmed());
+            }
+            OutputFormat::Plain | OutputFormat::Markdown => {
+                println!("No semantic changes detected.");
             }
         }
         timings.finish();

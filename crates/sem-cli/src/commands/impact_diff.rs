@@ -90,6 +90,8 @@ pub fn impact_diff_command(opts: ImpactDiffOptions) -> Result<(), Box<dyn std::e
     let mut missing = 0usize;
     for id in ids {
         let mut cmd = std::process::Command::new(&exe);
+        // The child gets the options this run resolved, not the shell's defaults.
+        super::without_cli_defaults(&mut cmd);
         // The parent run already counted itself and checked for updates.
         cmd.current_dir(&root)
             .env("SEM_NO_TELEMETRY", "1")

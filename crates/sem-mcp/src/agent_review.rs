@@ -79,7 +79,7 @@ impl AgentReviewConfig {
             .or_else(|| creds.as_ref().map(|c| c.api_key.clone()))
             .ok_or_else(|| {
                 "No sem-cloud API key found. Set SEM_API_KEY (or SEM_CLOUD_URL) in the \
-                 environment, or run `sem login` to write ~/.sem/credentials.json."
+                 environment, or run `sem cloud login` to write ~/.sem/credentials.json."
                     .to_string()
             })?;
 

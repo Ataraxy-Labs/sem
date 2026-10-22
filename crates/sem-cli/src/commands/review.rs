@@ -49,7 +49,7 @@ pub(crate) fn listen(
     client.manifest(&diff_id).map_err(|e| {
         format!(
             "Could not find review '{diff_id}' on {} — {e}\n\
-             Check the diff id/URL, and that SEM_CLOUD_URL/SEM_API_KEY (or `sem login`) point at \
+             Check the diff id/URL, and that SEM_CLOUD_URL/SEM_API_KEY (or `sem cloud login`) point at \
              the right sem-cloud account.",
             config.base_url
         )
@@ -73,7 +73,7 @@ pub(crate) fn listen(
         return Err(format!(
             "`claude` was not found on PATH. Install the Claude Code CLI first \
              (https://code.claude.com/docs/en/get-started), then re-run:\n  \
-             sem review listen {diff_id_or_url}"
+             sem cloud review listen {diff_id_or_url}"
         )
         .into());
     }

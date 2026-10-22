@@ -160,7 +160,7 @@ bun pm trust @ataraxy-labs/sem
 Once installed, update to the latest release any time:
 
 ```bash
-sem update
+sem config update
 ```
 
 Or via cargo, from [crates.io](https://crates.io/crates/sem-cli):
@@ -455,7 +455,7 @@ sem config setup
 
 Now `git diff` shows entity-level changes instead of line-level. No prompts, no agent configuration needed. Everything that calls `git diff` gets sem output automatically. Also installs a pre-commit hook that shows entity-level blast radius of staged changes.
 
-On macOS and Linux, `sem config setup` also registers a Claude Code `UserPromptSubmit` hook (`sem hook prompt-submit`) for prompt-time context injection. It edits `~/.claude/settings.json` idempotently, backs it up first, and leaves any hooks you already have untouched.
+On macOS and Linux, `sem config setup` also registers a Claude Code `UserPromptSubmit` hook (`sem hook prompt-submit`) for prompt-time context injection, and `sem hook tool` around the Edit, Write and MultiEdit tools. After each edit that hook tells the agent which sibling implementations of a changed method it did not touch, which callers still use a signature it just changed, and which tests reach the change, with a command to run them; it stays silent when there is nothing to say. It edits `~/.claude/settings.json` idempotently, backs it up first, and leaves any hooks you already have untouched.
 
 To disable and go back to normal git diff (also removes the session hooks):
 

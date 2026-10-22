@@ -19,7 +19,7 @@ sem-core = { path = "../sem-core", version = "0.28.1", features = ["disk-cache",
 sem-mcp = { path = "../sem-mcp", version = "0.28.1" }
 sem-cloud-client = { path = "../sem-cloud-client", version = "0.28.1" }
 serde = { version = "1", features = ["derive"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 colored = "2"
 similar = "2"
 git2 = { version = "0.20", default-features = false }

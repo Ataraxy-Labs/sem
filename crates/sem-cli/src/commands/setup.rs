@@ -193,8 +193,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &Outcome::Done("aliased globally".into()),
     );
 
-    // Step 2 — the Claude Code session hook: registers `sem hook prompt-submit`
-    // as a UserPromptSubmit hook. (This used to also install a SessionStart
+    // Step 2 — the Claude Code session hooks: registers `sem hook prompt-submit`
+    // as a UserPromptSubmit hook, and `sem hook tool` around the edit tools
+    // (Pre: snapshot the file, Post: the edit follow-through). (This used to also install a SessionStart
     // hook that forked `sem mcp --resident` detached on every session; that
     // resident server was deleted, so the hook was
     // forking a no-op process per session for no benefit. Removed here.)
@@ -275,11 +276,14 @@ fn claude_settings_path() -> PathBuf {
 /// `mcp --resident` (see `add_session_hooks`), but the substring stays here
 /// so `sem unsetup` still recognizes and removes a SessionStart hook left
 /// behind by an older `sem setup` run. These substrings are sem-specific (no
-/// other tool ships `mcp --resident` or `hook prompt-submit`), so matching
+/// other tool ships `mcp --resident`, `hook prompt-submit` or `hook tool`), so matching
 /// them will not remove a user's unrelated hooks.
 fn is_sem_hook_command(cmd: &str) -> bool {
-    cmd.contains("mcp --resident") || cmd.contains("hook prompt-submit")
+    cmd.contains("mcp --resident") || cmd.contains("hook prompt-submit") || cmd.contains("hook tool")
 }
+
+/// The edit tools `sem hook tool` follows through on.
+const EDIT_TOOLS: &str = "Edit|Write|MultiEdit";
 
 /// True if a Claude Code hook entry is one sem installed (any of its `hooks`
 /// commands is a sem hook command).
@@ -307,7 +311,13 @@ fn entry_is_sem_hook(entry: &Value) -> bool {
 /// backward compatibility, so installing a hook that runs it would fork a
 /// process that does nothing, once per session, for every user who runs
 /// `sem setup` from here on.
-fn add_session_hooks(root: &mut Value, prompt_cmd: &str) -> usize {
+///
+/// Also installs `sem hook tool` (`tool_cmd`) for the edit tools as a
+/// `PreToolUse` hook (it snapshots the file) and a `PostToolUse` hook (the
+/// edit follow-through: untouched twins, stranded callers, tests to run).
+/// An event that already runs a sem hook (say the full `.*` tool router) is
+/// left as it is.
+fn add_session_hooks(root: &mut Value, prompt_cmd: &str, tool_cmd: &str) -> usize {
     let Some(obj) = root.as_object_mut() else {
         return 0;
     };
@@ -316,17 +326,21 @@ fn add_session_hooks(root: &mut Value, prompt_cmd: &str) -> usize {
         return 0;
     };
 
-    let prompt = hooks.entry("UserPromptSubmit").or_insert_with(|| json!([]));
-    let Some(arr) = prompt.as_array_mut() else {
-        return 0;
-    };
-    if arr.iter().any(entry_is_sem_hook) {
-        return 0;
+    let mut added = 0;
+    for (event, entry) in [
+        ("UserPromptSubmit", json!({ "hooks": [{ "type": "command", "command": prompt_cmd }] })),
+        ("PreToolUse", json!({ "matcher": EDIT_TOOLS, "hooks": [{ "type": "command", "command": tool_cmd }] })),
+        ("PostToolUse", json!({ "matcher": EDIT_TOOLS, "hooks": [{ "type": "command", "command": tool_cmd }] })),
+    ] {
+        let Some(arr) = hooks.entry(event).or_insert_with(|| json!([])).as_array_mut() else {
+            continue;
+        };
+        if !arr.iter().any(entry_is_sem_hook) {
+            arr.push(entry);
+            added += 1;
+        }
     }
-    arr.push(json!({
-        "hooks": [{ "type": "command", "command": prompt_cmd }]
-    }));
-    1
+    added
 }
 
 /// Remove only the sem-installed session hooks from a parsed settings object,
@@ -343,7 +357,7 @@ fn remove_session_hooks(root: &mut Value) -> bool {
         let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
             return false;
         };
-        for key in ["SessionStart", "UserPromptSubmit"] {
+        for key in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"] {
             let mut now_empty = false;
             if let Some(arr) = hooks.get_mut(key).and_then(|a| a.as_array_mut()) {
                 let before = arr.len();
@@ -374,6 +388,7 @@ fn install_session_hooks() -> Outcome {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "sem".to_string());
     let prompt = format!("{sem} hook prompt-submit");
+    let tool = format!("{sem} hook tool");
 
     let path = claude_settings_path();
 
@@ -406,7 +421,7 @@ fn install_session_hooks() -> Outcome {
         }
     }
 
-    let added = add_session_hooks(&mut root, &prompt);
+    let added = add_session_hooks(&mut root, &prompt, &tool);
     if added == 0 {
         return Outcome::Done("already installed".into());
     }
@@ -418,7 +433,7 @@ fn install_session_hooks() -> Outcome {
     }
     match serde_json::to_string_pretty(&root) {
         Ok(s) if fs::write(&path, format!("{s}\n")).is_ok() => {
-            Outcome::Done("prompt-submit hook installed".into())
+            Outcome::Done("prompt-submit and edit follow-through hooks installed".into())
         }
         _ => Outcome::Warn("couldn't write settings.json — skipped".into()),
     }
@@ -472,8 +487,9 @@ mod session_hook_tests {
                 ]
             }
         });
-        let n = add_session_hooks(&mut root, "sem hook prompt-submit");
-        assert_eq!(n, 1, "the prompt hook is added on a fresh config");
+        let n = add_session_hooks(&mut root, "sem hook prompt-submit", "sem hook tool");
+        assert_eq!(n, 3, "the prompt hook and both edit hooks are added on a fresh config");
+        assert_eq!(root["hooks"]["PostToolUse"][0]["matcher"], "Edit|Write|MultiEdit");
         assert_eq!(root["model"], "opus", "unrelated keys preserved");
         assert_eq!(
             root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -483,7 +499,7 @@ mod session_hook_tests {
             root["hooks"].get("SessionStart").is_none(),
             "no SessionStart hook is installed (mcp --resident is a dead no-op)"
         );
-        let n2 = add_session_hooks(&mut root, "sem hook prompt-submit");
+        let n2 = add_session_hooks(&mut root, "sem hook prompt-submit", "sem hook tool");
         assert_eq!(n2, 0, "second install adds nothing (idempotent)");
     }
 
@@ -496,7 +512,7 @@ mod session_hook_tests {
                 ]
             }
         });
-        add_session_hooks(&mut root, "sem hook prompt-submit");
+        add_session_hooks(&mut root, "sem hook prompt-submit", "sem hook tool");
         assert!(remove_session_hooks(&mut root));
         assert_eq!(
             root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo hi",
@@ -509,7 +525,7 @@ mod session_hook_tests {
     #[test]
     fn add_then_remove_roundtrips_to_no_hooks() {
         let mut root = json!({});
-        add_session_hooks(&mut root, "a hook prompt-submit");
+        add_session_hooks(&mut root, "a hook prompt-submit", "a hook tool");
         remove_session_hooks(&mut root);
         assert!(
             root.as_object().unwrap().get("hooks").is_none(),

@@ -614,7 +614,7 @@ fn find_entity<'a>(
     // agent can act on (re-query with a qualified `Parent::name`, --file, or
     // --entity-id). This is the "never miss silently" contract.
     println!(
-        "'{}' is ambiguous ({} matches). Re-run `sem context` on one of these (use a qualified name, --file, or --entity-id):",
+        "'{}' is ambiguous ({} matches). Re-run `sem find --context` on one of these (use a qualified name, --file, or --entity-id):",
         name,
         matching.len()
     );

@@ -11,71 +11,101 @@ Git tracks lines. Developers think in functions. sem bridges the gap.
 ## Install
 
 ```
+curl -fsSL https://raw.githubusercontent.com/Ataraxy-Labs/sem/main/install.sh | sh
 brew install sem-cli
+npm install --save-dev @ataraxy-labs/sem
+cargo install sem-cli
 ```
 
-Or build from source:
-```
-git clone https://github.com/Ataraxy-Labs/sem
-cd sem/crates && cargo install --path sem-cli
-```
-
-Binary at `crates/target/release/sem`.
+Update with `sem config update`.
 
 ## Commands
 
-### sem diff
-Entity-level diff. Shows which functions/classes were added, modified, deleted, or renamed. Distinguishes cosmetic changes (whitespace/formatting) from structural changes (logic).
+Four questions, four verbs, plus diff, graph and history. Every verb takes `--json`, and `sem <verb> --help` shows each flag with an example.
 
+### sem find: where is it?
 ```
-sem diff                          # working changes
-sem diff --staged                 # staged only
-sem diff --commit abc1234         # specific commit
-sem diff --from HEAD~5 --to HEAD  # commit range
-sem diff file1.ts file2.ts       # compare two files (no git needed)
-sem diff --format json            # JSON output for agents/CI
-sem diff --format plain           # git-status style
-sem diff --format markdown        # markdown tables
-sem diff --stdin --format json    # read file changes from stdin
-sem diff --file-exts .py .rs      # filter by extension
-sem diff -v                       # verbose inline content diffs
+sem find parseConfig                  # where parseConfig is defined
+sem find parseConfig loadEnv          # several names in one call
+sem find parseConfig --callers        # who calls it (exact, or marked incomplete)
+sem find parseConfig --refs           # what it calls and references
+sem find parseConfig --context        # its code plus callers and callees, in a token budget
+sem find --in src/config.ts           # every entity in a file or directory
 ```
 
-### sem blame
-Entity-level blame. Who last modified each function/class, not each line.
-
+### sem grep: where does this text appear?
 ```
-sem blame src/auth.ts
-sem blame src/auth.ts --json
-```
-
-### sem graph
-Cross-file entity dependency graph. Shows what each function calls and what calls it.
-
-```
-sem graph
-sem graph --entity validateToken
-sem graph --file-exts .py
-sem graph --format json
-sem graph --no-default-excludes
+sem grep 'retry budget'               # rg-style file:line:text
+sem grep -i todo src/                 # case-insensitive, under src/
+sem grep -e foo -e bar --json         # two patterns, hits kept apart
 ```
 
-### sem impact
-Transitive impact analysis. If this entity changes, what else is affected? BFS through dependency graph.
+### sem impact: what does my change touch?
+```
+sem impact parseConfig                # dependents, dependencies and tests it reaches
+sem impact parseConfig --tests        # only the tests to run
+sem impact --diff HEAD --tests        # tests for the uncommitted change
+sem impact parseConfig --depth 0      # unlimited transitive depth (default 2)
+```
+
+### sem check: is it correct?
+```
+sem check                             # every checker the project has
+sem check --base origin/main          # against origin/main instead of HEAD
+sem check --json                      # one JSON object with a verification certificate
+```
+
+### sem certify: what should a human review?
+```
+sem certify main..HEAD                # the review certificate for a commit range
+sem certify main..HEAD --arch         # the architecture view
+```
+
+### sem diff: which functions and classes changed?
+Distinguishes cosmetic changes (whitespace, formatting, comments) from structural ones.
+```
+sem diff                              # working changes
+sem diff --staged                     # staged only
+sem diff main..HEAD --json            # a range, as JSON
+sem diff file1.ts file2.ts            # compare two files (no git needed)
+sem diff --format markdown -v         # markdown tables with inline content diffs
+sem diff --no-cosmetics               # hide formatting-only changes
+```
+
+### sem graph: how is the code connected?
+```
+sem graph --json                      # entity dependency graph
+sem graph --modules blast-radius pkg  # who breaks if pkg changes (JS/TS workspaces)
+sem graph --dataflow --json           # per-function reads/writes and source-to-sink paths
+```
+
+### sem history: how did this entity change?
+```
+sem history parseConfig               # every version of parseConfig
+sem history --blame src/config.ts     # who last changed each entity in the file
+sem history                           # hotspots and co-change pairs
+```
+
+### sem mcp: the same verbs as MCP tools
+`sem mcp` serves sem_find, sem_grep, sem_impact, sem_check, sem_certify, sem_diff, sem_graph and sem_history over stdin/stdout.
+
+## Defaults per command
+
+Flags an agent or CI repeats on every call can be set once in the environment, as `SEM_<COMMAND>_<OPTION>`. A flag on the command line still wins.
 
 ```
-sem impact validateToken
-sem impact validateToken --json
-sem impact validateToken --file-exts .py
-sem impact validateToken --no-default-excludes
+SEM_DIFF_FORMAT=markdown SEM_DIFF_VERBOSE=1 sem diff     # same as sem diff --format markdown -v
+SEM_DIFF_VERBOSE=0 sem diff                              # turns an exported default back off
 ```
+
+Supported: SEM_DIFF_FORMAT, SEM_DIFF_VERBOSE, SEM_DIFF_NO_COSMETICS, SEM_DIFF_COLOR, SEM_DIFF_FILE_EXTS (comma separated), SEM_IMPACT_FORMAT, SEM_IMPACT_DEPTH, SEM_IMPACT_FILE_EXTS, SEM_FIND_JSON, SEM_GREP_JSON, SEM_GREP_IGNORE_CASE. On/off values accept 1/0, true/false, yes/no, on/off.
 
 ## Key Features
 
 - 27 languages with full entity extraction via tree-sitter
 - Structural hashing: AST-normalized hashes that ignore whitespace, comments, formatting
 - Cosmetic vs structural change detection in diff
-- Entity-level blame (per function, not per line)
+- Entity-level blame (per function, not per line): `sem history --blame`
 - Cross-file dependency graph via call/reference analysis
 - Transitive impact analysis (BFS through dependency graph)
 - Three-phase entity matching: exact ID, structural hash (rename detection), fuzzy similarity
@@ -131,7 +161,7 @@ Everything else falls back to chunk-based diffing.
 ## JSON Output
 
 ```
-sem diff --format json
+sem diff --json
 ```
 
 Returns:
@@ -158,7 +188,7 @@ The named change-type buckets (added, modified, deleted, moved, renamed, reorder
 
 ## Architecture
 
-Cargo workspace: sem-core (library) + sem-cli (binary).
+Cargo workspace: sem-core (library), sem-cli (binary) and sem-mcp (MCP server).
 
 - tree-sitter for code parsing (native Rust, not WASM)
 - git2 for in-process Git operations
@@ -180,7 +210,7 @@ sem-core can be used as a Rust library dependency:
 
 ```toml
 [dependencies]
-sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.3" }
+sem-core = "0.28"
 ```
 
 Used by weave (semantic merge driver) and inspect (entity-level code review).

@@ -119,6 +119,7 @@ fn index_lookup(repo_root: &Path, names: &[String], paths: &[String]) -> Option<
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let run = |name: &str, scope: Option<&str>| -> Option<String> {
         let mut cmd = std::process::Command::new(&exe);
+        super::without_cli_defaults(&mut cmd);
         cmd.args(["find", name, "--context", "--budget", &budget]);
         if let Some(p) = scope {
             cmd.args(["--in", p]);

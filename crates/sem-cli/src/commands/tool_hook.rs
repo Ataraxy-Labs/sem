@@ -15,6 +15,11 @@
 //! any other shell write              ->  refused: use weave_edit
 //! ```
 //!
+//! As a post-tool hook it follows the agent's own edits through (Edit,
+//! Write, MultiEdit, apply_patch; `follow_through`): untouched twins of a
+//! changed method, callers a signature change stranded, the tests to run,
+//! as additional context. The pre-tool half snapshots the file to diff from.
+//!
 //! Each decision is logged to `<git dir>/sem-run/coverage/<session>.jsonl`
 //! (or `$SEM_COVERAGE_DIR`),
 //! so a session can be checked for how much of its code access went through
@@ -36,9 +41,12 @@ pub fn tool() {
         return;
     }
     let Ok(event) = serde_json::from_str::<Value>(&input) else { return };
-    if event["hook_event_name"].as_str() != Some("PreToolUse") {
-        return;
-    }
+    let started = std::time::Instant::now();
+    let post = match event["hook_event_name"].as_str() {
+        Some("PreToolUse") => false,
+        Some("PostToolUse") => true,
+        _ => return,
+    };
     let cwd = event["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let ctx = Ctx {
         sem: std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "sem".into()),
@@ -47,12 +55,21 @@ pub fn tool() {
         codex: event["transcript_path"].as_str().is_some_and(|p| p.contains("/.codex/")) || event["turn_id"].is_string(),
         cwd,
     };
-    prewarm_once(&ctx);
     let name = event["tool_name"].as_str().unwrap_or("");
     let input = &event["tool_input"];
+    if post {
+        if let Some(text) = follow_through(&ctx, name, input, started) {
+            println!("{}", json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}));
+        }
+        return;
+    }
+    prewarm_once(&ctx);
+    if let Some(files) = edited_files(name, input) {
+        snapshot(&ctx, &files);
+    }
     let out = match name {
         "Bash" => bash(&ctx, input),
-        "apply_patch" => apply_patch(&ctx, input),
+        "apply_patch" => apply_patch(&ctx, input, started),
         n if n.starts_with("mcp__sem") || n.starts_with("mcp__weave") || n.starts_with("sem_") || n.starts_with("weave_") => {
             ctx.log(if n.contains("weave") { "weave" } else { "sem" }, true, n);
             None
@@ -95,6 +112,46 @@ impl Ctx {
     }
 }
 
+/// The files a native edit tool is about to change (or just changed).
+fn edited_files(tool: &str, input: &Value) -> Option<Vec<String>> {
+    match tool {
+        "Edit" | "Write" | "MultiEdit" => Some(vec![input["file_path"].as_str()?.to_string()]),
+        "apply_patch" => Some(super::follow_through::patch_files(input["command"].as_str().or(input["input"].as_str())?)),
+        _ => None,
+    }
+}
+
+/// PreToolUse half of the edit follow-through: keep each file's content
+/// before the edit, keyed by session and path.
+fn snapshot(ctx: &Ctx, files: &[String]) {
+    let Some(run) = run_dir(&ctx.cwd) else { return };
+    let root = super::repo_root_or_cwd(&ctx.cwd.to_string_lossy());
+    for f in files {
+        if let Some(rel) = super::follow_through::relative(&root, &ctx.cwd, f) {
+            super::follow_through::snapshot(&run, &ctx.session, &root, &rel);
+        }
+    }
+}
+
+/// PostToolUse half: what the edit left undone (twins, stranded callers,
+/// tests to run), as additional context; None when there is nothing to say.
+fn follow_through(ctx: &Ctx, tool: &str, input: &Value, started: std::time::Instant) -> Option<String> {
+    let files = edited_files(tool, input)?;
+    let run = run_dir(&ctx.cwd);
+    let root = super::repo_root_or_cwd(&ctx.cwd.to_string_lossy());
+    let edited: Vec<super::follow_through::Edited> = files
+        .iter()
+        .filter_map(|f| super::follow_through::relative(&root, &ctx.cwd, f))
+        .map(|rel| super::follow_through::Edited { before: super::follow_through::before(run.as_deref(), &ctx.session, &root, &rel), rel })
+        .collect();
+    if edited.is_empty() {
+        return None;
+    }
+    let (text, note) = super::follow_through::follow_through(&root, &ctx.session, run.as_deref(), &edited, started);
+    ctx.log("follow", text.is_some(), &format!("{tool} {}: {note}", edited.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>().join(" ")));
+    text
+}
+
 /// `<git common dir>/sem-run`.
 fn run_dir(cwd: &Path) -> Option<PathBuf> {
     let o = std::process::Command::new("git").args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).current_dir(cwd).output().ok()?;
@@ -105,6 +162,12 @@ fn run_dir(cwd: &Path) -> Option<PathBuf> {
 /// background (compile everything, compile the tests without running them),
 /// so the cold build overlaps the agent's reading instead of its first test
 /// run. Once per session, and only with `SEM_PREWARM=1`.
+/// `VAR=0 ` for each per-command default the agent's shell has set: a rewritten
+/// read or grep must print what the agent's own command would have printed.
+fn neutral_defaults(vars: &[&str]) -> String {
+    vars.iter().filter(|v| std::env::var_os(v).is_some()).map(|v| format!("{v}=0 ")).collect()
+}
+
 fn prewarm_once(ctx: &Ctx) {
     // opt-in: a background build sharing a constrained machine (or a
     // container) with the agent can hold build locks and slow its own runs
@@ -309,7 +372,7 @@ fn read_segment(ctx: &Ctx, seg: &str) -> Option<String> {
             stages.remove(1);
         }
     }
-    let mut cmd = format!("SEM_SESSION={} {} find --read {}", quote(&ctx.session), quote(&ctx.sem), files.iter().map(|f| quote(f)).collect::<Vec<_>>().join(" "));
+    let mut cmd = format!("SEM_SESSION={} {}{} find --read {}", quote(&ctx.session), neutral_defaults(&["SEM_FIND_JSON"]), quote(&ctx.sem), files.iter().map(|f| quote(f)).collect::<Vec<_>>().join(" "));
     if let Some(l) = lines {
         cmd.push_str(&format!(" --lines {l}"));
     }
@@ -386,7 +449,7 @@ fn grep_segment(ctx: &Ctx, seg: &str) -> Option<String> {
         p
     };
     flags.dedup();
-    let mut cmd = format!("{} grep", quote(&ctx.sem));
+    let mut cmd = format!("{}{} grep", neutral_defaults(&["SEM_GREP_JSON", "SEM_GREP_IGNORE_CASE"]), quote(&ctx.sem));
     for f in &flags {
         cmd.push_str(&format!(" {f}"));
     }
@@ -544,7 +607,7 @@ fn bash(ctx: &Ctx, input: &Value) -> Option<Value> {
 
 /// Codex's apply_patch, one weave old/new edit per hunk (or a new file), run
 /// by weave; the native patch is then not applied.
-fn apply_patch(ctx: &Ctx, input: &Value) -> Option<Value> {
+fn apply_patch(ctx: &Ctx, input: &Value, started: std::time::Instant) -> Option<Value> {
     let text = input["command"].as_str().or(input["input"].as_str())?;
     let mut edits: Vec<Value> = Vec::new();
     let (mut cur, mut hunk): (Option<String>, Vec<String>) = (None, Vec::new());
@@ -610,10 +673,14 @@ fn apply_patch(ctx: &Ctx, input: &Value) -> Option<Value> {
     let r = std::process::Command::new(&ctx.weave).args(["edit", &Value::Array(edits.clone()).to_string()]).current_dir(&ctx.cwd).output();
     ctx.log("edit", true, &format!("apply_patch: {} hunks", edits.len()));
     Some(match r {
-        Ok(o) if o.status.success() => deny(format!(
-            "Applied through weave; the change is in the files now, so do not apply this patch again.\n{}",
-            String::from_utf8_lossy(&o.stdout).trim()
-        )),
+        Ok(o) if o.status.success() => {
+            // the patch never reaches PostToolUse (it is denied): follow through here
+            let follow = follow_through(ctx, "apply_patch", input, started).map(|t| format!("\n{t}")).unwrap_or_default();
+            deny(format!(
+                "Applied through weave; the change is in the files now, so do not apply this patch again.\n{}{follow}",
+                String::from_utf8_lossy(&o.stdout).trim()
+            ))
+        }
         Ok(o) => deny(format!(
             "weave refused this patch and nothing was written:\n{}\nRead the current text and send the patch again, or use weave_edit.",
             format!("{}{}", String::from_utf8_lossy(&o.stderr), String::from_utf8_lossy(&o.stdout)).trim()
