@@ -31,6 +31,9 @@
         "start_line": 4,
         "type": "function"
       }
-    ]
+    ],
+    "returned": 2,
+    "total": 2,
+    "truncated": false
   }
 ]

@@ -23,6 +23,9 @@
         "start_line": 6,
         "type": "function"
       }
-    ]
+    ],
+    "returned": 1,
+    "total": 2,
+    "truncated": true
   }
 ]
