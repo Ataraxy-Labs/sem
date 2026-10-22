@@ -15,10 +15,10 @@ pub struct EntitiesParams {
         description = "Optional free-text query to find entities by intent across the whole repo (e.g. \"where is the retry logic\"), when you don't know the entity name. Ranks by name/signature relevance and graph centrality; returns file:line and dependent counts. Ignores `path` when set."
     )]
     pub query: Option<String>,
-    #[schemars(description = "Max results for `query` mode (default 10).")]
+    #[schemars(description = "Max results for `query` and `text` mode (default 10, at most 100).")]
     pub limit: Option<usize>,
     #[schemars(
-        description = "Exact substring to search for inside entity bodies across the whole repo (use instead of grep for strings, error messages, config keys). Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text."
+        description = "Exact substring to search for inside entity bodies under `path` (default: the whole repo); use instead of grep for strings, error messages, config keys. Case-sensitive. Hits come back entity-addressed: file, innermost entity, line, matched line text. `limit` caps the hits (default 10)."
     )]
     pub text: Option<String>,
     #[schemars(
@@ -76,6 +76,10 @@ pub struct DiffParams {
     pub target_ref: Option<String>,
     #[schemars(description = "Optional: diff only this file")]
     pub file_path: Option<String>,
+    #[schemars(
+        description = "Include each changed entity's before/after source (default false: names, kinds and locations only). Narrow with file_path when the diff is large."
+    )]
+    pub content: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -88,14 +92,20 @@ pub struct BlameParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImpactAnalysisParams {
-    #[schemars(description = "Path to the file containing the entity")]
-    pub file_path: String,
+    #[schemars(
+        description = "Path to the file containing the entity. Optional: omitted, the entity_name is resolved across the whole repo (an ambiguous name lists the candidate files)."
+    )]
+    pub file_path: Option<String>,
     #[schemars(description = "Name of the entity to analyze impact for")]
     pub entity_name: String,
     #[schemars(
         description = "Analysis mode: 'all' (default, shows deps + dependents + transitive impact + tests), 'deps' (direct dependencies only), 'dependents' (direct dependents only), 'tests' (affected test entities only)"
     )]
     pub mode: Option<String>,
+    #[schemars(
+        description = "Mode 'all': how many hops of transitive dependents to follow (default 2; 0 = unlimited)."
+    )]
+    pub depth: Option<usize>,
     #[schemars(
         description = "Include files and directories excluded by default, including generated, fixture, vendor, and benchmark paths."
     )]
@@ -111,7 +121,7 @@ pub struct LogParams {
     pub entity_name: Option<String>,
     #[schemars(description = "Path to the file containing the entity. If omitted, auto-detects.")]
     pub file_path: Option<String>,
-    #[schemars(description = "Maximum number of commits to analyze. Defaults to 50.")]
+    #[schemars(description = "With entity_name: the most recent changes returned (0 = all). Without: the commits analyzed for hotspots. Defaults to 50.")]
     pub limit: Option<usize>,
 }
 
@@ -189,7 +199,7 @@ pub struct FindParams {
     pub in_path: Option<String>,
     #[schemars(description = "Restrict to entities defined in this file (same as `in`).")]
     pub file: Option<String>,
-    #[schemars(description = "Mode \"callers\": return at most this many callers. With `intent`: at most this many results.")]
+    #[schemars(description = "Mode \"callers\": return at most this many callers. With `intent` or `text`: at most this many results (default 10, at most 100).")]
     pub limit: Option<usize>,
     #[schemars(description = "Mode \"context\": token budget (default 8000).")]
     pub token_budget: Option<usize>,
@@ -250,9 +260,11 @@ pub struct GrepParams {
     pub patterns: Option<Vec<String>>,
     #[schemars(description = "Case-insensitive match.")]
     pub case_insensitive: Option<bool>,
-    #[schemars(description = "Only search under this directory or file, or files matching this glob (e.g. \"rich/\", \"src/**/*.ts\").")]
+    #[schemars(description = "Only search under this directory or file, or files matching this glob (e.g. \"rich/\", \"src/**/*.ts\"). A named path is searched whole, hidden and default-excluded files included (e.g. \".github/workflows\", \"tests/fixtures\").")]
     #[serde(rename = "in")]
     pub in_path: Option<String>,
+    #[schemars(description = "Return at most this many hits per pattern (default 200); the rest are counted.")]
+    pub limit: Option<usize>,
     #[schemars(
         description = "Return the source of each function, method or class that contains a hit (each once), so one call finds and reads; capped by token_budget. Default: on when there are at most 6 hits."
     )]
@@ -264,6 +276,10 @@ pub struct GrepParams {
 }
 
 impl GrepParams {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(200).max(1)
+    }
+
     pub fn case_insensitive(&self) -> bool {
         self.case_insensitive.unwrap_or(false)
     }
@@ -439,7 +455,7 @@ pub struct HistoryParams {
     pub file_path: Option<String>,
     #[schemars(description = "Who last changed each entity in file_path, instead of the entity's history.")]
     pub blame: Option<bool>,
-    #[schemars(description = "Maximum number of commits to analyze. Defaults to 50.")]
+    #[schemars(description = "With entity_name: the most recent changes returned (0 = all). Without: the commits analyzed for hotspots. Defaults to 50.")]
     pub limit: Option<usize>,
 }
 

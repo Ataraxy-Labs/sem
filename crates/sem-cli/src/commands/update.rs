@@ -90,7 +90,7 @@ pub fn maybe_notify(command: &str) {
         eprintln!(
             "{}",
             format!(
-                "A new version of sem is available: v{} → v{}. Run `sem update` to upgrade.",
+                "A new version of sem is available: v{} → v{}. Run `sem config update` to upgrade.",
                 env!("CARGO_PKG_VERSION"),
                 state.latest_version
             )

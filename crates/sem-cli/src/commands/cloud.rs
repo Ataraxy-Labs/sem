@@ -101,7 +101,7 @@ pub fn maybe_suggest_cloud_after_diff(entity_changes: usize) {
         "{} {} changed. {} to see what they break across your repos.",
         "↗".cyan(),
         format!("{entity_changes} {noun}").dimmed(),
-        "sem login".cyan().bold(),
+        "sem cloud login".cyan().bold(),
     );
     mark_login_hint_shown();
 }
@@ -413,7 +413,7 @@ pub fn logout() -> Result<(), Box<dyn std::error::Error>> {
 // ─── sem whoami ──────────────────────────────────────────────────────────
 
 pub fn whoami() -> Result<(), Box<dyn std::error::Error>> {
-    let creds = load_credentials().ok_or("Not logged in. Run: sem login")?;
+    let creds = load_credentials().ok_or("Not logged in. Run: sem cloud login")?;
 
     let masked = if creds.api_key.len() > 16 {
         format!(
@@ -1189,7 +1189,7 @@ impl CloudClient {
 /// repos) can answer. This is a reason to log in.
 pub fn xref(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let client = CloudClient::from_credentials()
-        .ok_or("Not logged in. Cross-repo dependencies are a sem cloud feature. Run: sem login")?;
+        .ok_or("Not logged in. Cross-repo dependencies are a sem cloud feature. Run: sem cloud login")?;
     let resp = client.cross_deps()?;
 
     if json {

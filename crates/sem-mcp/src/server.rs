@@ -84,6 +84,37 @@ fn sem_exe() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("sem"))
 }
 
+/// Per-command flag defaults a user can set for the CLI (`SEM_DIFF_FORMAT`
+/// and the rest; the same list as sem-cli's `commands::CLI_DEFAULT_ENV`). A
+/// tool call answers with exactly the arguments it was given, so they are
+/// cleared from the sem it runs.
+const CLI_DEFAULT_ENV: &[&str] = &[
+    "SEM_DIFF_FORMAT",
+    "SEM_DIFF_VERBOSE",
+    "SEM_DIFF_NO_COSMETICS",
+    "SEM_DIFF_COLOR",
+    "SEM_DIFF_FILE_EXTS",
+    "SEM_IMPACT_FORMAT",
+    "SEM_IMPACT_DEPTH",
+    "SEM_IMPACT_FILE_EXTS",
+    "SEM_FIND_JSON",
+    "SEM_GREP_JSON",
+    "SEM_GREP_IGNORE_CASE",
+];
+
+trait EnvsCleared {
+    fn envs_cleared(&mut self, vars: &[&str]) -> &mut Self;
+}
+
+impl EnvsCleared for std::process::Command {
+    fn envs_cleared(&mut self, vars: &[&str]) -> &mut Self {
+        for var in vars {
+            self.env_remove(var);
+        }
+        self
+    }
+}
+
 /// Runs `sem <args>` in `cwd`: stdout as the result, stderr and the exit
 /// code after it. `verdict` names exit codes for verbs that have them.
 async fn run_sem(cwd: &Path, args: Vec<String>, verdict: fn(i32) -> Option<&'static str>) -> CallToolResult {
@@ -93,6 +124,9 @@ async fn run_sem(cwd: &Path, args: Vec<String>, verdict: fn(i32) -> Option<&'sta
             .args(&args)
             .current_dir(&cwd)
             .env("SEM_NO_PROGRESS", "1")
+            // A tool result answers the agent's question; no "new version" notice.
+            .env("SEM_NO_UPDATE_CHECK", "1")
+            .envs_cleared(CLI_DEFAULT_ENV)
             .stdin(std::process::Stdio::null())
             .output()
     })
@@ -467,17 +501,19 @@ impl SemServer {
         Ok(files)
     }
 
-    /// Walk a subdirectory, returning paths relative to `prefix_root` (e.g. the repo root).
+    /// Walk a subdirectory, returning paths relative to `prefix_root` (e.g.
+    /// the repo root). `include_hidden` walks dot-files and dot-dirs too.
     fn walk_dir_files_with_options(
         dir: &Path,
         prefix_root: &Path,
         registry: &ParserRegistry,
         no_default_excludes: bool,
+        include_hidden: bool,
     ) -> Result<Vec<String>, String> {
         let mut files = Vec::new();
         let mut builder = ignore::WalkBuilder::new(dir);
         builder
-            .hidden(true)
+            .hidden(!include_hidden)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true);
@@ -660,31 +696,80 @@ impl SemServer {
         entities
     }
 
-    /// Find entity by name in the target file.
-    fn find_entity_in_graph<'a>(
-        graph: &'a EntityGraph,
-        entity_name: &str,
-        rel_path: &str,
-    ) -> Result<&'a str, String> {
-        // Match the bare name, or `Class.method` addressing (a child entity
-        // whose parent is named by the qualifier before the final dot). Agents
-        // reach for `Class.method` naturally, and for "function name".
-        let (kind, entity_name) = match entity_name.trim().split_once(' ') {
+    /// A by-name query's optional leading kind ("function name", "method
+    /// Text.count") and the name itself.
+    fn split_kind(query: &str) -> (Option<&str>, &str) {
+        match query.trim().split_once(' ') {
             Some((k, rest)) if !rest.trim().is_empty() && !k.contains(['.', ':']) => (Some(k), rest.trim()),
-            _ => (None, entity_name.trim()),
-        };
-        let qualified = entity_name.rsplit_once('.');
-        let matches = |e: &sem_core::parser::graph::EntityInfo| {
-            kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
-            && (e.name == entity_name
-                || qualified.is_some_and(|(parent_part, child_part)| {
+            _ => (None, query.trim()),
+        }
+    }
+
+    /// Whether `e` is what a by-name query names: the bare name, or
+    /// `Class.method` addressing (a child entity whose parent is named by the
+    /// qualifier before the final dot), optionally under a leading kind, where
+    /// "function" and "method" stand for each other. Agents reach for
+    /// `Class.method` naturally, and for "function name". Every by-name
+    /// lookup shares this so they never disagree about what a query names.
+    fn entity_name_matches(graph: &EntityGraph, query: &str, e: &sem_core::parser::graph::EntityInfo) -> bool {
+        let (kind, name) = Self::split_kind(query);
+        kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
+            && (e.name == name
+                || name.rsplit_once('.').is_some_and(|(parent_part, child_part)| {
                     e.name == child_part
                         && e.parent_id
                             .as_ref()
                             .and_then(|pid| graph.entities.get(pid))
                             .is_some_and(|p| p.name == parent_part)
                 }))
-        };
+    }
+
+    /// Up to five entity names containing the query's bare name (its last
+    /// `.` segment), case-insensitively: the suggestions a miss offers.
+    fn near_match_names<'a>(graph: &'a EntityGraph, query: &str) -> Vec<&'a str> {
+        let name = Self::split_kind(query).1;
+        let bare = name.rsplit('.').next().unwrap_or(name).to_lowercase();
+        if bare.is_empty() {
+            return Vec::new();
+        }
+        let mut near: Vec<&str> = graph
+            .entities
+            .values()
+            .filter(|e| e.name.to_lowercase().contains(&bare))
+            .map(|e| e.name.as_str())
+            .collect();
+        near.sort_unstable();
+        near.dedup();
+        near.truncate(5);
+        near
+    }
+
+    /// The answer to a by-name lookup that matched nothing: the near matches,
+    /// and where to look when the name is not an entity at all.
+    fn entity_miss(graph: &EntityGraph, query: &str, scope: Option<&str>) -> String {
+        let scope = scope.map(|s| format!(" in {s}")).unwrap_or_default();
+        format!("no entity named '{query}'{scope}{}", Self::near_match_hint(graph, query))
+    }
+
+    /// What follows a miss message: ". Near matches: …" or where to look.
+    fn near_match_hint(graph: &EntityGraph, query: &str) -> String {
+        let near = Self::near_match_names(graph, query);
+        if near.is_empty() {
+            "; no near match either: try sem_grep for text".to_string()
+        } else {
+            format!(". Near matches: {} (or try sem_grep for text)", near.join(", "))
+        }
+    }
+
+    /// Find entity by name in the target file.
+    fn find_entity_in_graph<'a>(
+        graph: &'a EntityGraph,
+        entity_name: &str,
+        rel_path: &str,
+    ) -> Result<&'a str, String> {
+        let query = entity_name;
+        let entity_name = Self::split_kind(query).1;
+        let matches = |e: &sem_core::parser::graph::EntityInfo| Self::entity_name_matches(graph, query, e);
 
         if let Some(entity) = graph
             .entities
@@ -726,39 +811,16 @@ impl SemServer {
         graph: &'a EntityGraph,
         entity_name: &str,
     ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
-        // "method Text.count" names the kind too, as plain lookup accepts
-        let (kind, entity_name) = match entity_name.trim().split_once(' ') {
-            Some((k, rest)) if !rest.trim().is_empty() && !k.contains(['.', ':']) => (Some(k), rest.trim()),
-            _ => (None, entity_name.trim()),
-        };
-        let qualified = entity_name.rsplit_once('.');
-        let matches = |e: &sem_core::parser::graph::EntityInfo| {
-            kind.is_none_or(|k| e.entity_type == k || (k == "function" && e.entity_type == "method") || (k == "method" && e.entity_type == "function"))
-            && (e.name == entity_name
-                || qualified.is_some_and(|(parent_part, child_part)| {
-                    e.name == child_part
-                        && e.parent_id
-                            .as_ref()
-                            .and_then(|pid| graph.entities.get(pid))
-                            .is_some_and(|p| p.name == parent_part)
-                }))
-        };
+        let query = entity_name;
+        let entity_name = Self::split_kind(query).1;
+        let matches = |e: &sem_core::parser::graph::EntityInfo| Self::entity_name_matches(graph, query, e);
         let mut hits: Vec<&sem_core::parser::graph::EntityInfo> =
             graph.entities.values().filter(|e| matches(e)).collect();
         hits.sort_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)));
         match hits.len() {
             1 => Ok(hits[0]),
             0 => {
-                let lower = entity_name.to_lowercase();
-                let mut near: Vec<&str> = graph
-                    .entities
-                    .values()
-                    .filter(|e| e.name.to_lowercase().contains(&lower))
-                    .map(|e| e.name.as_str())
-                    .collect();
-                near.sort_unstable();
-                near.dedup();
-                near.truncate(5);
+                let near = Self::near_match_names(graph, query);
                 if near.is_empty() {
                     Err(format!("Entity '{}' not found in this repo", entity_name))
                 } else {
@@ -1293,12 +1355,13 @@ impl SemServer {
     fn collect_text_hits<'a>(
         all_entities: &'a [SemanticEntity],
         needle: &str,
+        scope: Option<&str>,
     ) -> Vec<(&'a str, usize, &'a str, &'a str, &'a str)> {
         use std::collections::HashMap;
         // (file, absolute line) -> (span, entity name, entity type, line text)
         let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
         for e in all_entities {
-            if !e.content.contains(needle) {
+            if !e.content.contains(needle) || scope.is_some_and(|s| !in_scope(&e.file_path, s)) {
                 continue;
             }
             let span = e.end_line.saturating_sub(e.start_line);
@@ -1324,11 +1387,18 @@ impl SemServer {
     }
 
     pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
-        let hits = Self::collect_text_hits(all_entities, needle);
+        Self::render_text_hits_in(all_entities, needle, limit, None)
+    }
+
+    /// `render_text_hits` over the entities under `scope` (a repo-relative
+    /// file or directory) only.
+    fn render_text_hits_in(all_entities: &[SemanticEntity], needle: &str, limit: usize, scope: Option<&str>) -> String {
+        let hits = Self::collect_text_hits(all_entities, needle, scope);
         if hits.is_empty() {
             return format!(
-                "no entity contains \"{needle}\" (searches code entity bodies; \
-                 comments between entities and non-code files are not covered)"
+                "no entity contains \"{needle}\"{} (searches code entity bodies; \
+                 comments between entities and non-code files are not covered: try sem_grep)",
+                scope.map(|s| format!(" in {s}")).unwrap_or_default()
             );
         }
         let total = hits.len();
@@ -1458,8 +1528,10 @@ impl SemServer {
         // entities, not line numbers in anonymous files.
         if let Some(needle) = params.text() {
             let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
+            let scope = params.path().map(|p| Self::resolve_file_path(&ctx.repo_root, p).0);
+            let scope = scope.as_deref();
             if params.format() == "json" {
-                let hits = Self::collect_text_hits(&all_entities, needle);
+                let hits = Self::collect_text_hits(&all_entities, needle, scope);
                 let rows: Vec<serde_json::Value> = hits
                     .iter()
                     .take(params.limit())
@@ -1479,7 +1551,7 @@ impl SemServer {
                     serde_json::to_string(&rows).unwrap_or_default(),
                 )]));
             }
-            let text = Self::render_text_hits(&all_entities, needle, params.limit());
+            let text = Self::render_text_hits_in(&all_entities, needle, params.limit(), scope);
             return Ok(CallToolResult::success(vec![Content::text(text)]));
         }
 
@@ -1640,6 +1712,7 @@ impl SemServer {
                     &ctx.repo_root,
                     &self.registry,
                     params.no_default_excludes(),
+                    false,
                 ) {
                     Ok(file_paths) => file_paths,
                     Err(err) => return Ok(tool_error(err)),
@@ -1739,7 +1812,7 @@ impl SemServer {
     // ── Tool 2: Diff ──
 
     #[tool(
-        description = "Which entities changed? Semantic diff between two refs, or the working tree against HEAD: functions and classes added, modified, deleted or renamed, not lines."
+        description = "Which entities changed? Semantic diff between two refs, or the working tree against HEAD: functions and classes added, modified, deleted or renamed, not lines. content=true adds each entity's before/after source."
     )]
     async fn sem_diff(
         &self,
@@ -1778,9 +1851,31 @@ impl SemServer {
 
         let binary_changes = collect_binary_file_changes(&file_changes);
         let diff_result = compute_semantic_diff(&file_changes, &self.registry, None, None);
+        let json = format_diff_json_with_binary_changes(&diff_result, &binary_changes);
+        if params.content.unwrap_or(false) {
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
 
+        // Which entities changed, not their source: every body twice is most
+        // of a large diff's bytes. `content` asks for it.
+        let mut payload: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(payload) => payload,
+            Err(_) => return Ok(CallToolResult::success(vec![Content::text(json)])),
+        };
+        let mut omitted = false;
+        for change in payload["changes"].as_array_mut().into_iter().flatten() {
+            if let Some(change) = change.as_object_mut() {
+                omitted |= change.remove("beforeContent").is_some_and(|c| !c.is_null());
+                omitted |= change.remove("afterContent").is_some_and(|c| !c.is_null());
+            }
+        }
+        if omitted {
+            payload["note"] = serde_json::json!(
+                "content omitted; pass content=true (optionally with file_path) for before/after source"
+            );
+        }
         Ok(CallToolResult::success(vec![Content::text(
-            format_diff_json_with_binary_changes(&diff_result, &binary_changes),
+            serde_json::to_string(&payload).unwrap_or(json),
         )]))
     }
 
@@ -1880,25 +1975,41 @@ impl SemServer {
     // ── Tool 4: Impact ──
 
     #[tool(
-        description = "What does changing this entity touch? Its dependencies, its dependents (transitively) and the tests that reach it; says when the caller set may be incomplete. mode narrows: 'all' (default), 'deps', 'dependents', 'tests'. Call before editing, renaming or deleting an entity."
+        description = "What does changing this entity touch? Its dependencies, its dependents (transitively, `depth` hops, default 2) and the tests that reach it; says when the caller set may be incomplete. mode narrows: 'all' (default), 'deps', 'dependents', 'tests'. file_path is optional. Call before editing, renaming or deleting an entity."
     )]
     async fn sem_impact(
         &self,
         Parameters(params): Parameters<ImpactAnalysisParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let start = Instant::now();
-        let ctx = match self.get_context(Some(&params.file_path)).await {
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
-        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
-        if let Some(err) = file_path_error(&params.file_path, &abs_path) {
-            return Ok(tool_error(err));
-        }
-        if self.registry.get_plugin(&rel_path).is_none() {
-            return Ok(tool_error(format!("No parser for file: {}", rel_path)));
-        }
+        // No file_path: the entity is resolved repo-wide once the graph is
+        // built, as context mode does.
+        let explicit_rel = match params.file_path.as_deref() {
+            Some(fp) => {
+                let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+                if let Some(err) = file_path_error(fp, &abs_path) {
+                    return Ok(tool_error(err));
+                }
+                if self.registry.get_plugin(&rel_path).is_none() {
+                    return Ok(tool_error(format!("No parser for file: {}", rel_path)));
+                }
+                Some(rel_path)
+            }
+            None => None,
+        };
         let no_default_excludes = params.no_default_excludes.unwrap_or(false);
+        let resolve = |graph: &EntityGraph| -> Result<(String, String), String> {
+            match explicit_rel.as_deref() {
+                Some(rel_path) => Self::find_entity_in_graph(graph, &params.entity_name, rel_path)
+                    .map(|id| (id.to_string(), rel_path.to_string())),
+                None => Self::find_entity_repo_wide(graph, &params.entity_name)
+                    .map(|e| (e.id.to_string(), e.file_path.to_string())),
+            }
+        };
 
         let mode = params.mode.as_deref().unwrap_or("all");
         let valid_modes = ["all", "deps", "dependents", "tests"];
@@ -1914,9 +2025,9 @@ impl SemServer {
         // warm cloud graph instead of a local build. Custom-scope requests
         // (no_default_excludes) stay local since the cloud indexes the default
         // scope; on any miss/error this returns None and the local path runs.
-        if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
+        if let Some(rel_path) = explicit_rel.as_deref().filter(|_| !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1")) {
             if let Some(mut out) =
-                crate::cloud::try_impact(&ctx.git, &params.entity_name, &rel_path, mode)
+                crate::cloud::try_impact(&ctx.git, &params.entity_name, rel_path, mode)
             {
                 out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
                 out["source"] = serde_json::json!("cloud");
@@ -1942,11 +2053,11 @@ impl SemServer {
             } else {
                 self.live_topology(&ctx.repo_root).await
             };
-            let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)
-            {
-                Ok(entity_id) => entity_id,
+            let (entity_id, rel_path) = match resolve(&graph) {
+                Ok(found) => found,
                 Err(err) => return Ok(tool_error(err)),
             };
+            let entity_id = entity_id.as_str();
 
             let mut output = match mode {
                 "deps" => {
@@ -2011,10 +2122,11 @@ impl SemServer {
             self.live_graph(&ctx.repo_root).await
         };
 
-        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
-            Ok(entity_id) => entity_id,
+        let (entity_id, rel_path) = match resolve(&graph) {
+            Ok(found) => found,
             Err(err) => return Ok(tool_error(err)),
         };
+        let entity_id = entity_id.as_str();
 
         let mut output = match mode {
             "tests" => {
@@ -2042,10 +2154,25 @@ impl SemServer {
             }
             "deps" | "dependents" => unreachable!(),
             _ => {
-                // "all" mode: everything
+                // "all" mode: everything, the transitive dependents bounded
+                // by depth like the CLI's (default 2 hops)
+                let depth = params.depth.unwrap_or(2);
                 let deps = graph.get_dependencies(entity_id);
                 let dependents = graph.get_dependents(entity_id);
-                let impact = graph.impact_analysis(entity_id);
+                let (impact, beyond_depth) = if depth == 0 {
+                    (graph.impact_analysis(entity_id), false)
+                } else {
+                    let bounded = graph.impact_analysis_bounded(entity_id, depth);
+                    let reached: std::collections::HashSet<&str> =
+                        bounded.iter().map(|(e, _)| e.id.as_str()).chain([entity_id]).collect();
+                    // anything one hop past the bound that was cut off
+                    let beyond = bounded.iter().filter(|(_, d)| *d == depth).any(|(e, _)| {
+                        graph.get_dependents(&e.id).iter().any(|d| !reached.contains(d.id.as_str()))
+                    });
+                    (bounded.into_iter().map(|(e, _)| e).collect(), beyond)
+                };
+                let impact_total = impact.len();
+                let impact = &impact[..impact_total.min(IMPACT_LIST_CAP)];
                 let tests = graph.test_impact_with_custom_dirs(
                     entity_id,
                     &all_entities,
@@ -2071,8 +2198,10 @@ impl SemServer {
                     "dependencies": map_entities(&deps),
                     "dependents": map_entities(&dependents),
                     "impact": {
-                        "total": impact.len(),
-                        "entities": map_entities(&impact),
+                        "total": impact_total,
+                        "depth": depth,
+                        "beyond_depth": beyond_depth,
+                        "entities": map_entities(impact),
                     },
                     "tests": map_entities(&tests),
                 })
@@ -2165,10 +2294,12 @@ impl SemServer {
                 }
                 match found_in.len() {
                     0 => {
+                        let (graph, _) = self.live_graph(&ctx.repo_root).await;
                         return Ok(tool_error(format!(
-                            "Entity '{}' not found in any file",
-                            params.entity_name
-                        )))
+                            "Entity '{}' not found in any file{}",
+                            params.entity_name,
+                            Self::near_match_hint(&graph, &params.entity_name)
+                        )));
                     }
                     1 => found_in.into_iter().next().unwrap(),
                     _ => {
@@ -2585,7 +2716,7 @@ impl SemServer {
                 };
                 let mut args = vec!["refs".to_string(), q];
                 if let Some(f) = params.file() {
-                    args.extend(["--file".to_string(), f.to_string()]);
+                    args.extend(["--file".to_string(), Self::resolve_file_path(&ctx.repo_root, f).0]);
                 }
                 if params.format() == "json" {
                     args.push("--json".to_string());
@@ -2640,7 +2771,7 @@ impl SemServer {
                     path: params.in_path.clone().or(params.file.clone()),
                     no_default_excludes: None,
                     query: None,
-                    limit: None,
+                    limit: params.limit,
                     text: params.text.clone(),
                     signatures: None,
                     format: params.format.clone(),
@@ -2737,23 +2868,18 @@ impl SemServer {
             Err(err) => return Ok(tool_error(err)),
         };
         let (graph, _) = self.live_graph(&ctx.repo_root).await;
-        let file_filter = params.file();
+        // repo-relative, so an absolute or "./" path scopes like the graph's own
+        let file_filter = params.file().map(|f| Self::resolve_file_path(&ctx.repo_root, f).0);
+        let file_filter = file_filter.as_deref();
 
         // One query's matches, sorted for determinism. Shared by the single
-        // and batch forms so they can never drift apart.
+        // and batch forms so they can never drift apart. "type name" and
+        // `Class.method` match as every other by-name lookup does.
         let match_one = |query: &str| {
-            // Same "type name" split as the CLI's find verb: both halves
-            // non-empty means kind + name, anything else is the whole string
-            // as the name.
-            let (name, want_type) = match query.split_once(' ') {
-                Some((t, n)) if !t.is_empty() && !n.is_empty() => (n, Some(t)),
-                _ => (query, None),
-            };
             let mut matches: Vec<_> = graph
                 .entities
                 .values()
-                .filter(|e| e.name == name)
-                .filter(|e| want_type.is_none_or(|t| e.entity_type == t))
+                .filter(|e| Self::entity_name_matches(&graph, query, e))
                 .filter(|e| file_filter.is_none_or(|f| in_scope(&e.file_path, f)))
                 .collect();
             matches.sort_by(|a, b| {
@@ -2802,7 +2928,7 @@ impl SemServer {
                 }
                 out.push_str(&format!("query \"{query}\":\n"));
                 if matches.is_empty() {
-                    out.push_str(&format!("  no entity named '{query}'\n"));
+                    out.push_str(&format!("  {}\n", Self::entity_miss(&graph, query, file_filter)));
                 }
                 for e in matches {
                     out.push_str(&format!(
@@ -2825,7 +2951,7 @@ impl SemServer {
         let matches = match_one(query);
 
         if matches.is_empty() {
-            return Ok(tool_error(format!("no entity named '{query}'")));
+            return Ok(tool_error(Self::entity_miss(&graph, query, file_filter)));
         }
 
         if params.format() == "json" {
@@ -2848,127 +2974,33 @@ impl SemServer {
     // ── Callers ──
 
     #[tool(
-        description = "List the direct callers of one entity (who calls/references it). The query must resolve to exactly one definition — an ambiguous name is refused with the full candidate list so you can disambiguate with file or a \"type name\" query and retry. limit caps the number of callers returned."
+        description = "List the direct callers of one entity (who calls/references it), and whether that caller set is complete: when the static graph may miss callers (aliases, dynamic dispatch, computed names) it says so and lists the possible ones. The query must resolve to exactly one definition — an ambiguous name is refused with the full candidate list so you can disambiguate with file or a \"type name\" query and retry. limit caps the number of callers returned."
     )]
     async fn sem_callers(
         &self,
         Parameters(params): Parameters<CallersParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = match self.get_context(params.file.as_deref()).await {
-            Ok(ctx) => ctx,
-            Err(err) => return Ok(tool_error(err)),
-        };
-        let (graph, _) = self.live_graph(&ctx.repo_root).await;
-
         let query = params.query.trim();
         if query.is_empty() {
             return Ok(tool_error("query is required"));
         }
-        // Same "type name" split and match/sort discipline as sem_find, so
-        // the two tools can never disagree about what a query resolves to.
-        let (name, want_type) = match query.split_once(' ') {
-            Some((t, n)) if !t.is_empty() && !n.is_empty() => (n, Some(t)),
-            _ => (query, None),
+        let ctx = match self.get_context(params.file()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
         };
-        let file_filter = params.file();
-        let mut matches: Vec<_> = graph
-            .entities
-            .values()
-            .filter(|e| e.name == name)
-            .filter(|e| want_type.is_none_or(|t| e.entity_type == t))
-            .filter(|e| file_filter.is_none_or(|f| e.file_path == f))
-            .collect();
-        matches.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then_with(|| a.start_line.cmp(&b.start_line))
-        });
-        let row = |e: &sem_core::parser::graph::EntityInfo| {
-            serde_json::json!({
-                "id": e.id,
-                "name": e.name,
-                "type": e.entity_type,
-                "file": e.file_path,
-                "start_line": e.start_line,
-                "end_line": e.end_line,
-            })
-        };
-
-        if matches.is_empty() {
-            return Ok(tool_error(format!("no entity named '{query}'")));
+        // The CLI's answer, so the completeness verdict, near matches and
+        // dispatcher grouping are the same here as in `sem callers`.
+        let mut args = vec!["callers".to_string(), query.to_string()];
+        if let Some(f) = params.file() {
+            args.extend(["--file".to_string(), Self::resolve_file_path(&ctx.repo_root, f).0]);
         }
-        if matches.len() > 1 {
-            // A caller list only means something once you know whose callers
-            // it is: refuse, listing every candidate so the next call can
-            // pick one instead of re-running discovery.
-            if params.format() == "json" {
-                let out = serde_json::json!({
-                    "resolved": false,
-                    "candidates": matches.iter().map(|e| row(e)).collect::<Vec<_>>(),
-                });
-                return Ok(CallToolResult::error(vec![Content::text(
-                    serde_json::to_string(&out).unwrap_or_default(),
-                )]));
-            }
-            let mut out = format!(
-                "'{query}' matches {} definitions; pass file (or a \"type name\" query) to pick one:\n",
-                matches.len()
-            );
-            for e in &matches {
-                out.push_str(&format!(
-                    "  {} {} {}:{}\n",
-                    e.entity_type, e.name, e.file_path, e.start_line
-                ));
-            }
-            return Ok(CallToolResult::error(vec![Content::text(out)]));
+        if let Some(n) = params.limit {
+            args.extend(["--limit".to_string(), n.to_string()]);
         }
-
-        let def = matches[0];
-        let mut callers: Vec<_> = graph
-            .dependents()
-            .get(def.id.as_str())
-            .map(|ids| ids.iter().filter_map(|id| graph.entities.get(id)).collect())
-            .unwrap_or_default();
-        callers.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then_with(|| a.start_line.cmp(&b.start_line))
-        });
-        let total = callers.len();
-        if let Some(cap) = params.limit {
-            callers.truncate(cap);
-        }
-
         if params.format() == "json" {
-            let out = serde_json::json!({
-                "entity": row(def),
-                "callers": callers.iter().map(|e| row(e)).collect::<Vec<_>>(),
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&out).unwrap_or_default(),
-            )]));
+            args.push("--json".to_string());
         }
-
-        let mut out = format!(
-            "{} {} {}:{}\n",
-            def.entity_type, def.name, def.file_path, def.start_line
-        );
-        if callers.is_empty() {
-            out.push_str("  (callers: none)\n");
-        }
-        for e in &callers {
-            out.push_str(&format!(
-                "  {} {} {}:{}\n",
-                e.entity_type, e.name, e.file_path, e.start_line
-            ));
-        }
-        if callers.len() < total {
-            out.push_str(&format!(
-                "  … {} more (raise limit)\n",
-                total - callers.len()
-            ));
-        }
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        Ok(run_sem(&ctx.repo_root, args, no_verdict).await)
     }
 
     // ── History, check, certify, graph ──
@@ -3095,26 +3127,37 @@ impl SemServer {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
+        // A path the agent names is searched whole: its hidden files and
+        // default-excluded dirs (.github/workflows, tests/fixtures) too. A
+        // glob walks its literal leading directories that way; with none
+        // ("**/*.ts") it is the default repo walk.
+        let scope = params.in_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let scope = scope.map(|s| if s.contains(['*', '?']) { s.trim_start_matches("./").to_string() } else { Self::resolve_file_path(&ctx.repo_root, s).0 });
+        let glob = scope.as_deref().is_some_and(|s| s.contains(['*', '?']));
+        let walk_root = match scope.as_deref() {
+            Some(s) if glob => s.split('/').take_while(|c| !c.contains(['*', '?'])).collect::<Vec<_>>().join("/"),
+            Some(s) => s.to_string(),
+            None => String::new(),
+        };
+        let walk_root = Some(walk_root).filter(|r| !r.is_empty() && r != ".");
         let file_paths = match Self::walk_dir_files_with_options(
-            &ctx.repo_root,
+            &walk_root.as_deref().map_or_else(|| ctx.repo_root.clone(), |r| ctx.repo_root.join(r)),
             &ctx.repo_root,
             &self.registry,
-            false,
+            walk_root.is_some(),
+            walk_root.is_some(),
         ) {
             Ok(file_paths) => file_paths,
             Err(err) => return Ok(tool_error(err)),
         };
-        let file_paths: Vec<String> = match params.in_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(scope) => {
-                let scope = scope.trim_start_matches("./");
-                let glob = scope.contains(['*', '?']);
-                file_paths
-                    .into_iter()
-                    .filter(|f| if glob { glob_match(scope, f) } else { f == scope || f.starts_with(&format!("{}/", scope.trim_end_matches('/'))) })
-                    .collect()
-            }
+        let file_paths: Vec<String> = match scope.as_deref() {
+            Some(scope) => file_paths
+                .into_iter()
+                .filter(|f| if glob { glob_match(scope, f) } else { in_scope(f, scope) })
+                .collect(),
             None => file_paths,
         };
+        let limit = params.limit();
         let opts = sem_core::index::grep::GrepOptions {
             case_insensitive: params.case_insensitive(),
         };
@@ -3149,13 +3192,20 @@ impl SemServer {
                 let results: Vec<serde_json::Value> = per_pattern
                     .iter()
                     .map(|(pattern, outcome)| match outcome {
-                        Ok(hits) => serde_json::json!({
-                            "pattern": pattern,
-                            "hits": hit_rows(hits),
-                            "candidate_files": file_paths.len(),
-                            "total_files": file_paths.len(),
-                            "origin": "full_scan",
-                        }),
+                        Ok(hits) => {
+                            let mut row = serde_json::json!({
+                                "pattern": pattern,
+                                "hits": hit_rows(&hits[..hits.len().min(limit)]),
+                                "candidate_files": file_paths.len(),
+                                "total_files": file_paths.len(),
+                                "origin": "full_scan",
+                            });
+                            if hits.len() > limit {
+                                row["truncated"] = serde_json::json!(true);
+                                row["total_hits"] = serde_json::json!(hits.len());
+                            }
+                            row
+                        }
                         Err(e) => serde_json::json!({
                             "pattern": pattern,
                             "error": e,
@@ -3178,14 +3228,17 @@ impl SemServer {
                         if hits.is_empty() {
                             out.push_str("  (no hits)\n");
                         }
-                        for hit in hits {
+                        for hit in hits.iter().take(limit) {
                             out.push_str(&format!("  {}:{}:{}\n", hit.file, hit.line, hit.text));
+                        }
+                        if let Some(more) = grep_more_line(hits, limit) {
+                            out.push_str(&format!("  {more}\n"));
                         }
                     }
                     Err(e) => out.push_str(&format!("  {e}\n")),
                 }
             }
-            let all: Vec<sem_core::index::grep::GrepHit> = per_pattern.iter().filter_map(|(_, o)| o.as_ref().ok()).flatten().cloned().collect();
+            let all: Vec<sem_core::index::grep::GrepHit> = per_pattern.iter().filter_map(|(_, o)| o.as_ref().ok()).flat_map(|h| h.iter().take(limit)).cloned().collect();
             if params.bodies.unwrap_or(all.len() <= AUTO_BODIES) && !all.is_empty() {
                 out.push_str(&self.enclosing_bodies(&ctx.repo_root, &all, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
             }
@@ -3202,20 +3255,30 @@ impl SemServer {
             };
 
         if params.format() == "json" {
-            let report = serde_json::json!({
-                "hits": hit_rows(&hits),
+            let mut report = serde_json::json!({
+                "hits": hit_rows(&hits[..hits.len().min(limit)]),
                 "candidate_files": file_paths.len(),
                 "total_files": file_paths.len(),
                 "origin": "full_scan",
             });
+            if hits.len() > limit {
+                report["truncated"] = serde_json::json!(true);
+                report["total_hits"] = serde_json::json!(hits.len());
+            }
             return Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&report).unwrap_or_default(),
             )]));
         }
 
+        let more = grep_more_line(&hits, limit);
+        let mut hits = hits;
+        hits.truncate(limit);
         let mut out = String::new();
         for hit in &hits {
             out.push_str(&format!("{}:{}:{}\n", hit.file, hit.line, hit.text));
+        }
+        if let Some(more) = more {
+            out.push_str(&format!("{more}\n"));
         }
         // a handful of hits: show the code around them too, since the next
         // turn would read it anyway
@@ -3501,6 +3564,17 @@ struct LedgerFill {
 
 /// At most this many hits and sem_grep returns the code around them unasked.
 const AUTO_BODIES: usize = 6;
+
+/// sem_impact all mode lists at most this many transitive dependents (the
+/// total still counts every one).
+const IMPACT_LIST_CAP: usize = 100;
+
+/// The line that stands for the grep hits past `limit`, if any.
+fn grep_more_line(hits: &[sem_core::index::grep::GrepHit], limit: usize) -> Option<String> {
+    let rest = hits.get(limit..).filter(|r| !r.is_empty())?;
+    let files: std::collections::BTreeSet<&str> = rest.iter().map(|h| h.file.as_str()).collect();
+    Some(format!("… {} more hits in {} files (narrow with in, or raise limit)", rest.len(), files.len()))
+}
 
 /// `*` (within a path segment), `**` (any depth) and `?` against a
 /// repo-relative path.
@@ -3856,6 +3930,7 @@ mod tests {
                 base_ref: None,
                 target_ref: None,
                 file_path: Some(file_path.to_string_lossy().to_string()),
+                content: None,
             }))
             .await
             .unwrap();
@@ -3878,6 +3953,9 @@ mod tests {
         assert!(change.get("filePath").is_some());
         assert!(change.get("entity_name").is_none());
         assert!(change.get("change_type").is_none());
+        // source only on request
+        assert!(change.get("afterContent").is_none());
+        assert!(payload["note"].as_str().unwrap().contains("content=true"));
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -4227,6 +4305,7 @@ mod tests {
                 base_ref: None,
                 target_ref: None,
                 file_path: Some(file_path.display().to_string()),
+                content: None,
             }))
             .await
             .unwrap();
@@ -4268,6 +4347,7 @@ mod tests {
                 base_ref: Some(base_sha),
                 target_ref: Some(add_sha),
                 file_path: Some("branch_only.py".to_string()),
+                content: None,
             }))
             .await
             .unwrap();
@@ -4288,6 +4368,7 @@ mod tests {
                 base_ref: Some("missing-ref".to_string()),
                 target_ref: Some("HEAD".to_string()),
                 file_path: Some("sample.py".to_string()),
+                content: None,
             }))
             .await
             .unwrap();
@@ -4305,7 +4386,8 @@ mod tests {
 
         let result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: file_path.display().to_string(),
+                file_path: Some(file_path.display().to_string()),
+                depth: None,
                 entity_name: "nonexistent_zzz".to_string(),
                 mode: None,
                 no_default_excludes: None,
@@ -4325,7 +4407,8 @@ mod tests {
 
         let result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: file_path.display().to_string(),
+                file_path: Some(file_path.display().to_string()),
+                depth: None,
                 entity_name: "anything".to_string(),
                 mode: None,
                 no_default_excludes: None,
@@ -4351,7 +4434,8 @@ mod tests {
 
         let result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: file_path.display().to_string(),
+                file_path: Some(file_path.display().to_string()),
+                depth: None,
                 entity_name: "known_entity".to_string(),
                 mode: None,
                 no_default_excludes: None,
@@ -4378,7 +4462,8 @@ mod tests {
 
         let result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: "./sample.py".to_string(),
+                file_path: Some("./sample.py".to_string()),
+                depth: None,
                 entity_name: "known_entity".to_string(),
                 mode: Some("deps".to_string()),
                 no_default_excludes: None,
@@ -4403,7 +4488,8 @@ mod tests {
 
         let default_result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: "src/generated/schema.ts".to_string(),
+                file_path: Some("src/generated/schema.ts".to_string()),
+                depth: None,
                 entity_name: "generatedTarget".to_string(),
                 mode: Some("deps".to_string()),
                 no_default_excludes: None,
@@ -4417,7 +4503,8 @@ mod tests {
 
         let opt_in_result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: "src/generated/schema.ts".to_string(),
+                file_path: Some("src/generated/schema.ts".to_string()),
+                depth: None,
                 entity_name: "generatedTarget".to_string(),
                 mode: Some("deps".to_string()),
                 no_default_excludes: Some(true),
@@ -4613,7 +4700,8 @@ mod tests {
 
         let result = server
             .sem_impact(Parameters(ImpactAnalysisParams {
-                file_path: file_path.display().to_string(),
+                file_path: Some(file_path.display().to_string()),
+                depth: None,
                 entity_name: "known_entity".to_string(),
                 mode: Some("invalid".to_string()),
                 no_default_excludes: None,
@@ -4622,6 +4710,59 @@ mod tests {
             .unwrap();
 
         assert_tool_error(result, "Invalid mode 'invalid'");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_find_accepts_absolute_scope_and_qualified_names_and_suggests_on_a_miss() {
+        let root = temp_git_repo("find-qualified");
+        let file = root.join("text.py");
+        std::fs::write(&file, "class Text:\n    def count(self):\n        return 1\n").unwrap();
+        let server = server_for_repo(&root).await;
+        let find = |args: serde_json::Value| server.sem_find(Parameters(serde_json::from_value(args).unwrap()));
+
+        let hit = find(serde_json::json!({"query": "Text.count", "in": file.display().to_string()})).await.unwrap();
+        assert!(text_of(hit).contains("count text.py:2"));
+        let miss = find(serde_json::json!({"query": "coun"})).await.unwrap();
+        assert_tool_error(miss, "no entity named 'coun'. Near matches: count (or try sem_grep for text)");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_grep_caps_hits_and_searches_a_named_hidden_dir() {
+        let root = temp_git_repo("grep-limit");
+        std::fs::write(root.join("a.py"), "X = 'NEEDLE'\nY = 'NEEDLE'\nZ = 'NEEDLE'\n").unwrap();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "name: NEEDLE\n").unwrap();
+        let server = server_for_repo(&root).await;
+        let grep = |args: serde_json::Value| server.sem_grep(Parameters(serde_json::from_value(args).unwrap()));
+
+        let capped = text_of(grep(serde_json::json!({"pattern": "NEEDLE", "limit": 1})).await.unwrap());
+        assert!(capped.contains("… 2 more hits in 1 files (narrow with in, or raise limit)"), "{capped}");
+        let hidden = text_of(grep(serde_json::json!({"pattern": "NEEDLE", "in": ".github/workflows"})).await.unwrap());
+        assert!(hidden.contains(".github/workflows/ci.yml:1:name: NEEDLE"), "{hidden}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_resolves_the_entity_repo_wide_without_file_path() {
+        let root = temp_git_repo("impact-repo-wide");
+        std::fs::write(root.join("a.py"), "def uniq():\n    return 1\n\ndef dup():\n    return uniq()\n").unwrap();
+        std::fs::write(root.join("b.py"), "def dup():\n    return 2\n").unwrap();
+        let server = server_for_repo(&root).await;
+        let impact = |name: &str| {
+            server.sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: None,
+                entity_name: name.to_string(),
+                mode: None,
+                depth: None,
+                no_default_excludes: None,
+            }))
+        };
+
+        let found = text_of(impact("uniq").await.unwrap());
+        assert!(found.starts_with("◉ uniq · a.py"), "{found}");
+        assert_tool_error(impact("dup").await.unwrap(), "Pass file_path to pick one: a.py, b.py");
         let _ = std::fs::remove_dir_all(root);
     }
 

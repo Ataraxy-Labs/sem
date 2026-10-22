@@ -34,7 +34,7 @@ pub fn run(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{} not logged in — cloud inventory unavailable. Run: {}",
                 "cloud:".bold(),
-                "sem login".cyan()
+                "sem cloud login".cyan()
             );
         }
         CloudSection::Error(err) => {

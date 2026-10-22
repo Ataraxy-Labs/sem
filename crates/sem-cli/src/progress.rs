@@ -38,13 +38,13 @@ const SUMMARY_MIN: Duration = Duration::from_millis(150);
 /// command you're already running.
 const TIPS: &[&str] = &[
     "sem impact <entity> shows everything that breaks if you change it",
-    "sem context <entity> packs the right code into a token budget for your agent",
-    "sem blame <file> shows who last touched each function, not each line",
-    "sem log <entity> traces how one function evolved across commits",
-    "sem entities <dir> lists functions and classes without opening files",
+    "sem find <entity> --context packs the right code into a token budget for your agent",
+    "sem history --blame <file> shows who last touched each function, not each line",
+    "sem history <entity> traces how one function evolved across commits",
+    "sem find --in <dir> lists functions and classes without opening files",
     "sem graph maps your repo's entity dependency graph",
     "Give your agent sem: claude mcp add sem -- sem mcp",
-    "Stop rebuilding every run: sem login serves the graph warm from the cloud",
+    "Stop rebuilding every run: sem cloud login serves the graph warm from the cloud",
 ];
 
 /// Only nudge toward the cloud after a build slow enough that the warm cloud
@@ -234,7 +234,7 @@ fn maybe_cloud_nudge(elapsed: Duration) {
         "  {} {}",
         "⚡".cyan(),
         format!(
-            "You spent {} rebuilding this locally. On sem cloud it's served warm in milliseconds. Log in once: sem login",
+            "You spent {} rebuilding this locally. On sem cloud it's served warm in milliseconds. Log in once: sem cloud login",
             fmt_duration(elapsed)
         )
         .dimmed()

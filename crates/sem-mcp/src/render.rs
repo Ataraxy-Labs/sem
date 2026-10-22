@@ -172,6 +172,15 @@ pub fn impact_text(v: &Value) -> String {
             if !beyond.is_empty() {
                 push_grouped(&mut out, &beyond);
             }
+            if total > entities.len() as u64 {
+                out.push_str(&format!("  … {} more not listed\n", total - entities.len() as u64));
+            }
+            if impact.get("beyond_depth").and_then(Value::as_bool) == Some(true) {
+                out.push_str(&format!(
+                    "  … more past depth {} (raise depth; 0 = unlimited)\n",
+                    get_u64(impact, "depth").unwrap_or(0)
+                ));
+            }
         } else {
             out.push_str("⚡ nothing transitively affected\n");
         }

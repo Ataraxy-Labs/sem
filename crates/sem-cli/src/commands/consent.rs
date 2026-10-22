@@ -205,7 +205,7 @@ fn require_login() -> Option<cloud::CloudCredentials> {
             eprintln!(
                 "{} Not logged in. Run {} first.",
                 "error:".red().bold(),
-                "sem login".bold()
+                "sem cloud login".bold()
             );
             None
         }
@@ -413,7 +413,7 @@ pub fn status(cwd: &str) {
             "{} {} (run {})",
             "Account:  ".bold(),
             "not logged in".dimmed(),
-            "sem login".bold()
+            "sem cloud login".bold()
         ),
     }
 

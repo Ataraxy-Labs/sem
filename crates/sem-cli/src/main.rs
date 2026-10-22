@@ -120,7 +120,7 @@ enum Commands {
         patch: bool,
 
         /// Output format: terminal, json, plain, markdown. Example: sem diff --format markdown
-        #[arg(long, default_value = "terminal")]
+        #[arg(long, default_value = "terminal", env = "SEM_DIFF_FORMAT")]
         format: OutputFormat,
 
         /// Shorthand for --format json. Example: sem diff --json
@@ -128,7 +128,7 @@ enum Commands {
         json: bool,
 
         /// Show inline content diffs for each entity. Example: sem diff -v
-        #[arg(long, short = 'v')]
+        #[arg(long, short = 'v', env = "SEM_DIFF_VERBOSE", value_parser = clap::builder::FalseyValueParser::new())]
         verbose: bool,
 
         /// Show internal timing profile
@@ -136,15 +136,15 @@ enum Commands {
         profile: bool,
 
         /// Only include files with these extensions. Example: sem diff --file-exts .py .rs
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., value_delimiter = ',', env = "SEM_DIFF_FILE_EXTS")]
         file_exts: Vec<String>,
 
         /// Hide cosmetic changes (formatting, whitespace, comments only). Example: sem diff --no-cosmetics
-        #[arg(long)]
+        #[arg(long, env = "SEM_DIFF_NO_COSMETICS", value_parser = clap::builder::FalseyValueParser::new())]
         no_cosmetics: bool,
 
         /// When to use colors. Example: sem diff --color never
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", env = "SEM_DIFF_COLOR")]
         color: ColorMode,
 
         /// Run as if started in this directory (like git -C). Example: sem diff -C ../other-repo
@@ -198,7 +198,7 @@ enum Commands {
         tests: bool,
 
         /// Output format (terminal or json). Example: --format json
-        #[arg(long, value_parser = ["terminal", "json"])]
+        #[arg(long, value_parser = ["terminal", "json"], env = "SEM_IMPACT_FORMAT")]
         format: Option<String>,
 
         /// Output as JSON (shorthand for --format json). Example: sem impact parseConfig --json
@@ -206,11 +206,11 @@ enum Commands {
         json: bool,
 
         /// Only include files with these extensions. Example: --file-exts .py .rs
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., value_delimiter = ',', env = "SEM_IMPACT_FILE_EXTS")]
         file_exts: Vec<String>,
 
         /// Max traversal depth for transitive impact (default 2, 0 = unlimited). Example: --depth 0
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "2", env = "SEM_IMPACT_DEPTH")]
         depth: usize,
 
         /// Skip the SQLite entity cache (rebuild from scratch). Example: --no-cache
@@ -265,7 +265,7 @@ enum Commands {
         file: Option<String>,
 
         /// Output as JSON. Example: sem find parseConfig --json
-        #[arg(long)]
+        #[arg(long, env = "SEM_FIND_JSON", value_parser = clap::builder::FalseyValueParser::new())]
         json: bool,
 
         /// Output format (terminal or json)
@@ -395,7 +395,7 @@ enum Commands {
         patterns: Vec<String>,
 
         /// Case-insensitive match (disables the trigram prefilter). Example: sem grep -i todo
-        #[arg(long, short = 'i')]
+        #[arg(long, short = 'i', env = "SEM_GREP_IGNORE_CASE", value_parser = clap::builder::FalseyValueParser::new())]
         ignore_case: bool,
 
         /// Only report hits under these files or directories (rg-style
@@ -412,7 +412,7 @@ enum Commands {
         line_number: bool,
 
         /// Output as JSON (one object: hits, candidate_files, total_files, origin). Example: sem grep todo --json
-        #[arg(long)]
+        #[arg(long, env = "SEM_GREP_JSON", value_parser = clap::builder::FalseyValueParser::new())]
         json: bool,
     },
     /// Promises about the codebase, each verified by a deterministic check

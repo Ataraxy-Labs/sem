@@ -234,12 +234,12 @@ pub fn record(command: &str) {
         match mode {
             Mode::Local => eprintln!(
                 "sem keeps anonymous usage stats (command names only — never code or repo names) \
-                 on this machine. Nothing is uploaded. Run `sem telemetry on` to share them, or \
-                 `sem telemetry off` to disable."
+                 on this machine. Nothing is uploaded. Run `sem config telemetry on` to share them, or \
+                 `sem config telemetry off` to disable."
             ),
             Mode::On => eprintln!(
                 "sem collects anonymous usage data (command names only — never code or repo names). \
-                 Run `sem telemetry off` to disable."
+                 Run `sem config telemetry off` to disable."
             ),
             Mode::Off => unreachable!(),
         }
@@ -431,7 +431,7 @@ pub fn preview() {
     if mode == Mode::On {
         println!("These are uploaded as anonymous batches like:");
     } else {
-        println!("If enabled (`sem telemetry on`), these would upload as anonymous batches like:");
+        println!("If enabled (`sem config telemetry on`), these would upload as anonymous batches like:");
     }
     println!(
         "  {{ \"command\": \"impact\", \"version\": \"{}\", \"os\": \"{}\", \"ts\": \"…\" }}",
