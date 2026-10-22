@@ -325,120 +325,158 @@ pub(crate) fn build_image(
         .collect();
     image_mark("file_and_entity_index", __fileidx_t0);
 
-    let __entbytes_t0 = std::time::Instant::now();
-    let mut entity_bytes = Vec::with_capacity(entities.len() * ENTITY_REC_LEN);
-    for entity in &entities {
-        let id_text = if ids_elided {
-            id_tail_of(&entity.id, &entity.file_path).unwrap_or(&entity.id)
-        } else {
-            entity.id.as_str()
-        };
-        let kind = kinds.intern(&entity.entity_type, &mut arena);
-        let parent = entity
-            .parent_id
-            .as_deref()
-            .and_then(|id| entity_index.get(id).copied())
-            .unwrap_or(NONE_U32);
-        let flags = match test_entity_ids {
-            Some(ids) if ids.contains(entity.id.as_str()) => format::entity::FLAG_IS_TEST,
-            _ => 0,
-        };
-        let (start_byte, end_byte) = entity_byte_spans
-            .and_then(|spans| spans.get(entity.id.as_str()))
-            .copied()
-            .unwrap_or((NONE_U32, NONE_U32));
-        format::entity::write(
-            &mut entity_bytes,
-            arena.push_short(id_text),
-            arena.push_interned(&entity.name),
-            kind,
-            flags,
-            file_index[entity.file_path.as_str()],
-            entity.start_line as u32,
-            entity.end_line as u32,
-            parent,
-            start_byte,
-            end_byte,
-        );
-    }
-
-    // NAMES: entity indices sorted by name bytes, so a name query is an
-    // equal_range rather than a scan. The tie-break on
-    // index keeps the table a deterministic function of the graph, which is
-    // what the consistency oracle's byte-equality property needs.
-    image_mark("entities_section", __entbytes_t0);
-    let __names_t0 = std::time::Instant::now();
-    let mut name_order: Vec<u32> = (0..entities.len() as u32).collect();
-    maybe_par_sort_unstable_by!(name_order, |a: &u32, b: &u32| {
-        entities[*a as usize]
-            .name
-            .cmp(&entities[*b as usize].name)
-            .then(a.cmp(b))
-    });
-    let mut name_bytes = Vec::with_capacity(name_order.len() * NAME_REC_LEN);
-    for index in &name_order {
-        name_bytes.extend_from_slice(&index.to_le_bytes());
-    }
-
-    // FILES carry the entity range, which requires entities to be grouped by
-    // file — guaranteed by the sort above.
-    image_mark("names_section", __names_t0);
-    let __files_t0 = std::time::Instant::now();
-    let mut ranges: HashMap<u32, (u32, u32)> = HashMap::new();
-    for (i, entity) in entities.iter().enumerate() {
-        let file = file_index[entity.file_path.as_str()];
-        let entry = ranges.entry(file).or_insert((i as u32, i as u32));
-        entry.1 = i as u32 + 1;
-    }
-    let mut file_bytes = Vec::with_capacity(file_paths.len() * FILE_REC_LEN);
-    for (i, path) in file_paths.iter().enumerate() {
-        let (lo, hi) = ranges.get(&(i as u32)).copied().unwrap_or((0, 0));
-        let fingerprint = supplied.get(path);
-        format::file::write(
-            &mut file_bytes,
-            arena.push(path),
-            fingerprint.map_or(0, |f| f.mtime_secs),
-            fingerprint.map_or(0, |f| f.mtime_nanos) as i32,
-            fingerprint.map_or(0, |f| f.content_hash),
-            lo,
-            hi,
-        );
-    }
-
-    let mut kind_bytes = Vec::with_capacity(kinds.entries.len() * KIND_REC_LEN);
-    for (off, len) in &kinds.entries {
-        kind_bytes.extend_from_slice(&off.to_le_bytes());
-        kind_bytes.extend_from_slice(&len.to_le_bytes());
-    }
-
-    // REFS (S2; typed edges added): a serialization of
-    // `graph.edges` grouped by `from_entity` (forward — "refs", what an
-    // entity calls) and by `to_entity` (reverse — "callers", who calls it),
-    // keyed through the same `entity_index` used for `parent` above. Built
-    // directly from `edges` rather than from `graph.dependencies`/
-    // `dependents` (which drop `ref_type`) — every real `EntityGraph`
-    // constructor (`from_parts`, and both resolve-path constructors in
-    // `parser::graph`) builds `dependencies`/`dependents`/`edges` in one pass
-    // over the same deduped, sorted edge list, so grouping `edges` here
-    // reproduces the identical per-entity target order those maps already
-    // have, while also carrying the kind. The index is a transport, not a
-    // re-derivation: a mismatch here is a serialization bug, never a
-    // resolution one ("extraction identity" obligation).
-    image_mark("files_and_kinds_section", __files_t0);
+    // ENTITIES/NAMES/FILES/KINDS share the string arena, so they are built in
+    // order on one task; REFS and TRIGRAM read only the sorted entities and
+    // the file list, so they run beside that chain instead of after it. Each
+    // section is a pure function of its inputs, so the image is byte-identical
+    // to the serial build (the image sha256 gate witnesses this).
     let refs_typed = entities.len() <= format::refs::MAX_ENTITIES;
-    let __refs_t0 = std::time::Instant::now();
-    let refs_bytes = build_refs_section(&entities, &entity_index, graph, refs_typed);
-    image_mark("refs_section", __refs_t0);
+    let sections = || {
+        let __entbytes_t0 = std::time::Instant::now();
+        // The per-entity hash lookups (parent index, test flag, byte span,
+        // file index) touch no shared state, so they are resolved in parallel
+        // first; only the arena pushes, which assign string offsets in entity
+        // order, stay serial.
+        let resolved: Vec<(u32, u16, (u32, u32), u32)> = maybe_par_iter!(entities)
+            .map(|entity| {
+                let parent = entity
+                    .parent_id
+                    .as_deref()
+                    .and_then(|id| entity_index.get(id).copied())
+                    .unwrap_or(NONE_U32);
+                let flags = match test_entity_ids {
+                    Some(ids) if ids.contains(entity.id.as_str()) => format::entity::FLAG_IS_TEST,
+                    _ => 0,
+                };
+                let span = entity_byte_spans
+                    .and_then(|spans| spans.get(entity.id.as_str()))
+                    .copied()
+                    .unwrap_or((NONE_U32, NONE_U32));
+                (parent, flags, span, file_index[entity.file_path.as_str()])
+            })
+            .collect();
+        let mut entity_bytes = Vec::with_capacity(entities.len() * ENTITY_REC_LEN);
+        for (entity, &(parent, flags, (start_byte, end_byte), file)) in
+            entities.iter().zip(&resolved)
+        {
+            let id_text = if ids_elided {
+                id_tail_of(&entity.id, &entity.file_path).unwrap_or(&entity.id)
+            } else {
+                entity.id.as_str()
+            };
+            let kind = kinds.intern(&entity.entity_type, &mut arena);
+            format::entity::write(
+                &mut entity_bytes,
+                arena.push_short(id_text),
+                arena.push_interned(&entity.name),
+                kind,
+                flags,
+                file,
+                entity.start_line as u32,
+                entity.end_line as u32,
+                parent,
+                start_byte,
+                end_byte,
+            );
+        }
+        drop(resolved);
 
-    // TRIGRAM (S3): postings over **file** indices, built from
-    // whatever `contents` the caller supplied. A file with no content entry
-    // (fingerprint-only, or the caller opted out entirely via `build`)
-    // contributes nothing — never a partial or guessed posting — which is
-    // why `build` above passes an empty map and gets a zero-length section,
-    // identical to the pre-S3 skeleton contract.
-    let __trig_t0 = std::time::Instant::now();
-    let (trigram_bytes, trigram_stats) = build_trigram_section(&file_paths, &trigram_source);
-    image_mark("trigram_section", __trig_t0);
+        // NAMES: entity indices sorted by name bytes, so a name query is an
+        // equal_range rather than a scan. The tie-break on
+        // index keeps the table a deterministic function of the graph, which is
+        // what the consistency oracle's byte-equality property needs.
+        image_mark("entities_section", __entbytes_t0);
+        let __names_t0 = std::time::Instant::now();
+        let mut name_order: Vec<u32> = (0..entities.len() as u32).collect();
+        maybe_par_sort_unstable_by!(name_order, |a: &u32, b: &u32| {
+            entities[*a as usize]
+                .name
+                .cmp(&entities[*b as usize].name)
+                .then(a.cmp(b))
+        });
+        let mut name_bytes = Vec::with_capacity(name_order.len() * NAME_REC_LEN);
+        for index in &name_order {
+            name_bytes.extend_from_slice(&index.to_le_bytes());
+        }
+
+        // FILES carry the entity range, which requires entities to be grouped by
+        // file — guaranteed by the sort above.
+        image_mark("names_section", __names_t0);
+        let __files_t0 = std::time::Instant::now();
+        let mut ranges: HashMap<u32, (u32, u32)> = HashMap::new();
+        for (i, entity) in entities.iter().enumerate() {
+            let file = file_index[entity.file_path.as_str()];
+            let entry = ranges.entry(file).or_insert((i as u32, i as u32));
+            entry.1 = i as u32 + 1;
+        }
+        let mut file_bytes = Vec::with_capacity(file_paths.len() * FILE_REC_LEN);
+        for (i, path) in file_paths.iter().enumerate() {
+            let (lo, hi) = ranges.get(&(i as u32)).copied().unwrap_or((0, 0));
+            let fingerprint = supplied.get(path);
+            format::file::write(
+                &mut file_bytes,
+                arena.push(path),
+                fingerprint.map_or(0, |f| f.mtime_secs),
+                fingerprint.map_or(0, |f| f.mtime_nanos) as i32,
+                fingerprint.map_or(0, |f| f.content_hash),
+                lo,
+                hi,
+            );
+        }
+
+        let mut kind_bytes = Vec::with_capacity(kinds.entries.len() * KIND_REC_LEN);
+        for (off, len) in &kinds.entries {
+            kind_bytes.extend_from_slice(&off.to_le_bytes());
+            kind_bytes.extend_from_slice(&len.to_le_bytes());
+        }
+
+        image_mark("files_and_kinds_section", __files_t0);
+        (entity_bytes, name_bytes, file_bytes, kind_bytes)
+    };
+    let refs = || {
+        // REFS (S2; typed edges added): a serialization of
+        // `graph.edges` grouped by `from_entity` (forward — "refs", what an
+        // entity calls) and by `to_entity` (reverse — "callers", who calls it),
+        // keyed through the same `entity_index` used for `parent` above. Built
+        // directly from `edges` rather than from `graph.dependencies`/
+        // `dependents` (which drop `ref_type`) — every real `EntityGraph`
+        // constructor (`from_parts`, and both resolve-path constructors in
+        // `parser::graph`) builds `dependencies`/`dependents`/`edges` in one pass
+        // over the same deduped, sorted edge list, so grouping `edges` here
+        // reproduces the identical per-entity target order those maps already
+        // have, while also carrying the kind. The index is a transport, not a
+        // re-derivation: a mismatch here is a serialization bug, never a
+        // resolution one ("extraction identity" obligation).
+        let __refs_t0 = std::time::Instant::now();
+        let refs_bytes = build_refs_section(&entities, &entity_index, graph, refs_typed);
+        image_mark("refs_section", __refs_t0);
+        refs_bytes
+    };
+    let trigrams = || {
+        // TRIGRAM (S3): postings over **file** indices, built from
+        // whatever `contents` the caller supplied. A file with no content entry
+        // (fingerprint-only, or the caller opted out entirely via `build`)
+        // contributes nothing — never a partial or guessed posting — which is
+        // why `build` above passes an empty map and gets a zero-length section,
+        // identical to the pre-S3 skeleton contract.
+        let __trig_t0 = std::time::Instant::now();
+        let trigrams = build_trigram_section(&file_paths, &trigram_source);
+        image_mark("trigram_section", __trig_t0);
+        trigrams
+    };
+    #[cfg(feature = "parallel")]
+    let (
+        (entity_bytes, name_bytes, file_bytes, kind_bytes),
+        (refs_bytes, (trigram_bytes, trigram_stats)),
+    ) = rayon::join(sections, || rayon::join(refs, trigrams));
+    #[cfg(not(feature = "parallel"))]
+    let (
+        (entity_bytes, name_bytes, file_bytes, kind_bytes),
+        (refs_bytes, (trigram_bytes, trigram_stats)),
+    ) = {
+        let mut sections = sections;
+        (sections(), (refs(), trigrams()))
+    };
 
     // DIRS (`Complete` freshness —): sorted
     // by path bytes, same convention FILES uses, though the reader's
