@@ -808,11 +808,21 @@ impl SemServer {
         graph: &'a EntityGraph,
         entity_name: &str,
     ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
+        Self::find_entity_in_scope(graph, entity_name, None)
+    }
+
+    fn find_entity_in_scope<'a>(
+        graph: &'a EntityGraph,
+        entity_name: &str,
+        directory: Option<&str>,
+    ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
         let query = entity_name;
         let entity_name = Self::split_kind(query).1;
         let matches = |e: &sem_core::parser::graph::EntityInfo| Self::entity_name_matches(graph, query, e);
         let mut hits: Vec<&sem_core::parser::graph::EntityInfo> =
-            graph.entities.values().filter(|e| matches(e)).collect();
+            graph.entities.values().filter(|e| matches(e) && directory.is_none_or(|dir| {
+                dir == "." || Path::new(&e.file_path).starts_with(dir)
+            })).collect();
         hits.sort_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)));
         match hits.len() {
             1 => Ok(hits[0]),
@@ -2463,9 +2473,14 @@ impl SemServer {
         };
         // With a file hint, validate it up front; without one, the entity is
         // resolved repo-wide after the graph is available (one-call lookup).
+        let mut directory_scope = None;
         let explicit_rel: Option<String> = match params.file_path.as_deref() {
             Some(fp) => {
                 let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+                if abs_path.is_dir() {
+                    directory_scope = Some(rel_path);
+                    None
+                } else {
                 if let Some(err) = file_path_error(fp, &abs_path) {
                     return Ok(tool_error(err));
                 }
@@ -2473,6 +2488,7 @@ impl SemServer {
                     return Ok(tool_error(format!("No parser for file: {}", rel_path)));
                 }
                 Some(rel_path)
+                }
             }
             None => None,
         };
@@ -2521,7 +2537,7 @@ impl SemServer {
                 Ok(entity_id) => (entity_id.to_string(), rel_path),
                 Err(err) => return Ok(tool_error(err)),
             },
-            None => match Self::find_entity_repo_wide(&graph, entity_name) {
+            None => match Self::find_entity_in_scope(&graph, entity_name, directory_scope.as_deref()) {
                 Ok(entity) => (entity.id.to_string(), entity.file_path.clone()),
                 Err(err) => return Ok(tool_error(err)),
             },
@@ -2696,6 +2712,24 @@ impl SemServer {
         match mode {
             None | Some("definitions") => {}
             Some("callers") => {
+                if let Some(names) = queries {
+                    let mut blocks = Vec::new();
+                    let mut any_ok = false;
+                    for name in names {
+                        let result = self.sem_callers(Parameters(CallersParams {
+                            query: name.clone(), file: params.file().map(str::to_string),
+                            limit: params.limit, format: params.format.clone(),
+                        })).await?;
+                        any_ok |= !result.is_error.unwrap_or(false);
+                        for content in result.content {
+                            if let rmcp::model::RawContent::Text(t) = content.raw {
+                                blocks.push(if params.format() == "json" { t.text } else { format!("{name}:\n{}", t.text) });
+                            }
+                        }
+                    }
+                    let content = vec![Content::text(blocks.join("\n\n"))];
+                    return Ok(if any_ok { CallToolResult::success(content) } else { CallToolResult::error(content) });
+                }
                 let Some(q) = query else {
                     return Ok(tool_error("mode \"callers\" takes one query"));
                 };
@@ -3672,6 +3706,39 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn query_contract_directory_context() {
+        let root = temp_git_repo("directory-context");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src_other")).unwrap();
+        fs::write(root.join("src/a.py"), "def target():\n    return 42\n").unwrap();
+        fs::write(root.join("src_other/a.py"), "def target():\n    return 99\n").unwrap();
+        let params: FindParams = serde_json::from_value(serde_json::json!({
+            "mode": "context", "queries": ["target"], "in": root.join("src").to_str().unwrap()
+        })).unwrap();
+        let result = SemServer::new().sem_find(Parameters(params)).await.unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        let text = text_of(result);
+        assert!(text.contains("42"), "{text}");
+        assert!(!text.contains("99"), "scope must not include sibling: {text}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn query_contract_caller_batch_dispatches_each_name() {
+        // A nonexistent scope yields a per-query error without spawning the CLI.
+        // The important contract is accepting a batch instead of rejecting its shape.
+        let params: FindParams = serde_json::from_value(serde_json::json!({
+            "mode": "callers", "queries": ["first", "second"],
+            "file": "/nonexistent-sem-contract-test/a.py"
+        })).unwrap();
+        let result = SemServer::new().sem_find(Parameters(params)).await.unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let text = text_of(result);
+        assert!(text.contains("first:") && text.contains("second:"), "{text}");
+        assert!(!text.contains("takes one query"));
+    }
 
     #[test]
     fn completeness_source_fallback_preserves_bytes() {
