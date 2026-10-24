@@ -2714,20 +2714,36 @@ impl SemServer {
             Some("callers") => {
                 if let Some(names) = queries {
                     let mut blocks = Vec::new();
+                    let mut json_results = Vec::new();
                     let mut any_ok = false;
                     for name in names {
                         let result = self.sem_callers(Parameters(CallersParams {
                             query: name.clone(), file: params.file().map(str::to_string),
                             limit: params.limit, format: params.format.clone(),
                         })).await?;
-                        any_ok |= !result.is_error.unwrap_or(false);
+                        let is_error = result.is_error.unwrap_or(false);
+                        any_ok |= !is_error;
+                        let mut query_results = Vec::new();
                         for content in result.content {
                             if let rmcp::model::RawContent::Text(t) = content.raw {
-                                blocks.push(if params.format() == "json" { t.text } else { format!("{name}:\n{}", t.text) });
+                                if params.format() == "json" {
+                                    query_results.push(serde_json::from_str::<serde_json::Value>(&t.text)
+                                        .unwrap_or_else(|_| serde_json::Value::String(t.text)));
+                                } else {
+                                    blocks.push(format!("{name}:\n{}", t.text));
+                                }
                             }
                         }
+                        json_results.push(serde_json::json!({
+                            "query": name, "is_error": is_error, "results": query_results,
+                        }));
                     }
-                    let content = vec![Content::text(blocks.join("\n\n"))];
+                    let text = if params.format() == "json" {
+                        serde_json::Value::Array(json_results).to_string()
+                    } else {
+                        blocks.join("\n\n")
+                    };
+                    let content = vec![Content::text(text)];
                     return Ok(if any_ok { CallToolResult::success(content) } else { CallToolResult::error(content) });
                 }
                 let Some(q) = query else {
@@ -3723,6 +3739,24 @@ mod tests {
         assert!(text.contains("42"), "{text}");
         assert!(!text.contains("99"), "scope must not include sibling: {text}");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn query_contract_caller_batch_json_preserves_query_errors() {
+        let params: FindParams = serde_json::from_value(serde_json::json!({
+            "mode": "callers", "queries": ["first", "second"],
+            "file": "/nonexistent-sem-contract-test/a.py", "format": "json"
+        })).unwrap();
+        let result = SemServer::new().sem_find(Parameters(params)).await.unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let value: serde_json::Value = serde_json::from_str(&text_of(result)).unwrap();
+        let rows = value.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, name) in rows.iter().zip(["first", "second"]) {
+            assert_eq!(row["query"], name);
+            assert_eq!(row["is_error"], true);
+            assert!(!row["results"].as_array().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
