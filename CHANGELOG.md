@@ -6,6 +6,8 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
+- Experimental validation benchmark adapters for persistent TypeScript diagnostics and independent check batching, with fresh-compiler parity tests and measured limitations.
+
 - **After an edit, the agent hears what the change left undone.** `sem hook tool` now also runs after Edit, Write, MultiEdit and apply_patch, and adds at most a few lines to the agent's context: other implementations or overrides of a method it changed that it has not touched (from the dispatch edges of the graph), callers still using a signature it changed or an entity it removed, and the tests that reach the change with a command to run them. It stays silent when there is nothing to say, says each thing once per session, and gives up within 1.5 s. `sem setup` now registers the tool hook before and after edit tools (`Edit|Write|MultiEdit`); before, it installed only the prompt hook.
 - **Per-command defaults from the environment.** A flag an agent or CI repeats on every call can be set once as `SEM_<COMMAND>_<OPTION>`: `SEM_DIFF_FORMAT`, `SEM_DIFF_VERBOSE`, `SEM_DIFF_NO_COSMETICS`, `SEM_DIFF_COLOR`, `SEM_DIFF_FILE_EXTS`, `SEM_IMPACT_FORMAT`, `SEM_IMPACT_DEPTH`, `SEM_IMPACT_FILE_EXTS`, `SEM_FIND_JSON`, `SEM_GREP_JSON` and `SEM_GREP_IGNORE_CASE`. A flag on the command line still wins, and an on/off default is turned back off with `SEM_DIFF_VERBOSE=0`. sem clears these when it runs itself (the MCP tools, `sem impact --diff`, the hooks), so their output never changes shape (#473).
 - **`sem_impact` takes `depth`** (default 2 like the CLI, `0` for unlimited) and no longer needs `file_path`: a name is resolved across the repo, and an ambiguous one lists the files it could be in.

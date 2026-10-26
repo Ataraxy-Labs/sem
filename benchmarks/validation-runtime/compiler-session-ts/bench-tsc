@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node /opt/sem-compiler/project-worker.cjs "$@"

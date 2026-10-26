@@ -1,0 +1,8 @@
+[user]
+	name = bench
+	email = bench@localhost
+[core]
+	filemode = false
+	pager = cat
+[commit]
+	gpgsign = false
