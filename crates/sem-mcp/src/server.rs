@@ -345,9 +345,9 @@ impl SemServer {
                 } else {
                     p.parent().unwrap_or(p)
                 };
-                if let Ok(bridge) = GitBridge::open(search_dir) {
-                    return Ok(bridge.repo_root().to_path_buf());
-                }
+                return GitBridge::open(search_dir)
+                    .map(|bridge| bridge.repo_root().to_path_buf())
+                    .map_err(|err| format!("Cannot find git repository for explicit path '{fp}': {err}"));
             }
         }
 
@@ -3743,9 +3743,11 @@ mod tests {
 
     #[tokio::test]
     async fn query_contract_caller_batch_json_preserves_query_errors() {
+        let outside_repo = TempDir::new().unwrap();
+        let missing_file = outside_repo.path().join("missing/a.py");
         let params: FindParams = serde_json::from_value(serde_json::json!({
             "mode": "callers", "queries": ["first", "second"],
-            "file": "/nonexistent-sem-contract-test/a.py", "format": "json"
+            "file": missing_file, "format": "json"
         })).unwrap();
         let result = SemServer::new().sem_find(Parameters(params)).await.unwrap();
         assert!(result.is_error.unwrap_or(false));
@@ -3761,11 +3763,13 @@ mod tests {
 
     #[tokio::test]
     async fn query_contract_caller_batch_dispatches_each_name() {
+        let outside_repo = TempDir::new().unwrap();
+        let missing_file = outside_repo.path().join("missing/a.py");
         // A nonexistent scope yields a per-query error without spawning the CLI.
         // The important contract is accepting a batch instead of rejecting its shape.
         let params: FindParams = serde_json::from_value(serde_json::json!({
             "mode": "callers", "queries": ["first", "second"],
-            "file": "/nonexistent-sem-contract-test/a.py"
+            "file": missing_file
         })).unwrap();
         let result = SemServer::new().sem_find(Parameters(params)).await.unwrap();
         assert!(result.is_error.unwrap_or(false));

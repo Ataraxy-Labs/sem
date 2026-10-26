@@ -24,6 +24,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- Explicit absolute MCP repository hints fail when their repository cannot be opened instead of silently falling back to the current repository. Caller-batch error tests use portable temporary paths.
+
 - MCP context queries honor directory scopes. Caller queries accept batches, with valid JSON arrays carrying per-query results and error status. Includes the capability-aware agent policy used in benchmark experiments (#529).
 
 - MCP graph lookups accept nested qualified names and exact entity IDs, and reject ambiguous same-file names. Source-read receipts preserve line endings and final-newline state. Caller JSON reports `total`, `returned`, and `truncated` separately from its semantic completeness verdict (#527).
