@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-10-25
+
 ### Added
 
 - Experimental validation benchmark adapters for persistent TypeScript diagnostics and independent check batching, with fresh-compiler parity tests and measured limitations.
@@ -21,6 +23,8 @@ All notable changes to sem are documented in this file.
 - **`sem_find` with mode `callers` gives the CLI's answer.** It says when the static graph cannot prove the caller set is complete, lists possible callers, and merges dispatch groups, where it used to print `callers: none` either way. Its JSON is now the shape `sem callers --json` prints (`entity`, `related`, `complete`, `incomplete_because`).
 
 ### Fixed
+
+- Explicit absolute MCP repository hints fail when their repository cannot be opened instead of silently falling back to the current repository. Caller-batch error tests use portable temporary paths.
 
 - MCP context queries honor directory scopes. Caller queries accept batches, with valid JSON arrays carrying per-query results and error status. Includes the capability-aware agent policy used in benchmark experiments (#529).
 
