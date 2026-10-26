@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-10-25
+
 ### Added
 
 - Experimental validation benchmark adapters for persistent TypeScript diagnostics and independent check batching, with fresh-compiler parity tests and measured limitations.
