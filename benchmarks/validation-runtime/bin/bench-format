@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Apply the project's Prettier output to explicit host paths after hash checks.
+
+Experimental benchmark adapter. Requires exclusive/cooperative host editing while
+this command runs. Only requested regular files inside BENCH_REPO can be changed.
+No build/test verdict is cached or inferred from formatting.
+"""
+import base64, hashlib, json, os, pathlib, shlex, subprocess, sys, tempfile, signal
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+def apply(root, originals, results):
+    by_path={r['path']:r for r in results}
+    if len(by_path)!=len(results) or set(by_path)!=set(originals):
+        raise ValueError('formatter returned unexpected or duplicate paths')
+    formatted={}
+    for name, old in originals.items():
+        p=root/name; r=by_path[name]
+        if not p.is_file() or p.is_symlink() or p.read_bytes()!=old or r['before']!=sha(old):
+            raise ValueError('source changed during formatting: '+name)
+        formatted[name]=base64.b64decode(r['content'],validate=True)
+    changed=[]
+    for name,new in formatted.items():
+        if new==originals[name]: continue
+        p=root/name
+        fd,tmp=tempfile.mkstemp(prefix='.bench-format-',dir=p.parent)
+        try:
+            with os.fdopen(fd,'wb') as f:f.write(new)
+            os.chmod(tmp,p.stat().st_mode & 0o777)
+            os.replace(tmp,p)
+        finally:
+            if os.path.exists(tmp):os.unlink(tmp)
+        changed.append(name)
+    return changed
+
+def main():
+    root=pathlib.Path(os.environ['BENCH_REPO']).resolve(); originals={}
+    for name in sys.argv[1:]:
+        p=root/name
+        if p.is_symlink() or not p.is_file():raise ValueError('expected regular file: '+name)
+        resolved=p.resolve(); rel=str(resolved.relative_to(root))
+        if any(part in ('.git','.sem','.weave','node_modules') for part in pathlib.Path(rel).parts):raise ValueError('excluded path: '+name)
+        if rel in originals:raise ValueError('duplicate path: '+name)
+        originals[rel]=p.read_bytes()
+    if not originals:raise ValueError('usage: bench-format <file> [file ...]')
+    script=r'''const fs=require('fs'),c=require('crypto'),p=require('prettier');
+(async()=>{const result=[];for(const name of JSON.parse(process.argv[1])){
+const old=fs.readFileSync(name),options=await p.resolveConfig(name)||{};
+const next=await p.format(old.toString('utf8'),{...options,filepath:name});
+result.push({path:name,before:c.createHash('sha256').update(old).digest('hex'),content:Buffer.from(next).toString('base64')});
+}console.log(JSON.stringify(result));})().catch(e=>{console.error(e);process.exitCode=1;});'''
+    command='node -e '+shlex.quote(script)+' '+shlex.quote(json.dumps(list(originals)))
+    process=subprocess.Popen(['bench-exec',command],cwd=root,stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,text=True,start_new_session=True)
+    try:
+        stdout,stderr=process.communicate(timeout=360)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        os.killpg(process.pid,signal.SIGTERM)
+        try:process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid,signal.SIGKILL);process.communicate()
+        raise RuntimeError('formatter cancelled; no local edits applied')
+    if process.returncode:raise RuntimeError(stderr+stdout)
+    changed=apply(root,originals,json.loads(stdout))
+    print(json.dumps({'formatted':changed,'checked':len(originals),'scope':'formatting only; behavioral validation is separate'}))
+if __name__=='__main__':
+    try:main()
+    except Exception as e:print(json.dumps({'error':str(e)}),file=sys.stderr);sys.exit(1)

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# bench-exec: run a shell command inside this task's offline Linux container.
+#
+# Usage: bench-exec '<shell command>'
+#
+# Before running, the current working-tree state of the host checkout (all
+# tracked and untracked, non-ignored files, relative to the base commit) is
+# synced into the container's /testbed. The container has the task's
+# toolchain and dependency caches preinstalled; network is disabled.
+#
+# Env (set by run.py): BENCH_CONTAINER, BENCH_REPO, BENCH_BASE
+# Optional: BENCH_EXEC_TIMEOUT (seconds, default 1800)
+# Experimental: BENCH_PERSISTENT_SYNC=1 preserves unchanged synchronized source.
+set -uo pipefail
+export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-$(cd "$(dirname "$0")/.." && pwd)/gitconfig}"
+: "${BENCH_CONTAINER:?BENCH_CONTAINER not set}"
+: "${BENCH_REPO:?BENCH_REPO not set}"
+: "${BENCH_BASE:?BENCH_BASE not set}"
+if [ $# -eq 0 ]; then
+  echo "usage: bench-exec '<shell command>'" >&2
+  exit 2
+fi
+cmd="$*"
+tmo="${BENCH_EXEC_TIMEOUT:-1800}"
+
+lock="${TMPDIR:-/tmp}/bench-exec-${BENCH_CONTAINER}.lock"
+locked=0
+for _ in $(seq 1 600); do
+  if mkdir "$lock" 2>/dev/null; then locked=1; break; fi
+  sleep 0.5
+done
+[ "$locked" = 1 ] || { echo "bench-exec: validation workspace busy" >&2; exit 3; }
+trap 'if [ -n "${tmp:-}" ]; then rm -rf "$tmp"; fi; rmdir "$lock" 2>/dev/null' EXIT
+trap 'exit 143' TERM INT HUP
+
+tmp="$(mktemp -d)"
+GIT_INDEX_FILE="$tmp/index" git -C "$BENCH_REPO" read-tree "$BENCH_BASE" &&
+GIT_INDEX_FILE="$tmp/index" git -C "$BENCH_REPO" add -A . &&
+GIT_INDEX_FILE="$tmp/index" git -C "$BENCH_REPO" diff --no-ext-diff --no-textconv --cached --binary "$BENCH_BASE" -- . \
+  ':(exclude).sem' ':(exclude).weave' ':(exclude).claude' > "$tmp/p.diff" || {
+  echo "bench-exec: failed to compute working-tree diff" >&2; rm -rf "$tmp"; exit 3; }
+
+# Prototype: reuse only the synchronized source, never a test result. Compare
+# content trees rather than timestamps; a formatter/test modifying source must
+# force the next sync. Keep the lock through execution so another validation
+# cannot reset the workspace under a running command.
+snapshot='set -eu
+  cd /testbed
+  idx=$(mktemp); rm -f "$idx"
+  trap '\''rm -f "$idx"'\'' EXIT
+  export GIT_INDEX_FILE="$idx"
+  git read-tree HEAD
+  git add -A .
+  git rev-parse HEAD
+  git write-tree'
+reuse=0
+if [ "${BENCH_PERSISTENT_SYNC:-0}" = 1 ]; then
+  { printf '%s\n' "$BENCH_BASE"; cat "$tmp/p.diff"; } > "$tmp/input"
+  key=$(git hash-object "$tmp/input")
+  compare='current=$('
+  compare+="$snapshot"
+  compare+=') || exit 1
+    expected=$(printf "%s\n%s\n" "$0" "$current")
+    actual=$(cat /tmp/bench-sync-receipt) || exit 1
+    test "$expected" = "$actual"'
+  if docker exec -u root "$BENCH_CONTAINER" bash -c "$compare" "$key" 2>/dev/null; then
+    reuse=1
+  fi
+fi
+if [ "$reuse" = 0 ]; then
+docker cp -q "$tmp/p.diff" "$BENCH_CONTAINER:/tmp/bench-sync.diff" >/dev/null || {
+  echo "bench-exec: docker cp failed (is the task container running?)" >&2; rm -rf "$tmp"; exit 3; }
+
+docker exec -u root "$BENCH_CONTAINER" bash -c '
+  cd /testbed &&
+  git checkout -q -- . && git clean -fdq &&
+  if [ -s /tmp/bench-sync.diff ]; then git apply --binary /tmp/bench-sync.diff; fi
+' || { echo "bench-exec: failed to sync working tree into container" >&2; exit 3; }
+if [ "${BENCH_PERSISTENT_SYNC:-0}" = 1 ]; then
+  if docker exec -u root "$BENCH_CONTAINER" bash -c "$snapshot" > "$tmp/current"; then
+    printf '%s\n' "$key" > "$tmp/receipt"
+    cat "$tmp/current" >> "$tmp/receipt"
+    docker cp -q "$tmp/receipt" "$BENCH_CONTAINER:/tmp/bench-sync-receipt" >/dev/null || exit 3
+  else
+    docker exec -u root "$BENCH_CONTAINER" rm -f /tmp/bench-sync-receipt >/dev/null
+  fi
+fi
+fi
+if [ "${BENCH_PERSISTENT_SYNC:-0}" = 1 ]; then
+  echo "bench-exec: source_sync=$([ "$reuse" = 1 ] && echo reused || echo refreshed)" >&2
+fi
+rm -rf "$tmp"
+# Harness-only handshake: snapshot sync is complete and the validation lock is
+# held before the model can edit the host checkout. Read-only baseline checks
+# can now overlap discovery without racing another validation workspace sync.
+if [ -n "${BENCH_EXEC_READY_FILE:-}" ]; then
+  printf 'ready\n' > "$BENCH_EXEC_READY_FILE"
+fi
+
+# Run in the container directory matching the caller's host cwd (repo root if the
+# cwd is outside the checkout). Directories under .git/ (e.g. sem's base-revision
+# side checkouts at .git/sem-base/<commit>/) are not part of the synced diff, so
+# they are copied into the container fresh on every call.
+host_root="$(cd "$BENCH_REPO" && pwd -P)"
+here="$(pwd -P)"
+workdir=/testbed
+case "$here/" in
+  "$host_root"/*)
+    rel="${here#"$host_root"}"; rel="${rel#/}"
+    if [ -n "$rel" ]; then
+      workdir="/testbed/$rel"
+      case "$rel/" in
+        .git/*)
+          docker exec -u root "$BENCH_CONTAINER" bash -c 'rm -rf "$0" && mkdir -p "$0"' "$workdir" &&
+          COPYFILE_DISABLE=1 tar -C "$here" -cf - . | docker exec -i -u root "$BENCH_CONTAINER" tar -C "$workdir" -xf - || {
+            echo "bench-exec: failed to copy $rel into container" >&2; exit 3; } ;;
+        *)
+          docker exec -u root "$BENCH_CONTAINER" mkdir -p "$workdir" ;;
+      esac
+    fi ;;
+esac
+
+# Run in the background so a SIGTERM/SIGINT to bench-exec (e.g. the agent's tool
+# timeout) can kill the in-container process group; a killed `docker exec` client
+# alone would leave the command running inside the container.
+id="$$-$RANDOM"
+docker exec -u root -w "$workdir" "$BENCH_CONTAINER" bash -c \
+  'echo $$ > /tmp/bench-exec-'"$id"'.pid; export PATH="/usr/local/go/bin:/usr/local/cargo/bin:/root/.cargo/bin:/root/.local/bin:$PATH"; exec timeout '"$tmo"' bash -c "$0"' "$cmd" &
+dpid=$!
+stop() {
+  docker exec -u root "$BENCH_CONTAINER" bash -c \
+    'p=$(cat /tmp/bench-exec-'"$id"'.pid 2>/dev/null) && [ -n "$p" ] && { kill -TERM -- -$p 2>/dev/null; sleep 3; kill -KILL -- -$p 2>/dev/null; }; true' >/dev/null 2>&1
+  kill "$dpid" 2>/dev/null
+  echo "bench-exec: stopped; in-container process group killed" >&2
+  exit 143
+}
+trap stop TERM INT HUP
+wait "$dpid"
+rc=$?
+trap - TERM INT HUP
+docker exec -u root "$BENCH_CONTAINER" rm -f "/tmp/bench-exec-$id.pid" >/dev/null 2>&1
+exit $rc

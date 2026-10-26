@@ -1,0 +1,36 @@
+name: Experimental validation runtime
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/validation-runtime/**'
+      - '.github/workflows/validation-runtime.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'benchmarks/validation-runtime/**'
+      - '.github/workflows/validation-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  validation-contract:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: benchmarks/validation-runtime
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: node compiler-session-ts/test-observations.cjs
+      - run: python3 compiler-session-ts/test-validation-batch.py
+      - name: Fresh-compiler diagnostic parity
+        run: |
+          sudo mkdir -p /testbed /opt/sem-compiler
+          sudo chown "$USER" /testbed /opt/sem-compiler
+          npm install --prefix /testbed --ignore-scripts --no-audit --no-fund typescript@5.8.3
+          cp compiler-session-ts/project-worker.cjs compiler-session-ts/compiler-observations.cjs /opt/sem-compiler/
+          node compiler-session-ts/probe-project.cjs --fixture-only
