@@ -236,54 +236,36 @@ jobs:
         run: ./mcp-publisher publish || (sleep 60 && ./mcp-publisher publish)
 
   publish-crates:
-    needs: [check-version, semver-check]
+    needs: [check-version, create-tag]
     if: >-
       always() && needs.check-version.result == 'success' &&
-      ((needs.check-version.outputs.should_release == 'true' && needs.semver-check.result == 'success') ||
+      ((needs.check-version.outputs.should_release == 'true' && needs.create-tag.result == 'success') ||
       (inputs.publish_crates_only == true && needs.check-version.outputs.should_release == 'false'))
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates
+    timeout-minutes: 90
+    concurrency:
+      group: crates-publication
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test and preserve publishing helper
+        run: |
+          python3 scripts/test-publish-crates.py
+          cp scripts/publish-crates.py "$RUNNER_TEMP/publish-crates.py"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.check-version.outputs.version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish sem-core
-        run: |
-          VERSION=$(grep '^version' sem-core/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          cargo publish -p sem-core || cargo info --registry crates-io "sem-core@$VERSION" >/dev/null
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish sem-cloud-client
-        run: |
-          VERSION=$(grep '^version' sem-cloud-client/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          cargo publish -p sem-cloud-client || cargo info --registry crates-io "sem-cloud-client@$VERSION" >/dev/null
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish sem-mcp
-        run: |
-          VERSION=$(grep '^version' sem-mcp/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          cargo publish -p sem-mcp || cargo info --registry crates-io "sem-mcp@$VERSION" >/dev/null
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish sem-cli
-        run: |
-          VERSION=$(grep '^version' sem-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          cargo publish -p sem-cli || cargo info --registry crates-io "sem-cli@$VERSION" >/dev/null
+      - name: Publish crates in dependency order
+        run: python3 "$RUNNER_TEMP/publish-crates.py" --workspace crates sem-core sem-cloud-client sem-mcp sem-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
