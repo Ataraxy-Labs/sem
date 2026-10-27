@@ -204,6 +204,7 @@ fn make_change(
         author: author.map(String::from),
         timestamp: None,
         structural_change,
+        entry: None,
     }
 }
 

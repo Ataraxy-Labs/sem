@@ -101,6 +101,11 @@ impl Serialize for SemanticChangeJson<'_> {
         fields.serialize_field("commitSha", &change.commit_sha)?;
         fields.serialize_field("author", &change.author)?;
         fields.serialize_field("structuralChange", &change.structural_change)?;
+        // Only `--entries` produces entry changes; every other diff keeps the
+        // exact schema it had.
+        if let Some(entry) = &change.entry {
+            fields.serialize_field("entry", entry)?;
+        }
         fields.end()
     }
 }
@@ -233,6 +238,7 @@ mod tests {
                 author: Some("Ada".to_string()),
                 timestamp: Some("2026-05-26".to_string()),
                 structural_change: Some(true),
+                entry: None,
             }],
             file_count: 1,
             added_count: 0,

@@ -79,12 +79,46 @@ fn lacks_diffable_content(file: &FileChange) -> bool {
     }
 }
 
+/// Knobs for [`compute_semantic_diff_with_options`]. The default is exactly
+/// [`compute_semantic_diff`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SemanticDiffOptions {
+    /// Diff the elements of container literals (dict / object / map / slice
+    /// literals bound to a name) as `entry` entities, and give Python module-
+    /// and class-level assignments entities of their own. See
+    /// `parser::plugins::code::entries`.
+    pub entries: bool,
+}
+
 pub fn compute_semantic_diff(
     file_changes: &[FileChange],
     registry: &ParserRegistry,
     commit_sha: Option<&str>,
     author: Option<&str>,
 ) -> DiffResult {
+    compute_semantic_diff_with_options(
+        file_changes,
+        registry,
+        commit_sha,
+        author,
+        SemanticDiffOptions::default(),
+    )
+}
+
+pub fn compute_semantic_diff_with_options(
+    file_changes: &[FileChange],
+    registry: &ParserRegistry,
+    commit_sha: Option<&str>,
+    author: Option<&str>,
+    options: SemanticDiffOptions,
+) -> DiffResult {
+    let extract = |plugin: &dyn SemanticParserPlugin, content: &str, path: &str| {
+        if options.entries {
+            plugin.extract_entities_with_entries(content, path)
+        } else {
+            plugin.extract_entities(content, path)
+        }
+    };
     // Fresh accumulation for this call — see phase_timing's module doc for
     // why a top-level reset is needed before the parallel fan-out below.
     phase_timing::reset_diff_phase_timings();
@@ -109,7 +143,7 @@ pub fn compute_semantic_diff(
                     let before_detection = before_resolved.as_deref().unwrap_or(before_path);
                     phase_timing::timed(&PHASE_ACC.extraction_ns, || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let mut entities = plugin.extract_entities(content, before_detection);
+                            let mut entities = extract(plugin, content, before_detection);
                             disambiguate_colliding_entity_ids(&mut entities);
                             entities
                         }))
@@ -122,7 +156,7 @@ pub fn compute_semantic_diff(
                 let after_entities = if let Some(ref content) = file.after_content {
                     phase_timing::timed(&PHASE_ACC.extraction_ns, || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let mut entities = plugin.extract_entities(content, detection_path);
+                            let mut entities = extract(plugin, content, detection_path);
                             disambiguate_colliding_entity_ids(&mut entities);
                             entities
                         }))
@@ -152,6 +186,9 @@ pub fn compute_semantic_diff(
                         &before_entities,
                         &after_entities,
                     );
+                    if options.entries {
+                        finish_entry_changes(&mut result.changes, &before_entities, &after_entities);
+                    }
                     result
                 });
 
@@ -440,6 +477,148 @@ fn suppress_redundant_parents(
     }
 }
 
+/// `--entries` post-pass over one file's changes:
+/// - an entry's key is its identity, so a Renamed or Moved entry (the matcher
+///   pairs entries by similar content) is reported as the Deleted old key and
+///   the Added new key;
+/// - a binding whose literal changed only in its entries is dropped (the entry
+///   changes say what changed);
+/// - every entry change carries its container and key.
+fn finish_entry_changes(
+    changes: &mut Vec<SemanticChange>,
+    before: &[SemanticEntity],
+    after: &[SemanticEntity],
+) {
+    use crate::model::change::EntryRef;
+    use crate::parser::plugins::code::entries::{META_CONTAINER, META_KEY, META_KEY_KIND};
+
+    if !changes.iter().any(|c| c.entity_type == "entry" || c.entity_type == "variable") {
+        return;
+    }
+    let before_by_id: HashMap<&str, &SemanticEntity> =
+        before.iter().map(|e| (e.id.as_str(), e)).collect();
+    let after_by_id: HashMap<&str, &SemanticEntity> =
+        after.iter().map(|e| (e.id.as_str(), e)).collect();
+
+    // 1. Renamed / Moved entries -> Deleted old key + Added new key.
+    let mut split: Vec<SemanticChange> = Vec::new();
+    for c in changes.iter_mut() {
+        if c.entity_type != "entry"
+            || !matches!(c.change_type, ChangeType::Renamed | ChangeType::Moved)
+        {
+            continue;
+        }
+        let Some(new) = after_by_id.get(c.entity_id.as_str()) else { continue };
+        let old_name = c.old_entity_name.clone().unwrap_or_else(|| new.name.clone());
+        let old_parent = c.old_parent_id.clone().or_else(|| new.parent_id.clone());
+        let old = before.iter().find(|e| {
+            e.entity_type == "entry"
+                && e.name == old_name
+                && e.parent_id == old_parent
+                && (e.file_path == c.old_file_path.clone().unwrap_or_else(|| c.file_path.clone()))
+        });
+        if let Some(old) = old {
+            let mut del = c.clone();
+            del.id = format!("change::deleted::{}", old.id);
+            del.entity_id = old.id.clone();
+            del.change_type = ChangeType::Deleted;
+            del.entity_name = old.name.clone();
+            del.entity_line = old.start_line;
+            del.start_line = old.start_line;
+            del.end_line = old.end_line;
+            del.old_start_line = Some(old.start_line);
+            del.old_end_line = Some(old.end_line);
+            del.file_path = old.file_path.clone();
+            del.old_entity_name = None;
+            del.old_file_path = None;
+            del.old_parent_id = None;
+            del.before_content = Some(old.content.clone());
+            del.after_content = None;
+            del.structural_change = None;
+            split.push(del);
+        }
+        c.change_type = ChangeType::Added;
+        c.old_entity_name = None;
+        c.old_file_path = None;
+        c.old_parent_id = None;
+        c.old_start_line = None;
+        c.old_end_line = None;
+        c.before_content = None;
+        c.structural_change = None;
+    }
+    changes.extend(split);
+
+    // 2. Bindings explained by their entries.
+    let entry_children = |id: &str, side: &[SemanticEntity]| -> Vec<(usize, usize)> {
+        side.iter()
+            .filter(|e| e.entity_type == "entry" && e.parent_id.as_deref() == Some(id))
+            .filter_map(|e| Some((e.start_byte?, e.end_byte?)))
+            .collect()
+    };
+    let own_declaration = |e: &SemanticEntity, kids: &[(usize, usize)]| -> Option<String> {
+        let start = e.start_byte?;
+        let mut ranges: Vec<(usize, usize)> = kids
+            .iter()
+            .filter(|(s, t)| *s >= start && *t <= start + e.content.len())
+            .map(|(s, t)| (s - start, t - start))
+            .collect();
+        ranges.sort_unstable();
+        let mut out = String::new();
+        let mut cursor = 0;
+        for (s, t) in ranges {
+            if s > cursor {
+                out.push_str(e.content.get(cursor..s)?);
+            }
+            cursor = cursor.max(t);
+        }
+        out.push_str(e.content.get(cursor.min(e.content.len())..)?);
+        // Separators between entries come and go with the entries.
+        Some(out.chars().filter(|ch| !ch.is_whitespace() && *ch != ',').collect())
+    };
+    let mut drop: HashSet<String> = HashSet::new();
+    for c in changes.iter() {
+        if c.change_type != ChangeType::Modified {
+            continue;
+        }
+        let id = c.entity_id.as_str();
+        let (Some(b), Some(a)) = (before_by_id.get(id), after_by_id.get(id)) else { continue };
+        let (bk, ak) = (entry_children(id, before), entry_children(id, after));
+        if bk.is_empty() && ak.is_empty() {
+            continue;
+        }
+        if let (Some(x), Some(y)) = (own_declaration(b, &bk), own_declaration(a, &ak)) {
+            if x == y {
+                drop.insert(c.entity_id.clone());
+            }
+        }
+    }
+    if !drop.is_empty() {
+        changes.retain(|c| !drop.contains(&c.entity_id));
+    }
+
+    // 3. Container and key on every entry change.
+    for c in changes.iter_mut() {
+        if c.entity_type != "entry" {
+            continue;
+        }
+        let entity = if c.change_type == ChangeType::Deleted {
+            before_by_id.get(c.entity_id.as_str())
+        } else {
+            after_by_id.get(c.entity_id.as_str())
+        };
+        let Some(meta) = entity.and_then(|e| e.metadata.as_ref()) else { continue };
+        if let (Some(container), Some(key), Some(kind)) =
+            (meta.get(META_CONTAINER), meta.get(META_KEY), meta.get(META_KEY_KIND))
+        {
+            c.entry = Some(EntryRef {
+                container: container.clone(),
+                key: key.clone(),
+                key_kind: kind.clone(),
+            });
+        }
+    }
+}
+
 fn strip_children_content(
     content: &str,
     parent_start_line: usize,
@@ -606,6 +785,7 @@ fn detect_orphan_changes(
                 plugin,
                 detection_path,
             ),
+            entry: None,
         });
     }
 
