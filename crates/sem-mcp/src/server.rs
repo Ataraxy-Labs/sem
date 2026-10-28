@@ -2716,11 +2716,21 @@ impl SemServer {
                     let mut blocks = Vec::new();
                     let mut json_results = Vec::new();
                     let mut any_ok = false;
+                    // Batch-local only: never reuse a caller result across edits
+                    // or requests. Keep one output slot for every input query.
+                    let mut results_by_query: HashMap<String, CallToolResult> = HashMap::new();
                     for name in names {
-                        let result = self.sem_callers(Parameters(CallersParams {
-                            query: name.clone(), file: params.file().map(str::to_string),
-                            limit: params.limit, format: params.format.clone(),
-                        })).await?;
+                        let key = name.trim().to_string();
+                        let result = if let Some(result) = results_by_query.get(&key) {
+                            result.clone()
+                        } else {
+                            let result = self.sem_callers(Parameters(CallersParams {
+                                query: name.clone(), file: params.file().map(str::to_string),
+                                limit: params.limit, format: params.format.clone(),
+                            })).await?;
+                            results_by_query.insert(key, result.clone());
+                            result
+                        };
                         let is_error = result.is_error.unwrap_or(false);
                         any_ok |= !is_error;
                         let mut query_results = Vec::new();
@@ -3746,15 +3756,16 @@ mod tests {
         let outside_repo = TempDir::new().unwrap();
         let missing_file = outside_repo.path().join("missing/a.py");
         let params: FindParams = serde_json::from_value(serde_json::json!({
-            "mode": "callers", "queries": ["first", "second"],
+            "mode": "callers", "queries": ["first", "second", " first "],
             "file": missing_file, "format": "json"
         })).unwrap();
         let result = SemServer::new().sem_find(Parameters(params)).await.unwrap();
         assert!(result.is_error.unwrap_or(false));
         let value: serde_json::Value = serde_json::from_str(&text_of(result)).unwrap();
         let rows = value.as_array().unwrap();
-        assert_eq!(rows.len(), 2);
-        for (row, name) in rows.iter().zip(["first", "second"]) {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["results"], rows[2]["results"]);
+        for (row, name) in rows.iter().zip(["first", "second", " first "]) {
             assert_eq!(row["query"], name);
             assert_eq!(row["is_error"], true);
             assert!(!row["results"].as_array().unwrap().is_empty());

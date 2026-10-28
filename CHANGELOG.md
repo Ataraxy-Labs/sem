@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- Repeated caller queries within one MCP batch reuse the first lookup while preserving input order and per-query responses. Results are not reused across requests.
+
 ### Fixed
 
 - Crate publishing checks accepted uploads separately from sparse-index availability, waits before publishing dependents, and resumes from the immutable release tag without re-uploading accepted versions.
