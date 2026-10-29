@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.28.3] - 2026-10-29
+
 ### Performance
 
 - Repeated caller queries within one MCP batch reuse the first lookup while preserving input order and per-query responses. Results are not reused across requests.
