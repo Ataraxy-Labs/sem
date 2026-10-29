@@ -10,6 +10,8 @@ All notable changes to sem are documented in this file.
 
 ### Fixed
 
+- Code discovery honors .gitignore in source snapshots without Git metadata; permission errors explain how to exclude an unreadable directory without returning an incomplete graph (#535).
+
 - Crate publishing checks accepted uploads separately from sparse-index availability, waits before publishing dependents, and resumes from the immutable release tag without re-uploading accepted versions.
 
 

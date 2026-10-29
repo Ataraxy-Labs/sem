@@ -39,6 +39,8 @@ fn find_files_in_path(
     builder
         .hidden(true)
         .git_ignore(true)
+        // Source snapshots and container mounts may not include .git.
+        .require_git(false)
         .git_global(true)
         .git_exclude(true);
 
@@ -74,6 +76,15 @@ fn find_files_in_path(
                     scan_path.display(),
                     e
                 );
+                if e.io_error()
+                    .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    eprintln!(
+                        "hint: exclude the unreadable directory itself in .gitignore or .semignore \
+                         (for example, postgres/ rather than postgres/**). \
+                         sem stops instead of returning an incomplete graph."
+                    );
+                }
                 std::process::exit(1);
             }
         };
@@ -169,6 +180,31 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn scan_honors_nested_gitignore_without_git_metadata() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("postgres")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "postgres/\n").unwrap();
+        fs::write(root.join("postgres/hidden.py"), "def hidden(): pass\n").unwrap();
+        fs::write(root.join("src/.gitignore"), "*.py\n!keep.py\n").unwrap();
+        fs::write(root.join("src/hidden.py"), "def hidden(): pass\n").unwrap();
+        fs::write(root.join("src/keep.py"), "def keep(): pass\n").unwrap();
+        let registry = create_default_registry();
+        for no_default_excludes in [false, true] {
+            assert_eq!(
+                find_supported_files_in_path(&root, &root, &registry, &[], no_default_excludes),
+                vec!["src/keep.py"]
+            );
+        }
+        assert_eq!(find_search_files(&root), vec!["src/keep.py"]);
+        assert_eq!(
+            find_supported_files_in_path(&root, &root.join("src"), &registry, &[], false),
+            vec!["src/keep.py"]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
