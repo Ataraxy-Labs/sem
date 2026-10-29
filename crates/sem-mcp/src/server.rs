@@ -468,6 +468,8 @@ impl SemServer {
         builder
             .hidden(true)
             .git_ignore(true)
+            // Source snapshots and container mounts may not include .git.
+            .require_git(false)
             .git_global(true)
             .git_exclude(true);
         let semignore = root.join(".semignore");
@@ -515,6 +517,8 @@ impl SemServer {
         builder
             .hidden(!include_hidden)
             .git_ignore(true)
+            // Source snapshots and container mounts may not include .git.
+            .require_git(false)
             .git_global(true)
             .git_exclude(true);
         let semignore = prefix_root.join(".semignore");
@@ -4137,6 +4141,38 @@ mod tests {
         let expected = vec!["added", "renamed", "moved", "modified (logic)"];
         assert_eq!(mcp_log_labels(&repo, "renamed_func", "b.py"), expected);
         assert_eq!(mcp_log_labels(&repo, "original", "a.py"), expected);
+    }
+
+    #[test]
+    fn discovery_honors_gitignore_without_git_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("postgres")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "postgres/\n").unwrap();
+        fs::write(root.join("postgres/hidden.py"), "def hidden(): pass\n").unwrap();
+        fs::write(root.join("src/.gitignore"), "*.py\n!keep.py\n").unwrap();
+        fs::write(root.join("src/hidden.py"), "def hidden(): pass\n").unwrap();
+        fs::write(root.join("src/keep.py"), "def keep(): pass\n").unwrap();
+        let registry = sem_core::parser::plugins::create_default_registry();
+        for no_default_excludes in [false, true] {
+            assert_eq!(
+                SemServer::find_supported_files_with_options(root, &registry, no_default_excludes)
+                    .unwrap(),
+                vec!["src/keep.py"]
+            );
+            assert_eq!(
+                SemServer::walk_dir_files_with_options(
+                    &root.join("src"),
+                    root,
+                    &registry,
+                    no_default_excludes,
+                    false
+                )
+                .unwrap(),
+                vec!["src/keep.py"]
+            );
+        }
     }
 
     #[test]
