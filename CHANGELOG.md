@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Entity extraction finds definitions it used to miss.** C++ headers saved as `.h` are read as C++; members of C++ template classes, `using` aliases, C function-pointer typedefs, Rust trait method signatures, Java annotation members, C# operators, delegates, events and indexers, Kotlin companion objects and members of `object :` expressions, and Elixir `@type` specs are now entities. When C, C++ or Kotlin code cannot be parsed (macros the grammar cannot expand, Kotlin Multiplatform constructors), clear definition headers in the unparsed region are recovered and marked `recovered = parse_error`. Measured against each language's own parser or Universal Ctags on 14 real repositories, recall is now 99–100% in every language except C++ (92%), up from 56% for C++, 71% for Kotlin and 92% for C#.
+
 ## [0.28.3] - 2026-10-29
 
 ### Performance
