@@ -447,6 +447,20 @@ const JS_TS_SCOPE_BOUNDARIES: &[&str] = &[
 /// Inside C function bodies, suppress `declaration` nodes so that block-local
 /// variables are not extracted as nested entities. Inner type declarations are
 /// still reached by traversal after the wrapper is skipped.
+/// Kotlin function bodies are walked so members of `object : Base { ... }`
+/// expressions are found, but the function's own local `val`/`var`
+/// declarations are locals, not entities.
+const KOTLIN_SUPPRESSED_NESTED: &[SuppressedNestedEntity] = &[
+    SuppressedNestedEntity {
+        parent_entity_node_type: "function_declaration",
+        child_entity_node_type: "property_declaration",
+    },
+    SuppressedNestedEntity {
+        parent_entity_node_type: "secondary_constructor",
+        child_entity_node_type: "property_declaration",
+    },
+];
+
 const C_SUPPRESSED_NESTED: &[SuppressedNestedEntity] = &[SuppressedNestedEntity {
     parent_entity_node_type: "function_definition",
     child_entity_node_type: "declaration",
@@ -659,6 +673,7 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
     extensions: &[".rs"],
     entity_node_types: &[
         "function_item",
+        "function_signature_item",
         "struct_item",
         "enum_item",
         "impl_item",
@@ -690,12 +705,14 @@ static JAVA_CONFIG: LanguageConfig = LanguageConfig {
         "field_declaration",
         "constructor_declaration",
         "annotation_type_declaration",
+        "annotation_type_element_declaration",
     ],
     container_node_types: &[
         "class_body",
         "interface_body",
         "enum_body",
         "record_body",
+        "annotation_type_body",
         "block",
     ],
     call_entity_identifiers: &[],
@@ -738,6 +755,7 @@ static CPP_CONFIG: LanguageConfig = LanguageConfig {
         "template_declaration",
         "declaration",
         "type_definition",
+        "alias_declaration",
     ],
     container_node_types: &[
         "field_declaration_list",
@@ -780,8 +798,23 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
         "property_declaration",
         "constructor_declaration",
         "field_declaration",
+        "operator_declaration",
+        "conversion_operator_declaration",
+        "delegate_declaration",
+        "destructor_declaration",
+        "indexer_declaration",
+        "event_declaration",
+        "event_field_declaration",
     ],
-    container_node_types: &["declaration_list", "record_body", "block"],
+    container_node_types: &[
+        "declaration_list",
+        "record_body",
+        "block",
+        "preproc_if",
+        "preproc_elif",
+        "preproc_else",
+        "preproc_region",
+    ],
     call_entity_identifiers: &[],
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
@@ -935,9 +968,9 @@ static KOTLIN_CONFIG: LanguageConfig = LanguageConfig {
         "secondary_constructor",
         "type_alias",
     ],
-    container_node_types: &["class_body", "enum_class_body"],
+    container_node_types: &["class_body", "enum_class_body", "function_body"],
     call_entity_identifiers: &[],
-    suppressed_nested_entities: &[],
+    suppressed_nested_entities: KOTLIN_SUPPRESSED_NESTED,
     scope_boundary_types: &[],
     get_language: get_kotlin,
     scope_resolve: Some(&KOTLIN_SCOPE_CONFIG),

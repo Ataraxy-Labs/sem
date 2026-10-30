@@ -49,8 +49,39 @@ pub fn language_config_for_content(
         })
         .unwrap_or_default();
 
+    // `.h` is shared by C and C++. A header written in C++ (templates,
+    // namespaces, access sections) parsed with the C grammar loses most of
+    // its classes and functions, so it is read as C++ instead.
+    if ext == ".h" && looks_like_cpp_header(content) {
+        if let Some(cpp) = get_language_config(".hpp") {
+            return Some(cpp);
+        }
+    }
+
     get_language_config(&ext).or_else(|| {
         detect_ext_from_content(content).and_then(|shebang_ext| get_language_config(&shebang_ext))
+    })
+}
+
+/// True when a `.h` file uses constructs only C++ has. Each check is a
+/// line-start keyword or `std::`, none of which is valid C, so a plain C
+/// header (including one with an `extern "C"` guard) stays C.
+pub(crate) fn looks_like_cpp_header(content: &str) -> bool {
+    let mut end = content.len().min(256 * 1024);
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &content[..end];
+    head.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("template<")
+            || t.starts_with("template <")
+            || (t.starts_with("namespace ") && !t.ends_with(';'))
+            || t.starts_with("public:")
+            || t.starts_with("private:")
+            || t.starts_with("protected:")
+            || t.starts_with("using namespace ")
+            || t.contains("std::")
     })
 }
 

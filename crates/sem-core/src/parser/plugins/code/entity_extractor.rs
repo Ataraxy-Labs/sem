@@ -34,9 +34,258 @@ pub fn extract_entities(
         attach_go_package_metadata(tree.root_node(), source_code.as_bytes(), &mut entities);
     }
 
+    recover_definitions_in_parse_errors(tree.root_node(), file_path, config, &mut entities, source_code);
+
     disambiguate_colliding_entity_ids(&mut entities);
 
     entities
+}
+
+/// When tree-sitter cannot parse part of a C, C++ or Kotlin file, the
+/// definitions in that part come back inside ERROR nodes and are never seen:
+/// C/C++ macros the grammar cannot expand (`XXH_RESTRICT`, `FMT_API`) and
+/// Kotlin Multiplatform's `internal actual constructor(` on its own line are
+/// the usual causes. This pass reads the lines of each ERROR region and
+/// recovers the definition headers that are unambiguous on their own, so that
+/// code is not invisible to the graph. Files that parse cleanly are untouched,
+/// a definition already extracted is never added twice, and every recovered
+/// entity is marked `recovered = parse_error` in its metadata.
+fn recover_definitions_in_parse_errors(
+    root: Node,
+    file_path: &str,
+    config: &LanguageConfig,
+    entities: &mut Vec<SemanticEntity>,
+    source: &str,
+) {
+    if !matches!(config.id, "c" | "cpp" | "kotlin") || !root.has_error() {
+        return;
+    }
+    let mut error_rows: Vec<(usize, usize)> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() {
+            error_rows.push((node.start_position().row, node.end_position().row));
+            continue;
+        }
+        if node.has_error() {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+    if error_rows.is_empty() {
+        return;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let mut rows: Vec<usize> = error_rows
+        .iter()
+        .flat_map(|&(a, b)| a..=b.min(lines.len().saturating_sub(1)))
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let mut recovered: Vec<SemanticEntity> = Vec::new();
+    for row in rows {
+        let line = lines[row];
+        let header = if config.id == "kotlin" {
+            kotlin_definition_header(line)
+        } else {
+            c_family_definition_header(&lines, row)
+        };
+        let Some((entity_type, name, opens_body)) = header else {
+            continue;
+        };
+        let start_line = row + 1;
+        let already = entities.iter().chain(recovered.iter()).any(|e| {
+            e.name.rsplit("::").next() == Some(name.as_str())
+                && e.start_line + 3 >= start_line
+                && e.start_line <= start_line + 1
+        });
+        if already {
+            continue;
+        }
+        let end_row = if opens_body {
+            matching_brace_row(&lines, row).unwrap_or(row)
+        } else {
+            row
+        };
+        let start_byte = line_starts[row];
+        let end_byte = line_starts
+            .get(end_row + 1)
+            .copied()
+            .unwrap_or(source.len());
+        let content = source[start_byte..end_byte].to_string();
+        let parent = entities
+            .iter()
+            .filter(|e| {
+                e.start_line < start_line
+                    && e.end_line >= end_row + 1
+                    && matches!(
+                        e.entity_type.as_str(),
+                        "class" | "struct" | "namespace" | "object" | "interface"
+                            | "companion_object" | "union" | "template" | "module"
+                    )
+            })
+            .min_by_key(|e| e.end_line - e.start_line)
+            .map(|e| e.id.clone());
+        let mut metadata = BTreeMap::new();
+        metadata.insert("recovered".to_string(), "parse_error".to_string());
+        recovered.push(SemanticEntity {
+            id: build_entity_id(file_path, entity_type, &name, parent.as_deref()),
+            file_path: file_path.to_string(),
+            entity_type: entity_type.to_string(),
+            name,
+            parent_id: parent,
+            content_hash: content_hash(&content),
+            structural_hash: None,
+            kappa: None,
+            content,
+            start_line,
+            end_line: end_row + 1,
+            start_byte: Some(start_byte),
+            end_byte: Some(end_byte),
+            metadata: Some(metadata),
+        });
+    }
+    entities.extend(recovered);
+}
+
+/// `fun name(`, `class Name`, `interface Name`, `object Name` or
+/// `companion object` on one Kotlin line, after any modifiers.
+fn kotlin_definition_header(line: &str) -> Option<(&'static str, String, bool)> {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|internal|open|override|actual|expect|abstract|final|inline|suspend|operator|infix|tailrec|external|data|sealed|enum|annotation|inner|value|const)\s+)*(fun|class|interface|object|companion\s+object)\b\s*(?:<[^>]*>\s*)?(?:[A-Za-z_][\w.<>?, ]*?\.)?(`[^`]+`|[A-Za-z_]\w*)?",
+        )
+        .expect("valid Kotlin header regex")
+    });
+    let caps = RE.captures(line)?;
+    let keyword = caps.get(1)?.as_str();
+    let name = caps.get(2).map(|m| m.as_str().trim_matches('`').to_string());
+    let (kind, name) = match keyword {
+        "fun" => ("function", name?),
+        "class" => ("class", name?),
+        "interface" => ("interface", name?),
+        "object" => ("object", name?),
+        _ => ("companion_object", name.unwrap_or_else(|| "Companion".to_string())),
+    };
+    if kind == "function" && !line[caps.get(0)?.end()..].trim_start().starts_with('(') {
+        return None;
+    }
+    Some((kind, name, line.contains('{')))
+}
+
+/// A C/C++ function definition (`name(params) {`, the body opening within the
+/// next few lines with no `;` before it) or a `class`/`struct`/`union` with a
+/// body. Control-flow keywords and statements ending in `;` are never taken.
+fn c_family_definition_header(lines: &[&str], row: usize) -> Option<(&'static str, String, bool)> {
+    use std::sync::LazyLock;
+    static TYPE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^\s*(?:template\s*<.*>\s*)?(?:typedef\s+)?(class|struct|union)\s+([^;{]*?)\s*(?:\{|$)")
+            .expect("valid C type header regex")
+    });
+    static FN_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^\s*(?:[\w:<>,*&~\s]*?[\s*&])?((?:[A-Za-z_]\w*::)*~?[A-Za-z_]\w*|operator\s*[^\s(]+)\s*\(")
+            .expect("valid C function header regex")
+    });
+    const NOT_FUNCTIONS: &[&str] = &[
+        "if", "for", "while", "switch", "return", "else", "do", "sizeof", "case", "catch",
+        "new", "delete", "throw", "static_assert", "defined", "decltype", "alignof", "typeof",
+    ];
+    let line = lines[row];
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with('*') {
+        return None;
+    }
+    if let Some(caps) = TYPE_RE.captures(line) {
+        let kind = match &caps[1] {
+            "class" => "class",
+            "struct" => "struct",
+            _ => "union",
+        };
+        // `class FMT_API buffer : base` -> `buffer`: the last identifier
+        // before the base list.
+        let head = caps[2].split(':').next().unwrap_or("");
+        let name = head
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .next_back()?
+            .to_string();
+        let opens = (row..lines.len().min(row + 3)).any(|r| lines[r].contains('{'));
+        return opens.then_some((kind, name, true));
+    }
+    let caps = FN_RE.captures(line)?;
+    let name = caps.get(1)?.as_str().to_string();
+    let bare = name.rsplit("::").next().unwrap_or(&name);
+    if NOT_FUNCTIONS.contains(&bare) {
+        return None;
+    }
+    // A macro call (`TEST_BEGIN(x) {`) is not a definition: names in all
+    // capitals are taken to be macros.
+    if bare.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+        return None;
+    }
+    // The body must open before any `;`, within a few lines.
+    for (i, l) in lines.iter().enumerate().skip(row).take(12) {
+        let text = if i == row { &l[caps.get(0)?.end()..] } else { l };
+        let semi = text.find(';');
+        let brace = text.find('{');
+        match (semi, brace) {
+            (Some(s), Some(b)) if s < b => return None,
+            (Some(_), None) => return None,
+            (_, Some(_)) => return Some(("function", name, true)),
+            (None, None) => {}
+        }
+    }
+    None
+}
+
+/// The row of the `}` that closes the first `{` at or after `row`, skipping
+/// braces inside string and character literals and comments.
+fn matching_brace_row(lines: &[&str], row: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut opened = false;
+    let mut in_block_comment = false;
+    for (r, line) in lines.iter().enumerate().skip(row) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_block_comment {
+                if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    in_block_comment = false;
+                    i += 1;
+                }
+            } else if let Some(q) = quote {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                break;
+            } else if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                in_block_comment = true;
+                i += 1;
+            } else if c == b'"' || c == b'\'' {
+                quote = Some(c);
+            } else if c == b'{' {
+                depth += 1;
+                opened = true;
+            } else if c == b'}' {
+                depth -= 1;
+                if opened && depth == 0 {
+                    return Some(r);
+                }
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 fn attach_go_package_metadata(root: Node, source: &[u8], entities: &mut [SemanticEntity]) {
@@ -111,6 +360,31 @@ fn visit_node(
                     entity_type: "target".to_string(),
                     name,
                     parent_id: None,
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(struct_hash),
+                    kappa: Some(kappa_hash),
+                    content,
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
+                    start_byte: Some(node.start_byte()),
+                    end_byte: Some(node.end_byte()),
+                    metadata: None,
+                });
+                continue;
+            }
+        }
+
+        // Elixir typespecs: `@type name :: ...` (also @typep, @opaque).
+        if config.id == "elixir" && node_type == "unary_operator" {
+            if let Some(name) = elixir_typespec_name(node, source) {
+                let content = node_text(node, source).to_string();
+                let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
+                entities.push(SemanticEntity {
+                    id: build_entity_id(file_path, "type", &name, parent_id),
+                    file_path: file_path.to_string(),
+                    entity_type: "type".to_string(),
+                    name,
+                    parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
                     kappa: Some(kappa_hash),
@@ -670,6 +944,10 @@ fn visit_node(
                     // the wrapped definition's children, not the wrapper's.
                     let body_owner = if node_type == "decorated_definition" {
                         node.child_by_field_name("definition").unwrap_or(node)
+                    } else if node_type == "template_declaration" {
+                        // `template<...> class A { ... }`: the members live in the
+                        // wrapped class's body, one or more template levels down.
+                        templated_declaration(node)
                     } else {
                         node
                     };
@@ -1707,7 +1985,10 @@ fn find_declarator_name_range(mut node: Node) -> Option<(usize, usize)> {
             | "function_declarator"
             | "array_declarator"
             | "parenthesized_declarator" => {
-                if let Some(inner) = node.child_by_field_name("declarator") {
+                if let Some(inner) = node
+                    .child_by_field_name("declarator")
+                    .or_else(|| nested_declarator(node))
+                {
                     node = inner;
                     continue;
                 }
@@ -1733,6 +2014,30 @@ fn find_declarator_name_range(mut node: Node) -> Option<(usize, usize)> {
 
 fn extract_name(node: Node, source: &[u8]) -> Option<String> {
     let node_type = node.kind();
+
+    // C#: `operator +` and `explicit operator decimal` have no name field;
+    // name them by the operator or target type, as C# tooling does.
+    if node_type == "operator_declaration" {
+        if let Some(op) = node.child_by_field_name("operator") {
+            return Some(format!("operator {}", node_text(op, source)));
+        }
+    }
+    if node_type == "conversion_operator_declaration" {
+        if let Some(ty) = node.child_by_field_name("type") {
+            return Some(format!("operator {}", node_text(ty, source)));
+        }
+    }
+
+    // Kotlin: an unnamed `companion object` is named `Companion` by the
+    // language itself, which is how callers refer to it.
+    if node_type == "companion_object" {
+        let mut cursor = node.walk();
+        let named = node
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "type_identifier" || c.kind() == "simple_identifier")
+            .map(|c| node_text(c, source).to_string());
+        return Some(named.unwrap_or_else(|| "Companion".to_string()));
+    }
 
     if node_type == "subscript_declaration" {
         return Some("subscript".to_string());
@@ -2230,7 +2535,10 @@ fn extract_declarator_name(mut node: Node, source: &[u8]) -> Option<String> {
             | "function_declarator"
             | "array_declarator"
             | "parenthesized_declarator" => {
-                if let Some(inner) = node.child_by_field_name("declarator") {
+                if let Some(inner) = node
+                    .child_by_field_name("declarator")
+                    .or_else(|| nested_declarator(node))
+                {
                     node = inner;
                     continue;
                 }
@@ -2252,6 +2560,41 @@ fn extract_declarator_name(mut node: Node, source: &[u8]) -> Option<String> {
             }
         }
     }
+}
+
+/// The declaration a (possibly nested) C++ `template_declaration` wraps:
+/// the class, struct, union or function whose body holds the members.
+fn templated_declaration(node: Node) -> Node {
+    let mut current = node;
+    loop {
+        let mut cursor = current.walk();
+        let inner = current.named_children(&mut cursor).find(|c| {
+            matches!(
+                c.kind(),
+                "template_declaration"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "function_definition"
+            )
+        });
+        match inner {
+            Some(n) if n.kind() == "template_declaration" => current = n,
+            Some(n) => return n,
+            None => return current,
+        }
+    }
+}
+
+/// A `parenthesized_declarator` has no `declarator` field: its inner
+/// declarator is a plain child, as in a function-pointer typedef
+/// `typedef int (*Handler)(void);`. Step into it so the name is found.
+fn nested_declarator(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind().ends_with("_declarator"));
+    found
 }
 
 fn node_text<'a>(node: Node, source: &'a [u8]) -> &'a str {
@@ -2600,6 +2943,35 @@ fn starlark_target_name(node: Node, source: &[u8]) -> Option<String> {
 }
 
 /// Extract entity info from a call node (Elixir macros like def, defmodule, etc.)
+/// The declared name of an Elixir `@type`/`@typep`/`@opaque` attribute:
+/// `@type t :: ...` is `t`, `@type result(a) :: ...` is `result`.
+fn elixir_typespec_name(node: Node, source: &[u8]) -> Option<String> {
+    let operand = node.child_by_field_name("operand")?;
+    if operand.kind() != "call" {
+        return None;
+    }
+    let target = operand.child_by_field_name("target")?;
+    if !matches!(node_text(target, source), "type" | "typep" | "opaque") {
+        return None;
+    }
+    let mut cursor = operand.walk();
+    let args = operand
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
+    let mut args_cursor = args.walk();
+    let spec = args.named_children(&mut args_cursor).next()?;
+    let left = if spec.kind() == "binary_operator" {
+        spec.child_by_field_name("left")?
+    } else {
+        spec
+    };
+    let name_node = match left.kind() {
+        "call" => left.child_by_field_name("target")?,
+        _ => left,
+    };
+    (name_node.kind() == "identifier").then(|| node_text(name_node, source).to_string())
+}
+
 fn extract_call_entity(
     node: Node,
     config: &LanguageConfig,
