@@ -3775,13 +3775,27 @@ const INTENT_STOPWORDS: &[&str] = &[
     "which", "when", "how", "does", "not", "but", "its", "has", "have", "can", "all", "any", "out",
     "get", "set", "use", "used", "using", "code", "function", "method", "class", "file", "files",
     "find", "make", "made", "them", "they", "their", "there", "here", "should", "would", "will",
-    "fix", "bug", "add", "change", "update", "support", "work", "need", "want",
+    "fix", "bug", "add", "change", "update", "support", "work", "need", "want", "done", "must", "keep",
+    "focus", "task", "repository", "build", "today", "instead", "still", "only", "also", "make",
 ];
 
 /// Lower-cased word stems of `text`: snake_case, camelCase and punctuation
 /// all split into words, short and filler words dropped, and a light suffix
 /// trim so "entities", "entity" and "extracted", "extract" meet.
 fn intent_words(text: &str) -> Vec<String> {
+    // Language names that tokenize to nothing ("C#" is just "c").
+    let aliased;
+    let text = if text.contains('#') || text.contains("++") {
+        aliased = text
+            .replace("C#", " csharp ")
+            .replace("c#", " csharp ")
+            .replace("F#", " fsharp ")
+            .replace("C++", " cpp ")
+            .replace("c++", " cpp ");
+        aliased.as_str()
+    } else {
+        text
+    };
     let mut words = Vec::new();
     let mut current = String::new();
     let mut prev_lower = false;
@@ -3811,76 +3825,112 @@ fn intent_words(text: &str) -> Vec<String> {
 }
 
 fn intent_stem(word: &str) -> String {
-    for suffix in ["ities", "ing", "ies", "ed", "es", "s"] {
-        if let Some(stem) = word.strip_suffix(suffix) {
-            if stem.len() >= 3 {
-                return match suffix {
-                    "ities" => format!("{stem}it"),
-                    "ies" => format!("{stem}y"),
-                    _ => stem.to_string(),
-                };
-            }
+    // "entity" and "entities" both become "entiti", "extracted" and
+    // "extracting" become "extract".
+    if let Some(stem) = word.strip_suffix("ies").filter(|s| s.len() >= 3) {
+        return format!("{stem}i");
+    }
+    if let Some(stem) = word.strip_suffix('y').filter(|s| s.len() >= 3) {
+        return format!("{stem}i");
+    }
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(stem) = word.strip_suffix(suffix).filter(|s| s.len() >= 3) {
+            return stem.to_string();
         }
     }
     word.to_string()
 }
 
 /// Score every entity against `intent` and return the best `limit`, most
-/// relevant first. Name words weigh most, then file path words, then words of
-/// the entity's first line (its signature); `centrality` breaks ties.
+/// relevant first. BM25 over each entity's words (its body, where the fix
+/// usually is), plus bonuses when a word is in its name or file path; every
+/// word is weighted by how rare it is in the repository, so "elixir" counts
+/// and "entity" barely does. Tests rank below code; `centrality` breaks ties.
 fn intent_rank<'a>(
     intent: &str,
     entities: &'a [SemanticEntity],
     centrality: impl Fn(&str) -> usize,
     limit: usize,
 ) -> Vec<(&'a SemanticEntity, f64)> {
+    use std::collections::HashMap;
     let wanted: Vec<String> = {
         let mut w = intent_words(intent);
         w.sort();
         w.dedup();
         w
     };
-    if wanted.is_empty() {
+    // Only leaf code: a container (an impl, a module, a class with methods)
+    // holds every word its members do and would outrank them, and prose (a
+    // licence, a changelog, docs) is never where a code change goes.
+    let containers: std::collections::HashSet<&str> = entities.iter().filter_map(|e| e.parent_id.as_deref()).collect();
+    let prose = |e: &SemanticEntity| {
+        matches!(e.entity_type.as_str(), "chunk" | "element" | "heading" | "section" | "paragraph")
+            || [".md", ".txt", ".html", ".htm", ".rst", ".json", ".lock", ".csv", ".svg"]
+                .iter()
+                .any(|ext| e.file_path.ends_with(ext))
+            || e.file_path.rsplit('/').next().is_some_and(|f| f.starts_with("LICENSE") || f.starts_with("CHANGELOG"))
+    };
+    let entities: Vec<&'a SemanticEntity> =
+        entities.iter().filter(|e| !containers.contains(e.id.as_str()) && !prose(e)).collect();
+    if wanted.is_empty() || entities.is_empty() {
         return Vec::new();
     }
-    let mut scored: Vec<(&SemanticEntity, f64)> = entities
+    // Per entity: how often each wanted word occurs in its body, and its length.
+    let docs: Vec<(HashMap<&str, u32>, usize)> = entities
         .iter()
-        .filter_map(|e| {
+        .map(|e| {
+            let words = intent_words(&e.content);
+            let mut tf: HashMap<&str, u32> = HashMap::new();
+            for w in &words {
+                if let Some(k) = wanted.iter().find(|k| *k == w) {
+                    *tf.entry(k.as_str()).or_default() += 1;
+                }
+            }
+            (tf, words.len())
+        })
+        .collect();
+    let n = entities.len() as f64;
+    let avg_len = (docs.iter().map(|d| d.1).sum::<usize>() as f64 / n).max(1.0);
+    let idf: HashMap<&str, f64> = wanted
+        .iter()
+        .map(|w| {
+            let df = docs.iter().filter(|d| d.0.contains_key(w.as_str())).count() as f64;
+            (w.as_str(), ((n - df + 0.5) / (df + 0.5) + 1.0).ln())
+        })
+        .collect();
+    let (k1, b) = (1.2, 0.75);
+    let mut scored: Vec<(&'a SemanticEntity, f64)> = entities
+        .iter()
+        .zip(&docs)
+        .filter_map(|(&e, (tf, len))| {
             let name = intent_words(&e.name);
             let path = intent_words(&e.file_path);
-            let signature = intent_words(e.content.lines().next().unwrap_or(""));
-            let mut name_score = 0.0;
-            let mut name_hits = 0;
             let mut score = 0.0;
             for w in &wanted {
+                let weight = idf[w.as_str()];
+                if let Some(&f) = tf.get(w.as_str()) {
+                    let f = f as f64;
+                    score += weight * f * (k1 + 1.0) / (f + k1 * (1.0 - b + b * *len as f64 / avg_len));
+                }
                 if name.contains(w) {
-                    name_score += 3.0;
-                    name_hits += 1;
-                } else if name.iter().any(|n| n.len() >= 4 && (n.starts_with(w.as_str()) || w.starts_with(n.as_str()))) {
-                    name_score += 1.5;
-                    name_hits += 1;
+                    score += weight;
                 }
                 if path.contains(w) {
-                    score += 1.0;
-                }
-                if signature.contains(w) {
-                    score += 0.5;
+                    score += 0.5 * weight;
                 }
             }
-            // An entity none of whose name words match is noise however its
-            // path reads; demand at least one name hit.
-            if name_hits == 0 {
+            if score <= 0.0 {
                 return None;
             }
-            // A sentence-long name (a test title, a doc heading) matches some
-            // word of almost any description; weigh name hits by how much of
-            // the name they cover, and put tests and prose below code.
-            let coverage = name_hits as f64 / name.len().max(1) as f64;
-            score += name_score * (0.5 + 0.5 * coverage.min(1.0));
-            if matches!(e.entity_type.as_str(), "test" | "heading" | "section") {
-                score *= 0.5;
+            let is_test = matches!(e.entity_type.as_str(), "test" | "heading" | "section")
+                || e.name.starts_with("test_")
+                || e.file_path.contains("/tests/")
+                || e.id.contains("::tests::")
+                || e.parent_id.as_deref().is_some_and(|p| p.ends_with("::tests") || p.ends_with("_tests"));
+            if is_test {
+                score *= 0.3;
             }
-            Some((e, score + (1.0 + centrality(&e.id) as f64).ln() * 0.2))
+            Some((e, score + (1.0 + centrality(&e.id) as f64).ln() * 0.1))
         })
         .collect();
     scored.sort_by(|a, b| {
@@ -3917,8 +3967,10 @@ mod intent_tests {
 
     #[test]
     fn words_split_case_and_stem() {
-        assert_eq!(intent_words("extractEntities from_tree"), vec!["extract", "entit", "tree"]);
-        assert_eq!(intent_words("where are entities extracted"), vec!["entit", "extract"]);
+        assert_eq!(intent_words("extractEntities from_tree"), vec!["extract", "entiti", "tree"]);
+        assert_eq!(intent_words("where are entities extracted"), vec!["entiti", "extract"]);
+        assert_eq!(intent_words("entity"), vec!["entiti"]);
+        assert_eq!(intent_words("C# and C++ operators"), vec!["csharp", "cpp", "operator"]);
     }
 
     #[test]
@@ -3937,6 +3989,29 @@ mod intent_tests {
         let ranked = intent_rank("where are entities extracted from a parse tree", &entities, |_| 0, 5);
         assert_eq!(ranked.first().map(|(e, _)| e.name.as_str()), Some("extract_entities"));
         assert!(ranked.iter().all(|(e, _)| e.name != "render_diff"));
+    }
+
+    #[test]
+    fn rare_words_in_a_body_beat_common_words_in_names() {
+        let mut entities: Vec<SemanticEntity> = (0..20)
+            .map(|i| {
+                let name = format!("helper_{i}");
+                let body = format!("fn {name}() {{ extract entities from node }}");
+                entity(&name, "function", "src/other.rs", &body)
+            })
+            .collect();
+        entities.extend([
+            entity("extract_entities", "function", "src/code/mod.rs", "fn extract_entities() { walk() }"),
+            entity("extract_name", "function", "src/code/extractor.rs", "fn extract_name(node) { node.name }"),
+            entity(
+                "CSHARP_CONFIG",
+                "constant",
+                "src/code/languages.rs",
+                "const CSHARP_CONFIG = { entity_node_types: [method_declaration, operator_declaration] }",
+            ),
+        ]);
+        let ranked = intent_rank("C# operators are not extracted as entities", &entities, |_| 0, 3);
+        assert_eq!(ranked.first().map(|(e, _)| e.name.as_str()), Some("CSHARP_CONFIG"));
     }
 }
 
