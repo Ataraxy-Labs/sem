@@ -4,6 +4,11 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Describing code finds it.** `sem_find` with `intent` matched the whole description against entity names, so a plain sentence returned nothing. It now ranks code by the words in its body, name and path, weighting rare words like a language name over common ones like "entity", and leaves out docs, licences and container blocks. C#, C++ and F# are understood.
+- **`sem hook tool` no longer refuses scratch writes.** Shell redirects to a file outside the repository or to a non-code file (a log, a JSON dump, a test file under `/tmp`) are allowed; only shell writes to source files in the repository are refused, and the refusal names the Edit tool as a fallback when `weave_edit` is not loaded.
+
 ## [0.29.0] - 2026-10-29
 
 ### Fixed

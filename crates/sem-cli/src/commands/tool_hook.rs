@@ -476,14 +476,47 @@ fn heavy(cmd: &str) -> bool {
     RE.is_match(cmd)
 }
 
-/// A whole command that writes files through the shell.
-fn shell_write(cmd: &str) -> bool {
+/// A whole command that writes code in the repository through the shell.
+/// Scratch output (a file under /tmp, a log, a JSON dump) is not code and is
+/// left alone; refusing it only cost the agent a turn.
+fn shell_write(ctx: &Ctx, cmd: &str) -> bool {
     static EDIT: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"(^|[;&|]\s*)(sudo\s+)?(sed\s+(-[a-zA-Z]*i|--in-place)|perl\s+-[a-zA-Z]*[pi]|tee|truncate|patch\s)").unwrap()
+        Regex::new(r"(^|[;&|]\s*)(sudo\s+)?(sed\s+(-[a-zA-Z]*i|--in-place)|perl\s+-[a-zA-Z]*[pi]|truncate|patch\s)").unwrap()
     });
-    static REDIRECT: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"(^|[^<>&0-9])>{1,2}\s*[\w./-]+\.\w+").unwrap());
+    static TARGET: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?:(?:^|[^<>&0-9])>{1,2}|(?:^|[;&|]\s*|\|\s*)tee(?:\s+-a)?)\s*([\w./~-]+\.\w+)").unwrap()
+    });
     static SCRIPT: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r#"open\([^)]*,\s*['"][wa]|\.write_text\("#).unwrap());
-    EDIT.is_match(cmd) || REDIRECT.is_match(&cmd.replace("/dev/null", "")) || (cmd.contains("python") && SCRIPT.is_match(cmd))
+    EDIT.is_match(cmd)
+        || TARGET.captures_iter(cmd).any(|c| repo_code(ctx, &c[1]))
+        || (cmd.contains("python") && SCRIPT.is_match(cmd))
+}
+
+/// Whether `path` (as the shell would resolve it from the agent's directory)
+/// is a source file inside the repository.
+fn repo_code(ctx: &Ctx, path: &str) -> bool {
+    const CODE: &[&str] = &[
+        "rs", "py", "pyi", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "scala", "c", "h", "cc",
+        "cpp", "cxx", "hpp", "hh", "cs", "fs", "rb", "php", "swift", "m", "mm", "ex", "exs", "erl", "hs", "ml", "mli",
+        "dart", "lua", "zig", "vue", "svelte", "sol", "r", "jl", "nim", "clj", "elm",
+    ];
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if !CODE.contains(&ext.as_str()) || path.starts_with('~') || path.starts_with("/dev/") {
+        return false;
+    }
+    let root = ctx.cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(&ctx.cwd);
+    let full = ctx.cwd.join(path);
+    let mut parts: Vec<std::path::Component> = Vec::new();
+    for c in full.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => parts.push(c),
+        }
+    }
+    parts.iter().collect::<PathBuf>().starts_with(root)
 }
 
 /// `sed -i 's/A/B/[g]' files` or `perl -pi -e ...` with literal A and B, as a
@@ -575,9 +608,9 @@ fn bash(ctx: &Ctx, input: &Value) -> Option<Value> {
         let idle = if Regex::new(r"\s(-q|--quiet|-qq)\b").unwrap().is_match(cmd) { 0 } else { 300 };
         return Some(allow(input, format!("{} check --run {} --idle {idle}", quote(&ctx.sem), quote(cmd))));
     }
-    if shell_write(cmd) {
+    if shell_write(ctx, cmd) {
         ctx.log("edit", false, cmd);
-        return Some(deny("Change files with the weave_edit tool (entity + content, entity + old/new, old/new on the whole file, rename, into; content alone creates a file), not the shell.".into()));
+        return Some(deny("Change code with the weave_edit tool (entity + content, entity + old/new, old/new on the whole file, rename, into; content alone creates a file), or with your Edit tool if weave_edit is not loaded, not the shell.".into()));
     }
     let mut changed = false;
     let mut out = String::new();
@@ -710,9 +743,16 @@ mod tests {
 
     #[test]
     fn shell_writes_are_recognised() {
-        assert!(shell_write("sed -i 's/a/b/' x.py"));
-        assert!(shell_write("echo hi > notes.txt"));
-        assert!(!shell_write("go test ./... 2>/dev/null"));
+        let c = ctx();
+        assert!(shell_write(&c, "sed -i 's/a/b/' x.py"));
+        assert!(shell_write(&c, "echo 'x = 1' > src/a.py"));
+        assert!(shell_write(&c, "printf x | tee -a lib.rs"));
+        assert!(!shell_write(&c, "go test ./... 2>/dev/null"));
+        // scratch and non-code output is not a code change
+        assert!(!shell_write(&c, "echo hi > notes.txt"));
+        assert!(!shell_write(&c, "cargo test 2>&1 > out.log"));
+        assert!(!shell_write(&c, "cat > /var/scratch/t.rs <<'E'\nfn main() {}\nE"));
+        assert!(!shell_write(&c, "jq . > ../../outside/x.py"));
         assert!(heavy("go test ./... | tail -5") && !heavy("git status"));
     }
 }

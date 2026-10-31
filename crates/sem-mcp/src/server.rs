@@ -2814,17 +2814,7 @@ impl SemServer {
             }
         }
         if let Some(intent) = params.intent.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
-            return self
-                .sem_entities(Parameters(EntitiesParams {
-                    path: None,
-                    no_default_excludes: None,
-                    query: Some(intent.to_string()),
-                    limit: params.limit,
-                    text: None,
-                    signatures: None,
-                    format: params.format.clone(),
-                }))
-                .await;
+            return Ok(self.find_by_intent(intent, params.limit, params.format.as_deref()).await);
         }
         if query.is_none() && queries.is_none() && (params.in_path.is_some() || params.text.is_some()) {
             return self
@@ -2840,6 +2830,57 @@ impl SemServer {
                 .await;
         }
         self.find_definitions(params).await
+    }
+
+    /// Entities ranked against a free-text description, for when the caller
+    /// does not know a name ("where are C# operators extracted"). The
+    /// description is split into words; each entity scores by how many of
+    /// them appear in its name (most), its file path, and its first line,
+    /// with graph centrality breaking ties. Names are compared word by word,
+    /// so `extract_entities` matches "entities are extracted".
+    async fn find_by_intent(&self, intent: &str, limit: Option<usize>, format: Option<&str>) -> CallToolResult {
+        let ctx = match self.get_context(None).await {
+            Ok(ctx) => ctx,
+            Err(err) => return tool_error(err),
+        };
+        let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+        let dependents = graph.dependents();
+        let limit = limit.unwrap_or(10).clamp(1, 100);
+        let ranked = intent_rank(intent, &all_entities, |id| dependents.get(id).map_or(0, Vec::len), limit);
+        if format == Some("json") {
+            let rows: Vec<serde_json::Value> = ranked
+                .iter()
+                .map(|(e, score)| {
+                    serde_json::json!({
+                        "name": e.name,
+                        "type": e.entity_type,
+                        "file": e.file_path,
+                        "start_line": e.start_line,
+                        "score": score,
+                        "dependents": dependents.get(e.id.as_str()).map_or(0, Vec::len),
+                    })
+                })
+                .collect();
+            return CallToolResult::success(vec![Content::text(serde_json::to_string(&rows).unwrap_or_default())]);
+        }
+        if ranked.is_empty() {
+            return CallToolResult::success(vec![Content::text(
+                "no entity matches that description; try a name with sem_find query, or sem_grep for text".to_string(),
+            )]);
+        }
+        let mut out = format!("{} entities ranked for the description:\n", ranked.len());
+        for (e, _) in &ranked {
+            let deps = dependents.get(e.id.as_str()).map_or(0, Vec::len);
+            out.push_str(&format!(
+                "  {} {}  {}:{}{}\n",
+                e.entity_type,
+                e.name,
+                e.file_path,
+                e.start_line,
+                if deps > 0 { format!("  ({deps} dependents)") } else { String::new() }
+            ));
+        }
+        CallToolResult::success(vec![Content::text(out)])
     }
 
     /// Whole files (or a line range of each), numbered like `cat -n`. A file
@@ -3726,6 +3767,252 @@ fn exact_source_lines(text: &str, from: usize, to: usize) -> String {
         return String::new();
     }
     text.split_inclusive('\n').skip(from - 1).take(to - from + 1).collect()
+}
+
+/// Words that carry no meaning in a description of code to find.
+const INTENT_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "into", "where", "what",
+    "which", "when", "how", "does", "not", "but", "its", "has", "have", "can", "all", "any", "out",
+    "get", "set", "use", "used", "using", "code", "function", "method", "class", "file", "files",
+    "find", "make", "made", "them", "they", "their", "there", "here", "should", "would", "will",
+    "fix", "bug", "add", "change", "update", "support", "work", "need", "want", "done", "must", "keep",
+    "focus", "task", "repository", "build", "today", "instead", "still", "only", "also", "make",
+];
+
+/// Lower-cased word stems of `text`: snake_case, camelCase and punctuation
+/// all split into words, short and filler words dropped, and a light suffix
+/// trim so "entities", "entity" and "extracted", "extract" meet.
+fn intent_words(text: &str) -> Vec<String> {
+    // Language names that tokenize to nothing ("C#" is just "c").
+    let aliased;
+    let text = if text.contains('#') || text.contains("++") {
+        aliased = text
+            .replace("C#", " csharp ")
+            .replace("c#", " csharp ")
+            .replace("F#", " fsharp ")
+            .replace("C++", " cpp ")
+            .replace("c++", " cpp ");
+        aliased.as_str()
+    } else {
+        text
+    };
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    let flush = |current: &mut String, words: &mut Vec<String>| {
+        if !current.is_empty() {
+            words.push(std::mem::take(current).to_lowercase());
+        }
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if c.is_uppercase() && prev_lower {
+                flush(&mut current, &mut words);
+            }
+            prev_lower = c.is_lowercase() || c.is_ascii_digit();
+            current.push(c);
+        } else {
+            flush(&mut current, &mut words);
+            prev_lower = false;
+        }
+    }
+    flush(&mut current, &mut words);
+    words
+        .into_iter()
+        .filter(|w| w.len() >= 3 && !INTENT_STOPWORDS.contains(&w.as_str()))
+        .map(|w| intent_stem(&w))
+        .collect()
+}
+
+fn intent_stem(word: &str) -> String {
+    // "entity" and "entities" both become "entiti", "extracted" and
+    // "extracting" become "extract".
+    if let Some(stem) = word.strip_suffix("ies").filter(|s| s.len() >= 3) {
+        return format!("{stem}i");
+    }
+    if let Some(stem) = word.strip_suffix('y').filter(|s| s.len() >= 3) {
+        return format!("{stem}i");
+    }
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(stem) = word.strip_suffix(suffix).filter(|s| s.len() >= 3) {
+            return stem.to_string();
+        }
+    }
+    word.to_string()
+}
+
+/// Score every entity against `intent` and return the best `limit`, most
+/// relevant first. BM25 over each entity's words (its body, where the fix
+/// usually is), plus bonuses when a word is in its name or file path; every
+/// word is weighted by how rare it is in the repository, so "elixir" counts
+/// and "entity" barely does. Tests rank below code; `centrality` breaks ties.
+fn intent_rank<'a>(
+    intent: &str,
+    entities: &'a [SemanticEntity],
+    centrality: impl Fn(&str) -> usize,
+    limit: usize,
+) -> Vec<(&'a SemanticEntity, f64)> {
+    use std::collections::HashMap;
+    let wanted: Vec<String> = {
+        let mut w = intent_words(intent);
+        w.sort();
+        w.dedup();
+        w
+    };
+    // Only leaf code: a container (an impl, a module, a class with methods)
+    // holds every word its members do and would outrank them, and prose (a
+    // licence, a changelog, docs) is never where a code change goes.
+    let containers: std::collections::HashSet<&str> = entities.iter().filter_map(|e| e.parent_id.as_deref()).collect();
+    let prose = |e: &SemanticEntity| {
+        matches!(e.entity_type.as_str(), "chunk" | "element" | "heading" | "section" | "paragraph")
+            || [".md", ".txt", ".html", ".htm", ".rst", ".json", ".lock", ".csv", ".svg"]
+                .iter()
+                .any(|ext| e.file_path.ends_with(ext))
+            || e.file_path.rsplit('/').next().is_some_and(|f| f.starts_with("LICENSE") || f.starts_with("CHANGELOG"))
+    };
+    let entities: Vec<&'a SemanticEntity> =
+        entities.iter().filter(|e| !containers.contains(e.id.as_str()) && !prose(e)).collect();
+    if wanted.is_empty() || entities.is_empty() {
+        return Vec::new();
+    }
+    // Per entity: how often each wanted word occurs in its body, and its length.
+    let docs: Vec<(HashMap<&str, u32>, usize)> = entities
+        .iter()
+        .map(|e| {
+            let words = intent_words(&e.content);
+            let mut tf: HashMap<&str, u32> = HashMap::new();
+            for w in &words {
+                if let Some(k) = wanted.iter().find(|k| *k == w) {
+                    *tf.entry(k.as_str()).or_default() += 1;
+                }
+            }
+            (tf, words.len())
+        })
+        .collect();
+    let n = entities.len() as f64;
+    let avg_len = (docs.iter().map(|d| d.1).sum::<usize>() as f64 / n).max(1.0);
+    let idf: HashMap<&str, f64> = wanted
+        .iter()
+        .map(|w| {
+            let df = docs.iter().filter(|d| d.0.contains_key(w.as_str())).count() as f64;
+            (w.as_str(), ((n - df + 0.5) / (df + 0.5) + 1.0).ln())
+        })
+        .collect();
+    let (k1, b) = (1.2, 0.75);
+    let mut scored: Vec<(&'a SemanticEntity, f64)> = entities
+        .iter()
+        .zip(&docs)
+        .filter_map(|(&e, (tf, len))| {
+            let name = intent_words(&e.name);
+            let path = intent_words(&e.file_path);
+            let mut score = 0.0;
+            for w in &wanted {
+                let weight = idf[w.as_str()];
+                if let Some(&f) = tf.get(w.as_str()) {
+                    let f = f as f64;
+                    score += weight * f * (k1 + 1.0) / (f + k1 * (1.0 - b + b * *len as f64 / avg_len));
+                }
+                if name.contains(w) {
+                    score += weight;
+                }
+                if path.contains(w) {
+                    score += 0.5 * weight;
+                }
+            }
+            if score <= 0.0 {
+                return None;
+            }
+            let is_test = matches!(e.entity_type.as_str(), "test" | "heading" | "section")
+                || e.name.starts_with("test_")
+                || e.file_path.contains("/tests/")
+                || e.id.contains("::tests::")
+                || e.parent_id.as_deref().is_some_and(|p| p.ends_with("::tests") || p.ends_with("_tests"));
+            if is_test {
+                score *= 0.3;
+            }
+            Some((e, score + (1.0 + centrality(&e.id) as f64).ln() * 0.1))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    scored.truncate(limit);
+    scored
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    fn entity(name: &str, ty: &str, file: &str, content: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: format!("{file}::{ty}::{name}"),
+            file_path: file.to_string(),
+            entity_type: ty.to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            content: content.to_string(),
+            content_hash: String::new(),
+            structural_hash: None,
+            kappa: None,
+            start_line: 1,
+            end_line: 1,
+            start_byte: None,
+            end_byte: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn words_split_case_and_stem() {
+        assert_eq!(intent_words("extractEntities from_tree"), vec!["extract", "entiti", "tree"]);
+        assert_eq!(intent_words("where are entities extracted"), vec!["entiti", "extract"]);
+        assert_eq!(intent_words("entity"), vec!["entiti"]);
+        assert_eq!(intent_words("C# and C++ operators"), vec!["csharp", "cpp", "operator"]);
+    }
+
+    #[test]
+    fn description_finds_the_named_function() {
+        let entities = vec![
+            entity("extract_entities", "function", "src/parser/entity_extractor.rs", "pub fn extract_entities("),
+            entity("render_diff", "function", "src/diff.rs", "fn render_diff("),
+            entity("retry_after", "function", "src/net/retry.rs", "fn retry_after("),
+            entity(
+                "entities are listed in source order for every parse tree",
+                "test",
+                "tests/order.rs",
+                "",
+            ),
+        ];
+        let ranked = intent_rank("where are entities extracted from a parse tree", &entities, |_| 0, 5);
+        assert_eq!(ranked.first().map(|(e, _)| e.name.as_str()), Some("extract_entities"));
+        assert!(ranked.iter().all(|(e, _)| e.name != "render_diff"));
+    }
+
+    #[test]
+    fn rare_words_in_a_body_beat_common_words_in_names() {
+        let mut entities: Vec<SemanticEntity> = (0..20)
+            .map(|i| {
+                let name = format!("helper_{i}");
+                let body = format!("fn {name}() {{ extract entities from node }}");
+                entity(&name, "function", "src/other.rs", &body)
+            })
+            .collect();
+        entities.extend([
+            entity("extract_entities", "function", "src/code/mod.rs", "fn extract_entities() { walk() }"),
+            entity("extract_name", "function", "src/code/extractor.rs", "fn extract_name(node) { node.name }"),
+            entity(
+                "CSHARP_CONFIG",
+                "constant",
+                "src/code/languages.rs",
+                "const CSHARP_CONFIG = { entity_node_types: [method_declaration, operator_declaration] }",
+            ),
+        ]);
+        let ranked = intent_rank("C# operators are not extracted as entities", &entities, |_| 0, 3);
+        assert_eq!(ranked.first().map(|(e, _)| e.name.as_str()), Some("CSHARP_CONFIG"));
+    }
 }
 
 #[cfg(test)]
