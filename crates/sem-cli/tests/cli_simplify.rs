@@ -1119,16 +1119,12 @@ fn mcp_lists_the_core_verbs_and_still_answers_old_tool_names() {
         strip(tool_text(&replies[12])),
         "mode context is sem_context"
     );
-    let strip_ms = |s: String| {
-        s.lines()
-            .filter(|l| !l.contains("ms"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert_eq!(
-        strip_ms(tool_text(&replies[13])),
-        strip_ms(tool_text(&replies[14])),
-        "intent is sem_entities' ranked query"
+    // intent ranks code by what a description says, where the old name
+    // query only matched names as substrings
+    assert!(
+        tool_text(&replies[13]).contains("parse_config"),
+        "intent finds the function a description names: {}",
+        tool_text(&replies[13])
     );
 }
 
