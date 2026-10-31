@@ -2775,7 +2775,15 @@ fn map_node_type(tree_sitter_type: &str) -> &str {
         | "singleton_method"
         | "method_signature"
         | "abstract_method_signature"
-        | "operator_signature" => "method",
+        | "operator_signature"
+        | "function_signature_item"
+        | "annotation_type_element_declaration"
+        | "destructor_declaration" => "method",
+        "conversion_operator_declaration" => "operator",
+        "indexer_declaration" => "property",
+        "event_declaration" | "event_field_declaration" => "event",
+        "delegate_declaration" => "type",
+        "alias_declaration" => "type",
         "class_declaration"
         | "abstract_class_declaration"
         | "class_definition"

@@ -2814,17 +2814,7 @@ impl SemServer {
             }
         }
         if let Some(intent) = params.intent.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
-            return self
-                .sem_entities(Parameters(EntitiesParams {
-                    path: None,
-                    no_default_excludes: None,
-                    query: Some(intent.to_string()),
-                    limit: params.limit,
-                    text: None,
-                    signatures: None,
-                    format: params.format.clone(),
-                }))
-                .await;
+            return Ok(self.find_by_intent(intent, params.limit, params.format.as_deref()).await);
         }
         if query.is_none() && queries.is_none() && (params.in_path.is_some() || params.text.is_some()) {
             return self
@@ -2840,6 +2830,57 @@ impl SemServer {
                 .await;
         }
         self.find_definitions(params).await
+    }
+
+    /// Entities ranked against a free-text description, for when the caller
+    /// does not know a name ("where are C# operators extracted"). The
+    /// description is split into words; each entity scores by how many of
+    /// them appear in its name (most), its file path, and its first line,
+    /// with graph centrality breaking ties. Names are compared word by word,
+    /// so `extract_entities` matches "entities are extracted".
+    async fn find_by_intent(&self, intent: &str, limit: Option<usize>, format: Option<&str>) -> CallToolResult {
+        let ctx = match self.get_context(None).await {
+            Ok(ctx) => ctx,
+            Err(err) => return tool_error(err),
+        };
+        let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+        let dependents = graph.dependents();
+        let limit = limit.unwrap_or(10).clamp(1, 100);
+        let ranked = intent_rank(intent, &all_entities, |id| dependents.get(id).map_or(0, Vec::len), limit);
+        if format == Some("json") {
+            let rows: Vec<serde_json::Value> = ranked
+                .iter()
+                .map(|(e, score)| {
+                    serde_json::json!({
+                        "name": e.name,
+                        "type": e.entity_type,
+                        "file": e.file_path,
+                        "start_line": e.start_line,
+                        "score": score,
+                        "dependents": dependents.get(e.id.as_str()).map_or(0, Vec::len),
+                    })
+                })
+                .collect();
+            return CallToolResult::success(vec![Content::text(serde_json::to_string(&rows).unwrap_or_default())]);
+        }
+        if ranked.is_empty() {
+            return CallToolResult::success(vec![Content::text(
+                "no entity matches that description; try a name with sem_find query, or sem_grep for text".to_string(),
+            )]);
+        }
+        let mut out = format!("{} entities ranked for the description:\n", ranked.len());
+        for (e, _) in &ranked {
+            let deps = dependents.get(e.id.as_str()).map_or(0, Vec::len);
+            out.push_str(&format!(
+                "  {} {}  {}:{}{}\n",
+                e.entity_type,
+                e.name,
+                e.file_path,
+                e.start_line,
+                if deps > 0 { format!("  ({deps} dependents)") } else { String::new() }
+            ));
+        }
+        CallToolResult::success(vec![Content::text(out)])
     }
 
     /// Whole files (or a line range of each), numbered like `cat -n`. A file
@@ -3726,6 +3767,177 @@ fn exact_source_lines(text: &str, from: usize, to: usize) -> String {
         return String::new();
     }
     text.split_inclusive('\n').skip(from - 1).take(to - from + 1).collect()
+}
+
+/// Words that carry no meaning in a description of code to find.
+const INTENT_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "into", "where", "what",
+    "which", "when", "how", "does", "not", "but", "its", "has", "have", "can", "all", "any", "out",
+    "get", "set", "use", "used", "using", "code", "function", "method", "class", "file", "files",
+    "find", "make", "made", "them", "they", "their", "there", "here", "should", "would", "will",
+    "fix", "bug", "add", "change", "update", "support", "work", "need", "want",
+];
+
+/// Lower-cased word stems of `text`: snake_case, camelCase and punctuation
+/// all split into words, short and filler words dropped, and a light suffix
+/// trim so "entities", "entity" and "extracted", "extract" meet.
+fn intent_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    let flush = |current: &mut String, words: &mut Vec<String>| {
+        if !current.is_empty() {
+            words.push(std::mem::take(current).to_lowercase());
+        }
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if c.is_uppercase() && prev_lower {
+                flush(&mut current, &mut words);
+            }
+            prev_lower = c.is_lowercase() || c.is_ascii_digit();
+            current.push(c);
+        } else {
+            flush(&mut current, &mut words);
+            prev_lower = false;
+        }
+    }
+    flush(&mut current, &mut words);
+    words
+        .into_iter()
+        .filter(|w| w.len() >= 3 && !INTENT_STOPWORDS.contains(&w.as_str()))
+        .map(|w| intent_stem(&w))
+        .collect()
+}
+
+fn intent_stem(word: &str) -> String {
+    for suffix in ["ities", "ing", "ies", "ed", "es", "s"] {
+        if let Some(stem) = word.strip_suffix(suffix) {
+            if stem.len() >= 3 {
+                return match suffix {
+                    "ities" => format!("{stem}it"),
+                    "ies" => format!("{stem}y"),
+                    _ => stem.to_string(),
+                };
+            }
+        }
+    }
+    word.to_string()
+}
+
+/// Score every entity against `intent` and return the best `limit`, most
+/// relevant first. Name words weigh most, then file path words, then words of
+/// the entity's first line (its signature); `centrality` breaks ties.
+fn intent_rank<'a>(
+    intent: &str,
+    entities: &'a [SemanticEntity],
+    centrality: impl Fn(&str) -> usize,
+    limit: usize,
+) -> Vec<(&'a SemanticEntity, f64)> {
+    let wanted: Vec<String> = {
+        let mut w = intent_words(intent);
+        w.sort();
+        w.dedup();
+        w
+    };
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(&SemanticEntity, f64)> = entities
+        .iter()
+        .filter_map(|e| {
+            let name = intent_words(&e.name);
+            let path = intent_words(&e.file_path);
+            let signature = intent_words(e.content.lines().next().unwrap_or(""));
+            let mut name_score = 0.0;
+            let mut name_hits = 0;
+            let mut score = 0.0;
+            for w in &wanted {
+                if name.contains(w) {
+                    name_score += 3.0;
+                    name_hits += 1;
+                } else if name.iter().any(|n| n.len() >= 4 && (n.starts_with(w.as_str()) || w.starts_with(n.as_str()))) {
+                    name_score += 1.5;
+                    name_hits += 1;
+                }
+                if path.contains(w) {
+                    score += 1.0;
+                }
+                if signature.contains(w) {
+                    score += 0.5;
+                }
+            }
+            // An entity none of whose name words match is noise however its
+            // path reads; demand at least one name hit.
+            if name_hits == 0 {
+                return None;
+            }
+            // A sentence-long name (a test title, a doc heading) matches some
+            // word of almost any description; weigh name hits by how much of
+            // the name they cover, and put tests and prose below code.
+            let coverage = name_hits as f64 / name.len().max(1) as f64;
+            score += name_score * (0.5 + 0.5 * coverage.min(1.0));
+            if matches!(e.entity_type.as_str(), "test" | "heading" | "section") {
+                score *= 0.5;
+            }
+            Some((e, score + (1.0 + centrality(&e.id) as f64).ln() * 0.2))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    scored.truncate(limit);
+    scored
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    fn entity(name: &str, ty: &str, file: &str, content: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: format!("{file}::{ty}::{name}"),
+            file_path: file.to_string(),
+            entity_type: ty.to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            content: content.to_string(),
+            content_hash: String::new(),
+            structural_hash: None,
+            kappa: None,
+            start_line: 1,
+            end_line: 1,
+            start_byte: None,
+            end_byte: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn words_split_case_and_stem() {
+        assert_eq!(intent_words("extractEntities from_tree"), vec!["extract", "entit", "tree"]);
+        assert_eq!(intent_words("where are entities extracted"), vec!["entit", "extract"]);
+    }
+
+    #[test]
+    fn description_finds_the_named_function() {
+        let entities = vec![
+            entity("extract_entities", "function", "src/parser/entity_extractor.rs", "pub fn extract_entities("),
+            entity("render_diff", "function", "src/diff.rs", "fn render_diff("),
+            entity("retry_after", "function", "src/net/retry.rs", "fn retry_after("),
+            entity(
+                "entities are listed in source order for every parse tree",
+                "test",
+                "tests/order.rs",
+                "",
+            ),
+        ];
+        let ranked = intent_rank("where are entities extracted from a parse tree", &entities, |_| 0, 5);
+        assert_eq!(ranked.first().map(|(e, _)| e.name.as_str()), Some("extract_entities"));
+        assert!(ranked.iter().all(|(e, _)| e.name != "render_diff"));
+    }
 }
 
 #[cfg(test)]
