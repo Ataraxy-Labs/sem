@@ -13,7 +13,7 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
     }
 
     fn extensions(&self) -> &[&str] {
-        &[".md", ".mdx"]
+        &[".md", ".mdx", ".qmd"]
     }
 
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
@@ -203,6 +203,15 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarto_documents_are_markdown() {
+        let registry = crate::parser::plugins::create_default_registry();
+        let plugin = registry.get_plugin("report.qmd").expect("a plugin for .qmd");
+        assert_eq!(plugin.id(), "markdown");
+        let entities = registry.extract_entities("report.qmd", "---\ntitle: Report\n---\n\n# Results\n\nbody\n");
+        assert!(entities.iter().any(|e| e.name == "Results"));
+    }
 
     #[test]
     fn unique_heading_keeps_legacy_id() {

@@ -572,7 +572,7 @@ Plus structured data formats:
 | TOML | `.toml` | sections, properties |
 | EDN | `.edn` | top-level map entries (keyword keys) |
 | CSV | `.csv` `.tsv` | rows (first column as identity) |
-| Markdown | `.md` `.mdx` | heading-based sections |
+| Markdown | `.md` `.mdx` `.qmd` | heading-based sections |
 | LaTeX | `.tex` `.latex` `.cls` `.sty` | sections (part/chapter/section/…), plus theorem/lemma/proof/figure/table/algorithm and other tracked environments |
 
 Everything else falls back to chunk-based diffing.
