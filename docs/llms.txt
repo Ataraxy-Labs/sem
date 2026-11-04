@@ -154,7 +154,7 @@ Plus structured data formats:
 | YAML | .yml .yaml | sections, properties (dot paths) |
 | TOML | .toml | sections, properties |
 | CSV | .csv .tsv | rows (first column as ID) |
-| Markdown | .md .mdx | heading-based sections |
+| Markdown | .md .mdx .qmd | heading-based sections |
 
 Everything else falls back to chunk-based diffing.
 

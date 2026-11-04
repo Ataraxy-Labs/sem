@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Quarto documents (`.qmd`) are parsed as Markdown, by heading. Thanks @athyfr for the request (Ataraxy-Labs/weave#216).
+
 ## [0.29.1] - 2026-11-02
 
 ### Fixed
