@@ -7564,7 +7564,52 @@ fn strip_for_language(
     match strategy {
         StripStrategy::Generic => strip_comments_and_strings(content),
         StripStrategy::Clojure => strip_clojure_line_comments(&strip_clojure_content(content)),
+        StripStrategy::HashLine => strip_hash_comments_and_strings(content),
     }
+}
+
+/// Blank `#` line comments and double-quoted strings, nothing else.
+///
+/// For jq, where `//` is the alternative operator, `/` is division and `'` is
+/// not a quote, so the generic stripper's C-style comment and single-quote
+/// rules would blank live code. Blanking (not removing) keeps byte offsets
+/// and line numbers aligned with the original content.
+fn strip_hash_comments_and_strings(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut result = bytes.to_vec();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'"' => {
+                let span_start = i;
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(len);
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                blank_span_preserving_newlines(&mut result, bytes, span_start, i);
+            }
+            b'#' => {
+                let span_start = i;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                blank_span_preserving_newlines(&mut result, bytes, span_start, i);
+            }
+            _ => i += 1,
+        }
+    }
+
+    String::from_utf8(result).expect("stripped source preserves UTF-8 boundaries")
 }
 
 /// Extract dot-chains (receiver.member) from content for precise resolution.
@@ -8923,6 +8968,27 @@ impl Service {
             "run() should depend on helper() via self.helper(). Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_hash_line_strip_keeps_jq_alternative_operator() {
+        use crate::parser::plugins::code::languages::StripStrategy;
+        // jq: `//` is the alternative operator and `/` is division, so the
+        // generic stripper would blank `helper` as a "comment". Only `#`
+        // comments and double-quoted strings are noise.
+        let content = "def run: .x // helper # note about thing\n  | \"a # not comment\" + other /* kept */;\n";
+
+        let stripped = strip_for_language(StripStrategy::HashLine, content);
+
+        assert!(stripped.contains(".x // helper"), "got: {stripped:?}");
+        assert!(!stripped.contains("note about thing"), "got: {stripped:?}");
+        assert!(!stripped.contains("not comment"), "got: {stripped:?}");
+        assert!(
+            stripped.contains("+ other /* kept */;"),
+            "got: {stripped:?}"
+        );
+        assert_eq!(stripped.lines().count(), content.lines().count());
+        assert_eq!(stripped.len(), content.len(), "byte offsets preserved");
     }
 
     #[test]

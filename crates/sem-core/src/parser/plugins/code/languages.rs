@@ -18,6 +18,10 @@ pub(crate) enum StripStrategy {
     /// Clojure: blank double-quoted strings only (preserves `#` for gensyms and reader macros),
     /// then strip `;` line comments in a second pass.
     Clojure,
+    /// jq: blank `#` line comments and double-quoted strings only. `//` is the
+    /// alternative operator and `/` is division, so the generic stripper would
+    /// blank every reference after `.x // ...` on a line.
+    HashLine,
 }
 
 #[allow(dead_code)]
@@ -49,6 +53,7 @@ impl LanguageConfig {
     pub(crate) fn strip_strategy(&self) -> StripStrategy {
         match self.id {
             "clojure" | "edn" => StripStrategy::Clojure,
+            "jq" => StripStrategy::HashLine,
             _ => StripStrategy::Generic,
         }
     }
@@ -379,6 +384,11 @@ fn get_bsl() -> Option<Language> {
 #[cfg(feature = "lang-fish")]
 fn get_fish() -> Option<Language> {
     Some(tree_sitter_fish::language())
+}
+
+#[cfg(feature = "lang-jq")]
+fn get_jq() -> Option<Language> {
+    Some(tree_sitter_jq::LANGUAGE.into())
 }
 
 /// Inside JS/TS function bodies, suppress variable declarations so that local
@@ -1364,6 +1374,27 @@ static FISH_CONFIG: LanguageConfig = LanguageConfig {
     scope_boundary_types: &[],
     get_language: get_fish,
     scope_resolve: Some(&FISH_SCOPE_CONFIG),
+};
+
+#[cfg(feature = "lang-jq")]
+static JQ_CONFIG: LanguageConfig = LanguageConfig {
+    id: "jq",
+    extensions: &[".jq"],
+    // nverno/tree-sitter-jq: `def name(params): body;` is a
+    // `function_definition` with `name`/`parameters`/`body` fields. A def
+    // nested in another def's body stays part of the outer entity, as with
+    // fish: the body has no container node, and nested defs are lexically
+    // private to the outer def anyway. A def that follows a top-level
+    // pipeline (`expr | def f: ...; ...`) is reached by the general recursion.
+    // The trailing top-level program is not an entity; `sem diff` reports
+    // edits to it as orphan changes.
+    entity_node_types: &["function_definition"],
+    container_node_types: &[],
+    call_entity_identifiers: &[],
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_jq,
+    scope_resolve: None,
 };
 
 // ─── Scope Resolve Configs for Supported Languages ────────────────────────────
@@ -2412,6 +2443,8 @@ macro_rules! all_configs {
             &LUA_CONFIG,
             #[cfg(feature = "lang-fish")]
             &FISH_CONFIG,
+            #[cfg(feature = "lang-jq")]
+            &JQ_CONFIG,
             #[cfg(feature = "lang-bsl")]
             &BSL_CONFIG,
         ]

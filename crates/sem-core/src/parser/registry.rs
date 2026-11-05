@@ -681,6 +681,7 @@ const LANG_MAPPING: &[(&str, &str)] = &[
     ("erb", ".erb"),
     ("vue", ".vue"),
     ("svelte", ".svelte"),
+    ("jq", ".jq"),
 ];
 
 /// Detect file extension from shebang line, vim modeline, or content heuristics.

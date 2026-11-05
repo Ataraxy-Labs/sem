@@ -1980,6 +1980,78 @@ end
         assert_eq!(entities.len(), 3, "only functions, got: {:?}", names);
     }
 
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_entity_extraction() {
+        // Modeled on a real jq library file: comment header, top-level defs
+        // (one with a multi-line body, regex string, `$var` bindings and `//`),
+        // then a top-level program that is not an entity.
+        let code = r#"# build a request body
+include "util";
+
+def words: split(" ") | map(select(length > 0));
+def repo_resource:
+  ($repo | capture("^(?<owner>[^/@]+)/(?<name>[^/@]+)$")) as $r
+  | {url: ("https://github.com/" + $r.owner), mount: ("/workspace/\($r.name)")}
+  + (if $r.branch != null then {checkout: $r.branch} else {} end);
+def memory_resource(access):
+  split(":") | {id: .[0], ro: (.[1] // access)}
+  | reduce .[] as $x ({}; . + $x)?;
+
+{ids: ($ids | words), resources: [repo_resource, ($m | memory_resource("rw"))]}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "session-create.jq");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["words", "repo_resource", "memory_resource"],
+            "one entity per top-level def, nothing for the program"
+        );
+        for e in &entities {
+            assert_eq!(e.entity_type, "function", "{} should be a function", e.name);
+        }
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_nested_def_stays_in_outer_entity() {
+        let code = "def outer: def inner_helper: . + 1; inner_helper | inner_helper;\n.x | outer\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "nested.jq");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert_eq!(names, vec!["outer"], "inner def is part of outer");
+        assert!(entities[0].content.contains("def inner_helper"));
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_def_after_top_level_pipeline() {
+        // `expr | def name: ...; body` is legal jq, and real code uses it to
+        // define helpers mid-pipeline. The def is not a child of `program`.
+        let code = "(.[0] // null) as $idle\n| def waiting: $idle.stop_reason // empty;\n{stop: waiting}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "fold.jq");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert_eq!(names, vec!["waiting"]);
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_program_without_defs_yields_nothing() {
+        let code = "# just a filter\n.items[] | select(.ok) | {id, name}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "filter.jq");
+        assert!(
+            entities.is_empty(),
+            "got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_typescript_entity_extraction() {
         // Existing language should still work
