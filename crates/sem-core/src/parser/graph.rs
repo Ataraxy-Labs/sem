@@ -8677,6 +8677,82 @@ function outer() {
         assert!(!refs.iter().any(|(word, _)| *word == "nested"));
     }
 
+    /// Edges in a one-file jq graph as `(from_name, to_name, ref_type)`.
+    #[cfg(feature = "lang-jq")]
+    fn jq_edges(content: &str) -> Vec<(String, String, RefType)> {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+        write_file(root, "lib.jq", content);
+        let (graph, _) = EntityGraph::build(root, &["lib.jq".into()], &registry);
+        let name = |id: &EntityId| graph.entities[id.as_str()].name.clone();
+        graph
+            .edges
+            .iter()
+            .map(|e| (name(&e.from_entity), name(&e.to_entity), e.ref_type.clone()))
+            .collect()
+    }
+
+    // jq has no import extraction, so every edge below comes from the generic
+    // same-file word scan over HashLine-stripped content. Two scan rules shape
+    // the fixtures: names under three characters are not reference words, and
+    // only `name(` reads as `Calls`, so a bare jq call is a `TypeRef` edge.
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_bare_mention_creates_edge() {
+        let edges = jq_edges("def safe: tostring;\ndef wrap: safe | ascii_downcase;\n");
+        assert!(
+            edges.iter().any(|(f, t, _)| f == "wrap" && t == "safe"),
+            "got: {edges:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_call_with_arguments_is_calls_edge() {
+        let edges = jq_edges("def pick(f): f;\ndef run: pick(.x) | map(. + 1);\n");
+        assert!(
+            edges
+                .iter()
+                .any(|(f, t, r)| f == "run" && t == "pick" && *r == RefType::Calls),
+            "got: {edges:?}"
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "builtins like map resolve to nothing: {edges:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_reference_after_alternative_operator_creates_edge() {
+        let edges = jq_edges("def helper: 1;\ndef run: .x // helper;\n");
+        assert!(
+            edges.iter().any(|(f, t, _)| f == "run" && t == "helper"),
+            "`//` must not be stripped as a comment; got: {edges:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_builtins_only_has_no_edges() {
+        let edges = jq_edges("def evens: map(select(. % 2 == 0));\ndef other: 1;\n");
+        assert!(edges.is_empty(), "got: {edges:?}");
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    #[ignore = "known false positive: token_iter splits on `$`, so the variable \
+                `$words` tokenizes to `words` and matches the def of that name"]
+    fn test_jq_variable_shadowing_def_name_is_not_an_edge() {
+        let edges = jq_edges("def words: split(\" \");\ndef pick: . as $words | $words;\n");
+        assert!(
+            !edges.iter().any(|(f, t, _)| f == "pick" && t == "words"),
+            "got: {edges:?}"
+        );
+    }
+
     #[test]
     fn test_deep_nested_typescript_graph_builds() {
         let (dir, registry) = create_test_repo();
