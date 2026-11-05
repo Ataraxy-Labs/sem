@@ -543,6 +543,7 @@ If your team runs code review through sem cloud, `sem cloud review listen <diff-
 | Elixir | `.ex` `.exs` | modules, functions, macros, guards, protocols |
 | Bash | `.sh` | functions |
 | Fish | `.fish` | functions |
+| jq (opt-in, `--features lang-jq`) | `.jq` | functions (`def`) |
 | Lua | `.lua` | functions (global, local, table, and method forms) |
 | HCL/Terraform | `.hcl` `.tf` `.tfvars` | blocks, attributes (qualified names for nested blocks) |
 | Kotlin | `.kt` `.kts` | classes, interfaces, objects, functions, properties, companion objects |
