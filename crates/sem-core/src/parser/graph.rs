@@ -7564,7 +7564,52 @@ fn strip_for_language(
     match strategy {
         StripStrategy::Generic => strip_comments_and_strings(content),
         StripStrategy::Clojure => strip_clojure_line_comments(&strip_clojure_content(content)),
+        StripStrategy::HashLine => strip_hash_comments_and_strings(content),
     }
+}
+
+/// Blank `#` line comments and double-quoted strings, nothing else.
+///
+/// For jq, where `//` is the alternative operator, `/` is division and `'` is
+/// not a quote, so the generic stripper's C-style comment and single-quote
+/// rules would blank live code. Blanking (not removing) keeps byte offsets
+/// and line numbers aligned with the original content.
+fn strip_hash_comments_and_strings(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut result = bytes.to_vec();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'"' => {
+                let span_start = i;
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(len);
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                blank_span_preserving_newlines(&mut result, bytes, span_start, i);
+            }
+            b'#' => {
+                let span_start = i;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                blank_span_preserving_newlines(&mut result, bytes, span_start, i);
+            }
+            _ => i += 1,
+        }
+    }
+
+    String::from_utf8(result).expect("stripped source preserves UTF-8 boundaries")
 }
 
 /// Extract dot-chains (receiver.member) from content for precise resolution.
@@ -8632,6 +8677,82 @@ function outer() {
         assert!(!refs.iter().any(|(word, _)| *word == "nested"));
     }
 
+    /// Edges in a one-file jq graph as `(from_name, to_name, ref_type)`.
+    #[cfg(feature = "lang-jq")]
+    fn jq_edges(content: &str) -> Vec<(String, String, RefType)> {
+        let (dir, registry) = create_test_repo();
+        let root = dir.path();
+        write_file(root, "lib.jq", content);
+        let (graph, _) = EntityGraph::build(root, &["lib.jq".into()], &registry);
+        let name = |id: &EntityId| graph.entities[id.as_str()].name.clone();
+        graph
+            .edges
+            .iter()
+            .map(|e| (name(&e.from_entity), name(&e.to_entity), e.ref_type.clone()))
+            .collect()
+    }
+
+    // jq has no import extraction, so every edge below comes from the generic
+    // same-file word scan over HashLine-stripped content. Two scan rules shape
+    // the fixtures: names under three characters are not reference words, and
+    // only `name(` reads as `Calls`, so a bare jq call is a `TypeRef` edge.
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_bare_mention_creates_edge() {
+        let edges = jq_edges("def safe: tostring;\ndef wrap: safe | ascii_downcase;\n");
+        assert!(
+            edges.iter().any(|(f, t, _)| f == "wrap" && t == "safe"),
+            "got: {edges:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_call_with_arguments_is_calls_edge() {
+        let edges = jq_edges("def pick(f): f;\ndef run: pick(.x) | map(. + 1);\n");
+        assert!(
+            edges
+                .iter()
+                .any(|(f, t, r)| f == "run" && t == "pick" && *r == RefType::Calls),
+            "got: {edges:?}"
+        );
+        assert_eq!(
+            edges.len(),
+            1,
+            "builtins like map resolve to nothing: {edges:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_reference_after_alternative_operator_creates_edge() {
+        let edges = jq_edges("def helper: 1;\ndef run: .x // helper;\n");
+        assert!(
+            edges.iter().any(|(f, t, _)| f == "run" && t == "helper"),
+            "`//` must not be stripped as a comment; got: {edges:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    fn test_jq_builtins_only_has_no_edges() {
+        let edges = jq_edges("def evens: map(select(. % 2 == 0));\ndef other: 1;\n");
+        assert!(edges.is_empty(), "got: {edges:?}");
+    }
+
+    #[cfg(feature = "lang-jq")]
+    #[test]
+    #[ignore = "known false positive: token_iter splits on `$`, so the variable \
+                `$words` tokenizes to `words` and matches the def of that name"]
+    fn test_jq_variable_shadowing_def_name_is_not_an_edge() {
+        let edges = jq_edges("def words: split(\" \");\ndef pick: . as $words | $words;\n");
+        assert!(
+            !edges.iter().any(|(f, t, _)| f == "pick" && t == "words"),
+            "got: {edges:?}"
+        );
+    }
+
     #[test]
     fn test_deep_nested_typescript_graph_builds() {
         let (dir, registry) = create_test_repo();
@@ -8923,6 +9044,27 @@ impl Service {
             "run() should depend on helper() via self.helper(). Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_hash_line_strip_keeps_jq_alternative_operator() {
+        use crate::parser::plugins::code::languages::StripStrategy;
+        // jq: `//` is the alternative operator and `/` is division, so the
+        // generic stripper would blank `helper` as a "comment". Only `#`
+        // comments and double-quoted strings are noise.
+        let content = "def run: .x // helper # note about thing\n  | \"a # not comment\" + other /* kept */;\n";
+
+        let stripped = strip_for_language(StripStrategy::HashLine, content);
+
+        assert!(stripped.contains(".x // helper"), "got: {stripped:?}");
+        assert!(!stripped.contains("note about thing"), "got: {stripped:?}");
+        assert!(!stripped.contains("not comment"), "got: {stripped:?}");
+        assert!(
+            stripped.contains("+ other /* kept */;"),
+            "got: {stripped:?}"
+        );
+        assert_eq!(stripped.lines().count(), content.lines().count());
+        assert_eq!(stripped.len(), content.len(), "byte offsets preserved");
     }
 
     #[test]

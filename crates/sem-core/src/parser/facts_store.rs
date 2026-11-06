@@ -910,6 +910,7 @@ pub const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("d", "ts-0.8.2"),
     ("lua", "ts-0.5.0"),
     ("fish", "ts-3.6"),
+    ("jq", "ts-1.0"),
     ("svelte", "ts-0.1.7"),
     ("erb", "ts-0.25"),
     ("toml", "handrolled-1"),

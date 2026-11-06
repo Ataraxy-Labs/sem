@@ -98,6 +98,10 @@ lang-sql = ["dep:tree-sitter-sequel"]
 lang-lua = ["dep:tree-sitter-lua"]
 lang-fish = ["dep:tree-sitter-fish"]
 lang-bsl = ["dep:tree-sitter-bsl"]
+# Opt-in only: tree-sitter-jq is GPL-3.0-or-later, unlike every other grammar
+# here, so it stays out of grammar-all (and the default build) pending
+# Ataraxy-Labs/sem#543.
+lang-jq = ["dep:tree-sitter-jq"]
 
 [dependencies]
 git2 = { version = "0.20", optional = true, default-features = false }
@@ -147,6 +151,7 @@ tree-sitter-d = { version = "0.8.2", optional = true }
 tree-sitter-lua = { version = "0.5.0", optional = true }
 tree-sitter-fish = { version = "3.6", optional = true }
 tree-sitter-bsl = { version = "0.1.7", optional = true }
+tree-sitter-jq = { version = "1.0", optional = true }
 rustc-hash = "2"
 # On-disk persistence for the red-green facts layer (parser::facts_store).
 # Pure Rust, no C dependency (keeps the `wasm` feature viable). CBOR, not
