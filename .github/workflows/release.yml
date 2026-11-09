@@ -97,13 +97,13 @@ jobs:
             cross_linker: aarch64-linux-gnu-gcc
             vendor_openssl: true
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             name: sem-darwin-arm64
           - target: x86_64-apple-darwin
             # Cross-compile on Apple Silicon: macOS clang targets x86_64 natively,
-            # and macos-14 runners are plentiful (Intel macos-13 runners are scarce
-            # and being retired, which can leave the build queued indefinitely).
-            os: macos-14
+            # and Apple Silicon runners are plentiful (Intel runners are scarce and
+            # being retired). macos-14 was retired in Nov 2026 ("configuration not supported").
+            os: macos-15
             name: sem-darwin-x86_64
             # Cross-compiling can't find a target-arch OpenSSL, so vendor + build
             # it from source for x86_64 (same as the Linux arm64 cross-build).
