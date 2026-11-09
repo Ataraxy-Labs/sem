@@ -4,8 +4,11 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-09
+
 ### Added
 
+- Ruby constants are entities. A constant assigned in a class or module body (`UNICODE_DATA = {...}`) is reported as a `constant`, so a change to it is a change to that name rather than to the whole class body. land's test selection uses this to rerun only the tests that read the constant (on addressable, 3.2% of tests instead of all of them).
 - Quarto documents (`.qmd`) are parsed as Markdown, by heading. Thanks @athyfr for the request (Ataraxy-Labs/weave#216).
 - jq support, via the `tree-sitter-jq` grammar, behind an opt-in `lang-jq` feature that is **not** in `grammar-all`: the grammar is GPL-3.0-or-later, unlike every other grammar sem ships (#543). Each `def` in a `.jq` file is a `function` entity; a `def` nested in another stays part of the outer entity, and a `def` after a top-level pipeline (`expr | def f: ...;`) is still found. Defs that mention each other in the same file are connected, so `sem impact` and `sem find --callers` see them: `name(args)` is a `calls` edge, a bare `name` a type reference. jq's `//` alternative operator is no longer read as a comment when scanning for references. Known limits: the top-level program is not an entity, so edits there are orphan changes and calls from it make no edges; builtins and other files' defs are not resolved; a `$name` variable that shares a def's name produces a false edge.
 
