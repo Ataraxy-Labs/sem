@@ -348,6 +348,50 @@ fn visit_node(
         let suppression_context = sup_owned.as_deref();
         let node_type = node.kind();
 
+        // Ruby constants: `NAME = value` (or `Scope::NAME = value`) in a class,
+        // module or file body is a constant. Ruby rejects a constant assignment
+        // inside a method, so no local is caught here. Its value is traversed
+        // under it, so methods defined inside (`Point = Struct.new(:x) do def
+        // norm ... end end`) stay entities of their own.
+        if config.id == "ruby" && node_type == "assignment" {
+            if let Some(left) = node.child_by_field_name("left") {
+                let name_node = match left.kind() {
+                    "constant" => Some(left),
+                    "scope_resolution" => left
+                        .child_by_field_name("name")
+                        .filter(|n| n.kind() == "constant"),
+                    _ => None,
+                };
+                if let Some(name_node) = name_node {
+                    let name = node_text(name_node, source).to_string();
+                    let content = node_text(node, source).to_string();
+                    let (struct_hash, kappa_hash) = compute_structural_hash_and_kappa(node, source);
+                    let entity = SemanticEntity {
+                        id: build_entity_id(file_path, "constant", &name, parent_id),
+                        file_path: file_path.to_string(),
+                        entity_type: "constant".to_string(),
+                        name,
+                        parent_id: parent_id.map(String::from),
+                        content_hash: content_hash(&content),
+                        structural_hash: Some(struct_hash),
+                        kappa: Some(kappa_hash),
+                        content,
+                        start_line: node.start_position().row + 1,
+                        end_line: node.end_position().row + 1,
+                        start_byte: Some(node.start_byte()),
+                        end_byte: Some(node.end_byte()),
+                        metadata: None,
+                    };
+                    let entity_id = entity.id.clone();
+                    entities.push(entity);
+                    if let Some(value) = node.child_by_field_name("right") {
+                        worklist.push((value, Some(entity_id), sup_owned.clone()));
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Starlark build targets: a top-level `rule(name = "x", ...)` call is the
         // target `x`, whatever the rule or macro is called.
         if config.id == "starlark" && node_type == "call" && parent_id.is_none() {

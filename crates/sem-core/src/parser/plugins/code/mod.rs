@@ -848,6 +848,24 @@ int main() {
     }
 
     #[test]
+    fn test_ruby_constants_are_entities() {
+        let code = "module Codes\n  TABLE = {\n    1 => \"a\",\n  }.freeze\n  Auth::LIMIT = 3\n  Point = Struct.new(:x) do\n    def norm\n      x.abs\n    end\n  end\n  def lookup(k)\n    count = 1\n    TABLE[k]\n  end\nend\n";
+        let entities = CodeParserPlugin.extract_entities(code, "codes.rb");
+        let kind = |n: &str| entities.iter().find(|e| e.name == n).map(|e| e.entity_type.as_str());
+        assert_eq!(kind("TABLE"), Some("constant"));
+        assert_eq!(kind("LIMIT"), Some("constant"));
+        assert_eq!(kind("Point"), Some("constant"));
+        // a method defined inside a constant's value stays a method, under the constant
+        let norm = entities.iter().find(|e| e.name == "norm").expect("norm");
+        assert_eq!(norm.entity_type, "method");
+        assert!(norm.parent_id.as_deref().unwrap_or("").ends_with("Point"), "{:?}", norm.parent_id);
+        // a local variable inside a method is not an entity
+        assert!(kind("count").is_none());
+        let table = entities.iter().find(|e| e.name == "TABLE").unwrap();
+        assert_eq!((table.start_line, table.end_line), (2, 4));
+    }
+
+    #[test]
     fn test_csharp_entity_extraction() {
         let code = "namespace MyApp {\npublic class User {\n    public string GetName() { return \"\"; }\n}\npublic enum Role { Admin, User }\n}\n";
         let plugin = CodeParserPlugin;
