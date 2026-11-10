@@ -87,11 +87,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux builds run on the oldest supported Ubuntu: a binary needs the glibc it was built against or newer,
+          # so building on ubuntu-latest (glibc 2.39) broke Debian 12 (2.36) and Ubuntu 22.04 (2.35).
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: sem-linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: sem-linux-arm64
             cross_package: gcc-aarch64-linux-gnu
             cross_linker: aarch64-linux-gnu-gcc
@@ -140,6 +142,18 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p sem-cli ${{ matrix.vendor_openssl && '--features vendored-openssl' || '' }}
+
+      - name: Check the binary runs on glibc 2.35 (Ubuntu 22.04, Debian 12)
+        if: runner.os == 'Linux'
+        run: |
+          OBJDUMP=objdump
+          [ "${{ matrix.target }}" = aarch64-unknown-linux-gnu ] && OBJDUMP=aarch64-linux-gnu-objdump
+          need=$($OBJDUMP -T target/${{ matrix.target }}/release/sem | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "highest glibc symbol needed: $need"
+          if [ "$(printf '%s\n2.35\n' "$need" | sort -V | tail -1)" != "2.35" ]; then
+            echo "::error::sem needs glibc $need, newer than 2.35: it would not start on Ubuntu 22.04 or Debian 12"
+            exit 1
+          fi
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

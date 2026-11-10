@@ -4,6 +4,14 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-11-11
+
+### Fixed
+
+- sem starts on Debian 12 and Ubuntu 22.04 again. The Linux binaries were built against glibc 2.39 and failed with `GLIBC_2.38 not found`; they are now built on Ubuntu 22.04, and a release fails if a binary needs anything newer than glibc 2.35. Thanks to Grump for the report and repro.
+- The install script and `npm install` no longer report success when sem can't start. They now show the error and exit with a failure.
+- `cargo install sem-cli` builds again: sem-mcp now accepts rmcp 1.6.x only, since rmcp 1.8.0 doesn't compile with it. The README also uses `--locked`.
+
 ## [0.30.0] - 2026-11-09
 
 ### Added
