@@ -114,7 +114,14 @@ async function main() {
   }
 
   await installFromRelease(destinationBinaryPath);
-  console.log(`Installed sem binary to ${destinationBinaryPath}.`);
+  // the binary is there, but make sure it starts on this system (a glibc too old for it fails only at run time)
+  const run = spawnSync(destinationBinaryPath, ['--version'], { encoding: 'utf8' });
+  if (run.status !== 0) {
+    const why = (run.stderr || run.stdout || String(run.error || '')).trim().split('\n')[0];
+    throw new Error(`sem was downloaded to ${destinationBinaryPath} but does not start on this system: ${why}. ` +
+      'Please report it at https://github.com/Ataraxy-Labs/sem/issues with your OS version.');
+  }
+  console.log(`Installed ${run.stdout.trim()} to ${destinationBinaryPath}.`);
 }
 
 main().catch((error) => {

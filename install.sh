@@ -278,7 +278,12 @@ main() {
     download_and_install
 
     if [ -x "${INSTALL_DIR}/${BINARY}" ]; then
-        installed_version=$("${INSTALL_DIR}/${BINARY}" --version 2>/dev/null || echo "unknown")
+        if ! installed_version=$("${INSTALL_DIR}/${BINARY}" --version 2>&1); then
+            # the binary is there but won't start (for example a glibc too old for it): say so, don't report success
+            error "sem was installed to ${INSTALL_DIR}/${BINARY} but does not start on this system:
+    ${installed_version}
+  Please report it at https://github.com/${REPO}/issues with your OS version (cat /etc/os-release)."
+        fi
         info "Installed" "${installed_version} -> ${INSTALL_DIR}/${BINARY}"
     else
         error "install appears to have failed: ${INSTALL_DIR}/${BINARY} is not executable"

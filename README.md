@@ -166,13 +166,13 @@ sem config update
 Or via cargo, from [crates.io](https://crates.io/crates/sem-cli):
 
 ```bash
-cargo install sem-cli
+cargo install --locked sem-cli
 ```
 
 Or build the latest `main` from source (requires Rust):
 
 ```bash
-cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli
+cargo install --locked --git https://github.com/Ataraxy-Labs/sem sem-cli
 ```
 
 Or grab a binary from [GitHub Releases](https://github.com/Ataraxy-Labs/sem/releases).
