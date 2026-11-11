@@ -10,7 +10,9 @@ use sem_core::git::bridge::GitBridge;
 use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
-use sem_core::parser::differ::{collect_binary_file_changes, compute_semantic_diff, DiffResult};
+use sem_core::parser::differ::{
+    collect_binary_file_changes, compute_semantic_diff_with_options, DiffResult, SemanticDiffOptions,
+};
 use sem_core::parser::plugins::code::languages::get_language_config;
 use sem_core::parser::registry::{detect_ext_from_content, ParserRegistry};
 
@@ -47,6 +49,7 @@ pub(crate) struct DiffOptions {
     pub(crate) profile: bool,
     pub(crate) file_exts: Vec<String>,
     pub(crate) no_cosmetics: bool,
+    pub(crate) entries: bool,
     pub(crate) label: Option<String>,
     pub(crate) args: Vec<String>,
 }
@@ -1723,7 +1726,13 @@ fn run_diff_pipeline(
 
     let t3 = Instant::now();
     let binary_changes = collect_binary_file_changes(&file_changes);
-    let mut result = compute_semantic_diff(&file_changes, &registry, None, None);
+    let mut result = compute_semantic_diff_with_options(
+        &file_changes,
+        &registry,
+        None,
+        None,
+        SemanticDiffOptions { entries: opts.entries },
+    );
     let parse_diff_ms = t3.elapsed().as_secs_f64() * 1000.0;
     // compute_semantic_diff fans work out over a rayon par_iter internally,
     // so there's no single call stack to time per phase — see

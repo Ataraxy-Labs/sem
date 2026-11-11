@@ -66,6 +66,26 @@ pub struct SemanticChange {
     /// None when structural hash is unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structural_change: Option<bool>,
+    /// For an `entry` change (`sem diff --entries`): which container literal
+    /// and which key. `None` for every other change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<EntryRef>,
+}
+
+/// The container and key of one element of a container literal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryRef {
+    /// The binding holding the literal, qualified by its enclosing entities:
+    /// `ClickHouseParser.FUNCTIONS`, `Builtins`.
+    pub container: String,
+    /// The key as written, unquoted for string keys: `TOUNIXTIMESTAMP`,
+    /// `exp.TimeToUnix`, or a spread's expression `parser.Parser.FUNCTIONS`.
+    pub key: String,
+    /// `string`, `identifier`, `attribute`, `number`, `constant`, `spread`,
+    /// `field` (Go struct field), `name_field` (Go slice element named by its
+    /// `Name:` field), `index` (positional), `computed`, or `expr`.
+    pub key_kind: String,
 }
 
 impl SemanticChange {

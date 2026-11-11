@@ -143,6 +143,13 @@ enum Commands {
         #[arg(long, env = "SEM_DIFF_NO_COSMETICS", value_parser = clap::builder::FalseyValueParser::new())]
         no_cosmetics: bool,
 
+        /// Diff inside container literals: each key of a dict / object / map literal (and each
+        /// named element of a Go slice of structs) is an entry, so adding one key reports
+        /// `added entry FUNCTIONS["X"]` instead of the whole literal. Python, JS/TS, Go.
+        /// Example: sem diff --entries --format json
+        #[arg(long)]
+        entries: bool,
+
         /// When to use colors. Example: sem diff --color never
         #[arg(long, default_value = "auto", env = "SEM_DIFF_COLOR")]
         color: ColorMode,
@@ -1487,6 +1494,7 @@ fn sem_main() {
             profile,
             file_exts,
             no_cosmetics,
+            entries,
             color,
             directory,
             pathspecs,
@@ -1511,6 +1519,7 @@ fn sem_main() {
                 profile,
                 file_exts,
                 no_cosmetics,
+                entries,
                 label,
                 args,
             });
@@ -2028,6 +2037,7 @@ fn sem_main() {
                 profile: false,
                 file_exts: vec![],
                 no_cosmetics: false,
+                entries: false,
                 label: None,
                 args: vec![],
             });

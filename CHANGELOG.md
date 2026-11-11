@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`sem diff --entries` diffs inside container literals.** A registry written as one literal (`FUNCTIONS = {**Parent.FUNCTIONS, "X": ...}` in a Python class, a JS/TS object literal, a Go map or struct literal, a Go slice of structs named by a `Name:` field) was one entity, so adding a key read as "class modified". With `--entries` each element is an `entry` entity keyed by its literal key, and the diff reports `added entry FUNCTIONS["TOUNIXTIMESTAMP"]`, `modified entry TRANSFORMS[exp.TimeToUnix]`, `added entry Builtins["ceil"]`; spreads are entries too (`FUNCTIONS[**parser.Parser.FUNCTIONS]`). JSON entry changes carry `entry: {container, key, keyKind}`. Python module- and class-level assignments get `variable` entities in this mode, so a changed class flag is reported by name. Without the flag nothing changes.
+
 ## [0.30.1] - 2026-11-11
 
 ### Fixed
@@ -79,6 +83,7 @@ All notable changes to sem are documented in this file.
 - **`sem diff --color never` prints no escape codes** when there are no changes.
 - **Hints name the current commands** (`sem cloud login`, `sem config telemetry`, `sem config update`, `sem cloud review listen`, `sem find --context`, `sem history --blame`), and `docs/llms.txt` documents the current verbs.
 
+||||||| parent of 575d06d (feat(diff): --entries diffs inside container literals)
 ## [0.28.1] - 2026-10-19
 
 ### Added

@@ -1,4 +1,5 @@
 mod entity_extractor;
+pub mod entries;
 pub mod languages;
 #[cfg(feature = "oxc-fastpath")]
 pub mod oxc_extractor;
@@ -563,6 +564,24 @@ impl SemanticParserPlugin for CodeParserPlugin {
 
         let entities = extract_entities(&tree, file_path, config, content);
         (entities, Some(tree))
+    }
+
+    /// Not cached: the default extraction underneath is, and this mode is
+    /// only used by `sem diff --entries` on the changed files.
+    fn extract_entities_with_entries(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        let mut entities = self.extract_entities(content, file_path);
+        let Some(config) = language_config_for_content(content, file_path) else {
+            return entities;
+        };
+        if !matches!(config.id, "python" | "javascript" | "typescript" | "tsx" | "go")
+            || is_pathological_large_file(content)
+        {
+            return entities;
+        }
+        if let Some(tree) = parse_tree(config, content) {
+            entries::append_entry_entities(&tree, file_path, config, content, &mut entities);
+        }
+        entities
     }
 
     /// Also content-addressed — it otherwise re-parses the file from scratch.

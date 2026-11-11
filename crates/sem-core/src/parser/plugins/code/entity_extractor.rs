@@ -1764,7 +1764,7 @@ fn sibling_function_body(node: Node) -> Option<Node> {
 /// against the plain `structural_hash`/`structural_hash_excluding_range`
 /// functions directly. Kappa deliberately does NOT exclude the name range:
 /// see `structural_and_semantic_hash`'s doc comment.
-fn compute_structural_hash_and_kappa(node: Node, source: &[u8]) -> (String, String) {
+pub(super) fn compute_structural_hash_and_kappa(node: Node, source: &[u8]) -> (String, String) {
     let exclude_range = find_name_byte_range(node, source);
     structural_and_semantic_hash(node, source, exclude_range)
 }

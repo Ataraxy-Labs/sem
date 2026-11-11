@@ -18,6 +18,13 @@ pub trait SemanticParserPlugin: Send + Sync {
     ) -> (Vec<SemanticEntity>, Option<tree_sitter::Tree>) {
         (self.extract_entities(content, file_path), None)
     }
+    /// `extract_entities` plus, for each container literal (dict, object,
+    /// map or slice literal bound to a name), one `entry` entity per element.
+    /// Opt-in (`sem diff --entries`); plugins without container support
+    /// return the plain extraction.
+    fn extract_entities_with_entries(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
+        self.extract_entities(content, file_path)
+    }
     fn structural_hash_content(&self, _content: &str, _file_path: &str) -> Option<String> {
         None
     }
