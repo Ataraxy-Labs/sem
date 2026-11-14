@@ -228,33 +228,42 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let new_binary = find_binary(&tmp).ok_or("No sem binary found in release archive")?;
 
+    // Stage the new binary beside the installed one first. The temp dir is often
+    // on another filesystem (/tmp on tmpfs), where a rename fails with EXDEV
+    // (os error 18); a copy works anywhere, and the swap below is then two
+    // renames inside one directory.
+    let staged = exe.with_extension("new");
+    if let Err(e) = stage(&new_binary, &staged) {
+        let _ = fs::remove_file(&staged);
+        cleanup(&tmp);
+        return Err(format!(
+            "Cannot write next to {} ({e}). Try with elevated permissions, or reinstall:\n  curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | sh",
+            exe.display()
+        )
+        .into());
+    }
+    cleanup(&tmp);
+
     // Swap in place: move the running binary aside (allowed on Unix and
     // Windows), then move the new one into its path.
     let old = exe.with_extension("old");
     let _ = fs::remove_file(&old);
     if let Err(e) = fs::rename(&exe, &old) {
-        cleanup(&tmp);
+        let _ = fs::remove_file(&staged);
         return Err(format!(
             "Cannot replace {} ({e}). Try with elevated permissions, or reinstall:\n  curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | sh",
             exe.display()
         )
         .into());
     }
-    if let Err(e) = fs::rename(&new_binary, &exe) {
+    if let Err(e) = fs::rename(&staged, &exe) {
         // Roll back so the user still has a working sem.
         let _ = fs::rename(&old, &exe);
-        cleanup(&tmp);
+        let _ = fs::remove_file(&staged);
         return Err(format!("Failed to install new binary: {e}").into());
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o755));
-    }
-
     let _ = fs::remove_file(&old); // fails harmlessly on Windows while running
-    cleanup(&tmp);
 
     println!(
         "{} Updated to v{latest} ({})",
@@ -377,4 +386,46 @@ fn find_binary(dir: &Path) -> Option<PathBuf> {
 
 fn cleanup(tmp: &Path) {
     let _ = fs::remove_dir_all(tmp);
+}
+
+/// Copy `from` to `to` (any filesystem) and make it executable.
+fn stage(from: &Path, to: &Path) -> std::io::Result<()> {
+    let _ = fs::remove_file(to);
+    fs::copy(from, to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(to, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #549: the staged binary lands beside the installed one, executable, so
+    /// the final swap never renames across filesystems.
+    #[test]
+    fn stage_copies_next_to_the_target_and_makes_it_executable() {
+        let dir = std::env::temp_dir().join(format!("sem-stage-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("download")).unwrap();
+        let from = dir.join("download").join("sem");
+        fs::write(&from, b"new sem").unwrap();
+        let exe = dir.join("sem");
+        let staged = exe.with_extension("new");
+        fs::write(&staged, b"stale").unwrap();
+
+        stage(&from, &staged).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"new sem");
+        assert_eq!(staged.parent(), exe.parent());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&staged).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        fs::rename(&staged, &exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"new sem");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
