@@ -4,6 +4,11 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `sem update` works when `/tmp` is on a different filesystem from the installed binary (tmpfs is common on Linux). It failed with `Invalid cross-device link (os error 18)`; the new binary is now copied next to the installed one before the swap. Thanks @kevmoo for the report (#549).
+- `sem find --text` and `sem entities --text` honor `--in`, `--only`, `--except` and `--json`. They used to search the whole repository and always print text. With `--json` they now print `{text, total, hits: [{file, entity, type, line, text}]}`. Thanks @kevmoo for the report (#548).
+
 ## [0.30.1] - 2026-11-11
 
 ### Fixed

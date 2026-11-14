@@ -1363,7 +1363,7 @@ impl SemServer {
     /// both renderings of the entity-body text search: one hit per matching
     /// line as `(file, line, entity name, entity type, line text)`, the
     /// smallest-span (innermost) enclosing entity winning a contested line.
-    fn collect_text_hits<'a>(
+    pub fn collect_text_hits<'a>(
         all_entities: &'a [SemanticEntity],
         needle: &str,
         scope: Option<&str>,

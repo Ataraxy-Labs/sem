@@ -505,10 +505,60 @@ fn text_search(opts: &EntitiesOptions, needle: &str) {
     );
     let (_, all_entities) =
         super::graph::get_or_build_graph(&root, &file_paths, &registry, false, source_scope);
+
+    // --in and --only/--except narrow the search exactly as they narrow a listing (#548).
+    if !opts.only_kinds.is_empty() && !opts.except_kinds.is_empty() {
+        eprintln!("{} --only and --except cannot be used together", "error:".red().bold());
+        std::process::exit(2);
+    }
+    let scopes = text_scopes(&root, Path::new(&opts.cwd), &opts.paths);
+    let entities: Vec<SemanticEntity> = all_entities
+        .iter()
+        .filter(|e| scopes.is_empty() || scopes.iter().any(|s| in_text_scope(&e.file_path, s)))
+        .filter(|e| opts.only_kinds.is_empty() || opts.only_kinds.iter().any(|k| k == &e.entity_type))
+        .filter(|e| !opts.except_kinds.iter().any(|k| k == &e.entity_type))
+        .cloned()
+        .collect();
+
+    if opts.json {
+        let hits = sem_mcp::server::SemServer::collect_text_hits(&entities, needle, None);
+        let rows: Vec<serde_json::Value> = hits
+            .iter()
+            .take(TEXT_SEARCH_LIMIT)
+            .map(|(file, line, name, ty, text)| {
+                serde_json::json!({"file": file, "entity": name, "type": ty, "line": line, "text": text.trim()})
+            })
+            .collect();
+        let out = serde_json::json!({"text": needle, "total": hits.len(), "hits": rows});
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return;
+    }
     print!(
         "{}",
-        sem_mcp::server::SemServer::render_text_hits(&all_entities, needle, TEXT_SEARCH_LIMIT)
+        sem_mcp::server::SemServer::render_text_hits(&entities, needle, TEXT_SEARCH_LIMIT)
     );
+}
+
+/// The `--in` paths as repo-relative scopes (a file or a directory). Empty means
+/// the whole repository, as does any path that resolves to the repository root.
+fn text_scopes(root: &Path, cwd: &Path, paths: &[String]) -> Vec<String> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut scopes = Vec::new();
+    for p in paths.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        let abs = cwd.join(p);
+        let abs = abs.canonicalize().unwrap_or(abs);
+        let rel = abs.strip_prefix(&root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_else(|_| p.to_string());
+        let rel = rel.trim_start_matches("./").trim_end_matches('/').to_string();
+        if rel.is_empty() || rel == "." {
+            return Vec::new();
+        }
+        scopes.push(rel);
+    }
+    scopes
+}
+
+fn in_text_scope(file: &str, scope: &str) -> bool {
+    file == scope || file.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn extract_file_entities(
@@ -702,6 +752,21 @@ fn print_entity_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #548: `--in` scopes a text search to a file or a folder, from the repo
+    /// root or from a subfolder, and the repo root itself means everything.
+    #[test]
+    fn text_search_scopes_follow_in_paths() {
+        let root = std::env::temp_dir().join(format!("sem-text-scope-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let s = |cwd: &Path, p: &[&str]| text_scopes(&root, cwd, &p.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(s(&root, &["src"]), vec!["src"]);
+        assert_eq!(s(&root.join("src"), &["."]), vec!["src"]);
+        assert!(s(&root, &["."]).is_empty() && s(&root, &[]).is_empty(), "the root is the whole repo");
+        assert!(in_text_scope("src/a.rs", "src") && in_text_scope("src/a.rs", "src/a.rs"));
+        assert!(!in_text_scope("srcx/a.rs", "src") && !in_text_scope("tests/b.rs", "src"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn entity(id: &str, parent_id: Option<&str>) -> SemanticEntity {
         SemanticEntity {
