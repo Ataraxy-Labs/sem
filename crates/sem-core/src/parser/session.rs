@@ -2826,6 +2826,61 @@ mod tests {
     }
 
     #[test]
+    fn extensionless_bash_calls_become_reference_edges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let registry = create_default_registry();
+        let script = "tools/run";
+        let caller = "tools/run::function::main";
+        let source = |callee: &str| {
+            format!("#!/usr/bin/env bash\n{callee}() {{ echo hi; }}\nmain() {{ {callee}; }}\n")
+        };
+        let assert_call = |graph: &EntityGraph, callee| {
+            let target = format!("tools/run::function::{callee}");
+            assert!(
+                graph.edges.iter().any(|edge| {
+                    edge.from_entity.as_str() == caller
+                        && edge.to_entity.as_str() == target
+                        && edge.ref_type == RefType::Calls
+                }),
+                "missing call to {target}; edges: {:?}",
+                graph.edges,
+            );
+        };
+
+        for filler_files in [0, 9] {
+            write(root, script, &source("helper"));
+            for i in 0..filler_files {
+                write(root, &format!("note_{i}.md"), "# Unrelated note\n");
+            }
+            let files = walk_sorted(root);
+            assert_eq!(
+                crate::parser::graph::retain_parsed_files(root, &files),
+                filler_files == 0,
+            );
+
+            let (full, entities) = EntityGraph::build(root, &files, &registry);
+            assert_call(&full, "helper");
+            let (direct, _) =
+                EntityGraph::build_direct_dependencies(root, &files, &registry, |e| {
+                    e.id.as_str() == caller
+                });
+            assert_call(&direct, "helper");
+
+            let mut session = GraphSession::build(root, &files, &registry);
+            write(root, script, &source("replacement"));
+            let changed = [script.to_string()];
+            session.rebuild(&files, &changed, &registry);
+            assert_call(session.graph(), "replacement");
+
+            let (stale, clean) = entities.into_iter().partition(|entity| entity.file_path == script);
+            let (incremental, _) =
+                EntityGraph::build_incremental(root, &changed, &files, clean, vec![], stale, &registry);
+            assert_call(&incremental, "replacement");
+        }
+    }
+
+    #[test]
     fn fish_calls_across_files_become_reference_edges() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();

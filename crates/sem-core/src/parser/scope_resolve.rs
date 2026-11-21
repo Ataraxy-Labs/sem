@@ -76,9 +76,11 @@ use crate::parser::incremental::{
 };
 use crate::parser::plugins::code::languages::{
     get_language_config, AssignmentStrategy, CallNodeStyle, ClassNameField, InitStrategy,
-    ParamNameField, ScopeResolveConfig,
+    LanguageConfig, ParamNameField, ScopeResolveConfig,
 };
-use crate::parser::plugins::code::{is_pathological_large_file, parse_tree};
+use crate::parser::plugins::code::{
+    is_pathological_large_file, language_config_for_content, parse_tree,
+};
 
 type EntityScopeMap = HashMap<EntityId, usize>;
 type ResolvedReference = (EntityId, RefType, &'static str);
@@ -607,23 +609,30 @@ pub(crate) struct PreBuiltLookups {
     pub(crate) ext_overrides: HashMap<String, String>,
 }
 
-/// The scope resolver's own admission test: `Some` iff this file's language has
-/// a [`ScopeResolveConfig`], which is what every consumer of a re-parsed tree
-/// requires before it looks at one.
-///
-/// Deliberately keyed on the *raw* extension, with no `.semrc`/`.gitattributes`
-/// override applied, because that is what the per-file scope closure and the
-/// return-type/init-attr scan do (see their `get_language_config(ext)` lines).
-/// The re-parse's own grammar choice still honors overrides via
-/// [`reparse_language_config`] — this decides *whether* a file is re-parsed at
-/// all, that decides *with which grammar*, and keeping the first question in one
-/// function is what stops the skip in the re-parse loop from drifting away from
-/// the decline it mirrors.
-fn scope_resolve_config_for_path(
-    file_path: &str,
-) -> Option<&'static crate::parser::plugins::code::languages::ScopeResolveConfig> {
+/// Check the raw extension before opening files. The grammar used on the
+/// reparse path may still be overridden by repository configuration.
+fn scope_resolve_config_for_path(file_path: &str) -> Option<&'static ScopeResolveConfig> {
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
     get_language_config(ext).and_then(|c| c.scope_resolve)
+}
+
+pub(crate) fn may_have_scope_resolver(file_path: &str) -> bool {
+    scope_resolve_config_for_path(file_path).is_some() || Path::new(file_path).extension().is_none()
+}
+
+fn extensionless_bash_language(file_path: &str, content: &str) -> Option<&'static LanguageConfig> {
+    if Path::new(file_path).extension().is_some() || !content.starts_with("#!") {
+        return None;
+    }
+    language_config_for_content(content, file_path).filter(|config| config.id == "bash")
+}
+
+fn scope_resolve_config_for_source(
+    file_path: &str,
+    content: &str,
+) -> Option<&'static ScopeResolveConfig> {
+    scope_resolve_config_for_path(file_path)
+        .or_else(|| extensionless_bash_language(file_path, content)?.scope_resolve)
 }
 
 /// Pick the grammar to re-parse `file_path` with, honoring repo-level language
@@ -2369,26 +2378,25 @@ fn resolve_with_scopes_full_inner(
             if precomputed_facts.is_some_and(|m| m.contains_key(file_path)) {
                 return None;
             }
-            //: a file whose language has no `scope_resolve`
-            // config is declined by *every* consumer of this vector — the
-            // per-file scope closure below opens with exactly this predicate
-            // (`get_language_config(ext).and_then(|c| c.scope_resolve)?`), the
-            // return-type/init-attr scan repeats it, `build_ts_default_export_
-            // table` filters to JS/TS and `build_swift_call_signatures` to
-            // `.swift`, all of which have one. So its tree was read, parsed and
-            // dropped. Skipping the read+parse is work elimination, not a
-            // semantics change: chunk membership, chunk order, the visited-chunk
-            // guard and every surviving file's own facts are untouched. Measured
-            // on llvm-project, 34,260 files / 267 MB of `.h`/`.c` re-parsed per
-            // cold build for nothing (linux: 29,158 / 333 MB) — see
-            // ": parse ceiling".
-            //
-            // (`?` on the admission test itself: the grammar this file is
-            // re-parsed *with* still comes from `reparse_language_config`.)
-            scope_resolve_config_for_path(file_path)?;
+            // Pass 1 already discovered the entities. An extensionless Bash
+            // file needs a function entity to contribute outgoing references.
+            let has_extensionless_function = || {
+                Path::new(file_path).extension().is_none()
+                    && entities_by_file
+                        .get(file_path.as_str())
+                        .is_some_and(|entities| {
+                            entities
+                                .iter()
+                                .any(|entity| entity.entity_type == "function")
+                        })
+            };
+            if scope_resolve_config_for_path(file_path).is_none() && !has_extensionless_function() {
+                return None;
+            }
             let full_path = root.join(file_path);
             let content = std::fs::read_to_string(&full_path).ok()?;
-            let config = reparse_language_config(file_path, &lookups.ext_overrides)?;
+            let config = reparse_language_config(file_path, &lookups.ext_overrides)
+                .or_else(|| extensionless_bash_language(file_path, &content))?;
             // shared with pass 1's `CodeParserPlugin::extract_entities_with_tree`
             // (see `plugins/code/mod.rs`'s `is_pathological_large_file` doc
             // comment) -- one shared, deterministic, pure-per-file give-up
@@ -2513,9 +2521,7 @@ fn resolve_with_scopes_full_inner(
     )> = maybe_par_iter!(parsed_files)
         .filter_map(|(file_path, content, tree)| {
             let source = content.as_bytes();
-            // Same admission test the re-parse loop applies before building a
-            // tree at all.
-            let config = scope_resolve_config_for_path(file_path)?;
+            let config = scope_resolve_config_for_source(file_path, content)?;
 
             let file_entities = entities_by_file
                 .get(file_path.as_str())
@@ -2775,10 +2781,6 @@ fn resolve_with_scopes_full_inner(
             let mut __file_profile: Option<prof::FileAccum> =
                 prof::names_enabled().then(prof::FileAccum::default);
             let __scope_build_t0 = __prof_on.then(Instant::now);
-            // Same admission test the re-parse loop applies before building a
-            // tree at all.
-            let config = scope_resolve_config_for_path(file_path)?;
-
             let precomputed = precomputed_facts.and_then(|m| m.get(file_path.as_str()));
             let reparsed = if precomputed.is_none() {
                 parsed_by_path.get(file_path.as_str()).copied()
@@ -2790,6 +2792,7 @@ fn resolve_with_scopes_full_inner(
                 (None, Some((_, content, _))) => content.as_str(),
                 (None, None) => return None,
             };
+            let config = scope_resolve_config_for_source(file_path, content)?;
             let source = content.as_bytes();
 
             // scope_build's own decomposition. Zero-cost when the
