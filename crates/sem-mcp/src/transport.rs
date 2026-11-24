@@ -12,6 +12,62 @@ use tokio::sync::Mutex;
 const PARSE_ERROR_RESPONSE: &[u8] =
     br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#;
 
+/// The largest request line stdio accepts (issue #553), the same 1 MiB the HTTP transport's body limit allows.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+const TOO_LARGE_RESPONSE: &[u8] =
+    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request: a request line is at most 1 MiB"}}"#;
+
+/// What one bounded read of a line found.
+#[derive(Debug, PartialEq)]
+enum Bounded {
+    /// a line (possibly the last, unterminated one) in the buffer
+    Line,
+    /// a line past the bound: read through its end and discarded, never held in memory
+    TooLong,
+    /// end of input, nothing read
+    Eof,
+}
+
+/// Read one '\n'-terminated line into `out`, holding at most `max` bytes of it (plus the newline). A longer line is
+/// consumed through its newline in the reader's own chunks and reported as TooLong, so the next read starts at the
+/// next request.
+async fn read_bounded_line<R: AsyncRead + Unpin>(
+    r: &mut BufReader<R>,
+    out: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Bounded> {
+    let mut too_long = false;
+    loop {
+        let buf = r.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(if too_long {
+                Bounded::TooLong
+            } else if out.is_empty() {
+                Bounded::Eof
+            } else {
+                Bounded::Line
+            });
+        }
+        let (n, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (buf.len(), false),
+        };
+        if !too_long {
+            if out.len() + n > max + 1 {
+                too_long = true;
+                out.clear();
+            } else {
+                out.extend_from_slice(&buf[..n]);
+            }
+        }
+        r.consume(n);
+        if done {
+            return Ok(if too_long { Bounded::TooLong } else { Bounded::Line });
+        }
+    }
+}
+
 pub(crate) struct ResilientStdioTransport<R, W> {
     read: BufReader<R>,
     write: Arc<Mutex<Option<W>>>,
@@ -51,9 +107,18 @@ where
         loop {
             line.clear();
 
-            match self.read.read_until(b'\n', &mut line).await {
-                Ok(0) => return None,
-                Ok(_) => {}
+            match read_bounded_line(&mut self.read, &mut line, MAX_REQUEST_BYTES).await {
+                Ok(Bounded::Eof) => return None,
+                Ok(Bounded::Line) => {}
+                Ok(Bounded::TooLong) => {
+                    tracing::debug!("Request line over {} bytes discarded", MAX_REQUEST_BYTES);
+                    let write = Arc::clone(&self.write);
+                    if let Err(error) = write_raw_line(&write, TOO_LARGE_RESPONSE).await {
+                        tracing::error!("Error writing request too large response: {}", error);
+                        return None;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     tracing::error!("Error reading from stream: {}", error);
                     return None;
@@ -395,5 +460,28 @@ mod tests {
 
         let err = write_raw_line(&transport.write, b"{}").await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+    }
+
+
+    /// Issue #553: a request line past the bound is drained and reported, never held whole, and the next line
+    /// reads normally.
+    #[tokio::test]
+    async fn an_oversized_line_is_drained_and_the_next_one_reads() {
+        let mut input = vec![b'x'; 300];
+        input.push(b'\n');
+        input.extend_from_slice(b"short\n");
+        input.extend_from_slice(b"last");
+        let mut r = BufReader::with_capacity(16, &input[..]);
+        let mut line = Vec::new();
+        assert_eq!(read_bounded_line(&mut r, &mut line, 100).await.unwrap(), Bounded::TooLong);
+        assert!(line.is_empty());
+        line.clear();
+        assert_eq!(read_bounded_line(&mut r, &mut line, 100).await.unwrap(), Bounded::Line);
+        assert_eq!(line, b"short\n");
+        line.clear();
+        assert_eq!(read_bounded_line(&mut r, &mut line, 100).await.unwrap(), Bounded::Line);
+        assert_eq!(line, b"last");
+        line.clear();
+        assert_eq!(read_bounded_line(&mut r, &mut line, 100).await.unwrap(), Bounded::Eof);
     }
 }

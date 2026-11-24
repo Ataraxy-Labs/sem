@@ -2415,6 +2415,9 @@ impl SemServer {
         // agent waited on — let the speed be felt, not claimed.
         let start = Instant::now();
 
+        if let Some(msg) = params.entities().and_then(|e| crate::tools::batch_over(e.len(), "entities")) {
+            return Ok(tool_error(msg));
+        }
         if let Some(entities) = params.entities() {
             // Batch form: one block per entity, resolution failures reported
             // inline per entity (a miss on one never hides the others). The
@@ -2497,7 +2500,7 @@ impl SemServer {
             None => None,
         };
         let no_default_excludes = params.no_default_excludes.unwrap_or(false);
-        let budget = params.token_budget.unwrap_or(8000);
+        let budget = params.token_budget.unwrap_or(8000).min(crate::tools::MAX_TOKEN_BUDGET);
         let hops = params.hops.unwrap_or(0);
 
         // File-hinted queries stay local (same gate as the CLI, #409): the
@@ -2710,6 +2713,9 @@ impl SemServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let query = params.query.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
         let queries = params.queries().map(<[String]>::to_vec);
+        if let Some(msg) = queries.as_ref().and_then(|q| crate::tools::batch_over(q.len(), "queries")) {
+            return Ok(tool_error(msg));
+        }
         // `files` or `lines` with no entity named can only mean "read these"
         let reading = query.is_none() && queries.is_none() && (params.files.as_ref().is_some_and(|f| !f.is_empty()) || params.lines.is_some());
         let mode = if reading { Some("context") } else { params.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) };
@@ -2896,27 +2902,52 @@ impl SemServer {
             Ok(r) => r,
             Err(e) => return tool_error(e),
         };
+        // Issue #553: a path named twice is read once, at most MAX_FILES distinct files per call, read on at most
+        // READ_THREADS threads (never one thread per path), and a file past MAX_FILE_BYTES is refused with its size.
+        let mut seen = std::collections::HashSet::new();
+        let paths: Vec<String> = paths.into_iter().filter(|p| seen.insert(p.clone())).collect();
+        if paths.len() > crate::tools::MAX_FILES {
+            return tool_error(format!(
+                "{} files in one read; at most {} (split the read)",
+                paths.len(),
+                crate::tools::MAX_FILES
+            ));
+        }
         let root = ctx.repo_root.clone();
         let read: Vec<(String, Result<String, String>)> = tokio::task::spawn_blocking(move || {
+            let read_one = |p: &String| -> (String, Result<String, String>) {
+                let (rel, abs) = Self::resolve_file_path(&root, p);
+                let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+                let text = if size > crate::tools::MAX_FILE_BYTES {
+                    Err(format!(
+                        "{size} bytes, over the {} MiB a read returns",
+                        crate::tools::MAX_FILE_BYTES / (1024 * 1024)
+                    ))
+                } else {
+                    match std::fs::read(&abs) {
+                        Ok(b) if b.contains(&0) => Err(format!("binary file, {} bytes", b.len())),
+                        Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+                        Err(e) if abs.is_dir() => Err(format!("a directory ({e}); list it with `in` and no mode")),
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+                (rel, text)
+            };
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<(String, Result<String, String>)>>> =
+                paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
+            let workers = crate::tools::READ_THREADS.min(paths.len()).max(1);
             std::thread::scope(|scope| {
-                let jobs: Vec<_> = paths
-                    .iter()
-                    .map(|p| {
-                        let root = &root;
-                        scope.spawn(move || {
-                            let (rel, abs) = Self::resolve_file_path(root, p);
-                            let text = match std::fs::read(&abs) {
-                                Ok(b) if b.contains(&0) => Err(format!("binary file, {} bytes", b.len())),
-                                Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-                                Err(e) if abs.is_dir() => Err(format!("a directory ({e}); list it with `in` and no mode")),
-                                Err(e) => Err(e.to_string()),
-                            };
-                            (rel, text)
-                        })
-                    })
-                    .collect();
-                jobs.into_iter().filter_map(|j| j.join().ok()).collect()
-            })
+                for _ in 0..workers {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(p) = paths.get(i) else { break };
+                        *slots[i].lock().unwrap() = Some(read_one(p));
+                    });
+                }
+            });
+            // in the order the paths were named
+            slots.into_iter().filter_map(|s| s.into_inner().ok().flatten()).collect()
         })
         .await
         .unwrap_or_default();
@@ -3275,6 +3306,9 @@ impl SemServer {
                 .collect::<Vec<_>>()
         };
 
+        if let Some(msg) = params.patterns().and_then(|p| crate::tools::batch_over(p.len(), "patterns")) {
+            return Ok(tool_error(msg));
+        }
         if let Some(patterns) = params.patterns() {
             // Batch form: each pattern scanned and reported separately (never
             // merged); an invalid pattern is reported inline for its own
@@ -3342,7 +3376,7 @@ impl SemServer {
             }
             let all: Vec<sem_core::index::grep::GrepHit> = per_pattern.iter().filter_map(|(_, o)| o.as_ref().ok()).flat_map(|h| h.iter().take(limit)).cloned().collect();
             if params.bodies.unwrap_or(all.len() <= AUTO_BODIES) && !all.is_empty() {
-                out.push_str(&self.enclosing_bodies(&ctx.repo_root, &all, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
+                out.push_str(&self.enclosing_bodies(&ctx.repo_root, &all, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 }).min(crate::tools::MAX_TOKEN_BUDGET)));
             }
             return Ok(CallToolResult::success(vec![Content::text(out)]));
         }
@@ -3385,7 +3419,7 @@ impl SemServer {
         // a handful of hits: show the code around them too, since the next
         // turn would read it anyway
         if params.bodies.unwrap_or(hits.len() <= AUTO_BODIES) && !hits.is_empty() {
-            out.push_str(&self.enclosing_bodies(&ctx.repo_root, &hits, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 })));
+            out.push_str(&self.enclosing_bodies(&ctx.repo_root, &hits, params.token_budget.unwrap_or(if params.bodies.is_some() { 4000 } else { 1500 }).min(crate::tools::MAX_TOKEN_BUDGET)));
         }
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
@@ -5222,6 +5256,35 @@ mod tests {
         assert!(capped.contains("… 2 more hits in 1 files (narrow with in, or raise limit)"), "{capped}");
         let hidden = text_of(grep(serde_json::json!({"pattern": "NEEDLE", "in": ".github/workflows"})).await.unwrap());
         assert!(hidden.contains(".github/workflows/ci.yml:1:name: NEEDLE"), "{hidden}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    /// Issue #553: one call is bounded. A path repeated in one read is read once, a read past MAX_FILES distinct
+    /// files is refused, and a batch past MAX_BATCH is refused by sem_find, sem_context and sem_grep, each naming
+    /// the bound.
+    #[tokio::test]
+    async fn one_call_is_bounded_issue_553() {
+        let root = temp_git_repo("bounds-553");
+        std::fs::write(root.join("big.txt"), "line\n".repeat(1000)).unwrap();
+        let server = server_for_repo(&root).await;
+        let find = |args: serde_json::Value| server.sem_find(Parameters(serde_json::from_value(args).unwrap()));
+
+        let repeated = vec!["big.txt"; 500];
+        let once = text_of(find(serde_json::json!({"mode": "context", "files": repeated})).await.unwrap());
+        assert_eq!(once.matches("── big.txt").count(), 1, "a path repeated 500 times is read once:\n{once}");
+
+        let many: Vec<String> = (0..=crate::tools::MAX_FILES).map(|i| format!("f{i}.txt")).collect();
+        let refused = text_of(find(serde_json::json!({"mode": "context", "files": many})).await.unwrap());
+        assert!(refused.contains("101 files in one read; at most 100"), "{refused}");
+
+        let names: Vec<String> = (0..=crate::tools::MAX_BATCH).map(|i| format!("q{i}")).collect();
+        let q = text_of(find(serde_json::json!({"queries": names})).await.unwrap());
+        assert!(q.contains("51 queries in one call; at most 50"), "{q}");
+        let e = text_of(server.sem_context(Parameters(serde_json::from_value(serde_json::json!({"entities": names})).unwrap())).await.unwrap());
+        assert!(e.contains("51 entities in one call; at most 50"), "{e}");
+        let p = text_of(server.sem_grep(Parameters(serde_json::from_value(serde_json::json!({"patterns": names})).unwrap())).await.unwrap());
+        assert!(p.contains("51 patterns in one call; at most 50"), "{p}");
         let _ = std::fs::remove_dir_all(root);
     }
 
