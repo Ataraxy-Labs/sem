@@ -2,6 +2,26 @@ use serde::Deserialize;
 
 // ── Tool parameter structs ──
 
+/// Bounds on what one tool call may ask for (issue #553): a single call must not be able to exhaust threads,
+/// memory or output. Batches past MAX_BATCH and reads past MAX_FILES are refused with the bound named; limits and
+/// budgets past theirs are clamped.
+pub const MAX_BATCH: usize = 50;
+/// Distinct files one read may name.
+pub const MAX_FILES: usize = 100;
+/// Threads one read uses, however many files it names.
+pub const READ_THREADS: usize = 8;
+/// The largest file one read returns whole (a larger one is refused, with its size).
+pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// The largest token_budget any tool honors.
+pub const MAX_TOKEN_BUDGET: usize = 100_000;
+/// The largest per-pattern hit limit sem_grep honors.
+pub const MAX_GREP_LIMIT: usize = 2_000;
+
+/// A batch past MAX_BATCH, refused before any work: Some(message) names the bound.
+pub fn batch_over(len: usize, what: &str) -> Option<String> {
+    (len > MAX_BATCH).then(|| format!("{len} {what} in one call; at most {MAX_BATCH} (split the batch)"))
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EntitiesParams {
@@ -277,7 +297,7 @@ pub struct GrepParams {
 
 impl GrepParams {
     pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(200).max(1)
+        self.limit.unwrap_or(200).clamp(1, MAX_GREP_LIMIT)
     }
 
     pub fn case_insensitive(&self) -> bool {
