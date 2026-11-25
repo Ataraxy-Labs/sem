@@ -332,7 +332,7 @@ const LANGUAGE_SALTS: &[(&str, &str)] = &[
     ("fortran", "ts-0.5"),
     ("swift", "ts-0.7"),
     ("elixir", "ts-0.3"),
-    ("bash", "ts-0.23"),
+    ("bash", "ts-0.23-shebang-calls"),
     ("hcl", "ts-1.1"),
     ("kotlin", "ts-1.1"),
     ("xml", "ts-0.7"),

@@ -1727,12 +1727,10 @@ fn resolve_scopes_in_file_chunks(
         chunk_files_by_byte_budget(root, file_paths, SCOPE_RESOLVE_BYTE_BUDGET);
     for (chunk_index, chunk_range) in byte_budget_chunks.into_iter().enumerate() {
         let chunk = &file_paths[chunk_range];
-        if !chunk.iter().any(|file_path| {
-            let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-            crate::parser::plugins::code::languages::get_language_config(ext)
-                .and_then(|config| config.scope_resolve)
-                .is_some()
-        }) {
+        if !chunk
+            .iter()
+            .any(|path| scope_resolve::may_have_scope_resolver(path))
+        {
             continue;
         }
 
@@ -3229,12 +3227,9 @@ impl EntityGraph {
         );
 
         // Run scope-aware resolver for supported languages (reuse pre-parsed trees)
-        let has_scope_lang = file_paths.iter().any(|f| {
-            let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
-            crate::parser::plugins::code::languages::get_language_config(ext)
-                .and_then(|c| c.scope_resolve)
-                .is_some()
-        });
+        let has_scope_lang = file_paths
+            .iter()
+            .any(|f| scope_resolve::may_have_scope_resolver(f));
         let __scope_wall_t0 = std::time::Instant::now();
         let (scope_edges, scope_consumed_words) = if has_scope_lang && retain_parsed_files {
             let mut scope_inc = inc
@@ -3671,12 +3666,9 @@ impl EntityGraph {
         } else {
             file_paths.to_vec()
         };
-        let has_scope_lang = resolve_file_paths.iter().any(|f| {
-            let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
-            crate::parser::plugins::code::languages::get_language_config(ext)
-                .and_then(|c| c.scope_resolve)
-                .is_some()
-        });
+        let has_scope_lang = resolve_file_paths
+            .iter()
+            .any(|f| scope_resolve::may_have_scope_resolver(f));
         let mut call_edges = calls::resolve_call_edges(
             root,
             file_paths,
@@ -4457,12 +4449,9 @@ impl EntityGraph {
             .cloned()
             .collect();
 
-        let has_scope_lang = resolve_file_paths.iter().any(|f| {
-            let ext = f.rfind('.').map(|i| &f[i..]).unwrap_or("");
-            crate::parser::plugins::code::languages::get_language_config(ext)
-                .and_then(|c| c.scope_resolve)
-                .is_some()
-        });
+        let has_scope_lang = resolve_file_paths
+            .iter()
+            .any(|f| scope_resolve::may_have_scope_resolver(f));
         // snapshot content from `parsed_files` (the stale files this
         // call reparsed) before it's consumed by `.into_iter()` just below.
         // Clean files' content isn't retained on this legacy incremental API,
