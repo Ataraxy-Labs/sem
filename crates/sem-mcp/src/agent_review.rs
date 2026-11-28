@@ -324,6 +324,18 @@ impl AgentReviewClient {
         format!("{}{}", self.config.base_url.trim_end_matches('/'), path)
     }
 
+    /// The URL of `rest` under one diff. Issue #552: the diff id goes into the path, so anything but a plain id
+    /// (letters, digits, `_`, `-`) is refused before a request is made; `../` could otherwise send the operator's
+    /// key to any path on sem-cloud.
+    fn diff_url(&self, diff_id: &str, rest: &str) -> Result<String, AgentReviewError> {
+        if !valid_diff_id(diff_id) {
+            return Err(AgentReviewError::Config(format!(
+                "'{diff_id}' is not a diff id; ids are letters, digits, '_' and '-'"
+            )));
+        }
+        Ok(self.url(&format!("/v1/diffs/{diff_id}/{rest}")))
+    }
+
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.config.api_key)
     }
@@ -336,7 +348,7 @@ impl AgentReviewClient {
         wait_ms: u64,
     ) -> Result<AgentNext, AgentReviewError> {
         let wait_ms = wait_ms.min(MAX_WAIT_MS);
-        let url = self.url(&format!("/v1/diffs/{diff_id}/agent/next?wait_ms={wait_ms}"));
+        let url = self.diff_url(diff_id, &format!("agent/next?wait_ms={wait_ms}"))?;
         let resp = self
             .agent
             .get(&url)
@@ -358,7 +370,7 @@ impl AgentReviewClient {
         content: &str,
         partial: Option<bool>,
     ) -> Result<(), AgentReviewError> {
-        let url = self.url(&format!("/v1/diffs/{diff_id}/agent/reply"));
+        let url = self.diff_url(diff_id, "agent/reply")?;
         let mut body = serde_json::json!({ "commentId": comment_id, "content": content });
         if let Some(p) = partial {
             body["partial"] = serde_json::json!(p);
@@ -377,7 +389,7 @@ impl AgentReviewClient {
         status: &str,
         label: Option<&str>,
     ) -> Result<(), AgentReviewError> {
-        let url = self.url(&format!("/v1/diffs/{diff_id}/agent/presence"));
+        let url = self.diff_url(diff_id, "agent/presence")?;
         let mut body = serde_json::json!({ "status": status });
         if let Some(label) = label {
             body["label"] = serde_json::json!(label);
@@ -395,7 +407,7 @@ impl AgentReviewClient {
     /// extracts common fields defensively so an unexpected shape degrades to
     /// a short summary instead of a hard failure.
     pub fn manifest(&self, diff_id: &str) -> Result<Value, AgentReviewError> {
-        let url = self.url(&format!("/v1/diffs/{diff_id}/manifest"));
+        let url = self.diff_url(diff_id, "manifest")?;
         let resp = self
             .agent
             .get(&url)
@@ -415,7 +427,7 @@ impl AgentReviewClient {
         &self,
         diff_id: &str,
     ) -> Result<Vec<OpenBranch>, AgentReviewError> {
-        let url = self.url(&format!("/v1/diffs/{diff_id}/comments"));
+        let url = self.diff_url(diff_id, "comments")?;
         let resp = self
             .agent
             .get(&url)
@@ -432,6 +444,13 @@ impl AgentReviewClient {
             .map(OpenBranch::from)
             .collect())
     }
+}
+
+/// A diff id as sem-cloud issues them: non-empty, at most 128 characters, only letters, digits, `_` and `-`.
+pub(crate) fn valid_diff_id(diff_id: &str) -> bool {
+    !diff_id.is_empty()
+        && diff_id.len() <= 128
+        && diff_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn parse_agent_next(value: Value) -> Result<AgentNext, AgentReviewError> {

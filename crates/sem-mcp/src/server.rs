@@ -3578,7 +3578,7 @@ impl SemServer {
 async fn join_review_impl(
     Parameters(params): Parameters<JoinReviewParams>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let client = match resolve_agent_review_client() {
+    let client = match resolve_agent_review_client(&params.diff_id) {
         Ok(c) => c,
         Err(result) => return Ok(result),
     };
@@ -3621,7 +3621,7 @@ async fn join_review_impl(
 async fn wait_for_branch_impl(
     Parameters(params): Parameters<WaitForBranchParams>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let client = match resolve_agent_review_client() {
+    let client = match resolve_agent_review_client(&params.diff_id) {
         Ok(c) => c,
         Err(result) => return Ok(result),
     };
@@ -3669,7 +3669,7 @@ async fn wait_for_branch_impl(
 async fn reply_to_branch_impl(
     Parameters(params): Parameters<ReplyToBranchParams>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let client = match resolve_agent_review_client() {
+    let client = match resolve_agent_review_client(&params.diff_id) {
         Ok(c) => c,
         Err(result) => return Ok(result),
     };
@@ -3711,7 +3711,7 @@ async fn reply_to_branch_impl(
 async fn list_open_branches_impl(
     Parameters(params): Parameters<ListOpenBranchesParams>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let client = match resolve_agent_review_client() {
+    let client = match resolve_agent_review_client(&params.diff_id) {
         Ok(c) => c,
         Err(result) => return Ok(result),
     };
@@ -4654,6 +4654,21 @@ mod tests {
     }
 
     #[test]
+    fn review_tools_only_run_for_their_own_review_session() {
+        // Issue #552: no review session, another diff, or a path-like id is refused before any request is made.
+        assert!(review_session_allows(None, "abc123").is_err());
+        assert!(review_session_allows(Some(""), "abc123").is_err());
+        assert!(review_session_allows(Some("abc123"), "other").is_err());
+        assert!(review_session_allows(Some("abc123"), "../../v1/repos").is_err());
+        assert!(review_session_allows(Some("../../v1/repos"), "../../v1/repos").is_err());
+        assert!(review_session_allows(Some("abc123"), "abc123").is_ok());
+        for bad in ["../../v1/repos", "a/b", "a?b", "a#b", "", "a b", "%2e%2e"] {
+            assert!(!agent_review::valid_diff_id(bad), "{bad:?} should be refused");
+        }
+        assert!(agent_review::valid_diff_id("Ab9_-z"));
+    }
+
+    #[test]
     fn path_to_slash_converts_backslashes() {
         assert_eq!(path_to_slash(Path::new("a\\b\\c.py")), "a/b/c.py");
         assert_eq!(path_to_slash(Path::new("a/b/c.py")), "a/b/c.py");
@@ -5500,9 +5515,27 @@ fn tool_error(msg: impl Into<String>) -> CallToolResult {
 /// resolution failure is reported as a normal (non-error) tool result
 /// carrying the message — matching what every one of those call sites did
 /// inline before this was factored out.
-fn resolve_agent_review_client() -> Result<agent_review::AgentReviewClient, CallToolResult> {
+///
+/// Issue #552: the review tools act with the operator's sem-cloud key, so they only run in a session launched by
+/// `sem cloud review listen` (which sets `SEM_REVIEW_DIFF_ID`), and only for that session's own diff. Hiding them
+/// from `tools/list` was not enough, since any client can call a tool by name.
+fn resolve_agent_review_client(diff_id: &str) -> Result<agent_review::AgentReviewClient, CallToolResult> {
+    review_session_allows(std::env::var("SEM_REVIEW_DIFF_ID").ok().as_deref(), diff_id).map_err(tool_error)?;
     agent_review::AgentReviewClient::from_env_or_credentials()
         .map_err(|err| tool_error(err.to_string()))
+}
+
+fn review_session_allows(session: Option<&str>, diff_id: &str) -> Result<(), String> {
+    let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err("review tools only run in a session started by `sem cloud review listen <diff>`".to_string());
+    };
+    if diff_id.trim() != session {
+        return Err(format!("this session reviews diff '{session}', not '{diff_id}'"));
+    }
+    if !agent_review::valid_diff_id(session) {
+        return Err(format!("'{session}' is not a diff id; ids are letters, digits, '_' and '-'"));
+    }
+    Ok(())
 }
 
 /// Run a blocking `agent_review` client call on `spawn_blocking` and map a
