@@ -373,9 +373,12 @@ impl SemServer {
             .to_string())
     }
 
-    fn resolve_file_path(repo_root: &Path, file_path: &str) -> (String, PathBuf) {
+    /// Issue #554: a path that ends up outside the repository, through `..`, an absolute path elsewhere or a symlink
+    /// that leads out, is refused. The path returned is the one that was checked, with `..` and symlinks resolved, so
+    /// the file a tool then opens is the file that passed the check.
+    fn resolve_file_path(repo_root: &Path, file_path: &str) -> Result<(String, PathBuf), String> {
         let p = Path::new(file_path);
-        if p.is_absolute() {
+        let (relative, requested) = if p.is_absolute() {
             let relative_path = p
                 .strip_prefix(repo_root)
                 .ok()
@@ -387,9 +390,14 @@ impl SemServer {
                 .unwrap_or_else(|| file_path.replace('\\', "/"));
             (relative, p.to_path_buf())
         } else {
-            let abs_path = repo_root.join(file_path);
-            let relative_path = normalize_relative_path(p);
-            (path_to_slash(&relative_path), abs_path)
+            (path_to_slash(&normalize_relative_path(p)), repo_root.join(file_path))
+        };
+        match contained_path(repo_root, &requested) {
+            Some(abs) => Ok((relative, abs)),
+            None => Err(format!(
+                "'{file_path}' is outside the repository at {}; use a path inside it",
+                repo_root.display()
+            )),
         }
     }
 
@@ -1539,7 +1547,10 @@ impl SemServer {
         // entities, not line numbers in anonymous files.
         if let Some(needle) = params.text() {
             let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
-            let scope = params.path().map(|p| Self::resolve_file_path(&ctx.repo_root, p).0);
+            let scope = match params.path().map(|p| Self::resolve_file_path(&ctx.repo_root, p)).transpose() {
+                Ok(scope) => scope.map(|(rel, _)| rel),
+                Err(e) => return Ok(tool_error(e)),
+            };
             let scope = scope.as_deref();
             if params.format() == "json" {
                 let hits = Self::collect_text_hits(&all_entities, needle, scope);
@@ -1635,7 +1646,10 @@ impl SemServer {
             return Ok(CallToolResult::success(vec![Content::text(out)]));
         }
 
-        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
+        let (rel_path, abs_path) = match Self::resolve_file_path(&ctx.repo_root, path) {
+            Ok(found) => found,
+            Err(e) => return Ok(tool_error(e)),
+        };
         let (entities, include_file) = if abs_path.is_file() {
             if !params.no_default_excludes() && is_default_excluded(&rel_path) {
                 return Ok(tool_error(format!(
@@ -1846,7 +1860,10 @@ impl SemServer {
         };
 
         let pathspecs: Vec<String> = if let Some(ref fp) = params.file_path {
-            let (rel, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+            let (rel, abs_path) = match Self::resolve_file_path(&ctx.repo_root, fp) {
+                Ok(found) => found,
+                Err(e) => return Ok(tool_error(e)),
+            };
             if let Some(err) = pathspec_error(&ctx.git, &scope, &rel, fp, &abs_path) {
                 return Ok(tool_error(err));
             }
@@ -1903,7 +1920,10 @@ impl SemServer {
             Ok(ctx) => ctx,
             Err(err) => return Ok(tool_error(err)),
         };
-        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
+        let (rel_path, abs_path) = match Self::resolve_file_path(&ctx.repo_root, &params.file_path) {
+            Ok(found) => found,
+            Err(e) => return Ok(tool_error(e)),
+        };
         let content = match Self::read_file_at(&abs_path, &rel_path) {
             Ok(content) => content,
             Err(err) => return Ok(tool_error(err)),
@@ -2001,7 +2021,10 @@ impl SemServer {
         // built, as context mode does.
         let explicit_rel = match params.file_path.as_deref() {
             Some(fp) => {
-                let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+                let (rel_path, abs_path) = match Self::resolve_file_path(&ctx.repo_root, fp) {
+                    Ok(found) => found,
+                    Err(e) => return Ok(tool_error(e)),
+                };
                 if let Some(err) = file_path_error(fp, &abs_path) {
                     return Ok(tool_error(err));
                 }
@@ -2246,10 +2269,10 @@ impl SemServer {
         let Some(entity_name) = params.entity_name else {
             let limit = params.limit.unwrap_or(50);
             let (rel_file, analytics) = {
-                let rel_file = params.file_path.as_ref().map(|fp| {
-                    let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
-                    rel
-                });
+                let rel_file = match params.file_path.as_ref().map(|fp| Self::resolve_file_path(&ctx.repo_root, fp)).transpose() {
+                    Ok(found) => found.map(|(rel, _)| rel),
+                    Err(e) => return Ok(tool_error(e)),
+                };
                 // Semantic commit index first (each commit diffed once, ever);
                 // live walk only when the cache is unusable.
                 let analytics = crate::cache::history_analytics_from_store(
@@ -2283,8 +2306,10 @@ impl SemServer {
         // Resolve file path: use provided or auto-detect
         let file_path = match params.file_path {
             Some(ref fp) => {
-                let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
-                rel
+                match Self::resolve_file_path(&ctx.repo_root, fp) {
+                    Ok((rel, _)) => rel,
+                    Err(e) => return Ok(tool_error(e)),
+                }
             }
             None => {
                 let files = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
@@ -2483,7 +2508,10 @@ impl SemServer {
         let mut directory_scope = None;
         let explicit_rel: Option<String> = match params.file_path.as_deref() {
             Some(fp) => {
-                let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+                let (rel_path, abs_path) = match Self::resolve_file_path(&ctx.repo_root, fp) {
+                    Ok(found) => found,
+                    Err(e) => return Ok(tool_error(e)),
+                };
                 if abs_path.is_dir() {
                     directory_scope = Some(rel_path);
                     None
@@ -2783,7 +2811,10 @@ impl SemServer {
                 };
                 let mut args = vec!["refs".to_string(), q];
                 if let Some(f) = params.file() {
-                    args.extend(["--file".to_string(), Self::resolve_file_path(&ctx.repo_root, f).0]);
+                    match Self::resolve_file_path(&ctx.repo_root, f) {
+                        Ok((rel, _)) => args.extend(["--file".to_string(), rel]),
+                        Err(e) => return Ok(tool_error(e)),
+                    }
                 }
                 if params.format() == "json" {
                     args.push("--json".to_string());
@@ -2916,7 +2947,10 @@ impl SemServer {
         let root = ctx.repo_root.clone();
         let read: Vec<(String, Result<String, String>)> = tokio::task::spawn_blocking(move || {
             let read_one = |p: &String| -> (String, Result<String, String>) {
-                let (rel, abs) = Self::resolve_file_path(&root, p);
+                let (rel, abs) = match Self::resolve_file_path(&root, p) {
+                    Ok(found) => found,
+                    Err(e) => return (p.clone(), Err(e)),
+                };
                 let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
                 let text = if size > crate::tools::MAX_FILE_BYTES {
                     Err(format!(
@@ -3002,7 +3036,10 @@ impl SemServer {
         };
         let (graph, _) = self.live_graph(&ctx.repo_root).await;
         // repo-relative, so an absolute or "./" path scopes like the graph's own
-        let file_filter = params.file().map(|f| Self::resolve_file_path(&ctx.repo_root, f).0);
+        let file_filter = match params.file().map(|f| Self::resolve_file_path(&ctx.repo_root, f)).transpose() {
+            Ok(filter) => filter.map(|(rel, _)| rel),
+            Err(e) => return Ok(tool_error(e)),
+        };
         let file_filter = file_filter.as_deref();
 
         // One query's matches, sorted for determinism. Shared by the single
@@ -3125,7 +3162,10 @@ impl SemServer {
         // dispatcher grouping are the same here as in `sem callers`.
         let mut args = vec!["callers".to_string(), query.to_string()];
         if let Some(f) = params.file() {
-            args.extend(["--file".to_string(), Self::resolve_file_path(&ctx.repo_root, f).0]);
+            match Self::resolve_file_path(&ctx.repo_root, f) {
+                Ok((rel, _)) => args.extend(["--file".to_string(), rel]),
+                Err(e) => return Ok(tool_error(e)),
+            }
         }
         if let Some(n) = params.limit {
             args.extend(["--limit".to_string(), n.to_string()]);
@@ -3265,7 +3305,13 @@ impl SemServer {
         // glob walks its literal leading directories that way; with none
         // ("**/*.ts") it is the default repo walk.
         let scope = params.in_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let scope = scope.map(|s| if s.contains(['*', '?']) { s.trim_start_matches("./").to_string() } else { Self::resolve_file_path(&ctx.repo_root, s).0 });
+        let scope = match scope
+            .map(|s| if s.contains(['*', '?']) { Ok(s.trim_start_matches("./").to_string()) } else { Self::resolve_file_path(&ctx.repo_root, s).map(|(rel, _)| rel) })
+            .transpose()
+        {
+            Ok(scope) => scope,
+            Err(e) => return Ok(tool_error(e)),
+        };
         let glob = scope.as_deref().is_some_and(|s| s.contains(['*', '?']));
         let walk_root = match scope.as_deref() {
             Some(s) if glob => s.split('/').take_while(|c| !c.contains(['*', '?'])).collect::<Vec<_>>().join("/"),
@@ -4576,10 +4622,34 @@ mod tests {
     fn resolve_file_path_normalizes_missing_relative_paths_lexically() {
         let root = temp_git_repo("missing-relative-normalize");
 
-        let (rel_path, abs_path) = SemServer::resolve_file_path(&root, "./missing.py");
+        let (rel_path, abs_path) = SemServer::resolve_file_path(&root, "./missing.py").unwrap();
 
         assert_eq!(rel_path, "missing.py");
-        assert_eq!(abs_path, root.join("./missing.py"));
+        assert_eq!(abs_path, root.canonicalize().unwrap().join("missing.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_file_path_refuses_paths_outside_the_repository() {
+        // Issue #554: `..`, an absolute path elsewhere and a symlink leading out are refused; inside paths still work.
+        let root = temp_git_repo("outside-repo");
+        std::fs::write(root.join("app.py"), "x = 1\n").unwrap();
+        let outside = root.parent().unwrap().join(format!("{}-secret", root.file_name().unwrap().to_string_lossy()));
+        std::fs::write(&outside, "secret\n").unwrap();
+        let climb = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        for path in [climb.as_str(), "src/../../x", outside.to_str().unwrap(), "../../../../../../../../etc/hostname"] {
+            assert!(SemServer::resolve_file_path(&root, path).is_err(), "{path} should be refused");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.parent().unwrap(), root.join("escape")).unwrap();
+            assert!(SemServer::resolve_file_path(&root, "escape/x").is_err());
+        }
+        for path in ["app.py", "./app.py", "src/../app.py", "missing.py", root.join("app.py").to_str().unwrap()] {
+            let (rel, _) = SemServer::resolve_file_path(&root, path).unwrap();
+            assert!(rel == "app.py" || rel == "missing.py", "{path} gave {rel}");
+        }
+        let _ = std::fs::remove_file(outside);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4593,7 +4663,7 @@ mod tests {
     fn resolve_file_path_returns_forward_slashes() {
         let root = temp_git_repo("forward-slash-relative");
 
-        let (rel_path, _) = SemServer::resolve_file_path(&root, "src/inner/file.py");
+        let (rel_path, _) = SemServer::resolve_file_path(&root, "src/inner/file.py").unwrap();
 
         assert_eq!(rel_path, "src/inner/file.py");
         assert!(!rel_path.contains('\\'));
@@ -5509,6 +5579,24 @@ fn path_exists_at_ref(git: &GitBridge, refspec: &str, rel_path: &str) -> Option<
     git.read_file_at_ref(refspec, rel_path)
         .ok()
         .map(|content| content.is_some())
+}
+
+/// The path with `..` and symlinks resolved, if it stays inside the repository. The deepest part that exists is
+/// resolved on disk and the rest, which no longer has any `..`, is appended to it, so a missing file can still be
+/// named while a symlink can't lead out.
+fn contained_path(repo_root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = repo_root.canonicalize().ok()?;
+    let path = normalize_relative_path(path);
+    let mut base = path.as_path();
+    let mut tail = Vec::new();
+    let resolved = loop {
+        if let Ok(found) = base.canonicalize() {
+            break tail.iter().rev().fold(found, |acc: PathBuf, part| acc.join(part));
+        }
+        tail.push(base.file_name()?.to_os_string());
+        base = base.parent()?;
+    };
+    resolved.starts_with(&root).then_some(resolved)
 }
 
 fn canonical_relative_path(repo_root: &Path, abs_path: &Path) -> Option<PathBuf> {
